@@ -1,0 +1,17 @@
+[package]
+name = "rushls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+derive_more = { version = "2", features = ["debug", "display"] }
+bytes = "1.12.1"
+ffmpeg-sys-next = { version = "8.1.0", default-features = false, features = ["avformat"] }
+nz = "0.4"
+parking_lot = "0.12"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

@@ -1,0 +1,23 @@
+//! Two deliberately different reporting mechanisms.
+//!
+//! [`SessionMeters`] carries per-item volume: bytes, packets, samples, parts.
+//! Recording is a relaxed atomic add reached through a narrow trait view, and
+//! callers on the streaming path accumulate batch-local totals and flush once
+//! per batch. There is no dispatch table, no queue, and no allocation.
+//!
+//! [`SessionEvent`] carries rare structured facts: what was discovered, when
+//! segmentation locked, why a session ended. These are boxed and matched
+//! because they happen a handful of times per session.
+//!
+//! Conflating the two is what makes reporting feel expensive. A counter routed
+//! through an event bus pays dispatch to reach a `fetch_add`; a lifecycle fact
+//! squeezed into a counter loses the structure that made it worth reporting.
+
+mod events;
+mod meters;
+
+pub use events::{EventObserver, EventSink, Events, SessionEnd, SessionEvent};
+pub use meters::{
+    DeliveryMeters, MediaMeters, MeterSnapshot, MuxMeters, ProcessMeters, ProcessSnapshot,
+    SessionMeters, SourceMeters,
+};

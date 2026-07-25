@@ -1,0 +1,158 @@
+//! Who may publish, as what stream, under which constraints.
+//!
+//! [`StreamPolicy`] lives here rather than in `media` because it is an
+//! authorization decision that happens to be expressed in media terms. Media
+//! validation consumes the policy but never learns what a grant is, which keeps
+//! the two modules from depending on each other.
+
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU16, NonZeroU32},
+    time::Duration,
+};
+
+use derive_more::{Debug, Display};
+use thiserror::Error;
+
+use crate::domain::{BoxFuture, Codec, FrameRate, StreamId};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngestProtocol {
+    Rtmp,
+    Srt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishResource {
+    pub namespace: Option<String>,
+    pub name: String,
+}
+
+#[derive(Clone, Eq, PartialEq, Debug)]
+#[debug("PresentedCredential([REDACTED])")]
+pub struct PresentedCredential(Vec<u8>);
+
+impl PresentedCredential {
+    pub fn new(value: impl Into<Vec<u8>>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientInfo {
+    pub remote_address: SocketAddr,
+    pub encoder: Option<String>,
+    pub protocol_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishRequest {
+    pub protocol: IngestProtocol,
+    pub resource: PublishResource,
+    pub credential: PresentedCredential,
+    pub client: ClientInfo,
+}
+
+#[derive(Clone, Debug, Display, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[display("{_0}")]
+pub struct Principal(pub String);
+
+/// Whether an authenticated publisher may replace an existing publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TakeoverPolicy {
+    Deny,
+    Allow,
+}
+
+/// How an admitted publication may advance relative to wall clock.
+///
+/// This is a stream authorization decision rather than a transport setting:
+/// RTMP and SRT publications can both be either genuinely live or replayed
+/// from a file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngestTimingPolicy {
+    /// Reject a publisher once normalized media gets this far ahead.
+    RequireRealtime { maximum_lead: Duration },
+    /// Apply backpressure when normalized media gets ahead of wall clock.
+    PaceToRealtime {
+        /// Lead allowed without delaying the publisher after pre-roll.
+        initial_lead: Duration,
+        /// Reject a forward discontinuity this large rather than sleeping for
+        /// what is probably a broken timeline.
+        maximum_timestamp_jump: Duration,
+    },
+}
+
+/// What a principal is allowed to publish.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamPolicy {
+    pub takeovers: TakeoverPolicy,
+    pub ingest_timing: IngestTimingPolicy,
+    pub accepted_video_codecs: Vec<Codec>,
+    pub accepted_audio_codecs: Vec<Codec>,
+    pub maximum_audio_tracks: usize,
+    pub maximum_subtitle_tracks: usize,
+    pub maximum_video_tracks: usize,
+    pub maximum_video_width: NonZeroU32,
+    pub maximum_video_height: NonZeroU32,
+    pub maximum_video_frame_rate: FrameRate,
+    pub maximum_audio_sample_rate: NonZeroU32,
+    pub maximum_audio_channels: NonZeroU16,
+}
+
+impl StreamPolicy {
+    /// The codec set this node can currently mux for LL-HLS delivery.
+    pub fn permissive() -> Self {
+        Self {
+            takeovers: TakeoverPolicy::Allow,
+            ingest_timing: IngestTimingPolicy::PaceToRealtime {
+                initial_lead: Duration::from_secs(2),
+                maximum_timestamp_jump: Duration::from_secs(10),
+            },
+            accepted_video_codecs: vec![Codec::H264, Codec::Hevc, Codec::Av1],
+            accepted_audio_codecs: vec![Codec::Aac, Codec::Opus],
+            maximum_audio_tracks: 8,
+            maximum_subtitle_tracks: 8,
+            maximum_video_tracks: 8,
+            maximum_video_width: nz::u32!(7680),
+            maximum_video_height: nz::u32!(4320),
+            maximum_video_frame_rate: FrameRate::new(nz::u32!(240), nz::u32!(1)),
+            maximum_audio_sample_rate: nz::u32!(192_000),
+            maximum_audio_channels: nz::u16!(32),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PublishGrant {
+    pub stream_id: StreamId,
+    pub principal: Principal,
+    pub policy: StreamPolicy,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum AdmissionError {
+    #[error("the presented credential is invalid")]
+    InvalidCredential,
+    #[error("the publisher is not permitted to publish this resource")]
+    Forbidden,
+    #[error("another publisher already owns this stream")]
+    AlreadyPublished,
+    #[error("admission service failed: {0}")]
+    Service(String),
+}
+
+/// Resolves a protocol handshake into a grant.
+///
+/// Boxed because it is awaited exactly once per session; the allocation is
+/// irrelevant next to the network round trip an implementation usually makes.
+pub trait Authenticator: Send + Sync {
+    fn authenticate<'a>(
+        &'a self,
+        request: &'a PublishRequest,
+    ) -> BoxFuture<'a, Result<PublishGrant, AdmissionError>>;
+}

@@ -1,0 +1,403 @@
+use std::{
+    ffi::c_void,
+    ptr::{self, NonNull},
+    slice,
+    sync::Arc,
+    time::Instant,
+};
+
+use bytes::Bytes;
+use ffmpeg_sys_next as ffmpeg;
+
+use crate::{
+    domain::{Payload, TrackId},
+    source::{DiscoveryLimits, InputState, Packet, SourceError},
+};
+
+use super::{
+    control::Control,
+    error::AvError,
+    input::{AvformatInput, AvformatInputError},
+    metadata::StreamCatalog,
+};
+
+struct ReadOpaque {
+    input: Box<dyn AvformatInput>,
+    control: Arc<Control>,
+}
+
+struct Avio {
+    context: NonNull<ffmpeg::AVIOContext>,
+    _opaque: Box<ReadOpaque>,
+}
+
+impl Avio {
+    fn new(
+        input: Box<dyn AvformatInput>,
+        control: Arc<Control>,
+        buffer_size: usize,
+    ) -> Result<Self, SourceError> {
+        let buffer_size = i32::try_from(buffer_size)
+            .ok()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| SourceError::Open("invalid AVIO buffer size".into()))?;
+        // SAFETY: FFmpeg owns this allocation after `avio_alloc_context`
+        // succeeds. The failure path frees it below.
+        let buffer = unsafe { ffmpeg::av_malloc(buffer_size as usize) }.cast::<u8>();
+        let Some(buffer) = NonNull::new(buffer) else {
+            return Err(SourceError::Open(
+                "could not allocate the AVIO buffer".into(),
+            ));
+        };
+
+        let mut opaque = Box::new(ReadOpaque { input, control });
+        // SAFETY: every pointer is valid and remains alive in `Self`; this is a
+        // read-only, non-seekable byte stream.
+        let context = unsafe {
+            ffmpeg::avio_alloc_context(
+                buffer.as_ptr(),
+                buffer_size,
+                0,
+                (&mut *opaque as *mut ReadOpaque).cast(),
+                Some(read_packet),
+                None,
+                None,
+            )
+        };
+        let Some(context) = NonNull::new(context) else {
+            // SAFETY: ownership was not transferred because allocation failed.
+            unsafe { ffmpeg::av_free(buffer.as_ptr().cast()) };
+            return Err(SourceError::Open(
+                "could not allocate the AVIO context".into(),
+            ));
+        };
+        Ok(Self {
+            context,
+            _opaque: opaque,
+        })
+    }
+
+    fn as_ptr(&self) -> *mut ffmpeg::AVIOContext {
+        self.context.as_ptr()
+    }
+}
+
+impl Drop for Avio {
+    fn drop(&mut self) {
+        let mut context = self.context.as_ptr();
+        // SAFETY: this object uniquely owns the AVIO context. FFmpeg also
+        // releases the possibly replaced internal buffer here.
+        unsafe { ffmpeg::avio_context_free(&mut context) };
+    }
+}
+
+unsafe extern "C" fn read_packet(opaque: *mut c_void, buffer: *mut u8, buffer_size: i32) -> i32 {
+    if opaque.is_null() || buffer.is_null() || buffer_size <= 0 {
+        return ffmpeg::AVERROR(ffmpeg::EINVAL);
+    }
+    // SAFETY: `Avio` keeps this `ReadOpaque` alive for the callback's lifetime.
+    let opaque = unsafe { &mut *opaque.cast::<ReadOpaque>() };
+    if opaque.control.interrupted() {
+        return ffmpeg::AVERROR_EXIT;
+    }
+    let Ok(buffer_size) = usize::try_from(buffer_size) else {
+        return ffmpeg::AVERROR(ffmpeg::EINVAL);
+    };
+    let buffer_size = opaque.control.limit_read(buffer_size);
+    if buffer_size == 0 {
+        return ffmpeg::AVERROR_EXIT;
+    }
+    // SAFETY: FFmpeg supplied a writable buffer of `buffer_size` bytes.
+    let buffer = unsafe { slice::from_raw_parts_mut(buffer, buffer_size) };
+    match opaque.input.read(buffer, opaque.control.as_ref()) {
+        Ok(read) if read <= buffer_size => {
+            opaque.control.record_read(read);
+            i32::try_from(read).unwrap_or(i32::MAX)
+        }
+        Ok(read) => {
+            opaque.control.set_input_error(format!(
+                "byte input reported {read} bytes for a {buffer_size}-byte buffer"
+            ));
+            ffmpeg::AVERROR(ffmpeg::EIO)
+        }
+        Err(AvformatInputError::End(state)) => {
+            opaque.control.set_terminal(match state {
+                InputState::Open => InputState::Interrupted,
+                state => state,
+            });
+            ffmpeg::AVERROR_EOF
+        }
+        Err(AvformatInputError::Failed(error)) => {
+            opaque.control.set_input_error(error);
+            ffmpeg::AVERROR(ffmpeg::EIO)
+        }
+    }
+}
+
+unsafe extern "C" fn interrupt(opaque: *mut c_void) -> i32 {
+    if opaque.is_null() {
+        return 1;
+    }
+    // SAFETY: `Avio` owns the `Arc<Control>` whose pointee remains stable.
+    i32::from(unsafe { &*opaque.cast::<Control>() }.interrupted())
+}
+
+pub struct FormatInput {
+    context: NonNull<ffmpeg::AVFormatContext>,
+    _io: Avio,
+    control: Arc<Control>,
+}
+
+impl FormatInput {
+    pub fn open(
+        input: Box<dyn AvformatInput>,
+        control: Arc<Control>,
+        limits: DiscoveryLimits,
+        io_buffer_size: usize,
+    ) -> Result<(Self, StreamCatalog), SourceError> {
+        if limits.maximum_probe_bytes == 0 {
+            return Err(SourceError::Discovery(
+                "maximum probe bytes must be nonzero".into(),
+            ));
+        }
+        control.set_deadline(Some(Instant::now() + limits.maximum_wall_time));
+        control.begin_probe(limits.maximum_probe_bytes);
+        let io = Avio::new(input, Arc::clone(&control), io_buffer_size)?;
+        // SAFETY: no arguments and no ownership prerequisites.
+        let context = unsafe { ffmpeg::avformat_alloc_context() };
+        let Some(context) = NonNull::new(context) else {
+            return Err(SourceError::Open(
+                "could not allocate the AVFormat context".into(),
+            ));
+        };
+        // SAFETY: the context is uniquely owned until `avformat_open_input`.
+        unsafe {
+            (*context.as_ptr()).pb = io.as_ptr();
+            (*context.as_ptr()).flags |= ffmpeg::AVFMT_FLAG_CUSTOM_IO;
+            (*context.as_ptr()).probesize =
+                i64::try_from(limits.maximum_probe_bytes).unwrap_or(i64::MAX);
+            (*context.as_ptr()).interrupt_callback = ffmpeg::AVIOInterruptCB {
+                callback: Some(interrupt),
+                opaque: Arc::as_ptr(&control).cast_mut().cast(),
+            };
+        }
+
+        let mut opened = context.as_ptr();
+        // SAFETY: `opened` points to a configured input context. Custom IO
+        // means neither a URL nor an explicit input format is required.
+        let result = unsafe {
+            ffmpeg::avformat_open_input(&mut opened, ptr::null(), ptr::null(), ptr::null_mut())
+        };
+        if result < 0 {
+            if !opened.is_null() {
+                // SAFETY: FFmpeg left a live context in `opened`.
+                unsafe { ffmpeg::avformat_close_input(&mut opened) };
+            }
+            return Err(open_error("opening input", result, &control));
+        }
+        let context = NonNull::new(opened)
+            .ok_or_else(|| SourceError::Open("AVFormat returned a null context".into()))?;
+
+        // SAFETY: the context is open and exclusively owned.
+        let result =
+            unsafe { ffmpeg::avformat_find_stream_info(context.as_ptr(), ptr::null_mut()) };
+        if result < 0 {
+            let mut opened = context.as_ptr();
+            // SAFETY: the context is open and exclusively owned.
+            unsafe { ffmpeg::avformat_close_input(&mut opened) };
+            return Err(discovery_error(result, &control));
+        }
+        control.set_deadline(None);
+        control.finish_probe();
+        // SAFETY: stream discovery has completed on this open context.
+        let catalog = match unsafe { StreamCatalog::discover(context.as_ptr()) } {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                let mut opened = context.as_ptr();
+                // SAFETY: discovery left the context open and exclusively owned.
+                unsafe { ffmpeg::avformat_close_input(&mut opened) };
+                return Err(error);
+            }
+        };
+        Ok((
+            Self {
+                context,
+                _io: io,
+                control,
+            },
+            catalog,
+        ))
+    }
+
+    pub fn context(&self) -> *mut ffmpeg::AVFormatContext {
+        self.context.as_ptr()
+    }
+
+    pub fn read(&mut self, packet: &mut AvPacket) -> i32 {
+        // SAFETY: both objects are live and uniquely borrowed.
+        unsafe { ffmpeg::av_read_frame(self.context.as_ptr(), packet.as_ptr()) }
+    }
+
+    pub fn read_error(&self, code: i32) -> ReadError {
+        if self.control.cancelled() {
+            return ReadError::Cancelled;
+        }
+        if let Some(error) = self.control.take_input_error() {
+            return ReadError::Failed(SourceError::Input(error));
+        }
+        if code == ffmpeg::AVERROR_EOF {
+            return ReadError::End(self.control.terminal().unwrap_or(InputState::Interrupted));
+        }
+        if code == ffmpeg::AVERROR_EXIT {
+            return ReadError::End(InputState::Interrupted);
+        }
+        ReadError::Failed(SourceError::Input(AvError::new(code).to_string()))
+    }
+}
+
+impl Drop for FormatInput {
+    fn drop(&mut self) {
+        let mut context = self.context.as_ptr();
+        // SAFETY: this object uniquely owns the open format context.
+        unsafe { ffmpeg::avformat_close_input(&mut context) };
+    }
+}
+
+pub enum ReadError {
+    End(InputState),
+    Failed(SourceError),
+    Cancelled,
+}
+
+pub struct AvPacket {
+    packet: NonNull<ffmpeg::AVPacket>,
+}
+
+impl AvPacket {
+    pub fn new() -> Result<Self, SourceError> {
+        // SAFETY: no arguments and no ownership prerequisites.
+        let packet = unsafe { ffmpeg::av_packet_alloc() };
+        NonNull::new(packet)
+            .map(|packet| Self { packet })
+            .ok_or_else(|| SourceError::Open("could not allocate an AVPacket".into()))
+    }
+
+    pub fn as_ptr(&mut self) -> *mut ffmpeg::AVPacket {
+        self.packet.as_ptr()
+    }
+
+    pub fn to_packet(
+        &self,
+        track_id: TrackId,
+        maximum_payload_bytes: usize,
+    ) -> Result<Packet, SourceError> {
+        // SAFETY: the packet is live and initialized by `av_read_frame`.
+        let packet = unsafe { self.packet.as_ref() };
+        let size = usize::try_from(packet.size)
+            .map_err(|_| SourceError::Input("AVPacket has a negative payload size".into()))?;
+        if size > maximum_payload_bytes {
+            return Err(SourceError::PacketPayloadTooLarge {
+                limit: maximum_payload_bytes,
+                found: size,
+            });
+        }
+        if size > 0 && packet.data.is_null() {
+            return Err(SourceError::Input(
+                "AVPacket has a null payload pointer".into(),
+            ));
+        }
+        let payload = if size == 0 {
+            Payload::default()
+        } else if packet.buf.is_null() {
+            // Unusual non-reference-counted packets cannot outlive `unref`;
+            // copying is the only safe fallback.
+            // SAFETY: AVPacket guarantees `size` readable payload bytes.
+            Payload::from(unsafe { slice::from_raw_parts(packet.data, size) }.to_vec())
+        } else {
+            // SAFETY: the source packet owns a live AVBuffer reference.
+            let buffer = unsafe { ffmpeg::av_buffer_ref(packet.buf) };
+            let buffer = NonNull::new(buffer)
+                .ok_or_else(|| SourceError::Input("could not retain AVPacket payload".into()))?;
+            Payload::from_bytes(Bytes::from_owner(PacketPayload {
+                buffer,
+                data: packet.data,
+                size,
+            }))
+        };
+        Ok(Packet {
+            track_id,
+            pts: timestamp(packet.pts),
+            dts: timestamp(packet.dts),
+            duration: (packet.duration > 0).then_some(packet.duration),
+            random_access: packet.flags & ffmpeg::AV_PKT_FLAG_KEY != 0,
+            payload,
+        })
+    }
+
+    pub fn unref(&mut self) {
+        // SAFETY: the packet is live and uniquely borrowed.
+        unsafe { ffmpeg::av_packet_unref(self.packet.as_ptr()) };
+    }
+}
+
+struct PacketPayload {
+    buffer: NonNull<ffmpeg::AVBufferRef>,
+    data: *const u8,
+    size: usize,
+}
+
+// SAFETY: `av_buffer_ref` created an independent reference to an immutable
+// AVBuffer. FFmpeg buffer references may be released from a thread other than
+// the one that created them.
+unsafe impl Send for PacketPayload {}
+
+impl AsRef<[u8]> for PacketPayload {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: the owned AVPacket keeps this exact data region alive.
+        unsafe { slice::from_raw_parts(self.data, self.size) }
+    }
+}
+
+impl Drop for PacketPayload {
+    fn drop(&mut self) {
+        let mut buffer = self.buffer.as_ptr();
+        // SAFETY: this owner uniquely owns its AVBuffer reference.
+        unsafe { ffmpeg::av_buffer_unref(&mut buffer) };
+    }
+}
+
+impl Drop for AvPacket {
+    fn drop(&mut self) {
+        let mut packet = self.packet.as_ptr();
+        // SAFETY: this object uniquely owns the AVPacket allocation.
+        unsafe { ffmpeg::av_packet_free(&mut packet) };
+    }
+}
+
+fn timestamp(value: i64) -> Option<i64> {
+    (value != ffmpeg::AV_NOPTS_VALUE).then_some(value)
+}
+
+fn open_error(action: &str, code: i32, control: &Control) -> SourceError {
+    if control.probe_exceeded() {
+        SourceError::Discovery("stream discovery exceeded its probe byte limit".into())
+    } else if control.interrupted() {
+        SourceError::Open(format!("{action} exceeded its deadline"))
+    } else if let Some(error) = control.take_input_error() {
+        SourceError::Open(error)
+    } else {
+        SourceError::Open(format!("{action}: {}", AvError::new(code)))
+    }
+}
+
+fn discovery_error(code: i32, control: &Control) -> SourceError {
+    if control.probe_exceeded() {
+        SourceError::Discovery("stream discovery exceeded its probe byte limit".into())
+    } else if control.interrupted() {
+        SourceError::Discovery("stream discovery exceeded its deadline".into())
+    } else if let Some(error) = control.take_input_error() {
+        SourceError::Discovery(error)
+    } else {
+        SourceError::Discovery(AvError::new(code).to_string())
+    }
+}
