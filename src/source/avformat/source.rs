@@ -6,8 +6,8 @@ use crate::{
     domain::{Appender, BoxFuture},
     observe::SourceMeters,
     source::{
-        DiscoveryLimits, DiscoveryReport, InputLimits, InputState, Packet, PacketSource,
-        SourceError,
+        DiscoveryLimits, DiscoveryProblem, DiscoveryReport, InputLimits, InputState, Packet,
+        PacketSource, SourceError,
     },
 };
 
@@ -114,10 +114,7 @@ impl PacketSource for AvformatPacketSource {
             if let Some(discovery) = &self.discovery {
                 return Ok(discovery.clone());
             }
-            let input = self
-                .input
-                .take()
-                .ok_or_else(|| SourceError::Discovery("discovery already started".into()))?;
+            let input = self.input.take().ok_or(DiscoveryProblem::AlreadyStarted)?;
             let (discovery_tx, discovery_rx) = oneshot::channel();
             let (output_tx, output_rx) = mpsc::channel(self.config.packet_channel_capacity.get());
             worker::spawn(
@@ -130,9 +127,9 @@ impl PacketSource for AvformatPacketSource {
                 output_tx,
             )?;
             self.receiver = Some(output_rx);
-            let discovery = discovery_rx.await.map_err(|_| {
-                SourceError::Discovery("AVFormat worker stopped during discovery".into())
-            })??;
+            let discovery = discovery_rx
+                .await
+                .map_err(|_| SourceError::from(DiscoveryProblem::Abandoned))??;
             self.discovery = Some(discovery.clone());
             Ok(discovery)
         })
@@ -366,8 +363,12 @@ mod tests {
             .await
             .expect_err("the WAV header does not fit the probe budget");
 
-        assert!(matches!(error, SourceError::Discovery(_)));
-        assert!(error.to_string().contains("probe byte limit"));
+        assert_eq!(
+            error,
+            SourceError::Discovery(DiscoveryProblem::ProbeLimitExceeded),
+            "the budget ran out, which is a different operator response from \
+             the deadline running out"
+        );
     }
 
     #[tokio::test]
@@ -406,7 +407,7 @@ mod tests {
             match self.reader.read(buffer) {
                 Ok(0) => Err(AvformatInputError::End(InputState::Closed)),
                 Ok(read) => Ok(read),
-                Err(error) => Err(AvformatInputError::Failed(error.to_string())),
+                Err(error) => Err(AvformatInputError::Failed(error.to_string().into())),
             }
         }
     }

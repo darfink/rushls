@@ -8,7 +8,7 @@ mod segment;
 use super::{BoundaryAlignmentPolicy, BoundarySearchPolicy, SegmentationPolicy};
 use crate::{
     domain::{TickTimestamp, Timebase, TrackId},
-    media::{NormalizedSample, TimelineCalibration},
+    media::{NormalizedSample, Rounding, TimelineCalibration},
 };
 pub(super) use part::select_part_duration;
 use segment::select_segment_boundaries;
@@ -134,30 +134,18 @@ impl BoundarySelector {
                 return Err(BoundarySelectionError::DuplicateTrack(track.track_id));
             }
 
-            let desired_limit = track
-                .origin_pts
-                .checked_add_unsigned(
-                    track
-                        .timebase
-                        .duration_to_ticks_floor(policy.desired_segment_duration),
-                )
-                .ok_or(BoundarySelectionError::HorizonOverflow(track.track_id))?;
-            let desired_coverage = track
-                .origin_pts
-                .checked_add_unsigned(
-                    track
-                        .timebase
-                        .duration_to_ticks_ceil(policy.desired_segment_duration),
-                )
-                .ok_or(BoundarySelectionError::HorizonOverflow(track.track_id))?;
-            let maximum_limit = track
-                .origin_pts
-                .checked_add_unsigned(track.timebase.duration_to_ticks_floor(maximum_duration))
-                .ok_or(BoundarySelectionError::HorizonOverflow(track.track_id))?;
-            let maximum_coverage = track
-                .origin_pts
-                .checked_add_unsigned(track.timebase.duration_to_ticks_ceil(maximum_duration))
-                .ok_or(BoundarySelectionError::HorizonOverflow(track.track_id))?;
+            // Each duration is needed twice: rounded down as the latest
+            // boundary policy permits, and rounded up as the point past which
+            // no more evidence can arrive.
+            let horizon = |duration, rounding| {
+                track
+                    .horizon(duration, rounding)
+                    .ok_or(BoundarySelectionError::HorizonOverflow(track.track_id))
+            };
+            let desired_limit = horizon(policy.desired_segment_duration, Rounding::Down)?;
+            let desired_coverage = horizon(policy.desired_segment_duration, Rounding::Up)?;
+            let maximum_limit = horizon(maximum_duration, Rounding::Down)?;
+            let maximum_coverage = horizon(maximum_duration, Rounding::Up)?;
 
             tracks.push(TrackState {
                 track_id: track.track_id,

@@ -5,7 +5,7 @@ use tokio::time::Instant;
 
 use crate::{
     admission::IngestTimingPolicy,
-    domain::{TickOffset, Timebase, TrackId, offset_from},
+    domain::{MediaInstant, TrackId},
     observe::MediaMeters,
 };
 
@@ -46,39 +46,29 @@ impl Drop for PacingWait<'_> {
     }
 }
 
+/// A sample's presentation instant, remembering which track it came from.
+///
+/// [`MediaInstant`] does the arithmetic and reports overflow as [`None`]; the
+/// track identity lives here so a failure can name the publisher's track rather
+/// than an anonymous timestamp.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MediaPoint {
     track_id: TrackId,
-    timebase: Timebase,
-    offset: TickOffset,
+    instant: MediaInstant,
 }
 
 impl MediaPoint {
     fn compare(self, other: Self) -> Result<Ordering, PacingError> {
-        self.timebase
-            .compare_offsets(self.offset, other.timebase, other.offset)
+        self.instant
+            .compare(other.instant)
             .ok_or(PacingError::TimestampOverflow(self.track_id))
     }
 
     pub(crate) fn elapsed_since(self, earlier: Self) -> Result<Duration, PacingError> {
-        let later_nanos = nanos(self)?;
-        let earlier_nanos = nanos(earlier)?;
-        let elapsed = later_nanos
-            .checked_sub(earlier_nanos)
-            .ok_or(PacingError::TimestampOverflow(self.track_id))?;
-        Ok(Duration::from_nanos(
-            u64::try_from(elapsed).unwrap_or(u64::MAX),
-        ))
+        self.instant
+            .elapsed_since(earlier.instant)
+            .ok_or(PacingError::TimestampOverflow(self.track_id))
     }
-}
-
-fn nanos(point: MediaPoint) -> Result<i128, PacingError> {
-    point
-        .offset
-        .checked_mul(i128::from(point.timebase.num().get()))
-        .and_then(|value| value.checked_mul(1_000_000_000))
-        .map(|value| value / i128::from(point.timebase.den().get()))
-        .ok_or(PacingError::TimestampOverflow(point.track_id))
 }
 
 fn point(
@@ -91,8 +81,7 @@ fn point(
         .ok_or(PacingError::UnknownTrack(track_id))?;
     Ok(MediaPoint {
         track_id,
-        timebase: track.timebase,
-        offset: offset_from(sample.pts(), track.origin_pts),
+        instant: MediaInstant::new(track.timebase, sample.pts(), track.origin_pts),
     })
 }
 

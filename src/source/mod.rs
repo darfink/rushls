@@ -18,5 +18,8 @@ pub use limits::{
     BatchUnit, BoundedBatch, BoundedPacketBatch, DensityUnit, InputLimits, LimitError,
     PacketBatchStats,
 };
-pub use packet::{DiscoveryLimits, DiscoveryReport, InputState, Packet, PacketSource, SourceError};
+pub use packet::{
+    DiscoveryLimits, DiscoveryProblem, DiscoveryReport, InputState, Packet, PacketSource,
+    SourceError,
+};
 pub use publish::{AcceptedPublish, PendingPublish, PublishRejection, TransportError};

@@ -1,22 +1,26 @@
 use std::time::Duration;
 
-use crate::source::{DensityUnit, InputLimits, LimitError};
-
-use super::{
-    NormalizedSample, PacingError, TimelineCalibration,
-    pacer::{MediaPoint, MediaWatermark},
+use crate::{
+    domain::{MediaInstant, TrackId},
+    source::{DensityUnit, InputLimits, LimitError},
 };
+
+use super::{NormalizedSample, TimelineCalibration};
 
 /// Fixed media-time accounting for one publisher.
 ///
 /// Unlike an arrival-rate limiter, this window advances only when normalized
 /// media time advances. Replaying ten valid seconds quickly is therefore fine;
 /// sending unbounded packets or samples at one timestamp is not.
+///
+/// Tracks the media clock itself rather than borrowing the pacer's watermark:
+/// the two ask different questions of the same timestamps, and sharing the
+/// answer made a density failure report itself as a pacing failure.
 pub struct MediaDensityWindow {
     limits: InputLimits,
     timeline: TimelineCalibration,
-    window_start: Option<MediaPoint>,
-    watermark: MediaWatermark,
+    window_start: Option<MediaInstant>,
+    latest: Option<(TrackId, MediaInstant)>,
     bytes: u64,
     packets: u64,
     samples: u64,
@@ -28,7 +32,7 @@ impl MediaDensityWindow {
             limits,
             timeline: timeline.clone(),
             window_start: None,
-            watermark: MediaWatermark::default(),
+            latest: None,
             bytes: 0,
             packets: 0,
             samples: 0,
@@ -42,15 +46,20 @@ impl MediaDensityWindow {
         samples: &[NormalizedSample],
     ) -> Result<(), MediaDensityError> {
         for sample in samples {
-            self.watermark.observe(sample, &self.timeline)?;
+            self.observe(sample)?;
         }
 
-        if let Some(current) = self.watermark.get() {
+        if let Some((track_id, current)) = self.latest {
+            let elapsed = |start| {
+                current
+                    .elapsed_since(start)
+                    .ok_or(MediaDensityError::TimestampOverflow(track_id))
+            };
             match self.window_start {
                 None => self.window_start = Some(current),
-                Some(start)
-                    if current.elapsed_since(start)? >= self.limits.media_density_window =>
-                {
+                // Fixed, non-overlapping windows: once media time has advanced
+                // a full window, everything before it stops counting.
+                Some(start) if elapsed(start)? >= self.limits.media_density_window => {
                     self.window_start = Some(current);
                     self.bytes = 0;
                     self.packets = 0;
@@ -86,6 +95,31 @@ impl MediaDensityWindow {
         )?;
         Ok(())
     }
+
+    /// Advances the media clock, ignoring samples that do not move it forward.
+    ///
+    /// Reordered access units and interleaved tracks both go backwards
+    /// routinely; only the furthest point reached defines how much media time
+    /// the publisher has actually spent.
+    fn observe(&mut self, sample: &NormalizedSample) -> Result<(), MediaDensityError> {
+        let track_id = sample.track_id();
+        let track = self
+            .timeline
+            .get(track_id)
+            .ok_or(MediaDensityError::UnknownTrack(track_id))?;
+        let candidate = MediaInstant::new(track.timebase, sample.pts(), track.origin_pts);
+        let advances = match self.latest {
+            Some((_, current)) => candidate
+                .compare(current)
+                .ok_or(MediaDensityError::TimestampOverflow(track_id))?
+                .is_gt(),
+            None => true,
+        };
+        if advances {
+            self.latest = Some((track_id, candidate));
+        }
+        Ok(())
+    }
 }
 
 fn check(
@@ -116,10 +150,12 @@ fn per_second(observed: u64, window: Duration) -> u64 {
     u64::try_from(rate).unwrap_or(u64::MAX)
 }
 
-#[derive(Clone, Debug, thiserror::Error, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
 pub enum MediaDensityError {
-    #[error(transparent)]
-    Timestamp(#[from] PacingError),
+    #[error("media density accounting received a sample for unknown {0}")]
+    UnknownTrack(TrackId),
+    #[error("timestamp arithmetic overflowed while accounting for {0}")]
+    TimestampOverflow(TrackId),
     #[error(transparent)]
     Limit(#[from] LimitError),
 }

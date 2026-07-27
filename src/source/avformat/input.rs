@@ -8,7 +8,7 @@ pub enum AvformatInputError {
     #[error("the byte input ended: {0:?}")]
     End(InputState),
     #[error("byte input failed: {0}")]
-    Failed(String),
+    Failed(Box<str>),
 }
 
 /// Cancellation and discovery-deadline state shared with a blocking reader.
@@ -66,7 +66,7 @@ impl<R: Read + Send> AvformatInput for ReadInput<R> {
         match self.reader.read(buffer) {
             Ok(0) => Err(AvformatInputError::End(self.end)),
             Ok(read) => Ok(read),
-            Err(error) => Err(AvformatInputError::Failed(error.to_string())),
+            Err(error) => Err(AvformatInputError::Failed(error.to_string().into())),
         }
     }
 }

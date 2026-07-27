@@ -97,7 +97,9 @@ pub fn spawn(
             );
         })
         .map(|_| ())
-        .map_err(|error| SourceError::Open(format!("could not start AVFormat worker: {error}")))
+        .map_err(|error| {
+            SourceError::Open(format!("could not start AVFormat worker: {error}").into())
+        })
 }
 
 fn run(

@@ -71,10 +71,7 @@ impl<'a, W: Write + ?Sized> AttributeList<'a, W> {
         Self { out, first: true }
     }
 
-    pub fn item(
-        &mut self,
-        write: impl FnOnce(&mut W) -> fmt::Result,
-    ) -> ManifestWriteResult<()> {
+    pub fn item(&mut self, write: impl FnOnce(&mut W) -> fmt::Result) -> ManifestWriteResult<()> {
         if !self.first {
             self.out.write_char(',')?;
         }

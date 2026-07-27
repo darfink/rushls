@@ -113,9 +113,9 @@ impl PackagedMedia {
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum MuxError {
     #[error("cannot mux the locked segmentation plan: {0}")]
-    InvalidPlan(String),
+    InvalidPlan(Box<str>),
     #[error("media muxing failed: {0}")]
-    Mux(String),
+    Mux(Box<str>),
 }
 
 /// What continuity delivery may expect after this muxer stops.

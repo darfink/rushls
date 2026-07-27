@@ -11,7 +11,7 @@ use ffmpeg_sys_next as ffmpeg;
 
 use crate::{
     domain::{Payload, TrackId},
-    source::{DiscoveryLimits, InputState, Packet, SourceError},
+    source::{DiscoveryLimits, DiscoveryProblem, InputState, Packet, SourceError},
 };
 
 use super::{
@@ -115,9 +115,9 @@ unsafe extern "C" fn read_packet(opaque: *mut c_void, buffer: *mut u8, buffer_si
             i32::try_from(read).unwrap_or(i32::MAX)
         }
         Ok(read) => {
-            opaque.control.set_input_error(format!(
-                "byte input reported {read} bytes for a {buffer_size}-byte buffer"
-            ));
+            opaque.control.set_input_error(
+                format!("byte input reported {read} bytes for a {buffer_size}-byte buffer").into(),
+            );
             ffmpeg::AVERROR(ffmpeg::EIO)
         }
         Err(AvformatInputError::End(state)) => {
@@ -156,9 +156,10 @@ impl FormatInput {
         io_buffer_size: usize,
     ) -> Result<(Self, StreamCatalog), SourceError> {
         if limits.maximum_probe_bytes == 0 {
-            return Err(SourceError::Discovery(
-                "maximum probe bytes must be nonzero".into(),
-            ));
+            return Err(DiscoveryProblem::LimitNotPositive {
+                field: "maximum probe bytes",
+            }
+            .into());
         }
         control.set_deadline(Some(Instant::now() + limits.maximum_wall_time));
         control.begin_probe(limits.maximum_probe_bytes);
@@ -190,7 +191,9 @@ impl FormatInput {
         };
         if result < 0 {
             if !opened.is_null() {
-                // SAFETY: FFmpeg left a live context in `opened`.
+                // SAFETY: FFmpeg left a live context in `opened`. This is the
+                // one failure the type below cannot cover, because ownership
+                // has not come back to us yet.
                 unsafe { ffmpeg::avformat_close_input(&mut opened) };
             }
             return Err(open_error("opening input", result, &control));
@@ -198,35 +201,27 @@ impl FormatInput {
         let context = NonNull::new(opened)
             .ok_or_else(|| SourceError::Open("AVFormat returned a null context".into()))?;
 
-        // SAFETY: the context is open and exclusively owned.
-        let result =
-            unsafe { ffmpeg::avformat_find_stream_info(context.as_ptr(), ptr::null_mut()) };
-        if result < 0 {
-            let mut opened = context.as_ptr();
-            // SAFETY: the context is open and exclusively owned.
-            unsafe { ffmpeg::avformat_close_input(&mut opened) };
-            return Err(discovery_error(result, &control));
-        }
-        control.set_deadline(None);
-        control.finish_probe();
-        // SAFETY: stream discovery has completed on this open context.
-        let catalog = match unsafe { StreamCatalog::discover(context.as_ptr()) } {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                let mut opened = context.as_ptr();
-                // SAFETY: discovery left the context open and exclusively owned.
-                unsafe { ffmpeg::avformat_close_input(&mut opened) };
-                return Err(error);
-            }
+        // Take ownership the moment FFmpeg hands the context back, before doing
+        // anything else that can fail. Everything below is now covered by
+        // `Drop`, so a later `?` releases the context instead of leaking a whole
+        // demuxer per failed session — which is the path a hostile input takes.
+        let format = Self {
+            context,
+            _io: io,
+            control,
         };
-        Ok((
-            Self {
-                context,
-                _io: io,
-                control,
-            },
-            catalog,
-        ))
+
+        // SAFETY: the context is open and exclusively owned by `format`.
+        let result =
+            unsafe { ffmpeg::avformat_find_stream_info(format.context(), ptr::null_mut()) };
+        if result < 0 {
+            return Err(discovery_error(result, &format.control));
+        }
+        format.control.set_deadline(None);
+        format.control.finish_probe();
+        // SAFETY: stream discovery has completed on this open context.
+        let catalog = unsafe { StreamCatalog::discover(format.context()) }?;
+        Ok((format, catalog))
     }
 
     pub fn context(&self) -> *mut ffmpeg::AVFormatContext {
@@ -251,7 +246,7 @@ impl FormatInput {
         if code == ffmpeg::AVERROR_EXIT {
             return ReadError::End(InputState::Interrupted);
         }
-        ReadError::Failed(SourceError::Input(AvError::new(code).to_string()))
+        ReadError::Failed(SourceError::Input(AvError::new(code).to_string().into()))
     }
 }
 
@@ -380,24 +375,24 @@ fn timestamp(value: i64) -> Option<i64> {
 
 fn open_error(action: &str, code: i32, control: &Control) -> SourceError {
     if control.probe_exceeded() {
-        SourceError::Discovery("stream discovery exceeded its probe byte limit".into())
+        DiscoveryProblem::ProbeLimitExceeded.into()
     } else if control.interrupted() {
-        SourceError::Open(format!("{action} exceeded its deadline"))
+        DiscoveryProblem::DeadlineExceeded.into()
     } else if let Some(error) = control.take_input_error() {
         SourceError::Open(error)
     } else {
-        SourceError::Open(format!("{action}: {}", AvError::new(code)))
+        SourceError::Open(format!("{action}: {}", AvError::new(code)).into())
     }
 }
 
 fn discovery_error(code: i32, control: &Control) -> SourceError {
     if control.probe_exceeded() {
-        SourceError::Discovery("stream discovery exceeded its probe byte limit".into())
+        DiscoveryProblem::ProbeLimitExceeded.into()
     } else if control.interrupted() {
-        SourceError::Discovery("stream discovery exceeded its deadline".into())
+        DiscoveryProblem::DeadlineExceeded.into()
     } else if let Some(error) = control.take_input_error() {
-        SourceError::Discovery(error)
+        SourceError::Input(error)
     } else {
-        SourceError::Discovery(AvError::new(code).to_string())
+        SourceError::Demux(AvError::new(code).to_string().into())
     }
 }

@@ -183,10 +183,7 @@ impl StreamStore {
 
     /// Test-only lifecycle lease for metrics that do not publish media.
     #[cfg(test)]
-    pub fn lease_without_presentation(
-        &self,
-        stream: StreamId,
-    ) -> Result<StreamLease, StoreFull> {
+    pub fn lease_without_presentation(&self, stream: StreamId) -> Result<StreamLease, StoreFull> {
         self.lease(
             stream,
             Arc::new(PackagedPresentation {

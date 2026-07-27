@@ -184,10 +184,9 @@ struct SessionCounters {
     pacing_delay_nanos: AtomicU64,
     publisher_backpressured: AtomicBool,
     live_readers: AtomicUsize,
-    /// Nanoseconds since `started_at`, offset by one so zero means "never".
-    source_seen: AtomicU64,
-    media_seen: AtomicU64,
-    publication_seen: AtomicU64,
+    source_seen: LivenessMark,
+    media_seen: LivenessMark,
+    publication_seen: LivenessMark,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -229,9 +228,9 @@ impl SessionMeters {
                 pacing_delay_nanos: AtomicU64::new(0),
                 publisher_backpressured: AtomicBool::new(false),
                 live_readers: AtomicUsize::new(0),
-                source_seen: AtomicU64::new(0),
-                media_seen: AtomicU64::new(0),
-                publication_seen: AtomicU64::new(0),
+                source_seen: LivenessMark::default(),
+                media_seen: LivenessMark::default(),
+                publication_seen: LivenessMark::default(),
             }),
         }
     }
@@ -290,17 +289,23 @@ impl SessionMeters {
 
     /// How long ago the source last delivered data, or `None` if it never has.
     pub fn source_idle_for(&self, now: Instant) -> Option<Duration> {
-        self.counters.idle_for(now, &self.counters.source_seen)
+        self.counters
+            .source_seen
+            .idle_for(self.counters.started_at, now)
     }
 
     /// How long ago normalization last produced a sample.
     pub fn media_idle_for(&self, now: Instant) -> Option<Duration> {
-        self.counters.idle_for(now, &self.counters.media_seen)
+        self.counters
+            .media_seen
+            .idle_for(self.counters.started_at, now)
     }
 
     /// How long ago a chunk or complete segment became available to viewers.
     pub fn publication_idle_for(&self, now: Instant) -> Option<Duration> {
-        self.counters.idle_for(now, &self.counters.publication_seen)
+        self.counters
+            .publication_seen
+            .idle_for(self.counters.started_at, now)
     }
 
     pub fn reader_attached(&self) {
@@ -322,21 +327,38 @@ impl SessionMeters {
     }
 }
 
-impl SessionCounters {
-    /// Stores elapsed nanoseconds biased by one so that zero reads as "never".
-    fn mark(&self, target: &AtomicU64) {
-        let elapsed = Instant::now().saturating_duration_since(self.started_at);
+/// When a stage last showed a sign of life, or never.
+///
+/// Health evaluation asks "how long since X last happened?", and the answer has
+/// to distinguish *never* from *just now* — a source that has produced nothing
+/// since the session began is as stalled as one that stopped, but only if the
+/// two are told apart, and only if "never" does not read as "at time zero".
+///
+/// Stored as one atomic so a stage can mark it from the same batch update it
+/// was already making, without a lock and without a second timestamp source to
+/// drift from the counters an operator reads.
+#[derive(Debug, Default)]
+struct LivenessMark(AtomicU64);
+
+impl LivenessMark {
+    /// Records "now", measured from the session's own start.
+    ///
+    /// The stored value is biased by one so that zero — the initial state —
+    /// unambiguously means never, without needing a second flag to say so.
+    fn mark(&self, started_at: Instant) {
+        let elapsed = Instant::now().saturating_duration_since(started_at);
         let nanos = elapsed.as_nanos().min(u128::from(u64::MAX - 1)) as u64;
-        target.store(nanos + 1, Ordering::Relaxed);
+        self.0.store(nanos + 1, Ordering::Relaxed);
     }
 
-    fn idle_for(&self, now: Instant, target: &AtomicU64) -> Option<Duration> {
-        let stored = target.load(Ordering::Relaxed);
+    /// How long ago this was last marked, or `None` if it never was.
+    fn idle_for(&self, started_at: Instant, now: Instant) -> Option<Duration> {
+        let stored = self.0.load(Ordering::Relaxed);
         if stored == 0 {
             return None;
         }
 
-        let seen_at = self.started_at + Duration::from_nanos(stored - 1);
+        let seen_at = started_at + Duration::from_nanos(stored - 1);
         Some(now.saturating_duration_since(seen_at))
     }
 }
@@ -350,7 +372,7 @@ impl SourceMeters for SessionCounters {
         add(&self.process.counters.packets_received, packets);
         add(&self.process.counters.packets_lost, lost);
         if bytes > 0 || packets > 0 {
-            self.mark(&self.source_seen);
+            self.source_seen.mark(self.started_at);
         }
     }
 
@@ -366,7 +388,7 @@ impl MediaMeters for SessionCounters {
         raise(&self.peak_packets_per_batch, packets);
         raise(&self.peak_samples_per_batch, samples);
         if samples > 0 {
-            self.mark(&self.media_seen);
+            self.media_seen.mark(self.started_at);
         }
     }
 
@@ -403,7 +425,7 @@ impl DeliveryMeters for SessionCounters {
         add(&self.process.counters.parts_published, parts);
         add(&self.process.counters.segments_published, segments);
         if parts > 0 || segments > 0 {
-            self.mark(&self.publication_seen);
+            self.publication_seen.mark(self.started_at);
         }
     }
 }

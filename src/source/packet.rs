@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::domain::{Appender, BoxFuture, Payload, TrackCatalog, TrackId};
+use crate::domain::{Appender, BoxFuture, Payload, TrackCatalog, TrackCatalogError, TrackId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiscoveryLimits {
@@ -50,12 +50,53 @@ impl InputState {
     }
 }
 
+/// Why a demuxer could not describe an input's tracks.
+///
+/// Structured rather than a message because these are the answers a publisher
+/// most often needs acted on: an operator triaging rejected ingests wants to
+/// group by cause, and a protocol adapter may want to map a specific one to its
+/// own status code. Each names the field it read, which is what makes an
+/// otherwise identical message actionable.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum DiscoveryProblem {
+    #[error("{field} is not positive")]
+    NotPositive { field: &'static str },
+    #[error("{field} is negative")]
+    Negative { field: &'static str },
+    #[error("{field} is missing")]
+    Missing { field: &'static str },
+    #[error("{field} does not fit this platform's address size")]
+    OutOfRange { field: &'static str },
+    #[error("the demuxer stopped before it described the input")]
+    Abandoned,
+    #[error("discovery was already started for this input")]
+    AlreadyStarted,
+    /// Distinct from a deadline: the bytes ran out, not the clock. An operator
+    /// raises a different limit for each.
+    #[error("discovery read its full probe byte budget without recognizing the input")]
+    ProbeLimitExceeded,
+    #[error("discovery exceeded its deadline")]
+    DeadlineExceeded,
+    #[error("a discovery limit was configured as zero")]
+    LimitNotPositive { field: &'static str },
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum SourceError {
     #[error("failed to open input: {0}")]
-    Open(String),
+    Open(Box<str>),
     #[error("stream discovery failed: {0}")]
-    Discovery(String),
+    Discovery(#[from] DiscoveryProblem),
+    /// What the demuxer itself said, when it is the only thing available.
+    ///
+    /// Separate from [`Self::Discovery`] so the structured causes stay
+    /// matchable: a caller pattern-matching on a probe-limit failure should not
+    /// have to string-search a message that came out of a third-party library.
+    #[error("the demuxer could not describe the input: {0}")]
+    Demux(Box<str>),
+    /// A discovered track set that policy-independent validation rejected.
+    #[error("stream discovery produced an unusable track set: {0}")]
+    DiscoveredTracks(#[from] TrackCatalogError),
     #[error("the input introduced a new track after discovery")]
     TrackSetChanged,
     #[error("codec parameters changed after discovery for {track_id}")]
@@ -63,7 +104,7 @@ pub enum SourceError {
     #[error("packet payload was {found} bytes, above the permitted {limit}")]
     PacketPayloadTooLarge { limit: usize, found: usize },
     #[error("input failed: {0}")]
-    Input(String),
+    Input(Box<str>),
 }
 
 /// A running, demultiplexed input.

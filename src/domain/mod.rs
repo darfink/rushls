@@ -8,7 +8,9 @@ use std::{future::Future, pin::Pin};
 
 mod appender;
 mod ids;
+mod instant;
 mod payload;
+mod rfc6381;
 mod time;
 mod track;
 
@@ -17,7 +19,9 @@ pub mod fixtures;
 
 pub use appender::Appender;
 pub use ids::{RenditionId, SessionId, SourceTrackKey, StreamId, TrackId};
+pub use instant::MediaInstant;
 pub use payload::Payload;
+pub use rfc6381::rfc6381;
 pub use time::{TickDuration, TickOffset, TickTimestamp, Timebase, duration_since, offset_from};
 pub use track::{
     Codec, DiscoveredTrack, FrameRate, MediaKind, MediaParameters, TrackCatalog, TrackCatalogError,

@@ -102,11 +102,7 @@ pub fn video_sample_at(second: i64) -> NormalizedSample {
 }
 
 /// One 48 kHz audio access unit carrying no payload.
-pub fn audio_sample(
-    track_id: u32,
-    pts: TickTimestamp,
-    duration: TickDuration,
-) -> NormalizedSample {
+pub fn audio_sample(track_id: u32, pts: TickTimestamp, duration: TickDuration) -> NormalizedSample {
     NormalizedSample::Audio(AudioSample {
         track_id: TrackId(track_id),
         codec: Codec::Aac,

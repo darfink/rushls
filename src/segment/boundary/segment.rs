@@ -4,7 +4,7 @@ use super::{
     BoundaryAlignmentPolicy, BoundarySearchPolicy, BoundarySelection, BoundarySelectionError,
     TrackBoundary, TrackState,
 };
-use crate::domain::{TickTimestamp, offset_from};
+use crate::domain::{MediaInstant, TickTimestamp};
 
 #[derive(Clone, Copy, Debug)]
 struct BoundaryCandidate {
@@ -96,44 +96,49 @@ impl BoundarySearch<'_> {
     fn latest_common_at_or_before_desired(
         &self,
     ) -> Result<Option<BoundaryCandidate>, BoundarySelectionError> {
-        let mut selected = None;
-        for (track_index, track) in self.tracks.iter().enumerate() {
-            for boundary in &track.boundaries {
-                let candidate = BoundaryCandidate {
-                    track_index,
-                    pts: boundary.start,
-                };
-                if candidate.pts <= track.origin || candidate.pts > track.desired_limit {
-                    continue;
-                }
-                if let Some(current) = selected
-                    && self.compare(candidate, current)? != Ordering::Greater
-                {
-                    continue;
-                }
-                if self.is_common_to_all_tracks(candidate)? {
-                    selected = Some(candidate);
-                }
-            }
-        }
-        Ok(selected)
+        // The latest instant that still fits the desired duration: the segment
+        // is as long as policy allows, so pre-roll waits no longer than it must.
+        self.best_common(Ordering::Greater, |track, pts| {
+            track.origin < pts && pts <= track.desired_limit
+        })
     }
 
     fn earliest_common_after_desired(
         &self,
     ) -> Result<Option<BoundaryCandidate>, BoundarySelectionError> {
-        let mut selected = None;
+        // Nothing fit, and extension is permitted: take the first instant past
+        // the desired duration, which costs the least added latency.
+        self.best_common(Ordering::Less, |track, pts| {
+            track.desired_limit < pts && pts <= track.maximum_limit
+        })
+    }
+
+    /// The extreme candidate, in `prefer` order, that every track can meet.
+    ///
+    /// Both searches are this one: scan every track's boundaries, keep those
+    /// the window admits, and take the furthest in the preferred direction that
+    /// survives the cross-track check. Only the window and the direction differ,
+    /// and writing them twice is how the two drift apart.
+    ///
+    /// Compatibility is checked last on purpose — it is the quadratic step, so
+    /// a candidate that could not win anyway never pays for it.
+    fn best_common(
+        &self,
+        prefer: Ordering,
+        admits: impl Fn(&TrackState, TickTimestamp) -> bool,
+    ) -> Result<Option<BoundaryCandidate>, BoundarySelectionError> {
+        let mut selected: Option<BoundaryCandidate> = None;
         for (track_index, track) in self.tracks.iter().enumerate() {
             for boundary in &track.boundaries {
                 let candidate = BoundaryCandidate {
                     track_index,
                     pts: boundary.start,
                 };
-                if candidate.pts <= track.desired_limit || candidate.pts > track.maximum_limit {
+                if !admits(track, candidate.pts) {
                     continue;
                 }
                 if let Some(current) = selected
-                    && self.compare(candidate, current)? != Ordering::Less
+                    && self.compare(candidate, current)? != prefer
                 {
                     continue;
                 }
@@ -201,20 +206,20 @@ impl BoundarySearch<'_> {
         )
     }
 
-    /// Compares presentation offsets exactly without converting either track
+    /// Compares presentation instants exactly, without converting either track
     /// into the other track's tick domain.
     fn compare(
         &self,
         left: BoundaryCandidate,
         right: BoundaryCandidate,
     ) -> Result<Ordering, BoundarySelectionError> {
-        let left_track = &self.tracks[left.track_index];
-        let right_track = &self.tracks[right.track_index];
-        let left_offset = offset_from(left.pts, left_track.origin);
-        let right_offset = offset_from(right.pts, right_track.origin);
-        left_track
-            .timebase
-            .compare_offsets(left_offset, right_track.timebase, right_offset)
+        self.instant(left)
+            .compare(self.instant(right))
             .ok_or(BoundarySelectionError::ComparisonOverflow)
+    }
+
+    fn instant(&self, candidate: BoundaryCandidate) -> MediaInstant {
+        let track = &self.tracks[candidate.track_index];
+        MediaInstant::new(track.timebase, candidate.pts, track.origin)
     }
 }

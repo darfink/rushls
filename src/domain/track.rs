@@ -17,6 +17,7 @@ pub enum Codec {
     Av1,
     H264,
     Hevc,
+    MovText,
     Opus,
     WebVtt,
     Unknown(u32),
@@ -111,6 +112,23 @@ pub struct DiscoveredTrack {
 impl DiscoveredTrack {
     pub fn kind(&self) -> MediaKind {
         self.parameters.kind()
+    }
+
+    /// The RFC 6381 string a manifest would advertise for this track as-is.
+    ///
+    /// **Correct only for a pass-through output.** It describes the *input*, so
+    /// any muxer that changes the bytes must build its own string from what it
+    /// emitted rather than calling this. Two cases reach that today:
+    ///
+    /// - A transcoder emits a profile and level of its own choosing.
+    /// - A [`Codec::MovText`] subtitle track is admitted so a muxer can present
+    ///   it as WebVTT. This returns `tx3g` — the format that arrived — while
+    ///   the rendition carrying it will advertise `wvtt`.
+    pub fn rfc6381_codec(&self) -> Option<std::sync::Arc<str>> {
+        // Absent extradata and empty extradata mean the same thing to the
+        // mapper — nothing to refine from — so they are spelled the same way.
+        let config = (!self.codec_extradata.is_empty()).then(|| self.codec_extradata.as_bytes());
+        super::rfc6381(self.codec, config)
     }
 }
 

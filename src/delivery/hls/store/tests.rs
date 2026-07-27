@@ -123,13 +123,7 @@ fn completion(rendition: u32, segment: u64, start: i64, duration: u64) -> Packag
     })
 }
 
-fn direct(
-    rendition: u32,
-    segment: u64,
-    start: i64,
-    duration: u64,
-    bytes: usize,
-) -> PackagedMedia {
+fn direct(rendition: u32, segment: u64, start: i64, duration: u64, bytes: usize) -> PackagedMedia {
     PackagedMedia::Segment(PackagedSegment {
         rendition_id: PackagingRenditionId(rendition),
         packaging_segment_id: PackagingSegmentId(segment),
@@ -326,8 +320,7 @@ fn completing_a_chunked_segment_reuses_the_original_payloads() {
 
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
     assert!(snapshot.has_completed_segment());
-    let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) = &snapshot.segments[0].kind
-    else {
+    let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) = &snapshot.segments[0].kind else {
         panic!("segment should retain its chunks");
     };
     assert_eq!(parts[0].payload.as_bytes().as_ptr(), pointer);

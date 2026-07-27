@@ -21,7 +21,24 @@ pub enum MediaError {
     #[error(transparent)]
     Limit(#[from] LimitError),
     #[error(transparent)]
-    Density(#[from] MediaDensityError),
+    Density(MediaDensityError),
+}
+
+impl From<MediaDensityError> for MediaError {
+    /// Routes a density *limit* to [`MediaError::Limit`] rather than burying it
+    /// under density.
+    ///
+    /// The distinction is the one the enum already draws: media that exceeded a
+    /// budget is well-formed and simply too abundant, while the other density
+    /// errors mean its timeline does not make sense. Doing this in the
+    /// conversion rather than at the call site is what lets the ingest loop use
+    /// `?` and stay out of the classification business.
+    fn from(error: MediaDensityError) -> Self {
+        match error {
+            MediaDensityError::Limit(limit) => Self::Limit(limit),
+            other => Self::Density(other),
+        }
+    }
 }
 
 /// A running supply of normalized access units.

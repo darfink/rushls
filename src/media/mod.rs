@@ -23,5 +23,7 @@ pub use normalize::{
 };
 pub use pacer::{MediaPacer, PacingError};
 pub use stream::{MediaError, SampleSource};
-pub use timeline::{TimelineCalibration, TimelineCalibrationError, TrackTimeline, calibrate};
+pub use timeline::{
+    Rounding, TimelineCalibration, TimelineCalibrationError, TrackTimeline, calibrate,
+};
 pub use validate::{PresentationPlan, ValidationError, validate};

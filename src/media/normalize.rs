@@ -104,9 +104,9 @@ impl NormalizedSample {
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum NormalizeError {
     #[error("cannot normalize the validated presentation: {0}")]
-    InvalidPlan(String),
+    InvalidPlan(Box<str>),
     #[error("media processing failed: {0}")]
-    Processing(String),
+    Processing(Box<str>),
 }
 
 /// Turns demultiplexed packets into calibrated access units.

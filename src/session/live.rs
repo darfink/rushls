@@ -6,8 +6,8 @@ use crate::{
     delivery::hls::{HlsError, HlsPublisher, PublishOutcome},
     domain::{Appender, BoxFuture},
     media::{
-        MediaDensityError, MediaDensityWindow, MediaError, MediaNormalizer, MediaPacer,
-        NormalizedSample, PacingError, SampleSource, TimelineCalibration,
+        MediaDensityWindow, MediaError, MediaNormalizer, MediaPacer, NormalizedSample, PacingError,
+        SampleSource, TimelineCalibration,
     },
     mux::{FinishReason, MuxError, Muxer, PackagedMedia},
     observe::{DeliveryMeters, MediaMeters, MuxMeters},
@@ -132,16 +132,11 @@ impl SampleSource for MediaHead {
                 self.drained = true;
             }
             let produced = samples.produced()?;
-            if let Err(error) = self.density.admit(
+            self.density.admit(
                 consumed.payload_bytes as u64,
                 consumed.packets as u64,
                 &self.normalized,
-            ) {
-                return Err(match error {
-                    MediaDensityError::Limit(error) => MediaError::Limit(error),
-                    other => MediaError::Density(other),
-                });
-            }
+            )?;
             for sample in self.normalized.drain(..) {
                 out.push(sample);
             }
@@ -187,41 +182,41 @@ impl MediaTail {
         while let Some(sample) = samples.pop_front() {
             self.muxer.push(sample, &mut self.media)?;
         }
-        let (chunks, segments) = count_packaged(&self.media);
-        self.mux_meters.mux_progress(chunks, segments);
         self.publish()
     }
 
     fn write_one(&mut self, sample: NormalizedSample) -> Result<(), ExecutionError> {
         self.muxer.push(sample, &mut self.media)?;
-        let (chunks, segments) = count_packaged(&self.media);
-        self.mux_meters.mux_progress(chunks, segments);
         self.publish()
     }
 
     fn finish(&mut self, reason: FinishReason) -> Result<(), ExecutionError> {
         self.muxer.finish(reason, &mut self.media)?;
-        let (chunks, segments) = count_packaged(&self.media);
-        self.mux_meters.mux_progress(chunks, segments);
         self.publish()?;
         self.publisher.finish(reason)?;
         Ok(())
     }
 
+    /// Hands everything the muxer produced to the publisher, counting as it
+    /// goes.
+    ///
+    /// Muxed and published volume are tallied in the same pass. They are
+    /// different numbers — a superseded write is muxed but never delivered —
+    /// but both are known at the moment an object is handed over, and walking
+    /// the buffer twice to learn them separately only invited the two counts to
+    /// be taken from different states of it.
     fn publish(&mut self) -> Result<(), ExecutionError> {
-        let mut parts = 0;
-        let mut segments = 0;
+        let mut muxed = MediaCounts::default();
+        let mut delivered = MediaCounts::default();
         let mut result = Ok(());
 
         for media in self.media.drain(..) {
-            let (chunk, completed_segment) = media_object_count(&media);
+            let counts = MediaCounts::of(&media);
+            muxed += counts;
             match self.publisher.write(media) {
-                Ok(PublishOutcome::Published) => {
-                    // Packaging calls these chunks; HLS projects each one as
-                    // a partial segment and therefore reports it as a part.
-                    parts += chunk;
-                    segments += completed_segment;
-                }
+                // Packaging calls these chunks; HLS projects each one as a
+                // partial segment and therefore reports it as a part.
+                Ok(PublishOutcome::Published) => delivered += counts,
                 Ok(PublishOutcome::Superseded) => {}
                 Err(error) => {
                     result = Err(error.into());
@@ -231,30 +226,40 @@ impl MediaTail {
         }
         self.media.clear();
 
-        // Reported even when publication failed part way, so the counters
-        // reflect what viewers actually received.
-        self.delivery_meters.delivery_progress(parts, segments);
+        // Both reported even when publication failed part way, so the counters
+        // reflect what was actually produced and what viewers actually got.
+        self.mux_meters.mux_progress(muxed.chunks, muxed.segments);
+        self.delivery_meters
+            .delivery_progress(delivered.chunks, delivered.segments);
         result
     }
 }
 
-fn count_packaged(media: &[PackagedMedia]) -> (u64, u64) {
-    media.iter().fold((0, 0), |(chunks, segments), item| {
-        let (chunk, segment) = media_object_count(item);
-        (chunks + chunk, segments + segment)
-    })
+/// The media objects one packaged event represents.
+#[derive(Clone, Copy, Debug, Default)]
+struct MediaCounts {
+    chunks: u64,
+    segments: u64,
 }
 
-/// Returns the `(chunks, completed segments)` represented by one event.
-///
-/// Initialization events produce no media object. A direct segment and a
-/// chunked segment completion each represent one completed segment, while the
-/// completion carries no second copy of its payload.
-fn media_object_count(media: &PackagedMedia) -> (u64, u64) {
-    match media {
-        PackagedMedia::Initialization(_) => (0, 0),
-        PackagedMedia::Chunk(_) => (1, 0),
-        PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) => (0, 1),
+impl MediaCounts {
+    /// Initialization events produce no media object. A direct segment and a
+    /// chunked segment completion each represent one completed segment, while
+    /// the completion carries no second copy of its payload.
+    fn of(media: &PackagedMedia) -> Self {
+        let (chunks, segments) = match media {
+            PackagedMedia::Initialization(_) => (0, 0),
+            PackagedMedia::Chunk(_) => (1, 0),
+            PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) => (0, 1),
+        };
+        Self { chunks, segments }
+    }
+}
+
+impl std::ops::AddAssign for MediaCounts {
+    fn add_assign(&mut self, other: Self) {
+        self.chunks = self.chunks.saturating_add(other.chunks);
+        self.segments = self.segments.saturating_add(other.segments);
     }
 }
 

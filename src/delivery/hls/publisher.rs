@@ -12,13 +12,13 @@ use super::{StoreFull, StoreWriteError, StreamLease, StreamStore};
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HlsError {
     #[error("failed to initialize HLS publication: {0}")]
-    Initialization(String),
+    Initialization(Box<str>),
     #[error(transparent)]
     Capacity(#[from] StoreFull),
     #[error(transparent)]
     Store(#[from] StoreWriteError),
     #[error("HLS publication failed: {0}")]
-    Publication(String),
+    Publication(Box<str>),
 }
 
 /// What became of one published object.

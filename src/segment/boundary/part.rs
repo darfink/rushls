@@ -62,25 +62,154 @@ pub(in crate::segment) fn select_part_duration(
         .map(NormalizedSample::duration)
         .collect();
     let segment_duration = duration_since(segment_boundary, origin)?;
-    let mut best_candidate = None;
+    choose_part_duration(&access_unit_durations, segment_duration, desired)
+}
 
-    for access_unit_count in 1..=access_unit_durations.len() {
-        let observed = measure_windows(&access_unit_durations, access_unit_count)?;
+/// Chooses the access-unit count whose window duration sits nearest `desired`.
+///
+/// # Why this is not an exhaustive scan
+///
+/// Measuring every count against every window is quadratic, and the count is
+/// bounded only by
+/// [`PrerollLimits::maximum_buffered_samples`](crate::segment::PrerollLimits::maximum_buffered_samples)
+/// — sixteen thousand by default. A publisher sending very short access units
+/// reaches that cheaply, so an exhaustive search hands it a large, free slice
+/// of a core once per session.
+///
+/// The search is pruned instead, resting on one property: the **longest**
+/// window is non-decreasing in the count. Every window of `k + 1` access units
+/// contains one of `k`, and durations are unsigned, so widening the window can
+/// only raise the maximum. Three consequences follow, and each is a bisection
+/// or an early exit rather than a scan:
+///
+/// - Counts whose windows overrun the segment form a suffix, so the usable
+///   range has a bisectable upper bound.
+/// - Counts whose windows are empty form a prefix, so it has a bisectable
+///   lower bound. This is what stops an input of zero-duration access units
+///   from costing the full quadratic sweep before being rejected.
+/// - Distance from `desired` is therefore V-shaped across the range, so
+///   walking outward from its floor can stop as soon as the distance exceeds
+///   the best candidate already accepted.
+///
+/// The 85% consistency rule is *not* monotone, so it can never terminate the
+/// walk — only the distance can. That is why the pruning is expressed in terms
+/// of distance alone.
+fn choose_part_duration(
+    durations: &[TickDuration],
+    segment_duration: TickDuration,
+    desired: TickDuration,
+) -> Option<NonZero<TickDuration>> {
+    let largest = largest_fitting_count(durations, segment_duration)?;
+    if largest == 0 {
+        return None;
+    }
+    // A window of zero duration is never a part target, and those counts are a
+    // prefix, so the range starts after them.
+    let smallest = first_count_reaching(durations, largest, 1)?;
+    if smallest > largest {
+        return None;
+    }
+    let usable = smallest..=largest;
+    // The floor of the distance curve is at this count or the one below it.
+    // Walking outward from here covers both.
+    let pivot = first_count_reaching(durations, largest, desired)?.clamp(smallest, largest);
 
+    let mut best = None;
+    // Downward first: on a tie the shorter target wins, and that is the
+    // direction shorter targets lie in.
+    scan(
+        durations,
+        (smallest..=pivot).rev(),
+        segment_duration,
+        desired,
+        &mut best,
+    )?;
+    scan(
+        durations,
+        pivot.saturating_add(1)..=*usable.end(),
+        segment_duration,
+        desired,
+        &mut best,
+    )?;
+
+    best.and_then(|candidate| NonZero::new(candidate.target))
+}
+
+/// Measures counts in the given order until the distance can only grow.
+///
+/// The caller walks outward from the floor of the distance curve, so within one
+/// direction the distance is monotone. The comparison is deliberately strict:
+/// an equal distance keeps the walk going, because those are decided by the
+/// shorter target and the downward walk is still finding shorter ones.
+fn scan(
+    durations: &[TickDuration],
+    counts: impl Iterator<Item = usize>,
+    segment_duration: TickDuration,
+    desired: TickDuration,
+    best: &mut Option<PartDurationCandidate>,
+) -> Option<()> {
+    for access_unit_count in counts {
+        let observed = measure_windows(durations, access_unit_count)?;
+        let distance_from_desired = observed.longest.abs_diff(desired);
+        if best.is_some_and(|current| distance_from_desired > current.distance_from_desired) {
+            break;
+        }
         if !is_usable_candidate(observed, segment_duration) {
             continue;
         }
 
         let candidate = PartDurationCandidate {
             target: observed.longest,
-            distance_from_desired: observed.longest.abs_diff(desired),
+            distance_from_desired,
         };
-        if candidate.is_better_than(best_candidate) {
-            best_candidate = Some(candidate);
+        if candidate.is_better_than(*best) {
+            *best = Some(candidate);
         }
     }
+    Some(())
+}
 
-    best_candidate.and_then(|candidate| NonZero::new(candidate.target))
+/// The largest count whose longest window still fits one segment, or zero when
+/// even a single access unit overruns it.
+fn largest_fitting_count(
+    durations: &[TickDuration],
+    segment_duration: TickDuration,
+) -> Option<usize> {
+    let mut low = 1;
+    let mut high = durations.len();
+    let mut fitting = 0;
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        if measure_windows(durations, middle)?.longest <= segment_duration {
+            fitting = middle;
+            low = middle + 1;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Some(fitting)
+}
+
+/// The smallest count up to `limit` whose longest window reaches `threshold`,
+/// or `limit + 1` when none does.
+fn first_count_reaching(
+    durations: &[TickDuration],
+    limit: usize,
+    threshold: TickDuration,
+) -> Option<usize> {
+    let mut low = 1;
+    let mut high = limit;
+    let mut reaching = limit + 1;
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        if measure_windows(durations, middle)?.longest >= threshold {
+            reaching = middle;
+            high = middle - 1;
+        } else {
+            low = middle + 1;
+        }
+    }
+    Some(reaching)
 }
 
 /// Measures every consecutive window containing `access_unit_count` samples.
@@ -127,6 +256,101 @@ mod tests {
     };
 
     use super::*;
+
+    /// The unpruned search, kept as the reference the pruned one is checked
+    /// against.
+    ///
+    /// This is the algorithm `choose_part_duration` replaced, preserved
+    /// verbatim. Its only job is to be obviously correct — every count, every
+    /// window, no reasoning about monotonicity — so that any disagreement is
+    /// attributable to the pruning rather than to a second clever
+    /// implementation.
+    fn exhaustive_part_duration(
+        durations: &[TickDuration],
+        segment_duration: TickDuration,
+        desired: TickDuration,
+    ) -> Option<NonZero<TickDuration>> {
+        let mut best_candidate = None;
+        for access_unit_count in 1..=durations.len() {
+            let observed = measure_windows(durations, access_unit_count)?;
+            if !is_usable_candidate(observed, segment_duration) {
+                continue;
+            }
+            let candidate = PartDurationCandidate {
+                target: observed.longest,
+                distance_from_desired: observed.longest.abs_diff(desired),
+            };
+            if candidate.is_better_than(best_candidate) {
+                best_candidate = Some(candidate);
+            }
+        }
+        best_candidate.and_then(|candidate| NonZero::new(candidate.target))
+    }
+
+    /// Deterministic xorshift, so a failure is reproducible from the seed.
+    fn generator(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    #[test]
+    fn the_pruned_search_agrees_with_an_exhaustive_one() {
+        let mut next = generator(0x2545_F491_4F6C_DD1D);
+        for case in 0..2_000 {
+            let count = (next() % 40) as usize;
+            // Vary the spread so cases land on both sides of the 85% cadence
+            // rule, and include zero durations, which are the prefix the lower
+            // bound exists to skip.
+            let spread = 1 + next() % 400;
+            let durations: Vec<TickDuration> = (0..count).map(|_| next() % spread).collect();
+            let segment_duration = next() % 4_000;
+            let desired = next() % 1_500;
+
+            assert_eq!(
+                choose_part_duration(&durations, segment_duration, desired),
+                exhaustive_part_duration(&durations, segment_duration, desired),
+                "case {case}: durations={durations:?}, \
+                 segment_duration={segment_duration}, desired={desired}"
+            );
+        }
+    }
+
+    #[test]
+    fn uniform_cadences_agree_with_an_exhaustive_search() {
+        // The realistic shape: a fixed frame duration, so every count has
+        // shortest == longest and the cadence rule never rejects. This is the
+        // case the outward walk prunes hardest, so it is worth pinning
+        // separately from the noisy one.
+        for duration in [1_501_u64, 3_000, 3_003, 48_000] {
+            for count in [1_usize, 2, 7, 30, 61] {
+                let durations = vec![duration; count];
+                for desired in [0_u64, 1, 18_000, 90_000, u64::MAX] {
+                    let segment_duration = duration * 30;
+                    assert_eq!(
+                        choose_part_duration(&durations, segment_duration, desired),
+                        exhaustive_part_duration(&durations, segment_duration, desired),
+                        "duration={duration}, count={count}, desired={desired}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_duration_access_units_are_rejected_without_an_exhaustive_sweep() {
+        // The cheap hostile input: thousands of access units that advance the
+        // clock but carry no duration. Every count measures zero, so none is a
+        // usable part target — the point is that finding that out no longer
+        // costs a quadratic sweep.
+        let durations = vec![0_u64; 16_384];
+
+        assert_eq!(choose_part_duration(&durations, 540_000, 90_000), None);
+    }
 
     fn samples(durations: &[u64]) -> Vec<NormalizedSample> {
         let mut pts = 0_i64;

@@ -1,6 +1,8 @@
 use thiserror::Error;
 
-use crate::domain::{MediaKind, TickTimestamp, Timebase, TrackId};
+use std::time::Duration;
+
+use crate::domain::{MediaInstant, MediaKind, TickTimestamp, Timebase, TrackId};
 
 use super::PresentationPlan;
 
@@ -21,6 +23,35 @@ pub struct TrackTimeline {
 pub struct TimelineCalibration {
     pub timing_authority: TrackId,
     pub tracks: Vec<TrackTimeline>,
+}
+
+impl TrackTimeline {
+    /// This track's PTS `duration` of presentation time past its origin.
+    ///
+    /// Rounding is the caller's to choose and it matters: a search *limit*
+    /// rounds down so a selected boundary never exceeds the policy, while an
+    /// observation *horizon* rounds up so pre-roll consumes at least through
+    /// the duration before it concludes anything. Spelling both at every call
+    /// site is what previously put this arithmetic in five places.
+    pub fn horizon(&self, duration: Duration, rounding: Rounding) -> Option<TickTimestamp> {
+        let ticks = match rounding {
+            Rounding::Down => self.timebase.duration_to_ticks_floor(duration),
+            Rounding::Up => self.timebase.duration_to_ticks_ceil(duration),
+        };
+        self.origin_pts.checked_add_unsigned(ticks)
+    }
+
+    /// Places a track-local timestamp on the shared presentation timeline.
+    pub fn instant(&self, pts: TickTimestamp) -> MediaInstant {
+        MediaInstant::new(self.timebase, pts, self.origin_pts)
+    }
+}
+
+/// Which way a converted duration is rounded when it lands between ticks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rounding {
+    Down,
+    Up,
 }
 
 impl TimelineCalibration {

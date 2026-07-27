@@ -4,7 +4,10 @@ use tokio::time::{Instant, timeout};
 
 use crate::{
     domain::{TickDuration, TickTimestamp, TrackId, duration_since},
-    media::{NormalizedSample, PresentationPlan, SampleSource, TimelineCalibration, TrackTimeline},
+    media::{
+        NormalizedSample, PresentationPlan, Rounding, SampleSource, TimelineCalibration,
+        TrackTimeline,
+    },
     observe::{EventSink, SessionEvent},
     source::InputState,
 };
@@ -136,12 +139,11 @@ fn media_horizons(
         .tracks
         .iter()
         .map(|track| {
-            let duration = track
-                .timebase
-                .duration_to_ticks_ceil(limits.maximum_media_duration);
+            // Rounded up: a track that reaches exactly the budget has not
+            // exceeded it, and rejecting it there would fail publishers whose
+            // cadence merely lands on the boundary.
             let maximum_pts = track
-                .origin_pts
-                .checked_add_unsigned(duration)
+                .horizon(limits.maximum_media_duration, Rounding::Up)
                 .ok_or(BoundarySelectionError::HorizonOverflow(track.track_id))?;
             Ok(MediaHorizon {
                 track_id: track.track_id,
@@ -272,7 +274,9 @@ mod tests {
         domain::{Appender, BoxFuture, SessionId},
         media::{
             MediaError,
-            fixtures::{VIDEO_SECOND, video_presentation as presentation, video_timeline as timeline},
+            fixtures::{
+                VIDEO_SECOND, video_presentation as presentation, video_timeline as timeline,
+            },
         },
         observe::{EventObserver, Events, SessionEvent},
     };

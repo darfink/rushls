@@ -32,13 +32,13 @@ impl From<&AdmissionError> for PublishRejection {
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum TransportError {
     #[error("invalid publication request: {0}")]
-    InvalidPublishRequest(String),
+    InvalidPublishRequest(Box<str>),
     #[error("transport handshake failed: {0}")]
-    Handshake(String),
+    Handshake(Box<str>),
     #[error("transport failed while accepting publication: {0}")]
-    Accept(String),
+    Accept(Box<str>),
     #[error("transport failed while rejecting publication: {0}")]
-    Reject(String),
+    Reject(Box<str>),
 }
 
 pub struct AcceptedPublish {

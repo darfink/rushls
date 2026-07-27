@@ -39,7 +39,10 @@ use super::{
 ///
 /// Sending is deferred until the caller has released the state lock, so a woken
 /// reader never blocks behind the writer that woke it.
-pub type EdgeUpdate = (watch::Sender<super::RenditionLiveEdge>, super::RenditionLiveEdge);
+pub type EdgeUpdate = (
+    watch::Sender<super::RenditionLiveEdge>,
+    super::RenditionLiveEdge,
+);
 
 /// Announces committed edges to blocked readers.
 ///
@@ -324,10 +327,7 @@ impl RenditionState {
         )
     }
 
-    pub fn additional_bytes_for(
-        &self,
-        media: &PackagedMedia,
-    ) -> Result<usize, StoreWriteError> {
+    pub fn additional_bytes_for(&self, media: &PackagedMedia) -> Result<usize, StoreWriteError> {
         self.validate(media)?;
         Ok(match media {
             PackagedMedia::Initialization(segment) => {

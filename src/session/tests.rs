@@ -9,8 +9,8 @@ use crate::{
     },
     delivery::hls::{StorePublisherFactory, StreamStore},
     domain::{
-        Appender, BoxFuture, Codec, MediaKind, Payload, SessionId, StreamId, Timebase,
-        TrackCounts, TrackId, fixtures::video_catalog,
+        Appender, BoxFuture, Codec, MediaKind, Payload, SessionId, StreamId, Timebase, TrackCounts,
+        TrackId, fixtures::video_catalog,
     },
     media::{
         MediaNormalizer, NormalizeError, NormalizedSample, NormalizerFactory, PresentationPlan,
@@ -19,8 +19,7 @@ use crate::{
     mux::{
         FinishReason, InitializationSegment, MuxError, Muxer, MuxerFactory, MuxerStartRequest,
         PackagedChunk, PackagedMedia, PackagedSegmentCompletion, PackagingRenditionId,
-        PackagingSegmentId, StartedMuxer, fixtures as mux_fixtures,
-        fixtures::RenditionBuilder,
+        PackagingSegmentId, StartedMuxer, fixtures as mux_fixtures, fixtures::RenditionBuilder,
     },
     observe::{EventObserver, Events, ProcessMeters, SessionEnd, SessionEvent, SourceMeters},
     segment::{PrerollLimits, SegmentationPolicy},

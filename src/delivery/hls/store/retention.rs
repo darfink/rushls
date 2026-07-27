@@ -103,11 +103,7 @@ impl RetentionPolicy {
         self.part_tag_retention.resolve(target)
     }
 
-    pub fn part_fetch_deadline(
-        self,
-        removed_at: Instant,
-        target: Duration,
-    ) -> Option<Instant> {
+    pub fn part_fetch_deadline(self, removed_at: Instant, target: Duration) -> Option<Instant> {
         removed_at.checked_add(self.part_fetch_grace_period.resolve(target))
     }
 

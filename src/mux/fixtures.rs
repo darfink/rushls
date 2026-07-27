@@ -9,7 +9,10 @@
 use std::{num::NonZero, sync::Arc, time::SystemTime};
 
 use crate::{
-    domain::{FrameRate, MediaKind, TickDuration, Timebase, TrackId},
+    domain::{
+        DiscoveredTrack, FrameRate, MediaKind, TickDuration, Timebase, TrackId, fixtures as domain,
+        rfc6381,
+    },
     media::PresentationPlan,
 };
 
@@ -30,7 +33,8 @@ pub fn config(
     RenditionConfig {
         timebase,
         segment_target: NonZero::new(segment_target).expect("a segment target is nonzero"),
-        chunk_target: chunk_target.map(|target| NonZero::new(target).expect("a chunk target is nonzero")),
+        chunk_target: chunk_target
+            .map(|target| NonZero::new(target).expect("a chunk target is nonzero")),
         segment_format: MediaSegmentFormat::Cmaf,
     }
 }
@@ -52,14 +56,13 @@ pub fn media(kind: MediaKind) -> RenditionMedia {
     }
 }
 
-/// The RFC 6381 codec string matching the codec
-/// [`domain::fixtures::codec`](crate::domain::fixtures::codec) picks per kind.
-pub fn codecs(kind: MediaKind) -> &'static str {
-    match kind {
-        MediaKind::Audio => "mp4a.40.2",
-        MediaKind::Subtitle => "wvtt",
-        MediaKind::Video => "avc1.640028",
-    }
+/// The RFC 6381 string for a fixture track of `kind` carrying no extradata.
+///
+/// Derived rather than hardcoded so a change to
+/// [`domain::fixtures::codec`](crate::domain::fixtures::codec) cannot leave the
+/// declared codec and the advertised string disagreeing.
+pub fn codecs(kind: MediaKind) -> Arc<str> {
+    rfc6381(domain::codec(kind), None).expect("fixture codecs are representable")
 }
 
 /// Builds one packaged rendition, overriding only what a test cares about.
@@ -73,18 +76,33 @@ impl RenditionBuilder {
             packaging_rendition_id: PackagingRenditionId(packaging_rendition_id),
             key: RenditionKey::new(format!("{kind:?}/{packaging_rendition_id}")),
             source_tracks: Arc::from([TrackId(0)]),
-            config: config(
-                Timebase::hz90k(),
-                6 * 90_000,
-                Some(90_000),
-            ),
+            config: config(Timebase::hz90k(), 6 * 90_000, Some(90_000)),
             media: media(kind),
-            codecs: Arc::from(codecs(kind)),
+            codecs: codecs(kind),
             name: Arc::from(format!("{kind:?} {packaging_rendition_id}")),
             language: None,
             is_default: false,
             declared_bandwidth: None,
         })
+    }
+
+    /// A pass-through output of one discovered track.
+    ///
+    /// This is what a real pass-through muxer does, spelled once: take the
+    /// track's timebase, name it as the source, and derive the RFC 6381 string
+    /// from the codec *and its configuration bytes* rather than from a guess
+    /// keyed on media kind. A test that gives its track real extradata gets the
+    /// refined `avc1.640028` form out of this without doing anything else.
+    pub fn for_track(packaging_rendition_id: u32, track: &DiscoveredTrack) -> Self {
+        let mut builder = Self::new(packaging_rendition_id, track.kind())
+            .key(&RenditionKey::for_source(track).0)
+            .source_tracks(&[track.id.0]);
+        builder.0.config.timebase = track.timebase;
+        builder.0.language = track.language.as_deref().map(Arc::from);
+        if let Some(codecs) = track.rfc6381_codec() {
+            builder.0.codecs = codecs;
+        }
+        builder
     }
 
     pub fn key(mut self, key: &str) -> Self {

@@ -97,9 +97,12 @@ pub fn validate(
         let accepted = match track.kind() {
             MediaKind::Audio => policy.accepted_audio_codecs.contains(&track.codec),
             MediaKind::Video => policy.accepted_video_codecs.contains(&track.codec),
-            // Subtitles are passed through as-is; the muxer decides whether it
-            // can carry the cue format.
-            MediaKind::Subtitle => true,
+            // Checked like any other kind. Subtitles used to be waved through
+            // on the grounds that the muxer would decide — but the muxer runs
+            // after pre-roll has already buffered the publisher's media, so
+            // "decide later" meant accepting a session that could not be
+            // packaged and failing it seconds in rather than at the handshake.
+            MediaKind::Subtitle => policy.accepted_subtitle_codecs.contains(&track.codec),
         };
         if !accepted {
             return Err(ValidationError::UnsupportedCodec {
@@ -195,6 +198,7 @@ mod tests {
             ingest_timing: StreamPolicy::permissive().ingest_timing,
             accepted_video_codecs: vec![Codec::H264],
             accepted_audio_codecs: vec![Codec::Aac],
+            accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::MovText],
             maximum_audio_tracks: 1,
             maximum_subtitle_tracks: 2,
             maximum_video_tracks: 1,
@@ -245,6 +249,42 @@ mod tests {
                 kind: MediaKind::Audio,
                 limit: 1,
                 found: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_every_cue_format_a_muxer_can_present_as_webvtt() {
+        // MovText is admitted even though it is not carried unchanged: HLS
+        // needs WebVTT out, and reaching it from tx3g is a cue conversion the
+        // muxer performs. Admission is about whether the format is reachable.
+        for codec in [Codec::WebVtt, Codec::MovText] {
+            let tracks = catalog(vec![
+                track(0, MediaKind::Video, Codec::H264),
+                track(1, MediaKind::Subtitle, codec),
+            ]);
+
+            let plan = validate(&tracks, &policy())
+                .unwrap_or_else(|error| panic!("{codec:?} subtitles are accepted: {error}"));
+            assert_eq!(plan.counts().subtitle, 1);
+        }
+    }
+
+    #[test]
+    fn rejects_a_cue_format_no_muxer_can_turn_into_webvtt() {
+        // Subtitles used to bypass the codec check entirely, so an
+        // unpresentable cue format was admitted and only failed once the muxer
+        // had already let the publisher buffer media through pre-roll.
+        let tracks = catalog(vec![
+            track(0, MediaKind::Video, Codec::H264),
+            track(1, MediaKind::Subtitle, Codec::Unknown(94)),
+        ]);
+
+        assert_eq!(
+            validate(&tracks, &policy()),
+            Err(ValidationError::UnsupportedCodec {
+                track_id: TrackId(1),
+                codec: Codec::Unknown(94),
             })
         );
     }

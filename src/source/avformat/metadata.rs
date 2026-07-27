@@ -7,7 +7,7 @@ use crate::{
         Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload, Timebase, TrackCatalog,
         TrackId,
     },
-    source::{DiscoveryReport, SourceError},
+    source::{DiscoveryProblem, DiscoveryReport, SourceError},
 };
 
 use super::dictionary;
@@ -28,12 +28,15 @@ impl StreamCatalog {
     pub unsafe fn discover(context: *mut ffmpeg::AVFormatContext) -> Result<Self, SourceError> {
         // SAFETY: guaranteed by the caller.
         let format = unsafe { &*context };
-        let stream_count = usize::try_from(format.nb_streams)
-            .map_err(|_| SourceError::Discovery("stream count does not fit usize".into()))?;
+        let stream_count =
+            usize::try_from(format.nb_streams).map_err(|_| DiscoveryProblem::OutOfRange {
+                field: "stream count",
+            })?;
         if stream_count > 0 && format.streams.is_null() {
-            return Err(SourceError::Discovery(
-                "AVFormat returned a null stream table".into(),
-            ));
+            return Err(DiscoveryProblem::Missing {
+                field: "stream table",
+            }
+            .into());
         }
 
         let mut snapshots = Vec::with_capacity(stream_count);
@@ -42,9 +45,7 @@ impl StreamCatalog {
             // SAFETY: `streams` has `nb_streams` entries by AVFormat contract.
             let stream = unsafe { *format.streams.add(index) };
             if stream.is_null() {
-                return Err(SourceError::Discovery(format!(
-                    "AVFormat returned a null stream at index {index}"
-                )));
+                return Err(DiscoveryProblem::Missing { field: "stream" }.into());
             }
             // SAFETY: the stream belongs to the live format context.
             match unsafe { TrackSnapshot::new(stream) }? {
@@ -56,8 +57,7 @@ impl StreamCatalog {
             }
         }
 
-        let tracks = TrackCatalog::new(discovered)
-            .map_err(|error| SourceError::Discovery(error.to_string()))?;
+        let tracks = TrackCatalog::new(discovered)?;
         Ok(Self {
             stream_count,
             tracks: snapshots,
@@ -109,22 +109,43 @@ impl StreamCatalog {
     }
 }
 
-pub struct TrackSnapshot {
-    track: DiscoveredTrack,
+/// Codec identity FFmpeg exposes that [`DiscoveredTrack`] has no field for.
+///
+/// Everything else the mid-stream check cares about — dimensions, sample rate,
+/// channels, timebase, extradata — is already extracted into types that derive
+/// [`PartialEq`], so this holds only the remainder rather than mirroring the
+/// whole of `AVCodecParameters`.
+///
+/// The derive is the point. A hand-written comparison chain is one forgotten
+/// `||` away from silently accepting the codec change this exists to reject,
+/// and nothing would fail to compile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CodecIdentity {
     codec_type: ffmpeg::AVMediaType,
     codec_id: ffmpeg::AVCodecID,
     codec_tag: u32,
     profile: i32,
     level: i32,
-    width: i32,
-    height: i32,
-    sample_rate: i32,
-    channels: i32,
-    frame_size: i32,
-    bits_per_raw_sample: i32,
-    video_delay: i32,
-    timebase: ffmpeg::AVRational,
-    extradata: Payload,
+}
+
+impl CodecIdentity {
+    /// # Safety
+    ///
+    /// `parameters` must belong to a live stream owned by the caller.
+    fn read(parameters: &ffmpeg::AVCodecParameters) -> Self {
+        Self {
+            codec_type: parameters.codec_type,
+            codec_id: parameters.codec_id,
+            codec_tag: parameters.codec_tag,
+            profile: parameters.profile,
+            level: parameters.level,
+        }
+    }
+}
+
+pub struct TrackSnapshot {
+    track: DiscoveredTrack,
+    identity: CodecIdentity,
 }
 
 impl TrackSnapshot {
@@ -132,35 +153,24 @@ impl TrackSnapshot {
         // SAFETY: guaranteed by the caller.
         let stream = unsafe { &*stream };
         if stream.codecpar.is_null() {
-            return Err(SourceError::Discovery(format!(
-                "stream {} has no codec parameters",
-                stream.index
-            )));
+            return Err(DiscoveryProblem::Missing {
+                field: "codec parameters",
+            }
+            .into());
         }
         // SAFETY: codec parameters belong to the live stream.
         let parameters = unsafe { &*stream.codecpar };
-        let media = match parameters.codec_type {
-            ffmpeg::AVMediaType::AVMEDIA_TYPE_VIDEO => MediaParameters::Video {
-                width: positive_u32(parameters.width, "video width")?,
-                height: positive_u32(parameters.height, "video height")?,
-                frame_rate: frame_rate(stream.avg_frame_rate)
-                    .or_else(|| frame_rate(parameters.framerate)),
-                video_delay: nonnegative_u32(parameters.video_delay, "video delay")?,
-            },
-            ffmpeg::AVMediaType::AVMEDIA_TYPE_AUDIO => MediaParameters::Audio {
-                sample_rate: positive_u32(parameters.sample_rate, "audio sample rate")?,
-                channels: positive_u16(parameters.ch_layout.nb_channels, "audio channels")?,
-                frame_size: optional_u32(parameters.frame_size, "audio frame size")?,
-                bit_depth: optional_u16(parameters.bits_per_raw_sample, "audio bit depth")?,
-            },
-            ffmpeg::AVMediaType::AVMEDIA_TYPE_SUBTITLE => MediaParameters::Subtitle,
-            _ => return Ok(None),
+        let Some(media) = media_parameters(parameters, declared_frame_rate(stream, parameters))?
+        else {
+            return Ok(None);
         };
-        let id = u32::try_from(stream.index)
-            .map(TrackId)
-            .map_err(|_| SourceError::Discovery("stream index is negative".into()))?;
+        let id =
+            u32::try_from(stream.index)
+                .map(TrackId)
+                .map_err(|_| DiscoveryProblem::Negative {
+                    field: "stream index",
+                })?;
         let timebase = timebase(stream.time_base)?;
-        let extradata = Payload::from(extradata(parameters)?);
         Ok(Some(Self {
             track: DiscoveredTrack {
                 id,
@@ -176,25 +186,19 @@ impl TrackSnapshot {
                 title: unsafe { dictionary::value(stream.metadata, c"title") },
                 // SAFETY: metadata belongs to this live stream.
                 language: unsafe { dictionary::value(stream.metadata, c"language") },
-                codec_extradata: extradata.clone(),
+                codec_extradata: Payload::from(extradata(parameters)?),
             },
-            codec_type: parameters.codec_type,
-            codec_id: parameters.codec_id,
-            codec_tag: parameters.codec_tag,
-            profile: parameters.profile,
-            level: parameters.level,
-            width: parameters.width,
-            height: parameters.height,
-            sample_rate: parameters.sample_rate,
-            channels: parameters.ch_layout.nb_channels,
-            frame_size: parameters.frame_size,
-            bits_per_raw_sample: parameters.bits_per_raw_sample,
-            video_delay: parameters.video_delay,
-            timebase: stream.time_base,
-            extradata,
+            identity: CodecIdentity::read(parameters),
         }))
     }
 
+    /// Whether the stream still carries the configuration it was discovered
+    /// with.
+    ///
+    /// Compares the extracted [`DiscoveredTrack`] fields structurally instead
+    /// of re-listing FFmpeg's. Adding a field to [`MediaParameters`] therefore
+    /// extends this check automatically; forgetting to mirror one is no longer
+    /// something a reader has to notice.
     unsafe fn matches(&self, stream: *mut ffmpeg::AVStream, packet: &ffmpeg::AVPacket) -> bool {
         if stream.is_null() {
             return false;
@@ -206,20 +210,20 @@ impl TrackSnapshot {
         }
         // SAFETY: checked above.
         let parameters = unsafe { &*parameters };
-        if self.codec_type != parameters.codec_type
-            || self.codec_id != parameters.codec_id
-            || self.codec_tag != parameters.codec_tag
-            || self.profile != parameters.profile
-            || self.level != parameters.level
-            || self.width != parameters.width
-            || self.height != parameters.height
-            || self.sample_rate != parameters.sample_rate
-            || self.channels != parameters.ch_layout.nb_channels
-            || self.frame_size != parameters.frame_size
-            || self.bits_per_raw_sample != parameters.bits_per_raw_sample
-            || self.video_delay != parameters.video_delay
-            || self.timebase != unsafe { (*stream).time_base }
-            || !same_extradata(self.extradata.as_bytes(), parameters)
+        // SAFETY: the stream belongs to the live format context.
+        let stream = unsafe { &*stream };
+
+        // A parameter set this reader cannot describe is a change by
+        // definition: discovery accepted a shape that is no longer there.
+        let Ok(Some(media)) = media_parameters(parameters, declared_frame_rate(stream, parameters))
+        else {
+            return false;
+        };
+        let time_base = stream.time_base;
+        if self.identity != CodecIdentity::read(parameters)
+            || self.track.parameters != media
+            || timebase(time_base).ok() != Some(self.track.timebase)
+            || !same_extradata(self.track.codec_extradata.as_bytes(), parameters)
         {
             return false;
         }
@@ -251,9 +255,52 @@ impl TrackSnapshot {
             || (
                 // SAFETY: FFmpeg returned `side_data_size` readable bytes.
                 unsafe { slice::from_raw_parts(side_data, side_data_size) }
-                    == self.extradata.as_bytes()
+                    == self.track.codec_extradata.as_bytes()
             )
     }
+}
+
+/// Extracts the declared shape of a stream, or `None` for a kind this node
+/// does not carry.
+///
+/// The single source of truth for both discovery and the mid-stream change
+/// check, so the two can never disagree about what a stream's parameters are.
+fn media_parameters(
+    parameters: &ffmpeg::AVCodecParameters,
+    frame_rate: Option<FrameRate>,
+) -> Result<Option<MediaParameters>, SourceError> {
+    let media = match parameters.codec_type {
+        ffmpeg::AVMediaType::AVMEDIA_TYPE_VIDEO => MediaParameters::Video {
+            width: positive_u32(parameters.width, "video width")?,
+            height: positive_u32(parameters.height, "video height")?,
+            frame_rate,
+            video_delay: nonnegative_u32(parameters.video_delay, "video delay")?,
+        },
+        ffmpeg::AVMediaType::AVMEDIA_TYPE_AUDIO => MediaParameters::Audio {
+            sample_rate: positive_u32(parameters.sample_rate, "audio sample rate")?,
+            channels: positive_u16(parameters.ch_layout.nb_channels, "audio channels")?,
+            frame_size: optional_u32(parameters.frame_size, "audio frame size")?,
+            bit_depth: optional_u16(parameters.bits_per_raw_sample, "audio bit depth")?,
+        },
+        ffmpeg::AVMediaType::AVMEDIA_TYPE_SUBTITLE => MediaParameters::Subtitle,
+        _ => return Ok(None),
+    };
+    Ok(Some(media))
+}
+
+/// The cadence a video stream declares, preferring the stream's own average.
+///
+/// Codec parameters carry a framerate too, but live inputs commonly leave it
+/// unset while populating the stream average, so the stream wins.
+///
+/// # Safety
+///
+/// Both references must belong to the same live format context.
+fn declared_frame_rate(
+    stream: &ffmpeg::AVStream,
+    parameters: &ffmpeg::AVCodecParameters,
+) -> Option<FrameRate> {
+    frame_rate(stream.avg_frame_rate).or_else(|| frame_rate(parameters.framerate))
 }
 
 fn codec(codec: ffmpeg::AVCodecID) -> Codec {
@@ -264,6 +311,7 @@ fn codec(codec: ffmpeg::AVCodecID) -> Codec {
         ffmpeg::AVCodecID::AV_CODEC_ID_AAC | ffmpeg::AVCodecID::AV_CODEC_ID_AAC_LATM => Codec::Aac,
         ffmpeg::AVCodecID::AV_CODEC_ID_OPUS => Codec::Opus,
         ffmpeg::AVCodecID::AV_CODEC_ID_WEBVTT => Codec::WebVtt,
+        ffmpeg::AVCodecID::AV_CODEC_ID_MOV_TEXT => Codec::MovText,
         other => Codec::Unknown(other as u32),
     }
 }
@@ -280,32 +328,38 @@ fn frame_rate(value: ffmpeg::AVRational) -> Option<FrameRate> {
     Some(FrameRate::new(numerator, denominator))
 }
 
-fn positive_u32(value: i32, field: &str) -> Result<NonZero<u32>, SourceError> {
+// FFmpeg reports every declared scalar as `i32`, using zero or a negative
+// value for "not declared". Narrowing therefore needs the same two checks
+// everywhere and differs only in target width. A generic over `NonZero<T>`
+// would need the unstable `ZeroablePrimitive` bound, so the two widths stay
+// spelled out; the `optional_*` pair delegates rather than repeating them.
+
+fn positive_u32(value: i32, field: &'static str) -> Result<NonZero<u32>, SourceError> {
     u32::try_from(value)
         .ok()
         .and_then(NonZero::new)
-        .ok_or_else(|| SourceError::Discovery(format!("{field} is not positive")))
+        .ok_or(DiscoveryProblem::NotPositive { field }.into())
 }
 
-fn positive_u16(value: i32, field: &str) -> Result<NonZero<u16>, SourceError> {
+fn positive_u16(value: i32, field: &'static str) -> Result<NonZero<u16>, SourceError> {
     u16::try_from(value)
         .ok()
         .and_then(NonZero::new)
-        .ok_or_else(|| SourceError::Discovery(format!("{field} is not positive")))
+        .ok_or(DiscoveryProblem::NotPositive { field }.into())
 }
 
-fn nonnegative_u32(value: i32, field: &str) -> Result<u32, SourceError> {
-    u32::try_from(value).map_err(|_| SourceError::Discovery(format!("{field} is negative")))
+fn nonnegative_u32(value: i32, field: &'static str) -> Result<u32, SourceError> {
+    u32::try_from(value).map_err(|_| DiscoveryProblem::Negative { field }.into())
 }
 
-fn optional_u32(value: i32, field: &str) -> Result<Option<NonZero<u32>>, SourceError> {
+fn optional_u32(value: i32, field: &'static str) -> Result<Option<NonZero<u32>>, SourceError> {
     if value == 0 {
         return Ok(None);
     }
     positive_u32(value, field).map(Some)
 }
 
-fn optional_u16(value: i32, field: &str) -> Result<Option<NonZero<u16>>, SourceError> {
+fn optional_u16(value: i32, field: &'static str) -> Result<Option<NonZero<u16>>, SourceError> {
     if value == 0 {
         return Ok(None);
     }
@@ -313,15 +367,18 @@ fn optional_u16(value: i32, field: &str) -> Result<Option<NonZero<u16>>, SourceE
 }
 
 fn extradata(parameters: &ffmpeg::AVCodecParameters) -> Result<Vec<u8>, SourceError> {
-    let size = usize::try_from(parameters.extradata_size)
-        .map_err(|_| SourceError::Discovery("codec extradata size is negative".into()))?;
+    let size =
+        usize::try_from(parameters.extradata_size).map_err(|_| DiscoveryProblem::Negative {
+            field: "codec extradata size",
+        })?;
     if size == 0 {
         return Ok(Vec::new());
     }
     if parameters.extradata.is_null() {
-        return Err(SourceError::Discovery(
-            "codec extradata pointer is null".into(),
-        ));
+        return Err(DiscoveryProblem::Missing {
+            field: "codec extradata",
+        }
+        .into());
     }
     // SAFETY: codec parameters promise `extradata_size` readable bytes.
     Ok(unsafe { slice::from_raw_parts(parameters.extradata, size) }.to_vec())
