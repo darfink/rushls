@@ -9,8 +9,10 @@
 mod density;
 mod normalize;
 mod pacer;
+mod sample;
 mod stream;
 mod timeline;
+mod timing;
 mod validate;
 
 #[cfg(test)]
@@ -18,13 +20,14 @@ pub mod fixtures;
 
 pub use density::{MediaDensityError, MediaDensityWindow};
 pub use normalize::{
-    AudioSample, MediaNormalizer, NormalizeError, NormalizedSample, NormalizerFactory,
-    PassThroughNormalizerFactory, PresentedTiming, PresentedTimingCursor, SampleTimingError,
-    StartedNormalizer, SubtitleSample, VideoSample,
+    MediaNormalizer, NormalizeError, NormalizerFactory, PassThroughNormalizerFactory,
+    StartedNormalizer,
 };
 pub use pacer::{MediaPacer, PacingError};
+pub use sample::{AudioSample, NormalizedSample, SubtitleSample, VideoSample};
 pub use stream::{MediaError, SampleSource};
 pub use timeline::{
     Rounding, TimelineCalibration, TimelineCalibrationError, TrackTimeline, calibrate,
 };
+pub use timing::{PresentedTiming, PresentedTimingCursor, SampleTimingError};
 pub use validate::{PresentationPlan, ValidationError, validate};

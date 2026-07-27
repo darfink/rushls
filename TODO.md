@@ -1,9 +1,13 @@
 - Input tracks may in theory have PTS belonging to different epochs
-- Run `StreamStore::maintain` on a timer once the server has a task to own it
-- Playlist writer: EXT-X-DISCONTINUITY where `publication` changes, EXT-X-MAP from
-  `RenditionSnapshot::initialization_for`. EXT-X-DISCONTINUITY-SEQUENCE also needs
-  a count of discontinuities already evicted from the window — the store can track
-  it, but pin the semantics against the spec when the writer exists.
+- Run `StreamStore::maintain` on a timer once the server has a task to own it,
+  and call `Origin::prune` on the same tick so playlist caches do not outlive
+  the streams they describe
+- Delta playlists: `CAN-SKIP-UNTIL` is deliberately never advertised, since
+  advertising it commits the origin to rendering `EXT-X-SKIP`. Implement both
+  together or neither.
+- Confirm `EXT-X-MAP` on a WebVTT media playlist against mediastreamvalidator.
+  It is spec-legal and is how the pass-through muxer separates the `WEBVTT`
+  header from cue-only segments, but it is a less-travelled path in players.
 - Normalize PTS to 0 - ELST for adjustments?
 - Health evaluation doesn't consider track-local publication duration
 - Run an LLM against HLS spec and comment all spec related behavior
@@ -13,16 +17,17 @@
 - Implement tests w/ mediastreamvalidator
 - Implement end-to-end tests validating expected PTS, ELST, PDT, fetch, grace etc
 - Implement end-to-end tests with ffprobe??
-- Implement
+- Support discontinuities when muxing? PaceToRealtime "maximum_timestamp_jump" doesn't make sense?
 - A single automatic cancellable maintenance task for the store
+- Delta playlists
 
 # Steps
 
 - RTMP/SRT ingest
-- Media normalization
-- CMAF muxing
-- HLS generation
-- HTTP serving
+- Media normalization — done
+- CMAF muxing — done
+- HLS generation — done (`delivery::hls::project`)
+- HTTP serving — done (`delivery::hls::serve`, `server::http`)
 - Process wiring (main.rs)
 
 # Implement tests for:

@@ -12,7 +12,11 @@ nz = "0.4"
 parking_lot = "0.12"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+urlencoding = "2"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "original-uri", "query", "tokio"] }
+http-body-util = "0.1.4"
+http-body = "1.1.0"
 
 [dev-dependencies]
 base64 = "0.22"

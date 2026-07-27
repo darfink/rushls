@@ -15,7 +15,7 @@ use crate::{
     mux::{PlayableCombination, RenditionConfig, RenditionGroupKey, RenditionKey, RenditionMedia},
 };
 
-use super::{RenditionBandwidth, RenditionSnapshot};
+use super::{PlaylistContract, RenditionBandwidth, RenditionSnapshot};
 
 /// Atomically published media-playlist state for one rendition.
 ///
@@ -69,6 +69,14 @@ pub struct RenditionCatalogEntry {
     pub active: bool,
     pub key: RenditionKey,
     pub config: Option<RenditionConfig>,
+    /// This rendition's frozen playlist terms.
+    ///
+    /// Carried on the catalog entry as well as the media snapshot because
+    /// presentation-wide values — HLS requires one identical
+    /// `EXT-X-SERVER-CONTROL` across every playlist of a multivariant
+    /// presentation — are derived across renditions, and deriving them should
+    /// not mean loading every sibling's media snapshot.
+    pub contract: PlaylistContract,
     pub media: RenditionMedia,
     pub codecs: Arc<str>,
     pub name: Arc<str>,

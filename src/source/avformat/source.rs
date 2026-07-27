@@ -377,6 +377,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preserves_webvtt_cue_metadata_after_the_source_is_released() {
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let mut source = AvformatPacketSource::new(
+            Box::new(ReadInput::closed(Cursor::new(
+                crate::source::avformat::fixtures::WEBVTT,
+            ))),
+            AvformatConfig::default(),
+            InputLimits::permissive(),
+            meters.source_view(),
+        )
+        .expect("fixture source opens");
+
+        let discovery = source
+            .discover(discovery_limits())
+            .await
+            .expect("WebVTT is discovered");
+        assert_eq!(
+            discovery.tracks.tracks()[0].codec,
+            crate::domain::Codec::WebVtt
+        );
+        assert_eq!(
+            discovery.tracks.tracks()[0].timebase,
+            crate::domain::Timebase::new(nz::u32!(1), nz::u32!(1_000))
+        );
+
+        let (packets, state) = drain(&mut source).await;
+        assert_eq!(state, InputState::Closed);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].pts, Some(0));
+        assert_eq!(packets[0].duration, Some(2_000));
+        assert_eq!(packets[0].webvtt.identifier.as_deref(), Some("cue-one"));
+        assert_eq!(packets[0].webvtt.settings.as_deref(), Some("align:start"));
+        assert_eq!(packets[0].payload.as_bytes(), b"Hello <b>world</b>");
+
+        let retained = packets[0].clone();
+        drop(source);
+        assert_eq!(retained.webvtt.identifier.as_deref(), Some("cue-one"));
+        assert_eq!(retained.payload.as_bytes(), b"Hello <b>world</b>");
+    }
+
+    #[tokio::test]
+    async fn discovers_subrip_text_and_its_optional_position_side_data() {
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let mut source = AvformatPacketSource::new(
+            Box::new(ReadInput::closed(Cursor::new(
+                crate::source::avformat::fixtures::SUBRIP,
+            ))),
+            AvformatConfig::default(),
+            InputLimits::permissive(),
+            meters.source_view(),
+        )
+        .expect("fixture source opens");
+
+        let discovery = source
+            .discover(discovery_limits())
+            .await
+            .expect("SubRip is discovered");
+        assert_eq!(
+            discovery.tracks.tracks()[0].codec,
+            crate::domain::Codec::SubRip
+        );
+
+        let (packets, state) = drain(&mut source).await;
+        assert_eq!(state, InputState::Closed);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].payload.as_bytes(), b"<b>Hello</b> &amp; world");
+        assert_eq!(packets[0].subtitle_position, None);
+        assert_eq!(
+            packets[1].subtitle_position,
+            Some(crate::domain::SubtitlePosition {
+                x1: 10,
+                y1: 20,
+                x2: 100,
+                y2: 80,
+            })
+        );
+        assert_eq!(packets[1].pts, Some(1_000));
+        assert_eq!(packets[1].duration, Some(1_500));
+    }
+
+    #[tokio::test]
     async fn preserves_an_interrupted_byte_input_terminal_state() {
         let mut source = source(InputState::Interrupted, InputLimits::permissive());
         source

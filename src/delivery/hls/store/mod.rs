@@ -19,6 +19,7 @@
 //! |---|---|
 //! | [`ids`] | Durable identities the store assigns |
 //! | [`error`] | What a write may be refused for |
+//! | [`contract`] | The playlist terms a rendition is frozen to |
 //! | [`media`] | The retained media a projection reads |
 //! | [`catalog`] | The slow-changing, request-facing stream view |
 //! | [`rendition`] | One rendition's retention and live edge |
@@ -41,6 +42,7 @@ use crate::{
 
 mod bitrate;
 mod catalog;
+mod contract;
 mod error;
 mod ids;
 mod media;
@@ -57,6 +59,7 @@ pub use catalog::{
     PublicationAnchor, RenditionCatalogEntry, ResolvedPresentation, ResolvedRenditionGroup,
     StreamSnapshot,
 };
+pub use contract::PlaylistContract;
 pub use error::{StoreFull, StoreWriteError};
 pub use ids::{InitializationId, Msn, PartCursor, PartId, PartIndex, SegmentId};
 pub use media::{

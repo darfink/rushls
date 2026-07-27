@@ -3,7 +3,8 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::domain::{
-    Appender, AudioTrim, BoxFuture, Payload, TrackCatalog, TrackCatalogError, TrackId,
+    Appender, AudioTrim, BoxFuture, Payload, SubtitlePosition, TrackCatalog, TrackCatalogError,
+    TrackId, WebVttCueMetadata,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,7 +24,19 @@ pub struct Packet {
     /// Audio samples suppressed after decoding this packet, when present.
     /// Codec padding suppressed when this packet is presented.
     pub audio_trim: AudioTrim,
+    pub webvtt: WebVttCueMetadata,
+    pub subtitle_position: Option<SubtitlePosition>,
     pub payload: Payload,
+}
+
+impl Packet {
+    /// Encoded bytes retained by this packet, including packet side data that
+    /// was promoted into the domain model.
+    pub fn retained_payload_bytes(&self) -> usize {
+        self.payload
+            .len()
+            .saturating_add(self.webvtt.retained_bytes())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

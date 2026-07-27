@@ -291,8 +291,11 @@ struct FakeMuxerFactory {
 impl MuxerFactory for FakeMuxerFactory {
     fn start(&self, request: MuxerStartRequest<'_>) -> Result<StartedMuxer, MuxError> {
         record(&self.log, "muxer_start");
-        // Two-second segments cut into one-second chunks, so a handful of
-        // scripted frames is enough to exercise both cadences.
+        // One-second chunks accumulated into a single segment closed at end of
+        // stream. This fake never cuts mid-publication, so its declared target
+        // covers the whole scripted run rather than a live cadence: delivery
+        // holds a rendition to the target it advertises, and a fixture that
+        // under-declared would be refused for a cadence it never had.
         let presentation = mux_fixtures::presentation_at(
             request.time_anchor,
             request.presentation,
@@ -301,7 +304,7 @@ impl MuxerFactory for FakeMuxerFactory {
                     .key("video/main")
                     .config(mux_fixtures::config(
                         Timebase::hz90k(),
-                        2 * SECOND as u64,
+                        4 * SECOND as u64,
                         Some(SECOND as u64),
                     ))
                     .build(),
@@ -431,6 +434,8 @@ fn packet(pts: i64, random_access: bool) -> Packet {
         duration: Some(SECOND),
         random_access,
         audio_trim: crate::domain::AudioTrim::default(),
+        webvtt: crate::domain::WebVttCueMetadata::default(),
+        subtitle_position: None,
         payload: Payload::from(vec![1, 2, 3]),
     }
 }

@@ -23,12 +23,12 @@ pub use instant::MediaInstant;
 pub use payload::Payload;
 pub use rfc6381::rfc6381;
 pub use time::{
-    RationalTickAccumulator, TickDuration, TickOffset, TickTimestamp, Timebase, duration_since,
-    offset_from,
+    RationalTickAccumulator, TickDuration, TickOffset, TickTimestamp, Timebase, TimebaseProjection,
+    duration_since, offset_from,
 };
 pub use track::{
     AudioTiming, AudioTrim, Codec, DiscoveredTrack, FrameRate, MediaKind, MediaParameters,
-    TrackCatalog, TrackCatalogError, TrackCounts,
+    SubtitlePosition, TrackCatalog, TrackCatalogError, TrackCounts, WebVttCueMetadata,
 };
 
 /// A boxed future returned by object-safe trait methods.

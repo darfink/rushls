@@ -29,10 +29,10 @@ use crate::{
 };
 
 use super::{
-    InitializationId, Msn, OpenSegment, PartCursor, PartId, PartIndex, RenditionBitrateStatistics,
-    RenditionSnapshot, RenditionView, RetentionPolicy, SegmentBody, SegmentId, StoreWriteError,
-    StoredInitialization, StoredPart, StoredSegment, StoredSegmentKind, bitrate::BitrateTracker,
-    media::segment_byte_len,
+    InitializationId, Msn, OpenSegment, PartCursor, PartId, PartIndex, PlaylistContract,
+    RenditionBitrateStatistics, RenditionSnapshot, RenditionView, RetentionPolicy, SegmentBody,
+    SegmentId, StoreWriteError, StoredInitialization, StoredPart, StoredSegment, StoredSegmentKind,
+    bitrate::BitrateTracker, media::segment_byte_len,
 };
 
 /// A committed live edge and the channel that should announce it.
@@ -138,6 +138,10 @@ pub struct RenditionState {
     /// Muxer-authored identity and attributes from the latest compatible
     /// publication. This remains available while retired media is fetchable.
     pub descriptor: PackagedRendition,
+    /// Frozen at creation and never revised. A publication that cannot satisfy
+    /// it is matched to a different rendition rather than changing these terms
+    /// under viewers already reading this playlist.
+    pub contract: PlaylistContract,
     pub active: bool,
     /// Once removed from an active topology, this playlist remains terminal.
     /// Reusing it later would make an ENDLIST disappear for existing viewers.
@@ -166,6 +170,17 @@ pub struct RenditionState {
     /// HLS numbering is independent from publisher-local packaging IDs and is
     /// never reset when a publisher reconnects.
     next_msn: u64,
+    /// The MSN a media playlist must currently advertise.
+    media_sequence: u64,
+    /// Discontinuity tags already evicted from the front of the playlist.
+    discontinuity_sequence: u64,
+    /// Publication of the most recently *created* parent segment.
+    ///
+    /// Deliberately not the previous retained segment: retention can evict the
+    /// segment a reconnect follows, and the discontinuity between them must
+    /// survive that. Deliberately not the current lease either, which changes
+    /// at attach time whether or not media follows.
+    last_parent_publication: Option<u64>,
     issued_segments: u64,
     issued_parts: u64,
     pub last_packaging_segment_id: Option<PackagingSegmentId>,
@@ -185,9 +200,13 @@ impl RenditionState {
     pub fn new(rendition_id: RenditionId, descriptor: PackagedRendition) -> Self {
         let live_edge = super::RenditionLiveEdge::default();
         let (edge_updates, _) = watch::channel(live_edge);
+        let contract = PlaylistContract::derive(&descriptor.config);
         let published = Arc::new(RenditionView::new(RenditionSnapshot {
             rendition_id,
             config: Some(descriptor.config),
+            contract,
+            media_sequence: 0,
+            discontinuity_sequence: 0,
             initializations: Vec::new(),
             segments: Vec::new(),
             open_segment: None,
@@ -199,6 +218,7 @@ impl RenditionState {
             advertised_config: Some(descriptor.config),
             active_config: None,
             descriptor,
+            contract,
             active: false,
             retired: false,
             initializations: Vec::new(),
@@ -210,6 +230,9 @@ impl RenditionState {
             part_resources: HashMap::new(),
             open_segment: None,
             next_msn: 0,
+            media_sequence: 0,
+            discontinuity_sequence: 0,
+            last_parent_publication: None,
             issued_segments: 0,
             issued_parts: 0,
             last_packaging_segment_id: None,
@@ -289,6 +312,9 @@ impl RenditionState {
         RenditionSnapshot {
             rendition_id: self.rendition_id,
             config: self.advertised_config,
+            contract: self.contract,
+            media_sequence: self.media_sequence,
+            discontinuity_sequence: self.discontinuity_sequence,
             initializations: self.initializations.clone(),
             segments,
             open_segment,
@@ -372,6 +398,7 @@ impl RenditionState {
                 if config.chunk_target.is_none() {
                     return Err(StoreWriteError::ChunksDisabled { rendition_id });
                 }
+                self.require_permitted_part(config.timebase.ticks_to_duration(chunk.duration))?;
                 match &self.open_segment {
                     Some(open) if open.packaging_segment_id != chunk.packaging_segment_id => {
                         return Err(StoreWriteError::DifferentSegmentAlreadyOpen {
@@ -394,6 +421,20 @@ impl RenditionState {
                         {
                             return Err(StoreWriteError::SegmentTimingMismatch { rendition_id });
                         }
+                        // A part's 85% floor only applies once something
+                        // follows it, so the arrival of a successor is the
+                        // first moment the predecessor can be judged — and the
+                        // last moment before it becomes unfixable.
+                        if let Some(previous) = open.parts.last() {
+                            self.require_permitted_non_final_part(
+                                config.timebase.ticks_to_duration(previous.duration),
+                            )?;
+                        }
+                        self.require_permitted_segment(
+                            config
+                                .timebase
+                                .ticks_to_duration(open.duration.saturating_add(chunk.duration)),
+                        )?;
                     }
                     None => {
                         self.require_next_packaging_segment_id(chunk.packaging_segment_id)?;
@@ -404,6 +445,9 @@ impl RenditionState {
                                 found: chunk.chunk_index,
                             });
                         }
+                        self.require_permitted_segment(
+                            config.timebase.ticks_to_duration(chunk.duration),
+                        )?;
                     }
                 }
             }
@@ -416,6 +460,9 @@ impl RenditionState {
                     return Err(StoreWriteError::DirectSegmentsDisabled { rendition_id });
                 }
                 self.require_next_packaging_segment_id(segment.packaging_segment_id)?;
+                self.require_permitted_segment(
+                    config.timebase.ticks_to_duration(segment.duration),
+                )?;
             }
             PackagedMedia::SegmentCompleted(completion) => {
                 let config = self.require_media_ready()?;
@@ -437,6 +484,9 @@ impl RenditionState {
                 {
                     return Err(StoreWriteError::SegmentTimingMismatch { rendition_id });
                 }
+                self.require_permitted_segment(
+                    config.timebase.ticks_to_duration(completion.duration),
+                )?;
             }
         }
         Ok(())
@@ -458,6 +508,48 @@ impl RenditionState {
             });
         }
         Ok(config)
+    }
+
+    /// Rejects media the advertised target duration could not cover.
+    ///
+    /// Checked for an accumulating segment on every chunk rather than only at
+    /// completion: an over-long segment's parts are fetchable and tagged long
+    /// before it closes, so refusing it at completion would refuse media that
+    /// viewers had already been offered.
+    fn require_permitted_segment(&self, duration: Duration) -> Result<(), StoreWriteError> {
+        if self.contract.permits_segment(duration) {
+            return Ok(());
+        }
+        Err(StoreWriteError::SegmentTooLong {
+            rendition_id: self.rendition_id,
+            duration,
+            maximum: self.contract.maximum_segment_duration,
+        })
+    }
+
+    fn require_permitted_part(&self, duration: Duration) -> Result<(), StoreWriteError> {
+        if self.contract.permits_part(duration) {
+            return Ok(());
+        }
+        Err(StoreWriteError::PartTooLong {
+            rendition_id: self.rendition_id,
+            duration,
+            maximum: self.contract.part_target.unwrap_or(Duration::ZERO),
+        })
+    }
+
+    fn require_permitted_non_final_part(&self, duration: Duration) -> Result<(), StoreWriteError> {
+        if self.contract.permits_non_final_part(duration) {
+            return Ok(());
+        }
+        Err(StoreWriteError::PartTooShort {
+            rendition_id: self.rendition_id,
+            duration,
+            minimum: self
+                .contract
+                .minimum_non_final_part_duration()
+                .unwrap_or(Duration::ZERO),
+        })
     }
 
     fn require_next_packaging_segment_id(
@@ -534,8 +626,11 @@ impl RenditionState {
                 packaging_segment_id: chunk.packaging_segment_id,
                 media_start: chunk.media_start,
                 duration: 0,
+                discontinuity_before: self.opens_discontinuity(publication),
                 parts: Vec::new(),
             });
+            self.last_parent_publication = Some(publication);
+            self.refresh_media_sequence();
         }
 
         self.issued_parts = self.issued_parts.saturating_add(1);
@@ -602,6 +697,9 @@ impl RenditionState {
             duration: completion.duration,
             timebase: config.timebase,
             independent: parts.first().is_some_and(|part| part.independent),
+            // Decided when the segment opened; completing it only preserves
+            // the answer its already-published parts were tagged under.
+            discontinuity_before: open.discontinuity_before,
             parts: parts.iter().cloned().collect(),
             kind: StoredSegmentKind::Media(SegmentBody::Chunked(Arc::clone(&parts))),
         };
@@ -635,9 +733,11 @@ impl RenditionState {
             duration: packaged.duration,
             timebase: config.timebase,
             independent: packaged.independent,
+            discontinuity_before: self.opens_discontinuity(publication),
             parts: Vec::new(),
             kind: StoredSegmentKind::Media(SegmentBody::Contiguous(packaged.payload)),
         };
+        self.last_parent_publication = Some(publication);
         self.commit_segment(
             segment,
             packaged.packaging_segment_id,
@@ -733,6 +833,13 @@ impl RenditionState {
                 .segment_resources
                 .get_mut(&removed)
                 .expect("visible segment resource exists");
+            // A tag leaving the window is exactly what
+            // EXT-X-DISCONTINUITY-SEQUENCE counts, so the increment belongs
+            // here and nowhere else: the tag itself stays printed for as long
+            // as its segment is visible.
+            if resource.segment.discontinuity_before {
+                self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
+            }
             resource.visible = false;
             resource.expires_at = retention.segment_fetch_deadline(
                 now,
@@ -748,8 +855,34 @@ impl RenditionState {
                     resource.longest_playlist_duration.max(playlist_duration);
             }
         }
+        self.refresh_media_sequence();
         self.hide_old_parts(now, retention);
         self.sweep_expired(now);
+    }
+
+    /// Whether a parent segment created for `publication` follows a splice.
+    ///
+    /// The first parent a rendition ever creates does not: nothing precedes it
+    /// to be discontinuous with.
+    fn opens_discontinuity(&self, publication: u64) -> bool {
+        self.last_parent_publication
+            .is_some_and(|previous| previous != publication)
+    }
+
+    /// Recomputes the MSN a media playlist must advertise.
+    ///
+    /// The window head when there is one. Otherwise the open segment, whose
+    /// MSN is already observable through its parts, and failing that the MSN
+    /// the next segment will take — so a playlist with nothing to show still
+    /// names where it is rather than resetting to zero.
+    fn refresh_media_sequence(&mut self) {
+        self.media_sequence = self
+            .visible_segments
+            .front()
+            .and_then(|id| self.segment_resources.get(id))
+            .map(|resource| resource.segment.msn.0)
+            .or_else(|| self.open_segment.as_ref().map(|open| open.msn.0))
+            .unwrap_or(self.next_msn);
     }
 
     /// Resolves an open segment nobody will complete into a playlist gap.
@@ -780,6 +913,7 @@ impl RenditionState {
             duration,
             timebase: config.timebase,
             independent: false,
+            discontinuity_before: open.discontinuity_before,
             parts: Vec::new(),
             kind: StoredSegmentKind::Gap,
         };

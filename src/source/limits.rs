@@ -154,7 +154,7 @@ impl Appender<Packet> for BoundedPacketBatch<'_> {
             return;
         }
 
-        let packet_bytes = packet.payload.len();
+        let packet_bytes = packet.retained_payload_bytes();
         if packet_bytes > self.maximum_packet_bytes {
             self.error = Some(LimitError::PacketPayloadTooLarge {
                 limit: self.maximum_packet_bytes,
@@ -259,8 +259,26 @@ mod tests {
             duration: None,
             random_access: false,
             audio_trim: crate::domain::AudioTrim::default(),
+            webvtt: crate::domain::WebVttCueMetadata::default(),
+            subtitle_position: None,
             payload: crate::domain::Payload::from(vec![0; bytes]),
         }
+    }
+
+    #[test]
+    fn packet_limits_include_promoted_subtitle_side_data() {
+        let mut target = Vec::new();
+        let mut batch = BoundedPacketBatch::new(&mut target, 1, 7, 7);
+        let mut cue = packet(4);
+        cue.webvtt.identifier = Some(std::sync::Arc::from("four"));
+
+        batch.push(cue);
+
+        assert_eq!(
+            batch.produced(),
+            Err(LimitError::PacketPayloadTooLarge { limit: 7, found: 8 })
+        );
+        assert!(target.is_empty());
     }
 
     #[test]

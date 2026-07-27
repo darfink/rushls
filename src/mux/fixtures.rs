@@ -80,9 +80,22 @@ pub fn config(
     segment_target: TickDuration,
     chunk_target: Option<TickDuration>,
 ) -> RenditionConfig {
+    config_with_maximum(timebase, segment_target, segment_target, chunk_target)
+}
+
+/// A config whose segments may run past their target, as an extending
+/// boundary policy allows.
+pub fn config_with_maximum(
+    timebase: Timebase,
+    segment_target: TickDuration,
+    maximum_segment_duration: TickDuration,
+    chunk_target: Option<TickDuration>,
+) -> RenditionConfig {
     RenditionConfig {
         timebase,
         segment_target: NonZero::new(segment_target).expect("a segment target is nonzero"),
+        maximum_segment_duration: NonZero::new(maximum_segment_duration)
+            .expect("a maximum segment duration is nonzero"),
         chunk_target: chunk_target
             .map(|target| NonZero::new(target).expect("a chunk target is nonzero")),
         segment_format: MediaSegmentFormat::Cmaf,

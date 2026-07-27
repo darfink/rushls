@@ -23,3 +23,19 @@ pub fn primed_aac_mkv() -> Vec<u8> {
     output.resize(4_096, 0);
     output
 }
+
+/// Two cues covering cue identifiers, settings, inline markup, and overlap.
+pub const WEBVTT: &[u8] = b"WEBVTT\n\n\
+cue-one\n\
+00:00:00.000 --> 00:00:02.000 align:start\n\
+Hello <b>world</b>\n\n\
+00:00:01.500 --> 00:00:03.000\n\
+Second cue\n";
+
+/// Ordinary SubRip text followed by the format's optional pixel rectangle.
+pub const SUBRIP: &[u8] = b"1\n\
+00:00:00,000 --> 00:00:01,000\n\
+<b>Hello</b> &amp; world\n\n\
+2\n\
+00:00:01,000 --> 00:00:02,500 X1:10 X2:100 Y1:20 Y2:80\n\
+Positioned\n";

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::domain::{Payload, RenditionId, TickDuration, TickTimestamp, Timebase};
 use crate::mux::{PackagingSegmentId, RenditionConfig};
 
-use super::{InitializationId, Msn, PartCursor, PartId, SegmentId};
+use super::{InitializationId, Msn, PartCursor, PartId, PlaylistContract, SegmentId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredInitialization {
@@ -74,6 +74,14 @@ pub struct StoredSegment {
     pub duration: TickDuration,
     pub timebase: Timebase,
     pub independent: bool,
+    /// Whether a projection must precede this segment with a discontinuity.
+    ///
+    /// Decided when the parent segment is *created*, not when it completes,
+    /// and against the previous parent rather than the previous retained
+    /// segment: the segment a reconnect follows may already have been evicted,
+    /// and a discontinuity that vanished with it would splice two publications
+    /// together silently.
+    pub discontinuity_before: bool,
     /// Parts still eligible to appear as EXT-X-PART tags.
     pub parts: Vec<Arc<StoredPart>>,
     pub kind: StoredSegmentKind,
@@ -105,6 +113,14 @@ pub struct OpenSegment {
     pub media_start: TickTimestamp,
     /// Media accumulated by the parts published so far.
     pub duration: TickDuration,
+    /// Whether a projection must precede this segment with a discontinuity.
+    ///
+    /// Present on the open segment because `EXT-X-DISCONTINUITY`,
+    /// `EXT-X-MAP`, and `EXT-X-PROGRAM-DATE-TIME` all belong before the
+    /// segment's first `EXT-X-PART` tag. Waiting for completion to learn this
+    /// would publish the parts of a new publication under the previous one's
+    /// timeline.
+    pub discontinuity_before: bool,
     pub parts: Vec<Arc<StoredPart>>,
 }
 
@@ -155,6 +171,18 @@ pub struct RenditionBandwidth {
 pub struct RenditionSnapshot {
     pub rendition_id: RenditionId,
     pub config: Option<RenditionConfig>,
+    /// The playlist terms this rendition was created under, and keeps.
+    pub contract: PlaylistContract,
+    /// The `EXT-X-MEDIA-SEQUENCE` value this snapshot must advertise.
+    ///
+    /// Explicit rather than read from the first visible segment, because a
+    /// playlist may legitimately have no visible segment — before the first
+    /// one completes, or once the window has been swept — and still has to
+    /// name the position its next tag will occupy.
+    pub media_sequence: u64,
+    /// The `EXT-X-DISCONTINUITY-SEQUENCE` value: how many discontinuity tags
+    /// have already been evicted from the front of this playlist.
+    pub discontinuity_sequence: u64,
     /// Every initialization still referenced by current or downloadable media.
     ///
     /// This is intentionally not just the newest header: media from the

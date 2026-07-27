@@ -13,9 +13,11 @@
 //! through an event bus pays dispatch to reach a `fetch_add`; a lifecycle fact
 //! squeezed into a counter loses the structure that made it worth reporting.
 
+mod delivery;
 mod events;
 mod meters;
 
+pub use delivery::{OriginMeters, OriginSnapshot};
 pub use events::{EventObserver, EventSink, Events, SessionEnd, SessionEvent};
 pub use meters::{
     DeliveryMeters, MediaMeters, MeterSnapshot, MuxMeters, ProcessMeters, ProcessSnapshot,

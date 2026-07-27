@@ -10,8 +10,8 @@ use bytes::Bytes;
 use ffmpeg_sys_next as ffmpeg;
 
 use crate::{
-    domain::{Payload, TrackId},
-    ffmpeg::{AvError, OwnedPacket, read_audio_trim},
+    domain::{Codec, Payload, TrackId, WebVttCueMetadata},
+    ffmpeg::{AvError, OwnedPacket, read_audio_trim, read_subtitle_position, read_webvtt_metadata},
     source::{DiscoveryLimits, DiscoveryProblem, InputState, Packet, SourceError},
 };
 
@@ -280,6 +280,7 @@ impl AvPacket {
     pub fn to_packet(
         &self,
         track_id: TrackId,
+        codec: Codec,
         maximum_payload_bytes: usize,
     ) -> Result<Packet, SourceError> {
         // SAFETY: the packet is live and initialized by `av_read_frame`.
@@ -315,6 +316,30 @@ impl AvPacket {
                 size,
             }))
         };
+        // SAFETY: the packet remains live through this conversion.
+        let webvtt = if codec == Codec::WebVtt {
+            unsafe {
+                read_webvtt_metadata(self.0.as_ptr(), maximum_payload_bytes.saturating_sub(size))
+            }
+            .map_err(SourceError::Input)?
+        } else {
+            WebVttCueMetadata::default()
+        };
+        // SAFETY: the packet remains live through this conversion.
+        let subtitle_position = if codec == Codec::SubRip {
+            unsafe { read_subtitle_position(self.0.as_ptr()) }.map_err(SourceError::Input)?
+        } else {
+            None
+        };
+        let retained = size
+            .checked_add(webvtt.retained_bytes())
+            .ok_or_else(|| SourceError::Input("packet payload accounting overflowed".into()))?;
+        if retained > maximum_payload_bytes {
+            return Err(SourceError::PacketPayloadTooLarge {
+                limit: maximum_payload_bytes,
+                found: retained,
+            });
+        }
         Ok(Packet {
             track_id,
             pts: timestamp(packet.pts),
@@ -325,6 +350,8 @@ impl AvPacket {
             audio_trim: unsafe { read_audio_trim(self.0.as_ptr()) }
                 .map_err(SourceError::Input)?
                 .unwrap_or_default(),
+            webvtt,
+            subtitle_position,
             payload,
         })
     }

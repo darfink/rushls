@@ -22,9 +22,9 @@ use crate::{
 };
 
 use super::{
-    PartId, PublicationAnchor, RenditionCatalogEntry, RenditionLiveEdge, RenditionSnapshot,
-    ResolvedPresentation, ResolvedRenditionGroup, RetentionPolicy, SegmentId, StoreWriteError,
-    StoredPart, StoredSegment, StreamSnapshot,
+    PartId, PlaylistContract, PublicationAnchor, RenditionCatalogEntry, RenditionLiveEdge,
+    RenditionSnapshot, ResolvedPresentation, ResolvedRenditionGroup, RetentionPolicy, SegmentId,
+    StoreWriteError, StoredPart, StoredSegment, StreamSnapshot,
     rendition::{EdgeUpdate, RenditionState, notify_edges},
 };
 
@@ -193,6 +193,7 @@ impl LiveStream {
                 active: rendition.active,
                 key: rendition.descriptor.key.clone(),
                 config: rendition.advertised_config,
+                contract: rendition.contract,
                 media: rendition.descriptor.media.clone(),
                 codecs: Arc::clone(&rendition.descriptor.codecs),
                 name: Arc::clone(&rendition.descriptor.name),
@@ -244,10 +245,18 @@ impl LiveStream {
 
         let mut mapping = HashMap::new();
         for descriptor in presentation.renditions.iter() {
+            // Two independent gates. Packaging compatibility is the muxer's
+            // notion of "the same output", and the playlist contract is this
+            // layer's: a publication that would change EXT-X-TARGETDURATION or
+            // PART-TARGET cannot continue an existing playlist even when the
+            // muxer considers it a continuation, so it falls through to a new
+            // durable rendition and the old one retires with an ENDLIST.
+            let contract = PlaylistContract::derive(&descriptor.config);
             let existing = state.renditions.iter().position(|rendition| {
                 !rendition.active
                     && !rendition.retired
                     && rendition.descriptor.compatible_with(descriptor)
+                    && rendition.contract == contract
             });
             let index = match existing {
                 Some(index) => index,

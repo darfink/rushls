@@ -1,4 +1,7 @@
-use std::num::{NonZeroU16, NonZeroU32};
+use std::{
+    num::{NonZeroU16, NonZeroU32},
+    sync::Arc,
+};
 
 use thiserror::Error;
 
@@ -34,6 +37,40 @@ impl AudioTrim {
     }
 }
 
+/// Textual metadata carried beside one demuxed WebVTT cue.
+///
+/// FFmpeg exposes both values as packet side data. Keeping their semantic
+/// text here lets sources other than AVFormat provide the same information
+/// without exposing FFmpeg constants or byte layouts to the media pipeline.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WebVttCueMetadata {
+    pub identifier: Option<Arc<str>>,
+    pub settings: Option<Arc<str>>,
+}
+
+impl WebVttCueMetadata {
+    /// Returns the heap storage retained by this cue's metadata.
+    pub fn retained_bytes(&self) -> usize {
+        self.identifier
+            .as_deref()
+            .map_or(0, str::len)
+            .saturating_add(self.settings.as_deref().map_or(0, str::len))
+    }
+}
+
+/// Optional pixel-space placement attached to a SubRip cue.
+///
+/// WebVTT cannot faithfully project these coordinates without knowing the
+/// rendering canvas. They survive ingest so the muxer can reject the cue
+/// instead of silently discarding presentation semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubtitlePosition {
+    pub x1: i32,
+    pub y1: i32,
+    pub x2: i32,
+    pub y2: i32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MediaKind {
     Audio,
@@ -49,6 +86,7 @@ pub enum Codec {
     Hevc,
     MovText,
     Opus,
+    SubRip,
     WebVtt,
     Unknown(u32),
 }
@@ -152,9 +190,8 @@ impl DiscoveredTrack {
     /// emitted rather than calling this. Two cases reach that today:
     ///
     /// - A transcoder emits a profile and level of its own choosing.
-    /// - A [`Codec::MovText`] subtitle track is admitted so a muxer can present
-    ///   it as WebVTT. This returns `tx3g` — the format that arrived — while
-    ///   the rendition carrying it will advertise `wvtt`.
+    /// - A text subtitle track can be converted to WebVTT. Its input codec
+    ///   string, when one exists, does not describe the converted rendition.
     pub fn rfc6381_codec(&self) -> Option<std::sync::Arc<str>> {
         // Absent extradata and empty extradata mean the same thing to the
         // mapper — nothing to refine from — so they are spelled the same way.

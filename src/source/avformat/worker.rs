@@ -25,7 +25,7 @@ pub struct QueuedPacket {
 
 impl QueuedPacket {
     pub fn payload_len(&self) -> usize {
-        self.packet.payload.len()
+        self.packet.retained_payload_bytes()
     }
 
     pub fn into_packet(self) -> Packet {
@@ -157,7 +157,17 @@ fn run(
             let track_id = unsafe { catalog.validate_packet(format.context(), packet.as_ptr()) }?;
             track_id
                 .map(|track_id| {
-                    packet.to_packet(track_id, input_limits.maximum_payload_bytes_per_packet)
+                    let codec = catalog
+                        .report()
+                        .tracks
+                        .get(track_id)
+                        .expect("validated packet track remains in the discovery report")
+                        .codec;
+                    packet.to_packet(
+                        track_id,
+                        codec,
+                        input_limits.maximum_payload_bytes_per_packet,
+                    )
                 })
                 .transpose()
         })();
@@ -165,7 +175,7 @@ fn run(
 
         match converted {
             Ok(Some(packet)) => {
-                let permit = budget.reserve(packet.payload.len());
+                let permit = budget.reserve(packet.retained_payload_bytes());
                 if output
                     .blocking_send(WorkerEvent::Packet(QueuedPacket {
                         packet,

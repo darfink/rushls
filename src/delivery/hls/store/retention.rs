@@ -43,7 +43,12 @@ impl TargetDurationMultiple {
         self.denominator
     }
 
-    fn apply(self, target: Duration) -> Duration {
+    /// Scales a target duration by this multiple, exactly.
+    ///
+    /// Public because playlist projection sizes hold-backs the same way
+    /// retention sizes windows, and two implementations of one calculation is
+    /// how a playlist ends up promising something retention does not keep.
+    pub fn apply(self, target: Duration) -> Duration {
         // Round upward: a retention recommendation is a minimum, so losing a
         // fractional nanosecond must not make the configured window shorter.
         let nanos = target

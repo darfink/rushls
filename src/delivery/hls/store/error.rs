@@ -5,6 +5,8 @@
 //! before any state is touched, so a rejected write leaves the rendition
 //! exactly as the previous accepted write left it.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 use crate::{
@@ -65,6 +67,30 @@ pub enum StoreWriteError {
     ChunksDisabled { rendition_id: RenditionId },
     #[error("{rendition_id} emitted a direct segment for a chunked rendition")]
     DirectSegmentsDisabled { rendition_id: RenditionId },
+    #[error(
+        "{rendition_id} published a {duration:?} segment, exceeding the {maximum:?} \
+         its playlist advertises"
+    )]
+    SegmentTooLong {
+        rendition_id: RenditionId,
+        duration: Duration,
+        maximum: Duration,
+    },
+    #[error("{rendition_id} published a {duration:?} part, exceeding its {maximum:?} part target")]
+    PartTooLong {
+        rendition_id: RenditionId,
+        duration: Duration,
+        maximum: Duration,
+    },
+    #[error(
+        "{rendition_id} continued a segment after a {duration:?} part; a part that is not \
+         the last of its segment must reach {minimum:?}"
+    )]
+    PartTooShort {
+        rendition_id: RenditionId,
+        duration: Duration,
+        minimum: Duration,
+    },
     #[error(
         "retaining another {additional} bytes would exceed the stream payload budget of {maximum}"
     )]

@@ -2,7 +2,7 @@
 
 mod ffi;
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use crate::{
     domain::{
@@ -15,10 +15,9 @@ use crate::{
 };
 
 use super::{
-    FinishReason, InitializationSegment, MediaSegmentFormat, MuxError, MuxerFactory,
-    MuxerStartRequest, PackagedChunk, PackagedMedia, PackagedPresentation, PackagedRendition,
-    PackagedSegmentCompletion, PackagingRenditionId, PackagingSegmentId, RenditionConfig,
-    RenditionKey, RenditionMedia, StartedMuxer, TrackPackager, TrackRouter,
+    FinishReason, InitializationSegment, MediaSegmentFormat, MuxError, PackagedChunk,
+    PackagedMedia, PackagedRendition, PackagedSegmentCompletion, PackagingRenditionId,
+    PackagingSegmentId, RenditionConfig, RenditionKey, RenditionMedia, TrackPackager,
 };
 use ffi::FormatOutput;
 
@@ -26,7 +25,16 @@ use ffi::FormatOutput;
 pub enum SegmentBoundaryPolicy {
     #[default]
     Strict,
-    ExtendToRandomAccess,
+    /// Waits past the planned boundary for a random-access sample, by at most
+    /// `maximum_extension`.
+    ///
+    /// The bound is mandatory rather than advisory. HLS advertises one target
+    /// duration for a playlist's whole life, and the parts of an over-long
+    /// segment are published before its completion is known, so an unbounded
+    /// wait would put media into playlists that the advertised target cannot
+    /// cover and that no later rejection can withdraw. Exhausting the budget
+    /// fails the publication instead.
+    ExtendToRandomAccess { maximum_extension: Duration },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,72 +52,34 @@ impl Default for CmafMuxerConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct CmafMuxerFactory {
+pub(super) fn build_track(
+    rendition_id: PackagingRenditionId,
+    track: &DiscoveredTrack,
+    plan: TrackSegmentationPlan,
     config: CmafMuxerConfig,
-}
-
-impl CmafMuxerFactory {
-    pub fn new(config: CmafMuxerConfig) -> Self {
-        Self { config }
+    events: EventSink,
+) -> Result<(PackagedRendition, Box<dyn TrackPackager>), MuxError> {
+    if track.kind() == MediaKind::Subtitle {
+        return Err(invalid("subtitle tracks require WebVTT output"));
     }
-}
-
-impl MuxerFactory for CmafMuxerFactory {
-    fn start(&self, request: MuxerStartRequest<'_>) -> Result<StartedMuxer, MuxError> {
-        if request
-            .presentation
-            .tracks()
-            .iter()
-            .any(|track| track.kind() == MediaKind::Subtitle)
-        {
-            return Err(invalid("subtitle tracks require a WebVTT muxer"));
-        }
-
-        let mut renditions = Vec::with_capacity(request.presentation.tracks().len());
-        let mut packagers: Vec<Box<dyn TrackPackager>> =
-            Vec::with_capacity(request.presentation.tracks().len());
-        for (index, track) in request.presentation.tracks().iter().enumerate() {
-            let plan = request
-                .segmentation
-                .get(track.id)
-                .ok_or_else(|| invalid(format!("segmentation plan omits {}", track.id)))?;
-            if plan.timebase != track.timebase {
-                return Err(invalid(format!(
-                    "segmentation and input timebases differ for {}",
-                    track.id
-                )));
-            }
-            let rendition_id = PackagingRenditionId(
-                u32::try_from(index)
-                    .map_err(|_| invalid("too many tracks for packaging rendition IDs"))?,
-            );
-            let output = FormatOutput::open(track, self.config.io_buffer_size.get())
-                .map_err(|error| invalid(error.to_string()))?;
-            renditions.push(packaged_rendition(rendition_id, track, plan)?);
-            packagers.push(Box::new(CmafTrack::new(
-                rendition_id,
-                track,
-                *plan,
-                output,
-                self.config.segment_boundary_policy,
-                request.events.clone(),
-            )?));
-        }
-        let presentation = PackagedPresentation::with_default_topology(
-            request.time_anchor,
-            request.presentation,
-            renditions,
-        )
+    if plan.track_id != track.id || plan.timebase != track.timebase {
+        return Err(invalid(format!(
+            "segmentation plan does not describe {}",
+            track.id
+        )));
+    }
+    let output = FormatOutput::open(track, config.io_buffer_size.get())
         .map_err(|error| invalid(error.to_string()))?;
-        Ok(StartedMuxer {
-            muxer: Box::new(TrackRouter::new(
-                packagers,
-                request.segmentation.shortest_part_duration(),
-            )),
-            presentation: Arc::new(presentation),
-        })
-    }
+    let rendition = packaged_rendition(rendition_id, track, &plan, config.segment_boundary_policy)?;
+    let packager = CmafTrack::new(
+        rendition_id,
+        track,
+        plan,
+        output,
+        config.segment_boundary_policy,
+        events,
+    )?;
+    Ok((rendition, Box::new(packager)))
 }
 
 /// The chunk currently accumulating, if one is open.
@@ -370,8 +340,18 @@ impl CmafTrack {
         }
         let exact = pts == self.segment.next_boundary;
         let random_access = sample.random_access();
+        let maximum_extension = match self.policy {
+            SegmentBoundaryPolicy::Strict => None,
+            SegmentBoundaryPolicy::ExtendToRandomAccess { maximum_extension } => {
+                // Checked before either cutting or extending: a cut beyond the
+                // budget is as unpublishable as a wait beyond it, because both
+                // produce a segment longer than the advertised target.
+                self.require_within_extension(pts, maximum_extension)?;
+                Some(maximum_extension)
+            }
+        };
         if self.kind != MediaKind::Video {
-            if !exact && self.policy == SegmentBoundaryPolicy::Strict {
+            if !exact && maximum_extension.is_none() {
                 return Err(mux_error(format!(
                     "{} missed its planned segment boundary",
                     self.track_id
@@ -379,13 +359,13 @@ impl CmafTrack {
             }
             return Ok(true);
         }
-        match self.policy {
-            SegmentBoundaryPolicy::Strict if exact && random_access => Ok(true),
-            SegmentBoundaryPolicy::Strict => Err(mux_error(format!(
+        match (maximum_extension, random_access) {
+            (None, true) if exact => Ok(true),
+            (None, _) => Err(mux_error(format!(
                 "{} did not provide a random-access sample at its planned segment boundary",
                 self.track_id
             ))),
-            SegmentBoundaryPolicy::ExtendToRandomAccess if random_access => {
+            (Some(_), true) => {
                 if pts > self.segment.next_boundary {
                     let actual_ticks = pts
                         .checked_sub(self.segment.start)
@@ -402,8 +382,39 @@ impl CmafTrack {
                 }
                 Ok(true)
             }
-            SegmentBoundaryPolicy::ExtendToRandomAccess => Ok(false),
+            (Some(_), false) => Ok(false),
         }
+    }
+
+    /// Rejects a boundary the advertised target duration could not cover.
+    ///
+    /// The limit is the planned boundary plus the configured extension, which
+    /// is exactly the `maximum_segment_duration` this rendition advertises.
+    /// Failing here is deliberate: by the time an over-long segment completes,
+    /// its parts are already fetchable, so there is no later point at which
+    /// the overrun can be contained.
+    fn require_within_extension(
+        &self,
+        pts: TickTimestamp,
+        maximum_extension: Duration,
+    ) -> Result<(), MuxError> {
+        let extension_ticks = self
+            .plan
+            .timebase
+            .duration_to_ticks_floor(maximum_extension);
+        let limit = self
+            .segment
+            .next_boundary
+            .checked_add_unsigned(extension_ticks)
+            .ok_or_else(|| mux_error("segment extension limit overflowed"))?;
+        if pts > limit {
+            return Err(mux_error(format!(
+                "{} found no random-access sample within its {maximum_extension:?} \
+                 maximum segment extension",
+                self.track_id
+            )));
+        }
+        Ok(())
     }
 
     fn flush_fragment(&mut self, out: &mut dyn Appender<PackagedMedia>) -> Result<(), MuxError> {
@@ -502,6 +513,7 @@ fn packaged_rendition(
     rendition_id: PackagingRenditionId,
     track: &DiscoveredTrack,
     plan: &TrackSegmentationPlan,
+    policy: SegmentBoundaryPolicy,
 ) -> Result<PackagedRendition, MuxError> {
     let codecs = track
         .rfc6381_codec()
@@ -528,6 +540,15 @@ fn packaged_rendition(
         },
         MediaParameters::Subtitle => return Err(invalid("subtitle tracks require WebVTT output")),
     };
+    // The advertised maximum is the same limit `require_within_extension`
+    // enforces, computed the same way, so the two cannot drift apart.
+    let maximum_segment_duration = match policy {
+        SegmentBoundaryPolicy::Strict => plan.segment_duration,
+        SegmentBoundaryPolicy::ExtendToRandomAccess { maximum_extension } => plan
+            .segment_duration
+            .checked_add(plan.timebase.duration_to_ticks_floor(maximum_extension))
+            .ok_or_else(|| invalid("maximum segment duration overflowed"))?,
+    };
     let fallback_name = format!("{:?} {}", track.kind(), rendition_id.0 + 1);
     Ok(PackagedRendition {
         packaging_rendition_id: rendition_id,
@@ -536,6 +557,7 @@ fn packaged_rendition(
         config: RenditionConfig {
             timebase: plan.timebase,
             segment_target: plan.segment_duration,
+            maximum_segment_duration,
             chunk_target: Some(plan.part_duration),
             segment_format: MediaSegmentFormat::Cmaf,
         },
@@ -605,8 +627,8 @@ mod tests {
         },
     };
 
-    use super::{CmafMuxerConfig, CmafMuxerFactory};
-    use crate::mux::MuxerFactory;
+    use super::CmafMuxerConfig;
+    use crate::mux::{MuxerFactory, PassThroughMuxerFactory};
 
     const FRAME: u64 = 8_192;
 
@@ -687,7 +709,7 @@ mod tests {
             }],
         )
         .expect("fixture segmentation validates");
-        CmafMuxerFactory::new(CmafMuxerConfig {
+        PassThroughMuxerFactory::new(CmafMuxerConfig {
             segment_boundary_policy: policy,
             ..CmafMuxerConfig::default()
         })
@@ -734,7 +756,7 @@ mod tests {
             }],
         )
         .expect("audio segmentation validates");
-        CmafMuxerFactory::default()
+        PassThroughMuxerFactory::default()
             .start(MuxerStartRequest {
                 presentation: &input,
                 segmentation: &segmentation,
@@ -985,7 +1007,7 @@ mod tests {
                 .collect(),
         )
         .expect("two-track segmentation validates");
-        let mut started = CmafMuxerFactory::default()
+        let mut started = PassThroughMuxerFactory::default()
             .start(MuxerStartRequest {
                 presentation: &input,
                 segmentation: &segmentation,
@@ -1054,7 +1076,7 @@ mod tests {
             }],
         )
         .expect("audio segmentation validates");
-        let mut started = CmafMuxerFactory::default()
+        let mut started = PassThroughMuxerFactory::default()
             .start(MuxerStartRequest {
                 presentation: &input,
                 segmentation: &segmentation,
@@ -1316,7 +1338,7 @@ mod tests {
             }],
         )
         .expect("offset segmentation validates");
-        let mut started = CmafMuxerFactory::default()
+        let mut started = PassThroughMuxerFactory::default()
             .start(MuxerStartRequest {
                 presentation: &input,
                 segmentation: &segmentation,
@@ -1401,7 +1423,7 @@ mod tests {
             ],
         )
         .expect("two-kind segmentation validates");
-        let mut started = CmafMuxerFactory::default()
+        let mut started = PassThroughMuxerFactory::default()
             .start(MuxerStartRequest {
                 presentation: &input,
                 segmentation: &segmentation,
@@ -1548,7 +1570,7 @@ mod tests {
             }],
         )
         .expect("fixture segmentation validates");
-        let mut started = CmafMuxerFactory::default()
+        let mut started = PassThroughMuxerFactory::default()
             .start(MuxerStartRequest {
                 presentation: &input,
                 segmentation: &segmentation,
@@ -1656,7 +1678,9 @@ mod tests {
         let events = Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>);
         let sink = events.scoped(SessionId(nz::u64!(2)));
         let mut started = start(
-            SegmentBoundaryPolicy::ExtendToRandomAccess,
+            SegmentBoundaryPolicy::ExtendToRandomAccess {
+                maximum_extension: Duration::from_secs(1),
+            },
             Timebase::new(nz::u32!(1), nz::u32!(16_384)),
             &sink,
         )
@@ -1688,7 +1712,52 @@ mod tests {
     }
 
     #[test]
-    fn rejects_subtitles_and_negotiated_timebase_changes() {
+    fn an_exhausted_extension_budget_fails_instead_of_overrunning_the_target() {
+        let sink = event_sink();
+        let mut started = start(
+            SegmentBoundaryPolicy::ExtendToRandomAccess {
+                maximum_extension: Duration::from_millis(500),
+            },
+            Timebase::new(nz::u32!(1), nz::u32!(16_384)),
+            &sink,
+        )
+        .expect("CMAF muxer starts");
+
+        assert_eq!(
+            started.presentation.renditions[0]
+                .config
+                .maximum_segment_duration,
+            nz::u64!(24_576),
+            "the advertised maximum is the planned segment plus the whole budget, \
+             so delivery can fix a target duration that covers every extension"
+        );
+
+        let mut media = Vec::new();
+        for value in [
+            sample(0, true),
+            sample(8_192, false),
+            sample(16_384, false),
+            sample(24_576, false),
+        ] {
+            started
+                .muxer
+                .push(value, &mut media)
+                .expect("waiting inside the budget is what extension mode is for");
+        }
+
+        assert!(
+            matches!(
+                started.muxer.push(sample(32_768, false), &mut media),
+                Err(crate::mux::MuxError::Mux(_))
+            ),
+            "past the budget the publication fails: its parts are already \
+             fetchable, so there is no later point at which an overrun could be \
+             contained"
+        );
+    }
+
+    #[test]
+    fn accepts_webvtt_and_rejects_negotiated_cmaf_timebase_changes() {
         let sink = event_sink();
         let subtitle_input = validate(
             &catalog(vec![
@@ -1722,15 +1791,19 @@ mod tests {
             ],
         )
         .expect("fixture segmentation validates");
-        assert!(matches!(
-            CmafMuxerFactory::default().start(MuxerStartRequest {
+        let started = PassThroughMuxerFactory::default()
+            .start(MuxerStartRequest {
                 presentation: &subtitle_input,
                 segmentation: &segmentation,
                 time_anchor: SystemTime::UNIX_EPOCH,
                 events: &sink,
-            }),
-            Err(crate::mux::MuxError::InvalidPlan(_))
-        ));
+            })
+            .expect("mixed CMAF and WebVTT presentation starts");
+        assert_eq!(
+            started.presentation.renditions[1].config.segment_format,
+            crate::mux::MediaSegmentFormat::WebVtt
+        );
+        assert_eq!(started.presentation.renditions[1].codecs.as_ref(), "wvtt");
 
         let changed = start(
             SegmentBoundaryPolicy::Strict,

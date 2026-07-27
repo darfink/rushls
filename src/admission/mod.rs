@@ -94,10 +94,6 @@ pub struct StreamPolicy {
     pub ingest_timing: IngestTimingPolicy,
     pub accepted_video_codecs: Vec<Codec>,
     pub accepted_audio_codecs: Vec<Codec>,
-    /// Cue formats a muxer on this node can present as WebVTT.
-    ///
-    /// Membership means the format is *reachable*, not that it is carried
-    /// unchanged — see [`Self::permissive`].
     pub accepted_subtitle_codecs: Vec<Codec>,
     pub maximum_audio_tracks: usize,
     pub maximum_subtitle_tracks: usize,
@@ -119,11 +115,8 @@ impl StreamPolicy {
     ///
     /// - [`Codec::WebVtt`] is a pass-through. Cues are already in the output
     ///   form and the muxer only has to package them.
-    /// - [`Codec::MovText`] is not. A tx3g sample is a length-prefixed string
-    ///   with optional style boxes; a `wvtt` sample is a `vttc` box carrying
-    ///   `payl` and `sttg`. Reaching WebVTT means decoding the cues and
-    ///   re-emitting them, which converts text and timing faithfully but
-    ///   preserves tx3g styling only in part.
+    /// - [`Codec::SubRip`] is converted cue-by-cue. FFmpeg has already removed
+    ///   the SRT index and timing lines, leaving text plus packet timing.
     ///
     /// Accepting it here is therefore a statement about admission, not about
     /// packaging: a muxer that cannot perform that conversion must reject the
@@ -137,7 +130,7 @@ impl StreamPolicy {
             },
             accepted_video_codecs: vec![Codec::H264, Codec::Hevc, Codec::Av1],
             accepted_audio_codecs: vec![Codec::Aac, Codec::Opus],
-            accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::MovText],
+            accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::SubRip],
             maximum_audio_tracks: 8,
             maximum_subtitle_tracks: 8,
             maximum_video_tracks: 8,

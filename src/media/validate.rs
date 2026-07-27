@@ -225,7 +225,7 @@ mod tests {
             ingest_timing: StreamPolicy::permissive().ingest_timing,
             accepted_video_codecs: vec![Codec::H264],
             accepted_audio_codecs: vec![Codec::Aac],
-            accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::MovText],
+            accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::SubRip],
             maximum_audio_tracks: 1,
             maximum_subtitle_tracks: 2,
             maximum_video_tracks: 1,
@@ -282,10 +282,9 @@ mod tests {
 
     #[test]
     fn accepts_every_cue_format_a_muxer_can_present_as_webvtt() {
-        // MovText is admitted even though it is not carried unchanged: HLS
-        // needs WebVTT out, and reaching it from tx3g is a cue conversion the
-        // muxer performs. Admission is about whether the format is reachable.
-        for codec in [Codec::WebVtt, Codec::MovText] {
+        // SubRip is admitted even though it is not carried unchanged: HLS
+        // needs WebVTT out, and the muxer can convert its demuxed cue text.
+        for codec in [Codec::WebVtt, Codec::SubRip] {
             let tracks = catalog(vec![
                 track(0, MediaKind::Video, Codec::H264),
                 track(1, MediaKind::Subtitle, codec),
@@ -295,6 +294,22 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{codec:?} subtitles are accepted: {error}"));
             assert_eq!(plan.counts().subtitle, 1);
         }
+    }
+
+    #[test]
+    fn mov_text_waits_for_its_dedicated_converter() {
+        let tracks = catalog(vec![
+            track(0, MediaKind::Video, Codec::H264),
+            track(1, MediaKind::Subtitle, Codec::MovText),
+        ]);
+
+        assert_eq!(
+            validate(&tracks, &policy()),
+            Err(ValidationError::UnsupportedCodec {
+                track_id: TrackId(1),
+                codec: Codec::MovText,
+            })
+        );
     }
 
     #[test]

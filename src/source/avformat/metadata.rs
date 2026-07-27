@@ -325,6 +325,7 @@ fn codec(codec: ffmpeg::AVCodecID) -> Codec {
         ffmpeg::AVCodecID::AV_CODEC_ID_OPUS => Codec::Opus,
         ffmpeg::AVCodecID::AV_CODEC_ID_WEBVTT => Codec::WebVtt,
         ffmpeg::AVCodecID::AV_CODEC_ID_MOV_TEXT => Codec::MovText,
+        ffmpeg::AVCodecID::AV_CODEC_ID_SUBRIP | ffmpeg::AVCodecID::AV_CODEC_ID_SRT => Codec::SubRip,
         other => Codec::Unknown(other as u32),
     }
 }
@@ -415,4 +416,15 @@ fn same_extradata(expected: &[u8], parameters: &ffmpeg::AVCodecParameters) -> bo
     }
     // SAFETY: codec parameters promise `extradata_size` readable bytes.
     unsafe { slice::from_raw_parts(parameters.extradata, size) == expected }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_ffmpeg_subrip_identifiers_share_one_domain_codec() {
+        assert_eq!(codec(ffmpeg::AVCodecID::AV_CODEC_ID_SUBRIP), Codec::SubRip);
+        assert_eq!(codec(ffmpeg::AVCodecID::AV_CODEC_ID_SRT), Codec::SubRip);
+    }
 }

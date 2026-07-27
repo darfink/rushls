@@ -122,11 +122,23 @@ impl PackagedRendition {
     /// Exact semantic identity is necessary but not sufficient: changing the
     /// media kind, codec family, or container under one playlist URI is poorly
     /// supported even when separated by a discontinuity.
+    ///
+    /// Packaging cadence is included for the same reason, one level down. A
+    /// reconnect that repartitions the timeline is still the same *stream*, but
+    /// it is no longer the same series of segments, and delivery formats that
+    /// commit to a cadence for a playlist's lifetime cannot absorb the change
+    /// under the existing identity. What such a format then does about it —
+    /// retire the old output, start a new one — is its own decision; this only
+    /// reports that the two are not continuations of each other.
     pub fn compatible_with(&self, other: &Self) -> bool {
         self.key == other.key
             && self.media.kind() == other.media.kind()
             && self.codecs == other.codecs
             && self.config.segment_format == other.config.segment_format
+            && self.config.timebase == other.config.timebase
+            && self.config.segment_target == other.config.segment_target
+            && self.config.maximum_segment_duration == other.config.maximum_segment_duration
+            && self.config.chunk_target == other.config.chunk_target
     }
 }
 

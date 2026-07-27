@@ -4,9 +4,9 @@ use crate::{
     domain::{MediaKind, Payload, RenditionId, Timebase, fixtures::TrackBuilder},
     media::fixtures::presentation as validated,
     mux::{
-        InitializationSegment, PackagedChunk, PackagedMedia, PackagedPresentation,
-        PackagedRendition, PackagedSegment, PackagedSegmentCompletion, PackagingRenditionId,
-        PackagingSegmentId, RenditionKey,
+        InitializationSegment, MediaSegmentFormat, PackagedChunk, PackagedMedia,
+        PackagedPresentation, PackagedRendition, PackagedSegment, PackagedSegmentCompletion,
+        PackagingRenditionId, PackagingSegmentId, RenditionConfig, RenditionKey,
         fixtures::{RenditionBuilder, config, presentation_at},
     },
 };
@@ -75,14 +75,32 @@ fn keyed_presentation(
     chunked: bool,
     time_anchor: SystemTime,
 ) -> Arc<PackagedPresentation> {
+    presentation_with(
+        local_id,
+        key,
+        config(timebase(), 6, chunked.then_some(1)),
+        time_anchor,
+    )
+}
+
+/// The same, with the packaging cadence spelled out.
+///
+/// Cadence is what the playlist contract is derived from, so a test about
+/// contracts has to be able to state it rather than inherit the default.
+fn presentation_with(
+    local_id: u32,
+    key: &str,
+    rendition_config: RenditionConfig,
+    time_anchor: SystemTime,
+) -> Arc<PackagedPresentation> {
     let input = validated(vec![
         TrackBuilder::new(0, MediaKind::Video)
-            .timebase(timebase())
+            .timebase(rendition_config.timebase)
             .build(),
     ]);
     let rendition = RenditionBuilder::new(local_id, MediaKind::Video)
         .key(key)
-        .config(config(timebase(), 6, chunked.then_some(1)))
+        .config(rendition_config)
         .build();
     Arc::new(presentation_at(time_anchor, &input, vec![rendition]))
 }
@@ -136,6 +154,20 @@ fn direct(rendition: u32, segment: u64, start: i64, duration: u64, bytes: usize)
 
 fn write(lease: &StreamLease, media: PackagedMedia) {
     assert_eq!(lease.write(media), Ok(true));
+}
+
+/// Publishes one whole six-second segment as the parts that compose it.
+///
+/// A part may not exceed PART-TARGET, so advancing the playlist by a segment
+/// means publishing six one-second parts rather than one six-second part.
+fn write_segment(lease: &StreamLease, rendition: u32, segment: u64, start: i64) {
+    for index in 0..6 {
+        write(
+            lease,
+            chunk(rendition, segment, index, start + i64::from(index), 1, 1),
+        );
+    }
+    write(lease, completion(rendition, segment, start, 6));
 }
 
 fn configure(lease: &StreamLease, rendition: u32, chunked: bool) {
@@ -303,11 +335,16 @@ fn completing_a_chunked_segment_reuses_the_original_payloads() {
             packaging_segment_id: PackagingSegmentId(0),
             chunk_index: 0,
             media_start: 0,
-            duration: 6,
+            duration: 1,
             independent: true,
             payload: original,
         }),
     );
+    // The rest of the segment carries no bytes, so the retained total and the
+    // observed bitrate below still describe exactly the one tracked payload.
+    for index in 1..6 {
+        write(&lease, chunk(0, 0, index, index as i64, 1, 0));
+    }
     assert!(
         !lease
             .live()
@@ -360,6 +397,84 @@ fn direct_segments_remain_contiguous() {
             .bitrate
             .average_bits_per_second,
         Some(12)
+    );
+}
+
+#[test]
+fn webvtt_initialization_and_direct_segments_are_retained_as_authored() {
+    let input = validated(vec![
+        TrackBuilder::new(0, MediaKind::Video)
+            .timebase(timebase())
+            .build(),
+        TrackBuilder::new(1, MediaKind::Subtitle)
+            .timebase(timebase())
+            .build(),
+    ]);
+    let video = rendition(0, true);
+    let subtitle = RenditionBuilder::for_track(
+        1,
+        input
+            .catalog()
+            .get(crate::domain::TrackId(1))
+            .expect("subtitle track exists"),
+    )
+    .key("subtitle/english")
+    .config(RenditionConfig {
+        timebase: timebase(),
+        segment_target: nz::u64!(6),
+        maximum_segment_duration: nz::u64!(6),
+        chunk_target: None,
+        segment_format: MediaSegmentFormat::WebVtt,
+    })
+    .build();
+    let presentation = Arc::new(presentation_at(
+        SystemTime::UNIX_EPOCH,
+        &input,
+        vec![video, subtitle],
+    ));
+    let store = store();
+    let lease = store
+        .lease(stream(), presentation)
+        .expect("WebVTT publication fits");
+    let header = b"WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n";
+    let cue = b"00:00:00.000 --> 00:00:01.000\nHello\n\n";
+
+    write(
+        &lease,
+        PackagedMedia::Initialization(InitializationSegment {
+            rendition_id: PackagingRenditionId(1),
+            version: 0,
+            payload: Payload::from(header.to_vec()),
+        }),
+    );
+    write(
+        &lease,
+        PackagedMedia::Segment(PackagedSegment {
+            rendition_id: PackagingRenditionId(1),
+            packaging_segment_id: PackagingSegmentId(0),
+            media_start: 0,
+            duration: 1,
+            independent: true,
+            payload: Payload::from(cue.to_vec()),
+        }),
+    );
+
+    let snapshot = lease
+        .live()
+        .rendition(RenditionId(1))
+        .expect("subtitle rendition is retained");
+    assert_eq!(snapshot.initializations[0].payload.as_bytes(), header);
+    assert!(matches!(
+        &snapshot.segments[0].kind,
+        StoredSegmentKind::Media(SegmentBody::Contiguous(payload))
+            if payload.as_bytes() == cue
+    ));
+    assert_eq!(
+        snapshot
+            .config
+            .expect("configuration is advertised")
+            .segment_format,
+        MediaSegmentFormat::WebVtt
     );
 }
 
@@ -634,9 +749,14 @@ async fn part_tags_and_resources_have_distinct_retention_deadlines() {
     write(&lease, completion(0, 0, 0, 1));
     let part_id = PartId(1);
 
+    // Six one-second parts per segment: a part may not exceed PART-TARGET, so
+    // advancing the live edge by a whole segment means publishing the parts
+    // that actually compose one.
     for id in 1..=4 {
         let start = 1 + (id as i64 - 1) * 6;
-        write(&lease, chunk(0, id, 0, start, 6, 1));
+        for index in 0..6 {
+            write(&lease, chunk(0, id, index, start + index as i64, 1, 1));
+        }
         write(&lease, completion(0, id, start, 6));
     }
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
@@ -882,4 +1002,192 @@ async fn lock_free_lookups_coexist_with_takeover_and_retirement_checks() {
     }
     assert!(store.get(&stream()).is_some());
     drop(held);
+}
+
+#[test]
+fn a_takeover_marks_the_open_segment_before_any_of_its_parts_is_tagged() {
+    let store = store();
+    let first = lease(&store, &[(0, true)]);
+    configure(&first, 0, true);
+    write(&first, chunk(0, 0, 0, 0, 1, 1));
+
+    let second = lease(&store, &[(0, true)]);
+    configure(&second, 0, true);
+    write(&second, chunk(0, 0, 0, 0, 1, 1));
+
+    let snapshot = second.live().rendition(RenditionId(0)).unwrap();
+    let open = snapshot
+        .open_segment
+        .as_ref()
+        .expect("the successor opened a segment");
+    assert!(
+        open.discontinuity_before,
+        "a projection has to place the discontinuity before this segment's first \
+         part tag, which is published long before the segment completes"
+    );
+    assert!(
+        !snapshot.segments[0].discontinuity_before,
+        "the first parent a rendition ever creates follows nothing"
+    );
+    assert_eq!(
+        (snapshot.media_sequence, snapshot.discontinuity_sequence),
+        (0, 0),
+        "a tag still inside the window has not been removed from it"
+    );
+}
+
+#[test]
+fn an_evicted_discontinuity_becomes_a_sequence_number_rather_than_nothing() {
+    let store = store();
+    let first = lease(&store, &[(0, true)]);
+    configure(&first, 0, true);
+    write(&first, chunk(0, 0, 0, 0, 1, 1));
+
+    // The successor publishes enough segments to push its own first one — the
+    // segment carrying the discontinuity — out of the visible window.
+    let second = lease(&store, &[(0, true)]);
+    configure(&second, 0, true);
+    for id in 0..7 {
+        write_segment(&second, 0, id, id as i64 * 6);
+    }
+
+    let snapshot = second.live().rendition(RenditionId(0)).unwrap();
+    assert_eq!(snapshot.segments.len(), 6);
+    assert_eq!(
+        snapshot.media_sequence, 2,
+        "the window head is the gap and the discontinuous segment behind it"
+    );
+    assert_eq!(
+        snapshot.discontinuity_sequence, 1,
+        "the splice is still described once its tag is gone; a viewer joining \
+         now must not read the window as continuous with what preceded it"
+    );
+    assert!(
+        snapshot
+            .segments
+            .iter()
+            .all(|segment| !segment.discontinuity_before),
+        "nothing left in the window is itself a splice"
+    );
+}
+
+#[test]
+fn a_reconnect_that_changes_cadence_gets_a_new_playlist_rather_than_new_terms() {
+    let store = store();
+    let first = store
+        .lease(
+            stream(),
+            presentation_with(
+                0,
+                "camera/main",
+                config(timebase(), 6, None),
+                SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .unwrap();
+    write(&first, initialization(0, 1));
+    write(&first, direct(0, 0, 0, 6, 1));
+
+    let _second = store
+        .lease(
+            stream(),
+            presentation_with(
+                0,
+                "camera/main",
+                config(timebase(), 10, None),
+                SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .unwrap();
+
+    let catalog = store.get(&stream()).unwrap().snapshot();
+    assert_eq!(
+        catalog.renditions.len(),
+        2,
+        "the same key at a different cadence is a different playlist, because \
+         EXT-X-TARGETDURATION cannot change under viewers already reading one"
+    );
+    assert_eq!(
+        (
+            catalog.renditions[0].contract.target_duration,
+            catalog.renditions[1].contract.target_duration
+        ),
+        (nz::u64!(6), nz::u64!(10))
+    );
+    assert!(!catalog.renditions[0].active && catalog.renditions[1].active);
+    assert!(
+        catalog.renditions[0].snapshot().live_edge.ended,
+        "the playlist that cannot continue ends cleanly instead of stalling"
+    );
+}
+
+#[test]
+fn media_breaking_the_advertised_target_is_refused_without_disturbing_the_playlist() {
+    let store = store();
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    for index in 0..6 {
+        write(&lease, chunk(0, 0, index, i64::from(index), 1, 1));
+    }
+    let published = lease.live().rendition(RenditionId(0)).unwrap();
+
+    assert!(matches!(
+        lease.write(chunk(0, 0, 6, 6, 1, 1)),
+        Err(StoreWriteError::SegmentTooLong { .. })
+    ));
+    assert!(
+        Arc::ptr_eq(&published, &lease.live().rendition(RenditionId(0)).unwrap()),
+        "a refused write leaves the request-facing snapshot exactly as it was"
+    );
+    assert_eq!(
+        lease.write(completion(0, 0, 0, 6)),
+        Ok(true),
+        "the segment the publisher actually produced is still accepted"
+    );
+}
+
+#[test]
+fn a_part_is_held_to_its_target_at_both_ends() {
+    let store = store();
+    // Milliseconds, so a part can be a fraction of its target: six-second
+    // segments cut into one-second parts.
+    let millisecond = Timebase::new(nz::u32!(1), nz::u32!(1_000));
+    let lease = store
+        .lease(
+            stream(),
+            presentation_with(
+                0,
+                "camera/main",
+                config(millisecond, 6_000, Some(1_000)),
+                SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .unwrap();
+    write(&lease, initialization(0, 1));
+
+    assert!(
+        matches!(
+            lease.write(chunk(0, 0, 0, 0, 1_001, 1)),
+            Err(StoreWriteError::PartTooLong { .. })
+        ),
+        "a part longer than PART-TARGET is refused outright"
+    );
+
+    write(&lease, chunk(0, 0, 0, 0, 500, 1));
+    assert!(
+        matches!(
+            lease.write(chunk(0, 0, 1, 500, 1_000, 1)),
+            Err(StoreWriteError::PartTooShort {
+                minimum,
+                ..
+            }) if minimum == Duration::from_millis(850)
+        ),
+        "a short part is legal only as the last of its segment, so its \
+         successor's arrival is what makes it invalid"
+    );
+    assert_eq!(
+        lease.write(completion(0, 0, 0, 500)),
+        Ok(true),
+        "closing the segment leaves the short part final, and legal"
+    );
 }

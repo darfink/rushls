@@ -9,9 +9,11 @@ mod dictionary;
 mod error;
 mod packet;
 mod rational;
+mod subtitle;
 
 pub use audio::{read_audio_trim, write_audio_trim};
 pub use dictionary::{Dictionary, value};
 pub use error::AvError;
 pub use packet::OwnedPacket;
 pub use rational::{RationalError, from_av_rational, to_av_rational};
+pub use subtitle::{read_subtitle_position, read_webvtt_metadata};

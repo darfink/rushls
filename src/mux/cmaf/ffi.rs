@@ -356,7 +356,7 @@ fn codec_id(codec: Codec) -> Result<av::AVCodecID, Box<str>> {
         Codec::Av1 => Ok(av::AVCodecID::AV_CODEC_ID_AV1),
         Codec::Aac => Ok(av::AVCodecID::AV_CODEC_ID_AAC),
         Codec::Opus => Ok(av::AVCodecID::AV_CODEC_ID_OPUS),
-        Codec::MovText | Codec::WebVtt => {
+        Codec::MovText | Codec::SubRip | Codec::WebVtt => {
             Err("subtitle codecs are not supported by the CMAF muxer".into())
         }
         Codec::Unknown(id) => Err(format!("codec {id} is not supported by the CMAF muxer").into()),

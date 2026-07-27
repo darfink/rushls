@@ -1,0 +1,190 @@
+//! Playlist values derived from the locked plan rather than from what arrived.
+//!
+//! Everything here is a function of a rendition's frozen [`PlaylistContract`]
+//! and the presentation it belongs to. Nothing is inferred from observed media:
+//! a value learned from the first segment is a value that changes when the
+//! second one differs, and HLS treats several of these as promises for a
+//! playlist's whole life.
+
+use std::time::{Duration, SystemTime};
+
+use crate::{
+    delivery::hls::{PlaylistContract, TargetDurationMultiple, manifest::ServerControl},
+    domain::{TickTimestamp, Timebase},
+};
+
+/// Presentation-wide timing and timeout policy for HLS delivery.
+///
+/// HLS requires that *every* media playlist of one multivariant presentation
+/// carry an identical `EXT-X-SERVER-CONTROL`, so the advertised values are
+/// multiples of the presentation's widest cadence rather than of each
+/// rendition's own. Request deadlines live beside them so all delivery timing
+/// defaults are visible in one configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliveryTimingPolicy {
+    /// Multiple of the longest target duration; Apple requires at least 3.
+    pub hold_back: TargetDurationMultiple,
+    /// Multiple of the longest part target; Apple requires at least 3.
+    pub part_hold_back: TargetDurationMultiple,
+    /// Maximum blocking-reload and preload-hint wait.
+    pub blocking_reload: TargetDurationMultiple,
+    pub can_block_reload: bool,
+}
+
+impl Default for DeliveryTimingPolicy {
+    fn default() -> Self {
+        Self {
+            hold_back: TargetDurationMultiple::integer(3),
+            part_hold_back: TargetDurationMultiple::integer(3),
+            blocking_reload: TargetDurationMultiple::integer(3),
+            can_block_reload: true,
+        }
+    }
+}
+
+/// The `EXT-X-SERVER-CONTROL` every playlist in this presentation must carry.
+///
+/// Derived once across renditions, never per playlist. A presentation whose
+/// audio and video advertised different hold-backs would be malformed even
+/// though each value was individually reasonable, so the widest cadence present
+/// sets the value for all of them.
+///
+/// `CAN-SKIP-UNTIL` is deliberately absent: advertising a skip boundary commits
+/// the origin to rendering Playlist Delta Updates, and until that exists the
+/// honest advertisement is silence rather than a promise keyed on how much
+/// happens to be retained.
+pub fn server_control(
+    contracts: impl IntoIterator<Item = PlaylistContract>,
+    policy: DeliveryTimingPolicy,
+) -> Option<ServerControl> {
+    let mut longest_target = None::<Duration>;
+    let mut longest_part_target = None::<Duration>;
+    for contract in contracts {
+        let target = Duration::from_secs(contract.target_duration.get());
+        longest_target = Some(longest_target.map_or(target, |current| current.max(target)));
+        // Only renditions that publish parts contribute a part target. A
+        // presentation mixing chunked video with segment-only WebVTT still
+        // needs exactly one PART-HOLD-BACK, sized by the ones that have parts.
+        if let Some(part_target) = contract.part_target {
+            longest_part_target =
+                Some(longest_part_target.map_or(part_target, |current| current.max(part_target)));
+        }
+    }
+
+    Some(ServerControl {
+        hold_back: Some(policy.hold_back.apply(longest_target?)),
+        part_hold_back: longest_part_target.map(|target| policy.part_hold_back.apply(target)),
+        can_block_reload: policy.can_block_reload,
+        can_skip_until: None,
+        can_skip_dateranges: false,
+    })
+}
+
+/// How long a blocking playlist reload may be left unsatisfied.
+///
+/// The default is three target durations, after which the request is answered
+/// with a temporary failure rather than held indefinitely.
+pub fn blocking_reload_deadline(
+    contract: PlaylistContract,
+    policy: DeliveryTimingPolicy,
+) -> Duration {
+    policy
+        .blocking_reload
+        .apply(Duration::from_secs(contract.target_duration.get()))
+}
+
+/// The wall-clock time at which media starting at `media_start` is presented.
+///
+/// `media_start` is signed and may precede its publication's anchor: audio
+/// priming puts the first encoded access unit before the presentation origin,
+/// and a segmentation origin can sit earlier still. Both directions are
+/// handled, and a time falling outside `SystemTime` is reported absent rather
+/// than clamped to a wrong instant.
+pub fn program_date_time(
+    anchor: SystemTime,
+    media_start: TickTimestamp,
+    timebase: Timebase,
+) -> Option<SystemTime> {
+    match u64::try_from(media_start) {
+        Ok(forward) => anchor.checked_add(timebase.ticks_to_duration(forward)),
+        Err(_) => anchor.checked_sub(timebase.ticks_to_duration(media_start.unsigned_abs())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::mux::fixtures::config;
+
+    use super::*;
+
+    fn contract(segment_ticks: u64, chunk_ticks: Option<u64>) -> PlaylistContract {
+        let timebase = Timebase::new(nz::u32!(1), nz::u32!(1));
+        PlaylistContract::derive(&config(timebase, segment_ticks, chunk_ticks))
+    }
+
+    #[test]
+    fn one_server_control_covers_the_widest_cadence_in_the_presentation() {
+        let control = server_control(
+            [
+                contract(4, Some(1)),
+                contract(6, Some(2)),
+                // Segment-only WebVTT contributes a target but no part target.
+                contract(6, None),
+            ],
+            DeliveryTimingPolicy::default(),
+        )
+        .expect("an active presentation has a server control");
+
+        assert_eq!(control.hold_back, Some(Duration::from_secs(18)));
+        assert_eq!(control.part_hold_back, Some(Duration::from_secs(6)));
+        assert!(control.can_block_reload);
+        assert_eq!(
+            control.can_skip_until, None,
+            "a skip boundary is a promise to render delta updates"
+        );
+    }
+
+    #[test]
+    fn a_presentation_without_parts_advertises_no_part_hold_back() {
+        let control = server_control([contract(6, None)], DeliveryTimingPolicy::default())
+            .expect("a segment-only presentation still has a server control");
+
+        assert_eq!(control.part_hold_back, None);
+        assert_eq!(control.hold_back, Some(Duration::from_secs(18)));
+    }
+
+    #[test]
+    fn a_presentation_with_no_renditions_has_nothing_to_control() {
+        assert_eq!(server_control([], DeliveryTimingPolicy::default()), None);
+    }
+
+    #[test]
+    fn blocking_reload_uses_the_delivery_timing_policy() {
+        let policy = DeliveryTimingPolicy {
+            blocking_reload: TargetDurationMultiple::integer(4),
+            ..DeliveryTimingPolicy::default()
+        };
+
+        assert_eq!(
+            blocking_reload_deadline(contract(6, Some(1)), policy),
+            Duration::from_secs(24)
+        );
+    }
+
+    #[test]
+    fn program_date_time_handles_media_beginning_before_its_anchor() {
+        let anchor = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let timebase = Timebase::hz90k();
+
+        assert_eq!(
+            program_date_time(anchor, 90_000, timebase),
+            Some(anchor + Duration::from_secs(1))
+        );
+        assert_eq!(
+            program_date_time(anchor, -45_000, timebase),
+            Some(anchor - Duration::from_millis(500)),
+            "priming puts the first encoded unit before the presentation origin"
+        );
+        assert_eq!(program_date_time(anchor, 0, timebase), Some(anchor));
+    }
+}

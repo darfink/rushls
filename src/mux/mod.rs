@@ -16,13 +16,16 @@ use crate::{
 };
 
 mod cmaf;
+mod passthrough;
 mod presentation;
 mod track;
+mod webvtt;
 
 #[cfg(test)]
 pub mod fixtures;
 
-pub use cmaf::{CmafMuxerConfig, CmafMuxerFactory, SegmentBoundaryPolicy};
+pub use cmaf::{CmafMuxerConfig, SegmentBoundaryPolicy};
+pub use passthrough::PassThroughMuxerFactory;
 pub use track::{TrackPackager, TrackRouter};
 
 pub use presentation::{
@@ -49,6 +52,15 @@ pub struct PackagingSegmentId(pub u64);
 pub struct RenditionConfig {
     pub timebase: Timebase,
     pub segment_target: NonZero<TickDuration>,
+    /// The longest segment this muxer may ever emit.
+    ///
+    /// Equal to [`Self::segment_target`] when boundaries are exact. A policy
+    /// that waits past the planned boundary for a random-access sample must
+    /// declare the whole budget here, because delivery advertises a target
+    /// duration that cannot change once a viewer has seen it: an extension
+    /// discovered after the fact cannot be retracted from playlists that have
+    /// already published the segment's parts.
+    pub maximum_segment_duration: NonZero<TickDuration>,
     pub chunk_target: Option<NonZero<TickDuration>>,
     pub segment_format: MediaSegmentFormat,
 }

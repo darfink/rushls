@@ -124,6 +124,58 @@ impl Timebase {
     }
 }
 
+/// A checked projection from one tick domain into another.
+///
+/// Keeping the pair together makes interval conversion use the same mapping as
+/// timestamp conversion. Projecting both interval endpoints ensures adjacent
+/// intervals remain adjacent instead of accumulating independently rounded
+/// durations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimebaseProjection {
+    source: Timebase,
+    destination: Timebase,
+}
+
+impl TimebaseProjection {
+    pub const fn new(source: Timebase, destination: Timebase) -> Self {
+        Self {
+            source,
+            destination,
+        }
+    }
+
+    pub fn timestamp(self, value: TickTimestamp) -> Option<TickTimestamp> {
+        self.source.checked_rescale_ticks(value, self.destination)
+    }
+
+    pub fn interval(
+        self,
+        start: TickTimestamp,
+        duration: TickDuration,
+    ) -> Option<(TickTimestamp, TickDuration)> {
+        let end = start.checked_add_unsigned(duration)?;
+        let projected_start = self.timestamp(start)?;
+        let projected_end = self.timestamp(end)?;
+        let projected_duration = projected_end
+            .checked_sub(projected_start)
+            .and_then(|duration| TickDuration::try_from(duration).ok())
+            .filter(|duration| *duration > 0)?;
+        Some((projected_start, projected_duration))
+    }
+
+    /// The ceiling of one source tick measured in destination ticks.
+    pub fn one_source_tick_ceil(self) -> Option<TickDuration> {
+        let numerator = u128::from(self.source.num.get())
+            .checked_mul(u128::from(self.destination.den.get()))?;
+        let denominator = u128::from(self.source.den.get())
+            .checked_mul(u128::from(self.destination.num.get()))?;
+        let ticks = numerator
+            .checked_add(denominator.checked_sub(1)?)?
+            .checked_div(denominator)?;
+        TickDuration::try_from(ticks).ok()
+    }
+}
+
 /// Requantizes ordered tick deltas while carrying their fractional remainder.
 ///
 /// Absolute timestamps and observed intervals should be projected from their
@@ -282,6 +334,17 @@ mod tests {
                 .checked_rescale_ticks(i64::MAX, Timebase::new(nz::u32!(1), nz::u32!(u32::MAX))),
             None
         );
+    }
+
+    #[test]
+    fn interval_projection_uses_absolute_endpoints() {
+        let projection = TimebaseProjection::new(
+            Timebase::new(nz::u32!(1), nz::u32!(10_000)),
+            Timebase::hz90k(),
+        );
+
+        assert_eq!(projection.interval(333, 334), Some((2_997, 3_006)));
+        assert_eq!(projection.one_source_tick_ceil(), Some(9));
     }
 
     #[test]
