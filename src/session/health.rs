@@ -13,10 +13,10 @@ pub struct HealthPolicy {
     pub source_stall_timeout: Duration,
     /// How long normalization may produce nothing while input still arrives.
     pub media_stall_timeout: Duration,
-    /// Multiple of the locked part cadence tolerated between publications.
-    pub stalled_part_multiplier: u32,
-    /// Floor for the publication deadline, for very short part targets.
-    pub minimum_part_stall_tolerance: Duration,
+    /// Multiple of the expected output cadence tolerated between publications.
+    pub stalled_publication_multiplier: u32,
+    /// Floor for the publication deadline, for very short output cadences.
+    pub minimum_publication_stall_tolerance: Duration,
 }
 
 impl Default for HealthPolicy {
@@ -24,8 +24,8 @@ impl Default for HealthPolicy {
         Self {
             source_stall_timeout: Duration::from_secs(5),
             media_stall_timeout: Duration::from_secs(5),
-            stalled_part_multiplier: 3,
-            minimum_part_stall_tolerance: Duration::from_secs(1),
+            stalled_publication_multiplier: 3,
+            minimum_publication_stall_tolerance: Duration::from_secs(1),
         }
     }
 }
@@ -37,16 +37,16 @@ pub enum HealthEvaluation {
     /// Before segmentation locks there is no cadence to fall behind.
     #[display("waiting for media")]
     WaitingForMedia,
-    #[display("waiting for the first part")]
-    WaitingForFirstPart,
+    #[display("waiting for the first publication")]
+    WaitingForFirstPublication,
     #[display("intentionally pacing an ahead-of-time publisher")]
     PacingPublisher,
     #[display("the input delivered nothing for {stalled_for:?}")]
     SourceStalled { stalled_for: Duration },
     #[display("normalization produced nothing for {stalled_for:?}")]
     MediaStalled { stalled_for: Duration },
-    #[display("part publication is {overdue_by:?} overdue")]
-    PartPublicationStalled { overdue_by: Duration },
+    #[display("media publication is {overdue_by:?} overdue")]
+    PublicationStalled { overdue_by: Duration },
 }
 
 impl HealthEvaluation {
@@ -56,7 +56,7 @@ impl HealthEvaluation {
             self,
             Self::SourceStalled { .. }
                 | Self::MediaStalled { .. }
-                | Self::PartPublicationStalled { .. }
+                | Self::PublicationStalled { .. }
         )
     }
 }
@@ -102,16 +102,16 @@ pub fn evaluate(
         return HealthEvaluation::WaitingForMedia;
     }
 
-    let Some(part_idle) = meters.part_idle_for(now) else {
-        return HealthEvaluation::WaitingForFirstPart;
+    let Some(publication_idle) = meters.publication_idle_for(now) else {
+        return HealthEvaluation::WaitingForFirstPublication;
     };
     let deadline = expected_publication_interval
-        .saturating_mul(policy.stalled_part_multiplier)
-        .max(policy.minimum_part_stall_tolerance);
+        .saturating_mul(policy.stalled_publication_multiplier)
+        .max(policy.minimum_publication_stall_tolerance);
 
-    if part_idle > deadline {
-        HealthEvaluation::PartPublicationStalled {
-            overdue_by: part_idle - deadline,
+    if publication_idle > deadline {
+        HealthEvaluation::PublicationStalled {
+            overdue_by: publication_idle - deadline,
         }
     } else {
         HealthEvaluation::Healthy
@@ -132,8 +132,8 @@ mod tests {
         HealthPolicy {
             source_stall_timeout: Duration::from_secs(5),
             media_stall_timeout: Duration::from_secs(5),
-            stalled_part_multiplier: 2,
-            minimum_part_stall_tolerance: Duration::ZERO,
+            stalled_publication_multiplier: 2,
+            minimum_publication_stall_tolerance: Duration::ZERO,
         }
     }
 
@@ -248,7 +248,7 @@ mod tests {
         // Two seconds idle against a 400ms deadline.
         assert_eq!(
             evaluation,
-            HealthEvaluation::PartPublicationStalled {
+            HealthEvaluation::PublicationStalled {
                 overdue_by: Duration::from_millis(1_600),
             }
         );
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_running_session_before_its_first_part_is_waiting_not_stalled() {
+    async fn a_running_session_before_its_first_publication_is_waiting_not_stalled() {
         let meters = meters();
         meters.source_view().source_progress(1_024, 4, 0);
         meters.media_view().media_progress(4, 4);
@@ -270,7 +270,7 @@ mod tests {
             policy(),
         );
 
-        assert_eq!(evaluation, HealthEvaluation::WaitingForFirstPart);
+        assert_eq!(evaluation, HealthEvaluation::WaitingForFirstPublication);
         assert!(!evaluation.is_stalled());
     }
 

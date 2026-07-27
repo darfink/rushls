@@ -13,7 +13,7 @@ mod time;
 mod track;
 
 pub use appender::Appender;
-pub use ids::{RenditionId, SessionId, StreamId, TrackId};
+pub use ids::{RenditionId, SessionId, SourceTrackKey, StreamId, TrackId};
 pub use payload::Payload;
 pub use time::{TickDuration, TickOffset, TickTimestamp, Timebase, duration_since, offset_from};
 pub use track::{

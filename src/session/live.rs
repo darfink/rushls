@@ -9,7 +9,7 @@ use crate::{
         MediaDensityError, MediaDensityWindow, MediaError, MediaNormalizer, MediaPacer,
         NormalizedSample, PacingError, SampleSource, TimelineCalibration,
     },
-    mux::{FinishReason, MuxError, MuxedMedia, Muxer},
+    mux::{FinishReason, MuxError, Muxer, PackagedMedia},
     observe::{DeliveryMeters, MediaMeters, MuxMeters},
     source::{
         BatchUnit, BoundedBatch, BoundedPacketBatch, InputLimits, InputState, Packet, PacketSource,
@@ -161,7 +161,7 @@ pub struct MediaTail {
     publisher: Box<dyn HlsPublisher>,
     mux_meters: Arc<dyn MuxMeters>,
     delivery_meters: Arc<dyn DeliveryMeters>,
-    media: Vec<MuxedMedia>,
+    media: Vec<PackagedMedia>,
 }
 
 impl MediaTail {
@@ -187,22 +187,22 @@ impl MediaTail {
         while let Some(sample) = samples.pop_front() {
             self.muxer.push(sample, &mut self.media)?;
         }
-        let (parts, segments) = count(&self.media);
-        self.mux_meters.mux_progress(parts, segments);
+        let (chunks, segments) = count_packaged(&self.media);
+        self.mux_meters.mux_progress(chunks, segments);
         self.publish()
     }
 
     fn write_one(&mut self, sample: NormalizedSample) -> Result<(), ExecutionError> {
         self.muxer.push(sample, &mut self.media)?;
-        let (parts, segments) = count(&self.media);
-        self.mux_meters.mux_progress(parts, segments);
+        let (chunks, segments) = count_packaged(&self.media);
+        self.mux_meters.mux_progress(chunks, segments);
         self.publish()
     }
 
     fn finish(&mut self, reason: FinishReason) -> Result<(), ExecutionError> {
         self.muxer.finish(reason, &mut self.media)?;
-        let (parts, segments) = count(&self.media);
-        self.mux_meters.mux_progress(parts, segments);
+        let (chunks, segments) = count_packaged(&self.media);
+        self.mux_meters.mux_progress(chunks, segments);
         self.publish()?;
         self.publisher.finish(reason)?;
         Ok(())
@@ -214,11 +214,13 @@ impl MediaTail {
         let mut result = Ok(());
 
         for media in self.media.drain(..) {
-            let (part, segment) = weigh(&media);
+            let (chunk, completed_segment) = media_object_count(&media);
             match self.publisher.write(media) {
                 Ok(PublishOutcome::Published) => {
-                    parts += part;
-                    segments += segment;
+                    // Packaging calls these chunks; HLS projects each one as
+                    // a partial segment and therefore reports it as a part.
+                    parts += chunk;
+                    segments += completed_segment;
                 }
                 Ok(PublishOutcome::Superseded) => {}
                 Err(error) => {
@@ -236,18 +238,23 @@ impl MediaTail {
     }
 }
 
-fn count(media: &[MuxedMedia]) -> (u64, u64) {
-    media.iter().fold((0, 0), |(parts, segments), item| {
-        let (part, segment) = weigh(item);
-        (parts + part, segments + segment)
+fn count_packaged(media: &[PackagedMedia]) -> (u64, u64) {
+    media.iter().fold((0, 0), |(chunks, segments), item| {
+        let (chunk, segment) = media_object_count(item);
+        (chunks + chunk, segments + segment)
     })
 }
 
-fn weigh(media: &MuxedMedia) -> (u64, u64) {
+/// Returns the `(chunks, completed segments)` represented by one event.
+///
+/// Initialization events produce no media object. A direct segment and a
+/// chunked segment completion each represent one completed segment, while the
+/// completion carries no second copy of its payload.
+fn media_object_count(media: &PackagedMedia) -> (u64, u64) {
     match media {
-        MuxedMedia::Initialization(_) => (0, 0),
-        MuxedMedia::Part(_) => (1, 0),
-        MuxedMedia::Segment(_) => (0, 1),
+        PackagedMedia::Initialization(_) => (0, 0),
+        PackagedMedia::Chunk(_) => (1, 0),
+        PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) => (0, 1),
     }
 }
 
@@ -366,8 +373,8 @@ impl LiveSession {
 mod tests {
     use crate::{
         delivery::hls::PublishOutcome,
-        domain::{Appender, Payload, RenditionId},
-        mux::{MuxedPart, Muxer},
+        domain::{Appender, Payload},
+        mux::{Muxer, PackagedChunk, PackagingRenditionId, PackagingSegmentId},
         observe::{ProcessMeters, SessionMeters},
     };
 
@@ -376,10 +383,14 @@ mod tests {
     struct IdleMuxer;
 
     impl Muxer for IdleMuxer {
+        fn expected_publication_interval(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(1)
+        }
+
         fn push(
             &mut self,
             _sample: NormalizedSample,
-            _out: &mut dyn Appender<MuxedMedia>,
+            _out: &mut dyn Appender<PackagedMedia>,
         ) -> Result<(), MuxError> {
             Ok(())
         }
@@ -387,7 +398,7 @@ mod tests {
         fn finish(
             &mut self,
             _reason: FinishReason,
-            _out: &mut dyn Appender<MuxedMedia>,
+            _out: &mut dyn Appender<PackagedMedia>,
         ) -> Result<(), MuxError> {
             Ok(())
         }
@@ -396,7 +407,7 @@ mod tests {
     struct RevokedPublisher;
 
     impl HlsPublisher for RevokedPublisher {
-        fn write(&mut self, _media: MuxedMedia) -> Result<PublishOutcome, HlsError> {
+        fn write(&mut self, _media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
             Ok(PublishOutcome::Superseded)
         }
 
@@ -415,8 +426,10 @@ mod tests {
             session.mux_view(),
             session.delivery_view(),
         );
-        tail.media.push(MuxedMedia::Part(MuxedPart {
-            rendition_id: RenditionId(0),
+        tail.media.push(PackagedMedia::Chunk(PackagedChunk {
+            rendition_id: PackagingRenditionId(0),
+            packaging_segment_id: PackagingSegmentId(0),
+            chunk_index: 0,
             media_start: 0,
             duration: 1,
             independent: true,

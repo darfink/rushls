@@ -6,42 +6,70 @@
 //! and DASH — and separate from `media` because normalization is a codec and
 //! timing concern with an entirely different dependency set.
 
+use std::{num::NonZero, time::Duration};
+
 use thiserror::Error;
 
 use crate::{
-    domain::{Appender, Payload, RenditionId, TickDuration, TickTimestamp},
-    media::{NormalizedSample, PresentationPlan},
-    segment::SegmentationPlan,
+    domain::{Appender, Payload, TickDuration, TickTimestamp, Timebase},
+    media::NormalizedSample,
+};
+
+mod presentation;
+
+pub use presentation::{
+    MuxerStartRequest, PackagedPresentation, PackagedPresentationError, PackagedRendition,
+    PackagingRenditionId, PlayableCombination, RenditionGroup, RenditionGroupKey, RenditionKey,
+    RenditionMedia, StartedMuxer, VideoRange,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContainerFormat {
+pub enum MediaSegmentFormat {
     Cmaf,
     MpegTs,
     WebVtt,
 }
 
+/// Identifies a segment within one muxer publication and rendition.
+///
+/// Delivery assigns its own durable identifiers because this value may restart
+/// when a publisher reconnects.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PackagingSegmentId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RenditionConfig {
+    pub timebase: Timebase,
+    pub segment_target: NonZero<TickDuration>,
+    pub chunk_target: Option<NonZero<TickDuration>>,
+    pub segment_format: MediaSegmentFormat,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MuxedMedia {
+pub enum PackagedMedia {
     /// Header a player must fetch before any media of this rendition.
     Initialization(InitializationSegment),
-    /// A partial segment, publishable before the segment it belongs to closes.
-    Part(MuxedPart),
-    /// A closed segment covering the parts that preceded it.
-    Segment(MuxedSegment),
+    /// A container chunk, publishable before the segment it belongs to closes.
+    Chunk(PackagedChunk),
+    /// A complete segment emitted without progressively published chunks.
+    Segment(PackagedSegment),
+    /// Closes the segment assembled from the chunks that preceded it.
+    SegmentCompleted(PackagedSegmentCompletion),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InitializationSegment {
-    pub rendition_id: RenditionId,
-    pub format: ContainerFormat,
+    pub rendition_id: PackagingRenditionId,
     pub version: u64,
     pub payload: Payload,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MuxedPart {
-    pub rendition_id: RenditionId,
+pub struct PackagedChunk {
+    pub rendition_id: PackagingRenditionId,
+    /// Publisher-local segment identity; delivery assigns a durable HLS ID.
+    pub packaging_segment_id: PackagingSegmentId,
+    pub chunk_index: u32,
     pub media_start: TickTimestamp,
     pub duration: TickDuration,
     pub independent: bool,
@@ -49,19 +77,32 @@ pub struct MuxedPart {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MuxedSegment {
-    pub rendition_id: RenditionId,
+pub struct PackagedSegment {
+    pub rendition_id: PackagingRenditionId,
+    /// Publisher-local segment identity; delivery assigns a durable HLS ID.
+    pub packaging_segment_id: PackagingSegmentId,
     pub media_start: TickTimestamp,
     pub duration: TickDuration,
+    pub independent: bool,
     pub payload: Payload,
 }
 
-impl MuxedMedia {
-    pub fn rendition_id(&self) -> RenditionId {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackagedSegmentCompletion {
+    pub rendition_id: PackagingRenditionId,
+    /// Identifies the open packaging segment being completed.
+    pub packaging_segment_id: PackagingSegmentId,
+    pub media_start: TickTimestamp,
+    pub duration: TickDuration,
+}
+
+impl PackagedMedia {
+    pub fn rendition_id(&self) -> PackagingRenditionId {
         match self {
             Self::Initialization(media) => media.rendition_id,
-            Self::Part(media) => media.rendition_id,
+            Self::Chunk(media) => media.rendition_id,
             Self::Segment(media) => media.rendition_id,
+            Self::SegmentCompleted(media) => media.rendition_id,
         }
     }
 }
@@ -76,7 +117,7 @@ pub enum MuxError {
 
 /// What continuity delivery may expect after this muxer stops.
 ///
-/// A muxer's last act is a judgement call — emit the short trailing part and
+/// A muxer's last act is a judgement call — emit the short trailing chunk and
 /// segment, or discard them — while delivery must independently decide whether
 /// to signal end-of-stream. Only the session knows whether this is a deliberate
 /// end, an unexplained interruption, or a known takeover, so it says.
@@ -84,7 +125,7 @@ pub enum MuxError {
 pub enum FinishReason {
     /// No publisher will continue this stream.
     ///
-    /// Emit the open part and segment even if short: it is the last media
+    /// Emit the open chunk and segment even if short: it is the last media
     /// viewers will ever get, and a truncated tail is worse than an undersized
     /// segment.
     Final,
@@ -105,15 +146,22 @@ pub enum FinishReason {
 ///
 /// Like [`MediaNormalizer`](crate::media::MediaNormalizer), output goes to a
 /// reused caller buffer through an [`Appender`]. One sample commonly produces
-/// nothing (it is still accumulating into an open part) and occasionally
-/// produces two objects at once (a part that closes a segment), which a return
-/// value cannot express and a generic sink can only express by infecting every
-/// caller with its type.
+/// nothing (it is still accumulating into an open chunk) and occasionally
+/// produces two objects at once (a chunk and its segment completion), which a
+/// return value cannot express and a generic sink can only express by infecting
+/// every caller with its type.
 pub trait Muxer: Send {
+    /// Longest healthy interval between progressively publishable outputs.
+    ///
+    /// Chunked muxers report their regular chunk cadence; segment-only muxers
+    /// report their segment cadence. Supervision uses this without learning
+    /// either packaging mode.
+    fn expected_publication_interval(&self) -> Duration;
+
     fn push(
         &mut self,
         sample: NormalizedSample,
-        out: &mut dyn Appender<MuxedMedia>,
+        out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError>;
 
     /// Closes out the publication.
@@ -126,14 +174,14 @@ pub trait Muxer: Send {
     fn finish(
         &mut self,
         reason: FinishReason,
-        out: &mut dyn Appender<MuxedMedia>,
+        out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError>;
 }
 
 pub trait MuxerFactory: Send + Sync {
-    fn start(
-        &self,
-        presentation: &PresentationPlan,
-        segmentation: &SegmentationPlan,
-    ) -> Result<Box<dyn Muxer>, MuxError>;
+    /// Constructs both the byte producer and its authoritative output topology.
+    ///
+    /// A future transcoding muxer can therefore advertise its output ladder
+    /// without pretending those properties came from input discovery.
+    fn start(&self, request: MuxerStartRequest<'_>) -> Result<StartedMuxer, MuxError>;
 }

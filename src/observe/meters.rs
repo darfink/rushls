@@ -41,7 +41,7 @@ pub trait MediaMeters: Send + Sync {
 
 /// Volume produced by container muxing.
 pub trait MuxMeters: Send + Sync {
-    fn mux_progress(&self, parts: u64, segments: u64);
+    fn mux_progress(&self, chunks: u64, segments: u64);
 }
 
 /// Volume made available to viewers.
@@ -171,7 +171,7 @@ struct SessionCounters {
     packets_lost: AtomicU64,
     packets_normalized: AtomicU64,
     samples_normalized: AtomicU64,
-    parts_muxed: AtomicU64,
+    chunks_muxed: AtomicU64,
     segments_muxed: AtomicU64,
     parts_published: AtomicU64,
     segments_published: AtomicU64,
@@ -187,7 +187,7 @@ struct SessionCounters {
     /// Nanoseconds since `started_at`, offset by one so zero means "never".
     source_seen: AtomicU64,
     media_seen: AtomicU64,
-    part_seen: AtomicU64,
+    publication_seen: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -197,7 +197,7 @@ pub struct MeterSnapshot {
     pub packets_lost: u64,
     pub packets_normalized: u64,
     pub samples_normalized: u64,
-    pub parts_muxed: u64,
+    pub chunks_muxed: u64,
     pub segments_muxed: u64,
     pub parts_published: u64,
     pub segments_published: u64,
@@ -219,7 +219,7 @@ impl SessionMeters {
                 packets_lost: AtomicU64::new(0),
                 packets_normalized: AtomicU64::new(0),
                 samples_normalized: AtomicU64::new(0),
-                parts_muxed: AtomicU64::new(0),
+                chunks_muxed: AtomicU64::new(0),
                 segments_muxed: AtomicU64::new(0),
                 parts_published: AtomicU64::new(0),
                 segments_published: AtomicU64::new(0),
@@ -231,7 +231,7 @@ impl SessionMeters {
                 live_readers: AtomicUsize::new(0),
                 source_seen: AtomicU64::new(0),
                 media_seen: AtomicU64::new(0),
-                part_seen: AtomicU64::new(0),
+                publication_seen: AtomicU64::new(0),
             }),
         }
     }
@@ -272,7 +272,7 @@ impl SessionMeters {
             packets_lost: get(&counters.packets_lost),
             packets_normalized: get(&counters.packets_normalized),
             samples_normalized: get(&counters.samples_normalized),
-            parts_muxed: get(&counters.parts_muxed),
+            chunks_muxed: get(&counters.chunks_muxed),
             segments_muxed: get(&counters.segments_muxed),
             parts_published: get(&counters.parts_published),
             segments_published: get(&counters.segments_published),
@@ -298,9 +298,9 @@ impl SessionMeters {
         self.counters.idle_for(now, &self.counters.media_seen)
     }
 
-    /// How long ago a part became available to viewers.
-    pub fn part_idle_for(&self, now: Instant) -> Option<Duration> {
-        self.counters.idle_for(now, &self.counters.part_seen)
+    /// How long ago a chunk or complete segment became available to viewers.
+    pub fn publication_idle_for(&self, now: Instant) -> Option<Duration> {
+        self.counters.idle_for(now, &self.counters.publication_seen)
     }
 
     pub fn reader_attached(&self) {
@@ -390,8 +390,8 @@ impl MediaMeters for SessionCounters {
 }
 
 impl MuxMeters for SessionCounters {
-    fn mux_progress(&self, parts: u64, segments: u64) {
-        add(&self.parts_muxed, parts);
+    fn mux_progress(&self, chunks: u64, segments: u64) {
+        add(&self.chunks_muxed, chunks);
         add(&self.segments_muxed, segments);
     }
 }
@@ -402,8 +402,8 @@ impl DeliveryMeters for SessionCounters {
         add(&self.segments_published, segments);
         add(&self.process.counters.parts_published, parts);
         add(&self.process.counters.segments_published, segments);
-        if parts > 0 {
-            self.mark(&self.part_seen);
+        if parts > 0 || segments > 0 {
+            self.mark(&self.publication_seen);
         }
     }
 }
@@ -461,7 +461,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(4)).await;
 
         assert_eq!(meters.source_idle_for(Instant::now()), None);
-        assert_eq!(meters.part_idle_for(Instant::now()), None);
+        assert_eq!(meters.publication_idle_for(Instant::now()), None);
 
         meters.source_view().source_progress(1, 1, 0);
         tokio::time::advance(Duration::from_secs(1)).await;

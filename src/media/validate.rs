@@ -203,6 +203,7 @@ mod tests {
         };
         DiscoveredTrack {
             id: TrackId(id),
+            source_key: None,
             codec,
             parameters,
             timebase: Timebase::hz90k(),

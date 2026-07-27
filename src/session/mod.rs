@@ -3,6 +3,8 @@
 //! This is the only module that depends on every other one, and the dependency
 //! runs strictly one way: nothing below `session` knows that sessions exist.
 
+use std::sync::Arc;
+
 use thiserror::Error;
 use tokio::time::timeout;
 
@@ -260,20 +262,35 @@ async fn pipeline(
         &preroll.buffered,
         context.meters().media_view(),
     )?;
+    let started = services.muxers.start(crate::mux::MuxerStartRequest {
+        presentation: &presentation,
+        segmentation: &preroll.segmentation,
+        // One origin is captured for the complete muxer publication. The CMAF
+        // muxer remains responsible for any output edit lists needed to align
+        // tracks; delivery only advances this wall time by packaged timing.
+        time_anchor: std::time::SystemTime::now(),
+    })?;
+    let expected_publication_interval = started.muxer.expected_publication_interval();
+    let publisher = services
+        .publishers
+        .start(context.stream(), Arc::clone(&started.presentation))?;
     let tail = MediaTail::new(
-        services
-            .muxers
-            .start(&presentation, &preroll.segmentation)?,
-        services.publishers.start(context.stream(), &presentation)?,
+        started.muxer,
+        publisher,
         context.meters().mux_view(),
         context.meters().delivery_view(),
     );
 
     context.enter(Phase::Running);
     context.emit(SessionEvent::Running);
-    let part_target = preroll.segmentation.shortest_part_duration();
     let mut live = LiveSession::new(head, tail, pacer, preroll.buffered, preroll.input_state);
-    let supervised = supervise(&mut live, context, config.supervision, part_target).await;
+    let supervised = supervise(
+        &mut live,
+        context,
+        config.supervision,
+        expected_publication_interval,
+    )
+    .await;
 
     // A real failure decides the session's fate before the drain gets a say:
     // draining a broken pipeline is best-effort by definition, and letting it

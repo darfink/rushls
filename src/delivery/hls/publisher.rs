@@ -1,12 +1,13 @@
+use std::sync::Arc;
+
 use thiserror::Error;
 
 use crate::{
     domain::StreamId,
-    media::PresentationPlan,
-    mux::{FinishReason, MuxedMedia},
+    mux::{FinishReason, PackagedMedia, PackagedPresentation},
 };
 
-use super::{StoreFull, StreamLease, StreamStore};
+use super::{StoreFull, StoreWriteError, StreamLease, StreamStore};
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HlsError {
@@ -14,6 +15,8 @@ pub enum HlsError {
     Initialization(String),
     #[error(transparent)]
     Capacity(#[from] StoreFull),
+    #[error(transparent)]
+    Store(#[from] StoreWriteError),
     #[error("HLS publication failed: {0}")]
     Publication(String),
 }
@@ -32,9 +35,9 @@ pub enum PublishOutcome {
     Superseded,
 }
 
-/// Accepts muxed media on behalf of one stream and makes it fetchable.
+/// Accepts packaged media on behalf of one stream and makes it fetchable.
 pub trait HlsPublisher: Send {
-    fn write(&mut self, media: MuxedMedia) -> Result<PublishOutcome, HlsError>;
+    fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError>;
 
     /// Closes out the publication.
     ///
@@ -49,16 +52,18 @@ pub trait HlsPublisher: Send {
     fn finish(&mut self, reason: FinishReason) -> Result<(), HlsError>;
 }
 
-/// Opens a publication for one validated presentation.
+/// Opens a publication for one muxer-described presentation.
 ///
 /// Takes the stream identity because publishing is what makes a session
 /// reachable by viewers; a publisher that could not name its stream would leave
-/// the delivery side with no way to find it.
+/// the delivery side with no way to find it. The complete descriptor arrives
+/// here rather than piecemeal as media events, so topology replacement and
+/// durable rendition mapping are committed before an initialization is visible.
 pub trait PublisherFactory: Send + Sync {
     fn start(
         &self,
         stream: &StreamId,
-        presentation: &PresentationPlan,
+        presentation: Arc<PackagedPresentation>,
     ) -> Result<Box<dyn HlsPublisher>, HlsError>;
 }
 
@@ -82,10 +87,10 @@ impl PublisherFactory for StorePublisherFactory {
     fn start(
         &self,
         stream: &StreamId,
-        _presentation: &PresentationPlan,
+        presentation: Arc<PackagedPresentation>,
     ) -> Result<Box<dyn HlsPublisher>, HlsError> {
         Ok(Box::new(StorePublisher {
-            lease: self.store.lease(stream.clone())?,
+            lease: self.store.lease(stream.clone(), presentation)?,
         }))
     }
 }
@@ -95,8 +100,8 @@ struct StorePublisher {
 }
 
 impl HlsPublisher for StorePublisher {
-    fn write(&mut self, media: MuxedMedia) -> Result<PublishOutcome, HlsError> {
-        match self.lease.write(media) {
+    fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
+        match self.lease.write(media)? {
             true => Ok(PublishOutcome::Published),
             false => Ok(PublishOutcome::Superseded),
         }
@@ -112,14 +117,21 @@ impl HlsPublisher for StorePublisher {
 
 #[cfg(test)]
 mod tests {
+    use std::{num::NonZero, time::SystemTime};
+
     use crate::{
         admission::StreamPolicy,
         domain::{
-            Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload, RenditionId, Timebase,
+            Codec, DiscoveredTrack, FrameRate, MediaKind, MediaParameters, Payload, Timebase,
             TrackCatalog, TrackId,
         },
-        media::validate,
-        mux::MuxedPart,
+        media::{PresentationPlan, validate},
+        mux::{
+            InitializationSegment, MediaSegmentFormat, PackagedChunk, PackagedMedia,
+            PackagedPresentation, PackagedRendition, PackagingRenditionId, PackagingSegmentId,
+            PlayableCombination, RenditionConfig, RenditionGroup, RenditionGroupKey, RenditionKey,
+            RenditionMedia,
+        },
     };
 
     use super::{super::StoreLimits, *};
@@ -127,6 +139,7 @@ mod tests {
     fn presentation() -> PresentationPlan {
         let catalog = TrackCatalog::new(vec![DiscoveredTrack {
             id: TrackId(0),
+            source_key: None,
             codec: Codec::H264,
             parameters: MediaParameters::Video {
                 width: nz::u32!(1920),
@@ -144,14 +157,73 @@ mod tests {
         validate(&catalog, &StreamPolicy::permissive()).expect("test presentation is valid")
     }
 
-    fn part() -> MuxedMedia {
-        MuxedMedia::Part(MuxedPart {
-            rendition_id: RenditionId(0),
+    fn packaged_presentation() -> Arc<PackagedPresentation> {
+        let input = presentation();
+        let rendition_id = PackagingRenditionId(0);
+        Arc::new(
+            PackagedPresentation::new(
+                SystemTime::UNIX_EPOCH,
+                &input,
+                vec![PackagedRendition {
+                    packaging_rendition_id: rendition_id,
+                    key: RenditionKey::new("video/main"),
+                    source_tracks: Arc::from([TrackId(0)]),
+                    config: RenditionConfig {
+                        timebase: Timebase::hz90k(),
+                        segment_target: NonZero::new(540_000).unwrap(),
+                        chunk_target: NonZero::new(90_000),
+                        segment_format: MediaSegmentFormat::Cmaf,
+                    },
+                    media: RenditionMedia::Video {
+                        width: nz::u32!(1920),
+                        height: nz::u32!(1080),
+                        frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
+                        video_range: None,
+                    },
+                    codecs: Arc::from("avc1.640028"),
+                    name: Arc::from("Main"),
+                    language: None,
+                    is_default: true,
+                    declared_bandwidth: None,
+                }],
+                vec![RenditionGroup {
+                    key: RenditionGroupKey::new("video"),
+                    media_kind: MediaKind::Video,
+                    renditions: Arc::from([rendition_id]),
+                }],
+                vec![PlayableCombination {
+                    groups: Arc::from([RenditionGroupKey::new("video")]),
+                }],
+            )
+            .expect("test packaged presentation is valid"),
+        )
+    }
+
+    fn initialization() -> PackagedMedia {
+        PackagedMedia::Initialization(InitializationSegment {
+            rendition_id: PackagingRenditionId(0),
+            version: 1,
+            payload: Payload::from(vec![0]),
+        })
+    }
+
+    fn chunk() -> PackagedMedia {
+        PackagedMedia::Chunk(PackagedChunk {
+            rendition_id: PackagingRenditionId(0),
+            packaging_segment_id: PackagingSegmentId(0),
+            chunk_index: 0,
             media_start: 0,
-            duration: 18_000,
+            duration: 90_000,
             independent: true,
             payload: Payload::from(vec![7]),
         })
+    }
+
+    fn start_media(publisher: &mut dyn HlsPublisher) {
+        publisher
+            .write(initialization())
+            .expect("initialization is published");
+        publisher.write(chunk()).expect("chunk is published");
     }
 
     #[tokio::test(start_paused = true)]
@@ -161,12 +233,19 @@ mod tests {
         let stream = StreamId::new("live/camera");
 
         let mut publisher = factory
-            .start(&stream, &presentation())
+            .start(&stream, packaged_presentation())
             .expect("publication starts");
-        publisher.write(part()).expect("part is published");
+        start_media(&mut *publisher);
 
         let live = store.get(&stream).expect("stream is readable");
-        assert_eq!(live.snapshot().renditions[0].parts.len(), 1);
+        assert_eq!(
+            live.snapshot().renditions[0]
+                .snapshot()
+                .open_segment
+                .as_ref()
+                .map(|segment| segment.parts.len()),
+            Some(1)
+        );
         assert!(!live.is_ended());
 
         publisher
@@ -182,15 +261,15 @@ mod tests {
         let stream = StreamId::new("live/camera");
 
         let mut incumbent = factory
-            .start(&stream, &presentation())
+            .start(&stream, packaged_presentation())
             .expect("publication starts");
-        incumbent.write(part()).expect("part is published");
+        start_media(&mut *incumbent);
         let mut successor = factory
-            .start(&stream, &presentation())
+            .start(&stream, packaged_presentation())
             .expect("takeover starts");
 
         assert_eq!(
-            incumbent.write(part()),
+            incumbent.write(chunk()),
             Ok(PublishOutcome::Superseded),
             "a drained tail is discarded, and the caller is told so rather than \
              counting it as delivered"
@@ -204,12 +283,20 @@ mod tests {
         assert!(!live.is_ended());
         assert!(!live.is_idle());
 
+        successor
+            .write(initialization())
+            .expect("successor header is published");
+        successor
+            .write(chunk())
+            .expect("successor chunk is published");
         assert_eq!(
-            successor.write(part()),
-            Ok(PublishOutcome::Published),
-            "the successor owns the stream from the instant it leased it"
+            live.snapshot().renditions[0]
+                .snapshot()
+                .open_segment
+                .as_ref()
+                .map(|segment| segment.parts.len()),
+            Some(1)
         );
-        assert_eq!(live.snapshot().renditions[0].parts.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -219,9 +306,9 @@ mod tests {
         let stream = StreamId::new("live/camera");
 
         let mut publisher = factory
-            .start(&stream, &presentation())
+            .start(&stream, packaged_presentation())
             .expect("publication starts");
-        publisher.write(part()).expect("part is published");
+        start_media(&mut *publisher);
         publisher
             .finish(FinishReason::Interrupted)
             .expect("the publication is relinquished");
@@ -243,11 +330,11 @@ mod tests {
         let factory = StorePublisherFactory::new(store);
 
         let _held = factory
-            .start(&StreamId::new("a"), &presentation())
+            .start(&StreamId::new("a"), packaged_presentation())
             .expect("the first publication fits");
 
         assert!(matches!(
-            factory.start(&StreamId::new("b"), &presentation()),
+            factory.start(&StreamId::new("b"), packaged_presentation()),
             Err(HlsError::Capacity(StoreFull { maximum: 1 }))
         ));
     }

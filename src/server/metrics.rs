@@ -101,7 +101,7 @@ mod tests {
             .register(&grant(), session_meters, StopToken::new())
             .expect("the registry has room");
         let lease = store
-            .lease(StreamId::new("live/camera"))
+            .lease_without_presentation(StreamId::new("live/camera"))
             .expect("the store has room");
 
         let detailed = MetricsReader::new(

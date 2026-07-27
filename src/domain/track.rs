@@ -2,7 +2,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 
 use thiserror::Error;
 
-use super::{Payload, TickTimestamp, Timebase, TrackId};
+use super::{Payload, SourceTrackKey, TickTimestamp, Timebase, TrackId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MediaKind {
@@ -96,6 +96,8 @@ impl MediaParameters {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredTrack {
     pub id: TrackId,
+    /// Stable source identity when the protocol or carried container has one.
+    pub source_key: Option<SourceTrackKey>,
     pub codec: Codec,
     pub parameters: MediaParameters,
     pub timebase: Timebase,
@@ -198,6 +200,7 @@ mod tests {
         };
         DiscoveredTrack {
             id: TrackId(id),
+            source_key: None,
             codec: Codec::H264,
             parameters,
             timebase: Timebase::hz90k(),

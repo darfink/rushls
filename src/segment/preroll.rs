@@ -341,6 +341,7 @@ mod tests {
     fn presentation() -> PresentationPlan {
         let catalog = TrackCatalog::new(vec![DiscoveredTrack {
             id: TrackId(0),
+            source_key: None,
             codec: Codec::H264,
             parameters: MediaParameters::Video {
                 width: nz::u32!(1920),

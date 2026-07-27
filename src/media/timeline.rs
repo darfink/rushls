@@ -127,6 +127,7 @@ mod tests {
         };
         DiscoveredTrack {
             id: TrackId(id),
+            source_key: None,
             codec: match kind {
                 MediaKind::Audio => Codec::Aac,
                 MediaKind::Subtitle => Codec::WebVtt,

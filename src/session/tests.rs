@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{collections::VecDeque, num::NonZero, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
 
@@ -10,15 +10,18 @@ use crate::{
     delivery::hls::{StorePublisherFactory, StreamStore},
     domain::{
         Appender, BoxFuture, Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload,
-        RenditionId, SessionId, StreamId, Timebase, TrackCatalog, TrackCounts, TrackId,
+        SessionId, StreamId, Timebase, TrackCatalog, TrackCounts, TrackId,
     },
     media::{
         MediaNormalizer, NormalizeError, NormalizedSample, NormalizerFactory, PresentationPlan,
         TimelineCalibration, VideoSample,
     },
     mux::{
-        ContainerFormat, FinishReason, InitializationSegment, MuxError, MuxedMedia, MuxedPart,
-        MuxedSegment, Muxer, MuxerFactory,
+        FinishReason, InitializationSegment, MediaSegmentFormat, MuxError, Muxer, MuxerFactory,
+        MuxerStartRequest, PackagedChunk, PackagedMedia, PackagedPresentation, PackagedRendition,
+        PackagedSegmentCompletion, PackagingRenditionId, PackagingSegmentId, PlayableCombination,
+        RenditionConfig, RenditionGroup, RenditionGroupKey, RenditionKey, RenditionMedia,
+        StartedMuxer,
     },
     observe::{EventObserver, Events, ProcessMeters, SessionEnd, SessionEvent, SourceMeters},
     segment::{PrerollLimits, SegmentationPolicy},
@@ -284,56 +287,102 @@ struct FakeMuxerFactory {
 }
 
 impl MuxerFactory for FakeMuxerFactory {
-    fn start(
-        &self,
-        _presentation: &PresentationPlan,
-        _segmentation: &crate::segment::SegmentationPlan,
-    ) -> Result<Box<dyn Muxer>, MuxError> {
+    fn start(&self, request: MuxerStartRequest<'_>) -> Result<StartedMuxer, MuxError> {
         record(&self.log, "muxer_start");
-        Ok(Box::new(FakeMuxer {
-            initialized: false,
-            finished: Arc::clone(&self.finished),
-            fails_to_finish: self.faults.muxer_finish_fails,
-        }))
+        let rendition_id = PackagingRenditionId(0);
+        let presentation = PackagedPresentation::new(
+            request.time_anchor,
+            request.presentation,
+            vec![PackagedRendition {
+                packaging_rendition_id: rendition_id,
+                key: RenditionKey::new("video/main"),
+                source_tracks: Arc::from([TrackId(0)]),
+                config: RenditionConfig {
+                    timebase: Timebase::hz90k(),
+                    segment_target: NonZero::new(2 * SECOND as u64).unwrap(),
+                    chunk_target: NonZero::new(SECOND as u64),
+                    segment_format: MediaSegmentFormat::Cmaf,
+                },
+                media: RenditionMedia::Video {
+                    width: nz::u32!(1920),
+                    height: nz::u32!(1080),
+                    frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
+                    video_range: None,
+                },
+                codecs: Arc::from("avc1.640028"),
+                name: Arc::from("Main"),
+                language: None,
+                is_default: true,
+                declared_bandwidth: None,
+            }],
+            vec![RenditionGroup {
+                key: RenditionGroupKey::new("video"),
+                media_kind: crate::domain::MediaKind::Video,
+                renditions: Arc::from([rendition_id]),
+            }],
+            vec![PlayableCombination {
+                groups: Arc::from([RenditionGroupKey::new("video")]),
+            }],
+        )
+        .map_err(|error| MuxError::InvalidPlan(error.to_string()))?;
+        Ok(StartedMuxer {
+            muxer: Box::new(FakeMuxer {
+                initialized: false,
+                chunks: 0,
+                duration: 0,
+                finished: Arc::clone(&self.finished),
+                fails_to_finish: self.faults.muxer_finish_fails,
+            }),
+            presentation: Arc::new(presentation),
+        })
     }
 }
 
 /// Emits one part per sample and closes a single segment at end of stream.
 struct FakeMuxer {
     initialized: bool,
+    chunks: u32,
+    duration: u64,
     finished: FinishLog,
     fails_to_finish: bool,
 }
 
 impl Muxer for FakeMuxer {
+    fn expected_publication_interval(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+
     fn push(
         &mut self,
         sample: NormalizedSample,
-        out: &mut dyn Appender<MuxedMedia>,
+        out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
         if !self.initialized {
             self.initialized = true;
-            out.push(MuxedMedia::Initialization(InitializationSegment {
-                rendition_id: RenditionId(0),
-                format: ContainerFormat::Cmaf,
+            out.push(PackagedMedia::Initialization(InitializationSegment {
+                rendition_id: PackagingRenditionId(0),
                 version: 1,
                 payload: Payload::from(vec![0]),
             }));
         }
-        out.push(MuxedMedia::Part(MuxedPart {
-            rendition_id: RenditionId(0),
+        out.push(PackagedMedia::Chunk(PackagedChunk {
+            rendition_id: PackagingRenditionId(0),
+            packaging_segment_id: PackagingSegmentId(0),
+            chunk_index: self.chunks,
             media_start: sample.pts(),
             duration: sample.duration(),
             independent: sample.random_access(),
             payload: Payload::from(vec![1]),
         }));
+        self.chunks = self.chunks.saturating_add(1);
+        self.duration = self.duration.saturating_add(sample.duration());
         Ok(())
     }
 
     fn finish(
         &mut self,
         reason: FinishReason,
-        out: &mut dyn Appender<MuxedMedia>,
+        out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
         self.finished.lock().push(reason);
         if self.fails_to_finish {
@@ -344,12 +393,14 @@ impl Muxer for FakeMuxer {
         if matches!(reason, FinishReason::Superseded) {
             return Ok(());
         }
-        out.push(MuxedMedia::Segment(MuxedSegment {
-            rendition_id: RenditionId(0),
-            media_start: 0,
-            duration: SECOND as u64,
-            payload: Payload::from(vec![2]),
-        }));
+        if self.initialized {
+            out.push(PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
+                rendition_id: PackagingRenditionId(0),
+                packaging_segment_id: PackagingSegmentId(0),
+                media_start: 0,
+                duration: self.duration,
+            }));
+        }
         Ok(())
     }
 }
@@ -392,6 +443,7 @@ fn name(event: &SessionEvent) -> &'static str {
 fn video_catalog() -> TrackCatalog {
     TrackCatalog::new(vec![DiscoveredTrack {
         id: TrackId(0),
+        source_key: None,
         codec: Codec::H264,
         parameters: MediaParameters::Video {
             width: nz::u32!(1920),
@@ -455,8 +507,8 @@ fn config() -> SessionConfig {
             health: HealthPolicy {
                 source_stall_timeout: Duration::from_secs(3_600),
                 media_stall_timeout: Duration::from_secs(3_600),
-                stalled_part_multiplier: 1_000,
-                minimum_part_stall_tolerance: Duration::from_secs(3_600),
+                stalled_publication_multiplier: 1_000,
+                minimum_publication_stall_tolerance: Duration::from_secs(3_600),
             },
             health_interval: Duration::from_secs(3_600),
         },
@@ -741,7 +793,13 @@ async fn a_cancelled_session_still_leaves_a_playable_stream() {
 
     // Wait for the pipeline to reach the live loop and publish its pre-roll.
     let live = await_published(&harness.store).await;
-    assert!(live.snapshot().renditions[0].parts.len() >= 3);
+    assert!(
+        live.snapshot().renditions[0]
+            .snapshot()
+            .open_segment
+            .as_ref()
+            .is_some_and(|segment| segment.parts.len() >= 3)
+    );
 
     harness.sessions.stop_all(StopReason::Cancelled);
 
@@ -867,8 +925,8 @@ async fn a_stalled_publisher_is_terminated_as_unhealthy() {
             health: HealthPolicy {
                 source_stall_timeout: Duration::from_millis(50),
                 media_stall_timeout: Duration::from_millis(50),
-                stalled_part_multiplier: 1,
-                minimum_part_stall_tolerance: Duration::from_millis(50),
+                stalled_publication_multiplier: 1,
+                minimum_publication_stall_tolerance: Duration::from_millis(50),
             },
             health_interval: Duration::from_millis(10),
         },
@@ -1185,7 +1243,10 @@ async fn await_published(store: &StreamStore) -> Arc<crate::delivery::hls::LiveS
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(live) = store.get(&stream())
-                && !live.snapshot().renditions.is_empty()
+                && live.snapshot().renditions.iter().any(|rendition| {
+                    let media = rendition.snapshot();
+                    media.open_segment.is_some() || media.has_completed_segment()
+                })
             {
                 return live;
             }

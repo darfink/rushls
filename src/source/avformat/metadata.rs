@@ -164,6 +164,9 @@ impl TrackSnapshot {
         Ok(Some(Self {
             track: DiscoveredTrack {
                 id,
+                // AVStream indexes are publication-local. A protocol-aware
+                // adapter may later supply a durable identity instead.
+                source_key: None,
                 codec: codec(parameters.codec_id),
                 parameters: media,
                 timebase,

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arc-swap = "1"
 derive_more = { version = "2", features = ["debug", "display"] }
 bytes = "1.12.1"
 ffmpeg-sys-next = { version = "8.1.0", default-features = false, features = ["avformat"] }
