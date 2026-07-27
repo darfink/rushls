@@ -12,6 +12,9 @@ mod payload;
 mod time;
 mod track;
 
+#[cfg(test)]
+pub mod fixtures;
+
 pub use appender::Appender;
 pub use ids::{RenditionId, SessionId, SourceTrackKey, StreamId, TrackId};
 pub use payload::Payload;

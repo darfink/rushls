@@ -1,0 +1,876 @@
+use std::{sync::Arc, time::SystemTime};
+
+use crate::{
+    domain::{MediaKind, Payload, RenditionId, Timebase, fixtures::TrackBuilder},
+    media::fixtures::presentation as validated,
+    mux::{
+        InitializationSegment, PackagedChunk, PackagedMedia, PackagedPresentation,
+        PackagedRendition, PackagedSegment, PackagedSegmentCompletion, PackagingRenditionId,
+        PackagingSegmentId, RenditionKey,
+        fixtures::{RenditionBuilder, config, presentation_at},
+    },
+};
+
+use super::*;
+
+/// A one-tick timebase, so a test can say "six seconds" as `6`.
+///
+/// Segment and part arithmetic is what these tests are about; making the
+/// numbers legible keeps a retention expectation from being an exercise in
+/// dividing by ninety thousand.
+fn timebase() -> Timebase {
+    Timebase::new(nz::u32!(1), nz::u32!(1))
+}
+
+fn stream() -> StreamId {
+    StreamId::new("live/camera")
+}
+
+fn limits() -> StoreLimits {
+    StoreLimits {
+        maximum_streams: 8,
+        idle_retention: Duration::from_secs(30),
+        retention: RetentionPolicy::default(),
+    }
+}
+
+fn store() -> StreamStore {
+    StreamStore::new(limits())
+}
+
+/// One rendition per `(packaging id, chunked)`, six-second segments.
+fn rendition(packaging_rendition_id: u32, chunked: bool) -> PackagedRendition {
+    RenditionBuilder::new(packaging_rendition_id, MediaKind::Video)
+        .key(&format!("video/{packaging_rendition_id}"))
+        .config(config(timebase(), 6, chunked.then_some(1)))
+        .build()
+}
+
+fn packaged_presentation(configs: &[(u32, bool)]) -> Arc<PackagedPresentation> {
+    let input = validated(vec![
+        TrackBuilder::new(0, MediaKind::Video)
+            .timebase(timebase())
+            .build(),
+    ]);
+    let renditions = configs
+        .iter()
+        .map(|&(packaging_rendition_id, chunked)| rendition(packaging_rendition_id, chunked))
+        .collect();
+    Arc::new(presentation_at(SystemTime::UNIX_EPOCH, &input, renditions))
+}
+
+fn lease(store: &StreamStore, configs: &[(u32, bool)]) -> StreamLease {
+    store
+        .lease(stream(), packaged_presentation(configs))
+        .expect("test publication fits")
+}
+
+/// A single-rendition publication with an explicit key and wall-clock origin.
+///
+/// Both are what reconnect matching turns on, so they are spelled at the call
+/// site rather than patched into a presentation after it was validated.
+fn keyed_presentation(
+    local_id: u32,
+    key: &str,
+    chunked: bool,
+    time_anchor: SystemTime,
+) -> Arc<PackagedPresentation> {
+    let input = validated(vec![
+        TrackBuilder::new(0, MediaKind::Video)
+            .timebase(timebase())
+            .build(),
+    ]);
+    let rendition = RenditionBuilder::new(local_id, MediaKind::Video)
+        .key(key)
+        .config(config(timebase(), 6, chunked.then_some(1)))
+        .build();
+    Arc::new(presentation_at(time_anchor, &input, vec![rendition]))
+}
+
+fn initialization(rendition: u32, byte: u8) -> PackagedMedia {
+    PackagedMedia::Initialization(InitializationSegment {
+        rendition_id: PackagingRenditionId(rendition),
+        version: u64::from(byte),
+        payload: Payload::from(vec![byte]),
+    })
+}
+
+fn chunk(
+    rendition: u32,
+    segment: u64,
+    index: u32,
+    start: i64,
+    duration: u64,
+    bytes: usize,
+) -> PackagedMedia {
+    PackagedMedia::Chunk(PackagedChunk {
+        rendition_id: PackagingRenditionId(rendition),
+        packaging_segment_id: PackagingSegmentId(segment),
+        chunk_index: index,
+        media_start: start,
+        duration,
+        independent: index == 0,
+        payload: Payload::from(vec![index as u8; bytes]),
+    })
+}
+
+fn completion(rendition: u32, segment: u64, start: i64, duration: u64) -> PackagedMedia {
+    PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
+        rendition_id: PackagingRenditionId(rendition),
+        packaging_segment_id: PackagingSegmentId(segment),
+        media_start: start,
+        duration,
+    })
+}
+
+fn direct(
+    rendition: u32,
+    segment: u64,
+    start: i64,
+    duration: u64,
+    bytes: usize,
+) -> PackagedMedia {
+    PackagedMedia::Segment(PackagedSegment {
+        rendition_id: PackagingRenditionId(rendition),
+        packaging_segment_id: PackagingSegmentId(segment),
+        media_start: start,
+        duration,
+        independent: true,
+        payload: Payload::from(vec![segment as u8; bytes]),
+    })
+}
+
+fn write(lease: &StreamLease, media: PackagedMedia) {
+    assert_eq!(lease.write(media), Ok(true));
+}
+
+fn configure(lease: &StreamLease, rendition: u32, chunked: bool) {
+    let catalog = lease.live().snapshot();
+    let snapshot = catalog
+        .renditions
+        .iter()
+        .find(|entry| entry.key == RenditionKey::new(format!("video/{rendition}")))
+        .expect("rendition was configured by the descriptor");
+    assert_eq!(
+        snapshot
+            .config
+            .and_then(|config| config.chunk_target)
+            .is_some(),
+        chunked
+    );
+    write(lease, initialization(rendition, 1));
+}
+
+#[test]
+fn fractional_playlist_duration_policy_controls_the_visible_window() {
+    let mut limits = limits();
+    limits.retention.minimum_playlist_segments = 0;
+    limits.retention.minimum_playlist_duration = DurationRule::MultipleOfTarget(
+        TargetDurationMultiple::new(3, 2).expect("denominator is nonzero"),
+    );
+    let store = StreamStore::new(limits);
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+
+    for id in 0..3 {
+        write(&lease, direct(0, id, id as i64 * 6, 6, 1));
+    }
+
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    assert_eq!(snapshot.segments.len(), 2);
+    assert_eq!(snapshot.segments[0].msn, Msn(1));
+}
+
+#[test]
+fn invalid_packaging_sequences_are_rejected_atomically() {
+    let store = store();
+    let lease = lease(&store, &[(0, true)]);
+    assert_eq!(
+        lease.write(chunk(9, 0, 0, 0, 1, 3)),
+        Err(StoreWriteError::UnknownPackagingRendition {
+            rendition_id: PackagingRenditionId(9)
+        })
+    );
+
+    assert_eq!(
+        lease.write(chunk(0, 0, 0, 0, 1, 3)),
+        Err(StoreWriteError::InitializationMissing {
+            rendition_id: RenditionId(0)
+        })
+    );
+    write(&lease, initialization(0, 1));
+    write(&lease, chunk(0, 0, 0, 0, 1, 3));
+    let bytes = lease.live().retained_payload_bytes();
+    assert_eq!(
+        lease.write(chunk(0, 0, 2, 1, 1, 7)),
+        Err(StoreWriteError::UnexpectedChunkIndex {
+            rendition_id: RenditionId(0),
+            expected: 1,
+            found: 2,
+        })
+    );
+    assert_eq!(
+        lease.write(completion(0, 1, 0, 1)),
+        Err(StoreWriteError::WrongSegmentCompleted {
+            rendition_id: RenditionId(0),
+            open: PackagingSegmentId(0),
+            found: PackagingSegmentId(1),
+        })
+    );
+    assert!(matches!(
+        lease.write(direct(0, 1, 0, 6, 4)),
+        Err(StoreWriteError::DirectSegmentDuringOpenSegment { .. })
+    ));
+    assert_eq!(
+        lease.write(initialization(0, 2)),
+        Err(StoreWriteError::InitializationDuringOpenSegment {
+            rendition_id: RenditionId(0)
+        })
+    );
+    assert_eq!(lease.live().retained_payload_bytes(), bytes);
+    assert_eq!(
+        lease
+            .live()
+            .rendition(RenditionId(0))
+            .unwrap()
+            .open_segment
+            .as_ref()
+            .unwrap()
+            .parts
+            .len(),
+        1
+    );
+
+    write(&lease, completion(0, 0, 0, 1));
+    assert_eq!(
+        lease.write(chunk(0, 0, 0, 1, 1, 1)),
+        Err(StoreWriteError::NonMonotonicSegmentId {
+            rendition_id: RenditionId(0),
+            previous: PackagingSegmentId(0),
+            found: PackagingSegmentId(0),
+        })
+    );
+    assert_eq!(
+        lease.write(completion(0, 1, 1, 1)),
+        Err(StoreWriteError::NoOpenSegment {
+            rendition_id: RenditionId(0)
+        })
+    );
+}
+
+#[test]
+fn rendition_configuration_selects_chunked_or_segment_only_packaging() {
+    let store = store();
+    let lease = lease(&store, &[(0, false), (1, true)]);
+    configure(&lease, 0, false);
+    assert_eq!(
+        lease.write(chunk(0, 0, 0, 0, 1, 1)),
+        Err(StoreWriteError::ChunksDisabled {
+            rendition_id: RenditionId(0)
+        })
+    );
+
+    configure(&lease, 1, true);
+    assert_eq!(
+        lease.write(direct(1, 0, 0, 6, 1)),
+        Err(StoreWriteError::DirectSegmentsDisabled {
+            rendition_id: RenditionId(1)
+        })
+    );
+    assert!(
+        lease
+            .live()
+            .rendition(RenditionId(0))
+            .unwrap()
+            .segments
+            .is_empty()
+    );
+    assert!(
+        lease
+            .live()
+            .rendition(RenditionId(1))
+            .unwrap()
+            .segments
+            .is_empty()
+    );
+}
+
+#[test]
+fn completing_a_chunked_segment_reuses_the_original_payloads() {
+    let store = store();
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    let original = Payload::from(vec![1, 2, 3, 4]);
+    let pointer = original.as_bytes().as_ptr();
+    write(
+        &lease,
+        PackagedMedia::Chunk(PackagedChunk {
+            rendition_id: PackagingRenditionId(0),
+            packaging_segment_id: PackagingSegmentId(0),
+            chunk_index: 0,
+            media_start: 0,
+            duration: 6,
+            independent: true,
+            payload: original,
+        }),
+    );
+    assert!(
+        !lease
+            .live()
+            .rendition(RenditionId(0))
+            .unwrap()
+            .has_completed_segment(),
+        "the first parent segment is still open"
+    );
+    write(&lease, completion(0, 0, 0, 6));
+
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    assert!(snapshot.has_completed_segment());
+    let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) = &snapshot.segments[0].kind
+    else {
+        panic!("segment should retain its chunks");
+    };
+    assert_eq!(parts[0].payload.as_bytes().as_ptr(), pointer);
+    assert_eq!(
+        snapshot.segments[0].kind,
+        StoredSegmentKind::Media(SegmentBody::Chunked(Arc::clone(parts)))
+    );
+    assert_eq!(lease.live().retained_payload_bytes(), 5);
+    assert_eq!(
+        snapshot.bitrate,
+        RenditionBitrateStatistics {
+            peak_bits_per_second: Some(5),
+            average_bits_per_second: Some(5),
+            observed_segments: 1,
+        }
+    );
+}
+
+#[test]
+fn direct_segments_remain_contiguous() {
+    let store = store();
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    write(&lease, direct(0, 0, 0, 6, 9));
+
+    let segment = &lease.live().rendition(RenditionId(0)).unwrap().segments[0];
+    assert!(matches!(
+        &segment.kind,
+        StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) if payload.len() == 9
+    ));
+    assert!(segment.parts.is_empty());
+    assert_eq!(
+        lease
+            .live()
+            .rendition(RenditionId(0))
+            .unwrap()
+            .bitrate
+            .average_bits_per_second,
+        Some(12)
+    );
+}
+
+#[test]
+fn durable_part_ids_and_cursors_advance_independently() {
+    let store = store();
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    assert_eq!(
+        lease
+            .live()
+            .rendition_live_edge(RenditionId(0))
+            .unwrap()
+            .next_part_id,
+        Some(PartId(1))
+    );
+    write(&lease, chunk(0, 0, 0, 0, 1, 1));
+    assert_eq!(
+        lease.live().rendition_live_edge(RenditionId(0)).unwrap(),
+        RenditionLiveEdge {
+            last_segment: None,
+            last_part: Some((
+                PartCursor {
+                    msn: Msn(0),
+                    part_index: PartIndex(0)
+                },
+                PartId(1)
+            )),
+            next_part_id: Some(PartId(2)),
+            ended: false,
+            revision: 3,
+        }
+    );
+    write(&lease, completion(0, 0, 0, 1));
+    write(&lease, chunk(0, 1, 0, 1, 1, 1));
+
+    let edge = lease.live().rendition_live_edge(RenditionId(0)).unwrap();
+    assert_eq!(edge.last_segment, Some((Msn(0), SegmentId(1))));
+    assert_eq!(
+        edge.last_part,
+        Some((
+            PartCursor {
+                msn: Msn(1),
+                part_index: PartIndex(0)
+            },
+            PartId(2)
+        ))
+    );
+    assert_eq!(edge.next_part_id, Some(PartId(3)));
+}
+
+#[test]
+fn takeover_consumes_an_observed_open_msn_as_a_gap() {
+    let store = store();
+    let first = lease(&store, &[(0, true)]);
+    configure(&first, 0, true);
+    write(&first, chunk(0, 0, 0, 0, 1, 1));
+
+    let second = lease(&store, &[(0, true)]);
+    assert_eq!(first.write(chunk(0, 0, 1, 1, 1, 1)), Ok(false));
+    configure(&second, 0, true);
+    write(&second, chunk(0, 0, 0, 0, 1, 1));
+
+    let snapshot = second.live().rendition(RenditionId(0)).unwrap();
+    assert!(matches!(snapshot.segments[0].kind, StoredSegmentKind::Gap));
+    assert_eq!(snapshot.segments[0].msn, Msn(0));
+    let open = snapshot.open_segment.as_ref().unwrap();
+    assert_eq!(open.msn, Msn(1));
+    assert_eq!(open.parts[0].id, PartId(2));
+    assert_eq!(open.parts[0].cursor.part_index, PartIndex(0));
+}
+
+#[test]
+fn reconnect_matches_exact_keys_even_when_local_ids_change() {
+    let store = store();
+    let first = store
+        .lease(
+            stream(),
+            keyed_presentation(0, "camera/main", false, SystemTime::UNIX_EPOCH),
+        )
+        .unwrap();
+    write(&first, initialization(0, 1));
+    write(&first, direct(0, 0, 0, 6, 1));
+
+    let second_anchor = SystemTime::UNIX_EPOCH + Duration::from_secs(30);
+    let second = store
+        .lease(
+            stream(),
+            keyed_presentation(9, "camera/main", false, second_anchor),
+        )
+        .unwrap();
+    write(&second, initialization(9, 2));
+    write(&second, direct(9, 0, 0, 6, 1));
+
+    let catalog = second.live().snapshot();
+    assert_eq!(catalog.renditions.len(), 1);
+    assert_eq!(catalog.renditions[0].rendition_id, RenditionId(0));
+    assert_eq!(
+        catalog.presentation.as_ref().unwrap().groups[0]
+            .renditions
+            .as_ref(),
+        &[RenditionId(0)]
+    );
+    assert_eq!(catalog.publication_anchors.len(), 2);
+    assert_eq!(catalog.publication_anchors[1].time_anchor, second_anchor);
+    let media = catalog.renditions[0].snapshot();
+    assert_eq!(media.segments.len(), 2);
+    assert_eq!(media.segments[1].msn, Msn(1));
+}
+
+#[test]
+fn changed_topology_retires_old_renditions_instead_of_fuzzy_matching() {
+    let store = store();
+    let first = store
+        .lease(
+            stream(),
+            keyed_presentation(0, "camera/main", false, SystemTime::UNIX_EPOCH),
+        )
+        .unwrap();
+    write(&first, initialization(0, 1));
+    write(&first, direct(0, 0, 0, 6, 1));
+
+    let second = store
+        .lease(
+            stream(),
+            keyed_presentation(0, "camera/replacement", false, SystemTime::UNIX_EPOCH),
+        )
+        .unwrap();
+    write(&second, initialization(0, 1));
+
+    let catalog = second.live().snapshot();
+    assert_eq!(catalog.renditions.len(), 2);
+    assert!(!catalog.renditions[0].active);
+    assert!(catalog.renditions[0].snapshot().live_edge.ended);
+    assert!(catalog.renditions[1].active);
+    assert_eq!(catalog.renditions[1].rendition_id, RenditionId(1));
+    assert_eq!(
+        catalog.presentation.as_ref().unwrap().groups[0]
+            .renditions
+            .as_ref(),
+        &[RenditionId(1)]
+    );
+    assert!(
+        second
+            .live()
+            .segment(RenditionId(0), SegmentId(1))
+            .is_some(),
+        "retired playlist resources remain fetchable through normal retention"
+    );
+
+    let third = store
+        .lease(
+            stream(),
+            keyed_presentation(5, "camera/main", false, SystemTime::UNIX_EPOCH),
+        )
+        .unwrap();
+    let catalog = third.live().snapshot();
+    assert_eq!(
+        catalog.presentation.as_ref().unwrap().groups[0]
+            .renditions
+            .as_ref(),
+        &[RenditionId(2)],
+        "an ended playlist is not resurrected when its key later returns"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn rendition_watchers_are_isolated_and_bitrate_updates_bump_the_catalog() {
+    let store = store();
+    let lease = lease(&store, &[(0, true), (1, true)]);
+    configure(&lease, 0, true);
+    configure(&lease, 1, true);
+    let catalog_revision = lease.live().revision();
+    let mut first = lease.live().subscribe_rendition(RenditionId(0)).unwrap();
+    let mut sibling = lease.live().subscribe_rendition(RenditionId(1)).unwrap();
+    first.borrow_and_update();
+    sibling.borrow_and_update();
+
+    write(&lease, chunk(0, 0, 0, 0, 1, 1));
+    first.changed().await.unwrap();
+    assert!(!sibling.has_changed().unwrap());
+    assert_eq!(lease.live().revision(), catalog_revision);
+
+    write(&lease, completion(0, 0, 0, 1));
+    assert!(first.has_changed().unwrap());
+    assert!(!sibling.has_changed().unwrap());
+    assert!(
+        lease.live().revision() > catalog_revision,
+        "completed-segment bitrate statistics invalidate the multivariant projection"
+    );
+    let catalog = lease.live().snapshot();
+    assert_eq!(
+        catalog.renditions[0].bandwidth,
+        catalog.renditions[0].snapshot().bitrate.advertised(),
+        "one catalog revision captures the bitrate values it advertises"
+    );
+}
+
+#[test]
+fn unchanged_advertised_bitrate_does_not_churn_the_catalog() {
+    let store = store();
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    write(&lease, direct(0, 0, 0, 6, 6));
+    let revision = lease.live().revision();
+
+    write(&lease, direct(0, 1, 6, 6, 6));
+
+    assert_eq!(
+        lease.live().revision(),
+        revision,
+        "observation counts are diagnostic; only advertised rates invalidate the manifest"
+    );
+}
+
+#[test]
+fn request_snapshots_are_cached_until_the_next_committed_change() {
+    let store = store();
+    let lease = lease(&store, &[(0, true), (1, true)]);
+    configure(&lease, 0, true);
+    configure(&lease, 1, true);
+
+    let catalog = lease.live().snapshot();
+    let same_catalog = lease.live().snapshot();
+    assert!(Arc::ptr_eq(&catalog, &same_catalog));
+    let sibling = catalog.renditions[1].snapshot();
+    let first = catalog.renditions[0].snapshot();
+    let same = lease.live().rendition(RenditionId(0)).unwrap();
+    assert!(Arc::ptr_eq(&first, &same));
+
+    write(&lease, chunk(0, 0, 0, 0, 1, 1));
+    let same_catalog = lease.live().snapshot();
+    assert!(
+        Arc::ptr_eq(&catalog, &same_catalog),
+        "ordinary chunks do not rebuild the stream catalog"
+    );
+    assert!(
+        Arc::ptr_eq(&sibling, &same_catalog.renditions[1].snapshot()),
+        "an unrelated rendition does not rebuild its cached snapshot"
+    );
+    let advanced = same_catalog.renditions[0].snapshot();
+    assert!(!Arc::ptr_eq(&first, &advanced));
+    assert!(first.open_segment.is_none());
+    assert_eq!(
+        advanced.open_segment.as_ref().map(|open| open.parts.len()),
+        Some(1)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn part_tags_and_resources_have_distinct_retention_deadlines() {
+    let store = store();
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    write(&lease, chunk(0, 0, 0, 0, 1, 1));
+    write(&lease, completion(0, 0, 0, 1));
+    let part_id = PartId(1);
+
+    for id in 1..=4 {
+        let start = 1 + (id as i64 - 1) * 6;
+        write(&lease, chunk(0, id, 0, start, 6, 1));
+        write(&lease, completion(0, id, start, 6));
+    }
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    assert!(
+        snapshot.segments[0].parts.is_empty(),
+        "the tag is hidden once it is over three targets behind"
+    );
+    assert!(lease.live().part(RenditionId(0), part_id).is_some());
+
+    tokio::time::advance(Duration::from_secs(18)).await;
+    assert!(lease.live().part(RenditionId(0), part_id).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn removed_segments_obey_their_availability_deadline() {
+    let store = store();
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    for id in 0..7 {
+        write(&lease, direct(0, id, id as i64 * 6, 6, 1));
+        if id < 6 {
+            tokio::time::advance(Duration::from_secs(6)).await;
+        }
+    }
+    let first = SegmentId(1);
+    assert!(lease.live().segment(RenditionId(0), first).is_some());
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(lease.live().segment(RenditionId(0), first).is_none());
+    assert_eq!(
+        lease
+            .live()
+            .rendition(RenditionId(0))
+            .unwrap()
+            .segments
+            .len(),
+        6
+    );
+}
+
+#[test]
+fn live_window_never_falls_below_three_target_durations() {
+    let store = store();
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    for id in 0..19 {
+        write(&lease, direct(0, id, id as i64, 1, 1));
+    }
+
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    assert_eq!(
+        snapshot.segments.len(),
+        18,
+        "the six-segment count is only a floor when segments are shorter \
+         than the target duration"
+    );
+    assert_eq!(snapshot.segments[0].msn, Msn(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn initializations_live_until_every_dependent_resource_expires() {
+    let store = store();
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    write(&lease, direct(0, 0, 0, 6, 1));
+    write(&lease, initialization(0, 2));
+    for id in 1..7 {
+        write(&lease, direct(0, id, id as i64 * 6, 6, 1));
+    }
+
+    assert_eq!(
+        lease
+            .live()
+            .rendition(RenditionId(0))
+            .unwrap()
+            .initializations
+            .len(),
+        2
+    );
+    tokio::time::advance(Duration::from_secs(42)).await;
+    store.maintain();
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    assert_eq!(snapshot.initializations.len(), 1);
+    assert_eq!(snapshot.initializations[0].version, 2);
+}
+
+#[test]
+fn payload_capacity_failure_does_not_mutate_the_open_segment() {
+    let mut limits = limits();
+    limits.retention.maximum_payload_bytes = 4;
+    let store = StreamStore::new(limits);
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    write(&lease, chunk(0, 0, 0, 0, 1, 3));
+    assert_eq!(lease.live().retained_payload_bytes(), 4);
+
+    assert_eq!(
+        lease.write(chunk(0, 0, 1, 1, 1, 1)),
+        Err(StoreWriteError::PayloadCapacityExceeded {
+            maximum: 4,
+            additional: 1,
+        })
+    );
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    let open = snapshot.open_segment.as_ref().unwrap();
+    assert_eq!(open.parts.len(), 1);
+    assert_eq!(lease.live().retained_payload_bytes(), 4);
+}
+
+#[test]
+fn object_capacity_failure_is_atomic_even_for_empty_payloads() {
+    let mut limits = limits();
+    limits.retention.maximum_parts = 1;
+    let store = StreamStore::new(limits);
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    write(&lease, chunk(0, 0, 0, 0, 1, 0));
+
+    assert_eq!(
+        lease.write(chunk(0, 0, 1, 1, 1, 0)),
+        Err(StoreWriteError::PartCapacityExceeded { maximum: 1 })
+    );
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    assert_eq!(snapshot.open_segment.as_ref().unwrap().parts.len(), 1);
+    assert_eq!(snapshot.live_edge.next_part_id, Some(PartId(2)));
+}
+
+#[test]
+fn segment_count_capacity_failure_is_atomic() {
+    let mut limits = limits();
+    limits.retention.maximum_segments = 6;
+    let store = StreamStore::new(limits);
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    for id in 0..6 {
+        write(&lease, direct(0, id, id as i64 * 6, 6, 0));
+    }
+
+    assert_eq!(
+        lease.write(direct(0, 6, 36, 6, 0)),
+        Err(StoreWriteError::SegmentCapacityExceeded { maximum: 6 })
+    );
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    assert_eq!(snapshot.segments.len(), 6);
+    assert_eq!(
+        snapshot.live_edge.last_segment,
+        Some((Msn(5), SegmentId(6)))
+    );
+}
+
+#[test]
+fn ending_a_rendition_removes_its_preload_reservation() {
+    let store = store();
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    write(&lease, chunk(0, 0, 0, 0, 1, 1));
+    assert!(lease.end());
+
+    let edge = lease.live().rendition_live_edge(RenditionId(0)).unwrap();
+    assert!(edge.ended);
+    assert_eq!(edge.next_part_id, None);
+    assert_eq!(edge.last_segment, Some((Msn(0), SegmentId(1))));
+    assert_eq!(
+        lease
+            .live()
+            .rendition(RenditionId(0))
+            .unwrap()
+            .bitrate
+            .observed_segments,
+        0,
+        "the synthesized gap is not a bitrate observation"
+    );
+}
+
+#[test]
+fn peak_is_monotonic_and_average_uses_the_latest_media_hour() {
+    let store = store();
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    for id in 0..600 {
+        write(&lease, direct(0, id, id as i64 * 6, 6, 12));
+    }
+    for id in 600..1_200 {
+        write(&lease, direct(0, id, id as i64 * 6, 6, 6));
+    }
+
+    let stats = lease.live().rendition(RenditionId(0)).unwrap().bitrate;
+    assert_eq!(stats.peak_bits_per_second, Some(16));
+    assert_eq!(stats.average_bits_per_second, Some(8));
+    assert_eq!(stats.observed_segments, 1_200);
+}
+
+#[test]
+fn bitrate_peak_does_not_span_a_publication_discontinuity() {
+    let store = store();
+    let first = lease(&store, &[(0, false)]);
+    configure(&first, 0, false);
+    write(&first, direct(0, 0, 0, 2, 100));
+
+    let second = lease(&store, &[(0, false)]);
+    configure(&second, 0, false);
+    write(&second, direct(0, 0, 0, 2, 100));
+    assert_eq!(
+        second
+            .live()
+            .rendition(RenditionId(0))
+            .unwrap()
+            .bitrate
+            .peak_bits_per_second,
+        None
+    );
+
+    write(&second, direct(0, 1, 2, 2, 100));
+    assert_eq!(
+        second
+            .live()
+            .rendition(RenditionId(0))
+            .unwrap()
+            .bitrate
+            .peak_bits_per_second,
+        Some(400)
+    );
+}
+
+#[tokio::test]
+async fn lock_free_lookups_coexist_with_takeover_and_retirement_checks() {
+    let store = Arc::new(store());
+    let held = lease(&store, &[(0, true)]);
+    let mut readers = Vec::new();
+    for _ in 0..8 {
+        let store = Arc::clone(&store);
+        readers.push(tokio::spawn(async move {
+            for _ in 0..1_000 {
+                assert!(store.get(&stream()).is_some());
+            }
+        }));
+    }
+    for _ in 0..32 {
+        drop(lease(&store, &[(0, true)]));
+        store.maintain();
+    }
+    for reader in readers {
+        reader.await.unwrap();
+    }
+    assert!(store.get(&stream()).is_some());
+    drop(held);
+}

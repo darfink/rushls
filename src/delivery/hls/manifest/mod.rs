@@ -41,7 +41,7 @@ pub enum ManifestWriteError {
 
 pub type ManifestWriteResult<T> = Result<T, ManifestWriteError>;
 
-pub(super) fn validate_quoted(value: &str, field: &'static str) -> ManifestWriteResult<()> {
+pub fn validate_quoted(value: &str, field: &'static str) -> ManifestWriteResult<()> {
     if value.chars().any(|character| {
         character == '"' || character == '\r' || character == '\n' || character.is_control()
     }) {
@@ -50,7 +50,7 @@ pub(super) fn validate_quoted(value: &str, field: &'static str) -> ManifestWrite
     Ok(())
 }
 
-pub(super) fn validate_uri(value: &str, field: &'static str) -> ManifestWriteResult<()> {
+pub fn validate_uri(value: &str, field: &'static str) -> ManifestWriteResult<()> {
     if value.is_empty()
         || value.chars().any(|character| {
             character == '"' || character.is_whitespace() || character.is_control()
@@ -61,17 +61,17 @@ pub(super) fn validate_uri(value: &str, field: &'static str) -> ManifestWriteRes
     Ok(())
 }
 
-pub(super) struct AttributeList<'a, W: Write + ?Sized> {
+pub struct AttributeList<'a, W: Write + ?Sized> {
     out: &'a mut W,
     first: bool,
 }
 
 impl<'a, W: Write + ?Sized> AttributeList<'a, W> {
-    pub(super) fn new(out: &'a mut W) -> Self {
+    pub fn new(out: &'a mut W) -> Self {
         Self { out, first: true }
     }
 
-    pub(super) fn item(
+    pub fn item(
         &mut self,
         write: impl FnOnce(&mut W) -> fmt::Result,
     ) -> ManifestWriteResult<()> {
@@ -84,7 +84,7 @@ impl<'a, W: Write + ?Sized> AttributeList<'a, W> {
     }
 }
 
-pub(super) struct DecimalSeconds(pub(super) Duration);
+pub struct DecimalSeconds(pub Duration);
 
 impl fmt::Display for DecimalSeconds {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

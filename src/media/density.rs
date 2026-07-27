@@ -126,35 +126,9 @@ pub enum MediaDensityError {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        domain::{Codec, Payload, Timebase, TrackId},
-        media::{TimelineCalibration, TrackTimeline, VideoSample},
-    };
+    use crate::media::fixtures::{video_sample_at as sample, video_timeline as timeline};
 
     use super::*;
-
-    fn timeline() -> TimelineCalibration {
-        TimelineCalibration {
-            timing_authority: TrackId(0),
-            tracks: vec![TrackTimeline {
-                track_id: TrackId(0),
-                timebase: Timebase::hz90k(),
-                origin_pts: 0,
-            }],
-        }
-    }
-
-    fn sample(seconds: i64) -> NormalizedSample {
-        NormalizedSample::Video(VideoSample {
-            track_id: TrackId(0),
-            codec: Codec::H264,
-            pts: seconds * 90_000,
-            dts: seconds * 90_000,
-            duration: 3_000,
-            random_access: true,
-            payload: Payload::default(),
-        })
-    }
 
     fn limits() -> InputLimits {
         InputLimits {

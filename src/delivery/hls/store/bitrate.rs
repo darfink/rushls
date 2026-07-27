@@ -17,7 +17,7 @@ struct Observation {
 /// bounded to approximately the latest media hour so old operating conditions
 /// do not dominate a long-running live stream.
 #[derive(Debug, Default)]
-pub(super) struct BitrateTracker {
+pub struct BitrateTracker {
     peak_bits_per_second: Option<u64>,
     peak_window: VecDeque<Observation>,
     peak_window_duration: Duration,
@@ -28,12 +28,12 @@ pub(super) struct BitrateTracker {
 }
 
 impl BitrateTracker {
-    pub(super) fn break_contiguity(&mut self) {
+    pub fn break_contiguity(&mut self) {
         self.peak_window.clear();
         self.peak_window_duration = Duration::ZERO;
     }
 
-    pub(super) fn observe(&mut self, bytes: usize, duration: Duration, target: Duration) {
+    pub fn observe(&mut self, bytes: usize, duration: Duration, target: Duration) {
         if duration.is_zero() {
             return;
         }
@@ -91,7 +91,7 @@ impl BitrateTracker {
         }
     }
 
-    pub(super) fn snapshot(&self) -> RenditionBitrateStatistics {
+    pub fn snapshot(&self) -> RenditionBitrateStatistics {
         RenditionBitrateStatistics {
             peak_bits_per_second: self.peak_bits_per_second,
             average_bits_per_second: (!self.average_window_duration.is_zero())

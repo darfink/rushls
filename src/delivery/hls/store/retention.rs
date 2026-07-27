@@ -95,15 +95,15 @@ pub struct RetentionPolicy {
 }
 
 impl RetentionPolicy {
-    pub(super) fn minimum_playlist_duration_for(self, target: Duration) -> Duration {
+    pub fn minimum_playlist_duration_for(self, target: Duration) -> Duration {
         self.minimum_playlist_duration.resolve(target)
     }
 
-    pub(super) fn part_tag_retention_for(self, target: Duration) -> Duration {
+    pub fn part_tag_retention_for(self, target: Duration) -> Duration {
         self.part_tag_retention.resolve(target)
     }
 
-    pub(super) fn part_fetch_deadline(
+    pub fn part_fetch_deadline(
         self,
         removed_at: Instant,
         target: Duration,
@@ -111,7 +111,7 @@ impl RetentionPolicy {
         removed_at.checked_add(self.part_fetch_grace_period.resolve(target))
     }
 
-    pub(super) fn segment_fetch_deadline(
+    pub fn segment_fetch_deadline(
         self,
         removed_at: Instant,
         target: Duration,

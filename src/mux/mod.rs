@@ -17,6 +17,9 @@ use crate::{
 
 mod presentation;
 
+#[cfg(test)]
+pub mod fixtures;
+
 pub use presentation::{
     MuxerStartRequest, PackagedPresentation, PackagedPresentationError, PackagedRendition,
     PackagingRenditionId, PlayableCombination, RenditionGroup, RenditionGroupKey, RenditionKey,

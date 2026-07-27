@@ -231,50 +231,11 @@ pub enum PrerollError {
 #[cfg(test)]
 mod tests {
     use crate::{
-        admission::StreamPolicy,
-        domain::{Codec, DiscoveredTrack, FrameRate, MediaKind, MediaParameters, TrackCatalog},
-        media::validate,
+        domain::{MediaKind, fixtures::track},
+        media::fixtures::presentation,
     };
 
     use super::*;
-
-    fn track(id: u32, kind: MediaKind) -> DiscoveredTrack {
-        let parameters = match kind {
-            MediaKind::Audio => MediaParameters::Audio {
-                sample_rate: nz::u32!(48_000),
-                channels: nz::u16!(2),
-                frame_size: Some(nz::u32!(1_024)),
-                bit_depth: Some(nz::u16!(16)),
-            },
-            MediaKind::Subtitle => MediaParameters::Subtitle,
-            MediaKind::Video => MediaParameters::Video {
-                width: nz::u32!(1920),
-                height: nz::u32!(1080),
-                frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
-                video_delay: 0,
-            },
-        };
-        DiscoveredTrack {
-            id: TrackId(id),
-            source_key: None,
-            codec: match kind {
-                MediaKind::Audio => Codec::Aac,
-                MediaKind::Subtitle => Codec::WebVtt,
-                MediaKind::Video => Codec::H264,
-            },
-            parameters,
-            timebase: Timebase::hz90k(),
-            first_pts: Some(0),
-            title: None,
-            language: None,
-            codec_extradata: crate::domain::Payload::default(),
-        }
-    }
-
-    fn presentation(tracks: Vec<DiscoveredTrack>) -> PresentationPlan {
-        let catalog = TrackCatalog::new(tracks).expect("test catalog is valid");
-        validate(&catalog, &StreamPolicy::permissive()).expect("test presentation is valid")
-    }
 
     fn planned_track(track_id: u32) -> TrackSegmentationPlan {
         TrackSegmentationPlan {

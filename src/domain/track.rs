@@ -180,36 +180,9 @@ pub struct TrackCounts {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::domain::fixtures::track;
 
-    fn track(id: u32, kind: MediaKind) -> DiscoveredTrack {
-        let parameters = match kind {
-            MediaKind::Audio => MediaParameters::Audio {
-                sample_rate: nz::u32!(48_000),
-                channels: nz::u16!(2),
-                frame_size: Some(nz::u32!(1_024)),
-                bit_depth: Some(nz::u16!(16)),
-            },
-            MediaKind::Subtitle => MediaParameters::Subtitle,
-            MediaKind::Video => MediaParameters::Video {
-                width: nz::u32!(1920),
-                height: nz::u32!(1080),
-                frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
-                video_delay: 0,
-            },
-        };
-        DiscoveredTrack {
-            id: TrackId(id),
-            source_key: None,
-            codec: Codec::H264,
-            parameters,
-            timebase: Timebase::hz90k(),
-            first_pts: Some(0),
-            title: None,
-            language: None,
-            codec_extradata: Payload::default(),
-        }
-    }
+    use super::*;
 
     #[test]
     fn catalog_rejects_empty_and_duplicated_track_sets() {

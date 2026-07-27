@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, num::NonZero, sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
 
@@ -9,19 +9,18 @@ use crate::{
     },
     delivery::hls::{StorePublisherFactory, StreamStore},
     domain::{
-        Appender, BoxFuture, Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload,
-        SessionId, StreamId, Timebase, TrackCatalog, TrackCounts, TrackId,
+        Appender, BoxFuture, Codec, MediaKind, Payload, SessionId, StreamId, Timebase,
+        TrackCounts, TrackId, fixtures::video_catalog,
     },
     media::{
         MediaNormalizer, NormalizeError, NormalizedSample, NormalizerFactory, PresentationPlan,
         TimelineCalibration, VideoSample,
     },
     mux::{
-        FinishReason, InitializationSegment, MediaSegmentFormat, MuxError, Muxer, MuxerFactory,
-        MuxerStartRequest, PackagedChunk, PackagedMedia, PackagedPresentation, PackagedRendition,
-        PackagedSegmentCompletion, PackagingRenditionId, PackagingSegmentId, PlayableCombination,
-        RenditionConfig, RenditionGroup, RenditionGroupKey, RenditionKey, RenditionMedia,
-        StartedMuxer,
+        FinishReason, InitializationSegment, MuxError, Muxer, MuxerFactory, MuxerStartRequest,
+        PackagedChunk, PackagedMedia, PackagedSegmentCompletion, PackagingRenditionId,
+        PackagingSegmentId, StartedMuxer, fixtures as mux_fixtures,
+        fixtures::RenditionBuilder,
     },
     observe::{EventObserver, Events, ProcessMeters, SessionEnd, SessionEvent, SourceMeters},
     segment::{PrerollLimits, SegmentationPolicy},
@@ -289,42 +288,22 @@ struct FakeMuxerFactory {
 impl MuxerFactory for FakeMuxerFactory {
     fn start(&self, request: MuxerStartRequest<'_>) -> Result<StartedMuxer, MuxError> {
         record(&self.log, "muxer_start");
-        let rendition_id = PackagingRenditionId(0);
-        let presentation = PackagedPresentation::new(
+        // Two-second segments cut into one-second chunks, so a handful of
+        // scripted frames is enough to exercise both cadences.
+        let presentation = mux_fixtures::presentation_at(
             request.time_anchor,
             request.presentation,
-            vec![PackagedRendition {
-                packaging_rendition_id: rendition_id,
-                key: RenditionKey::new("video/main"),
-                source_tracks: Arc::from([TrackId(0)]),
-                config: RenditionConfig {
-                    timebase: Timebase::hz90k(),
-                    segment_target: NonZero::new(2 * SECOND as u64).unwrap(),
-                    chunk_target: NonZero::new(SECOND as u64),
-                    segment_format: MediaSegmentFormat::Cmaf,
-                },
-                media: RenditionMedia::Video {
-                    width: nz::u32!(1920),
-                    height: nz::u32!(1080),
-                    frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
-                    video_range: None,
-                },
-                codecs: Arc::from("avc1.640028"),
-                name: Arc::from("Main"),
-                language: None,
-                is_default: true,
-                declared_bandwidth: None,
-            }],
-            vec![RenditionGroup {
-                key: RenditionGroupKey::new("video"),
-                media_kind: crate::domain::MediaKind::Video,
-                renditions: Arc::from([rendition_id]),
-            }],
-            vec![PlayableCombination {
-                groups: Arc::from([RenditionGroupKey::new("video")]),
-            }],
-        )
-        .map_err(|error| MuxError::InvalidPlan(error.to_string()))?;
+            vec![
+                RenditionBuilder::new(0, MediaKind::Video)
+                    .key("video/main")
+                    .config(mux_fixtures::config(
+                        Timebase::hz90k(),
+                        2 * SECOND as u64,
+                        Some(SECOND as u64),
+                    ))
+                    .build(),
+            ],
+        );
         Ok(StartedMuxer {
             muxer: Box::new(FakeMuxer {
                 initialized: false,
@@ -438,26 +417,6 @@ fn name(event: &SessionEvent) -> &'static str {
         SessionEvent::Ended { .. } => "ended",
         SessionEvent::Failed { .. } => "failed",
     }
-}
-
-fn video_catalog() -> TrackCatalog {
-    TrackCatalog::new(vec![DiscoveredTrack {
-        id: TrackId(0),
-        source_key: None,
-        codec: Codec::H264,
-        parameters: MediaParameters::Video {
-            width: nz::u32!(1920),
-            height: nz::u32!(1080),
-            frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
-            video_delay: 0,
-        },
-        timebase: Timebase::hz90k(),
-        first_pts: Some(0),
-        title: None,
-        language: None,
-        codec_extradata: Payload::default(),
-    }])
-    .expect("test catalog is valid")
 }
 
 fn packet(pts: i64, random_access: bool) -> Packet {

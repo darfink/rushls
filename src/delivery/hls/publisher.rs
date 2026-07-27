@@ -117,86 +117,27 @@ impl HlsPublisher for StorePublisher {
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZero, time::SystemTime};
-
     use crate::{
-        admission::StreamPolicy,
-        domain::{
-            Codec, DiscoveredTrack, FrameRate, MediaKind, MediaParameters, Payload, Timebase,
-            TrackCatalog, TrackId,
-        },
-        media::{PresentationPlan, validate},
+        domain::Payload,
+        media::fixtures::video_presentation,
         mux::{
-            InitializationSegment, MediaSegmentFormat, PackagedChunk, PackagedMedia,
-            PackagedPresentation, PackagedRendition, PackagingRenditionId, PackagingSegmentId,
-            PlayableCombination, RenditionConfig, RenditionGroup, RenditionGroupKey, RenditionKey,
-            RenditionMedia,
+            InitializationSegment, PackagedChunk, PackagedMedia, PackagedPresentation,
+            PackagingRenditionId, PackagingSegmentId,
+            fixtures::{RenditionBuilder, presentation},
         },
     };
 
     use super::{super::StoreLimits, *};
 
-    fn presentation() -> PresentationPlan {
-        let catalog = TrackCatalog::new(vec![DiscoveredTrack {
-            id: TrackId(0),
-            source_key: None,
-            codec: Codec::H264,
-            parameters: MediaParameters::Video {
-                width: nz::u32!(1920),
-                height: nz::u32!(1080),
-                frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
-                video_delay: 0,
-            },
-            timebase: Timebase::hz90k(),
-            first_pts: Some(0),
-            title: None,
-            language: None,
-            codec_extradata: Payload::default(),
-        }])
-        .expect("test catalog is valid");
-        validate(&catalog, &StreamPolicy::permissive()).expect("test presentation is valid")
-    }
-
     fn packaged_presentation() -> Arc<PackagedPresentation> {
-        let input = presentation();
-        let rendition_id = PackagingRenditionId(0);
-        Arc::new(
-            PackagedPresentation::new(
-                SystemTime::UNIX_EPOCH,
-                &input,
-                vec![PackagedRendition {
-                    packaging_rendition_id: rendition_id,
-                    key: RenditionKey::new("video/main"),
-                    source_tracks: Arc::from([TrackId(0)]),
-                    config: RenditionConfig {
-                        timebase: Timebase::hz90k(),
-                        segment_target: NonZero::new(540_000).unwrap(),
-                        chunk_target: NonZero::new(90_000),
-                        segment_format: MediaSegmentFormat::Cmaf,
-                    },
-                    media: RenditionMedia::Video {
-                        width: nz::u32!(1920),
-                        height: nz::u32!(1080),
-                        frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
-                        video_range: None,
-                    },
-                    codecs: Arc::from("avc1.640028"),
-                    name: Arc::from("Main"),
-                    language: None,
-                    is_default: true,
-                    declared_bandwidth: None,
-                }],
-                vec![RenditionGroup {
-                    key: RenditionGroupKey::new("video"),
-                    media_kind: MediaKind::Video,
-                    renditions: Arc::from([rendition_id]),
-                }],
-                vec![PlayableCombination {
-                    groups: Arc::from([RenditionGroupKey::new("video")]),
-                }],
-            )
-            .expect("test packaged presentation is valid"),
-        )
+        Arc::new(presentation(
+            &video_presentation(),
+            vec![
+                RenditionBuilder::new(0, crate::domain::MediaKind::Video)
+                    .key("video/main")
+                    .build(),
+            ],
+        ))
     }
 
     fn initialization() -> PackagedMedia {

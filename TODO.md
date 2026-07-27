@@ -8,8 +8,11 @@
 - Health evaluation doesn't consider track-local publication duration
 - Run an LLM against HLS spec and comment all spec related behavior
 - Run an LLM to evaluate performance improvements + profile
+- Run an LLM to find reductions in allocations
 - Implement tests w/ mediastreamvalidator
 - Implement end-to-end tests validating expected PTS, ELST, PDT, fetch, grace etc
+- Implement end-to-end tests with ffprobe??
+- Implement
 - A single automatic cancellable maintenance task for the store
 
 # Steps

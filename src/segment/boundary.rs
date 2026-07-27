@@ -256,29 +256,16 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{Codec, Payload, Timebase, TrackId},
-        media::{AudioSample, TrackTimeline, VideoSample},
+        domain::Timebase,
+        media::fixtures::{AUDIO_SECOND, VIDEO_SECOND, audio_sample, video_sample},
     };
 
-    const VIDEO_SECOND: i64 = 90_000;
-    const AUDIO_SECOND: i64 = 48_000;
-
+    /// Video on 90 kHz, audio on 48 kHz: distinct tick domains, shared origin.
     fn timeline() -> TimelineCalibration {
-        TimelineCalibration {
-            timing_authority: TrackId(0),
-            tracks: vec![
-                TrackTimeline {
-                    track_id: TrackId(0),
-                    timebase: Timebase::hz90k(),
-                    origin_pts: 0,
-                },
-                TrackTimeline {
-                    track_id: TrackId(1),
-                    timebase: Timebase::new(nz::u32!(1), nz::u32!(48_000)),
-                    origin_pts: 0,
-                },
-            ],
-        }
+        crate::media::fixtures::timeline([
+            (0, Timebase::hz90k()),
+            (1, Timebase::new(nz::u32!(1), nz::u32!(48_000))),
+        ])
     }
 
     fn selector(alignment: BoundaryAlignmentPolicy) -> BoundarySelector {
@@ -321,23 +308,18 @@ mod tests {
         random_access: bool,
     ) {
         let sample = if track_id == 0 {
-            NormalizedSample::Video(VideoSample {
-                track_id: TrackId(track_id),
-                codec: Codec::H264,
-                pts: start_seconds * VIDEO_SECOND,
-                dts: start_seconds * VIDEO_SECOND,
-                duration: duration_seconds * VIDEO_SECOND as u64,
+            video_sample(
+                start_seconds * VIDEO_SECOND,
+                duration_seconds * VIDEO_SECOND as u64,
                 random_access,
-                payload: Payload::default(),
-            })
+                0,
+            )
         } else {
-            NormalizedSample::Audio(AudioSample {
-                track_id: TrackId(track_id),
-                codec: Codec::Aac,
-                pts: start_seconds * AUDIO_SECOND,
-                duration: duration_seconds * AUDIO_SECOND as u64,
-                payload: Payload::default(),
-            })
+            audio_sample(
+                track_id,
+                start_seconds * AUDIO_SECOND,
+                duration_seconds * AUDIO_SECOND as u64,
+            )
         };
         selector
             .observe(&sample)
@@ -375,66 +357,31 @@ mod tests {
 
     #[test]
     fn aligned_comparison_accounts_for_each_tracks_local_origin() {
-        let timeline = TimelineCalibration {
-            timing_authority: TrackId(0),
-            tracks: vec![
-                TrackTimeline {
-                    track_id: TrackId(0),
-                    timebase: Timebase::hz90k(),
-                    origin_pts: VIDEO_SECOND,
-                },
-                TrackTimeline {
-                    track_id: TrackId(1),
-                    timebase: Timebase::new(nz::u32!(1), nz::u32!(48_000)),
-                    origin_pts: 2 * AUDIO_SECOND,
-                },
-            ],
-        };
+        // The two origins denote the same instant expressed in different tick
+        // domains, so a comparison that forgets to subtract them would disagree.
+        let timeline = crate::media::fixtures::calibrated([
+            (0, Timebase::hz90k(), VIDEO_SECOND),
+            (
+                1,
+                Timebase::new(nz::u32!(1), nz::u32!(48_000)),
+                2 * AUDIO_SECOND,
+            ),
+        ]);
         let mut selector = BoundarySelector::new(
             &timeline,
             SegmentationPolicy::latency_first(Duration::from_secs(10), Duration::from_millis(200)),
         )
         .expect("test policy is representable");
-        selector
-            .observe(&NormalizedSample::Video(VideoSample {
-                track_id: TrackId(0),
-                codec: Codec::H264,
-                pts: 9 * VIDEO_SECOND,
-                dts: 9 * VIDEO_SECOND,
-                duration: VIDEO_SECOND as u64,
-                random_access: true,
-                payload: Payload::default(),
-            }))
-            .expect("video track is calibrated");
-        selector
-            .observe(&NormalizedSample::Audio(AudioSample {
-                track_id: TrackId(1),
-                codec: Codec::Aac,
-                pts: 10 * AUDIO_SECOND,
-                duration: AUDIO_SECOND as u64,
-                payload: Payload::default(),
-            }))
-            .expect("audio track is calibrated");
-        selector
-            .observe(&NormalizedSample::Video(VideoSample {
-                track_id: TrackId(0),
-                codec: Codec::H264,
-                pts: 10 * VIDEO_SECOND,
-                dts: 10 * VIDEO_SECOND,
-                duration: VIDEO_SECOND as u64,
-                random_access: false,
-                payload: Payload::default(),
-            }))
-            .expect("video track is calibrated");
-        selector
-            .observe(&NormalizedSample::Audio(AudioSample {
-                track_id: TrackId(1),
-                codec: Codec::Aac,
-                pts: 11 * AUDIO_SECOND,
-                duration: AUDIO_SECOND as u64,
-                payload: Payload::default(),
-            }))
-            .expect("audio track is calibrated");
+        for sample in [
+            video_sample(9 * VIDEO_SECOND, VIDEO_SECOND as u64, true, 0),
+            audio_sample(1, 10 * AUDIO_SECOND, AUDIO_SECOND as u64),
+            video_sample(10 * VIDEO_SECOND, VIDEO_SECOND as u64, false, 0),
+            audio_sample(1, 11 * AUDIO_SECOND, AUDIO_SECOND as u64),
+        ] {
+            selector
+                .observe(&sample)
+                .expect("test sample belongs to the timeline");
+        }
 
         assert_eq!(
             selector.selection(),

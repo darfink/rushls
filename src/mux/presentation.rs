@@ -438,92 +438,24 @@ const _: Option<MediaSegmentFormat> = None;
 
 #[cfg(test)]
 mod tests {
-    use std::{num::NonZero, sync::Arc, time::SystemTime};
+    use std::{sync::Arc, time::SystemTime};
 
     use crate::{
-        admission::StreamPolicy,
-        domain::{
-            Codec, DiscoveredTrack, FrameRate, MediaKind, MediaParameters, Payload, Timebase,
-            TrackCatalog, TrackId,
-        },
-        media::validate,
+        domain::{MediaKind, TrackId, fixtures::track},
+        media::fixtures::presentation,
+        mux::fixtures::RenditionBuilder,
     };
 
     use super::*;
 
     fn input() -> PresentationPlan {
-        let tracks =
-            TrackCatalog::new(vec![track(0, MediaKind::Video), track(1, MediaKind::Audio)])
-                .expect("test catalog is valid");
-        validate(&tracks, &StreamPolicy::permissive()).expect("test presentation is valid")
-    }
-
-    fn track(id: u32, kind: MediaKind) -> DiscoveredTrack {
-        DiscoveredTrack {
-            id: TrackId(id),
-            source_key: None,
-            codec: match kind {
-                MediaKind::Audio => Codec::Aac,
-                MediaKind::Subtitle => Codec::WebVtt,
-                MediaKind::Video => Codec::H264,
-            },
-            parameters: match kind {
-                MediaKind::Audio => MediaParameters::Audio {
-                    sample_rate: nz::u32!(48_000),
-                    channels: nz::u16!(2),
-                    frame_size: Some(nz::u32!(1_024)),
-                    bit_depth: Some(nz::u16!(16)),
-                },
-                MediaKind::Subtitle => MediaParameters::Subtitle,
-                MediaKind::Video => MediaParameters::Video {
-                    width: nz::u32!(1920),
-                    height: nz::u32!(1080),
-                    frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
-                    video_delay: 0,
-                },
-            },
-            timebase: Timebase::hz90k(),
-            first_pts: Some(0),
-            title: None,
-            language: None,
-            codec_extradata: Payload::default(),
-        }
+        presentation(vec![track(0, MediaKind::Video), track(1, MediaKind::Audio)])
     }
 
     fn rendition(id: u32, track_id: u32, kind: MediaKind) -> PackagedRendition {
-        PackagedRendition {
-            packaging_rendition_id: PackagingRenditionId(id),
-            key: RenditionKey::new(format!("{kind:?}/{id}")),
-            source_tracks: Arc::from([TrackId(track_id)]),
-            config: RenditionConfig {
-                timebase: Timebase::hz90k(),
-                segment_target: NonZero::new(540_000).unwrap(),
-                chunk_target: NonZero::new(90_000),
-                segment_format: MediaSegmentFormat::Cmaf,
-            },
-            media: match kind {
-                MediaKind::Audio => RenditionMedia::Audio {
-                    sample_rate: nz::u32!(48_000),
-                    channels: nz::u16!(2),
-                },
-                MediaKind::Subtitle => RenditionMedia::Subtitle,
-                MediaKind::Video => RenditionMedia::Video {
-                    width: nz::u32!(1920),
-                    height: nz::u32!(1080),
-                    frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
-                    video_range: None,
-                },
-            },
-            codecs: Arc::from(match kind {
-                MediaKind::Audio => "mp4a.40.2",
-                MediaKind::Subtitle => "wvtt",
-                MediaKind::Video => "avc1.640028",
-            }),
-            name: Arc::from(format!("{kind:?} {id}")),
-            language: None,
-            is_default: false,
-            declared_bandwidth: None,
-        }
+        RenditionBuilder::new(id, kind)
+            .source_tracks(&[track_id])
+            .build()
     }
 
     #[test]

@@ -13,6 +13,9 @@ mod stream;
 mod timeline;
 mod validate;
 
+#[cfg(test)]
+pub mod fixtures;
+
 pub use density::{MediaDensityError, MediaDensityWindow};
 pub use normalize::{
     AudioSample, MediaNormalizer, NormalizeError, NormalizedSample, NormalizerFactory,

@@ -269,12 +269,11 @@ mod tests {
     use parking_lot::Mutex;
 
     use crate::{
-        admission::StreamPolicy,
-        domain::{
-            Appender, BoxFuture, Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload,
-            SessionId, Timebase, TrackCatalog,
+        domain::{Appender, BoxFuture, SessionId},
+        media::{
+            MediaError,
+            fixtures::{VIDEO_SECOND, video_presentation as presentation, video_timeline as timeline},
         },
-        media::{MediaError, VideoSample, validate},
         observe::{EventObserver, Events, SessionEvent},
     };
 
@@ -338,49 +337,14 @@ mod tests {
         }
     }
 
-    fn presentation() -> PresentationPlan {
-        let catalog = TrackCatalog::new(vec![DiscoveredTrack {
-            id: TrackId(0),
-            source_key: None,
-            codec: Codec::H264,
-            parameters: MediaParameters::Video {
-                width: nz::u32!(1920),
-                height: nz::u32!(1080),
-                frame_rate: Some(FrameRate::new(nz::u32!(30), nz::u32!(1))),
-                video_delay: 0,
-            },
-            timebase: Timebase::hz90k(),
-            first_pts: Some(0),
-            title: None,
-            language: None,
-            codec_extradata: Payload::default(),
-        }])
-        .expect("test catalog is valid");
-        validate(&catalog, &StreamPolicy::permissive()).expect("test presentation is valid")
-    }
-
-    fn timeline() -> TimelineCalibration {
-        TimelineCalibration {
-            timing_authority: TrackId(0),
-            tracks: vec![TrackTimeline {
-                track_id: TrackId(0),
-                timebase: Timebase::hz90k(),
-                origin_pts: 0,
-            }],
-        }
-    }
-
+    /// One second of video starting at `start_seconds`.
     fn sample(start_seconds: i64, random_access: bool, payload_bytes: usize) -> NormalizedSample {
-        let pts = start_seconds * 90_000;
-        NormalizedSample::Video(VideoSample {
-            track_id: TrackId(0),
-            codec: Codec::H264,
-            pts,
-            dts: pts,
-            duration: 90_000,
+        crate::media::fixtures::video_sample(
+            start_seconds * VIDEO_SECOND,
+            VIDEO_SECOND as u64,
             random_access,
-            payload: Payload::from(vec![0; payload_bytes]),
-        })
+            payload_bytes,
+        )
     }
 
     fn policy() -> SegmentationPolicy {
@@ -503,17 +467,7 @@ mod tests {
         // charged on payload size alone, this buffers until the node dies.
         let mut source = Replay::new(vec![
             (0..64)
-                .map(|_| {
-                    NormalizedSample::Video(VideoSample {
-                        track_id: TrackId(0),
-                        codec: Codec::H264,
-                        pts: 0,
-                        dts: 0,
-                        duration: 0,
-                        random_access: false,
-                        payload: Payload::default(),
-                    })
-                })
+                .map(|_| crate::media::fixtures::video_sample(0, 0, false, 0))
                 .collect(),
         ]);
 
