@@ -11,12 +11,12 @@ use ffmpeg_sys_next as ffmpeg;
 
 use crate::{
     domain::{Payload, TrackId},
+    ffmpeg::{AvError, OwnedPacket},
     source::{DiscoveryLimits, DiscoveryProblem, InputState, Packet, SourceError},
 };
 
 use super::{
     control::Control,
-    error::AvError,
     input::{AvformatInput, AvformatInputError},
     metadata::StreamCatalog,
 };
@@ -264,21 +264,17 @@ pub enum ReadError {
     Cancelled,
 }
 
-pub struct AvPacket {
-    packet: NonNull<ffmpeg::AVPacket>,
-}
+pub struct AvPacket(OwnedPacket);
 
 impl AvPacket {
     pub fn new() -> Result<Self, SourceError> {
-        // SAFETY: no arguments and no ownership prerequisites.
-        let packet = unsafe { ffmpeg::av_packet_alloc() };
-        NonNull::new(packet)
-            .map(|packet| Self { packet })
+        OwnedPacket::new()
+            .map(Self)
             .ok_or_else(|| SourceError::Open("could not allocate an AVPacket".into()))
     }
 
     pub fn as_ptr(&mut self) -> *mut ffmpeg::AVPacket {
-        self.packet.as_ptr()
+        self.0.as_ptr()
     }
 
     pub fn to_packet(
@@ -287,7 +283,7 @@ impl AvPacket {
         maximum_payload_bytes: usize,
     ) -> Result<Packet, SourceError> {
         // SAFETY: the packet is live and initialized by `av_read_frame`.
-        let packet = unsafe { self.packet.as_ref() };
+        let packet = unsafe { &*self.0.as_ptr() };
         let size = usize::try_from(packet.size)
             .map_err(|_| SourceError::Input("AVPacket has a negative payload size".into()))?;
         if size > maximum_payload_bytes {
@@ -330,8 +326,7 @@ impl AvPacket {
     }
 
     pub fn unref(&mut self) {
-        // SAFETY: the packet is live and uniquely borrowed.
-        unsafe { ffmpeg::av_packet_unref(self.packet.as_ptr()) };
+        self.0.unref();
     }
 }
 
@@ -358,14 +353,6 @@ impl Drop for PacketPayload {
         let mut buffer = self.buffer.as_ptr();
         // SAFETY: this owner uniquely owns its AVBuffer reference.
         unsafe { ffmpeg::av_buffer_unref(&mut buffer) };
-    }
-}
-
-impl Drop for AvPacket {
-    fn drop(&mut self) {
-        let mut packet = self.packet.as_ptr();
-        // SAFETY: this object uniquely owns the AVPacket allocation.
-        unsafe { ffmpeg::av_packet_free(&mut packet) };
     }
 }
 

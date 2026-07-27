@@ -6,8 +6,6 @@
 //! pointer or depend on its ownership rules.
 
 mod control;
-mod dictionary;
-mod error;
 mod ffi;
 mod input;
 mod metadata;

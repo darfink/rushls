@@ -9,7 +9,7 @@ use std::{num::NonZero, time::Duration};
 use thiserror::Error;
 
 use crate::{
-    domain::{TickDuration, Timebase, TrackId},
+    domain::{TickDuration, TickTimestamp, Timebase, TrackId},
     media::{MediaError, PresentationPlan, TimelineCalibrationError},
 };
 
@@ -125,6 +125,8 @@ pub enum BoundaryAlignmentPolicy {
 pub struct TrackSegmentationPlan {
     pub track_id: TrackId,
     pub timebase: Timebase,
+    /// Track-local PTS corresponding to the publication's shared time anchor.
+    pub origin_pts: TickTimestamp,
     /// The selected segment cadence expressed in this track's output time base.
     pub segment_duration: NonZero<TickDuration>,
     /// Selected regular-part target expressed in this track's output time
@@ -132,9 +134,17 @@ pub struct TrackSegmentationPlan {
     pub part_duration: NonZero<TickDuration>,
 }
 
+/// How the locked track boundaries relate on the presentation timeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegmentationAlignment {
+    Aligned { timing_authority: TrackId },
+    Independent,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegmentationPlan {
     tracks: Vec<TrackSegmentationPlan>,
+    alignment: SegmentationAlignment,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -151,6 +161,7 @@ impl SegmentationPlan {
     pub fn new(
         presentation: &PresentationPlan,
         tracks: Vec<TrackSegmentationPlan>,
+        alignment: SegmentationAlignment,
     ) -> Result<Self, SegmentationPlanError> {
         for (index, track) in tracks.iter().enumerate() {
             if tracks[..index]
@@ -173,7 +184,13 @@ impl SegmentationPlan {
             }
         }
 
-        Ok(Self { tracks })
+        if let SegmentationAlignment::Aligned { timing_authority } = alignment
+            && presentation.catalog().get(timing_authority).is_none()
+        {
+            return Err(SegmentationPlanError::UnknownTrack(timing_authority));
+        }
+
+        Ok(Self { tracks, alignment })
     }
 
     pub fn get(&self, track_id: TrackId) -> Option<&TrackSegmentationPlan> {
@@ -182,6 +199,10 @@ impl SegmentationPlan {
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &TrackSegmentationPlan> {
         self.tracks.iter()
+    }
+
+    pub fn alignment(&self) -> SegmentationAlignment {
+        self.alignment
     }
 
     /// The shortest regular part target across tracks, as wall-clock time.
@@ -241,6 +262,7 @@ mod tests {
         TrackSegmentationPlan {
             track_id: TrackId(track_id),
             timebase: Timebase::hz90k(),
+            origin_pts: 0,
             segment_duration: nz::u64!(180_000),
             part_duration: nz::u64!(18_000),
         }
@@ -264,6 +286,9 @@ mod tests {
         let segmentation = SegmentationPlan::new(
             &plan,
             vec![planned_track(0), planned_track(1), planned_track(2)],
+            SegmentationAlignment::Aligned {
+                timing_authority: TrackId(0),
+            },
         )
         .expect("segmentation plan is valid");
 
@@ -291,15 +316,24 @@ mod tests {
             SegmentationPlan::new(
                 &plan,
                 vec![planned_track(0), planned_track(0), planned_track(1)],
+                SegmentationAlignment::Independent,
             ),
             Err(SegmentationPlanError::DuplicateTrack(TrackId(0)))
         );
         assert_eq!(
-            SegmentationPlan::new(&plan, vec![planned_track(0), planned_track(7)]),
+            SegmentationPlan::new(
+                &plan,
+                vec![planned_track(0), planned_track(7)],
+                SegmentationAlignment::Independent,
+            ),
             Err(SegmentationPlanError::UnknownTrack(TrackId(7)))
         );
         assert_eq!(
-            SegmentationPlan::new(&plan, vec![planned_track(0)]),
+            SegmentationPlan::new(
+                &plan,
+                vec![planned_track(0)],
+                SegmentationAlignment::Independent,
+            ),
             Err(SegmentationPlanError::MissingTrack(TrackId(1)))
         );
     }

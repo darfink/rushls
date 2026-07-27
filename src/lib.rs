@@ -37,6 +37,7 @@
 pub mod admission;
 pub mod delivery;
 pub mod domain;
+mod ffmpeg;
 pub mod media;
 pub mod mux;
 pub mod observe;

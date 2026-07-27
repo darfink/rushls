@@ -259,8 +259,8 @@ mod tests {
         let mut rendered = String::new();
         let mut writer = MediaPlaylistWriter::new(&mut rendered).expect("header renders");
         writer
-            .version(NonZeroU8::new(10).expect("constant"))
-            .and_then(|writer| writer.target_duration(NonZeroU64::new(2).expect("constant")))
+            .version(nz::u8!(10))
+            .and_then(|writer| writer.target_duration(nz::u64!(2)))
             .and_then(|writer| writer.media_sequence(41))
             .and_then(|writer| writer.discontinuity_sequence(3))
             .and_then(|writer| writer.part_information(Duration::from_millis(200)))

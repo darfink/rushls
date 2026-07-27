@@ -35,10 +35,9 @@ pub struct AvformatConfig {
 impl Default for AvformatConfig {
     fn default() -> Self {
         Self {
-            io_buffer_size: NonZeroUsize::new(32 * 1024).expect("constant is nonzero"),
-            packet_channel_capacity: NonZeroUsize::new(64).expect("constant is nonzero"),
-            maximum_queued_payload_bytes: NonZeroUsize::new(16 * 1024 * 1024)
-                .expect("constant is nonzero"),
+            io_buffer_size: nz::usize!(32 * 1024),
+            packet_channel_capacity: nz::usize!(64),
+            maximum_queued_payload_bytes: nz::usize!(16 * 1024 * 1024),
         }
     }
 }
@@ -429,7 +428,7 @@ mod tests {
         let mut source = AvformatPacketSource::new(
             Box::new(input),
             AvformatConfig {
-                packet_channel_capacity: NonZeroUsize::new(1).expect("constant is nonzero"),
+                packet_channel_capacity: nz::usize!(1),
                 ..AvformatConfig::default()
             },
             InputLimits::permissive(),

@@ -407,6 +407,7 @@ fn name(event: &SessionEvent) -> &'static str {
         SessionEvent::TracksDiscovered { .. } => "tracks_discovered",
         SessionEvent::TimelineCalibrated { .. } => "timeline_calibrated",
         SessionEvent::SegmentationLocked { .. } => "segmentation_locked",
+        SessionEvent::SegmentationExtended { .. } => "segmentation_extended",
         SessionEvent::Running => "running",
         SessionEvent::TrackSetChanged => "track_set_changed",
         SessionEvent::CodecParametersChanged { .. } => "codec_parameters_changed",

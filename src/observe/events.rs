@@ -31,6 +31,13 @@ pub enum SessionEvent {
         part: Duration,
         aligned: bool,
     },
+    /// A non-strict muxer kept parts flowing while extending a segment to a
+    /// usable random-access boundary.
+    SegmentationExtended {
+        track: TrackId,
+        planned: Duration,
+        actual: Duration,
+    },
     Running,
     TrackSetChanged,
     CodecParametersChanged {
@@ -129,8 +136,6 @@ impl EventObserver for Discard {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
-
     use parking_lot::Mutex;
 
     use super::*;
@@ -150,7 +155,7 @@ mod tests {
     fn scoped_sinks_carry_their_session_identity() {
         let recorder = Arc::new(Recorder::default());
         let events = Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>);
-        let id = SessionId(NonZeroU64::new(7).expect("constant is non-zero"));
+        let id = SessionId(nz::u64!(7));
 
         events.scoped(id).emit(SessionEvent::Running);
 
@@ -161,7 +166,7 @@ mod tests {
 
     #[test]
     fn the_default_destination_discards() {
-        let id = SessionId(NonZeroU64::new(1).expect("constant is non-zero"));
+        let id = SessionId(nz::u64!(1));
         Events::default().scoped(id).emit(SessionEvent::Draining);
     }
 }

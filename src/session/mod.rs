@@ -269,6 +269,7 @@ async fn pipeline(
         // muxer remains responsible for any output edit lists needed to align
         // tracks; delivery only advances this wall time by packaged timing.
         time_anchor: std::time::SystemTime::now(),
+        events: context.events(),
     })?;
     let expected_publication_interval = started.muxer.expected_publication_interval();
     let publisher = services

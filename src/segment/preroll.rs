@@ -14,8 +14,8 @@ use crate::{
 
 use super::{
     BoundarySelection, BoundarySelectionError, BoundarySelectionStatus, BoundarySelector,
-    PrerollError, PrerollLimits, SegmentationPlan, SegmentationPolicy, TrackSegmentationPlan,
-    boundary::select_part_duration,
+    PrerollError, PrerollLimits, SegmentationAlignment, SegmentationPlan, SegmentationPolicy,
+    TrackSegmentationPlan, boundary::select_part_duration,
 };
 
 /// Enough for a second or two of multi-track media, so the common case reaches
@@ -222,7 +222,13 @@ fn lock(
         tracks.push(plan_track(&buffered, policy, timing, boundary.pts)?);
     }
 
-    let segmentation = SegmentationPlan::new(presentation, tracks)?;
+    let alignment = match selection {
+        BoundarySelection::Aligned { .. } => SegmentationAlignment::Aligned {
+            timing_authority: timeline.timing_authority,
+        },
+        BoundarySelection::Independent { .. } => SegmentationAlignment::Independent,
+    };
+    let segmentation = SegmentationPlan::new(presentation, tracks, alignment)?;
     events.emit(SessionEvent::SegmentationLocked {
         segment: segmentation.longest_segment_duration(),
         part: segmentation.shortest_part_duration(),
@@ -259,6 +265,7 @@ fn plan_track(
     Ok(TrackSegmentationPlan {
         track_id: timing.track_id,
         timebase: timing.timebase,
+        origin_pts: timing.origin_pts,
         segment_duration,
         part_duration,
     })

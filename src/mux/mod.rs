@@ -15,11 +15,13 @@ use crate::{
     media::NormalizedSample,
 };
 
+mod cmaf;
 mod presentation;
 
 #[cfg(test)]
 pub mod fixtures;
 
+pub use cmaf::{CmafMuxerConfig, CmafMuxerFactory, SegmentBoundaryPolicy};
 pub use presentation::{
     MuxerStartRequest, PackagedPresentation, PackagedPresentationError, PackagedRendition,
     PackagingRenditionId, PlayableCombination, RenditionGroup, RenditionGroupKey, RenditionKey,

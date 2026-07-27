@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::{
     domain::{DiscoveredTrack, FrameRate, MediaKind, TrackId},
     media::PresentationPlan,
+    observe::EventSink,
 };
 
 use super::{MediaSegmentFormat, RenditionConfig};
@@ -430,6 +431,7 @@ pub struct MuxerStartRequest<'a> {
     pub presentation: &'a PresentationPlan,
     pub segmentation: &'a crate::segment::SegmentationPlan,
     pub time_anchor: SystemTime,
+    pub events: &'a EventSink,
 }
 
 // Keep this import used in rustdoc/type navigation even though compatibility

@@ -9,6 +9,7 @@
 - Run an LLM against HLS spec and comment all spec related behavior
 - Run an LLM to evaluate performance improvements + profile
 - Run an LLM to find reductions in allocations
+- Run LLM to change all tests to -> Result + ? for condensing stuff
 - Implement tests w/ mediastreamvalidator
 - Implement end-to-end tests validating expected PTS, ELST, PDT, fetch, grace etc
 - Implement end-to-end tests with ffprobe??

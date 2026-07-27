@@ -174,7 +174,7 @@ mod tests {
         let mut rendered = String::new();
         let mut writer = MultivariantPlaylistWriter::new(&mut rendered).expect("header renders");
         writer
-            .version(NonZeroU8::new(10).expect("constant"))
+            .version(nz::u8!(10))
             .and_then(MultivariantPlaylistWriter::independent_segments)
             .and_then(|writer| {
                 writer.rendition(Rendition {
@@ -191,8 +191,8 @@ mod tests {
             })
             .and_then(|writer| {
                 writer.variant(Variant {
-                    bandwidth: NonZeroU64::new(3_000_000).expect("constant"),
-                    average_bandwidth: Some(NonZeroU64::new(2_500_000).expect("constant")),
+                    bandwidth: nz::u64!(3_000_000),
+                    average_bandwidth: Some(nz::u64!(2_500_000)),
                     codecs: Some("avc1.640028,mp4a.40.2"),
                     resolution: Some((nz::u32!(1920), nz::u32!(1080))),
                     frame_rate: Some(FrameRate::new(nz::u32!(30_000), nz::u32!(1_001))),

@@ -83,6 +83,11 @@ impl TrackBuilder {
         self
     }
 
+    pub fn codec_extradata(mut self, codec_extradata: impl Into<Payload>) -> Self {
+        self.0.codec_extradata = codec_extradata.into();
+        self
+    }
+
     pub fn build(self) -> DiscoveredTrack {
         self.0
     }

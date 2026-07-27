@@ -7,10 +7,9 @@ use crate::{
         Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload, Timebase, TrackCatalog,
         TrackId,
     },
+    ffmpeg::{from_av_rational, value, RationalError},
     source::{DiscoveryProblem, DiscoveryReport, SourceError},
 };
-
-use super::dictionary;
 
 pub struct StreamCatalog {
     stream_count: usize,
@@ -183,9 +182,9 @@ impl TrackSnapshot {
                 first_pts: (stream.start_time != ffmpeg::AV_NOPTS_VALUE)
                     .then_some(stream.start_time),
                 // SAFETY: metadata belongs to this live stream.
-                title: unsafe { dictionary::value(stream.metadata, c"title") },
+                title: unsafe { value(stream.metadata, c"title") },
                 // SAFETY: metadata belongs to this live stream.
-                language: unsafe { dictionary::value(stream.metadata, c"language") },
+                language: unsafe { value(stream.metadata, c"language") },
                 codec_extradata: Payload::from(extradata(parameters)?),
             },
             identity: CodecIdentity::read(parameters),
@@ -317,9 +316,15 @@ fn codec(codec: ffmpeg::AVCodecID) -> Codec {
 }
 
 fn timebase(value: ffmpeg::AVRational) -> Result<Timebase, SourceError> {
-    let numerator = positive_u32(value.num, "timebase numerator")?;
-    let denominator = positive_u32(value.den, "timebase denominator")?;
-    Ok(Timebase::new(numerator, denominator))
+    from_av_rational(value).map_err(|error| {
+        DiscoveryProblem::NotPositive {
+            field: match error {
+                RationalError::Numerator => "timebase numerator",
+                RationalError::Denominator => "timebase denominator",
+            },
+        }
+        .into()
+    })
 }
 
 fn frame_rate(value: ffmpeg::AVRational) -> Option<FrameRate> {
