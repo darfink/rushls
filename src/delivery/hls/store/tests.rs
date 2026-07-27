@@ -609,6 +609,22 @@ fn request_snapshots_are_cached_until_the_next_committed_change() {
     );
 }
 
+#[test]
+fn rendition_start_offsets_are_preserved_without_cross_track_rejection() {
+    let store = store();
+    let lease = lease(&store, &[(0, false), (1, false)]);
+    configure(&lease, 0, false);
+    configure(&lease, 1, false);
+
+    write(&lease, direct(0, 0, -22, 6, 1));
+    write(&lease, direct(1, 0, 0, 6, 1));
+
+    let first = lease.live().rendition(RenditionId(0)).unwrap();
+    let second = lease.live().rendition(RenditionId(1)).unwrap();
+    assert_eq!(first.segments[0].media_start, -22);
+    assert_eq!(second.segments[0].media_start, 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn part_tags_and_resources_have_distinct_retention_deadlines() {
     let store = store();

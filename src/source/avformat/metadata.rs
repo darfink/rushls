@@ -4,10 +4,10 @@ use ffmpeg_sys_next as ffmpeg;
 
 use crate::{
     domain::{
-        Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload, Timebase, TrackCatalog,
-        TrackId,
+        AudioTiming, Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload, Timebase,
+        TrackCatalog, TrackId,
     },
-    ffmpeg::{from_av_rational, value, RationalError},
+    ffmpeg::{RationalError, from_av_rational, value},
     source::{DiscoveryProblem, DiscoveryReport, SourceError},
 };
 
@@ -280,6 +280,20 @@ fn media_parameters(
             channels: positive_u16(parameters.ch_layout.nb_channels, "audio channels")?,
             frame_size: optional_u32(parameters.frame_size, "audio frame size")?,
             bit_depth: optional_u16(parameters.bits_per_raw_sample, "audio bit depth")?,
+            timing: AudioTiming {
+                initial_padding_samples: nonnegative_u32(
+                    parameters.initial_padding,
+                    "audio initial padding",
+                )?,
+                trailing_padding_samples: nonnegative_u32(
+                    parameters.trailing_padding,
+                    "audio trailing padding",
+                )?,
+                seek_preroll_samples: nonnegative_u32(
+                    parameters.seek_preroll,
+                    "audio seek preroll",
+                )?,
+            },
         },
         ffmpeg::AVMediaType::AVMEDIA_TYPE_SUBTITLE => MediaParameters::Subtitle,
         _ => return Ok(None),

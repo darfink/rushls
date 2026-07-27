@@ -17,11 +17,14 @@ use crate::{
 
 mod cmaf;
 mod presentation;
+mod track;
 
 #[cfg(test)]
 pub mod fixtures;
 
 pub use cmaf::{CmafMuxerConfig, CmafMuxerFactory, SegmentBoundaryPolicy};
+pub use track::{TrackPackager, TrackRouter};
+
 pub use presentation::{
     MuxerStartRequest, PackagedPresentation, PackagedPresentationError, PackagedRendition,
     PackagingRenditionId, PlayableCombination, RenditionGroup, RenditionGroupKey, RenditionKey,

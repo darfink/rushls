@@ -8,7 +8,10 @@ mod segment;
 use super::{BoundaryAlignmentPolicy, BoundarySearchPolicy, SegmentationPolicy};
 use crate::{
     domain::{TickTimestamp, Timebase, TrackId},
-    media::{NormalizedSample, Rounding, TimelineCalibration},
+    media::{
+        NormalizedSample, PresentationPlan, PresentedTimingCursor, Rounding, SampleTimingError,
+        TimelineCalibration,
+    },
 };
 pub(super) use part::select_part_duration;
 use segment::select_segment_boundaries;
@@ -33,6 +36,9 @@ struct TrackState {
     maximum_coverage: TickTimestamp,
     /// Greatest observed AU end PTS in this track's tick domain.
     observed_until: Option<TickTimestamp>,
+    /// Carries leading audio trim that FFmpeg reports on one packet across all
+    /// encoded access units it suppresses.
+    presented_timing: PresentedTimingCursor,
     /// Random-access AU ranges retained for boundary compatibility searches.
     boundaries: Vec<Range<TickTimestamp>>,
 }
@@ -78,6 +84,14 @@ pub enum BoundarySelectionError {
     UnknownTrack(TrackId),
     #[error("access-unit timestamp overflowed for {0}")]
     TimestampOverflow(TrackId),
+    /// Carries the underlying cause: an inexact trim, an overrun, and an
+    /// arithmetic overflow are different operator problems, and collapsing
+    /// them to one message loses the only detail that distinguishes them.
+    #[error("{track_id} produced an access unit with unusable timing: {source}")]
+    InvalidSampleTiming {
+        track_id: TrackId,
+        source: SampleTimingError,
+    },
     #[error("segmentation search horizon cannot be represented for {0}")]
     HorizonOverflow(TrackId),
     #[error("segmentation search durations cannot be represented")]
@@ -116,6 +130,7 @@ pub struct BoundarySelector {
 
 impl BoundarySelector {
     pub fn new(
+        presentation: &PresentationPlan,
         timeline: &TimelineCalibration,
         policy: SegmentationPolicy,
     ) -> Result<Self, BoundarySelectionError> {
@@ -142,6 +157,11 @@ impl BoundarySelector {
                     .horizon(duration, rounding)
                     .ok_or(BoundarySelectionError::HorizonOverflow(track.track_id))
             };
+            let source = presentation
+                .catalog()
+                .get(track.track_id)
+                .ok_or(BoundarySelectionError::UnknownTrack(track.track_id))?
+                .clone();
             let desired_limit = horizon(policy.desired_segment_duration, Rounding::Down)?;
             let desired_coverage = horizon(policy.desired_segment_duration, Rounding::Up)?;
             let maximum_limit = horizon(maximum_duration, Rounding::Down)?;
@@ -149,6 +169,7 @@ impl BoundarySelector {
 
             tracks.push(TrackState {
                 track_id: track.track_id,
+                presented_timing: PresentedTimingCursor::for_track(&source),
                 timebase: track.timebase,
                 origin: track.origin_pts,
                 desired_limit,
@@ -175,9 +196,12 @@ impl BoundarySelector {
             .iter_mut()
             .find(|track| track.track_id == track_id)
             .ok_or(BoundarySelectionError::UnknownTrack(track_id))?;
-        let end = sample
-            .pts()
-            .checked_add_unsigned(sample.duration())
+        let timing = track
+            .presented_timing
+            .next(sample)
+            .map_err(|source| BoundarySelectionError::InvalidSampleTiming { track_id, source })?;
+        let end = timing
+            .end()
             .ok_or(BoundarySelectionError::TimestampOverflow(track_id))?;
 
         track.observed_until = Some(
@@ -185,11 +209,11 @@ impl BoundarySelector {
                 .observed_until
                 .map_or(end, |observed| observed.max(end)),
         );
-        if sample.random_access() && sample.pts() > track.origin {
+        if timing.duration > 0 && sample.random_access() && timing.start > track.origin {
             if track.boundaries.len() >= MAXIMUM_BOUNDARIES_PER_TRACK {
                 return Err(BoundarySelectionError::TooManyBoundaries(track_id));
             }
-            track.boundaries.push(sample.pts()..end);
+            track.boundaries.push(timing.start..end);
         }
         Ok(())
     }
@@ -244,9 +268,23 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::Timebase,
-        media::fixtures::{AUDIO_SECOND, VIDEO_SECOND, audio_sample, video_sample},
+        domain::{MediaKind, Timebase, fixtures::TrackBuilder},
+        media::{
+            PresentationPlan,
+            fixtures::{AUDIO_SECOND, VIDEO_SECOND, audio_sample, presentation, video_sample},
+        },
     };
+
+    fn test_presentation() -> PresentationPlan {
+        presentation(vec![
+            TrackBuilder::new(0, MediaKind::Video)
+                .timebase(Timebase::hz90k())
+                .build(),
+            TrackBuilder::new(1, MediaKind::Audio)
+                .timebase(Timebase::new(nz::u32!(1), nz::u32!(48_000)))
+                .build(),
+        ])
+    }
 
     /// Video on 90 kHz, audio on 48 kHz: distinct tick domains, shared origin.
     fn timeline() -> TimelineCalibration {
@@ -258,6 +296,7 @@ mod tests {
 
     fn selector(alignment: BoundaryAlignmentPolicy) -> BoundarySelector {
         BoundarySelector::new(
+            &test_presentation(),
             &timeline(),
             SegmentationPolicy {
                 desired_segment_duration: Duration::from_secs(10),
@@ -356,6 +395,7 @@ mod tests {
             ),
         ]);
         let mut selector = BoundarySelector::new(
+            &test_presentation(),
             &timeline,
             SegmentationPolicy::latency_first(Duration::from_secs(10), Duration::from_millis(200)),
         )

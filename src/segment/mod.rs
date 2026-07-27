@@ -126,7 +126,16 @@ pub struct TrackSegmentationPlan {
     pub track_id: TrackId,
     pub timebase: Timebase,
     /// Track-local PTS corresponding to the publication's shared time anchor.
-    pub origin_pts: TickTimestamp,
+    pub presentation_origin_pts: TickTimestamp,
+    /// Encoded access-unit start from which segment zero is accounted.
+    ///
+    /// This may follow the shared origin when this track genuinely starts later.
+    /// It may also precede the origin when the first audible sample lies inside
+    /// an access unit: cuts must remain on encoded unit boundaries, while the
+    /// edit list suppresses the leading codec priming.
+    pub segmentation_origin_pts: TickTimestamp,
+    /// Absolute selected boundary for closing segment zero.
+    pub first_segment_boundary_pts: TickTimestamp,
     /// The selected segment cadence expressed in this track's output time base.
     pub segment_duration: NonZero<TickDuration>,
     /// Selected regular-part target expressed in this track's output time
@@ -134,17 +143,9 @@ pub struct TrackSegmentationPlan {
     pub part_duration: NonZero<TickDuration>,
 }
 
-/// How the locked track boundaries relate on the presentation timeline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SegmentationAlignment {
-    Aligned { timing_authority: TrackId },
-    Independent,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegmentationPlan {
     tracks: Vec<TrackSegmentationPlan>,
-    alignment: SegmentationAlignment,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -155,13 +156,16 @@ pub enum SegmentationPlanError {
     UnknownTrack(TrackId),
     #[error("no segmentation plan was provided for {0}")]
     MissingTrack(TrackId),
+    #[error("segmentation and source timebases differ for {0}")]
+    TimebaseMismatch(TrackId),
+    #[error("segmentation timing is invalid for {0}")]
+    InvalidTiming(TrackId),
 }
 
 impl SegmentationPlan {
     pub fn new(
         presentation: &PresentationPlan,
         tracks: Vec<TrackSegmentationPlan>,
-        alignment: SegmentationAlignment,
     ) -> Result<Self, SegmentationPlanError> {
         for (index, track) in tracks.iter().enumerate() {
             if tracks[..index]
@@ -172,6 +176,20 @@ impl SegmentationPlan {
             }
             if presentation.catalog().get(track.track_id).is_none() {
                 return Err(SegmentationPlanError::UnknownTrack(track.track_id));
+            }
+            let source = presentation
+                .catalog()
+                .get(track.track_id)
+                .expect("the source track was checked above");
+            if source.timebase != track.timebase {
+                return Err(SegmentationPlanError::TimebaseMismatch(track.track_id));
+            }
+            let expected_duration = track
+                .first_segment_boundary_pts
+                .checked_sub(track.segmentation_origin_pts)
+                .and_then(|ticks| u64::try_from(ticks).ok());
+            if expected_duration != Some(track.segment_duration.get()) {
+                return Err(SegmentationPlanError::InvalidTiming(track.track_id));
             }
         }
 
@@ -184,13 +202,7 @@ impl SegmentationPlan {
             }
         }
 
-        if let SegmentationAlignment::Aligned { timing_authority } = alignment
-            && presentation.catalog().get(timing_authority).is_none()
-        {
-            return Err(SegmentationPlanError::UnknownTrack(timing_authority));
-        }
-
-        Ok(Self { tracks, alignment })
+        Ok(Self { tracks })
     }
 
     pub fn get(&self, track_id: TrackId) -> Option<&TrackSegmentationPlan> {
@@ -199,10 +211,6 @@ impl SegmentationPlan {
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &TrackSegmentationPlan> {
         self.tracks.iter()
-    }
-
-    pub fn alignment(&self) -> SegmentationAlignment {
-        self.alignment
     }
 
     /// The shortest regular part target across tracks, as wall-clock time.
@@ -262,7 +270,9 @@ mod tests {
         TrackSegmentationPlan {
             track_id: TrackId(track_id),
             timebase: Timebase::hz90k(),
-            origin_pts: 0,
+            presentation_origin_pts: 0,
+            segmentation_origin_pts: 0,
+            first_segment_boundary_pts: 180_000,
             segment_duration: nz::u64!(180_000),
             part_duration: nz::u64!(18_000),
         }
@@ -286,9 +296,6 @@ mod tests {
         let segmentation = SegmentationPlan::new(
             &plan,
             vec![planned_track(0), planned_track(1), planned_track(2)],
-            SegmentationAlignment::Aligned {
-                timing_authority: TrackId(0),
-            },
         )
         .expect("segmentation plan is valid");
 
@@ -316,25 +323,39 @@ mod tests {
             SegmentationPlan::new(
                 &plan,
                 vec![planned_track(0), planned_track(0), planned_track(1)],
-                SegmentationAlignment::Independent,
             ),
             Err(SegmentationPlanError::DuplicateTrack(TrackId(0)))
         );
         assert_eq!(
-            SegmentationPlan::new(
-                &plan,
-                vec![planned_track(0), planned_track(7)],
-                SegmentationAlignment::Independent,
-            ),
+            SegmentationPlan::new(&plan, vec![planned_track(0), planned_track(7)],),
             Err(SegmentationPlanError::UnknownTrack(TrackId(7)))
         );
         assert_eq!(
-            SegmentationPlan::new(
-                &plan,
-                vec![planned_track(0)],
-                SegmentationAlignment::Independent,
-            ),
+            SegmentationPlan::new(&plan, vec![planned_track(0)],),
             Err(SegmentationPlanError::MissingTrack(TrackId(1)))
+        );
+
+        let mut mismatched = planned_track(0);
+        mismatched.timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+        assert_eq!(
+            SegmentationPlan::new(&plan, vec![mismatched, planned_track(1)]),
+            Err(SegmentationPlanError::TimebaseMismatch(TrackId(0)))
+        );
+
+        let mut invalid_timing = planned_track(0);
+        invalid_timing.segmentation_origin_pts = -1;
+        assert_eq!(
+            SegmentationPlan::new(&plan, vec![invalid_timing, planned_track(1)]),
+            Err(SegmentationPlanError::InvalidTiming(TrackId(0)))
+        );
+
+        let mut straddling = planned_track(1);
+        straddling.presentation_origin_pts = 0;
+        straddling.segmentation_origin_pts = -64;
+        straddling.first_segment_boundary_pts = 180_000 - 64;
+        assert!(
+            SegmentationPlan::new(&plan, vec![planned_track(0), straddling]).is_ok(),
+            "an edit list may suppress the part of an encoded unit before the origin"
         );
     }
 }

@@ -30,6 +30,33 @@ impl PresentationPlan {
     pub fn counts(&self) -> TrackCounts {
         self.tracks.counts()
     }
+
+    /// Rebuilds an already-validated plan after a representation-only track
+    /// transformation such as timestamp normalization.
+    ///
+    /// Callers must preserve track identities, codecs, and media parameters.
+    /// Policy validation is intentionally not repeated: changing a timebase
+    /// cannot make an admitted codec or resolution inadmissible, while running
+    /// policy again here would require carrying session policy into a purely
+    /// mechanical media stage.
+    pub(crate) fn with_projected_tracks(
+        &self,
+        tracks: Vec<DiscoveredTrack>,
+    ) -> Result<Self, crate::domain::TrackCatalogError> {
+        debug_assert_eq!(self.tracks.tracks().len(), tracks.len());
+        debug_assert!(
+            self.tracks
+                .tracks()
+                .iter()
+                .zip(&tracks)
+                .all(|(before, after)| before.id == after.id
+                    && before.codec == after.codec
+                    && before.parameters == after.parameters)
+        );
+        Ok(Self {
+            tracks: TrackCatalog::new(tracks)?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -338,6 +365,7 @@ mod tests {
             channels: nz::u16!(16),
             frame_size: Some(nz::u32!(1_024)),
             bit_depth: Some(nz::u16!(16)),
+            timing: crate::domain::AudioTiming::default(),
         };
         let constrained = policy();
 

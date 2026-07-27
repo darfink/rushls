@@ -14,7 +14,7 @@ use crate::{
     },
     media::{
         MediaNormalizer, NormalizeError, NormalizedSample, NormalizerFactory, PresentationPlan,
-        TimelineCalibration, VideoSample,
+        StartedNormalizer, TimelineCalibration, VideoSample,
     },
     mux::{
         FinishReason, InitializationSegment, MuxError, Muxer, MuxerFactory, MuxerStartRequest,
@@ -224,14 +224,18 @@ struct FakeNormalizerFactory {
 impl NormalizerFactory for FakeNormalizerFactory {
     fn start(
         &self,
-        _presentation: &PresentationPlan,
-        _timeline: &TimelineCalibration,
-    ) -> Result<Box<dyn MediaNormalizer>, NormalizeError> {
+        presentation: &PresentationPlan,
+        timeline: &TimelineCalibration,
+    ) -> Result<StartedNormalizer, NormalizeError> {
         record(&self.log, "normalizer_start");
-        Ok(Box::new(FakeNormalizer {
-            reorders: self.faults.normalizer_reorders,
-            held: None,
-        }))
+        Ok(StartedNormalizer {
+            normalizer: Box::new(FakeNormalizer {
+                reorders: self.faults.normalizer_reorders,
+                held: None,
+            }),
+            presentation: presentation.clone(),
+            timeline: timeline.clone(),
+        })
     }
 }
 
@@ -426,6 +430,7 @@ fn packet(pts: i64, random_access: bool) -> Packet {
         dts: Some(pts),
         duration: Some(SECOND),
         random_access,
+        audio_trim: crate::domain::AudioTrim::default(),
         payload: Payload::from(vec![1, 2, 3]),
     }
 }

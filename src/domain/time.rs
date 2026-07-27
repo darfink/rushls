@@ -47,6 +47,24 @@ impl Timebase {
         clamp_i128_to_i64(div_round_nearest(num, den))
     }
 
+    /// Requantizes a signed timestamp without hiding arithmetic overflow.
+    ///
+    /// Media timestamps may legitimately be negative for priming or reordered
+    /// video. Returning `None` at either arithmetic boundary lets ingest reject
+    /// an unrepresentable clock instead of silently pinning it to an endpoint.
+    pub fn checked_rescale_ticks(
+        self,
+        value: TickTimestamp,
+        dst: Timebase,
+    ) -> Option<TickTimestamp> {
+        let numerator = i128::from(value)
+            .checked_mul(i128::from(self.num.get()))?
+            .checked_mul(i128::from(dst.den.get()))?;
+        let denominator = i128::from(self.den.get()).checked_mul(i128::from(dst.num.get()))?;
+        let rounded = div_round_nearest_checked(numerator, denominator)?;
+        TickTimestamp::try_from(rounded).ok()
+    }
+
     /// Compares signed tick offsets without requantizing either value.
     pub fn compare_offsets(
         self,
@@ -106,6 +124,69 @@ impl Timebase {
     }
 }
 
+/// Requantizes ordered tick deltas while carrying their fractional remainder.
+///
+/// Absolute timestamps and observed intervals should be projected from their
+/// endpoints with [`Timebase::checked_rescale_ticks`]. This stateful form is
+/// for clocks that must synthesize successive durations without an absolute
+/// endpoint to anchor every step, such as a declared fractional frame cadence.
+///
+/// The initial half-denominator makes the accumulated boundary use nearest
+/// rounding. Consequently, the sum of any uninterrupted run stays within half
+/// an output tick of the exact rational duration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RationalTickAccumulator {
+    whole_per_input_tick: u128,
+    remainder_per_input_tick: u128,
+    denominator: u128,
+    remainder: u128,
+}
+
+impl RationalTickAccumulator {
+    /// Builds an accumulator converting deltas from `src` ticks to `dst` ticks.
+    pub fn requantize_to_ticks(src: Timebase, dst: Timebase) -> Option<Self> {
+        let numerator = u128::from(src.num.get()).checked_mul(u128::from(dst.den.get()))?;
+        let denominator = u128::from(src.den.get()).checked_mul(u128::from(dst.num.get()))?;
+        let divisor = greatest_common_divisor(numerator, denominator);
+        let numerator = numerator / divisor;
+        let denominator = denominator / divisor;
+        Some(Self {
+            whole_per_input_tick: numerator / denominator,
+            remainder_per_input_tick: numerator % denominator,
+            denominator,
+            remainder: denominator / 2,
+        })
+    }
+
+    /// Restarts nearest-boundary rounding at a new synthesized clock anchor.
+    pub fn reset(&mut self) {
+        self.remainder = self.denominator / 2;
+    }
+
+    /// Advances the synthesized clock, rejecting rather than clamping overflow.
+    ///
+    /// State changes only after the result is known to fit, so callers may
+    /// report an error without leaving the clock at a partially advanced phase.
+    pub fn advance(&mut self, delta_ticks: TickDuration) -> Option<TickDuration> {
+        let delta = u128::from(delta_ticks);
+        let whole = delta.checked_mul(self.whole_per_input_tick)?;
+        let fractional = delta
+            .checked_mul(self.remainder_per_input_tick)?
+            .checked_add(self.remainder)?;
+        let output = whole.checked_add(fractional / self.denominator)?;
+        let output = TickDuration::try_from(output).ok()?;
+        self.remainder = fractional % self.denominator;
+        Some(output)
+    }
+}
+
+fn greatest_common_divisor(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
+
 fn clamp_i128_to_i64(value: i128) -> i64 {
     value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
@@ -124,6 +205,19 @@ fn div_round_nearest(num: i128, den: i128) -> i128 {
         quotient.saturating_add(1)
     } else {
         quotient.saturating_sub(1)
+    }
+}
+
+fn div_round_nearest_checked(num: i128, den: i128) -> Option<i128> {
+    debug_assert!(den != 0);
+    let quotient = num.checked_div(den)?;
+    let remainder = num.checked_rem(den)?;
+    if remainder == 0 || remainder.abs().checked_mul(2)? < den.abs() {
+        Some(quotient)
+    } else if (num >= 0) == (den >= 0) {
+        quotient.checked_add(1)
+    } else {
+        quotient.checked_sub(1)
     }
 }
 
@@ -173,5 +267,52 @@ mod tests {
             video.compare_offsets(video_offset, audio, audio_offset),
             Some(Ordering::Equal)
         );
+    }
+
+    #[test]
+    fn checked_rescaling_preserves_negative_timestamps_and_rejects_overflow() {
+        let milliseconds = Timebase::new(nz::u32!(1), nz::u32!(1_000));
+
+        assert_eq!(
+            milliseconds.checked_rescale_ticks(-22, Timebase::hz90k()),
+            Some(-1_980)
+        );
+        assert_eq!(
+            Timebase::new(nz::u32!(u32::MAX), nz::u32!(1))
+                .checked_rescale_ticks(i64::MAX, Timebase::new(nz::u32!(1), nz::u32!(u32::MAX))),
+            None
+        );
+    }
+
+    #[test]
+    fn rational_tick_accumulation_preserves_fractional_cadence_without_drift() {
+        let frame_period = Timebase::new(nz::u32!(1_001), nz::u32!(24_000));
+        let mut clock =
+            RationalTickAccumulator::requantize_to_ticks(frame_period, Timebase::hz90k())
+                .expect("the cadence ratio is representable");
+
+        let durations: Vec<_> = (0..8)
+            .map(|_| clock.advance(1).expect("one frame fits"))
+            .collect();
+
+        assert_eq!(durations.iter().sum::<TickDuration>(), 30_030);
+        assert_eq!(
+            durations,
+            [3_754, 3_754, 3_753, 3_754, 3_754, 3_754, 3_753, 3_754]
+        );
+        clock.reset();
+        assert_eq!(clock.advance(1), Some(durations[0]));
+    }
+
+    #[test]
+    fn failed_rational_tick_advance_does_not_change_its_phase() {
+        let src = Timebase::new(nz::u32!(u32::MAX), nz::u32!(2));
+        let dst = Timebase::new(nz::u32!(1), nz::u32!(u32::MAX));
+        let mut clock =
+            RationalTickAccumulator::requantize_to_ticks(src, dst).expect("ratio is valid");
+        let mut fresh = clock;
+
+        assert_eq!(clock.advance(3), None);
+        assert_eq!(clock.advance(1), fresh.advance(1));
     }
 }

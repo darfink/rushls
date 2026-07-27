@@ -24,6 +24,7 @@ pub fn parameters(kind: MediaKind) -> MediaParameters {
             channels: nz::u16!(2),
             frame_size: Some(nz::u32!(1_024)),
             bit_depth: Some(nz::u16!(16)),
+            timing: super::AudioTiming::default(),
         },
         MediaKind::Subtitle => MediaParameters::Subtitle,
         MediaKind::Video => MediaParameters::Video {

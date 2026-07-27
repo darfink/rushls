@@ -259,6 +259,22 @@ mod tests {
         .expect("configuration is valid")
     }
 
+    /// Reads to end of input, returning everything read and the terminal state.
+    ///
+    /// `fill` yields one batch, and where that batch ends depends on how far
+    /// the blocking demux worker has run: it waits only for the first packet
+    /// and then takes whatever else is already queued. Asserting a terminal
+    /// state — or a packet count — from a single call races that thread.
+    async fn drain(source: &mut dyn PacketSource) -> (Vec<crate::source::Packet>, InputState) {
+        let mut packets = Vec::new();
+        loop {
+            let state = source.fill(&mut packets).await.expect("packets are read");
+            if !state.is_open() {
+                return (packets, state);
+            }
+        }
+    }
+
     fn discovery_limits() -> DiscoveryLimits {
         DiscoveryLimits {
             maximum_probe_bytes: 64 * 1024,
@@ -282,6 +298,7 @@ mod tests {
                 channels: nz::u16!(1),
                 frame_size: None,
                 bit_depth: None,
+                timing: crate::domain::AudioTiming::default(),
             }
         );
         assert_eq!(discovery.tracks.tracks()[0].title, None);
@@ -295,8 +312,7 @@ mod tests {
             discovery
         );
 
-        let mut packets = Vec::new();
-        let state = source.fill(&mut packets).await.expect("packets are read");
+        let (packets, state) = drain(&mut source).await;
 
         assert_eq!(state, InputState::Closed);
         assert!(!packets.is_empty());
@@ -310,6 +326,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preserves_matroska_aac_priming_through_discovery_and_packets() {
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let mut source = AvformatPacketSource::new(
+            Box::new(ReadInput::closed(Cursor::new(
+                crate::source::avformat::fixtures::primed_aac_mkv(),
+            ))),
+            AvformatConfig::default(),
+            InputLimits::permissive(),
+            meters.source_view(),
+        )
+        .expect("fixture source opens");
+
+        let discovery = source
+            .discover(discovery_limits())
+            .await
+            .expect("AAC-in-Matroska is discovered");
+        let track = &discovery.tracks.tracks()[0];
+        assert_eq!(
+            track.first_pts,
+            Some(0),
+            "stream start is the audible start"
+        );
+        let MediaParameters::Audio { timing, .. } = track.parameters else {
+            panic!("fixture has one audio track");
+        };
+        assert_eq!(timing.initial_padding_samples, 1_024);
+
+        let mut packets = Vec::new();
+        while source
+            .fill(&mut packets)
+            .await
+            .expect("fixture demuxes")
+            .is_open()
+        {}
+        assert_eq!(packets[0].pts, Some(-21));
+        assert_eq!(
+            packets[0].audio_trim,
+            crate::domain::AudioTrim {
+                leading_samples: 1_024,
+                trailing_samples: 0,
+            }
+        );
+
+        let retained_payload = packets[0].payload.clone();
+        let retained_trim = packets[0].audio_trim;
+        drop(source);
+        assert!(!retained_payload.is_empty());
+        assert_eq!(retained_trim, packets[0].audio_trim);
+    }
+
+    #[tokio::test]
     async fn preserves_an_interrupted_byte_input_terminal_state() {
         let mut source = source(InputState::Interrupted, InputLimits::permissive());
         source
@@ -317,8 +384,7 @@ mod tests {
             .await
             .expect("WAV is discovered");
 
-        let mut packets = Vec::new();
-        let state = source.fill(&mut packets).await.expect("packets are read");
+        let (packets, state) = drain(&mut source).await;
 
         assert_eq!(state, InputState::Interrupted);
         assert!(!packets.is_empty());

@@ -11,7 +11,7 @@ use ffmpeg_sys_next as ffmpeg;
 
 use crate::{
     domain::{Payload, TrackId},
-    ffmpeg::{AvError, OwnedPacket},
+    ffmpeg::{AvError, OwnedPacket, read_audio_trim},
     source::{DiscoveryLimits, DiscoveryProblem, InputState, Packet, SourceError},
 };
 
@@ -321,6 +321,10 @@ impl AvPacket {
             dts: timestamp(packet.dts),
             duration: (packet.duration > 0).then_some(packet.duration),
             random_access: packet.flags & ffmpeg::AV_PKT_FLAG_KEY != 0,
+            // SAFETY: the packet remains live through this conversion.
+            audio_trim: unsafe { read_audio_trim(self.0.as_ptr()) }
+                .map_err(SourceError::Input)?
+                .unwrap_or_default(),
             payload,
         })
     }

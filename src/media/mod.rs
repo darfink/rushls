@@ -19,7 +19,8 @@ pub mod fixtures;
 pub use density::{MediaDensityError, MediaDensityWindow};
 pub use normalize::{
     AudioSample, MediaNormalizer, NormalizeError, NormalizedSample, NormalizerFactory,
-    SubtitleSample, VideoSample,
+    PassThroughNormalizerFactory, PresentedTiming, PresentedTimingCursor, SampleTimingError,
+    StartedNormalizer, SubtitleSample, VideoSample,
 };
 pub use pacer::{MediaPacer, PacingError};
 pub use stream::{MediaError, SampleSource};

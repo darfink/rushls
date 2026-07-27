@@ -234,10 +234,13 @@ async fn pipeline(
     context.emit(SessionEvent::TimelineCalibrated {
         authority: timeline.timing_authority,
     });
+    let normalized = services.normalizers.start(&presentation, &timeline)?;
+    let presentation = normalized.presentation;
+    let timeline = normalized.timeline;
 
     let mut head = MediaHead::new(
         source,
-        services.normalizers.start(&presentation, &timeline)?,
+        normalized.normalizer,
         context.meters().media_view(),
         config.input,
         &timeline,

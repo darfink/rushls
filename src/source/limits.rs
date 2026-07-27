@@ -258,6 +258,7 @@ mod tests {
             dts: None,
             duration: None,
             random_access: false,
+            audio_trim: crate::domain::AudioTrim::default(),
             payload: crate::domain::Payload::from(vec![0; bytes]),
         }
     }

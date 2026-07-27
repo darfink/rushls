@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::domain::{Appender, BoxFuture, Payload, TrackCatalog, TrackCatalogError, TrackId};
+use crate::domain::{
+    Appender, AudioTrim, BoxFuture, Payload, TrackCatalog, TrackCatalogError, TrackId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DiscoveryLimits {
@@ -18,6 +20,9 @@ pub struct Packet {
     pub dts: Option<i64>,
     pub duration: Option<i64>,
     pub random_access: bool,
+    /// Audio samples suppressed after decoding this packet, when present.
+    /// Codec padding suppressed when this packet is presented.
+    pub audio_trim: AudioTrim,
     pub payload: Payload,
 }
 

@@ -9,8 +9,8 @@
 use crate::{
     admission::StreamPolicy,
     domain::{
-        Codec, DiscoveredTrack, MediaKind, Payload, TickDuration, TickTimestamp, Timebase, TrackId,
-        fixtures as domain,
+        AudioTrim, Codec, DiscoveredTrack, MediaKind, Payload, TickDuration, TickTimestamp,
+        Timebase, TrackId, fixtures as domain,
     },
 };
 
@@ -108,6 +108,7 @@ pub fn audio_sample(track_id: u32, pts: TickTimestamp, duration: TickDuration) -
         codec: Codec::Aac,
         pts,
         duration,
+        trim: AudioTrim::default(),
         payload: Payload::default(),
     })
 }

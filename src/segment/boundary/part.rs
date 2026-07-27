@@ -1,8 +1,8 @@
 use std::num::NonZero;
 
 use crate::{
-    domain::{TickDuration, TickTimestamp, TrackId, duration_since},
-    media::NormalizedSample,
+    domain::{DiscoveredTrack, TickDuration, TickTimestamp, duration_since},
+    media::{NormalizedSample, PresentedTimingCursor, SampleTimingError},
 };
 
 /// The shortest observed window must be this close to the longest window.
@@ -47,22 +47,30 @@ impl PartDurationCandidate {
 /// this cadence check because it is allowed to be shorter than regular parts.
 pub(in crate::segment) fn select_part_duration(
     samples: &[NormalizedSample],
-    track_id: TrackId,
+    track: &DiscoveredTrack,
     origin: TickTimestamp,
     segment_boundary: TickTimestamp,
     desired: TickDuration,
-) -> Option<NonZero<TickDuration>> {
-    let access_unit_durations: Vec<_> = samples
+) -> Result<Option<NonZero<TickDuration>>, SampleTimingError> {
+    let mut access_unit_durations = Vec::new();
+    let mut presented_timing = PresentedTimingCursor::for_track(track);
+    for sample in samples
         .iter()
-        .filter(|sample| {
-            sample.track_id() == track_id
-                && origin <= sample.pts()
-                && sample.pts() < segment_boundary
-        })
-        .map(NormalizedSample::duration)
-        .collect();
-    let segment_duration = duration_since(segment_boundary, origin)?;
-    choose_part_duration(&access_unit_durations, segment_duration, desired)
+        .filter(|sample| sample.track_id() == track.id)
+    {
+        let timing = presented_timing.next(sample)?;
+        if timing.duration > 0 && origin <= timing.start && timing.start < segment_boundary {
+            access_unit_durations.push(timing.duration);
+        }
+    }
+    let Some(segment_duration) = duration_since(segment_boundary, origin) else {
+        return Ok(None);
+    };
+    Ok(choose_part_duration(
+        &access_unit_durations,
+        segment_duration,
+        desired,
+    ))
 }
 
 /// Chooses the access-unit count whose window duration sits nearest `desired`.
@@ -251,7 +259,7 @@ fn is_usable_candidate(observed: WindowDurationRange, segment_duration: TickDura
 #[cfg(test)]
 mod tests {
     use crate::{
-        domain::{Codec, Payload, TrackId},
+        domain::{Codec, MediaKind, Payload, TrackId, fixtures::track},
         media::VideoSample,
     };
 
@@ -375,45 +383,50 @@ mod tests {
     #[test]
     fn selects_six_frames_for_2997_fps_near_200ms() {
         let samples = samples(&vec![3_003; 60]);
+        let source = track(0, MediaKind::Video);
 
         assert_eq!(
-            select_part_duration(&samples, TrackId(0), 0, 180_180, 18_000,),
-            NonZero::new(18_018)
+            select_part_duration(&samples, &source, 0, 180_180, 18_000),
+            Ok(NonZero::new(18_018))
         );
     }
 
     #[test]
     fn selects_nine_aac_access_units_near_200ms() {
         let samples = samples(&vec![1_024; 100]);
+        let source = track(0, MediaKind::Video);
 
         assert_eq!(
-            select_part_duration(&samples, TrackId(0), 0, 102_400, 9_600,),
-            NonZero::new(9_216)
+            select_part_duration(&samples, &source, 0, 102_400, 9_600),
+            Ok(NonZero::new(9_216))
         );
     }
 
     #[test]
     fn uses_maximum_observed_window_as_safe_variable_cadence_target() {
         let samples = samples(&[100, 110, 100, 110, 100, 110]);
+        let source = track(0, MediaKind::Video);
 
         assert_eq!(
-            select_part_duration(&samples, TrackId(0), 0, 630, 410,),
-            NonZero::new(420)
+            select_part_duration(&samples, &source, 0, 630, 410),
+            Ok(NonZero::new(420))
         );
     }
 
     #[test]
     fn does_not_require_part_target_to_divide_segment_duration() {
         let samples = samples(&[20, 20, 20, 20, 20, 20]);
+        let source = track(0, MediaKind::Video);
 
         assert_eq!(
-            select_part_duration(&samples, TrackId(0), 0, 110, 60,),
-            NonZero::new(60)
+            select_part_duration(&samples, &source, 0, 110, 60),
+            Ok(NonZero::new(60))
         );
     }
 
     #[test]
     fn requires_cadence_evidence_before_the_segment_boundary() {
-        assert_eq!(select_part_duration(&[], TrackId(0), 0, 100, 20,), None);
+        let source = track(0, MediaKind::Video);
+        assert_eq!(select_part_duration(&[], &source, 0, 100, 20), Ok(None));
     }
 }

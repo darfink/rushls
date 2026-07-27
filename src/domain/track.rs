@@ -4,6 +4,36 @@ use thiserror::Error;
 
 use super::{Payload, SourceTrackKey, TickTimestamp, Timebase, TrackId};
 
+/// Codec-level audio timing declared for the whole track.
+///
+/// Counts remain in decoded audio samples rather than container ticks. That is
+/// the lossless unit FFmpeg exposes, and it avoids rounding priming before the
+/// output muxer can represent it in the media timescale.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioTiming {
+    pub initial_padding_samples: u32,
+    pub trailing_padding_samples: u32,
+    pub seek_preroll_samples: u32,
+}
+
+/// Samples suppressed from one decoded audio access unit.
+///
+/// This is the semantic form of FFmpeg's skip-samples packet side data. The
+/// FFI-specific ten-byte layout and its reason bytes stay in the internal
+/// FFmpeg module.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AudioTrim {
+    pub leading_samples: u32,
+    pub trailing_samples: u32,
+}
+
+impl AudioTrim {
+    /// Whether the access unit presents its complete decoded sample range.
+    pub fn is_empty(self) -> bool {
+        self.leading_samples == 0 && self.trailing_samples == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MediaKind {
     Audio,
@@ -80,6 +110,7 @@ pub enum MediaParameters {
         frame_size: Option<NonZeroU32>,
         /// Meaningful bits in each decoded sample, when declared.
         bit_depth: Option<NonZeroU16>,
+        timing: AudioTiming,
     },
     Subtitle,
 }

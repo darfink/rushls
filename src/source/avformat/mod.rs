@@ -7,6 +7,8 @@
 
 mod control;
 mod ffi;
+#[cfg(test)]
+pub(crate) mod fixtures;
 mod input;
 mod metadata;
 mod source;
