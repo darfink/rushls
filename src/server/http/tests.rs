@@ -381,3 +381,282 @@ async fn shutdown_lets_an_in_flight_blocking_reload_finish() {
 
     let _ = served.await;
 }
+
+mod end_to_end {
+    use std::{
+        fs,
+        io::Cursor,
+        process::Command,
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use crate::{
+        admission::{
+            ClientInfo, FixedStreamAuthenticator, IngestProtocol, PresentedCredential, Principal,
+            PublishGrant, PublishRequest, PublishResource, StreamPolicy,
+        },
+        delivery::hls::serve::PlaylistReadiness,
+        domain::{BoxFuture, StreamId},
+        observe::{Events, SourceMeters},
+        segment::SegmentationPolicy,
+        server::{Node, NodeConfig},
+        session::{SessionOutcome, run_session},
+        source::{
+            AcceptedPublish, PendingPublish, PublishRejection, TransportError,
+            avformat::{AvformatConfig, AvformatPacketSource, ReadInput},
+        },
+    };
+
+    use super::{HttpConfig, bind, request, serve};
+
+    struct FixturePublish {
+        request: PublishRequest,
+        bytes: Vec<u8>,
+        config: AvformatConfig,
+        input: crate::source::InputLimits,
+    }
+
+    impl PendingPublish for FixturePublish {
+        fn publish_request(&self) -> Result<PublishRequest, TransportError> {
+            Ok(self.request.clone())
+        }
+
+        fn accept(
+            self: Box<Self>,
+            grant: PublishGrant,
+            meters: Arc<dyn SourceMeters>,
+        ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
+            Box::pin(async move {
+                let source = AvformatPacketSource::new(
+                    Box::new(ReadInput::closed(Cursor::new(self.bytes))),
+                    self.config,
+                    self.input,
+                    meters,
+                )
+                .map_err(|error| TransportError::Accept(error.to_string().into()))?;
+                Ok(AcceptedPublish {
+                    source: Box::new(source),
+                    grant,
+                })
+            })
+        }
+
+        fn reject(
+            self: Box<Self>,
+            _rejection: PublishRejection,
+        ) -> BoxFuture<'static, Result<(), TransportError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn publish(input: crate::source::InputLimits) -> Box<dyn PendingPublish> {
+        Box::new(FixturePublish {
+            request: PublishRequest {
+                protocol: IngestProtocol::Rtmp,
+                resource: PublishResource {
+                    namespace: Some("live".into()),
+                    name: "presented-key".into(),
+                },
+                credential: PresentedCredential::new("secret"),
+                client: ClientInfo {
+                    remote_address: "127.0.0.1:1935".parse().expect("constant is valid"),
+                    encoder: Some("checked-in fixture".into()),
+                    protocol_version: None,
+                },
+            },
+            bytes: repeated_aac_flv(20),
+            config: AvformatConfig::default(),
+            input,
+        })
+    }
+
+    fn node() -> (Node, crate::session::SessionConfig) {
+        let mut config = NodeConfig::default();
+        // Eight AAC units per segment and four per part keep the fixture small
+        // while giving pre-roll enough cadence evidence for both boundaries.
+        config.session.segmentation = SegmentationPolicy::latency_first(
+            Duration::from_millis(180),
+            Duration::from_millis(90),
+        );
+        config.delivery.readiness = PlaylistReadiness::CompletedSegment;
+        let session = config.session;
+        let node = Node::new(
+            config,
+            Arc::new(FixedStreamAuthenticator::new(
+                "secret",
+                PublishGrant {
+                    stream_id: StreamId::new("live/camera"),
+                    principal: Principal("fixture".into()),
+                    policy: StreamPolicy::permissive(),
+                },
+            )),
+            Events::default(),
+        )
+        .expect("node configuration is valid");
+        (node, session)
+    }
+
+    #[tokio::test]
+    async fn avformat_through_normalization_cmaf_hls_and_http_is_playable() {
+        let (node, session) = node();
+        let outcome = run_session(publish(session.input), node.services(), &session).await;
+        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+
+        let listener = bind("127.0.0.1:0".parse().expect("constant is valid"))
+            .await
+            .expect("ephemeral HTTP listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve(
+            listener,
+            Arc::clone(node.origin()),
+            HttpConfig::default(),
+            async {
+                let _ = stopped.await;
+            },
+        ));
+
+        let master = request(address, "GET", "/live/camera/master.m3u8", &[]).await;
+        assert_eq!(master.status, 200);
+        assert!(
+            String::from_utf8(master.body)
+                .expect("master is text")
+                .contains("\n0/media.m3u8\n")
+        );
+        let media = request(address, "GET", "/live/camera/0/media.m3u8", &[]).await;
+        assert_eq!(media.status, 200);
+        let media = String::from_utf8(media.body).expect("media playlist is text");
+        assert!(media.contains("#EXT-X-MAP:"));
+        assert!(media.contains("segment/"));
+        let initialization = media
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("#EXT-X-MAP:URI=\"")
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+            .expect("media playlist names its initialization");
+        let segment = media
+            .lines()
+            .find(|line| !line.starts_with('#') && line.ends_with(".m4s"))
+            .expect("media playlist names a segment");
+        let initialization = request(
+            address,
+            "GET",
+            &format!("/live/camera/0/{initialization}"),
+            &[],
+        )
+        .await;
+        let segment = request(address, "GET", &format!("/live/camera/0/{segment}"), &[]).await;
+        assert_eq!((initialization.status, segment.status), (200, 200));
+        validate_with_ffprobe(&initialization.body, &segment.body);
+
+        if command_exists("mediastreamvalidator") {
+            let url = format!("http://{address}/live/camera/master.m3u8");
+            let report = temporary_path("json");
+            let validation = Command::new("mediastreamvalidator")
+                .args(["--timeout", "10", "--validation-data-path"])
+                .arg(&report)
+                .arg(&url)
+                .output()
+                .expect("Apple validator starts");
+            if report.exists() {
+                fs::remove_file(&report).expect("Apple validation report is removed");
+            }
+            assert!(
+                validation.status.success(),
+                "Apple playlist validation failed:\n{}\n{}",
+                String::from_utf8_lossy(&validation.stdout),
+                String::from_utf8_lossy(&validation.stderr)
+            );
+        }
+
+        let _ = shutdown.send(());
+        server
+            .await
+            .expect("HTTP task did not panic")
+            .expect("HTTP server stopped cleanly");
+    }
+
+    fn repeated_aac_flv(frames: usize) -> Vec<u8> {
+        use crate::mux::fixtures::{AAC_EXTRADATA, AAC_FRAME, AAC_FRAME_SAMPLES};
+
+        let mut flv = b"FLV\x01\x04\x00\x00\x00\x09\x00\x00\x00\x00".to_vec();
+        let mut sequence = Vec::with_capacity(2 + AAC_EXTRADATA.len());
+        sequence.extend_from_slice(&[0xaf, 0]);
+        sequence.extend_from_slice(AAC_EXTRADATA);
+        push_flv_tag(&mut flv, 8, 0, &sequence);
+        for frame in 0..frames {
+            let mut payload = Vec::with_capacity(2 + AAC_FRAME.len());
+            payload.extend_from_slice(&[0xaf, 1]);
+            payload.extend_from_slice(AAC_FRAME);
+            let timestamp = u32::try_from(frame as u64 * AAC_FRAME_SAMPLES * 1_000 / 48_000)
+                .expect("test fixture timestamp fits");
+            push_flv_tag(&mut flv, 8, timestamp, &payload);
+        }
+        flv
+    }
+
+    fn push_flv_tag(output: &mut Vec<u8>, kind: u8, timestamp: u32, payload: &[u8]) {
+        let length = u32::try_from(payload.len()).expect("test payload fits");
+        output.push(kind);
+        output.extend_from_slice(&[
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+            (timestamp >> 16) as u8,
+            (timestamp >> 8) as u8,
+            timestamp as u8,
+            (timestamp >> 24) as u8,
+            0,
+            0,
+            0,
+        ]);
+        output.extend_from_slice(payload);
+        output.extend_from_slice(&(11 + length).to_be_bytes());
+    }
+
+    fn validate_with_ffprobe(initialization: &[u8], segment: &[u8]) {
+        if !command_exists("ffprobe") {
+            return;
+        }
+        let path = temporary_path("mp4");
+        let mut media = Vec::with_capacity(initialization.len() + segment.len());
+        media.extend_from_slice(initialization);
+        media.extend_from_slice(segment);
+        fs::write(&path, media).expect("temporary CMAF presentation is written");
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_streams", "-of", "json"])
+            .arg(&path)
+            .output()
+            .expect("ffprobe starts");
+        fs::remove_file(&path).expect("temporary CMAF presentation is removed");
+
+        assert!(
+            probe.status.success(),
+            "ffprobe rejected packaged media: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let report = String::from_utf8(probe.stdout).expect("ffprobe JSON is UTF-8");
+        assert!(report.contains("\"codec_name\": \"aac\""));
+        assert!(report.contains("\"time_base\": \"1/48000\""));
+    }
+
+    fn command_exists(program: &str) -> bool {
+        Command::new(program)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    fn temporary_path(extension: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time follows the epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rushls-e2e-{}-{nonce}.{extension}",
+            std::process::id()
+        ))
+    }
+}

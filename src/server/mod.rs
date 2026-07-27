@@ -5,3 +5,6 @@
 
 pub mod http;
 pub mod metrics;
+mod runtime;
+
+pub use runtime::{Node, NodeConfig, RuntimeError};

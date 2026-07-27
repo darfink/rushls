@@ -12,6 +12,7 @@ use std::{
 };
 
 use derive_more::{Debug, Display};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::domain::{BoxFuture, Codec, FrameRate, StreamId};
@@ -171,4 +172,96 @@ pub trait Authenticator: Send + Sync {
         &'a self,
         request: &'a PublishRequest,
     ) -> BoxFuture<'a, Result<PublishGrant, AdmissionError>>;
+}
+
+/// Maps one shared publishing credential to one configured stream.
+///
+/// This is intentionally a single-stream authenticator rather than a pretend
+/// user database. It is useful for a self-contained origin and can be replaced
+/// through [`Authenticator`] when stream-key lookup lives in another service.
+#[derive(Clone, derive_more::Debug)]
+#[debug("FixedStreamAuthenticator {{ grant: {grant:?} }}")]
+pub struct FixedStreamAuthenticator {
+    #[debug(skip)]
+    credential: Vec<u8>,
+    grant: PublishGrant,
+}
+
+impl FixedStreamAuthenticator {
+    pub fn new(credential: impl Into<Vec<u8>>, grant: PublishGrant) -> Self {
+        Self {
+            credential: credential.into(),
+            grant,
+        }
+    }
+}
+
+impl Authenticator for FixedStreamAuthenticator {
+    fn authenticate<'a>(
+        &'a self,
+        request: &'a PublishRequest,
+    ) -> BoxFuture<'a, Result<PublishGrant, AdmissionError>> {
+        Box::pin(async move {
+            if self
+                .credential
+                .as_slice()
+                .ct_eq(request.credential.expose())
+                .into()
+            {
+                Ok(self.grant.clone())
+            } else {
+                Err(AdmissionError::InvalidCredential)
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(credential: &str) -> PublishRequest {
+        PublishRequest {
+            protocol: IngestProtocol::Rtmp,
+            resource: PublishResource {
+                namespace: Some("live".into()),
+                name: "presented-key".into(),
+            },
+            credential: PresentedCredential::new(credential),
+            client: ClientInfo {
+                remote_address: "127.0.0.1:1935".parse().expect("constant is valid"),
+                encoder: None,
+                protocol_version: None,
+            },
+        }
+    }
+
+    fn authenticator() -> FixedStreamAuthenticator {
+        FixedStreamAuthenticator::new(
+            "secret",
+            PublishGrant {
+                stream_id: StreamId::new("live/camera"),
+                principal: Principal("configured-publisher".into()),
+                policy: StreamPolicy::permissive(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn fixed_stream_authentication_hides_the_presented_key_from_the_stream_identity() {
+        let grant = authenticator()
+            .authenticate(&request("secret"))
+            .await
+            .expect("credential matches");
+
+        assert_eq!(grant.stream_id, StreamId::new("live/camera"));
+    }
+
+    #[tokio::test]
+    async fn fixed_stream_authentication_rejects_the_wrong_credential() {
+        assert!(matches!(
+            authenticator().authenticate(&request("wrong")).await,
+            Err(AdmissionError::InvalidCredential)
+        ));
+    }
 }

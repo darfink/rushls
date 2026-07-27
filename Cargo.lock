@@ -845,6 +845,7 @@ dependencies = [
  "nz",
  "parking_lot",
  "scuffle-rtmp",
+ "subtle",
  "thiserror",
  "time",
  "tokio",

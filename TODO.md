@@ -15,8 +15,9 @@
 - Run an LLM to find reductions in allocations
 - Run LLM to change all tests to -> Result + ? for condensing stuff
 - Implement tests w/ mediastreamvalidator
-- Implement end-to-end tests validating expected PTS, ELST, PDT, fetch, grace etc
-- Implement end-to-end tests with ffprobe??
+- Extend the end-to-end test matrix to video, ELST/PDT offsets, reconnect fetch
+  grace, and blocking reloads; the AAC AVFormat → HTTP path and ffprobe/Apple
+  validation are covered.
 - Support discontinuities when muxing? PaceToRealtime "maximum_timestamp_jump" doesn't make sense?
 - A single automatic cancellable maintenance task for the store
 - Delta playlists
@@ -28,7 +29,7 @@
 - CMAF muxing — done
 - HLS generation — done (`delivery::hls::project`)
 - HTTP serving — done (`delivery::hls::serve`, `server::http`)
-- Process wiring (main.rs)
+- Process wiring (main.rs) — done
 
 # Implement tests for:
 

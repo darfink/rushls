@@ -43,3 +43,19 @@ pub struct SessionConfig {
     pub segmentation: SegmentationPolicy,
     pub supervision: SupervisionPolicy,
 }
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            maximum_admission_time: Duration::from_secs(10),
+            discovery: DiscoveryLimits {
+                maximum_probe_bytes: 1024 * 1024,
+                maximum_wall_time: Duration::from_secs(10),
+            },
+            input: InputLimits::permissive(),
+            preroll: PrerollLimits::permissive(),
+            segmentation: SegmentationPolicy::default(),
+            supervision: SupervisionPolicy::default(),
+        }
+    }
+}

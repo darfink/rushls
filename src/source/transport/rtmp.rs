@@ -23,10 +23,11 @@ use crate::{
         ClientInfo, IngestProtocol, PresentedCredential, PublishGrant, PublishRequest,
         PublishResource,
     },
-    domain::BoxFuture,
+    domain::{Appender, BoxFuture},
     observe::SourceMeters,
     source::{
-        AcceptedPublish, InputLimits, InputState, PendingPublish, PublishRejection, TransportError,
+        AcceptedPublish, DiscoveryLimits, DiscoveryReport, InputLimits, InputState, Packet,
+        PacketSource, PendingPublish, PublishRejection, SourceError, TransportError,
         avformat::{
             AvformatByteChannel, AvformatByteChannelWriter, AvformatConfig, AvformatPacketSource,
         },
@@ -190,7 +191,7 @@ impl PendingPublish for RtmpPendingPublish {
                 decision,
                 input,
                 config,
-                session: _session,
+                session,
                 ..
             } = *self;
             let source = AvformatPacketSource::new(
@@ -217,7 +218,10 @@ impl PendingPublish for RtmpPendingPublish {
                 })?
                 .map_err(TransportError::Accept)?;
             Ok(AcceptedPublish {
-                source: Box::new(source),
+                source: Box::new(RtmpPacketSource {
+                    source,
+                    session: Some(session),
+                }),
                 grant,
             })
         })
@@ -229,7 +233,10 @@ impl PendingPublish for RtmpPendingPublish {
     ) -> BoxFuture<'static, Result<(), TransportError>> {
         Box::pin(async move {
             let (completion_tx, completion_rx) = oneshot::channel();
-            self.decision
+            let Self {
+                decision, session, ..
+            } = *self;
+            decision
                 .send(PublishDecision::Reject(rejection, completion_tx))
                 .map_err(|_| {
                     TransportError::Reject(
@@ -239,12 +246,42 @@ impl PendingPublish for RtmpPendingPublish {
             completion_rx.await.map_err(|_| {
                 TransportError::Reject("RTMP connection ended before rejection completed".into())
             })?;
+            session.abort();
 
             // scuffle-rtmp currently exposes no handler API for a typed
             // NetStream.Publish rejection. Returning a handler error closes the
             // connection, which is safe but less informative to the encoder.
             Ok(())
         })
+    }
+}
+
+struct RtmpPacketSource {
+    source: AvformatPacketSource,
+    session: Option<JoinHandle<Result<bool, scuffle_rtmp::error::RtmpError>>>,
+}
+
+impl PacketSource for RtmpPacketSource {
+    fn discover<'a>(
+        &'a mut self,
+        limits: DiscoveryLimits,
+    ) -> BoxFuture<'a, Result<DiscoveryReport, SourceError>> {
+        self.source.discover(limits)
+    }
+
+    fn fill<'a>(
+        &'a mut self,
+        out: &'a mut dyn Appender<Packet>,
+    ) -> BoxFuture<'a, Result<InputState, SourceError>> {
+        self.source.fill(out)
+    }
+}
+
+impl Drop for RtmpPacketSource {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            session.abort();
+        }
     }
 }
 

@@ -28,6 +28,9 @@
 - Enhanced RTMP ingest through `scuffle-rtmp`. Admission pauses the publish
   command, accepted audio/video/AMF0 messages are framed as a byte-bounded FLV
   stream, and the existing AVFormat source performs discovery and demuxing.
+- Production process assembly through `server::Node`: RTMP admission, AVFormat,
+  normalization, CMAF/WebVTT packaging, HLS storage, HTTP delivery, metrics,
+  graceful shutdown, and one maintenance task for store and playlist caches.
 
 ## Primary files
 
@@ -43,6 +46,9 @@
 - RTMP transport:
   - `src/source/transport/rtmp.rs`
   - `src/source/avformat/channel.rs`
+- Process assembly:
+  - `src/server/runtime.rs`
+  - `src/main.rs`
 - Timeline and segmentation:
   - `src/media/{timeline,validate,fixtures}.rs`
   - `src/segment/{mod,preroll,boundary}.rs`
@@ -62,7 +68,9 @@ working-tree changes. Preserve unrelated existing edits in `TODO.md`.
 
 ## Validation
 
-- `cargo test`: 316 passed.
+- `cargo test`: 322 passed, including real AVFormat → HTTP packaging.
+- `ffprobe`: validates fetched initialization plus CMAF media when installed.
+- `mediastreamvalidator`: validates the served HLS presentation when installed.
 - `cargo clippy --all-targets -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
 - `git diff --check`: passed.
@@ -83,6 +91,14 @@ working-tree changes. Preserve unrelated existing edits in `TODO.md`.
   mid-stream starts will require explicit trim provenance.
 - Subtitle initialization is a WebVTT header with `X-TIMESTAMP-MAP`; future HLS
   rendering must expose it with `EXT-X-MAP`.
+
+## Running the node
+
+`RUSHLS_PUBLISH_KEY` is required. `RUSHLS_STREAM_ID` defaults to
+`live/camera`, `RUSHLS_RTMP_LISTEN` to `0.0.0.0:1935`, and
+`RUSHLS_HTTP_LISTEN` to `0.0.0.0:8080`. Publish with the configured key as the
+RTMP publish name; the fixed-stream authenticator maps it to the configured
+stream identity rather than exposing the key in HLS URLs.
 
 ## HLS projection and HTTP serving
 
@@ -118,9 +134,9 @@ Built on top of the above. See `TODO.md` for what remains open.
 
 1. Implement and validate the SRT publishing adapter, reusing the byte-bounded
    AVFormat bridge introduced for RTMP.
-2. Wire production services in `main.rs`: authenticator, normalizer,
-   pass-through muxer, HLS publisher/store, HTTP server, session registry,
-   metrics, and shutdown/maintenance tasks — including `StreamStore::maintain`
-   and `Origin::prune` on one timer.
-3. Add end-to-end tests covering AVFormat → normalization → CMAF/HLS → HTTP with
-   `ffprobe` and, where available, Apple media validation tooling.
+2. Add a multi-stream authenticator or external stream-key lookup. The bundled
+   fixed-stream authenticator is intentionally sufficient for one configured
+   stream rather than pretending to be an account database.
+3. Add an on-the-wire RTMP client test around Scuffle's handshake and Enhanced
+   RTMP command/message parsing; FLV framing and the downstream path are already
+   covered independently.

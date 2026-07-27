@@ -11,6 +11,7 @@ ffmpeg-sys-next = { version = "8.1.0", default-features = false, features = ["av
 nz = "0.4"
 parking_lot = "0.12"
 scuffle-rtmp = "0.2.3"
+subtle = "2"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
