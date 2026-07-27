@@ -5,6 +5,7 @@
 //! neither Tokio nor the rest of the media pipeline can observe an FFmpeg
 //! pointer or depend on its ownership rules.
 
+mod channel;
 mod control;
 mod ffi;
 #[cfg(test)]
@@ -14,5 +15,6 @@ mod metadata;
 mod source;
 mod worker;
 
+pub use channel::{AvformatByteChannel, AvformatByteChannelWriter, ByteChannelWriteError};
 pub use input::{AvformatInput, AvformatInputError, AvformatInterrupt, ReadInput};
 pub use source::{AvformatConfig, AvformatPacketSource};

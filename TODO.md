@@ -23,7 +23,7 @@
 
 # Steps
 
-- RTMP/SRT ingest
+- SRT ingest
 - Media normalization — done
 - CMAF muxing — done
 - HLS generation — done (`delivery::hls::project`)

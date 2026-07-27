@@ -25,6 +25,9 @@
   - subtitle timing projected to 90 kHz for future `X-TIMESTAMP-MAP` rendering.
 - Normalization was split by responsibility: pipeline samples, presented
   timing, contracts, and per-kind pass-through implementations are separate.
+- Enhanced RTMP ingest through `scuffle-rtmp`. Admission pauses the publish
+  command, accepted audio/video/AMF0 messages are framed as a byte-bounded FLV
+  stream, and the existing AVFormat source performs discovery and demuxing.
 
 ## Primary files
 
@@ -37,6 +40,9 @@
   - `src/domain/{track,time,mod}.rs`
   - `src/source/{packet,limits}.rs`
   - `src/source/avformat/{ffi,metadata,source,fixtures}.rs`
+- RTMP transport:
+  - `src/source/transport/rtmp.rs`
+  - `src/source/avformat/channel.rs`
 - Timeline and segmentation:
   - `src/media/{timeline,validate,fixtures}.rs`
   - `src/segment/{mod,preroll,boundary}.rs`
@@ -56,7 +62,7 @@ working-tree changes. Preserve unrelated existing edits in `TODO.md`.
 
 ## Validation
 
-- `cargo test`: 233 passed.
+- `cargo test`: 316 passed.
 - `cargo clippy --all-targets -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
 - `git diff --check`: passed.
@@ -110,8 +116,8 @@ Built on top of the above. See `TODO.md` for what remains open.
 
 ## Suggested next steps
 
-1. Implement and validate RTMP and SRT publishing adapters, reusing the existing
-   AVFormat source for carried container bytes.
+1. Implement and validate the SRT publishing adapter, reusing the byte-bounded
+   AVFormat bridge introduced for RTMP.
 2. Wire production services in `main.rs`: authenticator, normalizer,
    pass-through muxer, HLS publisher/store, HTTP server, session registry,
    metrics, and shutdown/maintenance tasks — including `StreamStore::maintain`
