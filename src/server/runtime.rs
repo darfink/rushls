@@ -18,7 +18,10 @@ use crate::{
     mux::{CmafMuxerConfig, PassThroughMuxerFactory},
     observe::{Events, ProcessMeters},
     session::{Registry, Services, SessionConfig, StopReason, run_session},
-    source::transport::rtmp::{RtmpConfig, RtmpPendingPublish},
+    source::transport::{
+        rtmp::{RtmpConfig, RtmpPendingPublish},
+        srt::{SrtConfig, SrtListener},
+    },
 };
 
 use super::{
@@ -30,10 +33,12 @@ use super::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeConfig {
     pub rtmp_address: SocketAddr,
+    pub srt_address: SocketAddr,
     pub http_address: SocketAddr,
     pub maintenance_interval: Duration,
     pub maximum_sessions: usize,
     pub rtmp: RtmpConfig,
+    pub srt: SrtConfig,
     pub session: SessionConfig,
     pub cmaf: CmafMuxerConfig,
     pub store: StoreLimits,
@@ -46,10 +51,12 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             rtmp_address: "0.0.0.0:1935".parse().expect("constant address is valid"),
+            srt_address: "0.0.0.0:9000".parse().expect("constant address is valid"),
             http_address: "0.0.0.0:8080".parse().expect("constant address is valid"),
             maintenance_interval: Duration::from_secs(1),
             maximum_sessions: 256,
             rtmp: RtmpConfig::default(),
+            srt: SrtConfig::default(),
             session: SessionConfig::default(),
             cmaf: CmafMuxerConfig::default(),
             store: StoreLimits::default(),
@@ -69,6 +76,11 @@ pub enum RuntimeError {
         address: SocketAddr,
         source: std::io::Error,
     },
+    #[error("could not bind SRT at {address}: {source}")]
+    BindSrt {
+        address: SocketAddr,
+        source: crate::source::TransportError,
+    },
     #[error("could not bind HTTP at {address}: {source}")]
     BindHttp {
         address: SocketAddr,
@@ -76,6 +88,8 @@ pub enum RuntimeError {
     },
     #[error("RTMP listener failed: {0}")]
     Rtmp(std::io::Error),
+    #[error("SRT listener stopped unexpectedly")]
+    SrtStopped,
     #[error("HTTP server failed: {0}")]
     Http(std::io::Error),
     #[error("a runtime task failed: {0}")]
@@ -108,11 +122,12 @@ impl Node {
             ));
         }
 
-        // There is one input policy for a publication. Keeping the RTMP
-        // adapter and the session driver on the same value prevents bytes that
-        // passed one boundary from being refused by the next under a different
-        // supposedly process-wide limit.
+        // There is one input policy for a publication. Keeping both transport
+        // adapters and the session driver on the same value prevents bytes
+        // that passed one boundary from being refused by the next under a
+        // different supposedly process-wide limit.
         config.rtmp.input_limits = config.session.input;
+        config.srt.input_limits = config.session.input;
         let store = StreamStore::new(config.store);
         let sessions = Registry::with_capacity(config.maximum_sessions);
         let meters = ProcessMeters::default();
@@ -165,6 +180,15 @@ impl Node {
                     address: self.config.rtmp_address,
                     source,
                 })?;
+        let srt_listener = SrtListener::bind(
+            self.config.srt_address,
+            self.config.srt.clone(),
+            self.config.maximum_sessions,
+        )
+        .map_err(|source| RuntimeError::BindSrt {
+            address: self.config.srt_address,
+            source,
+        })?;
         let http_listener =
             TcpListener::bind(self.config.http_address)
                 .await
@@ -178,6 +202,12 @@ impl Node {
         tasks.spawn(run_rtmp(
             rtmp_listener,
             self.config.rtmp,
+            self.services.clone(),
+            self.config.session,
+            stop_rx.clone(),
+        ));
+        tasks.spawn(run_srt(
+            srt_listener,
             self.services.clone(),
             self.config.session,
             stop_rx.clone(),
@@ -214,6 +244,61 @@ impl Node {
             None => Ok(()),
         }
     }
+}
+
+async fn run_srt(
+    mut listener: SrtListener,
+    services: Services,
+    session_config: SessionConfig,
+    mut stop: watch::Receiver<bool>,
+) -> Result<(), RuntimeError> {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
+                }
+            }
+
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    eprintln!("SRT connection task failed: {error}");
+                }
+            }
+
+            accepted = listener.accept() => {
+                let Some(accepted) = accepted else {
+                    return Err(RuntimeError::SrtStopped);
+                };
+                let pending = match accepted {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        eprintln!("SRT handshake rejected: {error}");
+                        continue;
+                    }
+                };
+                let services = services.clone();
+                connections.spawn(async move {
+                    if let Err(error) =
+                        run_session(Box::new(pending), &services, &session_config).await
+                    {
+                        eprintln!("publishing session failed: {error}");
+                    }
+                });
+            }
+        }
+    }
+
+    drop(listener);
+    while let Some(completed) = connections.join_next().await {
+        if let Err(error) = completed {
+            eprintln!("SRT connection task failed during shutdown: {error}");
+        }
+    }
+    Ok(())
 }
 
 async fn run_rtmp(
@@ -352,10 +437,12 @@ mod tests {
         let mut config = NodeConfig::default();
         config.session.input.maximum_packets_per_batch = 17;
         config.rtmp.input_limits.maximum_packets_per_batch = 99;
+        config.srt.input_limits.maximum_packets_per_batch = 98;
 
         let node = node(config).expect("configuration is valid");
 
         assert_eq!(node.config.rtmp.input_limits.maximum_packets_per_batch, 17);
+        assert_eq!(node.config.srt.input_limits.maximum_packets_per_batch, 17);
     }
 
     #[test]
@@ -380,6 +467,7 @@ mod tests {
     async fn an_immediate_shutdown_stops_every_runtime_task() {
         let node = node(NodeConfig {
             rtmp_address: "127.0.0.1:0".parse().expect("constant is valid"),
+            srt_address: "127.0.0.1:0".parse().expect("constant is valid"),
             http_address: "127.0.0.1:0".parse().expect("constant is valid"),
             ..NodeConfig::default()
         })

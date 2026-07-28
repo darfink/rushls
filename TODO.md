@@ -13,6 +13,8 @@
 - Run an LLM against HLS spec and comment all spec related behavior
 - Run an LLM to evaluate performance improvements + profile
 - Run an LLM to find reductions in allocations
+- Run an LLM to determine clean error types
+- Run an LLM to revise SessionEvents
 - Run LLM to change all tests to -> Result + ? for condensing stuff
 - Implement tests w/ mediastreamvalidator
 - Extend the end-to-end test matrix to video, ELST/PDT offsets, reconnect fetch
@@ -29,6 +31,7 @@
 - Test subtitles + multitracks
 - Config, CLI params & TLS
 - Test reconnects/evictions?
+- Automated test on macos w/ mediastreamvalidator?
 
 # LATER
 

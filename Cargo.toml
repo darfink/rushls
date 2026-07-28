@@ -12,9 +12,11 @@ derive_more = { version = "2", features = ["debug", "deref", "display"] }
 bytes = "1.12.1"
 ffmpeg-sys-next = { version = "8.1.0", default-features = false, features = ["avformat"] }
 isolang = { version = "2.4.0", default-features = false }
+libc = "0.2"
 nz = "0.4"
 parking_lot = "0.12"
 scuffle-rtmp = "0.2.3"
+socket2 = "0.6"
 subtle = "2"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
@@ -23,6 +25,10 @@ urlencoding = "2"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "original-uri", "query", "tokio"] }
 http-body-util = "0.1.4"
 http-body = "1.1.0"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
 
 [dev-dependencies]
 base64 = "0.22"
