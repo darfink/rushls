@@ -91,7 +91,7 @@ pub enum DiscoveryProblem {
     AlreadyStarted,
     /// Distinct from a deadline: the bytes ran out, not the clock. An operator
     /// raises a different limit for each.
-    #[error("discovery read its full probe byte budget without recognizing the input")]
+    #[error("discovery read its full probe byte budget without completing")]
     ProbeLimitExceeded,
     #[error("discovery exceeded its deadline")]
     DeadlineExceeded,

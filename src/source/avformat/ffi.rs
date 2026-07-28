@@ -217,6 +217,16 @@ impl FormatInput {
         if result < 0 {
             return Err(discovery_error(result, &format.control));
         }
+        // FFmpeg may return success after its interrupt callback stopped a
+        // probe. The context is not usable in that case: the byte limit can
+        // have landed inside a container packet, leaving the demuxer poised in
+        // the middle of that packet when normal reads resume.
+        if format.control.probe_exceeded() {
+            return Err(DiscoveryProblem::ProbeLimitExceeded.into());
+        }
+        if format.control.interrupted() {
+            return Err(DiscoveryProblem::DeadlineExceeded.into());
+        }
         format.control.set_deadline(None);
         format.control.finish_probe();
         // SAFETY: stream discovery has completed on this open context.

@@ -49,7 +49,10 @@ impl Default for SessionConfig {
         Self {
             maximum_admission_time: Duration::from_secs(10),
             discovery: DiscoveryLimits {
-                maximum_probe_bytes: 1024 * 1024,
+                // A multi-rendition contribution can carry several megabits
+                // per second before FFmpeg has observed enough packets to
+                // finish stream discovery.
+                maximum_probe_bytes: 8 * 1024 * 1024,
                 maximum_wall_time: Duration::from_secs(10),
             },
             input: InputLimits::permissive(),

@@ -283,7 +283,14 @@ impl CmafTrack {
         } else if self.segment.part_access_units >= self.plan.part_access_units.get()
             && self.fragment.is_some()
         {
-            self.close_fragment_at(presented_pts);
+            // Audio is in presentation order, so the next PTS is a truthful
+            // cut point. Video is in decode order: a reference picture may
+            // have a later PTS than B-pictures that follow it, so extending a
+            // part to the next packet's PTS can exceed the target despite the
+            // part containing exactly the planned number of access units.
+            if self.kind != MediaKind::Video {
+                self.close_fragment_at(presented_pts);
+            }
             self.flush_fragment(out)?;
         }
 
@@ -291,11 +298,31 @@ impl CmafTrack {
             .checked_add_unsigned(presented.duration)
             .ok_or_else(|| mux_error(format!("sample end overflowed for {}", self.track_id)))?;
         match &mut self.fragment {
+            Some(fragment) if self.kind == MediaKind::Video => {
+                fragment.end = fragment
+                    .end
+                    .checked_add_unsigned(presented.duration)
+                    .ok_or_else(|| {
+                        mux_error(format!("chunk duration overflowed for {}", self.track_id))
+                    })?;
+            }
             Some(fragment) => fragment.end = fragment.end.max(end),
             none => {
+                let start = self.segment.filled_to()?;
                 *none = Some(OpenFragment {
-                    start: self.segment.filled_to()?,
-                    end,
+                    start,
+                    end: if self.kind == MediaKind::Video {
+                        start
+                            .checked_add_unsigned(presented.duration)
+                            .ok_or_else(|| {
+                                mux_error(format!(
+                                    "chunk duration overflowed for {}",
+                                    self.track_id
+                                ))
+                            })?
+                    } else {
+                        end
+                    },
                     independent: sample.random_access(),
                 });
             }
@@ -941,6 +968,62 @@ mod tests {
         let retained = chunk.payload.clone();
         drop(started);
         assert!(!retained.is_empty());
+    }
+
+    #[test]
+    fn reordered_video_parts_are_measured_on_the_decode_timeline() {
+        let sink = event_sink();
+        let timebase = Timebase::new(nz::u32!(1), nz::u32!(16_384));
+        let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
+            .expect("fixture presentation validates");
+        let segmentation = SegmentationPlan::new(
+            &input,
+            vec![TrackSegmentationPlan {
+                track_id: TrackId(0),
+                timebase,
+                presentation_origin_pts: 0,
+                segmentation_origin_pts: 0,
+                first_segment_boundary_pts: i64::try_from(16 * FRAME).expect("fixture fits"),
+                segment_duration: NonZero::new(16 * FRAME).expect("nonzero"),
+                part_access_units: nz::u32!(1),
+                part_duration: NonZero::new(FRAME).expect("nonzero"),
+                boundary_tolerance: 0,
+            }],
+        )
+        .expect("fixture segmentation validates");
+        let mut started = PassThroughMuxerFactory::default()
+            .start(MuxerStartRequest {
+                presentation: &input,
+                segmentation: &segmentation,
+                time_anchor: SystemTime::UNIX_EPOCH,
+                events: &sink,
+            })
+            .expect("reordered CMAF output starts");
+        let frame = i64::try_from(FRAME).expect("fixture duration fits");
+        let mut media = Vec::new();
+
+        // The second decoded access unit is a future reference picture. Its
+        // PTS must neither stretch the preceding part nor make its own part
+        // exceed the one-access-unit target.
+        for sample in [
+            sample_with_dts(0, 0, -3 * frame, true),
+            sample_with_dts(0, 4 * frame, -2 * frame, false),
+            sample_with_dts(0, frame, -frame, false),
+        ] {
+            started
+                .muxer
+                .push(sample, &mut media)
+                .expect("reordered sample packages");
+        }
+
+        let durations: Vec<_> = media
+            .iter()
+            .filter_map(|event| match event {
+                PackagedMedia::Chunk(chunk) => Some(chunk.duration),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(durations, [FRAME, FRAME]);
     }
 
     #[test]
