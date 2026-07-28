@@ -23,10 +23,11 @@ use tokio::time::timeout;
 
 use crate::{
     delivery::hls::{
-        LiveStream, Msn, PartId, PartIndex, RenditionCatalogEntry, RenditionLiveEdge,
-        RenditionSnapshot, SegmentBody, StoredSegment, StoredSegmentKind, StreamSnapshot,
-        StreamStore,
+        LiveStream, Msn, PartId, PartIndex, PlaylistContract, RenditionCatalogEntry,
+        RenditionLiveEdge, RenditionSnapshot, SegmentBody, StoredSegment, StoredSegmentKind,
+        StreamSnapshot, StreamStore,
         cache::{PlaylistKey, StreamPlaylistCache},
+        cache_control::{CacheControl, CacheControlPolicy},
         project::{
             self, DeliveryTimingPolicy, PlaylistPolicy, ProjectionError, media::media_playlist,
             multivariant::multivariant_playlist, timing::blocking_reload_deadline,
@@ -61,6 +62,8 @@ pub struct DeliveryConfig {
     pub playlist: PlaylistPolicy,
     pub timing: DeliveryTimingPolicy,
     pub readiness: PlaylistReadiness,
+    /// How long each class of response may be reused by downstream caches.
+    pub cache_control: CacheControlPolicy,
     /// Where the names playlists emit are rooted. Relative by default.
     pub uri_base: UriBase,
 }
@@ -115,17 +118,6 @@ impl Request {
     pub fn new(resource: Resource, blocking: Option<BlockingReload>) -> Self {
         Self { resource, blocking }
     }
-}
-
-/// How long a response may be reused.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Caching {
-    /// The resource is named by a durable identity and its bytes will never
-    /// change, so it may be held until it is evicted from the cache.
-    Immutable,
-    /// The resource describes a moving live edge and is stale the moment it is
-    /// written.
-    Live,
 }
 
 /// Bytes to send, in the buffers they were stored in.
@@ -277,32 +269,49 @@ pub enum Body {
 pub struct Response {
     pub body: Body,
     pub content_type: &'static str,
-    pub caching: Caching,
+    pub cache_control: CacheControl,
 }
 
 impl Response {
-    /// Media named by a durable identity, whose bytes can never change.
+    /// Media named by a durable identity, whose bytes cannot change under it.
     ///
     /// The media type comes from the name that asked for it, so what a resource
     /// is called and what it is served as cannot disagree.
-    fn immutable(body: MediaBody, resource: &Resource) -> Result<Self, DeliveryError> {
+    fn media(
+        body: MediaBody,
+        resource: &Resource,
+        cache_control: CacheControl,
+    ) -> Result<Self, DeliveryError> {
         Ok(Self {
             body: Body::Media(body),
             content_type: resource
                 .content_type()
                 .ok_or(DeliveryError::UnknownResource)?,
-            caching: Caching::Immutable,
+            cache_control,
         })
     }
 
-    /// A playlist, which describes a live edge and is stale as it is written.
-    fn playlist(bytes: Bytes) -> Self {
+    /// A playlist, whose lifetime depends on whether its request named a
+    /// position or the moving live edge.
+    fn playlist(bytes: Bytes, cache_control: CacheControl) -> Self {
         Self {
             body: Body::Playlist(bytes),
             content_type: PLAYLIST_CONTENT_TYPE,
-            caching: Caching::Live,
+            cache_control,
         }
     }
+}
+
+/// A failure, and how long anyone may remember it.
+///
+/// Attached at the boundary rather than at each failure site: whether a miss is
+/// worth caching is a property of what the request named, which the innermost
+/// code that discovers the miss has no view of.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
+#[display("{error}")]
+pub struct DeliveryFailure {
+    pub error: DeliveryError,
+    pub cache_control: CacheControl,
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -395,7 +404,7 @@ impl Origin {
         &self,
         stream: &StreamId,
         request: Request,
-    ) -> Result<Response, DeliveryError> {
+    ) -> Result<Response, DeliveryFailure> {
         let outcome = self.dispatch(stream, request).await;
         match &outcome {
             Ok(Response {
@@ -411,7 +420,60 @@ impl Origin {
             Err(DeliveryError::Unsatisfied) => self.meters.blocking_reload_expired(),
             _ => {}
         }
-        outcome
+        outcome.map_err(|error| self.failure(error, Some((stream, request))))
+    }
+
+    /// Describes a failure that never reached a stream, such as an unroutable
+    /// path.
+    pub fn unrouted(&self, error: DeliveryError) -> DeliveryFailure {
+        self.failure(error, None)
+    }
+
+    /// Attaches to a failure how long anyone may remember it.
+    ///
+    /// Only absence is cacheable. A rejected directive is the client's to fix,
+    /// and an unmet blocking deadline is a momentary condition — pinning one
+    /// across a CDN would turn a single slow tick into target durations of
+    /// failure for every viewer behind it. Both of those skip the store lookup
+    /// entirely, because a lifetime nobody is granted needs no target duration.
+    fn failure(
+        &self,
+        error: DeliveryError,
+        request: Option<(&StreamId, Request)>,
+    ) -> DeliveryFailure {
+        let cache_control = match error {
+            DeliveryError::UnknownStream
+            | DeliveryError::UnknownRendition
+            | DeliveryError::UnknownResource => {
+                let (target, blocking) = request.map_or((None, false), |(stream, request)| {
+                    (
+                        self.target_duration(stream, request.resource),
+                        request.blocking.is_some(),
+                    )
+                });
+                self.config.cache_control.missing(target, blocking)
+            }
+            _ => CacheControl::revalidate(),
+        };
+        DeliveryFailure {
+            error,
+            cache_control,
+        }
+    }
+
+    /// The target duration a lifetime for this request should be scaled by.
+    ///
+    /// Best effort by construction, because this also answers for requests that
+    /// named nothing that exists: the rendition's own contract where there is
+    /// one, the widest cadence in the presentation for a request that spans
+    /// renditions, and otherwise nothing, which leaves the policy to assume.
+    fn target_duration(&self, stream: &StreamId, resource: Resource) -> Option<Duration> {
+        let stream = self.store.get(stream)?.snapshot();
+        resource
+            .rendition()
+            .and_then(|rendition| rendition_entry(&stream, rendition))
+            .map(|entry| target_duration_of(entry.contract))
+            .or_else(|| longest_target_duration(&stream))
     }
 
     async fn dispatch(
@@ -431,27 +493,35 @@ impl Origin {
                 let held = snapshot
                     .initialization_for(initialization)
                     .ok_or(DeliveryError::UnknownResource)?;
-                Ok(Response::immutable(
+                Ok(Response::media(
                     MediaBody::single(held.payload.clone()),
                     &request.resource,
+                    self.media_cache_control(snapshot.contract),
                 )?)
             }
             Resource::Segment(rendition, segment, _) => {
                 // Resolved for its claim rather than its contents: a completed
                 // segment's bytes are held by the stream, not the snapshot.
-                self.rendition_for(&live, request.resource)?;
+                let snapshot = self.rendition_for(&live, request.resource)?;
                 let stored = live
                     .segment(rendition, segment)
                     .ok_or(DeliveryError::UnknownResource)?;
-                Ok(Response::immutable(
+                Ok(Response::media(
                     MediaBody::from_segment(&stored),
                     &request.resource,
+                    self.media_cache_control(snapshot.contract),
                 )?)
             }
             Resource::Part(rendition, part, _) => {
                 self.part(&live, request.resource, rendition, part).await
             }
         }
+    }
+
+    fn media_cache_control(&self, contract: PlaylistContract) -> CacheControl {
+        self.config
+            .cache_control
+            .media(Some(target_duration_of(contract)))
     }
 
     fn multivariant(
@@ -474,7 +544,15 @@ impl Origin {
             },
         )?;
         self.meters.playlist_served(rendered.freshly_rendered);
-        Ok(Response::playlist(rendered.bytes))
+        // A multivariant playlist names no rendition of its own, so it is paced
+        // by the widest cadence it points at, and it is never the target of a
+        // blocking reload.
+        Ok(Response::playlist(
+            rendered.bytes,
+            self.config
+                .cache_control
+                .playlist(longest_target_duration(&stream), false),
+        ))
     }
 
     async fn media_playlist(
@@ -533,7 +611,13 @@ impl Origin {
             },
         )?;
         self.meters.playlist_served(rendered.freshly_rendered);
-        Ok(Response::playlist(rendered.bytes))
+        Ok(Response::playlist(
+            rendered.bytes,
+            self.config.cache_control.playlist(
+                Some(target_duration_of(snapshot.contract)),
+                blocking.is_some(),
+            ),
+        ))
     }
 
     /// Serves one partial segment, waiting if it has been hinted but not yet
@@ -551,8 +635,13 @@ impl Origin {
         part: PartId,
     ) -> Result<Response, DeliveryError> {
         let snapshot = self.rendition_for(live, resource)?;
+        let cache_control = self.media_cache_control(snapshot.contract);
         if let Some(stored) = live.part(rendition, part) {
-            return Response::immutable(MediaBody::single(stored.payload.clone()), &resource);
+            return Response::media(
+                MediaBody::single(stored.payload.clone()),
+                &resource,
+                cache_control,
+            );
         }
 
         // Absent means one of two things, and they get opposite answers: media
@@ -577,7 +666,11 @@ impl Origin {
         let stored = live
             .part(rendition, part)
             .ok_or(DeliveryError::UnknownResource)?;
-        Response::immutable(MediaBody::single(stored.payload.clone()), &resource)
+        Response::media(
+            MediaBody::single(stored.payload.clone()),
+            &resource,
+            cache_control,
+        )
     }
 
     /// Rejects a directive naming media so far ahead it cannot be a wait.
@@ -737,6 +830,22 @@ fn satisfies(edge: &RenditionLiveEdge, blocking: BlockingReload) -> bool {
     }
 }
 
+/// The whole-second target duration a contract promised.
+fn target_duration_of(contract: PlaylistContract) -> Duration {
+    Duration::from_secs(contract.target_duration.get())
+}
+
+/// The widest cadence in the presentation.
+///
+/// What paces anything that belongs to no single rendition, for the same reason
+/// one `EXT-X-SERVER-CONTROL` covers them all: a value that held for the
+/// narrowest cadence would be wrong for every other rendition in the playlist.
+fn longest_target_duration(stream: &StreamSnapshot) -> Option<Duration> {
+    project::active_contracts(stream)
+        .map(target_duration_of)
+        .max()
+}
+
 /// Looks one rendition up in a stream catalog.
 pub fn rendition_entry(
     stream: &StreamSnapshot,
@@ -754,7 +863,8 @@ mod tests {
         delivery::hls::{
             InitializationId, SegmentId,
             fixtures::{
-                PART_BYTES, chunk, initialization, lease, stream_id, video, write, write_segment,
+                PART_BYTES, audio, chunk, initialization, lease, stream_id, video,
+                video_with_cadence, write, write_segment,
             },
         },
         domain::MediaKind,
@@ -790,6 +900,11 @@ mod tests {
         }
     }
 
+    /// What the default policy grants media of the fixture's six-second cadence.
+    fn media_cache_control() -> CacheControl {
+        CacheControlPolicy::default().media(Some(Duration::from_secs(6)))
+    }
+
     fn media(response: &Response) -> &MediaBody {
         match &response.body {
             Body::Media(body) => body,
@@ -809,7 +924,8 @@ mod tests {
             origin
                 .serve(&StreamId::new("nobody/here"), fetch(Resource::Multivariant))
                 .await
-                .unwrap_err(),
+                .unwrap_err()
+                .error,
             DeliveryError::UnknownStream
         );
         assert_eq!(
@@ -819,7 +935,8 @@ mod tests {
                     fetch(Resource::Segment(RenditionId(9), SegmentId(1), CMAF))
                 )
                 .await
-                .unwrap_err(),
+                .unwrap_err()
+                .error,
             DeliveryError::UnknownRendition
         );
         assert_eq!(
@@ -829,7 +946,8 @@ mod tests {
                     fetch(Resource::Segment(RenditionId(0), SegmentId(99), CMAF))
                 )
                 .await
-                .unwrap_err(),
+                .unwrap_err()
+                .error,
             DeliveryError::UnknownResource
         );
     }
@@ -857,7 +975,8 @@ mod tests {
             origin
                 .serve(&stream_id(), playlist(MediaKind::Audio))
                 .await
-                .unwrap_err(),
+                .unwrap_err()
+                .error,
             DeliveryError::UnknownResource,
             "answering under a name that misdescribes the playlist would let a \
              client cache the lie"
@@ -866,7 +985,8 @@ mod tests {
             origin
                 .serve(&stream_id(), segment(MediaSegmentFormat::WebVtt))
                 .await
-                .unwrap_err(),
+                .unwrap_err()
+                .error,
             DeliveryError::UnknownResource,
             "every format shares one identifier space, so `.vtt` and `.m4s` \
              name different resources and only one of them exists"
@@ -889,7 +1009,7 @@ mod tests {
             .await
             .expect("the segment is retained");
 
-        assert_eq!(response.caching, Caching::Immutable);
+        assert_eq!(response.cache_control, media_cache_control());
         assert_eq!(response.content_type, "video/iso.segment");
         assert_eq!(
             media(&response).clone().into_frames().count(),
@@ -1067,7 +1187,7 @@ mod tests {
         write(&lease, initialization(0, 1));
         write_segment(&lease, 0, 0, 0);
 
-        let error = origin
+        let failure = origin
             .serve(
                 &stream_id(),
                 video_playlist(
@@ -1078,7 +1198,13 @@ mod tests {
             .await
             .expect_err("the publisher never produced it");
 
-        assert_eq!(error, DeliveryError::Unsatisfied);
+        assert_eq!(failure.error, DeliveryError::Unsatisfied);
+        assert_eq!(
+            failure.cache_control,
+            CacheControl::revalidate(),
+            "a deadline the origin missed once must not be pinned across a CDN \
+             for every viewer behind it"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1101,7 +1227,8 @@ mod tests {
                     video_playlist(BlockingReload::from_directives(Some(99), None).unwrap())
                 )
                 .await
-                .unwrap_err(),
+                .unwrap_err()
+                .error,
             DeliveryError::InvalidDirective(_)
         ));
     }
@@ -1160,9 +1287,66 @@ mod tests {
                     fetch(Resource::Part(RenditionId(0), PartId(1_000), CMAF))
                 )
                 .await
-                .unwrap_err(),
+                .unwrap_err()
+                .error,
             DeliveryError::Unsatisfied,
             "a part far beyond the hint is still a wait, bounded by the deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_playlist_naming_no_rendition_is_paced_by_the_widest_one_it_points_at() {
+        let store = StreamStore::default();
+        let origin = origin(&store);
+        // Two seconds of video against six of audio: a multivariant playlist
+        // reusable for half of the *shorter* cadence would still be describing
+        // the audio rendition long after the video one moved on.
+        let _lease = lease(&store, vec![video_with_cadence(0, 2, 1), audio(1)]);
+
+        let response = origin
+            .serve(&stream_id(), fetch(Resource::Multivariant))
+            .await
+            .expect("a presentation with a topology is servable");
+
+        assert_eq!(
+            response.cache_control,
+            CacheControlPolicy::default().playlist(Some(Duration::from_secs(6)), false)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_directive_makes_a_playlist_reusable_far_longer_than_the_live_edge_is() {
+        let store = StreamStore::default();
+        let origin = origin(&store);
+        let lease = lease(&store, vec![video(0)]);
+        write(&lease, initialization(0, 1));
+        write_segment(&lease, 0, 0, 0);
+        let policy = CacheControlPolicy::default();
+
+        let edge = origin
+            .serve(&stream_id(), video_playlist(None))
+            .await
+            .expect("the playlist names media");
+        let position = origin
+            .serve(
+                &stream_id(),
+                video_playlist(BlockingReload::from_directives(Some(0), None).unwrap()),
+            )
+            .await
+            .expect("the requested position is already published");
+
+        assert_eq!(
+            edge.cache_control,
+            policy.playlist(Some(Duration::from_secs(6)), false)
+        );
+        assert_eq!(
+            position.cache_control,
+            policy.playlist(Some(Duration::from_secs(6)), true)
+        );
+        assert!(
+            position.cache_control.max_age > edge.cache_control.max_age,
+            "`_HLS_msn` is part of the URL, so the same bytes stay the right \
+             answer to it while a bare playlist URL means the moving edge"
         );
     }
 
@@ -1186,7 +1370,7 @@ mod tests {
             .expect("the header is retained");
 
         assert_eq!(response.content_type, "video/mp4");
-        assert_eq!(response.caching, Caching::Immutable);
+        assert_eq!(response.cache_control, media_cache_control());
     }
 }
 

@@ -191,9 +191,7 @@ fn configure(lease: &StreamLease, rendition: u32, chunked: bool) {
 fn fractional_playlist_duration_policy_controls_the_visible_window() {
     let mut limits = limits();
     limits.retention.minimum_playlist_segments = 0;
-    limits.retention.minimum_playlist_duration = DurationRule::MultipleOfTarget(
-        TargetDurationMultiple::new(3, 2).expect("denominator is nonzero"),
-    );
+    limits.retention.minimum_playlist_duration = TargetDurationMultiple::new(3, nz::u32!(2)).into();
     let store = StreamStore::new(limits);
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);

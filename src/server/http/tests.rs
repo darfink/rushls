@@ -124,7 +124,7 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn a_playlist_is_served_with_its_media_type_and_no_caching() {
+async fn a_playlist_is_served_with_its_media_type_and_half_a_target_duration() {
     let harness = Harness::start().await;
     let lease = lease(&harness.store, vec![video(0)]);
     write(&lease, initialization(0, 1));
@@ -137,7 +137,12 @@ async fn a_playlist_is_served_with_its_media_type_and_no_caching() {
         reply.header("content-type"),
         Some("application/vnd.apple.mpegurl")
     );
-    assert_eq!(reply.header("cache-control"), Some("no-cache"));
+    assert_eq!(
+        reply.header("cache-control"),
+        Some("public, max-age=3"),
+        "a plain reload names the live edge, so it may be reused for half of \
+         the fixture's six-second target duration"
+    );
     assert_eq!(reply.header("access-control-allow-origin"), Some("*"));
     let body = String::from_utf8(reply.body).expect("a playlist is text");
     assert!(body.starts_with("#EXTM3U\n"));
@@ -174,7 +179,7 @@ async fn a_segment_is_immutable_and_carries_its_true_length() {
     assert_eq!(reply.header("content-type"), Some("video/iso.segment"));
     assert_eq!(
         reply.header("cache-control"),
-        Some("public, max-age=31536000, immutable")
+        Some("public, max-age=36, immutable")
     );
     assert_eq!(reply.header("accept-ranges"), Some("bytes"));
     assert_eq!(
@@ -259,15 +264,24 @@ async fn unknown_resources_and_bad_directives_are_told_apart() {
     write(&lease, initialization(0, 1));
     write_segment(&lease, 0, 0, 0);
 
-    for (target, expected) in [
-        ("/nobody/here/index.m3u8", 404),
-        ("/live/camera/9/video.m3u8", 404),
-        ("/live/camera/0/segment/999.m4s", 404),
-        ("/live/camera/0/video.m3u8?_HLS_part=2", 400),
-        ("/live/camera/0/video.m3u8?_HLS_msn=9999", 400),
+    // Absence is worth remembering, and a directive naming it is worth
+    // remembering longer; a malformed request is the client's to fix and is
+    // never cached for anyone else.
+    for (target, expected, caching) in [
+        ("/nobody/here/index.m3u8", 404, "public, max-age=6"),
+        ("/live/camera/9/video.m3u8", 404, "public, max-age=6"),
+        ("/live/camera/0/segment/999.m4s", 404, "public, max-age=6"),
+        (
+            "/live/camera/9/video.m3u8?_HLS_msn=1",
+            404,
+            "public, max-age=24",
+        ),
+        ("/live/camera/0/video.m3u8?_HLS_part=2", 400, "no-cache"),
+        ("/live/camera/0/video.m3u8?_HLS_msn=9999", 400, "no-cache"),
     ] {
         let reply = request(harness.address, "GET", target, &[]).await;
         assert_eq!(reply.status, expected, "{target}");
+        assert_eq!(reply.header("cache-control"), Some(caching), "{target}");
     }
 
     let rejected = request(harness.address, "POST", "/live/camera/index.m3u8", &[]).await;
@@ -303,6 +317,12 @@ async fn a_blocking_reload_holds_the_connection_until_its_part_arrives() {
     let reply = held.await.expect("the request task ran");
 
     assert_eq!(reply.status, 200);
+    assert_eq!(
+        reply.header("cache-control"),
+        Some("public, max-age=36"),
+        "the directive is part of the URL, so these bytes answer one exact \
+         playlist state and can never become the wrong answer to it"
+    );
     let body = String::from_utf8(reply.body).expect("a playlist is text");
     assert!(
         body.contains("URI=\"part/8.m4s\""),
@@ -344,6 +364,12 @@ async fn an_unsatisfiable_wait_ends_in_503_with_a_retry_hint() {
         Some("1"),
         "a deadline passing means the origin fell behind, not that the stream \
          is over, so the client is told to come back"
+    );
+    assert_eq!(
+        reply.header("cache-control"),
+        Some("no-cache"),
+        "coming back is pointless if a cache answers every retry with the \
+         same failure"
     );
 
     harness.stop().await;

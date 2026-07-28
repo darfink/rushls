@@ -18,13 +18,10 @@ pub struct TargetDurationMultiple {
 }
 
 impl TargetDurationMultiple {
-    pub const fn new(numerator: u32, denominator: u32) -> Option<Self> {
-        match NonZeroU32::new(denominator) {
-            Some(denominator) => Some(Self {
-                numerator,
-                denominator,
-            }),
-            None => None,
+    pub const fn new(numerator: u32, denominator: NonZeroU32) -> Self {
+        Self {
+            numerator,
+            denominator,
         }
     }
 
@@ -59,7 +56,7 @@ impl TargetDurationMultiple {
     }
 }
 
-/// A retention duration independent of, or relative to, the target duration.
+/// A duration independent of, or relative to, the target duration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DurationRule {
     Fixed(Duration),
@@ -67,11 +64,28 @@ pub enum DurationRule {
 }
 
 impl DurationRule {
-    fn resolve(self, target: Duration) -> Duration {
+    /// Sizes this rule against the target duration it is relative to.
+    ///
+    /// Public because response freshness is expressed in the same terms as
+    /// retention: a lifetime the protocol paces by target durations, or a flat
+    /// one a deployment pins for its own reasons.
+    pub fn resolve(self, target: Duration) -> Duration {
         match self {
             Self::Fixed(duration) => duration,
             Self::MultipleOfTarget(multiple) => multiple.apply(target),
         }
+    }
+}
+
+impl From<Duration> for DurationRule {
+    fn from(duration: Duration) -> Self {
+        DurationRule::Fixed(duration)
+    }
+}
+
+impl From<TargetDurationMultiple> for DurationRule {
+    fn from(multiple: TargetDurationMultiple) -> Self {
+        DurationRule::MultipleOfTarget(multiple)
     }
 }
 
@@ -132,13 +146,9 @@ impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
             minimum_playlist_segments: DEFAULT_VISIBLE_SEGMENTS,
-            minimum_playlist_duration: DurationRule::MultipleOfTarget(
-                TargetDurationMultiple::integer(3),
-            ),
-            part_tag_retention: DurationRule::MultipleOfTarget(TargetDurationMultiple::integer(3)),
-            part_fetch_grace_period: DurationRule::MultipleOfTarget(
-                TargetDurationMultiple::integer(3),
-            ),
+            minimum_playlist_duration: TargetDurationMultiple::integer(3).into(),
+            part_tag_retention: TargetDurationMultiple::integer(3).into(),
+            part_fetch_grace_period: TargetDurationMultiple::integer(3).into(),
             segment_fetch_grace_period: None,
             maximum_payload_bytes: DEFAULT_MAXIMUM_RETAINED_PAYLOAD_BYTES,
             maximum_parts: DEFAULT_MAXIMUM_RETAINED_PARTS,
@@ -160,8 +170,8 @@ mod tests {
 
     #[test]
     fn fractional_target_duration_rules_are_exact_and_round_up() {
-        let one_and_a_half = TargetDurationMultiple::new(3, 2).expect("denominator is nonzero");
-        let rule = DurationRule::MultipleOfTarget(one_and_a_half);
+        let one_and_a_half = TargetDurationMultiple::new(3, nz::u32!(2));
+        let rule: DurationRule = one_and_a_half.into();
 
         assert_eq!(rule.resolve(Duration::from_secs(6)), Duration::from_secs(9));
         assert_eq!(
@@ -175,9 +185,7 @@ mod tests {
     fn a_segment_fetch_grace_override_starts_when_the_tag_is_removed() {
         let removed_at = Instant::now();
         let policy = RetentionPolicy {
-            segment_fetch_grace_period: Some(DurationRule::MultipleOfTarget(
-                TargetDurationMultiple::new(3, 2).expect("denominator is nonzero"),
-            )),
+            segment_fetch_grace_period: Some(TargetDurationMultiple::new(3, nz::u32!(2)).into()),
             ..RetentionPolicy::default()
         };
 

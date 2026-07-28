@@ -1,5 +1,10 @@
 //! Reusing a rendered playlist across the viewers who would get the same one.
 //!
+//! Bytes this origin holds, keyed by the stream state that produced them. What
+//! caches *downstream* are permitted to hold is
+//! [`cache_control`](super::cache_control), which decides a lifetime rather
+//! than holding anything; the two share no state.
+//!
 //! Projection is a pure function of immutable snapshots, so two requests
 //! arriving between two publications must produce identical bytes. Rendering
 //! them separately is pure waste — and at viewer counts where it matters, it is

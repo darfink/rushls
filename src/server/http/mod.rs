@@ -34,22 +34,22 @@ use axum::{
 };
 use tokio::net::TcpListener;
 
-use crate::delivery::hls::serve::{
-    Body as DeliveryBody, Caching, DeliveryError, MediaBody, Origin, Response as DeliveryResponse,
+use crate::delivery::hls::{
+    cache_control::CacheControl,
+    serve::{
+        Body as DeliveryBody, DeliveryError, DeliveryFailure, MediaBody, Origin,
+        Response as DeliveryResponse,
+    },
 };
 
 use body::{RangeOutcome, StoredMediaBody, parse_range};
 use route::route;
 
-/// How long a client may reuse a response.
+/// What a response with no reusable lifetime says.
 ///
-/// Media is addressed by durable identity, so its bytes can never change under
-/// a URL and it is cacheable for as long as anyone will keep it. A playlist
-/// describes a live edge and is stale the instant it is written; `no-cache`
-/// rather than `no-store` because a cache revalidating is useful and a cache
+/// `no-cache` rather than `no-store` because revalidating is useful and a cache
 /// holding a copy for the blocked-reload round trip is exactly the point.
-const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
-const LIVE_CACHE: &str = "no-cache";
+const REVALIDATE: &str = "no-cache";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HttpConfig {
@@ -126,11 +126,11 @@ async fn handle(
 
     let routed = match route(uri.path(), query.as_deref()) {
         Ok(routed) => routed,
-        Err(error) => return error_response(error, &service.config),
+        Err(error) => return error_response(service.origin.unrouted(error), &service.config),
     };
     let response = match service.origin.serve(&routed.stream, routed.request).await {
         Ok(response) => response,
-        Err(error) => return error_response(error, &service.config),
+        Err(failure) => return error_response(failure, &service.config),
     };
 
     let range = headers
@@ -145,10 +145,7 @@ async fn handle(
 
 fn into_http(response: DeliveryResponse, range: Option<&str>) -> Result<Response, StatusCode> {
     let content_type = HeaderValue::from_static(response.content_type);
-    let cache = HeaderValue::from_static(match response.caching {
-        Caching::Immutable => IMMUTABLE_CACHE,
-        Caching::Live => LIVE_CACHE,
-    });
+    let cache = response.cache_control.into();
 
     match response.body {
         DeliveryBody::Playlist(bytes) => Ok((
@@ -214,14 +211,34 @@ fn media_response(
     response
 }
 
+/// Writes a resolved lifetime as the header that communicates it.
+///
+/// Whole seconds is all the header carries, so a lifetime shorter than one
+/// becomes a revalidation. Truncating errs toward asking again sooner than
+/// policy allows rather than later, which is the safe direction for a live
+/// edge.
+impl From<CacheControl> for HeaderValue {
+    fn from(cache_control: CacheControl) -> Self {
+        let seconds = cache_control.max_age.as_secs();
+        if seconds == 0 {
+            return Self::from_static(REVALIDATE);
+        }
+        let mut value = format!("public, max-age={seconds}");
+        if cache_control.immutable {
+            value.push_str(", immutable");
+        }
+        Self::try_from(value).unwrap_or(Self::from_static(REVALIDATE))
+    }
+}
+
 /// Maps a delivery failure onto the status that describes it.
 ///
 /// The distinctions carry real information for an operator reading logs: a
 /// directive naming an impossible position is the client's mistake (400), a
 /// deadline passing without the media arriving is the origin failing to keep up
 /// (503), and an unknown resource is neither.
-fn error_response(error: DeliveryError, config: &HttpConfig) -> Response {
-    let status = match error {
+fn error_response(failure: DeliveryFailure, config: &HttpConfig) -> Response {
+    let status = match failure.error {
         DeliveryError::UnknownStream
         | DeliveryError::UnknownRendition
         | DeliveryError::UnknownResource => StatusCode::NOT_FOUND,
@@ -229,12 +246,12 @@ fn error_response(error: DeliveryError, config: &HttpConfig) -> Response {
         DeliveryError::Unsatisfied => StatusCode::SERVICE_UNAVAILABLE,
         DeliveryError::Projection => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    let mut response = (status, error.to_string()).into_response();
-    if matches!(error, DeliveryError::Unsatisfied) {
+    let mut response = (status, failure.error.to_string()).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, failure.cache_control.into());
+    if matches!(failure.error, DeliveryError::Unsatisfied) {
         // Tells a client to come back rather than to give up on the stream.
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     }
     with_common_headers(response, config)
 }
