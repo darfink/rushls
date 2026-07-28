@@ -79,9 +79,14 @@ pub enum TimelineCalibrationError {
 ///
 /// This runs on discovery metadata alone, so it is a planning step rather than
 /// part of pre-roll: it needs no media to flow. The origin is the *earliest*
-/// presented track start. Tracks that begin later retain a positive offset,
-/// which a pass-through MP4 muxer represents with an empty edit instead of
-/// clipping media from the earlier track.
+/// audio/video start. Tracks that begin later retain a positive offset, which
+/// a pass-through MP4 muxer represents with an empty edit instead of clipping
+/// media from the earlier track.
+///
+/// Subtitle cues do not establish the publication epoch. They are sparse,
+/// frequently have no discovery-time `start_time` on a live input, and the
+/// segmentation planner already projects their windows onto the audio/video
+/// timeline without requiring cue cadence.
 pub fn calibrate(
     presentation: &PresentationPlan,
 ) -> Result<TimelineCalibration, TimelineCalibrationError> {
@@ -91,11 +96,14 @@ pub fn calibrate(
     let authority = tracks
         .iter()
         .find(|track| track.kind() == MediaKind::Video)
-        .or_else(|| tracks.first())
+        .or_else(|| tracks.iter().find(|track| track.kind() == MediaKind::Audio))
         .ok_or(TimelineCalibrationError::NoTimelineAuthority)?;
 
     let mut shared_origin = TickTimestamp::MAX;
-    for track in tracks {
+    for track in tracks
+        .iter()
+        .filter(|track| track.kind() != MediaKind::Subtitle)
+    {
         let first_pts = track
             .first_pts
             .ok_or(TimelineCalibrationError::NoUsableTimestamp { track_id: track.id })?;
@@ -305,6 +313,24 @@ mod tests {
             Err(TimelineCalibrationError::NoUsableTimestamp {
                 track_id: TrackId(1),
             })
+        );
+    }
+
+    #[test]
+    fn a_sparse_subtitle_without_a_declared_start_uses_the_media_origin() {
+        let timebase = Timebase::new(nz::u32!(1), nz::u32!(1_000));
+        let plan = presentation(vec![
+            track(0, MediaKind::Video, timebase, Some(0)),
+            track(1, MediaKind::Audio, timebase, Some(23)),
+            track(2, MediaKind::Subtitle, timebase, None),
+        ]);
+
+        let calibration = calibrate(&plan).expect("A/V establishes the publication epoch");
+
+        assert_eq!(calibration.timing_authority, TrackId(0));
+        assert!(
+            calibration.tracks.iter().all(|track| track.origin_pts == 0),
+            "the later audio and sparse subtitle retain offsets from video zero"
         );
     }
 }
