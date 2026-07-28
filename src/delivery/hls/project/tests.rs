@@ -346,6 +346,20 @@ fn a_variant_advertises_what_playing_it_actually_costs() {
 }
 
 #[test]
+fn a_multivariant_playlist_preserves_canonical_language_metadata() {
+    let store = StreamStore::default();
+    let mut french = audio(1);
+    french.language = Some(Arc::from("fr-CA"));
+    let lease = lease(&store, vec![video(0), french]);
+
+    let rendered = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())
+        .expect("the presentation projects")
+        .expect("an attached publication has a topology");
+
+    assert!(rendered.contains("LANGUAGE=\"fr-CA\""));
+}
+
+#[test]
 fn an_unmeasured_presentation_is_servable_immediately() {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0), audio(1)]);

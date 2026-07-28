@@ -9,6 +9,7 @@ use std::{future::Future, pin::Pin};
 mod appender;
 mod ids;
 mod instant;
+mod language;
 mod payload;
 mod rfc6381;
 mod time;

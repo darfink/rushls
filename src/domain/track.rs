@@ -214,7 +214,7 @@ pub enum TrackCatalogError {
 }
 
 impl TrackCatalog {
-    pub fn new(tracks: Vec<DiscoveredTrack>) -> Result<Self, TrackCatalogError> {
+    pub fn new(mut tracks: Vec<DiscoveredTrack>) -> Result<Self, TrackCatalogError> {
         if tracks.is_empty() {
             return Err(TrackCatalogError::Empty);
         }
@@ -226,6 +226,15 @@ impl TrackCatalog {
             {
                 return Err(TrackCatalogError::DuplicateId(track.id));
             }
+        }
+
+        // Container-specific spellings converge here so muxers and manifest
+        // formats share one representation without each normalizing metadata.
+        for track in &mut tracks {
+            track.language = track
+                .language
+                .take()
+                .and_then(super::language::canonical_language_tag);
         }
 
         Ok(Self { tracks })
@@ -296,6 +305,19 @@ mod tests {
                 video: 1,
             }
         );
+    }
+
+    #[test]
+    fn catalog_canonicalizes_or_omits_language_metadata() {
+        let mut french = track(0, MediaKind::Audio);
+        french.language = Some("fre-ca".into());
+        let mut unknown = track(1, MediaKind::Audio);
+        unknown.language = Some("zzz-a-language".into());
+
+        let catalog = TrackCatalog::new(vec![french, unknown]).expect("catalog is valid");
+
+        assert_eq!(catalog.tracks()[0].language.as_deref(), Some("fr-ca"));
+        assert_eq!(catalog.tracks()[1].language, None);
     }
 
     #[test]

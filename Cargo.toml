@@ -8,6 +8,7 @@ arc-swap = "1"
 derive_more = { version = "2", features = ["debug", "display"] }
 bytes = "1.12.1"
 ffmpeg-sys-next = { version = "8.1.0", default-features = false, features = ["avformat"] }
+isolang = { version = "2.4.0", default-features = false }
 nz = "0.4"
 parking_lot = "0.12"
 scuffle-rtmp = "0.2.3"
