@@ -2,7 +2,11 @@
 
 mod ffi;
 
-use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{
+    num::{NonZero, NonZeroUsize},
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::{
     domain::{
@@ -109,7 +113,12 @@ struct SegmentCursor {
     /// Media accumulated by the chunks already emitted for this segment.
     filled: TickDuration,
     next_boundary: TickTimestamp,
-    next_part_boundary: TickTimestamp,
+    /// Presentable access units accumulated into the open chunk.
+    ///
+    /// Parts are counted rather than scheduled because HLS refuses a part
+    /// longer than the advertised `PART-TARGET`, and a target the plan derived
+    /// from an access-unit count is one a count can never exceed.
+    part_access_units: u32,
 }
 
 impl SegmentCursor {
@@ -122,16 +131,13 @@ impl SegmentCursor {
             .first_segment_boundary_pts
             .checked_sub(plan.presentation_origin_pts)
             .ok_or_else(|| invalid("first segment boundary rebasing overflowed"))?;
-        let next_part_boundary = start
-            .checked_add_unsigned(plan.part_duration.get())
-            .ok_or_else(|| invalid("first part boundary overflowed"))?;
         Ok(Self {
             id: 0,
             chunk_index: 0,
             start,
             filled: 0,
             next_boundary,
-            next_part_boundary,
+            part_access_units: 0,
         })
     }
 
@@ -144,36 +150,22 @@ impl SegmentCursor {
 
     /// Opens the next segment at the boundary the closed one actually reached.
     ///
-    /// The grid follows the achieved boundary, not an absolute schedule. Under
-    /// [`SegmentBoundaryPolicy::ExtendToRandomAccess`] that means an extension
-    /// **persists**: waiting for a late keyframe shifts every later boundary by
-    /// the same amount rather than the next segment absorbing it. Each segment
-    /// therefore stays close to the planned length, while the grid can walk
-    /// away from where planning put it.
+    /// Planned boundaries remain on this track's absolute locked schedule.
     ///
-    /// The alternative — targets computed as `first_boundary + k × period` —
-    /// keeps the grid fixed and lets one segment come out short instead. That
-    /// is what most packagers do, because it stops renditions of one stream
-    /// diverging after a single extension. It is worth revisiting if this ever
-    /// packages more than one rendition per source track; with one output per
-    /// track there is nothing to diverge from.
-    ///
-    /// Either way the boundary stays on the access-unit grid: the achieved
-    /// boundary is an access-unit start, and the period is a whole number of
-    /// access units because
-    /// [`TrackSegmentationPlan::segmentation_origin_pts`] is grid-aligned.
+    /// Re-anchoring on an achieved cut would accumulate an occasional late
+    /// audio unit or video keyframe into permanent drift. Keeping the planned
+    /// schedule makes the following segment absorb that bounded quantization.
     fn advance(&mut self, plan: &TrackSegmentationPlan) -> Result<(), MuxError> {
         let boundary = self.filled_to()?;
+        let next_boundary = self
+            .next_boundary
+            .checked_add_unsigned(plan.segment_duration.get())
+            .ok_or_else(|| mux_error("next segment boundary overflowed"))?;
         self.id = self.id.saturating_add(1);
         self.chunk_index = 0;
         self.start = boundary;
         self.filled = 0;
-        self.next_boundary = boundary
-            .checked_add_unsigned(plan.segment_duration.get())
-            .ok_or_else(|| mux_error("next segment boundary overflowed"))?;
-        self.next_part_boundary = boundary
-            .checked_add_unsigned(plan.part_duration.get())
-            .ok_or_else(|| mux_error("next part boundary overflowed"))?;
+        self.next_boundary = next_boundary;
         Ok(())
     }
 }
@@ -288,16 +280,11 @@ impl CmafTrack {
                 duration: self.segment.filled,
             }));
             self.segment.advance(&self.plan)?;
-        } else if presented_pts >= self.segment.next_part_boundary && self.fragment.is_some() {
+        } else if self.segment.part_access_units >= self.plan.part_access_units.get()
+            && self.fragment.is_some()
+        {
             self.close_fragment_at(presented_pts);
             self.flush_fragment(out)?;
-            while self.segment.next_part_boundary <= presented_pts {
-                self.segment.next_part_boundary = self
-                    .segment
-                    .next_part_boundary
-                    .checked_add_unsigned(self.plan.part_duration.get())
-                    .ok_or_else(|| mux_error("next part boundary overflowed"))?;
-            }
         }
 
         let end = presented_pts
@@ -313,6 +300,9 @@ impl CmafTrack {
                 });
             }
         }
+        // Counted after the sample joins the chunk, so the count always
+        // describes what the open chunk holds.
+        self.segment.part_access_units = self.segment.part_access_units.saturating_add(1);
         self.output
             .write(&sample, pts, dts)
             .map_err(|error| mux_error(error.to_string()))
@@ -351,12 +341,9 @@ impl CmafTrack {
             }
         };
         if self.kind != MediaKind::Video {
-            if !exact && maximum_extension.is_none() {
-                return Err(mux_error(format!(
-                    "{} missed its planned segment boundary",
-                    self.track_id
-                )));
-            }
+            // Variable-duration audio may not repeat its observed grid exactly.
+            // Cut at the first AU on or after the planned instant; the plan's
+            // boundary tolerance bounds the resulting quantization.
             return Ok(true);
         }
         match (maximum_extension, random_access) {
@@ -461,6 +448,7 @@ impl CmafTrack {
             .chunk_index
             .checked_add(1)
             .ok_or_else(|| mux_error("chunk index overflowed"))?;
+        self.segment.part_access_units = 0;
         self.segment.filled = self
             .segment
             .filled
@@ -540,15 +528,22 @@ fn packaged_rendition(
         },
         MediaParameters::Subtitle => return Err(invalid("subtitle tracks require WebVTT output")),
     };
-    // The advertised maximum is the same limit `require_within_extension`
-    // enforces, computed the same way, so the two cannot drift apart.
-    let maximum_segment_duration = match policy {
-        SegmentBoundaryPolicy::Strict => plan.segment_duration,
-        SegmentBoundaryPolicy::ExtendToRandomAccess { maximum_extension } => plan
-            .segment_duration
+    let first_segment_target = duration_since(
+        plan.first_segment_boundary_pts,
+        plan.segmentation_origin_pts,
+    )
+    .ok_or_else(|| invalid("first segment target is invalid"))?;
+    let maximum_target = first_segment_target.max(plan.segment_duration.get());
+    let mut maximum_segment_duration = maximum_target
+        .checked_add(plan.boundary_tolerance)
+        .ok_or_else(|| invalid("maximum segment duration overflowed"))?;
+    if let SegmentBoundaryPolicy::ExtendToRandomAccess { maximum_extension } = policy {
+        maximum_segment_duration = maximum_segment_duration
             .checked_add(plan.timebase.duration_to_ticks_floor(maximum_extension))
-            .ok_or_else(|| invalid("maximum segment duration overflowed"))?,
-    };
+            .ok_or_else(|| invalid("maximum segment duration overflowed"))?;
+    }
+    let maximum_segment_duration = NonZero::new(maximum_segment_duration)
+        .ok_or_else(|| invalid("maximum segment duration is zero"))?;
     let fallback_name = format!("{:?} {}", track.kind(), rendition_id.0 + 1);
     Ok(PackagedRendition {
         packaging_rendition_id: rendition_id,
@@ -705,7 +700,9 @@ mod tests {
                 segmentation_origin_pts: 0,
                 first_segment_boundary_pts: 16_384,
                 segment_duration: nz::u64!(16_384),
+                part_access_units: nz::u32!(1),
                 part_duration: nz::u64!(8_192),
+                boundary_tolerance: 0,
             }],
         )
         .expect("fixture segmentation validates");
@@ -752,7 +749,9 @@ mod tests {
                 first_segment_boundary_pts: segmentation_origin_pts
                     + i64::try_from(segment_duration).expect("fixture timing fits"),
                 segment_duration: NonZero::new(segment_duration).expect("nonzero"),
+                part_access_units: nz::u32!(2),
                 part_duration: NonZero::new(2 * AAC_FRAME_SAMPLES).expect("nonzero"),
+                boundary_tolerance: 0,
             }],
         )
         .expect("audio segmentation validates");
@@ -1002,7 +1001,9 @@ mod tests {
                     segmentation_origin_pts: 0,
                     first_segment_boundary_pts: 16_384,
                     segment_duration: nz::u64!(16_384),
+                    part_access_units: nz::u32!(1),
                     part_duration: nz::u64!(8_192),
+                    boundary_tolerance: 0,
                 })
                 .collect(),
         )
@@ -1046,11 +1047,8 @@ mod tests {
 
     #[test]
     fn audio_segments_repeat_on_the_access_unit_grid() {
-        // No audio track was packaged anywhere until this test, which is what
-        // let a boundary period that drifts off the access-unit grid survive.
-        // AAC frames are 1024 samples, so a segment period must be a whole
-        // number of them or the second boundary lands between frames and
-        // strict cutting has nothing to cut on.
+        // Exact AAC-aligned schedules should retain exact starts and durations;
+        // the absolute-schedule test below covers the non-aligned case.
         let sink = event_sink();
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
         let frames_per_segment = 16_u64;
@@ -1072,7 +1070,9 @@ mod tests {
                 first_segment_boundary_pts: i64::try_from(segment_ticks)
                     .expect("segment ticks fit"),
                 segment_duration: NonZero::new(segment_ticks).expect("nonzero"),
+                part_access_units: nz::u32!(4),
                 part_duration: NonZero::new(AAC_FRAME_SAMPLES * 4).expect("nonzero"),
+                boundary_tolerance: 0,
             }],
         )
         .expect("audio segmentation validates");
@@ -1115,6 +1115,211 @@ mod tests {
                 "segment {index} spans exactly the planned period"
             );
         }
+    }
+
+    /// Drives one audio track and reports `(part durations, PART-TARGET)`.
+    ///
+    /// Access-unit durations are supplied per frame so a jittery cadence can be
+    /// exercised alongside a constant one.
+    fn packaged_parts(
+        access_units: &[u64],
+        part_access_units: NonZero<u32>,
+        part_target: NonZero<u64>,
+        segment_ticks: u64,
+    ) -> (Vec<u64>, u64) {
+        let sink = event_sink();
+        let timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+        let audio = TrackBuilder::new(0, MediaKind::Audio)
+            .timebase(timebase)
+            .codec(crate::domain::Codec::Aac)
+            .codec_extradata(AAC_EXTRADATA.to_vec())
+            .build();
+        let input = validate(&catalog(vec![audio]), &StreamPolicy::permissive())
+            .expect("audio fixture validates");
+        let segmentation = SegmentationPlan::new(
+            &input,
+            vec![TrackSegmentationPlan {
+                track_id: TrackId(0),
+                timebase,
+                presentation_origin_pts: 0,
+                segmentation_origin_pts: 0,
+                first_segment_boundary_pts: i64::try_from(segment_ticks).expect("ticks fit"),
+                segment_duration: NonZero::new(segment_ticks).expect("nonzero"),
+                part_access_units,
+                part_duration: part_target,
+                boundary_tolerance: access_units.iter().copied().max().unwrap_or(0),
+            }],
+        )
+        .expect("audio segmentation validates");
+        let mut started = PassThroughMuxerFactory::default()
+            .start(MuxerStartRequest {
+                presentation: &input,
+                segmentation: &segmentation,
+                time_anchor: SystemTime::UNIX_EPOCH,
+                events: &sink,
+            })
+            .expect("an audio CMAF output starts");
+
+        let mut media = Vec::new();
+        let mut pts = 0_i64;
+        for duration in access_units {
+            let mut sample = audio_sample(pts);
+            if let NormalizedSample::Audio(sample) = &mut sample {
+                sample.duration = *duration;
+            }
+            started
+                .muxer
+                .push(sample, &mut media)
+                .unwrap_or_else(|error| panic!("audio frame at {pts} packages: {error}"));
+            pts += i64::try_from(*duration).expect("fixture duration fits");
+        }
+
+        let durations = media
+            .iter()
+            .filter_map(|event| match event {
+                PackagedMedia::Chunk(chunk) => Some(chunk.duration),
+                _ => None,
+            })
+            .collect();
+        (
+            durations,
+            started.presentation.renditions[0]
+                .config
+                .chunk_target
+                .expect("a CMAF audio rendition publishes parts")
+                .get(),
+        )
+    }
+
+    #[test]
+    fn every_non_final_part_lands_between_85_and_100_percent_of_the_target() {
+        // The rule delivery enforces, and the reason parts are counted in
+        // access units rather than scheduled on ticks: a tick schedule cuts at
+        // the first unit past the planned instant, so it can overshoot the
+        // advertised target by a whole access unit and be refused.
+        let uniform = vec![AAC_FRAME_SAMPLES; 24];
+        // A three-unit jitter cycle against a four-unit part, so the two stay
+        // permanently out of phase and consecutive parts genuinely differ. A
+        // target derived from the mean would be exceeded by every window that
+        // happens to hold only one short unit.
+        let jittery: Vec<u64> = (0..24)
+            .map(|index| if index % 3 == 0 { 900 } else { 1_000 })
+            .collect();
+
+        for (access_units, target, expected) in [
+            (uniform, nz::u64!(4 * AAC_FRAME_SAMPLES), vec![4_096_u64; 5]),
+            // Alternating windows, and the wider one is what the target has to
+            // cover — 3900 against a 4000 target, with 3800 still at 95%.
+            (
+                jittery,
+                nz::u64!(4_000),
+                vec![3_800, 3_900, 3_900, 3_800, 3_900],
+            ),
+        ] {
+            let (parts, part_target) =
+                packaged_parts(&access_units, nz::u32!(4), target, 24 * 1_024);
+            let minimum = part_target * 85 / 100;
+
+            assert_eq!(parts, expected);
+            // The last part is the one a segment boundary or the end of input
+            // truncated, and HLS exempts exactly that one from the floor.
+            for (index, duration) in parts[..parts.len() - 1].iter().enumerate() {
+                assert!(
+                    *duration <= part_target,
+                    "part {index} of {duration} exceeds the advertised \
+                     PART-TARGET of {part_target}"
+                );
+                assert!(
+                    *duration >= minimum,
+                    "part {index} of {duration} is below the 85% floor of \
+                     {minimum} for a PART-TARGET of {part_target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn part_counting_restarts_at_every_segment_boundary() {
+        // Five units to a segment against a four-unit part: each segment ends
+        // with a short part, and the next segment's first part must be a full
+        // four units rather than continuing the previous count.
+        let (parts, _) = packaged_parts(
+            &[AAC_FRAME_SAMPLES; 15],
+            nz::u32!(4),
+            nz::u64!(4 * AAC_FRAME_SAMPLES),
+            5 * AAC_FRAME_SAMPLES,
+        );
+
+        assert_eq!(
+            parts,
+            [
+                4 * AAC_FRAME_SAMPLES,
+                AAC_FRAME_SAMPLES,
+                4 * AAC_FRAME_SAMPLES,
+                AAC_FRAME_SAMPLES,
+                4 * AAC_FRAME_SAMPLES,
+            ]
+        );
+    }
+
+    #[test]
+    fn audio_boundary_quantization_does_not_move_the_planned_grid() {
+        let sink = event_sink();
+        let timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+        let audio = TrackBuilder::new(0, MediaKind::Audio)
+            .timebase(timebase)
+            .codec(crate::domain::Codec::Aac)
+            .codec_extradata(AAC_EXTRADATA.to_vec())
+            .build();
+        let input = validate(&catalog(vec![audio]), &StreamPolicy::permissive())
+            .expect("audio fixture validates");
+        let segmentation = SegmentationPlan::new(
+            &input,
+            vec![TrackSegmentationPlan {
+                track_id: TrackId(0),
+                timebase,
+                presentation_origin_pts: 0,
+                segmentation_origin_pts: 0,
+                first_segment_boundary_pts: 1_900,
+                segment_duration: nz::u64!(1_500),
+                part_access_units: nz::u32!(1),
+                part_duration: nz::u64!(500),
+                boundary_tolerance: AAC_FRAME_SAMPLES,
+            }],
+        )
+        .expect("non-grid audio schedule validates");
+        let mut started = PassThroughMuxerFactory::default()
+            .start(MuxerStartRequest {
+                presentation: &input,
+                segmentation: &segmentation,
+                time_anchor: SystemTime::UNIX_EPOCH,
+                events: &sink,
+            })
+            .expect("an audio CMAF output starts");
+
+        let mut media = Vec::new();
+        for frame in 0..=5 {
+            let pts = i64::try_from(frame * AAC_FRAME_SAMPLES).expect("fixture PTS fits");
+            started
+                .muxer
+                .push(audio_sample(pts), &mut media)
+                .unwrap_or_else(|error| panic!("audio frame at {pts} packages: {error}"));
+        }
+
+        let completions: Vec<_> = media
+            .iter()
+            .filter_map(|event| match event {
+                PackagedMedia::SegmentCompleted(completion) => {
+                    Some((completion.media_start, completion.duration))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions,
+            [(0, 2_048), (2_048, 2_048), (4_096, 1_024)],
+            "each cut rounds independently from the absolute 1900 + n*1500 schedule"
+        );
     }
 
     #[tokio::test]
@@ -1334,7 +1539,9 @@ mod tests {
                 segmentation_origin_pts: 0,
                 first_segment_boundary_pts: 16_384,
                 segment_duration: nz::u64!(16_384),
+                part_access_units: nz::u32!(1),
                 part_duration: nz::u64!(8_192),
+                boundary_tolerance: 0,
             }],
         )
         .expect("offset segmentation validates");
@@ -1409,7 +1616,9 @@ mod tests {
                     segmentation_origin_pts: 0,
                     first_segment_boundary_pts: 8 * AAC_FRAME_SAMPLES as i64,
                     segment_duration: NonZero::new(8 * AAC_FRAME_SAMPLES).expect("nonzero"),
+                    part_access_units: nz::u32!(2),
                     part_duration: NonZero::new(2 * AAC_FRAME_SAMPLES).expect("nonzero"),
+                    boundary_tolerance: 0,
                 },
                 TrackSegmentationPlan {
                     track_id: TrackId(1),
@@ -1418,7 +1627,9 @@ mod tests {
                     segmentation_origin_pts: 0,
                     first_segment_boundary_pts: 16_384,
                     segment_duration: nz::u64!(16_384),
+                    part_access_units: nz::u32!(1),
                     part_duration: nz::u64!(8_192),
+                    boundary_tolerance: 0,
                 },
             ],
         )
@@ -1566,7 +1777,9 @@ mod tests {
                 segmentation_origin_pts: 1_000,
                 first_segment_boundary_pts: 17_384,
                 segment_duration: nz::u64!(16_384),
+                part_access_units: nz::u32!(1),
                 part_duration: nz::u64!(8_192),
+                boundary_tolerance: 0,
             }],
         )
         .expect("fixture segmentation validates");
@@ -1777,7 +1990,9 @@ mod tests {
                     segmentation_origin_pts: 0,
                     first_segment_boundary_pts: 180_000,
                     segment_duration: nz::u64!(180_000),
+                    part_access_units: nz::u32!(1),
                     part_duration: nz::u64!(90_000),
+                    boundary_tolerance: 0,
                 },
                 TrackSegmentationPlan {
                     track_id: TrackId(1),
@@ -1786,7 +2001,9 @@ mod tests {
                     segmentation_origin_pts: 0,
                     first_segment_boundary_pts: 180_000,
                     segment_duration: nz::u64!(180_000),
+                    part_access_units: nz::u32!(1),
                     part_duration: nz::u64!(90_000),
+                    boundary_tolerance: 0,
                 },
             ],
         )

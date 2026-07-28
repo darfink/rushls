@@ -3,6 +3,15 @@
 //! Segmentation is delivery-agnostic: the plan describes cadence in each
 //! track's own tick domain and says nothing about playlists. HLS and DASH both
 //! consume it, and the muxer cuts to it.
+//!
+//! # The rule
+//!
+//! Pre-roll observes through the desired duration and chooses the latest
+//! overlapping keyframe interval across every video track. If no compatible
+//! interval exists, it expands the horizon only to the configured hard limit.
+//! Audio snaps that video-prioritized instant to its own access-unit grid, so
+//! codec priming and incompatible tick domains never invent a mid-unit cut.
+//! Each rendition owns its resulting close-but-not-necessarily-equal cadence.
 
 use std::{num::NonZero, time::Duration};
 
@@ -10,16 +19,14 @@ use thiserror::Error;
 
 use crate::{
     domain::{TickDuration, TickTimestamp, Timebase, TrackId},
-    media::{MediaError, PresentationPlan, TimelineCalibrationError},
+    media::{MediaError, PresentationPlan, SampleTimingError, TimelineCalibrationError},
 };
 
-mod boundary;
+mod cadence;
+mod part;
 mod preroll;
 
-pub use boundary::{
-    BoundarySelection, BoundarySelectionError, BoundarySelectionStatus, BoundarySelector,
-    TrackBoundary,
-};
+pub use cadence::CadenceObserver;
 pub use preroll::{Preroll, PrerollRequest, run as run_preroll};
 
 /// What pre-roll may spend before it gives up on a publisher.
@@ -62,15 +69,15 @@ impl PrerollLimits {
 pub struct SegmentationPolicy {
     pub desired_segment_duration: Duration,
     pub desired_part_duration: Duration,
-    pub alignment: BoundaryAlignmentPolicy,
+    pub search: BoundarySearchPolicy,
 }
 
 impl SegmentationPolicy {
-    /// Uses the latest aligned boundary at or before the desired duration.
+    /// Uses the latest compatible video cadence at or before the desired
+    /// duration, extending by at most one more desired-duration window.
     ///
-    /// This is the recommended live default: normally aligned publishers incur
-    /// no extra wait, while incompatible inputs are rejected instead of
-    /// silently increasing latency.
+    /// The desired horizon is still decisive: extension is used only when one
+    /// or more video tracks have not supplied a compatible keyframe cadence.
     pub fn latency_first(
         desired_segment_duration: Duration,
         desired_part_duration: Duration,
@@ -78,47 +85,30 @@ impl SegmentationPolicy {
         Self {
             desired_segment_duration,
             desired_part_duration,
-            alignment: BoundaryAlignmentPolicy::Aligned {
-                search: BoundarySearchPolicy::AtOrBeforeDesired,
+            search: BoundarySearchPolicy::ExtendToNext {
+                maximum_extension: desired_segment_duration,
             },
         }
-    }
-
-    pub fn is_aligned(self) -> bool {
-        matches!(self.alignment, BoundaryAlignmentPolicy::Aligned { .. })
     }
 }
 
 impl Default for SegmentationPolicy {
     /// Apple's recommended HLS cadence: nominal six-second segments and
-    /// one-second partial segments, aligned across renditions.
+    /// one-second partial segments.
     fn default() -> Self {
         Self::latency_first(Duration::from_secs(6), Duration::from_secs(1))
     }
 }
 
+/// How far all video tracks may be observed for compatible keyframe cadences.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundarySearchPolicy {
-    /// Select the latest usable random-access boundary at or before the
-    /// desired duration. This bounds pre-roll latency and rejects inputs that
-    /// cannot satisfy the requested alignment.
+    /// Select the latest compatible video boundary at or before the desired
+    /// duration and reject if none exists.
     AtOrBeforeDesired,
-    /// Search beyond the desired duration for a usable boundary, but never
-    /// beyond this extension. This accepts more inputs at the cost of latency.
+    /// Search greedily beyond the desired duration, but never past this
+    /// extension. The first compatible cross-video cluster resolves the plan.
     ExtendToNext { maximum_extension: Duration },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BoundaryAlignmentPolicy {
-    /// All tracks use boundaries representing the same presentation time.
-    ///
-    /// This supports seamless rendition switching and Apple's aligned-boundary
-    /// guidance. AU cadence can differ: each track maps the shared time to its
-    /// own usable boundary rather than requiring numerically identical ticks.
-    Aligned { search: BoundarySearchPolicy },
-    /// Each track selects boundaries independently. This minimizes rejection
-    /// and latency, but does not provide aligned rendition switching.
-    Independent { search: BoundarySearchPolicy },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,11 +126,31 @@ pub struct TrackSegmentationPlan {
     pub segmentation_origin_pts: TickTimestamp,
     /// Absolute selected boundary for closing segment zero.
     pub first_segment_boundary_pts: TickTimestamp,
-    /// The selected segment cadence expressed in this track's output time base.
+    /// This track's selected segment cadence in its output time base.
+    ///
+    /// Boundaries repeat as
+    /// `first_segment_boundary_pts + k × segment_duration`. Neighboring tracks
+    /// may differ by an access unit or video frame; the planner proves their
+    /// first cadence intervals overlap rather than forcing equal tick values.
     pub segment_duration: NonZero<TickDuration>,
-    /// Selected regular-part target expressed in this track's output time
-    /// base. The final part of a segment may be shorter.
+    /// How many presentable access units make up a regular part.
+    ///
+    /// Parts are counted rather than scheduled so that a regular part can
+    /// never exceed [`Self::part_duration`], which HLS advertises as
+    /// `PART-TARGET` and refuses to see exceeded. The final part of a segment
+    /// holds whatever remains and may be shorter.
+    pub part_access_units: NonZero<u32>,
+    /// The longest a regular part may run: `part_access_units` access units at
+    /// the longest access-unit duration observed for this track.
     pub part_duration: NonZero<TickDuration>,
+    /// Maximum delay between a planned segment boundary and the next usable
+    /// AU start.
+    ///
+    /// Video boundaries are selected random-access starts and therefore use
+    /// zero; a muxer that waits for a late keyframe accounts for that from its
+    /// own extension budget. Variable-duration audio may need up to one encoded
+    /// frame when later access units do not repeat the pre-roll grid exactly.
+    pub boundary_tolerance: TickDuration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -184,11 +194,16 @@ impl SegmentationPlan {
             if source.timebase != track.timebase {
                 return Err(SegmentationPlanError::TimebaseMismatch(track.track_id));
             }
-            let expected_duration = track
+            let first_duration = track
                 .first_segment_boundary_pts
                 .checked_sub(track.segmentation_origin_pts)
                 .and_then(|ticks| u64::try_from(ticks).ok());
-            if expected_duration != Some(track.segment_duration.get()) {
+            if first_duration.is_none_or(|duration| duration == 0)
+                || track
+                    .first_segment_boundary_pts
+                    .checked_sub_unsigned(track.segment_duration.get())
+                    .is_none()
+            {
                 return Err(SegmentationPlanError::InvalidTiming(track.track_id));
             }
         }
@@ -239,6 +254,35 @@ impl SegmentationPlan {
     }
 }
 
+/// Why a schedule could not be derived from the media that was observed.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum CadenceError {
+    #[error("timeline calibration contains duplicate {0}")]
+    DuplicateTrack(TrackId),
+    #[error("segmentation received an access unit for unknown {0}")]
+    UnknownTrack(TrackId),
+    #[error("access-unit timestamp overflowed for {0}")]
+    TimestampOverflow(TrackId),
+    /// Carries the underlying cause: an inexact trim, an overrun, and an
+    /// arithmetic overflow are different operator problems, and collapsing
+    /// them to one message loses the only detail that distinguishes them.
+    #[error("{track_id} produced an access unit with unusable timing: {source}")]
+    InvalidSampleTiming {
+        track_id: TrackId,
+        source: SampleTimingError,
+    },
+    #[error("segmentation search horizon cannot be represented for {0}")]
+    HorizonOverflow(TrackId),
+    #[error("track cadence comparison overflowed")]
+    ComparisonOverflow,
+    #[error("{0} presented no media to segment")]
+    NoPresentableMedia(TrackId),
+    #[error("{0} varies too much in access-unit duration to hold a part target")]
+    InconsistentPartCadence(TrackId),
+    #[error("no usable random-access boundary satisfies the segmentation policy")]
+    NoSegmentationBoundary,
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum PrerollError {
     #[error(transparent)]
@@ -248,13 +292,9 @@ pub enum PrerollError {
     #[error(transparent)]
     SegmentationPlan(#[from] SegmentationPlanError),
     #[error(transparent)]
-    BoundarySelection(#[from] BoundarySelectionError),
+    Cadence(#[from] CadenceError),
     #[error("segmentation pre-roll exceeded its configured bound")]
     LimitExceeded,
-    #[error("no usable random-access boundary satisfies the segmentation policy")]
-    NoSegmentationBoundary,
-    #[error("no usable part duration was found for {0}")]
-    NoPartDuration(TrackId),
 }
 
 #[cfg(test)]
@@ -274,15 +314,23 @@ mod tests {
             segmentation_origin_pts: 0,
             first_segment_boundary_pts: 180_000,
             segment_duration: nz::u64!(180_000),
+            part_access_units: nz::u32!(6),
             part_duration: nz::u64!(18_000),
+            boundary_tolerance: 0,
         }
     }
 
     #[test]
     fn default_segmentation_uses_apples_recommended_cadence() {
+        let policy = SegmentationPolicy::default();
+
+        assert_eq!(policy.desired_segment_duration, Duration::from_secs(6));
+        assert_eq!(policy.desired_part_duration, Duration::from_secs(1));
         assert_eq!(
-            SegmentationPolicy::default(),
-            SegmentationPolicy::latency_first(Duration::from_secs(6), Duration::from_secs(1))
+            policy.search,
+            BoundarySearchPolicy::ExtendToNext {
+                maximum_extension: Duration::from_secs(6)
+            }
         );
     }
 
@@ -343,7 +391,7 @@ mod tests {
         );
 
         let mut invalid_timing = planned_track(0);
-        invalid_timing.segmentation_origin_pts = -1;
+        invalid_timing.first_segment_boundary_pts = invalid_timing.segmentation_origin_pts;
         assert_eq!(
             SegmentationPlan::new(&plan, vec![invalid_timing, planned_track(1)]),
             Err(SegmentationPlanError::InvalidTiming(TrackId(0)))

@@ -51,8 +51,7 @@
   - `src/main.rs`
 - Timeline and segmentation:
   - `src/media/{timeline,validate,fixtures}.rs`
-  - `src/segment/{mod,preroll,boundary}.rs`
-  - `src/segment/boundary/part.rs`
+  - `src/segment/{mod,cadence,part,preroll}.rs`
 - Normalization organization:
   - `src/media/{mod,sample,timing}.rs`
   - `src/media/normalize/mod.rs`
@@ -68,7 +67,7 @@ working-tree changes. Preserve unrelated existing edits in `TODO.md`.
 
 ## Validation
 
-- `cargo test`: 322 passed, including real AVFormat → HTTP packaging.
+- `cargo test`: 329 passed, including real AVFormat → HTTP packaging.
 - `ffprobe`: validates fetched initialization plus CMAF media when installed.
 - `mediastreamvalidator`: validates the served HLS presentation when installed.
 - `cargo clippy --all-targets -- -D warnings`: passed.
@@ -77,6 +76,19 @@ working-tree changes. Preserve unrelated existing edits in `TODO.md`.
 
 ## Important contracts
 
+- Pre-roll observes every video track through the desired duration and chooses
+  the latest overlapping keyframe interval. If none exists, it extends
+  greedily only until the configured hard limit. The overlap permits
+  frame-close cadences without requiring identical ticks. Audio snaps the
+  video-prioritized elapsed instant to its own encoded access-unit grid, so
+  codec priming cannot create a mid-unit cadence. Each rendition repeats its
+  own locked period; `TrackSegmentationPlan::boundary_tolerance` bounds later
+  audio quantization for honest `maximum_segment_duration` advertising.
+- Parts are counted in access units, not scheduled on ticks. HLS refuses a part
+  longer than `PART-TARGET`, and a tick schedule can overshoot the target by a
+  whole access unit; a count cannot. `PART-TARGET` is `part_access_units × the
+  longest access unit observed`, so the ceiling holds by construction and the
+  85% floor reduces to `shortest ≥ 85% × longest`, checked once during pre-roll.
 - Incoming and mux output timebases must match exactly after normalization;
   FFmpeg timebase changes are rejected rather than silently rescaled.
 - Video and subtitles normalize to 90 kHz. Audio normalizes to its decoded

@@ -113,7 +113,9 @@ mod tests {
                     segmentation_origin_pts: 0,
                     first_segment_boundary_pts: 180_000,
                     segment_duration: nz::u64!(180_000),
+                    part_access_units: nz::u32!(1),
                     part_duration: nz::u64!(90_000),
+                    boundary_tolerance: 0,
                 })
                 .collect(),
         )
@@ -172,7 +174,9 @@ mod tests {
                     segmentation_origin_pts: -1_056,
                     first_segment_boundary_pts: 7_136,
                     segment_duration: nz::u64!(8_192),
+                    part_access_units: nz::u32!(2),
                     part_duration: nz::u64!(2_048),
+                    boundary_tolerance: 0,
                 },
                 TrackSegmentationPlan {
                     track_id: TrackId(1),
@@ -181,7 +185,9 @@ mod tests {
                     segmentation_origin_pts: 0,
                     first_segment_boundary_pts: 180_000,
                     segment_duration: nz::u64!(180_000),
+                    part_access_units: nz::u32!(1),
                     part_duration: nz::u64!(90_000),
+                    boundary_tolerance: 0,
                 },
             ],
         )

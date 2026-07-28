@@ -1,21 +1,15 @@
-use std::num::NonZero;
-
 use tokio::time::{Instant, timeout};
 
 use crate::{
-    domain::{TickDuration, TickTimestamp, TrackId, duration_since},
-    media::{
-        NormalizedSample, PresentationPlan, PresentedTimingCursor, Rounding, SampleSource,
-        TimelineCalibration, TrackTimeline,
-    },
+    domain::{TickTimestamp, TrackId},
+    media::{NormalizedSample, PresentationPlan, Rounding, SampleSource, TimelineCalibration},
     observe::{EventSink, SessionEvent},
     source::InputState,
 };
 
 use super::{
-    BoundarySelection, BoundarySelectionError, BoundarySelectionStatus, BoundarySelector,
-    PrerollError, PrerollLimits, SegmentationPlan, SegmentationPolicy, TrackSegmentationPlan,
-    boundary::select_part_duration,
+    CadenceError, CadenceObserver, PrerollError, PrerollLimits, SegmentationPlan,
+    SegmentationPolicy, TrackSegmentationPlan,
 };
 
 /// Enough for a second or two of multi-track media, so the common case reaches
@@ -61,23 +55,15 @@ pub async fn run(
         policy,
     } = request;
 
-    let mut selector = BoundarySelector::new(presentation, timeline, policy)?;
+    let mut observer = CadenceObserver::new(presentation, timeline, policy)?;
     let horizons = media_horizons(timeline, limits)?;
     let mut buffered = Vec::with_capacity(INITIAL_BUFFER_SAMPLES);
     let mut buffered_bytes = 0_usize;
     let deadline = Instant::now() + limits.maximum_wall_time;
 
     loop {
-        if let Some(selection) = ready_selection(&selector)? {
-            return lock(
-                presentation,
-                timeline,
-                policy,
-                selection,
-                buffered,
-                InputState::Open,
-                events,
-            );
+        if let Some(tracks) = observer.plan()? {
+            return lock(presentation, tracks, buffered, InputState::Open, events);
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -98,7 +84,7 @@ pub async fn run(
         let retained = buffered.len();
         for sample in &buffered[observed_from..] {
             admit(
-                &mut selector,
+                &mut observer,
                 &horizons,
                 &mut buffered_bytes,
                 retained,
@@ -108,18 +94,12 @@ pub async fn run(
         }
 
         if !state.is_open() {
-            return match ready_selection(&selector)? {
-                Some(selection) => lock(
-                    presentation,
-                    timeline,
-                    policy,
-                    selection,
-                    buffered,
-                    state,
-                    events,
-                ),
-                None => Err(PrerollError::NoSegmentationBoundary),
-            };
+            // The input is gone, so no further evidence can arrive. Whatever
+            // the observer can conclude now is final.
+            let tracks = observer
+                .plan()?
+                .ok_or(CadenceError::NoSegmentationBoundary)?;
+            return lock(presentation, tracks, buffered, state, events);
         }
     }
 }
@@ -144,7 +124,7 @@ fn media_horizons(
             // cadence merely lands on the boundary.
             let maximum_pts = track
                 .horizon(limits.maximum_media_duration, Rounding::Up)
-                .ok_or(BoundarySelectionError::HorizonOverflow(track.track_id))?;
+                .ok_or(CadenceError::HorizonOverflow(track.track_id))?;
             Ok(MediaHorizon {
                 track_id: track.track_id,
                 maximum_pts,
@@ -159,7 +139,7 @@ fn media_horizons(
 /// this batch contributed: the budget is on what pre-roll is keeping, and it is
 /// already keeping every sample it has looked at.
 fn admit(
-    selector: &mut BoundarySelector,
+    observer: &mut CadenceObserver,
     horizons: &[MediaHorizon],
     buffered_bytes: &mut usize,
     retained: usize,
@@ -174,11 +154,11 @@ fn admit(
     let horizon = horizons
         .iter()
         .find(|horizon| horizon.track_id == track_id)
-        .ok_or(BoundarySelectionError::UnknownTrack(track_id))?;
+        .ok_or(CadenceError::UnknownTrack(track_id))?;
     let end = sample
         .pts()
         .checked_add_unsigned(sample.duration())
-        .ok_or(BoundarySelectionError::TimestampOverflow(track_id))?;
+        .ok_or(CadenceError::TimestampOverflow(track_id))?;
     if end > horizon.maximum_pts {
         return Err(PrerollError::LimitExceeded);
     }
@@ -193,44 +173,22 @@ fn admit(
         return Err(PrerollError::LimitExceeded);
     }
 
-    selector.observe(sample)?;
+    observer.observe(sample)?;
     *buffered_bytes = total;
     Ok(())
 }
 
-fn ready_selection(selector: &BoundarySelector) -> Result<Option<BoundarySelection>, PrerollError> {
-    match selector.selection()? {
-        BoundarySelectionStatus::Pending => Ok(None),
-        BoundarySelectionStatus::Ready(selection) => Ok(Some(selection)),
-    }
-}
-
 fn lock(
     presentation: &PresentationPlan,
-    timeline: &TimelineCalibration,
-    policy: SegmentationPolicy,
-    selection: BoundarySelection,
+    tracks: Vec<TrackSegmentationPlan>,
     buffered: Vec<NormalizedSample>,
     input_state: InputState,
     events: &EventSink,
 ) -> Result<Preroll, PrerollError> {
-    let mut tracks = Vec::with_capacity(selection.tracks().len());
-    for boundary in selection.tracks() {
-        let timing = timeline
-            .get(boundary.track_id)
-            .ok_or(BoundarySelectionError::UnknownTrack(boundary.track_id))?;
-        let source = presentation
-            .catalog()
-            .get(boundary.track_id)
-            .ok_or(BoundarySelectionError::UnknownTrack(boundary.track_id))?;
-        tracks.push(plan_track(&buffered, policy, timing, source, boundary.pts)?);
-    }
-
     let segmentation = SegmentationPlan::new(presentation, tracks)?;
     events.emit(SessionEvent::SegmentationLocked {
         segment: segmentation.longest_segment_duration(),
         part: segmentation.shortest_part_duration(),
-        aligned: policy.is_aligned(),
     });
 
     Ok(Preroll {
@@ -238,96 +196,6 @@ fn lock(
         input_state,
         buffered,
     })
-}
-
-fn plan_track(
-    buffered: &[NormalizedSample],
-    policy: SegmentationPolicy,
-    timing: &TrackTimeline,
-    source: &crate::domain::DiscoveredTrack,
-    boundary_pts: TickTimestamp,
-) -> Result<TrackSegmentationPlan, PrerollError> {
-    let segmentation_origin_pts = segmentation_origin(buffered, timing, source)?;
-    let segment_duration = duration_since(boundary_pts, segmentation_origin_pts)
-        .and_then(NonZero::<TickDuration>::new)
-        .ok_or(PrerollError::NoSegmentationBoundary)?;
-    let part_duration = select_part_duration(
-        buffered,
-        source,
-        segmentation_origin_pts,
-        boundary_pts,
-        timing
-            .timebase
-            .duration_to_ticks(policy.desired_part_duration),
-    )
-    .map_err(|source| BoundarySelectionError::InvalidSampleTiming {
-        track_id: timing.track_id,
-        source,
-    })?
-    .ok_or(PrerollError::NoPartDuration(timing.track_id))?;
-
-    Ok(TrackSegmentationPlan {
-        track_id: timing.track_id,
-        timebase: timing.timebase,
-        presentation_origin_pts: timing.origin_pts,
-        segmentation_origin_pts,
-        first_segment_boundary_pts: boundary_pts,
-        segment_duration,
-        part_duration,
-    })
-}
-
-/// Finds the access unit that first carries audible media at or after the
-/// shared origin, without changing the origin used to rebase container
-/// timestamps.
-///
-/// # Why this is the access unit's start, not the audible instant
-///
-/// [`TrackSegmentationPlan::segment_duration`] is the distance from here to the
-/// first boundary, and the muxer reuses it as a repeating period. Boundaries
-/// can only fall on access-unit starts — a fragment cannot be cut mid-unit — so
-/// the period has to be a whole number of them, which it is only if this point
-/// is on the grid too. Otherwise the residue accumulates and boundary two lands
-/// between units.
-///
-/// Codec priming is what makes the distinction bite. It is not generally a
-/// whole number of access units: a 2112-sample encoder delay against
-/// 1024-sample AAC frames leaves the first audible sample 64 ticks inside its
-/// unit. Taking the audible instant would put the origin — and therefore every
-/// later boundary — off the grid. Taking the unit's start keeps segmentation
-/// aligned, and the 64 ticks of priming still inside it are suppressed by the
-/// edit list the muxer emits, which is where that belongs.
-fn segmentation_origin(
-    buffered: &[NormalizedSample],
-    timing: &TrackTimeline,
-    source: &crate::domain::DiscoveredTrack,
-) -> Result<TickTimestamp, PrerollError> {
-    let mut origin = None;
-    let mut presented_timing = PresentedTimingCursor::for_track(source);
-    for sample in buffered
-        .iter()
-        .filter(|sample| sample.track_id() == timing.track_id)
-    {
-        let presented = presented_timing.next(sample).map_err(|source| {
-            BoundarySelectionError::InvalidSampleTiming {
-                track_id: timing.track_id,
-                source,
-            }
-        })?;
-        let end = presented
-            .end()
-            .ok_or(BoundarySelectionError::TimestampOverflow(timing.track_id))?;
-        if presented.duration > 0 && end > timing.origin_pts {
-            // The unit's own start, so the grid is preserved. Clamping to the
-            // shared origin would reintroduce the offset for a unit that
-            // straddles it, so a straddling unit keeps its start and the
-            // segment simply begins fractionally before the origin.
-            let candidate = sample.pts();
-            origin =
-                Some(origin.map_or(candidate, |current: TickTimestamp| current.min(candidate)));
-        }
-    }
-    origin.ok_or_else(|| BoundarySelectionError::UnknownTrack(timing.track_id).into())
 }
 
 #[cfg(test)]
@@ -348,98 +216,6 @@ mod tests {
     };
 
     use super::*;
-
-    /// An AAC track whose first packet carries FFmpeg's complete skip count.
-    fn primed_aac(
-        initial_padding_samples: u32,
-    ) -> (crate::domain::DiscoveredTrack, Vec<NormalizedSample>) {
-        use crate::domain::{
-            AudioTiming, AudioTrim, Codec, MediaKind, MediaParameters, Payload, Timebase,
-            fixtures::TrackBuilder,
-        };
-        use crate::media::AudioSample;
-
-        const FRAME: u64 = 1_024;
-        let timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
-        let track = TrackBuilder::new(0, MediaKind::Audio)
-            .codec(Codec::Aac)
-            .timebase(timebase)
-            .parameters(MediaParameters::Audio {
-                sample_rate: nz::u32!(48_000),
-                channels: nz::u16!(2),
-                frame_size: Some(nz::u32!(1_024)),
-                bit_depth: None,
-                timing: AudioTiming {
-                    initial_padding_samples,
-                    ..AudioTiming::default()
-                },
-            })
-            .build();
-        let first_pts = -i64::from(initial_padding_samples);
-        let samples = (0..32_u64)
-            .map(|index| {
-                NormalizedSample::Audio(AudioSample {
-                    track_id: TrackId(0),
-                    codec: Codec::Aac,
-                    pts: first_pts + i64::try_from(index * FRAME).expect("fixture PTS fits"),
-                    duration: FRAME,
-                    trim: AudioTrim {
-                        leading_samples: if index == 0 {
-                            initial_padding_samples
-                        } else {
-                            0
-                        },
-                        trailing_samples: 0,
-                    },
-                    payload: Payload::default(),
-                })
-            })
-            .collect();
-        (track, samples)
-    }
-
-    #[test]
-    fn the_segmentation_origin_stays_on_the_access_unit_grid_through_priming() {
-        // 2112 samples is the Apple/iTunes AAC encoder delay: two whole
-        // 1024-sample frames plus 64. The audible timeline therefore starts
-        // mid-frame, but segment boundaries can only fall on frame starts, so
-        // the segmentation origin must be the frame — not the audible instant.
-        for initial_padding_samples in [0, 1_024, 2_048, 2_112, 1] {
-            let (track, samples) = primed_aac(initial_padding_samples);
-            let timing = TrackTimeline {
-                track_id: TrackId(0),
-                timebase: track.timebase,
-                origin_pts: 0,
-            };
-            let first_pts = -i64::from(initial_padding_samples);
-
-            let origin = segmentation_origin(&samples, &timing, &track)
-                .expect("a primed track still has an audible origin");
-
-            assert_eq!(
-                (origin - first_pts) % 1_024,
-                0,
-                "priming of {initial_padding_samples} samples pushed the \
-                 segmentation origin to {origin}, off the access-unit grid"
-            );
-            // A boundary is always a real sample PTS, so a grid-aligned origin
-            // is exactly what makes the period a whole number of frames — which
-            // is what stops boundary two landing between access units.
-            let boundary = first_pts + 20 * 1_024;
-            let period = boundary - origin;
-            assert_eq!(
-                period % 1_024,
-                0,
-                "period {period} is not a whole number of access units"
-            );
-
-            let track_plan = plan_track(&samples, policy(), &timing, &track, boundary)
-                .expect("primed audio produces a complete track plan");
-            let presentation = crate::media::fixtures::presentation(vec![track]);
-            SegmentationPlan::new(&presentation, vec![track_plan])
-                .expect("a straddling access unit is valid plan timing");
-        }
-    }
 
     /// Replays prepared batches, then reports the input as exhausted.
     struct Replay {
@@ -497,105 +273,6 @@ mod tests {
         fn observe(&self, _session: SessionId, event: SessionEvent) {
             self.events.lock().push(event);
         }
-    }
-
-    #[test]
-    fn priming_does_not_shift_segment_or_part_cadence() {
-        let timebase = crate::domain::Timebase::new(nz::u32!(1), nz::u32!(48_000));
-        let source = crate::domain::fixtures::TrackBuilder::new(0, crate::domain::MediaKind::Audio)
-            .timebase(timebase)
-            .parameters(crate::domain::MediaParameters::Audio {
-                sample_rate: nz::u32!(48_000),
-                channels: nz::u16!(2),
-                frame_size: Some(nz::u32!(1_024)),
-                bit_depth: None,
-                timing: crate::domain::AudioTiming {
-                    initial_padding_samples: 1_024,
-                    ..crate::domain::AudioTiming::default()
-                },
-            })
-            .build();
-        let timing = crate::media::TrackTimeline {
-            track_id: TrackId(0),
-            timebase,
-            origin_pts: 0,
-        };
-        let mut buffered = vec![NormalizedSample::Audio(crate::media::AudioSample {
-            track_id: TrackId(0),
-            codec: crate::domain::Codec::Aac,
-            pts: -1_024,
-            duration: 1_024,
-            trim: crate::domain::AudioTrim {
-                leading_samples: 1_024,
-                trailing_samples: 0,
-            },
-            payload: crate::domain::Payload::default(),
-        })];
-        buffered.extend(
-            (0..20).map(|frame| crate::media::fixtures::audio_sample(0, frame * 1_024, 1_024)),
-        );
-
-        let plan = plan_track(&buffered, policy(), &timing, &source, 20 * 1_024)
-            .expect("primed audio produces a plan");
-
-        assert_eq!(plan.presentation_origin_pts, 0);
-        assert_eq!(plan.segmentation_origin_pts, 0);
-        assert_eq!(plan.first_segment_boundary_pts, 20 * 1_024);
-        assert_eq!(plan.segment_duration.get(), 20 * 1_024);
-        assert_eq!(
-            plan.part_duration.get(),
-            9 * 1_024,
-            "the 200 ms preference is evaluated on audible AAC access units"
-        );
-    }
-
-    #[tokio::test]
-    async fn presentation_origin_remains_calibrated_when_media_starts_later() {
-        // A calibrated origin can fall between access units. It remains the
-        // timestamp-rebasing anchor; only segment accounting advances to the
-        // first effective access unit.
-        let calibrated = crate::media::fixtures::calibrated([(
-            0,
-            crate::domain::Timebase::hz90k(),
-            VIDEO_SECOND / 2,
-        )]);
-        let mut source = Replay::new(vec![
-            (1..24)
-                .map(|second| sample(second, second % 4 == 0, 1))
-                .collect(),
-        ]);
-
-        let locked = run(
-            &mut source,
-            PrerollRequest {
-                presentation: &presentation(),
-                timeline: &calibrated,
-                limits: limits(64, Duration::from_secs(30)),
-                policy: policy(),
-            },
-            &sink(),
-        )
-        .await
-        .expect("segmentation locks");
-
-        let track = locked
-            .segmentation
-            .get(TrackId(0))
-            .expect("the plan covers the track");
-        assert_eq!(
-            track.presentation_origin_pts,
-            VIDEO_SECOND / 2,
-            "calibration is not snapped onto an access-unit boundary"
-        );
-        assert_eq!(
-            track.segmentation_origin_pts, VIDEO_SECOND,
-            "segment accounting starts at the first effective presentation point"
-        );
-        assert_eq!(
-            track.segment_duration.get(),
-            u64::try_from(track.first_segment_boundary_pts - track.segmentation_origin_pts)
-                .expect("the selected boundary follows the segment origin")
-        );
     }
 
     /// One second of video starting at `start_seconds`.
@@ -660,36 +337,29 @@ mod tests {
         let events = Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>)
             .scoped(SessionId(nz::u64!(1)));
         let mut source = Replay::new(
-            (0..10)
+            (0..=10)
                 .map(|second| vec![sample(second, second == 8, 1)])
                 .collect(),
         );
 
-        let preroll = preroll(&mut source, limits(10, Duration::from_secs(20)), &events)
+        let preroll = preroll(&mut source, limits(11, Duration::from_secs(20)), &events)
             .await
             .expect("pre-roll succeeds");
 
-        assert_eq!(preroll.buffered.len(), 10);
-        assert_eq!(
-            preroll
-                .segmentation
-                .get(TrackId(0))
-                .map(|track| track.segment_duration.get()),
-            Some(8 * 90_000)
-        );
-        assert_eq!(
-            preroll
-                .segmentation
-                .get(TrackId(0))
-                .map(|track| track.part_duration.get()),
-            Some(90_000)
-        );
+        assert_eq!(preroll.buffered.len(), 11);
+        let track = preroll
+            .segmentation
+            .get(TrackId(0))
+            .expect("the plan covers the track");
+        assert_eq!(track.segment_duration.get(), 8 * 90_000);
+        assert_eq!(track.part_duration.get(), 90_000);
+        assert_eq!(track.part_access_units.get(), 1);
 
         let observed = recorder.events.lock();
         assert_eq!(observed.len(), 1);
         assert!(matches!(
             observed.first(),
-            Some(SessionEvent::SegmentationLocked { aligned: true, .. })
+            Some(SessionEvent::SegmentationLocked { .. })
         ));
     }
 
@@ -697,18 +367,67 @@ mod tests {
     async fn a_whole_batch_of_samples_is_admitted_in_order() {
         let mut source = Replay::new(vec![
             (0..5).map(|second| sample(second, false, 1)).collect(),
-            (5..10)
+            (5..=10)
                 .map(|second| sample(second, second == 8, 1))
                 .collect(),
         ]);
 
-        let preroll = preroll(&mut source, limits(10, Duration::from_secs(20)), &sink())
+        let preroll = preroll(&mut source, limits(11, Duration::from_secs(20)), &sink())
             .await
             .expect("pre-roll succeeds");
 
-        assert_eq!(preroll.buffered.len(), 10);
+        assert_eq!(preroll.buffered.len(), 11);
         assert_eq!(preroll.buffered[0].pts(), 0);
-        assert_eq!(preroll.buffered[9].pts(), 9 * 90_000);
+        assert_eq!(preroll.buffered[10].pts(), 10 * 90_000);
+    }
+
+    #[tokio::test]
+    async fn presentation_origin_remains_calibrated_when_media_starts_later() {
+        // A calibrated origin can fall between access units. It remains the
+        // timestamp-rebasing anchor; only segment accounting advances to the
+        // first effective access unit.
+        let calibrated = crate::media::fixtures::calibrated([(
+            0,
+            crate::domain::Timebase::hz90k(),
+            VIDEO_SECOND / 2,
+        )]);
+        let mut source = Replay::new(vec![
+            (1..24)
+                .map(|second| sample(second, second % 4 == 0, 1))
+                .collect(),
+        ]);
+
+        let locked = run(
+            &mut source,
+            PrerollRequest {
+                presentation: &presentation(),
+                timeline: &calibrated,
+                limits: limits(64, Duration::from_secs(30)),
+                policy: policy(),
+            },
+            &sink(),
+        )
+        .await
+        .expect("segmentation locks");
+
+        let track = locked
+            .segmentation
+            .get(TrackId(0))
+            .expect("the plan covers the track");
+        assert_eq!(
+            track.presentation_origin_pts,
+            VIDEO_SECOND / 2,
+            "calibration is not snapped onto an access-unit boundary"
+        );
+        assert_eq!(
+            track.segmentation_origin_pts, VIDEO_SECOND,
+            "segment accounting starts at the first effective presentation point"
+        );
+        assert_eq!(
+            track.segment_duration.get(),
+            u64::try_from(track.first_segment_boundary_pts - track.segmentation_origin_pts)
+                .expect("the selected boundary follows the segment origin")
+        );
     }
 
     #[tokio::test]
@@ -787,15 +506,17 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_after_the_horizon_without_a_random_access_boundary() {
-        let mut source = Replay::new(vec![vec![sample(9, false, 1)]]);
+        let mut source = Replay::new(vec![
+            (0..=10).map(|second| sample(second, false, 1)).collect(),
+        ]);
 
-        let error = preroll(&mut source, limits(10, Duration::from_secs(20)), &sink())
+        let error = preroll(&mut source, limits(20, Duration::from_secs(20)), &sink())
             .await
             .expect_err("missing boundary rejects pre-roll");
 
         assert_eq!(
             error,
-            PrerollError::BoundarySelection(BoundarySelectionError::NoCompatibleBoundary)
+            PrerollError::Cadence(CadenceError::NoSegmentationBoundary)
         );
     }
 
@@ -807,6 +528,9 @@ mod tests {
             .await
             .expect_err("truncated input rejects pre-roll");
 
-        assert_eq!(error, PrerollError::NoSegmentationBoundary);
+        assert_eq!(
+            error,
+            PrerollError::Cadence(CadenceError::NoSegmentationBoundary)
+        );
     }
 }

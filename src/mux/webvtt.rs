@@ -1,13 +1,13 @@
 //! Track-local WebVTT segmentation and SubRip cue conversion.
 
-use std::{collections::VecDeque, str, sync::Arc};
+use std::{collections::VecDeque, num::NonZero, str, sync::Arc};
 
 mod subrip;
 
 use crate::{
     domain::{
         Appender, Codec, DiscoveredTrack, MediaKind, Payload, TickDuration, TickTimestamp,
-        Timebase, TimebaseProjection, TrackId, WebVttCueMetadata,
+        Timebase, TimebaseProjection, TrackId, WebVttCueMetadata, duration_since,
     },
     media::{NormalizedSample, SubtitleSample},
     segment::TrackSegmentationPlan,
@@ -82,6 +82,12 @@ fn packaged_rendition(
     plan: &TrackSegmentationPlan,
 ) -> PackagedRendition {
     let fallback_name = format!("Subtitle {}", rendition_id.0 + 1);
+    let first_segment_duration = duration_since(
+        plan.first_segment_boundary_pts,
+        plan.segmentation_origin_pts,
+    )
+    .and_then(NonZero::new)
+    .unwrap_or(plan.segment_duration);
     PackagedRendition {
         packaging_rendition_id: rendition_id,
         key: RenditionKey::for_source(track),
@@ -90,8 +96,9 @@ fn packaged_rendition(
             timebase: plan.timebase,
             segment_target: plan.segment_duration,
             // Cue windows are cut on the planned grid regardless of cue
-            // arrival, so a WebVTT segment never extends past its target.
-            maximum_segment_duration: plan.segment_duration,
+            // arrival. The first may be longer when subtitles begin before
+            // their recurring cadence.
+            maximum_segment_duration: first_segment_duration.max(plan.segment_duration),
             chunk_target: None,
             segment_format: MediaSegmentFormat::WebVtt,
         },
@@ -110,6 +117,7 @@ struct WebVttTrack {
     codec: Codec,
     plan: TrackSegmentationPlan,
     origin: TickTimestamp,
+    first_boundary: TickTimestamp,
     segment_ticks: TickDuration,
     windows: VecDeque<Window>,
     next_window_id: u64,
@@ -133,8 +141,8 @@ impl WebVttTrack {
             .first_segment_boundary_pts
             .checked_sub(plan.presentation_origin_pts)
             .ok_or_else(|| invalid("WebVTT first boundary rebasing overflowed"))?;
-        if origin.checked_add_unsigned(plan.segment_duration.get()) != Some(first_boundary) {
-            return Err(invalid("WebVTT first segment boundary is inconsistent"));
+        if first_boundary <= origin {
+            return Err(invalid("WebVTT first segment boundary is invalid"));
         }
 
         Ok(Self {
@@ -143,6 +151,7 @@ impl WebVttTrack {
             codec: track.codec,
             plan,
             origin,
+            first_boundary,
             segment_ticks: plan.segment_duration.get(),
             windows: VecDeque::from([Window {
                 id: 0,
@@ -309,22 +318,38 @@ impl WebVttTrack {
     }
 
     fn segment_index(&self, timestamp: TickTimestamp) -> Result<u64, MuxError> {
+        if timestamp < self.first_boundary {
+            return Ok(0);
+        }
         let offset = timestamp
-            .checked_sub(self.origin)
+            .checked_sub(self.first_boundary)
             .and_then(|offset| u64::try_from(offset).ok())
             .ok_or_else(|| mux_error("subtitle timestamp precedes segmentation origin"))?;
-        Ok(offset / self.segment_ticks)
+        (offset / self.segment_ticks)
+            .checked_add(1)
+            .ok_or_else(|| mux_error("WebVTT segment ID overflowed"))
     }
 
     fn window_start(&self, id: u64) -> Result<TickTimestamp, MuxError> {
-        let offset = u128::from(id)
+        if id == 0 {
+            return Ok(self.origin);
+        }
+        let offset = u128::from(id - 1)
             .checked_mul(u128::from(self.segment_ticks))
             .and_then(|offset| i128::try_from(offset).ok())
             .ok_or_else(|| mux_error("WebVTT segment offset overflowed"))?;
-        i128::from(self.origin)
+        i128::from(self.first_boundary)
             .checked_add(offset)
             .and_then(|start| TickTimestamp::try_from(start).ok())
             .ok_or_else(|| mux_error("WebVTT segment start overflowed"))
+    }
+
+    fn window_duration(&self, id: u64) -> Result<TickDuration, MuxError> {
+        if id == 0 {
+            return duration_since(self.first_boundary, self.origin)
+                .ok_or_else(|| mux_error("WebVTT first window duration is invalid"));
+        }
+        Ok(self.segment_ticks)
     }
 
     fn ensure_through(&mut self, id: u64) -> Result<(), MuxError> {
@@ -344,13 +369,16 @@ impl WebVttTrack {
 
     fn seal_before(&mut self, timestamp: TickTimestamp, out: &mut dyn Appender<PackagedMedia>) {
         while self.windows.front().is_some_and(|window| {
-            window
-                .start
-                .checked_add_unsigned(self.segment_ticks)
+            self.window_duration(window.id)
+                .ok()
+                .and_then(|duration| window.start.checked_add_unsigned(duration))
                 .is_some_and(|end| end <= timestamp)
         }) {
             let window = self.windows.pop_front().expect("front was inspected above");
-            self.emit(window, self.segment_ticks, out);
+            let duration = self
+                .window_duration(window.id)
+                .expect("queued WebVTT windows have valid timing");
+            self.emit(window, duration, out);
         }
     }
 
@@ -448,7 +476,12 @@ impl TrackPackager for WebVttTrack {
             let duration = end
                 .checked_sub(window.start)
                 .and_then(|duration| u64::try_from(duration).ok())
-                .map(|duration| duration.min(self.segment_ticks))
+                .map(|duration| {
+                    duration.min(
+                        self.window_duration(window.id)
+                            .expect("queued WebVTT windows have valid timing"),
+                    )
+                })
                 .filter(|duration| *duration > 0)
                 .ok_or_else(|| mux_error("final WebVTT segment duration overflowed"))?;
             self.emit(window, duration, out);
@@ -567,7 +600,9 @@ mod tests {
             segmentation_origin_pts: 0,
             first_segment_boundary_pts: i64::try_from(duration).expect("fixture fits"),
             segment_duration: std::num::NonZero::new(duration).expect("fixture is nonzero"),
+            part_access_units: nz::u32!(1),
             part_duration: nz::u64!(90_000),
+            boundary_tolerance: 0,
         }
     }
 

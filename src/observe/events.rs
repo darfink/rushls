@@ -29,7 +29,6 @@ pub enum SessionEvent {
     SegmentationLocked {
         segment: Duration,
         part: Duration,
-        aligned: bool,
     },
     /// A non-strict muxer kept parts flowing while extending a segment to a
     /// usable random-access boundary.

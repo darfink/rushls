@@ -301,10 +301,13 @@ fn media_parameters(
     Ok(Some(media))
 }
 
-/// The cadence a video stream declares, preferring the stream's own average.
+/// The cadence a video stream declares, preferring the codec-level value.
 ///
-/// Codec parameters carry a framerate too, but live inputs commonly leave it
-/// unset while populating the stream average, so the stream wins.
+/// During live probing FFmpeg estimates `avg_frame_rate` from the short packet
+/// window it has seen. A coarse container clock can bias that estimate even
+/// when the parser has already recovered an exact coded cadence. FLV at 24 fps,
+/// for example, was observed as `293/12` from its 42/41 ms timestamps while
+/// `codecpar->framerate` correctly remained `24/1`.
 ///
 /// # Safety
 ///
@@ -313,7 +316,14 @@ fn declared_frame_rate(
     stream: &ffmpeg::AVStream,
     parameters: &ffmpeg::AVCodecParameters,
 ) -> Option<FrameRate> {
-    frame_rate(stream.avg_frame_rate).or_else(|| frame_rate(parameters.framerate))
+    preferred_frame_rate(parameters.framerate, stream.avg_frame_rate)
+}
+
+fn preferred_frame_rate(
+    codec: ffmpeg::AVRational,
+    stream_average: ffmpeg::AVRational,
+) -> Option<FrameRate> {
+    frame_rate(codec).or_else(|| frame_rate(stream_average))
 }
 
 fn codec(codec: ffmpeg::AVCodecID) -> Codec {
@@ -426,5 +436,26 @@ mod tests {
     fn both_ffmpeg_subrip_identifiers_share_one_domain_codec() {
         assert_eq!(codec(ffmpeg::AVCodecID::AV_CODEC_ID_SUBRIP), Codec::SubRip);
         assert_eq!(codec(ffmpeg::AVCodecID::AV_CODEC_ID_SRT), Codec::SubRip);
+    }
+
+    #[test]
+    fn coded_frame_rate_outranks_a_live_probe_estimate() {
+        assert_eq!(
+            preferred_frame_rate(
+                ffmpeg::AVRational { num: 24, den: 1 },
+                ffmpeg::AVRational { num: 293, den: 12 },
+            ),
+            Some(FrameRate::new(nz::u32!(24), nz::u32!(1)))
+        );
+        assert_eq!(
+            preferred_frame_rate(
+                ffmpeg::AVRational { num: 0, den: 1 },
+                ffmpeg::AVRational {
+                    num: 30_000,
+                    den: 1_001,
+                },
+            ),
+            Some(FrameRate::new(nz::u32!(30_000), nz::u32!(1_001)))
+        );
     }
 }
