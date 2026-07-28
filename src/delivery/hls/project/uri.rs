@@ -5,12 +5,13 @@
 //! naming a resource the router cannot parse is a class of bug that only shows
 //! up as a 404 in a player's network log.
 //!
-//! Every name a playlist emits is **relative to the playlist that emits it**, so
+//! Projection keeps every name **relative to the playlist that emits it**, so
 //! nothing here knows a host, a scheme, or a deployment path prefix. A media
 //! playlist at `.../{rendition}/media.m3u8` names its own media as
-//! `segment/7.m4s` and a sibling as `../3/media.m3u8`. That makes the same bytes
-//! correct behind any prefix, and it keeps the projection free of request
-//! context it would otherwise have to be handed.
+//! `segment/7.m4s` and a sibling as `../3/media.m3u8`. The HTTP surface may
+//! expand a multivariant playlist's rendition names for clients that cannot
+//! reload relative URLs; keeping the cached projection relative still makes it
+//! reusable behind any request-visible origin or prefix.
 //!
 //! Resource names are built from durable store identities rather than media
 //! sequence numbers. An ID names one immutable object for as long as it is

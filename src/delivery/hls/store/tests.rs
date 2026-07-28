@@ -770,6 +770,50 @@ async fn part_tags_and_resources_have_distinct_retention_deadlines() {
     assert!(lease.live().part(RenditionId(0), part_id).is_none());
 }
 
+#[test]
+fn part_tag_retention_never_exposes_only_a_parent_segment_suffix() {
+    let store = store();
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+
+    for id in 0..3 {
+        write_segment(&lease, 0, id, id as i64 * 6);
+    }
+
+    // At 21 seconds the first parts of segment zero are individually older
+    // than the 18-second retention, but its final part is not. All six tags
+    // must remain until the parent can disappear as a unit.
+    for index in 0..3 {
+        write(&lease, chunk(0, 3, index, 18 + i64::from(index), 1, 1));
+    }
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    assert_eq!(snapshot.segments[0].parts.len(), 6);
+    assert_eq!(
+        snapshot.segments[0].parts[0].media_start,
+        snapshot.segments[0].media_start
+    );
+    assert_eq!(
+        snapshot.segments[0]
+            .parts
+            .iter()
+            .map(|part| part.duration)
+            .sum::<u64>(),
+        snapshot.segments[0].duration
+    );
+
+    for index in 3..6 {
+        write(&lease, chunk(0, 3, index, 18 + i64::from(index), 1, 1));
+    }
+    write(&lease, completion(0, 3, 18, 6));
+    write(&lease, chunk(0, 4, 0, 24, 1, 1));
+
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    assert!(
+        snapshot.segments[0].parts.is_empty(),
+        "all PART tags leave once the final part exceeds retention"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn removed_segments_obey_their_availability_deadline() {
     let store = store();

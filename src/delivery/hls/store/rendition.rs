@@ -926,16 +926,50 @@ impl RenditionState {
 
     fn hide_old_parts(&mut self, now: Instant, retention: RetentionPolicy) {
         let live_position = self.current_live_position();
+
+        // A completed segment's PART tags are one description of that parent:
+        // hiding a prefix makes its advertised start and duration contradict
+        // EXTINF. Age the parent from its last part so the whole description
+        // enters and leaves the playlist atomically.
+        let mut visible_parents = Vec::<(Msn, PartId)>::new();
         for id in &self.part_order {
-            let Some(resource) = self.part_resources.get_mut(id) else {
+            let Some(resource) = self.part_resources.get(id) else {
                 continue;
             };
             if !resource.playlist_visible {
                 continue;
             }
+            match visible_parents.last_mut() {
+                Some((msn, last_part)) if *msn == resource.part.cursor.msn => *last_part = *id,
+                _ => visible_parents.push((resource.part.cursor.msn, *id)),
+            }
+        }
+
+        let mut hide_through = None;
+        for (msn, last_part) in visible_parents {
+            let resource = self
+                .part_resources
+                .get(&last_part)
+                .expect("visible part was collected from this map");
             let maximum_age = retention.part_tag_retention_for(resource.segment_target);
             if live_position.saturating_sub(resource.playlist_end) <= maximum_age {
                 break;
+            }
+            hide_through = Some(msn);
+        }
+
+        let Some(hide_through) = hide_through else {
+            return;
+        };
+        for id in &self.part_order {
+            let Some(resource) = self.part_resources.get_mut(id) else {
+                continue;
+            };
+            if resource.part.cursor.msn > hide_through {
+                break;
+            }
+            if !resource.playlist_visible {
+                continue;
             }
             resource.playlist_visible = false;
             resource.expires_at = retention.part_fetch_deadline(now, resource.segment_target);
