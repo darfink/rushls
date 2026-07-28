@@ -136,22 +136,34 @@ pub enum Caching {
 /// on. Callers write the frames in order.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MediaBody {
-    frames: Vec<Payload>,
+    frames: MediaFrames,
     length: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum MediaFrames {
+    #[default]
+    Empty,
+    Single(Payload),
+    Chunked(Arc<[Arc<crate::delivery::hls::StoredPart>]>),
+    Ranged(Vec<Payload>),
 }
 
 impl MediaBody {
     pub fn single(payload: Payload) -> Self {
         let length = payload.len() as u64;
         Self {
-            frames: vec![payload],
+            frames: MediaFrames::Single(payload),
             length,
         }
     }
 
-    fn from_frames(frames: Vec<Payload>) -> Self {
+    fn ranged(frames: Vec<Payload>) -> Self {
         let length = frames.iter().map(|frame| frame.len() as u64).sum();
-        Self { frames, length }
+        Self {
+            frames: MediaFrames::Ranged(frames),
+            length,
+        }
     }
 
     fn from_segment(segment: &StoredSegment) -> Self {
@@ -159,9 +171,10 @@ impl MediaBody {
             StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) => {
                 Self::single(payload.clone())
             }
-            StoredSegmentKind::Media(SegmentBody::Chunked(parts)) => {
-                Self::from_frames(parts.iter().map(|part| part.payload.clone()).collect())
-            }
+            StoredSegmentKind::Media(SegmentBody::Chunked(parts)) => Self {
+                frames: MediaFrames::Chunked(Arc::clone(parts)),
+                length: parts.iter().map(|part| part.payload.len() as u64).sum(),
+            },
             // A gap has no bytes by construction; it exists to keep a media
             // sequence number from vanishing, not to be fetched.
             StoredSegmentKind::Gap => Self::default(),
@@ -176,8 +189,13 @@ impl MediaBody {
         self.length == 0
     }
 
-    pub fn frames(&self) -> &[Payload] {
-        &self.frames
+    pub(crate) fn into_frames(self) -> MediaFrameIter {
+        match self.frames {
+            MediaFrames::Empty => MediaFrameIter::Empty,
+            MediaFrames::Single(payload) => MediaFrameIter::Single(Some(payload)),
+            MediaFrames::Chunked(parts) => MediaFrameIter::Chunked { parts, index: 0 },
+            MediaFrames::Ranged(frames) => MediaFrameIter::Ranged(frames.into_iter()),
+        }
     }
 
     /// Clips to a byte range, splitting frames where the range falls inside
@@ -187,21 +205,60 @@ impl MediaBody {
     /// refcount operation, so a range spanning several stored parts still
     /// copies nothing.
     pub fn range(&self, start: u64, end: u64) -> Self {
-        let mut frames = Vec::new();
-        let mut position = 0_u64;
-        for frame in &self.frames {
-            let length = frame.len() as u64;
-            let frame_end = position + length;
-            if frame_end > start && position <= end {
-                let from = start.saturating_sub(position).min(length);
-                let to = (end + 1 - position).min(length);
-                frames.push(Payload::from_bytes(
-                    frame.bytes().slice(from as usize..to as usize),
-                ));
+        let frames = match &self.frames {
+            MediaFrames::Empty => Vec::new(),
+            MediaFrames::Single(payload) => clip_range(std::iter::once(payload), start, end),
+            MediaFrames::Chunked(parts) => {
+                clip_range(parts.iter().map(|part| &part.payload), start, end)
             }
-            position = frame_end;
+            MediaFrames::Ranged(frames) => clip_range(frames.iter(), start, end),
+        };
+        Self::ranged(frames)
+    }
+}
+
+fn clip_range<'a>(frames: impl Iterator<Item = &'a Payload>, start: u64, end: u64) -> Vec<Payload> {
+    let mut clipped = Vec::new();
+    let mut position = 0_u64;
+    for frame in frames {
+        let length = frame.len() as u64;
+        let frame_end = position + length;
+        if frame_end > start && position <= end {
+            let from = start.saturating_sub(position).min(length);
+            let to = (end + 1 - position).min(length);
+            clipped.push(Payload::from_bytes(
+                frame.bytes().slice(from as usize..to as usize),
+            ));
         }
-        Self::from_frames(frames)
+        position = frame_end;
+    }
+    clipped
+}
+
+pub(crate) enum MediaFrameIter {
+    Empty,
+    Single(Option<Payload>),
+    Chunked {
+        parts: Arc<[Arc<crate::delivery::hls::StoredPart>]>,
+        index: usize,
+    },
+    Ranged(std::vec::IntoIter<Payload>),
+}
+
+impl Iterator for MediaFrameIter {
+    type Item = Bytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::Single(payload) => payload.take().map(Payload::into_bytes),
+            Self::Chunked { parts, index } => {
+                let bytes = parts.get(*index)?.payload.bytes().clone();
+                *index += 1;
+                Some(bytes)
+            }
+            Self::Ranged(frames) => frames.next().map(Payload::into_bytes),
+        }
     }
 }
 
@@ -318,20 +375,20 @@ impl Origin {
     /// a cache entry is small, but one per stream retained forever is a leak
     /// with the lifetime of the process.
     pub fn prune(&self) -> usize {
-        let live: Vec<StreamId> = self.store.streams();
         let mut caches = self.caches.lock();
         let before = caches.len();
-        caches.retain(|stream, _| live.contains(stream));
+        caches.retain(|stream, _| self.store.contains(stream));
         before - caches.len()
     }
 
     fn cache_for(&self, stream: &StreamId) -> Arc<StreamPlaylistCache> {
         let mut caches = self.caches.lock();
-        Arc::clone(
-            caches
-                .entry(stream.clone())
-                .or_insert_with(|| Arc::new(StreamPlaylistCache::default())),
-        )
+        if let Some(cache) = caches.get(stream) {
+            return Arc::clone(cache);
+        }
+        let cache = Arc::new(StreamPlaylistCache::new(self.config.uri_base.uris(stream)));
+        caches.insert(stream.clone(), Arc::clone(&cache));
+        cache
     }
 
     pub async fn serve(
@@ -409,13 +466,10 @@ impl Origin {
             return Err(DeliveryError::UnknownResource);
         }
         let caches = self.cache_for(stream_id);
-        // The base is configuration rather than request context, so one render
-        // still answers every viewer of this stream.
-        let uris = self.config.uri_base.uris(stream_id);
         let rendered = caches.multivariant().get_or_render(
             PlaylistKey::multivariant(&stream),
             || -> Result<String, DeliveryError> {
-                multivariant_playlist(&stream, &self.config.playlist, &uris)?
+                multivariant_playlist(&stream, &self.config.playlist, caches.uris())?
                     .ok_or(DeliveryError::UnknownResource)
             },
         )?;
@@ -456,20 +510,25 @@ impl Origin {
             .await?;
         }
 
-        let stream = live.snapshot();
-        let snapshot = self.rendition_for(live, resource)?;
         let caches = self.cache_for(stream_id);
-        let uris = self.config.uri_base.uris(stream_id);
-        let rendered = caches.rendition(rendition).get_or_render(
-            PlaylistKey::media(&stream),
-            || -> Result<String, DeliveryError> {
-                let control = project::presentation_server_control(&stream, self.config.timing);
+        let rendered = caches.rendition(rendition).get_or_render_stable(
+            || -> Result<_, DeliveryError> {
+                let media_revision = live.media_revision();
+                let stream = live.snapshot();
+                let snapshot = rendition_for_stream(&stream, resource)?;
+                Ok((
+                    PlaylistKey::media(&stream, media_revision),
+                    (stream, snapshot),
+                ))
+            },
+            |(stream, snapshot)| -> Result<String, DeliveryError> {
+                let control = project::presentation_server_control(stream, self.config.timing);
                 Ok(media_playlist(
-                    &stream,
-                    &snapshot,
+                    stream,
+                    snapshot,
                     control,
                     &self.config.playlist,
-                    &uris,
+                    caches.uris(),
                 )?)
             },
         )?;
@@ -607,20 +666,27 @@ impl Origin {
         live: &Arc<LiveStream>,
         resource: Resource,
     ) -> Result<Arc<RenditionSnapshot>, DeliveryError> {
-        let rendition = resource.rendition().ok_or(DeliveryError::UnknownResource)?;
         let stream = live.snapshot();
-        let entry = rendition_entry(&stream, rendition).ok_or(DeliveryError::UnknownRendition)?;
-        let holds = match resource {
-            Resource::Multivariant => false,
-            Resource::MediaPlaylist(_, kind) => entry.media.kind() == kind,
-            Resource::Initialization(_, _, format)
-            | Resource::Segment(_, _, format)
-            | Resource::Part(_, _, format) => entry.contract.segment_format == format,
-        };
-        holds
-            .then(|| entry.snapshot())
-            .ok_or(DeliveryError::UnknownResource)
+        rendition_for_stream(&stream, resource)
     }
+}
+
+fn rendition_for_stream(
+    stream: &StreamSnapshot,
+    resource: Resource,
+) -> Result<Arc<RenditionSnapshot>, DeliveryError> {
+    let rendition = resource.rendition().ok_or(DeliveryError::UnknownResource)?;
+    let entry = rendition_entry(stream, rendition).ok_or(DeliveryError::UnknownRendition)?;
+    let holds = match resource {
+        Resource::Multivariant => false,
+        Resource::MediaPlaylist(_, kind) => entry.media.kind() == kind,
+        Resource::Initialization(_, _, format)
+        | Resource::Segment(_, _, format)
+        | Resource::Part(_, _, format) => entry.contract.segment_format == format,
+    };
+    holds
+        .then(|| entry.snapshot())
+        .ok_or(DeliveryError::UnknownResource)
 }
 
 fn playlist_is_ready(readiness: PlaylistReadiness, edge: &RenditionLiveEdge) -> bool {
@@ -826,7 +892,7 @@ mod tests {
         assert_eq!(response.caching, Caching::Immutable);
         assert_eq!(response.content_type, "video/iso.segment");
         assert_eq!(
-            media(&response).frames().len(),
+            media(&response).clone().into_frames().count(),
             6,
             "the six stored parts are sent as they are, not copied into one buffer"
         );
@@ -854,8 +920,7 @@ mod tests {
         assert_eq!(clipped.len(), 1_101);
         assert_eq!(
             clipped
-                .frames()
-                .iter()
+                .into_frames()
                 .map(|frame| frame.len())
                 .collect::<Vec<_>>(),
             vec![24, 1_024, 53],
@@ -1127,6 +1192,8 @@ mod tests {
 
 #[cfg(test)]
 mod cache_tests {
+    #[cfg(feature = "allocation-counting")]
+    use crate::test_alloc::count_async;
     use crate::{
         delivery::hls::fixtures::{
             chunk, initialization, lease, stream_id, video, write, write_segment,
@@ -1205,6 +1272,48 @@ mod cache_tests {
             1,
             "a cache entry per stream retained forever is a leak with the \
              lifetime of the process"
+        );
+    }
+
+    #[cfg(feature = "allocation-counting")]
+    #[tokio::test(start_paused = true)]
+    async fn retained_parts_and_cached_playlists_allocate_nothing_per_viewer() {
+        let store = StreamStore::default();
+        let origin = Origin::new(store.clone(), DeliveryConfig::default());
+        let lease = lease(&store, vec![video(0)]);
+        write(&lease, initialization(0, 1));
+        write_segment(&lease, 0, 0, 0);
+        let stream = stream_id();
+
+        let part = Request::new(
+            Resource::Part(
+                RenditionId(0),
+                PartId(1),
+                crate::mux::MediaSegmentFormat::Cmaf,
+            ),
+            None,
+        );
+        origin
+            .serve(&stream, part)
+            .await
+            .expect("warm the thread-local lock-free lookup state");
+        let (response, allocations) = count_async(origin.serve(&stream, part)).await;
+        assert!(response.is_ok());
+        assert_eq!(allocations, 0, "a retained part is handed out by refcount");
+
+        let playlist = Request::new(
+            Resource::MediaPlaylist(RenditionId(0), MediaKind::Video),
+            None,
+        );
+        origin
+            .serve(&stream, playlist)
+            .await
+            .expect("the first request warms the render cache");
+        let (response, allocations) = count_async(origin.serve(&stream, playlist)).await;
+        assert!(response.is_ok());
+        assert_eq!(
+            allocations, 0,
+            "a cached playlist request only clones stable handles"
         );
     }
 }

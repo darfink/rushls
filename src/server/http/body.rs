@@ -17,24 +17,19 @@ use std::{
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 
-use crate::delivery::hls::serve::MediaBody;
+use crate::delivery::hls::serve::{MediaBody, MediaFrameIter};
 
 /// An HTTP body over the buffers media was stored in.
 pub struct StoredMediaBody {
-    frames: std::vec::IntoIter<Bytes>,
+    frames: MediaFrameIter,
     remaining: u64,
 }
 
 impl StoredMediaBody {
     pub fn new(media: MediaBody) -> Self {
         let remaining = media.len();
-        let frames: Vec<Bytes> = media
-            .frames()
-            .iter()
-            .map(|payload| payload.bytes().clone())
-            .collect();
         Self {
-            frames: frames.into_iter(),
+            frames: media.into_frames(),
             remaining,
         }
     }
@@ -156,6 +151,9 @@ pub enum RangeOutcome {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "allocation-counting")]
+    use crate::{domain::Payload, test_alloc::count};
+
     use super::*;
 
     #[test]
@@ -202,5 +200,13 @@ mod tests {
         );
         assert_eq!(parse_range("items=0-10", 1_000), RangeOutcome::Ignore);
         assert_eq!(parse_range("bytes=abc-def", 1_000), RangeOutcome::Ignore);
+    }
+
+    #[cfg(feature = "allocation-counting")]
+    #[test]
+    fn one_stored_frame_needs_no_iterator_allocation() {
+        let media = MediaBody::single(Payload::from(&b"media"[..]));
+        let (_, allocations) = count(|| StoredMediaBody::new(media));
+        assert_eq!(allocations, 0);
     }
 }

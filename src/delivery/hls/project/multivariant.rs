@@ -187,7 +187,7 @@ fn write_variant<W: Write + ?Sized>(
             .map(str::trim)
             .filter(|codec| !codec.is_empty())
         {
-            if seen.insert(codec.to_owned()) {
+            if seen.insert(codec) {
                 if !codecs.is_empty() {
                     codecs.push(',');
                 }

@@ -10,7 +10,14 @@
 //! anyone. Reads never take it at all: they load an [`Arc`] from an
 //! [`ArcSwap`] and are unaffected by whatever the writer does next.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use arc_swap::ArcSwap;
 use parking_lot::RwLock;
@@ -36,6 +43,9 @@ pub struct LiveStream {
     /// Slow-changing request-facing topology and lifecycle state. Each
     /// rendition replaces its media snapshot independently.
     snapshot: ArcSwap<StreamSnapshot>,
+    /// Exact invalidation epoch for every media-playlist-visible rendition
+    /// snapshot change. Kept beside the catalog so a chunk does not rebuild it.
+    media_revision: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -46,6 +56,9 @@ pub struct StreamState {
     issued_renditions: u32,
     /// Changes only for lifecycle, topology, or advertised metadata.
     catalog_revision: u64,
+    /// Catalog inputs consumed by media playlists. Bandwidth is deliberately
+    /// excluded because it is rendered only by the multivariant playlist.
+    media_catalog_revision: u64,
     ended: bool,
     /// Monotonic publisher generation and the current lease's identity.
     publication: u64,
@@ -58,6 +71,7 @@ impl LiveStream {
     pub fn new(limits: RetentionPolicy) -> Self {
         let snapshot = StreamSnapshot {
             revision: 0,
+            media_catalog_revision: 0,
             ended: false,
             idle: true,
             presentation: None,
@@ -72,17 +86,23 @@ impl LiveStream {
                 publication_anchors: Vec::new(),
                 issued_renditions: 0,
                 catalog_revision: 0,
+                media_catalog_revision: 0,
                 ended: false,
                 publication: 0,
                 idle_since: Some(Instant::now()),
                 retained_payload_bytes: 0,
             }),
             snapshot: ArcSwap::from_pointee(snapshot),
+            media_revision: AtomicU64::new(0),
         }
     }
 
     pub fn revision(&self) -> u64 {
         self.snapshot.load().revision
+    }
+
+    pub fn media_revision(&self) -> u64 {
+        self.media_revision.load(Ordering::Acquire)
     }
 
     pub fn is_ended(&self) -> bool {
@@ -207,6 +227,7 @@ impl LiveStream {
             .into();
         self.snapshot.store(Arc::new(StreamSnapshot {
             revision: state.catalog_revision,
+            media_catalog_revision: state.media_catalog_revision,
             ended: state.ended,
             idle: state.idle_since.is_some(),
             presentation: state.active_presentation.clone(),
@@ -311,7 +332,9 @@ impl LiveStream {
         state.prune_publication_anchors();
         state.recalculate_retained_bytes();
         state.bump_catalog();
+        state.bump_media_catalog();
         self.publish_catalog(&state);
+        self.advance_media_revision();
         drop(state);
 
         notify_edges(edge_updates);
@@ -337,7 +360,9 @@ impl LiveStream {
             })
             .collect();
         state.bump_catalog();
+        state.bump_media_catalog();
         self.publish_catalog(&state);
+        self.advance_media_revision();
         drop(state);
         notify_edges(edge_updates);
     }
@@ -361,6 +386,7 @@ impl LiveStream {
         // consistent state rather than waiting on media nobody will publish.
         let edge_updates = state.end(now, self.limits);
         self.publish_catalog(&state);
+        self.advance_media_revision();
         drop(state);
 
         notify_edges(edge_updates);
@@ -369,7 +395,9 @@ impl LiveStream {
 
     pub fn sweep_expired(&self) {
         let mut state = self.state.write();
-        state.sweep_expired(Instant::now());
+        if state.sweep_expired(Instant::now()) {
+            self.advance_media_revision();
+        }
     }
 
     pub fn write(
@@ -387,7 +415,9 @@ impl LiveStream {
         // publishes its cleanup immediately, so even a subsequently rejected
         // event cannot leave the request-facing cache pointing at expired
         // initialization state.
-        state.sweep_expired(now);
+        if state.sweep_expired(now) {
+            self.advance_media_revision();
+        }
 
         let existing = state
             .renditions
@@ -435,6 +465,7 @@ impl LiveStream {
             state.bump_catalog();
             self.publish_catalog(&state);
         }
+        self.advance_media_revision();
         drop(state);
 
         notify_edges([update]);
@@ -449,10 +480,19 @@ impl LiveStream {
         }
         let edge_updates = state.end(now, self.limits);
         self.publish_catalog(&state);
+        self.advance_media_revision();
         drop(state);
 
         notify_edges(edge_updates);
         true
+    }
+
+    fn advance_media_revision(&self) {
+        let _ =
+            self.media_revision
+                .fetch_update(Ordering::Release, Ordering::Relaxed, |revision| {
+                    Some(revision.saturating_add(1))
+                });
     }
 }
 
@@ -475,11 +515,16 @@ impl StreamState {
         self.ended = true;
         self.recalculate_retained_bytes();
         self.bump_catalog();
+        self.bump_media_catalog();
         updates
     }
 
     fn bump_catalog(&mut self) {
         self.catalog_revision = self.catalog_revision.saturating_add(1);
+    }
+
+    fn bump_media_catalog(&mut self) {
+        self.media_catalog_revision = self.media_catalog_revision.saturating_add(1);
     }
 
     fn sweep_expired(&mut self, now: Instant) -> bool {

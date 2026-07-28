@@ -383,12 +383,13 @@ fn direct_segments_remain_contiguous() {
     configure(&lease, 0, false);
     write(&lease, direct(0, 0, 0, 6, 9));
 
-    let segment = &lease.live().rendition(RenditionId(0)).unwrap().segments[0];
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    let segment = &snapshot.segments[0];
     assert!(matches!(
         &segment.kind,
         StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) if payload.len() == 9
     ));
-    assert!(segment.parts.is_empty());
+    assert!(snapshot.segments.parts(segment).is_empty());
     assert_eq!(
         lease
             .live()
@@ -541,6 +542,14 @@ fn takeover_consumes_an_observed_open_msn_as_a_gap() {
     let snapshot = second.live().rendition(RenditionId(0)).unwrap();
     assert!(matches!(snapshot.segments[0].kind, StoredSegmentKind::Gap));
     assert_eq!(snapshot.segments[0].msn, Msn(0));
+    assert!(
+        snapshot.segments.parts(&snapshot.segments[0]).is_empty(),
+        "a gap beyond the visibility frontier cannot expose the parts it replaced"
+    );
+    assert!(
+        second.live().part(RenditionId(0), PartId(1)).is_some(),
+        "the hidden part remains independently fetchable during its grace period"
+    );
     let open = snapshot.open_segment.as_ref().unwrap();
     assert_eq!(open.msn, Msn(1));
     assert_eq!(open.parts[0].id, PartId(2));
@@ -648,6 +657,7 @@ async fn rendition_watchers_are_isolated_and_bitrate_updates_bump_the_catalog() 
     configure(&lease, 0, true);
     configure(&lease, 1, true);
     let catalog_revision = lease.live().revision();
+    let media_catalog_revision = lease.live().snapshot().media_catalog_revision;
     let mut first = lease.live().subscribe_rendition(RenditionId(0)).unwrap();
     let mut sibling = lease.live().subscribe_rendition(RenditionId(1)).unwrap();
     first.borrow_and_update();
@@ -666,6 +676,10 @@ async fn rendition_watchers_are_isolated_and_bitrate_updates_bump_the_catalog() 
         "completed-segment bitrate statistics invalidate the multivariant projection"
     );
     let catalog = lease.live().snapshot();
+    assert_eq!(
+        catalog.media_catalog_revision, media_catalog_revision,
+        "bandwidth does not invalidate media playlists that never render it"
+    );
     assert_eq!(
         catalog.renditions[0].bandwidth,
         catalog.renditions[0].snapshot().bitrate.advertised(),
@@ -761,7 +775,7 @@ async fn part_tags_and_resources_have_distinct_retention_deadlines() {
     }
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
     assert!(
-        snapshot.segments[0].parts.is_empty(),
+        snapshot.segments.parts(&snapshot.segments[0]).is_empty(),
         "the tag is hidden once it is over three targets behind"
     );
     assert!(lease.live().part(RenditionId(0), part_id).is_some());
@@ -787,17 +801,11 @@ fn part_tag_retention_never_exposes_only_a_parent_segment_suffix() {
         write(&lease, chunk(0, 3, index, 18 + i64::from(index), 1, 1));
     }
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
-    assert_eq!(snapshot.segments[0].parts.len(), 6);
+    let parts = snapshot.segments.parts(&snapshot.segments[0]);
+    assert_eq!(parts.len(), 6);
+    assert_eq!(parts[0].media_start, snapshot.segments[0].media_start);
     assert_eq!(
-        snapshot.segments[0].parts[0].media_start,
-        snapshot.segments[0].media_start
-    );
-    assert_eq!(
-        snapshot.segments[0]
-            .parts
-            .iter()
-            .map(|part| part.duration)
-            .sum::<u64>(),
+        parts.iter().map(|part| part.duration).sum::<u64>(),
         snapshot.segments[0].duration
     );
 
@@ -809,7 +817,7 @@ fn part_tag_retention_never_exposes_only_a_parent_segment_suffix() {
 
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
     assert!(
-        snapshot.segments[0].parts.is_empty(),
+        snapshot.segments.parts(&snapshot.segments[0]).is_empty(),
         "all PART tags leave once the final part exceeds retention"
     );
 }

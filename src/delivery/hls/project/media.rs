@@ -69,22 +69,24 @@ pub fn media_playlist(
     // where it actually changes and PROGRAM-DATE-TIME is not restated on every
     // segment unless asked for.
     let mut state = Emitted::default();
-    for segment in &rendition.segments {
+    let mut uri = String::new();
+    for segment in rendition.segments.iter() {
         write_parent_tags(
             &mut writer,
             &mut state,
-            segment.into(),
+            segment.as_ref().into(),
             stream,
             rendition,
             &names,
             timebase,
             policy,
+            &mut uri,
         )?;
-        for part in &segment.parts {
-            write_part(&mut writer, part, &names, timebase)?;
+        for part in rendition.segments.parts(segment) {
+            write_part(&mut writer, part, &names, timebase, &mut uri)?;
         }
         writer.segment(Segment {
-            uri: &names.segment(segment.id),
+            uri: names.segment(segment.id, &mut uri),
             duration: timebase.ticks_to_duration(segment.duration),
             gap: matches!(segment.kind, StoredSegmentKind::Gap),
         })?;
@@ -100,9 +102,10 @@ pub fn media_playlist(
             &names,
             timebase,
             policy,
+            &mut uri,
         )?;
         for part in &open.parts {
-            write_part(&mut writer, part, &names, timebase)?;
+            write_part(&mut writer, part, &names, timebase, &mut uri)?;
         }
     }
 
@@ -111,11 +114,17 @@ pub fn media_playlist(
     if let Some(next) = rendition.live_edge.next_part_id {
         writer.preload_hint(PreloadHint {
             hint_type: PreloadHintType::Part,
-            uri: &names.part(next),
+            uri: names.part(next, &mut uri),
         })?;
     }
 
-    write_rendition_reports(&mut writer, stream, rendition.rendition_id, &names)?;
+    write_rendition_reports(
+        &mut writer,
+        stream,
+        rendition.rendition_id,
+        &names,
+        &mut uri,
+    )?;
 
     if rendition.live_edge.ended {
         writer.endlist()?;
@@ -180,6 +189,7 @@ fn write_parent_tags<W: Write + ?Sized>(
     names: &RenditionUris<'_>,
     timebase: Timebase,
     policy: &PlaylistPolicy,
+    uri: &mut String,
 ) -> Result<(), ProjectionError> {
     // The tag stays printed for as long as its segment is visible, including
     // at the window head; EXT-X-DISCONTINUITY-SEQUENCE counts only the ones
@@ -198,8 +208,8 @@ fn write_parent_tags<W: Write + ?Sized>(
                 },
             )?;
             writer.initialization_map(
-                &names
-                    .initialization(held.id)
+                names
+                    .initialization(held.id, uri)
                     .ok_or(ProjectionError::UnnameableResource)?,
             )?;
             state.initialization = Some(initialization);
@@ -229,9 +239,10 @@ fn write_part<W: Write + ?Sized>(
     part: &StoredPart,
     names: &RenditionUris<'_>,
     timebase: Timebase,
+    uri: &mut String,
 ) -> Result<(), ProjectionError> {
     writer.part(Part {
-        uri: &names.part(part.id),
+        uri: names.part(part.id, uri),
         duration: timebase.ticks_to_duration(part.duration),
         independent: part.independent,
         gap: false,
@@ -246,6 +257,7 @@ fn write_rendition_reports<W: Write + ?Sized>(
     stream: &StreamSnapshot,
     self_id: RenditionId,
     names: &RenditionUris<'_>,
+    uri: &mut String,
 ) -> Result<(), ProjectionError> {
     for entry in stream.renditions.iter() {
         if entry.rendition_id == self_id || !entry.active {
@@ -261,7 +273,7 @@ fn write_rendition_reports<W: Write + ?Sized>(
             (None, None) => continue,
         };
         writer.rendition_report(RenditionReport {
-            uri: &names.sibling_playlist(entry.rendition_id, entry.media.kind()),
+            uri: names.sibling_playlist(entry.rendition_id, entry.media.kind(), uri),
             last_media_sequence,
             last_part,
         })?;
@@ -285,7 +297,7 @@ fn estimated_size(rendition: &RenditionSnapshot) -> usize {
     let parts: usize = rendition
         .segments
         .iter()
-        .map(|segment| segment.parts.len())
+        .map(|segment| rendition.segments.parts(segment).len())
         .sum::<usize>()
         + rendition
             .open_segment

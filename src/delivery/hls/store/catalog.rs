@@ -124,6 +124,9 @@ pub struct StreamSnapshot {
     /// Changes only for lifecycle, rendition topology, or advertised metadata,
     /// including bandwidth values used by the multivariant projection.
     pub revision: u64,
+    /// Slow-changing inputs used by media playlists, excluding bandwidth-only
+    /// catalog updates that affect only the multivariant projection.
+    pub media_catalog_revision: u64,
     pub ended: bool,
     pub idle: bool,
     /// Current topology used for new multivariant projections.

@@ -30,9 +30,9 @@ use crate::{
 
 use super::{
     InitializationId, Msn, OpenSegment, PartCursor, PartId, PartIndex, PlaylistContract,
-    RenditionBitrateStatistics, RenditionSnapshot, RenditionView, RetentionPolicy, SegmentBody,
-    SegmentId, StoreWriteError, StoredInitialization, StoredPart, StoredSegment, StoredSegmentKind,
-    bitrate::BitrateTracker, media::segment_byte_len,
+    PublishedSegments, RenditionBitrateStatistics, RenditionSnapshot, RenditionView,
+    RetentionPolicy, SegmentBody, SegmentId, StoreWriteError, StoredInitialization, StoredPart,
+    StoredSegment, StoredSegmentKind, bitrate::BitrateTracker, media::segment_byte_len,
 };
 
 /// A committed live edge and the channel that should announce it.
@@ -153,11 +153,13 @@ pub struct RenditionState {
     pub active_config: Option<(u64, RenditionConfig)>,
     /// Initialization sections remain while current or retained media
     /// references them. Payload clones are refcounts, not byte copies.
-    initializations: Vec<StoredInitialization>,
+    initializations: Arc<[StoredInitialization]>,
     pub current_initialization: Option<InitializationId>,
     issued_initializations: u64,
     /// Segment IDs appearing in the current playlist window, in MSN order.
     visible_segments: VecDeque<SegmentId>,
+    /// Completed playlist parents rebuilt only when the visible window changes.
+    published_segments: Arc<[Arc<StoredSegment>]>,
     /// Downloadable segment resources, including entries no longer visible
     /// whose HLS availability deadline has not elapsed.
     segment_resources: HashMap<SegmentId, SegmentResource>,
@@ -207,8 +209,8 @@ impl RenditionState {
             contract,
             media_sequence: 0,
             discontinuity_sequence: 0,
-            initializations: Vec::new(),
-            segments: Vec::new(),
+            initializations: Arc::from([]),
+            segments: PublishedSegments::default(),
             open_segment: None,
             live_edge,
             bitrate: RenditionBitrateStatistics::default(),
@@ -221,10 +223,11 @@ impl RenditionState {
             contract,
             active: false,
             retired: false,
-            initializations: Vec::new(),
+            initializations: Arc::from([]),
             current_initialization: None,
             issued_initializations: 0,
             visible_segments: VecDeque::new(),
+            published_segments: Arc::from([]),
             segment_resources: HashMap::new(),
             part_order: VecDeque::new(),
             part_resources: HashMap::new(),
@@ -294,16 +297,12 @@ impl RenditionState {
                 .get(&part.id)
                 .is_some_and(|resource| resource.playlist_visible)
         };
-        let segments = self
-            .visible_segments
+        let parts_visible_from = self
+            .part_order
             .iter()
-            .filter_map(|id| self.segment_resources.get(id))
-            .map(|resource| {
-                let mut segment = (*resource.segment).clone();
-                segment.parts.retain(&visible);
-                segment
-            })
-            .collect();
+            .filter_map(|id| self.part_resources.get(id))
+            .find(|resource| resource.playlist_visible)
+            .map(|resource| resource.part.cursor.msn);
         let open_segment = self.open_segment.as_ref().map(|open| {
             let mut open = open.clone();
             open.parts.retain(&visible);
@@ -315,8 +314,11 @@ impl RenditionState {
             contract: self.contract,
             media_sequence: self.media_sequence,
             discontinuity_sequence: self.discontinuity_sequence,
-            initializations: self.initializations.clone(),
-            segments,
+            initializations: Arc::clone(&self.initializations),
+            segments: PublishedSegments::new(
+                Arc::clone(&self.published_segments),
+                parts_visible_from,
+            ),
             open_segment,
             live_edge: self.live_edge,
             bitrate: self.bitrate.snapshot(),
@@ -598,11 +600,13 @@ impl RenditionState {
         self.issued_initializations = self.issued_initializations.saturating_add(1);
         let id = InitializationId(self.issued_initializations);
         self.current_initialization = Some(id);
-        self.initializations.push(StoredInitialization {
+        let mut initializations = self.initializations.to_vec();
+        initializations.push(StoredInitialization {
             id,
             version: segment.version,
             payload: segment.payload,
         });
+        self.initializations = initializations.into();
     }
 
     fn push_chunk(
@@ -700,7 +704,6 @@ impl RenditionState {
             // Decided when the segment opened; completing it only preserves
             // the answer its already-published parts were tagged under.
             discontinuity_before: open.discontinuity_before,
-            parts: parts.iter().cloned().collect(),
             kind: StoredSegmentKind::Media(SegmentBody::Chunked(Arc::clone(&parts))),
         };
         self.commit_segment(
@@ -734,7 +737,6 @@ impl RenditionState {
             timebase: config.timebase,
             independent: packaged.independent,
             discontinuity_before: self.opens_discontinuity(publication),
-            parts: Vec::new(),
             kind: StoredSegmentKind::Media(SegmentBody::Contiguous(packaged.payload)),
         };
         self.last_parent_publication = Some(publication);
@@ -858,6 +860,13 @@ impl RenditionState {
         self.refresh_media_sequence();
         self.hide_old_parts(now, retention);
         self.sweep_expired(now);
+        self.published_segments = self
+            .visible_segments
+            .iter()
+            .filter_map(|id| self.segment_resources.get(id))
+            .map(|resource| Arc::clone(&resource.segment))
+            .collect::<Vec<_>>()
+            .into();
     }
 
     /// Whether a parent segment created for `publication` follows a splice.
@@ -914,7 +923,6 @@ impl RenditionState {
             timebase: config.timebase,
             independent: false,
             discontinuity_before: open.discontinuity_before,
-            parts: Vec::new(),
             kind: StoredSegmentKind::Gap,
         };
         self.advance_playlist(
@@ -931,32 +939,44 @@ impl RenditionState {
         // hiding a prefix makes its advertised start and duration contradict
         // EXTINF. Age the parent from its last part so the whole description
         // enters and leaves the playlist atomically.
-        let mut visible_parents = Vec::<(Msn, PartId)>::new();
-        for id in &self.part_order {
-            let Some(resource) = self.part_resources.get(id) else {
-                continue;
+        let hide_through = {
+            let expired = |last_part: PartId| {
+                let resource = self
+                    .part_resources
+                    .get(&last_part)
+                    .expect("visible part was read from this map");
+                let maximum_age = retention.part_tag_retention_for(resource.segment_target);
+                live_position.saturating_sub(resource.playlist_end) > maximum_age
             };
-            if !resource.playlist_visible {
-                continue;
+            let mut current = None::<(Msn, PartId)>;
+            let mut hidden = None;
+            for id in &self.part_order {
+                let Some(resource) = self
+                    .part_resources
+                    .get(id)
+                    .filter(|resource| resource.playlist_visible)
+                else {
+                    continue;
+                };
+                let msn = resource.part.cursor.msn;
+                if let Some((previous, last_part)) = current
+                    && previous != msn
+                {
+                    if !expired(last_part) {
+                        current = None;
+                        break;
+                    }
+                    hidden = Some(previous);
+                }
+                current = Some((msn, *id));
             }
-            match visible_parents.last_mut() {
-                Some((msn, last_part)) if *msn == resource.part.cursor.msn => *last_part = *id,
-                _ => visible_parents.push((resource.part.cursor.msn, *id)),
+            if let Some((msn, last_part)) = current
+                && expired(last_part)
+            {
+                hidden = Some(msn);
             }
-        }
-
-        let mut hide_through = None;
-        for (msn, last_part) in visible_parents {
-            let resource = self
-                .part_resources
-                .get(&last_part)
-                .expect("visible part was collected from this map");
-            let maximum_age = retention.part_tag_retention_for(resource.segment_target);
-            if live_position.saturating_sub(resource.playlist_end) <= maximum_age {
-                break;
-            }
-            hide_through = Some(msn);
-        }
+            hidden
+        };
 
         let Some(hide_through) = hide_through else {
             return;
@@ -1065,22 +1085,36 @@ impl RenditionState {
         // standalone part, and open segment that names it has gone. The
         // current initialization is retained even before its first media
         // object arrives, so publishing the header and then a chunk is safe.
-        let current = self.current_initialization;
-        self.initializations.retain(|held| {
-            Some(held.id) == current
-                || self
-                    .segment_resources
-                    .values()
-                    .any(|resource| resource.segment.initialization == held.id)
-                || self
-                    .part_resources
-                    .values()
-                    .any(|resource| resource.part.initialization == held.id)
-                || self
-                    .open_segment
-                    .as_ref()
-                    .is_some_and(|open| open.initialization == held.id)
-        });
+        if self
+            .initializations
+            .iter()
+            .all(|held| self.initialization_is_reachable(held.id))
+        {
+            return;
+        }
+        let retained: Vec<_> = self
+            .initializations
+            .iter()
+            .filter(|held| self.initialization_is_reachable(held.id))
+            .cloned()
+            .collect();
+        self.initializations = retained.into();
+    }
+
+    fn initialization_is_reachable(&self, id: InitializationId) -> bool {
+        self.current_initialization == Some(id)
+            || self
+                .segment_resources
+                .values()
+                .any(|resource| resource.segment.initialization == id)
+            || self
+                .part_resources
+                .values()
+                .any(|resource| resource.part.initialization == id)
+            || self
+                .open_segment
+                .as_ref()
+                .is_some_and(|open| open.initialization == id)
     }
 
     fn advance_edge(&mut self, ended: bool) -> super::RenditionLiveEdge {

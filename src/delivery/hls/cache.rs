@@ -16,8 +16,8 @@
 //! a stale report is worse than none, because a client switching renditions
 //! acts on it.
 //!
-//! The key is therefore the catalog revision, this rendition's edge revision,
-//! and every sibling's edge revision.
+//! The key is therefore the media-catalog revision plus the stream's exact
+//! media epoch, which advances after any rendition snapshot is published.
 
 use std::sync::Arc;
 
@@ -27,16 +27,15 @@ use parking_lot::Mutex;
 
 use crate::domain::RenditionId;
 
-use super::StreamSnapshot;
+use super::{StreamSnapshot, uri::PlaylistUris};
 
 /// Identifies exactly the inputs a rendered media playlist depends on.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PlaylistKey {
-    /// Changes on topology, lifecycle, and advertised-metadata replacement.
+    /// Changes when the slow inputs consumed by this playlist change.
     catalog_revision: u64,
-    /// Every active rendition's edge revision, in catalog order, including
-    /// this playlist's own.
-    edges: Vec<u64>,
+    /// Changes after any rendition snapshot that can affect a media playlist.
+    media_revision: u64,
 }
 
 impl PlaylistKey {
@@ -48,23 +47,15 @@ impl PlaylistKey {
     pub fn multivariant(stream: &StreamSnapshot) -> Self {
         Self {
             catalog_revision: stream.revision,
-            edges: Vec::new(),
+            media_revision: 0,
         }
     }
 
     /// Reads the current key for one media playlist of a stream.
-    ///
-    /// Sibling snapshots are loaded here rather than inside the projection so
-    /// that the key and the render see the same instants: the same handles are
-    /// then passed on to be rendered.
-    pub fn media(stream: &StreamSnapshot) -> Self {
+    pub fn media(stream: &StreamSnapshot, media_revision: u64) -> Self {
         Self {
-            catalog_revision: stream.revision,
-            edges: stream
-                .renditions
-                .iter()
-                .map(|entry| entry.snapshot().live_edge.revision)
-                .collect(),
+            catalog_revision: stream.media_catalog_revision,
+            media_revision,
         }
     }
 }
@@ -113,6 +104,13 @@ impl PlaylistCache {
             .map(|cached| cached.rendered.clone())
     }
 
+    fn hit(&self, key: &PlaylistKey) -> Option<Rendered> {
+        self.get(key).map(|bytes| Rendered {
+            bytes,
+            freshly_rendered: false,
+        })
+    }
+
     /// Returns the cached text, rendering it with `render` if it is stale.
     ///
     /// `render` may run more than once across threads only if the key changes
@@ -124,41 +122,77 @@ impl PlaylistCache {
         key: PlaylistKey,
         render: impl FnOnce() -> Result<String, E>,
     ) -> Result<Rendered, E> {
-        if let Some(cached) = self.get(&key) {
-            return Ok(Rendered {
-                bytes: cached,
-                freshly_rendered: false,
-            });
+        let mut render = Some(render);
+        self.get_or_render_stable(
+            || Ok((key, ())),
+            |_| {
+                render
+                    .take()
+                    .expect("an unchanging playlist key renders at most once")()
+            },
+        )
+    }
+
+    /// Renders from one stable capture of independently published snapshots.
+    ///
+    /// A rendition may advance between loading the key and loading the sibling
+    /// edges used by rendition reports. Re-capturing after projection prevents
+    /// those mixed bytes from being cached under an epoch they do not describe.
+    pub fn get_or_render_stable<T, E>(
+        &self,
+        mut capture: impl FnMut() -> Result<(PlaylistKey, T), E>,
+        mut render: impl FnMut(&T) -> Result<String, E>,
+    ) -> Result<Rendered, E> {
+        let (key, _) = capture()?;
+        if let Some(cached) = self.hit(&key) {
+            return Ok(cached);
         }
+
         let _rendering = self.rendering.lock();
-        // Re-checked under the lock: whoever held it may have rendered exactly
-        // what this caller wanted while it waited.
-        if let Some(cached) = self.get(&key) {
+        loop {
+            let (key, inputs) = capture()?;
+            // Whoever held the render lock may have filled this exact epoch.
+            if let Some(cached) = self.hit(&key) {
+                return Ok(cached);
+            }
+            let rendered = render(&inputs)?;
+            let (current, _) = capture()?;
+            if current != key {
+                continue;
+            }
+            let bytes = Bytes::from(rendered.into_bytes());
+            self.latest.store(Arc::new(Some(Cached {
+                key,
+                rendered: bytes.clone(),
+            })));
             return Ok(Rendered {
-                bytes: cached,
-                freshly_rendered: false,
+                bytes,
+                freshly_rendered: true,
             });
         }
-        let bytes = Bytes::from(render()?.into_bytes());
-        self.latest.store(Arc::new(Some(Cached {
-            key,
-            rendered: bytes.clone(),
-        })));
-        Ok(Rendered {
-            bytes,
-            freshly_rendered: true,
-        })
     }
 }
 
 /// Per-rendition playlist caches for one stream.
 #[derive(Debug, Default)]
 pub struct StreamPlaylistCache {
+    uris: PlaylistUris,
     multivariant: PlaylistCache,
     renditions: Mutex<Vec<(RenditionId, Arc<PlaylistCache>)>>,
 }
 
 impl StreamPlaylistCache {
+    pub fn new(uris: PlaylistUris) -> Self {
+        Self {
+            uris,
+            ..Self::default()
+        }
+    }
+
+    pub fn uris(&self) -> &PlaylistUris {
+        &self.uris
+    }
+
     pub fn multivariant(&self) -> &PlaylistCache {
         &self.multivariant
     }
@@ -176,6 +210,8 @@ impl StreamPlaylistCache {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use crate::{
         delivery::hls::{
             StreamStore,
@@ -194,7 +230,7 @@ mod tests {
 
         for _ in 0..3 {
             let rendered = cache
-                .get_or_render::<()>(key.clone(), || {
+                .get_or_render::<()>(key, || {
                     renders += 1;
                     Ok("#EXTM3U\n".to_owned())
                 })
@@ -206,6 +242,48 @@ mod tests {
     }
 
     #[test]
+    fn a_revision_change_during_projection_is_rendered_again_before_caching() {
+        let cache = PlaylistCache::new();
+        let revision = Cell::new(0);
+        let renders = Cell::new(0);
+        let rendered = cache
+            .get_or_render_stable::<_, ()>(
+                || {
+                    Ok((
+                        PlaylistKey {
+                            catalog_revision: 1,
+                            media_revision: revision.get(),
+                        },
+                        (),
+                    ))
+                },
+                |_| {
+                    let attempt = renders.get();
+                    renders.set(attempt + 1);
+                    if attempt == 0 {
+                        revision.set(1);
+                        Ok("mixed".to_owned())
+                    } else {
+                        Ok("stable".to_owned())
+                    }
+                },
+            )
+            .expect("stable rendering succeeds");
+
+        assert_eq!(rendered.bytes, "stable");
+        assert_eq!(renders.get(), 2);
+        assert!(
+            cache
+                .get(&PlaylistKey {
+                    catalog_revision: 1,
+                    media_revision: 0,
+                })
+                .is_none(),
+            "bytes observed across a revision change are never cached"
+        );
+    }
+
+    #[test]
     fn a_siblings_advance_invalidates_a_playlist_that_reports_it() {
         let store = StreamStore::default();
         let lease = lease(&store, vec![video(0), audio(1)]);
@@ -214,12 +292,12 @@ mod tests {
             write_segment(&lease, local, 0, 0);
         }
 
-        let before = PlaylistKey::media(&lease.live().snapshot());
+        let before = PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision());
 
         // Only the *audio* rendition advances. The video playlist's own edge is
         // untouched, but its EXT-X-RENDITION-REPORT for audio is now wrong.
         write(&lease, chunk(1, 1, 0, 6));
-        let after = PlaylistKey::media(&lease.live().snapshot());
+        let after = PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision());
 
         assert_ne!(
             before, after,
@@ -229,7 +307,7 @@ mod tests {
 
         let cache = PlaylistCache::new();
         cache
-            .get_or_render::<()>(before.clone(), || Ok("stale".to_owned()))
+            .get_or_render::<()>(before, || Ok("stale".to_owned()))
             .expect("renders");
         assert!(cache.get(&after).is_none());
         assert_eq!(
@@ -246,15 +324,16 @@ mod tests {
         write(&lease, initialization(0, 1));
         write_segment(&lease, 0, 0, 0);
 
-        let key = PlaylistKey::media(&lease.live().snapshot());
+        let key = PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision());
         let cache = PlaylistCache::new();
         let first = cache
-            .get_or_render::<()>(key.clone(), || Ok("#EXTM3U\n".to_owned()))
+            .get_or_render::<()>(key, || Ok("#EXTM3U\n".to_owned()))
             .expect("renders");
         let second = cache
-            .get_or_render::<()>(PlaylistKey::media(&lease.live().snapshot()), || {
-                panic!("nothing changed, so nothing should be re-rendered")
-            })
+            .get_or_render::<()>(
+                PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision()),
+                || panic!("nothing changed, so nothing should be re-rendered"),
+            )
             .expect("reuses");
 
         assert!(
@@ -273,7 +352,7 @@ mod tests {
 
         let before = lease.live().snapshot();
         let multivariant_before = PlaylistKey::multivariant(&before);
-        let media_before = PlaylistKey::media(&before);
+        let media_before = PlaylistKey::media(&before, lease.live().media_revision());
 
         write(&lease, chunk(0, 1, 0, 6));
         let after = lease.live().snapshot();
@@ -285,7 +364,7 @@ mod tests {
         );
         assert_ne!(
             media_before,
-            PlaylistKey::media(&after),
+            PlaylistKey::media(&after, lease.live().media_revision()),
             "the media playlist gained a part and a new live edge"
         );
     }

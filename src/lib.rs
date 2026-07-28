@@ -45,3 +45,6 @@ pub mod segment;
 pub mod server;
 pub mod session;
 pub mod source;
+
+#[cfg(all(test, feature = "allocation-counting"))]
+pub mod test_alloc;

@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::domain::{Payload, RenditionId, TickDuration, TickTimestamp, Timebase};
 use crate::mux::{PackagingSegmentId, RenditionConfig};
+use derive_more::Deref;
 
 use super::{InitializationId, Msn, PartCursor, PartId, PlaylistContract, SegmentId};
 
@@ -82,9 +83,40 @@ pub struct StoredSegment {
     /// and a discontinuity that vanished with it would splice two publications
     /// together silently.
     pub discontinuity_before: bool,
-    /// Parts still eligible to appear as EXT-X-PART tags.
-    pub parts: Vec<Arc<StoredPart>>,
     pub kind: StoredSegmentKind,
+}
+
+/// Completed segments and the prefix frontier controlling their PART tags.
+///
+/// Part retention hides whole completed parents from oldest to newest. A gap
+/// may sit beyond the frontier after an interrupted open segment, but its kind
+/// carries no part body, so it still cannot expose the retained payloads it
+/// replaced.
+#[derive(Clone, Debug, Default, Deref, Eq, PartialEq)]
+pub struct PublishedSegments {
+    #[deref]
+    entries: Arc<[Arc<StoredSegment>]>,
+    parts_visible_from: Option<Msn>,
+}
+
+impl PublishedSegments {
+    pub(crate) fn new(entries: Arc<[Arc<StoredSegment>]>, parts_visible_from: Option<Msn>) -> Self {
+        Self {
+            entries,
+            parts_visible_from,
+        }
+    }
+
+    pub fn parts<'a>(&self, segment: &'a StoredSegment) -> &'a [Arc<StoredPart>] {
+        if self
+            .parts_visible_from
+            .is_some_and(|frontier| segment.msn >= frontier)
+            && let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) = &segment.kind
+        {
+            return parts;
+        }
+        &[]
+    }
 }
 
 /// The bytes a completed segment charges against the retention budget.
@@ -187,8 +219,8 @@ pub struct RenditionSnapshot {
     ///
     /// This is intentionally not just the newest header: media from the
     /// previous publisher may remain fetchable after takeover.
-    pub initializations: Vec<StoredInitialization>,
-    pub segments: Vec<StoredSegment>,
+    pub initializations: Arc<[StoredInitialization]>,
+    pub segments: PublishedSegments,
     pub open_segment: Option<OpenSegment>,
     pub live_edge: RenditionLiveEdge,
     pub bitrate: RenditionBitrateStatistics,

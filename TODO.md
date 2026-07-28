@@ -23,29 +23,12 @@
 - Delta playlists
 - Do we want enriched content-types? E.g. codecs, charset etc
 
-# Steps
+# MUST DOES
 
-- SRT ingest
-- Media normalization — done
-- CMAF muxing — done
-- HLS generation — done (`delivery::hls::project`)
-- HTTP serving — done (`delivery::hls::serve`, `server::http`)
-- Process wiring (main.rs) — done
-
-# Implement tests for:
-
-Apple’s timing rules
-The main LL-HLS values should be derived from the locked segmentation plan, not opportunistically from the first segment:
-Rule	Value
-Recommended part target	1 second
-Part target versus network	At least P95 RTT; preferably at least 3× P95 RTT
-PART-HOLD-BACK	Apple requires at least 3× part target
-HOLD-BACK	At least 3× target duration
-CAN-SKIP-UNTIL	At least 6× target duration
-Part publication cadence	A new part within 1× part target
-Segment publication cadence	A new segment within 1.5× target duration
-Blocking reload deadline	After more than 3× target duration, return 503 if still unsatisfied
-Excessively future MSN	More than last segment MSN + 2 → normally 400
+- SRT
+- Test subtitles + multitracks
+- Config, CLI params & TLS
+- Test reconnects/evictions?
 
 # LATER
 

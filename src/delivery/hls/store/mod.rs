@@ -63,9 +63,9 @@ pub use contract::PlaylistContract;
 pub use error::{StoreFull, StoreWriteError};
 pub use ids::{InitializationId, Msn, PartCursor, PartId, PartIndex, SegmentId};
 pub use media::{
-    OpenSegment, RenditionBandwidth, RenditionBitrateStatistics, RenditionLiveEdge,
-    RenditionSnapshot, SegmentBody, StoredInitialization, StoredPart, StoredSegment,
-    StoredSegmentKind,
+    OpenSegment, PublishedSegments, RenditionBandwidth, RenditionBitrateStatistics,
+    RenditionLiveEdge, RenditionSnapshot, SegmentBody, StoredInitialization, StoredPart,
+    StoredSegment, StoredSegmentKind,
 };
 pub use retention::{DurationRule, RetentionPolicy, TargetDurationMultiple};
 pub use stream::LiveStream;
@@ -202,8 +202,8 @@ impl StreamStore {
         self.streams.load().get(stream).map(Arc::clone)
     }
 
-    pub fn streams(&self) -> Vec<StreamId> {
-        self.streams.load().keys().cloned().collect()
+    pub fn contains(&self, stream: &StreamId) -> bool {
+        self.streams.load().contains_key(stream)
     }
 
     /// Streams retained for viewers, whether or not a publisher is attached.

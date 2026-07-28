@@ -218,28 +218,43 @@ impl PlaylistUris {
     /// the emitting playlist's own directory: the multivariant playlist sits
     /// above every rendition, a media playlist inside its own.
     fn name(&self, from: Option<RenditionId>, resource: Resource) -> Option<String> {
+        let mut out = String::new();
+        self.write_name(&mut out, from, resource)?;
+        Some(out)
+    }
+
+    fn write_name<'a>(
+        &self,
+        out: &'a mut String,
+        from: Option<RenditionId>,
+        resource: Resource,
+    ) -> Option<&'a str> {
+        out.clear();
         let rendition = resource.rendition()?;
-        let mut out = match (&self.root, from) {
-            (Some(root), _) => format!("{root}/{}/", rendition.0),
-            (None, None) => format!("{}/", rendition.0),
-            (None, Some(emitter)) if emitter != rendition => format!("../{}/", rendition.0),
-            (None, Some(_)) => String::new(),
+        // Writing into a String cannot fail.
+        let _ = match (&self.root, from) {
+            (Some(root), _) => write!(out, "{root}/{}/", rendition.0),
+            (None, None) => write!(out, "{}/", rendition.0),
+            (None, Some(emitter)) if emitter != rendition => {
+                write!(out, "../{}/", rendition.0)
+            }
+            (None, Some(_)) => Ok(()),
         };
         match resource {
             // Ruled out by the rendition lookup above.
             Resource::Multivariant => return None,
             Resource::MediaPlaylist(_, kind) => out.push_str(media_playlist_name(kind)),
             Resource::Initialization(_, id, format) => append(
-                &mut out,
+                out,
                 INITIALIZATION_DIRECTORY,
                 id.0,
                 spellings(format).initialization?,
             ),
             Resource::Segment(_, id, format) => {
-                append(&mut out, SEGMENT_DIRECTORY, id.0, spellings(format).segment)
+                append(out, SEGMENT_DIRECTORY, id.0, spellings(format).segment)
             }
             Resource::Part(_, id, format) => {
-                append(&mut out, PART_DIRECTORY, id.0, spellings(format).segment)
+                append(out, PART_DIRECTORY, id.0, spellings(format).segment)
             }
         }
         Some(out)
@@ -266,22 +281,30 @@ pub struct RenditionUris<'a> {
 
 impl RenditionUris<'_> {
     /// `None` when this packaging has no initialization section to point at.
-    pub fn initialization(&self, id: InitializationId) -> Option<String> {
-        self.name(Resource::Initialization(self.rendition, id, self.format))
+    pub fn initialization<'a>(&self, id: InitializationId, out: &'a mut String) -> Option<&'a str> {
+        self.name(
+            Resource::Initialization(self.rendition, id, self.format),
+            out,
+        )
     }
 
-    pub fn segment(&self, id: SegmentId) -> String {
-        self.expect(Resource::Segment(self.rendition, id, self.format))
+    pub fn segment<'a>(&self, id: SegmentId, out: &'a mut String) -> &'a str {
+        self.expect(Resource::Segment(self.rendition, id, self.format), out)
     }
 
-    pub fn part(&self, id: PartId) -> String {
-        self.expect(Resource::Part(self.rendition, id, self.format))
+    pub fn part<'a>(&self, id: PartId, out: &'a mut String) -> &'a str {
+        self.expect(Resource::Part(self.rendition, id, self.format), out)
     }
 
     /// A *sibling's* playlist, which this rendition's packaging says nothing
     /// about — hence the kind rather than a format.
-    pub fn sibling_playlist(&self, rendition: RenditionId, kind: MediaKind) -> String {
-        self.expect(Resource::MediaPlaylist(rendition, kind))
+    pub fn sibling_playlist<'a>(
+        &self,
+        rendition: RenditionId,
+        kind: MediaKind,
+        out: &'a mut String,
+    ) -> &'a str {
+        self.expect(Resource::MediaPlaylist(rendition, kind), out)
     }
 
     /// Whether this packaging has an initialization section at all.
@@ -289,12 +312,12 @@ impl RenditionUris<'_> {
         spellings(self.format).initialization.is_some()
     }
 
-    fn name(&self, resource: Resource) -> Option<String> {
-        self.uris.name(Some(self.rendition), resource)
+    fn name<'a>(&self, resource: Resource, out: &'a mut String) -> Option<&'a str> {
+        self.uris.write_name(out, Some(self.rendition), resource)
     }
 
-    fn expect(&self, resource: Resource) -> String {
-        self.name(resource)
+    fn expect<'a>(&self, resource: Resource, out: &'a mut String) -> &'a str {
+        self.name(resource, out)
             .expect("every packaging spells its segments and every playlist")
     }
 }
@@ -390,34 +413,37 @@ pub fn parse_path(path: &str) -> Result<ResourcePath, ResourcePathError> {
     if path.len() > MAXIMUM_PATH_BYTES {
         return Err(ResourcePathError::Unrecognized);
     }
-    let segments: Vec<&str> = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.len() > MAXIMUM_PATH_SEGMENTS {
-        return Err(ResourcePathError::Unrecognized);
-    }
+    let mut segment_count = 0;
     // Traversal cannot reach anything — every resource is served from memory by
     // identity, not from a filesystem — but a path containing these is not a
     // name this origin ever produced, so it is a miss rather than a lookup.
-    if segments
-        .iter()
-        .any(|segment| *segment == "." || *segment == "..")
-    {
-        return Err(ResourcePathError::Unrecognized);
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        segment_count += 1;
+        if segment_count > MAXIMUM_PATH_SEGMENTS || matches!(segment, "." | "..") {
+            return Err(ResourcePathError::Unrecognized);
+        }
     }
 
-    let (resource, consumed) = parse_tail(&segments)?;
-    let stream_segments = &segments[..segments.len() - consumed];
-    if stream_segments.is_empty() {
+    let (resource, consumed) = parse_tail(path)?;
+    let stream_segments = segment_count.saturating_sub(consumed);
+    if stream_segments == 0 {
         return Err(ResourcePathError::Unrecognized);
     }
-    let mut stream = String::new();
-    for segment in stream_segments {
+    // The final decoded path can be shorter but never longer in UTF-8 bytes.
+    let mut stream = String::with_capacity(path.len());
+    for segment in path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .take(stream_segments)
+    {
         if !stream.is_empty() {
             stream.push('/');
         }
-        stream.push_str(&percent_decode(segment).ok_or(ResourcePathError::Unrecognized)?);
+        stream.push_str(
+            percent_decode(segment)
+                .ok_or(ResourcePathError::Unrecognized)?
+                .as_ref(),
+        );
     }
     Ok(ResourcePath {
         stream: StreamId::new(stream),
@@ -432,25 +458,20 @@ pub fn parse_path(path: &str) -> Result<ResourcePath, ResourcePathError> {
 /// format that spells it. A name no format spells — `init/1.m4s`, since no
 /// packaging calls an initialization section that — is a miss here rather than
 /// something delivery has to refuse after a lookup.
-fn parse_tail(segments: &[&str]) -> Result<(Resource, usize), ResourcePathError> {
-    if let [.., name] = segments
-        && *name == MULTIVARIANT_NAME
-    {
+fn parse_tail(path: &str) -> Result<(Resource, usize), ResourcePathError> {
+    let mut tail = path.split('/').filter(|segment| !segment.is_empty()).rev();
+    let name = tail.next().ok_or(ResourcePathError::Unrecognized)?;
+    if name == MULTIVARIANT_NAME {
         return Ok((Resource::Multivariant, 1));
     }
-    if let [.., rendition, name] = segments
-        && let Some(kind) = media_playlist_kind(name)
-    {
-        return Ok((
-            Resource::MediaPlaylist(parse_rendition(rendition)?, kind),
-            2,
-        ));
+    let second = tail.next().ok_or(ResourcePathError::Unrecognized)?;
+    if let Some(kind) = media_playlist_kind(name) {
+        return Ok((Resource::MediaPlaylist(parse_rendition(second)?, kind), 2));
     }
 
-    let [.., rendition, directory, file] = segments else {
-        return Err(ResourcePathError::Unrecognized);
-    };
-    let (identifier, extension) = file
+    let directory = second;
+    let rendition = tail.next().ok_or(ResourcePathError::Unrecognized)?;
+    let (identifier, extension) = name
         .rsplit_once('.')
         .ok_or(ResourcePathError::Unrecognized)?;
     // Shape first, identifiers second: a path whose directory and extension
@@ -460,7 +481,7 @@ fn parse_tail(segments: &[&str]) -> Result<(Resource, usize), ResourcePathError>
     let identifier: u64 = identifier
         .parse()
         .map_err(|_| ResourcePathError::InvalidIdentifier)?;
-    let resource = match *directory {
+    let resource = match directory {
         INITIALIZATION_DIRECTORY => {
             Resource::Initialization(rendition, InitializationId(identifier), format)
         }
@@ -503,7 +524,10 @@ fn parse_rendition(value: &str) -> Result<RenditionId, ResourcePathError> {
 /// characters a URL has to escape. Invalid escapes are a decoding failure
 /// rather than a pass-through: silently accepting `%zz` would let two spellings
 /// name one stream.
-fn percent_decode(value: &str) -> Option<String> {
+fn percent_decode(value: &str) -> Option<Cow<'_, str>> {
+    if !value.as_bytes().contains(&b'%') {
+        return Some(Cow::Borrowed(value));
+    }
     let bytes = value.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -518,7 +542,7 @@ fn percent_decode(value: &str) -> Option<String> {
             index += 1;
         }
     }
-    decode(value).ok().map(Cow::into_owned)
+    decode(value).ok()
 }
 
 /// Percent-encodes a hierarchical stream identity for inclusion in a URL path.
@@ -552,15 +576,16 @@ mod tests {
     fn media_playlists_name_their_own_media_relatively() {
         let uris = relative();
         let names = uris.within(RenditionId(3), CMAF);
+        let mut out = String::new();
 
-        assert_eq!(names.segment(SegmentId(7)), "segment/7.m4s");
-        assert_eq!(names.part(PartId(41)), "part/41.m4s");
+        assert_eq!(names.segment(SegmentId(7), &mut out), "segment/7.m4s");
+        assert_eq!(names.part(PartId(41), &mut out), "part/41.m4s");
         assert_eq!(
-            names.initialization(InitializationId(1)),
-            Some("init/1.mp4".to_owned())
+            names.initialization(InitializationId(1), &mut out),
+            Some("init/1.mp4")
         );
         assert_eq!(
-            names.sibling_playlist(RenditionId(9), MediaKind::Audio),
+            names.sibling_playlist(RenditionId(9), MediaKind::Audio, &mut out),
             "../9/audio.m3u8",
             "a rendition report steps out of its own directory"
         );
@@ -575,17 +600,18 @@ mod tests {
     fn a_configured_base_roots_every_name_at_the_stream() {
         let uris = UriBase::new("https://cdn.example.com/hls/").uris(&StreamId::new("live/a b"));
         let names = uris.within(RenditionId(0), CMAF);
+        let mut out = String::new();
 
         assert_eq!(
             uris.media_playlist(RenditionId(0), MediaKind::Video),
             "https://cdn.example.com/hls/live/a%20b/0/video.m3u8"
         );
         assert_eq!(
-            names.segment(SegmentId(7)),
+            names.segment(SegmentId(7), &mut out),
             "https://cdn.example.com/hls/live/a%20b/0/segment/7.m4s"
         );
         assert_eq!(
-            names.sibling_playlist(RenditionId(9), MediaKind::Audio),
+            names.sibling_playlist(RenditionId(9), MediaKind::Audio, &mut out),
             "https://cdn.example.com/hls/live/a%20b/9/audio.m3u8",
             "an absolute name is rooted at the stream, so a sibling needs no \
              relative step out"
@@ -601,18 +627,20 @@ mod tests {
     fn webvtt_names_both_its_header_and_its_cues_as_vtt() {
         let uris = relative();
         let names = uris.within(RenditionId(0), WEBVTT);
+        let mut out = String::new();
 
         assert_eq!(
-            names.initialization(InitializationId(1)),
-            Some("init/1.vtt".to_owned())
+            names.initialization(InitializationId(1), &mut out),
+            Some("init/1.vtt")
         );
-        assert_eq!(names.segment(SegmentId(2)), "segment/2.vtt");
+        assert_eq!(names.segment(SegmentId(2), &mut out), "segment/2.vtt");
     }
 
     #[test]
     fn a_format_without_an_initialization_section_cannot_name_or_type_one() {
         let uris = relative();
         let names = uris.within(RenditionId(0), MediaSegmentFormat::MpegTs);
+        let mut out = String::new();
         let initialization = Resource::Initialization(
             RenditionId(0),
             InitializationId(1),
@@ -620,7 +648,7 @@ mod tests {
         );
 
         assert!(!names.has_initialization());
-        assert_eq!(names.initialization(InitializationId(1)), None);
+        assert_eq!(names.initialization(InitializationId(1), &mut out), None);
         assert_eq!(initialization.content_type(), None);
         assert_eq!(
             parse_path("/s/0/init/1.ts"),
@@ -716,6 +744,7 @@ mod tests {
         let uris = relative();
         let rendition = RenditionId(3);
         let names = uris.within(rendition, CMAF);
+        let mut out = String::new();
 
         // Each name paired with the directory the playlist emitting it is
         // served from: the multivariant playlist sits above the renditions, a
@@ -728,24 +757,27 @@ mod tests {
             ),
             (
                 "/live/camera/3/",
-                names.sibling_playlist(RenditionId(9), MediaKind::Video),
+                names
+                    .sibling_playlist(RenditionId(9), MediaKind::Video, &mut out)
+                    .to_owned(),
                 Resource::MediaPlaylist(RenditionId(9), MediaKind::Video),
             ),
             (
                 "/live/camera/3/",
-                names.segment(SegmentId(7)),
+                names.segment(SegmentId(7), &mut out).to_owned(),
                 Resource::Segment(rendition, SegmentId(7), CMAF),
             ),
             (
                 "/live/camera/3/",
-                names.part(PartId(41)),
+                names.part(PartId(41), &mut out).to_owned(),
                 Resource::Part(rendition, PartId(41), CMAF),
             ),
             (
                 "/live/camera/3/",
                 names
-                    .initialization(InitializationId(1))
-                    .expect("a CMAF initialization is nameable"),
+                    .initialization(InitializationId(1), &mut out)
+                    .expect("a CMAF initialization is nameable")
+                    .to_owned(),
                 Resource::Initialization(rendition, InitializationId(1), CMAF),
             ),
         ] {
@@ -793,10 +825,10 @@ mod tests {
     #[test]
     fn percent_coding_round_trips_and_rejects_invalid_escapes() {
         assert_eq!(
-            percent_decode("live/camera"),
-            Some("live/camera".to_owned())
+            percent_decode("live/camera").as_deref(),
+            Some("live/camera")
         );
-        assert_eq!(percent_decode("a%20b"), Some("a b".to_owned()));
+        assert_eq!(percent_decode("a%20b").as_deref(), Some("a b"));
         assert_eq!(percent_decode("a%2"), None);
         assert_eq!(percent_decode("a%zz"), None);
         assert_eq!(PercentEncoded("live/a b").to_string(), "live/a%20b");
@@ -805,8 +837,8 @@ mod tests {
             "live/caf%C3%A9%3F%23"
         );
         assert_eq!(
-            percent_decode("live/caf%C3%A9%3F%23"),
-            Some("live/café?#".to_owned())
+            percent_decode("live/caf%C3%A9%3F%23").as_deref(),
+            Some("live/café?#")
         );
         assert_eq!(percent_decode("%FF"), None, "stream IDs must be UTF-8");
     }

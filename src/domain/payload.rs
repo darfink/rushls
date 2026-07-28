@@ -22,6 +22,10 @@ impl Payload {
         &self.0
     }
 
+    pub fn into_bytes(self) -> Bytes {
+        self.0
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }
