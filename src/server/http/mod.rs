@@ -22,7 +22,7 @@ mod route;
 #[cfg(test)]
 mod tests;
 
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -256,5 +256,3 @@ fn with_common_headers(mut response: Response, config: &HttpConfig) -> Response 
     }
     response
 }
-
-const _: Option<Infallible> = None;

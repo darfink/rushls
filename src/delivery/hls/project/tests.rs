@@ -11,12 +11,10 @@ use crate::{
             write_segment,
         },
         project::{
-            DeliveryTimingPolicy, PlaylistPolicy, ProgramDateTimePolicy,
-            media::media_playlist,
-            multivariant::multivariant_playlist,
-            presentation_server_control,
-            uri::{PlaylistUris, UriBase},
+            DeliveryTimingPolicy, PlaylistPolicy, ProgramDateTimePolicy, media::media_playlist,
+            multivariant::multivariant_playlist, presentation_server_control,
         },
+        uri::{PlaylistUris, UriBase},
     },
     domain::RenditionId,
 };

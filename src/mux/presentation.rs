@@ -88,6 +88,18 @@ pub enum RenditionMedia {
 }
 
 impl RenditionMedia {
+    /// The attributes only an audio rendition has, as a pair because a playlist
+    /// that advertises one of them advertises both.
+    pub fn audio(&self) -> Option<(NonZeroU32, NonZeroU16)> {
+        match self {
+            Self::Audio {
+                sample_rate,
+                channels,
+            } => Some((*sample_rate, *channels)),
+            Self::Subtitle | Self::Video { .. } => None,
+        }
+    }
+
     pub fn kind(&self) -> MediaKind {
         match self {
             Self::Audio { .. } => MediaKind::Audio,

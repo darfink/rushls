@@ -28,15 +28,12 @@ use crate::{
         StreamStore,
         cache::{PlaylistKey, StreamPlaylistCache},
         project::{
-            self, DeliveryTimingPolicy, PlaylistPolicy, ProjectionError,
-            media::media_playlist,
-            multivariant::multivariant_playlist,
-            timing::blocking_reload_deadline,
-            uri::{Resource, ResourceNaming, UriBase},
+            self, DeliveryTimingPolicy, PlaylistPolicy, ProjectionError, media::media_playlist,
+            multivariant::multivariant_playlist, timing::blocking_reload_deadline,
         },
+        uri::{PLAYLIST_CONTENT_TYPE, Resource, UriBase},
     },
-    domain::{MediaKind, Payload, RenditionId, StreamId},
-    mux::MediaSegmentFormat,
+    domain::{Payload, RenditionId, StreamId},
     observe::OriginMeters,
 };
 
@@ -100,53 +97,23 @@ impl BlockingReload {
 }
 
 /// What a client asked this origin for.
+///
+/// A [`Resource`] and, where one applies, the position the client refuses to be
+/// answered before. The resource already carries what its name claimed —
+/// a playlist's media kind, a media resource's packaging — and delivery checks
+/// each claim against the rendition that answers it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Request {
-    Multivariant,
-    MediaPlaylist {
-        rendition: RenditionId,
-        /// The kind the requested name claims the playlist carries.
-        ///
-        /// Checked against the rendition once it has been resolved: a playlist
-        /// served under a name that misdescribes it would make the naming
-        /// scheme decorative.
-        kind: MediaKind,
-        blocking: Option<BlockingReload>,
-    },
-    Initialization {
-        rendition: RenditionId,
-        initialization: crate::delivery::hls::InitializationId,
-    },
-    Segment {
-        rendition: RenditionId,
-        segment: crate::delivery::hls::SegmentId,
-    },
-    Part {
-        rendition: RenditionId,
-        part: PartId,
-    },
+pub struct Request {
+    pub resource: Resource,
+    /// Blocking is a playlist-reload directive. HLS attaches it to nothing
+    /// else, so one arriving on a media request is ignored rather than refused:
+    /// a client sending it has not asked for anything impossible.
+    pub blocking: Option<BlockingReload>,
 }
 
 impl Request {
-    /// Builds a request from a parsed resource and its delivery directives.
-    pub fn from_resource(
-        resource: Resource,
-        blocking: Option<BlockingReload>,
-    ) -> Result<Self, DeliveryError> {
-        Ok(match resource {
-            Resource::Multivariant => Self::Multivariant,
-            Resource::MediaPlaylist(rendition, kind) => Self::MediaPlaylist {
-                rendition,
-                kind,
-                blocking,
-            },
-            Resource::Initialization(rendition, initialization) => Self::Initialization {
-                rendition,
-                initialization,
-            },
-            Resource::Segment(rendition, segment) => Self::Segment { rendition, segment },
-            Resource::Part(rendition, part) => Self::Part { rendition, part },
-        })
+    pub fn new(resource: Resource, blocking: Option<BlockingReload>) -> Self {
+        Self { resource, blocking }
     }
 }
 
@@ -254,6 +221,31 @@ pub struct Response {
     pub body: Body,
     pub content_type: &'static str,
     pub caching: Caching,
+}
+
+impl Response {
+    /// Media named by a durable identity, whose bytes can never change.
+    ///
+    /// The media type comes from the name that asked for it, so what a resource
+    /// is called and what it is served as cannot disagree.
+    fn immutable(body: MediaBody, resource: &Resource) -> Result<Self, DeliveryError> {
+        Ok(Self {
+            body: Body::Media(body),
+            content_type: resource
+                .content_type()
+                .ok_or(DeliveryError::UnknownResource)?,
+            caching: Caching::Immutable,
+        })
+    }
+
+    /// A playlist, which describes a live edge and is stale as it is written.
+    fn playlist(bytes: Bytes) -> Self {
+        Self {
+            body: Body::Playlist(bytes),
+            content_type: PLAYLIST_CONTENT_TYPE,
+            caching: Caching::Live,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -371,45 +363,37 @@ impl Origin {
         request: Request,
     ) -> Result<Response, DeliveryError> {
         let live = self.store.get(stream).ok_or(DeliveryError::UnknownStream)?;
-        match request {
-            Request::Multivariant => self.multivariant(stream, &live),
-            Request::MediaPlaylist {
-                rendition,
-                kind,
-                blocking,
-            } => {
-                self.media_playlist(stream, &live, rendition, kind, blocking)
+        match request.resource {
+            Resource::Multivariant => self.multivariant(stream, &live),
+            Resource::MediaPlaylist(rendition, _) => {
+                self.media_playlist(stream, &live, rendition, request.resource, request.blocking)
                     .await
             }
-            Request::Initialization {
-                rendition,
-                initialization,
-            } => {
-                let snapshot = self.rendition_snapshot(&live, rendition)?;
+            Resource::Initialization(_, initialization, _) => {
+                let snapshot = self.rendition_for(&live, request.resource)?;
                 let held = snapshot
                     .initialization_for(initialization)
                     .ok_or(DeliveryError::UnknownResource)?;
-                Ok(Response {
-                    body: Body::Media(MediaBody::single(held.payload.clone())),
-                    content_type: initialization_content_type(snapshot.contract.segment_format),
-                    caching: Caching::Immutable,
-                })
+                Ok(Response::immutable(
+                    MediaBody::single(held.payload.clone()),
+                    &request.resource,
+                )?)
             }
-            Request::Segment { rendition, segment } => {
-                let format = self
-                    .rendition_snapshot(&live, rendition)?
-                    .contract
-                    .segment_format;
+            Resource::Segment(rendition, segment, _) => {
+                // Resolved for its claim rather than its contents: a completed
+                // segment's bytes are held by the stream, not the snapshot.
+                self.rendition_for(&live, request.resource)?;
                 let stored = live
                     .segment(rendition, segment)
                     .ok_or(DeliveryError::UnknownResource)?;
-                Ok(Response {
-                    body: Body::Media(MediaBody::from_segment(&stored)),
-                    content_type: segment_content_type(format),
-                    caching: Caching::Immutable,
-                })
+                Ok(Response::immutable(
+                    MediaBody::from_segment(&stored),
+                    &request.resource,
+                )?)
             }
-            Request::Part { rendition, part } => self.part(&live, rendition, part).await,
+            Resource::Part(rendition, part, _) => {
+                self.part(&live, request.resource, rendition, part).await
+            }
         }
     }
 
@@ -436,11 +420,7 @@ impl Origin {
             },
         )?;
         self.meters.playlist_served(rendered.freshly_rendered);
-        Ok(Response {
-            body: Body::Playlist(rendered.bytes),
-            content_type: PLAYLIST_CONTENT_TYPE,
-            caching: Caching::Live,
-        })
+        Ok(Response::playlist(rendered.bytes))
     }
 
     async fn media_playlist(
@@ -448,17 +428,10 @@ impl Origin {
         stream_id: &StreamId,
         live: &Arc<LiveStream>,
         rendition: RenditionId,
-        kind: MediaKind,
+        resource: Resource,
         blocking: Option<BlockingReload>,
     ) -> Result<Response, DeliveryError> {
-        let snapshot = self.rendition_snapshot(live, rendition)?;
-        // A media playlist is named after what it carries, so asking for the
-        // wrong kind names no resource this origin serves. Answering with the
-        // right rendition under the wrong name would be worse than a miss: a
-        // client would cache the lie.
-        if !carries_kind(live, rendition, kind) {
-            return Err(DeliveryError::UnknownResource);
-        }
+        let snapshot = self.rendition_for(live, resource)?;
         let deadline = blocking_reload_deadline(snapshot.contract, self.config.timing);
 
         if let Some(blocking) = blocking {
@@ -484,7 +457,7 @@ impl Origin {
         }
 
         let stream = live.snapshot();
-        let snapshot = self.rendition_snapshot(live, rendition)?;
+        let snapshot = self.rendition_for(live, resource)?;
         let caches = self.cache_for(stream_id);
         let uris = self.config.uri_base.uris(stream_id);
         let rendered = caches.rendition(rendition).get_or_render(
@@ -501,11 +474,7 @@ impl Origin {
             },
         )?;
         self.meters.playlist_served(rendered.freshly_rendered);
-        Ok(Response {
-            body: Body::Playlist(rendered.bytes),
-            content_type: PLAYLIST_CONTENT_TYPE,
-            caching: Caching::Live,
-        })
+        Ok(Response::playlist(rendered.bytes))
     }
 
     /// Serves one partial segment, waiting if it has been hinted but not yet
@@ -518,17 +487,13 @@ impl Origin {
     async fn part(
         &self,
         live: &Arc<LiveStream>,
+        resource: Resource,
         rendition: RenditionId,
         part: PartId,
     ) -> Result<Response, DeliveryError> {
-        let snapshot = self.rendition_snapshot(live, rendition)?;
-        let format = snapshot.contract.segment_format;
+        let snapshot = self.rendition_for(live, resource)?;
         if let Some(stored) = live.part(rendition, part) {
-            return Ok(Response {
-                body: Body::Media(MediaBody::single(stored.payload.clone())),
-                content_type: segment_content_type(format),
-                caching: Caching::Immutable,
-            });
+            return Response::immutable(MediaBody::single(stored.payload.clone()), &resource);
         }
 
         // Absent means one of two things, and they get opposite answers: media
@@ -553,11 +518,7 @@ impl Origin {
         let stored = live
             .part(rendition, part)
             .ok_or(DeliveryError::UnknownResource)?;
-        Ok(Response {
-            body: Body::Media(MediaBody::single(stored.payload.clone())),
-            content_type: segment_content_type(format),
-            caching: Caching::Immutable,
-        })
+        Response::immutable(MediaBody::single(stored.payload.clone()), &resource)
     }
 
     /// Rejects a directive naming media so far ahead it cannot be a wait.
@@ -632,22 +593,34 @@ impl Origin {
             .unwrap_or(Err(DeliveryError::Unsatisfied))
     }
 
-    fn rendition_snapshot(
+    /// The media of the rendition a name asks for, once that name's claim about
+    /// it holds.
+    ///
+    /// The one place a claim is checked, because here is the first place it can
+    /// be: the router parses a name before knowing which rendition, if any,
+    /// answers it. A playlist called `audio.m3u8` really does carry audio and a
+    /// `.m4s` really is CMAF — or this is a miss. Answering anyway would be
+    /// worse than one: every format shares a single identifier space, so a
+    /// cache would keep those bytes under a name no player should have fetched.
+    fn rendition_for(
         &self,
         live: &Arc<LiveStream>,
-        rendition: RenditionId,
+        resource: Resource,
     ) -> Result<Arc<RenditionSnapshot>, DeliveryError> {
-        live.rendition(rendition)
-            .ok_or(DeliveryError::UnknownRendition)
+        let rendition = resource.rendition().ok_or(DeliveryError::UnknownResource)?;
+        let stream = live.snapshot();
+        let entry = rendition_entry(&stream, rendition).ok_or(DeliveryError::UnknownRendition)?;
+        let holds = match resource {
+            Resource::Multivariant => false,
+            Resource::MediaPlaylist(_, kind) => entry.media.kind() == kind,
+            Resource::Initialization(_, _, format)
+            | Resource::Segment(_, _, format)
+            | Resource::Part(_, _, format) => entry.contract.segment_format == format,
+        };
+        holds
+            .then(|| entry.snapshot())
+            .ok_or(DeliveryError::UnknownResource)
     }
-}
-
-/// Whether a rendition carries the media its playlist's name claims.
-///
-/// Read from the stream catalog rather than the media snapshot because the kind
-/// is a slow-changing advertised attribute, not something a chunk changes.
-fn carries_kind(live: &Arc<LiveStream>, rendition: RenditionId, kind: MediaKind) -> bool {
-    rendition_entry(&live.snapshot(), rendition).is_some_and(|entry| entry.media.kind() == kind)
 }
 
 fn playlist_is_ready(readiness: PlaylistReadiness, edge: &RenditionLiveEdge) -> bool {
@@ -698,30 +671,6 @@ fn satisfies(edge: &RenditionLiveEdge, blocking: BlockingReload) -> bool {
     }
 }
 
-const PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
-
-fn initialization_content_type(format: MediaSegmentFormat) -> &'static str {
-    match format {
-        MediaSegmentFormat::Cmaf => "video/mp4",
-        MediaSegmentFormat::WebVtt => "text/vtt",
-        MediaSegmentFormat::MpegTs => "video/mp2t",
-    }
-}
-
-fn segment_content_type(format: MediaSegmentFormat) -> &'static str {
-    match format {
-        MediaSegmentFormat::Cmaf => "video/iso.segment",
-        MediaSegmentFormat::WebVtt => "text/vtt",
-        MediaSegmentFormat::MpegTs => "video/mp2t",
-    }
-}
-
-/// The naming scheme a rendition's resources use, for a router that has just
-/// resolved it.
-pub fn naming_for(entry: &RenditionCatalogEntry) -> ResourceNaming {
-    ResourceNaming::for_format(entry.contract.segment_format)
-}
-
 /// Looks one rendition up in a stream catalog.
 pub fn rendition_entry(
     stream: &StreamSnapshot,
@@ -735,17 +684,37 @@ pub fn rendition_entry(
 
 #[cfg(test)]
 mod tests {
-    use crate::delivery::hls::{
-        InitializationId, SegmentId,
-        fixtures::{
-            PART_BYTES, chunk, initialization, lease, stream_id, video, write, write_segment,
+    use crate::{
+        delivery::hls::{
+            InitializationId, SegmentId,
+            fixtures::{
+                PART_BYTES, chunk, initialization, lease, stream_id, video, write, write_segment,
+            },
         },
+        domain::MediaKind,
+        mux::MediaSegmentFormat,
     };
 
     use super::*;
 
+    /// Every fixture rendition is CMAF, so its names claim that packaging.
+    const CMAF: MediaSegmentFormat = MediaSegmentFormat::Cmaf;
+
     fn origin(store: &StreamStore) -> Origin {
         Origin::new(store.clone(), DeliveryConfig::default())
+    }
+
+    /// A request carrying no delivery directives.
+    fn fetch(resource: Resource) -> Request {
+        Request::new(resource, None)
+    }
+
+    /// The fixture's video rendition, reloaded with whatever directives.
+    fn video_playlist(blocking: Option<BlockingReload>) -> Request {
+        Request::new(
+            Resource::MediaPlaylist(RenditionId(0), MediaKind::Video),
+            blocking,
+        )
     }
 
     fn playlist(response: &Response) -> &str {
@@ -772,7 +741,7 @@ mod tests {
 
         assert_eq!(
             origin
-                .serve(&StreamId::new("nobody/here"), Request::Multivariant)
+                .serve(&StreamId::new("nobody/here"), fetch(Resource::Multivariant))
                 .await
                 .unwrap_err(),
             DeliveryError::UnknownStream
@@ -781,10 +750,7 @@ mod tests {
             origin
                 .serve(
                     &stream_id(),
-                    Request::Segment {
-                        rendition: RenditionId(9),
-                        segment: SegmentId(1)
-                    }
+                    fetch(Resource::Segment(RenditionId(9), SegmentId(1), CMAF))
                 )
                 .await
                 .unwrap_err(),
@@ -794,10 +760,7 @@ mod tests {
             origin
                 .serve(
                     &stream_id(),
-                    Request::Segment {
-                        rendition: RenditionId(0),
-                        segment: SegmentId(99)
-                    }
+                    fetch(Resource::Segment(RenditionId(0), SegmentId(99), CMAF))
                 )
                 .await
                 .unwrap_err(),
@@ -806,33 +769,41 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_playlist_named_after_the_wrong_kind_is_a_miss() {
+    async fn a_name_that_misdescribes_its_rendition_is_a_miss() {
         let store = StreamStore::default();
         let origin = origin(&store);
         let lease = lease(&store, vec![video(0)]);
         write(&lease, initialization(0, 1));
         write_segment(&lease, 0, 0, 0);
 
-        let request = |kind| Request::MediaPlaylist {
-            rendition: RenditionId(0),
-            kind,
-            blocking: None,
-        };
+        let playlist = |kind| fetch(Resource::MediaPlaylist(RenditionId(0), kind));
+        let segment = |format| fetch(Resource::Segment(RenditionId(0), SegmentId(1), format));
 
         assert!(
             origin
-                .serve(&stream_id(), request(MediaKind::Video))
+                .serve(&stream_id(), playlist(MediaKind::Video))
                 .await
                 .is_ok()
         );
+        assert!(origin.serve(&stream_id(), segment(CMAF)).await.is_ok());
+
         assert_eq!(
             origin
-                .serve(&stream_id(), request(MediaKind::Audio))
+                .serve(&stream_id(), playlist(MediaKind::Audio))
                 .await
                 .unwrap_err(),
             DeliveryError::UnknownResource,
             "answering under a name that misdescribes the playlist would let a \
              client cache the lie"
+        );
+        assert_eq!(
+            origin
+                .serve(&stream_id(), segment(MediaSegmentFormat::WebVtt))
+                .await
+                .unwrap_err(),
+            DeliveryError::UnknownResource,
+            "every format shares one identifier space, so `.vtt` and `.m4s` \
+             name different resources and only one of them exists"
         );
     }
 
@@ -847,10 +818,7 @@ mod tests {
         let response = origin
             .serve(
                 &stream_id(),
-                Request::Segment {
-                    rendition: RenditionId(0),
-                    segment: SegmentId(1),
-                },
+                fetch(Resource::Segment(RenditionId(0), SegmentId(1), CMAF)),
             )
             .await
             .expect("the segment is retained");
@@ -876,10 +844,7 @@ mod tests {
         let response = origin
             .serve(
                 &stream_id(),
-                Request::Segment {
-                    rendition: RenditionId(0),
-                    segment: SegmentId(1),
-                },
+                fetch(Resource::Segment(RenditionId(0), SegmentId(1), CMAF)),
             )
             .await
             .expect("the segment is retained");
@@ -906,11 +871,7 @@ mod tests {
         let lease = lease(&store, vec![video(0)]);
         write(&lease, initialization(0, 1));
 
-        let request = Request::MediaPlaylist {
-            rendition: RenditionId(0),
-            kind: MediaKind::Video,
-            blocking: None,
-        };
+        let request = video_playlist(None);
         let held = tokio::spawn({
             let origin = origin.clone();
             async move { origin.serve(&stream_id(), request).await }
@@ -939,18 +900,7 @@ mod tests {
 
         let held = tokio::spawn({
             let origin = origin.clone();
-            async move {
-                origin
-                    .serve(
-                        &stream_id(),
-                        Request::MediaPlaylist {
-                            rendition: RenditionId(0),
-                            kind: MediaKind::Video,
-                            blocking: None,
-                        },
-                    )
-                    .await
-            }
+            async move { origin.serve(&stream_id(), video_playlist(None)).await }
         });
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(!held.is_finished(), "the playlist still names no media");
@@ -1002,12 +952,10 @@ mod tests {
         write_segment(&lease, 0, 0, 0);
         write(&lease, chunk(0, 1, 0, 6));
 
-        let request = Request::MediaPlaylist {
-            rendition: RenditionId(0),
-            kind: MediaKind::Video,
-            blocking: BlockingReload::from_directives(Some(1), Some(1))
+        let request = video_playlist(
+            BlockingReload::from_directives(Some(1), Some(1))
                 .expect("the directive is well formed"),
-        };
+        );
         let held = tokio::spawn({
             let origin = origin.clone();
             async move { origin.serve(&stream_id(), request).await }
@@ -1035,12 +983,10 @@ mod tests {
         let response = origin
             .serve(
                 &stream_id(),
-                Request::MediaPlaylist {
-                    rendition: RenditionId(0),
-                    kind: MediaKind::Video,
-                    blocking: BlockingReload::from_directives(Some(0), Some(5))
+                video_playlist(
+                    BlockingReload::from_directives(Some(0), Some(5))
                         .expect("the directive is well formed"),
-                },
+                ),
             )
             .await
             .expect("the requested position is already published");
@@ -1059,12 +1005,10 @@ mod tests {
         let error = origin
             .serve(
                 &stream_id(),
-                Request::MediaPlaylist {
-                    rendition: RenditionId(0),
-                    kind: MediaKind::Video,
-                    blocking: BlockingReload::from_directives(Some(2), None)
+                video_playlist(
+                    BlockingReload::from_directives(Some(2), None)
                         .expect("the directive is well formed"),
-                },
+                ),
             )
             .await
             .expect_err("the publisher never produced it");
@@ -1089,11 +1033,7 @@ mod tests {
             origin
                 .serve(
                     &stream_id(),
-                    Request::MediaPlaylist {
-                        rendition: RenditionId(0),
-                        kind: MediaKind::Video,
-                        blocking: BlockingReload::from_directives(Some(99), None).unwrap(),
-                    }
+                    video_playlist(BlockingReload::from_directives(Some(99), None).unwrap())
                 )
                 .await
                 .unwrap_err(),
@@ -1113,11 +1053,7 @@ mod tests {
         let response = origin
             .serve(
                 &stream_id(),
-                Request::MediaPlaylist {
-                    rendition: RenditionId(0),
-                    kind: MediaKind::Video,
-                    blocking: BlockingReload::from_directives(Some(50), Some(9)).unwrap(),
-                },
+                video_playlist(BlockingReload::from_directives(Some(50), Some(9)).unwrap()),
             )
             .await
             .expect("an ended playlist is already final");
@@ -1140,10 +1076,7 @@ mod tests {
                 origin
                     .serve(
                         &stream_id(),
-                        Request::Part {
-                            rendition: RenditionId(0),
-                            part: PartId(2),
-                        },
+                        fetch(Resource::Part(RenditionId(0), PartId(2), CMAF)),
                     )
                     .await
             }
@@ -1159,10 +1092,7 @@ mod tests {
             origin
                 .serve(
                     &stream_id(),
-                    Request::Part {
-                        rendition: RenditionId(0),
-                        part: PartId(1_000)
-                    }
+                    fetch(Resource::Part(RenditionId(0), PartId(1_000), CMAF))
                 )
                 .await
                 .unwrap_err(),
@@ -1181,10 +1111,11 @@ mod tests {
         let response = origin
             .serve(
                 &stream_id(),
-                Request::Initialization {
-                    rendition: RenditionId(0),
-                    initialization: InitializationId(1),
-                },
+                fetch(Resource::Initialization(
+                    RenditionId(0),
+                    InitializationId(1),
+                    CMAF,
+                )),
             )
             .await
             .expect("the header is retained");
@@ -1196,8 +1127,11 @@ mod tests {
 
 #[cfg(test)]
 mod cache_tests {
-    use crate::delivery::hls::fixtures::{
-        chunk, initialization, lease, stream_id, video, write, write_segment,
+    use crate::{
+        delivery::hls::fixtures::{
+            chunk, initialization, lease, stream_id, video, write, write_segment,
+        },
+        domain::MediaKind,
     };
 
     use super::*;
@@ -1210,10 +1144,11 @@ mod cache_tests {
         write(&lease, initialization(0, 1));
         write_segment(&lease, 0, 0, 0);
 
-        let request = || Request::MediaPlaylist {
-            rendition: RenditionId(0),
-            kind: MediaKind::Video,
-            blocking: None,
+        let request = || {
+            Request::new(
+                Resource::MediaPlaylist(RenditionId(0), MediaKind::Video),
+                None,
+            )
         };
         for _ in 0..5 {
             origin
@@ -1251,11 +1186,10 @@ mod cache_tests {
         origin
             .serve(
                 &stream_id(),
-                Request::MediaPlaylist {
-                    rendition: RenditionId(0),
-                    kind: MediaKind::Video,
-                    blocking: None,
-                },
+                Request::new(
+                    Resource::MediaPlaylist(RenditionId(0), MediaKind::Video),
+                    None,
+                ),
             )
             .await
             .expect("the playlist is servable");

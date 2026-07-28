@@ -2,7 +2,7 @@ use std::{env, error::Error, net::SocketAddr, sync::Arc};
 
 use rushls::{
     admission::{FixedStreamAuthenticator, Principal, PublishGrant, StreamPolicy},
-    delivery::hls::project::uri::UriBase,
+    delivery::hls::uri::UriBase,
     domain::{SessionId, StreamId},
     observe::{EventObserver, Events, SessionEvent},
     server::{Node, NodeConfig},

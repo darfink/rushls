@@ -21,6 +21,7 @@
 - Support discontinuities when muxing? PaceToRealtime "maximum_timestamp_jump" doesn't make sense?
 - A single automatic cancellable maintenance task for the store
 - Delta playlists
+- Do we want enriched content-types? E.g. codecs, charset etc
 
 # Steps
 

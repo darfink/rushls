@@ -19,12 +19,13 @@ use crate::{
     delivery::hls::{
         RenditionCatalogEntry, StreamSnapshot,
         manifest::{MultivariantPlaylistWriter, PlaylistMediaType, Rendition, Variant, VideoRange},
+        uri::PlaylistUris,
     },
     domain::{MediaKind, RenditionId},
     mux::{RenditionGroupKey, RenditionMedia, VideoRange as MuxVideoRange},
 };
 
-use super::{PlaylistPolicy, ProjectionError, uri::PlaylistUris};
+use super::{PlaylistPolicy, ProjectionError};
 
 /// Version 6 covers everything this projection emits.
 const VERSION: u8 = 6;
@@ -69,78 +70,88 @@ pub fn multivariant_playlist(
     // and what makes switching between variants seamless.
     writer.independent_segments()?;
 
+    let playable: Vec<Playable<'_>> = presentation
+        .combinations
+        .iter()
+        .filter_map(|combination| Playable::resolve(&combination.groups, &groups))
+        .collect();
+
     // A group is "alternate" if some combination uses it without it being that
     // combination's primary; those are the ones that become EXT-X-MEDIA.
-    let mut alternates = BTreeSet::new();
-    for combination in presentation.combinations.iter() {
-        let referenced: Vec<&ResolvedGroup<'_>> = combination
-            .groups
-            .iter()
-            .filter_map(|key| groups.iter().find(|group| &group.key == key))
-            .collect();
-        if let Some(primary) = primary_group(&referenced) {
-            for group in &referenced {
-                if group.key != primary.key {
-                    alternates.insert(group.key.clone());
-                }
-            }
-        }
-    }
+    let alternates: BTreeSet<&RenditionGroupKey> = playable
+        .iter()
+        .flat_map(|playable| playable.alternates.iter().map(|group| &group.key))
+        .collect();
 
     for group in groups
         .iter()
         .filter(|group| alternates.contains(&group.key))
     {
         for entry in &group.renditions {
+            let (sample_rate, channels) = entry.media.audio().unzip();
             writer.rendition(Rendition {
                 media_type: media_type(group.media_kind),
                 group_id: &group.key.0,
                 name: &entry.name,
                 language: entry.language.as_deref(),
-                sample_rate: sample_rate(&entry.media),
-                channels: channels(&entry.media),
+                sample_rate,
+                channels,
                 default: entry.is_default,
                 // Anything the origin publishes is a legitimate automatic
                 // choice; a rendition nobody should select automatically would
                 // not be in the topology.
                 autoselect: true,
-                uri: Some(&uris.in_multivariant(entry.rendition_id, group.media_kind)),
+                uri: Some(&uris.media_playlist(entry.rendition_id, group.media_kind)),
             })?;
         }
     }
 
     let mut written = BTreeSet::new();
-    for combination in presentation.combinations.iter() {
-        let referenced: Vec<&ResolvedGroup<'_>> = combination
-            .groups
-            .iter()
-            .filter_map(|key| groups.iter().find(|group| &group.key == key))
-            .collect();
-        let Some(primary) = primary_group(&referenced) else {
-            continue;
-        };
-        let alternate_groups: Vec<&&ResolvedGroup<'_>> = referenced
-            .iter()
-            .filter(|group| group.key != primary.key)
-            .collect();
-
-        for entry in &primary.renditions {
+    for playable in &playable {
+        for entry in &playable.primary.renditions {
             // One combination per variant line: the same rendition reached
             // through two combinations is one variant, not two.
             if !written.insert(entry.rendition_id) {
                 continue;
             }
-            write_variant(&mut writer, entry, &alternate_groups, policy, uris)?;
+            write_variant(&mut writer, entry, &playable.alternates, policy, uris)?;
         }
     }
 
     Ok(Some(out))
 }
 
+/// One combination a client may play, split into the part that becomes variant
+/// lines and the parts it selects alongside them.
+///
+/// Resolved once and read twice: the same split decides which groups become
+/// `EXT-X-MEDIA` and what each `EXT-X-STREAM-INF` must account for.
+struct Playable<'a> {
+    primary: &'a ResolvedGroup<'a>,
+    alternates: Vec<&'a ResolvedGroup<'a>>,
+}
+
+impl<'a> Playable<'a> {
+    fn resolve(members: &[RenditionGroupKey], groups: &'a [ResolvedGroup<'a>]) -> Option<Self> {
+        let referenced: Vec<&ResolvedGroup<'_>> = members
+            .iter()
+            .filter_map(|key| groups.iter().find(|group| &group.key == key))
+            .collect();
+        let primary = primary_group(&referenced)?;
+        Some(Self {
+            alternates: referenced
+                .into_iter()
+                .filter(|group| group.key != primary.key)
+                .collect(),
+            primary,
+        })
+    }
+}
+
 fn write_variant<W: Write + ?Sized>(
     writer: &mut MultivariantPlaylistWriter<'_, W>,
     primary: &RenditionCatalogEntry,
-    alternates: &[&&ResolvedGroup<'_>],
+    alternates: &[&ResolvedGroup<'_>],
     policy: &PlaylistPolicy,
     uris: &PlaylistUris,
 ) -> Result<(), ProjectionError> {
@@ -215,7 +226,7 @@ fn write_variant<W: Write + ?Sized>(
         video_group_id: group_id(MediaKind::Video),
         audio_group_id: group_id(MediaKind::Audio),
         subtitle_group_id: group_id(MediaKind::Subtitle),
-        uri: &uris.in_multivariant(primary.rendition_id, primary.media.kind()),
+        uri: &uris.media_playlist(primary.rendition_id, primary.media.kind()),
     })?;
     Ok(())
 }
@@ -235,7 +246,7 @@ fn effective_bandwidth(entry: &RenditionCatalogEntry, policy: &PlaylistPolicy) -
 
 fn average_bandwidth(
     primary: &RenditionCatalogEntry,
-    alternates: &[&&ResolvedGroup<'_>],
+    alternates: &[&ResolvedGroup<'_>],
 ) -> Option<NonZeroU64> {
     let mut total = primary.bandwidth.average_bits_per_second?;
     for group in alternates {
@@ -312,19 +323,5 @@ fn video_range_of(range: MuxVideoRange) -> VideoRange {
         MuxVideoRange::Sdr => VideoRange::Sdr,
         MuxVideoRange::Hlg => VideoRange::Hlg,
         MuxVideoRange::Pq => VideoRange::Pq,
-    }
-}
-
-fn sample_rate(media: &RenditionMedia) -> Option<std::num::NonZeroU32> {
-    match media {
-        RenditionMedia::Audio { sample_rate, .. } => Some(*sample_rate),
-        _ => None,
-    }
-}
-
-fn channels(media: &RenditionMedia) -> Option<std::num::NonZeroU16> {
-    match media {
-        RenditionMedia::Audio { channels, .. } => Some(*channels),
-        _ => None,
     }
 }

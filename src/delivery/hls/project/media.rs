@@ -17,15 +17,12 @@ use crate::{
             MediaPlaylistWriter, Part, PreloadHint, PreloadHintType, RenditionReport, Segment,
             ServerControl,
         },
+        uri::{PlaylistUris, RenditionUris},
     },
     domain::{RenditionId, TickTimestamp, Timebase},
 };
 
-use super::{
-    PlaylistPolicy, ProgramDateTimePolicy, ProjectionError,
-    timing::program_date_time,
-    uri::{PlaylistUris, Resource, ResourceNaming},
-};
+use super::{PlaylistPolicy, ProgramDateTimePolicy, ProjectionError, timing::program_date_time};
 
 /// Version 6 is the floor for `EXT-X-MAP` in a playlist of media segments.
 const VERSION_WITH_MAP: u8 = 6;
@@ -45,10 +42,7 @@ pub fn media_playlist(
     uris: &PlaylistUris,
 ) -> Result<String, ProjectionError> {
     let contract = rendition.contract;
-    let names = Names {
-        uris,
-        naming: ResourceNaming::for_format(contract.segment_format),
-    };
+    let names = uris.within(rendition.rendition_id, contract.segment_format);
     let timebase = rendition
         .config
         .ok_or(ProjectionError::RenditionUnconfigured {
@@ -79,7 +73,7 @@ pub fn media_playlist(
         write_parent_tags(
             &mut writer,
             &mut state,
-            ParentSegment::Completed(segment),
+            segment.into(),
             stream,
             rendition,
             &names,
@@ -87,10 +81,10 @@ pub fn media_playlist(
             policy,
         )?;
         for part in &segment.parts {
-            write_part(&mut writer, rendition.rendition_id, part, &names, timebase)?;
+            write_part(&mut writer, part, &names, timebase)?;
         }
         writer.segment(Segment {
-            uri: &names.name(Resource::Segment(rendition.rendition_id, segment.id))?,
+            uri: &names.segment(segment.id),
             duration: timebase.ticks_to_duration(segment.duration),
             gap: matches!(segment.kind, StoredSegmentKind::Gap),
         })?;
@@ -100,7 +94,7 @@ pub fn media_playlist(
         write_parent_tags(
             &mut writer,
             &mut state,
-            ParentSegment::Open(open),
+            open.into(),
             stream,
             rendition,
             &names,
@@ -108,7 +102,7 @@ pub fn media_playlist(
             policy,
         )?;
         for part in &open.parts {
-            write_part(&mut writer, rendition.rendition_id, part, &names, timebase)?;
+            write_part(&mut writer, part, &names, timebase)?;
         }
     }
 
@@ -117,7 +111,7 @@ pub fn media_playlist(
     if let Some(next) = rendition.live_edge.next_part_id {
         writer.preload_hint(PreloadHint {
             hint_type: PreloadHintType::Part,
-            uri: &names.name(Resource::Part(rendition.rendition_id, next))?,
+            uri: &names.part(next),
         })?;
     }
 
@@ -129,64 +123,38 @@ pub fn media_playlist(
     Ok(out)
 }
 
-/// Names one rendition's resources the way its own media playlist must.
+/// What the playlist says about a parent segment rather than about its media.
 ///
-/// The pair travels together everywhere below: the format decides how a
-/// resource is spelled, and the stream's configured base decides where that
-/// spelling is rooted.
-struct Names<'a> {
-    uris: &'a PlaylistUris,
-    naming: ResourceNaming,
+/// A completed segment and a still-open one carry the identical set — that is
+/// the whole reason the open one is described at all — and differ only in what
+/// requires knowing how long the segment turned out to be. Reducing both to
+/// these four values is what lets one function write the tags for either.
+#[derive(Clone, Copy)]
+struct ParentSegment {
+    publication: u64,
+    initialization: InitializationId,
+    media_start: TickTimestamp,
+    discontinuity_before: bool,
 }
 
-impl Names<'_> {
-    fn name(&self, resource: Resource) -> Result<String, ProjectionError> {
-        self.uris
-            .in_media_playlist(self.naming, resource)
-            .ok_or(ProjectionError::UnnameableResource)
-    }
-
-    fn has_initialization(&self) -> bool {
-        self.naming.has_initialization()
+impl From<&StoredSegment> for ParentSegment {
+    fn from(segment: &StoredSegment) -> Self {
+        Self {
+            publication: segment.publication,
+            initialization: segment.initialization,
+            media_start: segment.media_start,
+            discontinuity_before: segment.discontinuity_before,
+        }
     }
 }
 
-/// Whichever parent segment the playlist is currently describing.
-///
-/// The open one carries the same leading tags as a completed one — that is the
-/// whole reason it is represented here at all — while differing in everything
-/// that requires knowing how long it turned out to be.
-enum ParentSegment<'a> {
-    Completed(&'a StoredSegment),
-    Open(&'a OpenSegment),
-}
-
-impl ParentSegment<'_> {
-    fn publication(&self) -> u64 {
-        match self {
-            Self::Completed(segment) => segment.publication,
-            Self::Open(open) => open.publication,
-        }
-    }
-
-    fn initialization(&self) -> InitializationId {
-        match self {
-            Self::Completed(segment) => segment.initialization,
-            Self::Open(open) => open.initialization,
-        }
-    }
-
-    fn media_start(&self) -> TickTimestamp {
-        match self {
-            Self::Completed(segment) => segment.media_start,
-            Self::Open(open) => open.media_start,
-        }
-    }
-
-    fn discontinuity_before(&self) -> bool {
-        match self {
-            Self::Completed(segment) => segment.discontinuity_before,
-            Self::Open(open) => open.discontinuity_before,
+impl From<&OpenSegment> for ParentSegment {
+    fn from(open: &OpenSegment) -> Self {
+        Self {
+            publication: open.publication,
+            initialization: open.initialization,
+            media_start: open.media_start,
+            discontinuity_before: open.discontinuity_before,
         }
     }
 }
@@ -206,22 +174,22 @@ struct Emitted {
 fn write_parent_tags<W: Write + ?Sized>(
     writer: &mut MediaPlaylistWriter<'_, W>,
     state: &mut Emitted,
-    segment: ParentSegment<'_>,
+    segment: ParentSegment,
     stream: &StreamSnapshot,
     rendition: &RenditionSnapshot,
-    names: &Names<'_>,
+    names: &RenditionUris<'_>,
     timebase: Timebase,
     policy: &PlaylistPolicy,
 ) -> Result<(), ProjectionError> {
     // The tag stays printed for as long as its segment is visible, including
     // at the window head; EXT-X-DISCONTINUITY-SEQUENCE counts only the ones
     // that have already left.
-    if segment.discontinuity_before() {
+    if segment.discontinuity_before {
         writer.discontinuity()?;
     }
 
     if names.has_initialization() {
-        let initialization = segment.initialization();
+        let initialization = segment.initialization;
         if state.initialization != Some(initialization) {
             let held = rendition.initialization_for(initialization).ok_or(
                 ProjectionError::InitializationMissing {
@@ -230,7 +198,9 @@ fn write_parent_tags<W: Write + ?Sized>(
                 },
             )?;
             writer.initialization_map(
-                &names.name(Resource::Initialization(rendition.rendition_id, held.id))?,
+                &names
+                    .initialization(held.id)
+                    .ok_or(ProjectionError::UnnameableResource)?,
             )?;
             state.initialization = Some(initialization);
         }
@@ -243,11 +213,11 @@ fn write_parent_tags<W: Write + ?Sized>(
         // One anchor per continuous range is all a client needs: it derives
         // every later segment's time by accumulating EXTINF from the last tag,
         // and a discontinuity is precisely where that accumulation restarts.
-        ProgramDateTimePolicy::AtDiscontinuities => first || segment.discontinuity_before(),
+        ProgramDateTimePolicy::AtDiscontinuities => first || segment.discontinuity_before,
     };
     if wanted
-        && let Some(anchor) = stream.time_anchor(segment.publication())
-        && let Some(time) = program_date_time(anchor, segment.media_start(), timebase)
+        && let Some(anchor) = stream.time_anchor(segment.publication)
+        && let Some(time) = program_date_time(anchor, segment.media_start, timebase)
     {
         writer.program_date_time(time)?;
     }
@@ -256,13 +226,12 @@ fn write_parent_tags<W: Write + ?Sized>(
 
 fn write_part<W: Write + ?Sized>(
     writer: &mut MediaPlaylistWriter<'_, W>,
-    rendition_id: RenditionId,
     part: &StoredPart,
-    names: &Names<'_>,
+    names: &RenditionUris<'_>,
     timebase: Timebase,
 ) -> Result<(), ProjectionError> {
     writer.part(Part {
-        uri: &names.name(Resource::Part(rendition_id, part.id))?,
+        uri: &names.part(part.id),
         duration: timebase.ticks_to_duration(part.duration),
         independent: part.independent,
         gap: false,
@@ -276,7 +245,7 @@ fn write_rendition_reports<W: Write + ?Sized>(
     writer: &mut MediaPlaylistWriter<'_, W>,
     stream: &StreamSnapshot,
     self_id: RenditionId,
-    names: &Names<'_>,
+    names: &RenditionUris<'_>,
 ) -> Result<(), ProjectionError> {
     for entry in stream.renditions.iter() {
         if entry.rendition_id == self_id || !entry.active {
@@ -292,10 +261,7 @@ fn write_rendition_reports<W: Write + ?Sized>(
             (None, None) => continue,
         };
         writer.rendition_report(RenditionReport {
-            uri: &names.name(Resource::MediaPlaylist(
-                entry.rendition_id,
-                entry.media.kind(),
-            ))?,
+            uri: &names.sibling_playlist(entry.rendition_id, entry.media.kind()),
             last_media_sequence,
             last_part,
         })?;

@@ -10,9 +10,11 @@
 //! cacheable by whoever holds the snapshot and what makes every rule below
 //! testable without a running stream.
 //!
+//! Names come from [`uri`](crate::delivery::hls::uri), which is shared with the
+//! router that has to resolve what these playlists emit.
+//!
 //! | Module | Owns |
 //! |---|---|
-//! | [`uri`] | The resource names playlists emit and routers parse |
 //! | [`timing`] | Values derived from the locked plan, not from arrivals |
 //! | [`media`] | One rendition's media playlist |
 //! | [`multivariant`] | The presentation a player chooses from |
@@ -29,7 +31,6 @@ use crate::{
 pub mod media;
 pub mod multivariant;
 pub mod timing;
-pub mod uri;
 
 #[cfg(test)]
 mod tests;

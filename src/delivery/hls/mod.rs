@@ -4,6 +4,7 @@ pub mod project;
 mod publisher;
 pub mod serve;
 mod store;
+pub mod uri;
 
 #[cfg(test)]
 pub mod fixtures;
