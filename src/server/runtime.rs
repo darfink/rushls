@@ -51,7 +51,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             rtmp_address: "0.0.0.0:1935".parse().expect("constant address is valid"),
-            srt_address: "0.0.0.0:9000".parse().expect("constant address is valid"),
+            srt_address: "[::]:9000".parse().expect("constant address is valid"),
             http_address: "0.0.0.0:8080".parse().expect("constant address is valid"),
             maintenance_interval: Duration::from_secs(1),
             maximum_sessions: 256,

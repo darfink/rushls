@@ -119,7 +119,12 @@ int rushls_srt_listener_open(const struct sockaddr *address, int address_length,
     if (socket == SRT_INVALID_SOCK) {
         return SRT_ERROR;
     }
+    const int dual_stack = 0;
     if (configure_socket(socket, options, true) == SRT_ERROR ||
+        // libSRT defaults wildcard IPv6 listeners to IPv6-only and rejects
+        // binding :: on macOS unless this option is set explicitly.
+        (address->sa_family == AF_INET6 &&
+         set_flag(socket, SRTO_IPV6ONLY, &dual_stack, sizeof(dual_stack)) == SRT_ERROR) ||
         srt_bind(socket, address, address_length) == SRT_ERROR ||
         srt_listen(socket, backlog) == SRT_ERROR) {
         srt_close(socket);

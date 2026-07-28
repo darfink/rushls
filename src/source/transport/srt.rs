@@ -596,6 +596,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ipv6_wildcard_listener_accepts_ipv4_callers() {
+        let config = SrtConfig::default();
+        let mut listener = SrtListener::bind(
+            "[::]:0".parse().expect("constant is valid"),
+            config.clone(),
+            1,
+        )
+        .expect("dual-stack listener binds");
+        let address = SocketAddr::from(([127, 0, 0, 1], listener.local_address().port()));
+        let caller = std::thread::spawn(move || {
+            let options = config.native_options().expect("options are valid");
+            native::test_connect(address, &options, "secret").expect("IPv4 caller connects")
+        });
+
+        let pending = listener
+            .accept()
+            .await
+            .expect("listener remains open")
+            .expect("connection is accepted");
+
+        assert_eq!(
+            pending
+                .publish_request()
+                .expect("request is valid")
+                .resource
+                .name,
+            "secret"
+        );
+        caller.join().expect("caller did not panic").close();
+    }
+
+    #[tokio::test]
     async fn matroska_over_srt_reuses_the_real_avformat_source() {
         let config = SrtConfig::default();
         let mut listener = SrtListener::bind(
