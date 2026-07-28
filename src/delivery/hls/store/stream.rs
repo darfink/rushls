@@ -324,13 +324,15 @@ impl LiveStream {
             return;
         }
         state.idle_since = Some(Instant::now());
+        let stream_ended = state.ended;
         let edge_updates: Vec<_> = state
             .renditions
             .iter_mut()
-            // A retired rendition remains terminal while the stream waits for
-            // reconnect; only active topology may resume publishing.
+            // Releasing the lease follows `end` during a clean shutdown, so it
+            // must preserve that terminal edge rather than reopening active
+            // renditions and restoring their preload hints.
             .map(|rendition| {
-                let ended = !rendition.active;
+                let ended = stream_ended || !rendition.active;
                 rendition.commit(ended)
             })
             .collect();

@@ -951,21 +951,21 @@ fn segment_count_capacity_failure_is_atomic() {
 }
 
 #[test]
-fn ending_a_rendition_removes_its_preload_reservation() {
+fn ending_and_releasing_a_rendition_keeps_it_terminal() {
     let store = store();
     let lease = lease(&store, &[(0, true)]);
     configure(&lease, 0, true);
     write(&lease, chunk(0, 0, 0, 0, 1, 1));
+    let live = Arc::clone(lease.live());
     assert!(lease.end());
+    drop(lease);
 
-    let edge = lease.live().rendition_live_edge(RenditionId(0)).unwrap();
+    let edge = live.rendition_live_edge(RenditionId(0)).unwrap();
     assert!(edge.ended);
     assert_eq!(edge.next_part_id, None);
     assert_eq!(edge.last_segment, Some((Msn(0), SegmentId(1))));
     assert_eq!(
-        lease
-            .live()
-            .rendition(RenditionId(0))
+        live.rendition(RenditionId(0))
             .unwrap()
             .bitrate
             .observed_segments,
