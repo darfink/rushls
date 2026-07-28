@@ -208,6 +208,95 @@ fn video_derives_variable_durations_and_synthesizes_missing_dts() {
     );
 }
 
+/// FLV timestamps are milliseconds, so 24 fps arrives as a 42/41 ms cadence
+/// while FFmpeg synthesizes a flat 41 ms `duration` from the declared frame
+/// rate. Trusting that duration leaves every access unit 0.67 ms short of the
+/// next DTS, which used to read as a decode discontinuity on the second frame.
+#[test]
+fn video_duration_follows_dts_steps_rather_than_a_quantized_packet_duration() {
+    let video = millisecond_video(24, 0);
+    let (mut started, _, _) = start(vec![video]);
+    let mut output = Vec::new();
+    for timestamp in [21, 63, 104, 146] {
+        started
+            .normalizer
+            .push(
+                packet(0, Some(timestamp), Some(timestamp), Some(41)),
+                &mut output,
+            )
+            .expect("a millisecond-quantized step is not a discontinuity");
+    }
+    started
+        .normalizer
+        .finish(&mut output)
+        .expect("video tail flushes");
+
+    assert_eq!(
+        video_timing(&output),
+        [
+            (1_890, 1_890, 3_780),
+            (5_670, 5_670, 3_690),
+            (9_360, 9_360, 3_780),
+            // No successor times the tail, so the declared duration stands.
+            (13_140, 13_140, 3_690)
+        ]
+    );
+}
+
+/// Without reordering, decode order is presentation order, so a PTS step
+/// describes the decode timeline and outranks the same quantized duration.
+#[test]
+fn video_duration_follows_pts_steps_when_decode_order_is_presentation_order() {
+    let video = millisecond_video(24, 0);
+    let (mut started, _, _) = start(vec![video]);
+    let mut output = Vec::new();
+    for pts in [21, 63, 104, 146] {
+        started
+            .normalizer
+            .push(packet(0, Some(pts), None, Some(41)), &mut output)
+            .expect("a millisecond-quantized step is not a discontinuity");
+    }
+    started
+        .normalizer
+        .finish(&mut output)
+        .expect("video tail flushes");
+
+    assert_eq!(
+        video_timing(&output),
+        [
+            (1_890, 1_890, 3_780),
+            (5_670, 5_670, 3_690),
+            (9_360, 9_360, 3_780),
+            (13_140, 13_140, 3_690)
+        ]
+    );
+}
+
+fn millisecond_video(frame_rate: u32, video_delay: u32) -> DiscoveredTrack {
+    TrackBuilder::new(0, MediaKind::Video)
+        .timebase(Timebase::new(nz::u32!(1), nz::u32!(1_000)))
+        .parameters(MediaParameters::Video {
+            width: nz::u32!(1920),
+            height: nz::u32!(1080),
+            frame_rate: Some(FrameRate::new(
+                frame_rate.try_into().expect("frame rate is positive"),
+                nz::u32!(1),
+            )),
+            video_delay,
+        })
+        .build()
+}
+
+fn video_timing(output: &[NormalizedSample]) -> Vec<(i64, i64, TickDuration)> {
+    output
+        .iter()
+        .map(|sample| match sample {
+            NormalizedSample::Video(sample) => (sample.pts, sample.dts, sample.duration),
+            _ => unreachable!("video input only produces video"),
+        })
+        .collect()
+}
+
 #[test]
 fn reordered_video_uses_declared_delay_to_synthesize_negative_dts() {
     let video = TrackBuilder::new(0, MediaKind::Video)

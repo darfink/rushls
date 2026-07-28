@@ -469,6 +469,9 @@ fn session_handshake_error(
 mod tests {
     use std::io::Cursor;
 
+    use bytes::BytesMut;
+    use scuffle_rtmp::chunk::reader::ChunkReader;
+
     use crate::{
         domain::Codec,
         observe::{ProcessMeters, SessionMeters},
@@ -489,6 +492,63 @@ mod tests {
         fn interrupted(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn scuffle_advances_a_new_type_three_message_by_the_previous_delta() {
+        let mut wire = BytesMut::new();
+        // Type 0: absolute timestamp 100, three-byte audio message.
+        wire.extend_from_slice(&[
+            0x04, 0x00, 0x00, 0x64, 0x00, 0x00, 0x03, 0x08, 0x01, 0x00, 0x00, 0x00,
+        ]);
+        wire.extend_from_slice(b"aaa");
+        // Type 1: delta 21, same stream with a new three-byte payload.
+        wire.extend_from_slice(&[0x44, 0x00, 0x00, 0x15, 0x00, 0x00, 0x03, 0x08]);
+        wire.extend_from_slice(b"bbb");
+        // Type 3: a complete new message reusing the delta, length, and type.
+        wire.extend_from_slice(&[0xc4]);
+        wire.extend_from_slice(b"ccc");
+        let mut reader = ChunkReader::default();
+
+        let first = reader
+            .read_chunk(&mut wire)
+            .expect("first chunk is valid")
+            .expect("first message is complete");
+        let second = reader
+            .read_chunk(&mut wire)
+            .expect("second chunk is valid")
+            .expect("second message is complete");
+        let third = reader
+            .read_chunk(&mut wire)
+            .expect("third chunk is valid")
+            .expect("third message is complete");
+
+        assert_eq!(first.message_header.timestamp, 100);
+        assert_eq!(second.message_header.timestamp, 121);
+        assert_eq!(third.message_header.timestamp, 142);
+        assert_eq!(third.payload.as_ref(), b"ccc");
+        assert!(wire.is_empty());
+    }
+
+    #[test]
+    fn scuffle_keeps_a_type_three_continuation_on_the_same_timestamp() {
+        let mut wire = BytesMut::new();
+        // The 130-byte message exceeds RTMP's initial 128-byte chunk size.
+        wire.extend_from_slice(&[
+            0x04, 0x00, 0x00, 0x64, 0x00, 0x00, 0x82, 0x08, 0x01, 0x00, 0x00, 0x00,
+        ]);
+        wire.extend_from_slice(&[b'a'; 128]);
+        wire.extend_from_slice(&[0xc4, b'b', b'b']);
+        let mut reader = ChunkReader::default();
+
+        let message = reader
+            .read_chunk(&mut wire)
+            .expect("continuation chunk is valid")
+            .expect("partial chunks form one complete message");
+
+        assert_eq!(message.message_header.timestamp, 100);
+        assert_eq!(message.payload.len(), 130);
+        assert!(wire.is_empty());
     }
 
     fn handler(

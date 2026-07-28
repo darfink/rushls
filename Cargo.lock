@@ -941,8 +941,6 @@ dependencies = [
 [[package]]
 name = "scuffle-rtmp"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c2da6c55454996d5654c7f56fcf5db9c9b48a82ece219b22badebdb9782de0a"
 dependencies = [
  "bitmask-enum",
  "byteorder",

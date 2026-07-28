@@ -143,7 +143,9 @@ impl VideoNormalizer {
                     })
             })
             .transpose()?;
-        let source_interval = packet
+        // Validate the declared duration even when a timestamp step outranks
+        // it, so a malformed one is still rejected rather than ignored.
+        let declared_by_packet = packet
             .duration
             .filter(|duration| *duration > 0)
             .map(|duration| {
@@ -151,30 +153,35 @@ impl VideoNormalizer {
                     .map_err(|_| processing(format!("{} video duration is invalid", self.track_id)))
             })
             .transpose()?
-            .map(|duration| (packet.dts.or(packet.pts).unwrap_or(0), duration))
-            .or_else(|| {
-                next.and_then(|next| match (packet.dts, next.dts) {
-                    (Some(current), Some(next)) => next
-                        .checked_sub(current)
-                        .and_then(|duration| TickDuration::try_from(duration).ok())
-                        .filter(|duration| *duration > 0)
-                        .map(|duration| (current, duration)),
-                    _ => None,
-                })
+            .map(|duration| (packet.dts.or(packet.pts).unwrap_or(0), duration));
+        // The distance to the next access unit outranks the declared duration.
+        // Consecutive units have to tile the decode timeline exactly, and only
+        // a timestamp step guarantees that: durations telescope back to the
+        // source timestamps, so quantization stays bounded instead of
+        // accumulating. A demuxer's `duration` is frequently a rounded
+        // 1/frame_rate in a coarse container clock — FLV hands 24 fps over as
+        // a flat 41 ms in its 1 kHz timebase, 0.67 ms short of the 42/41 ms
+        // cadence its own timestamps carry, which is 16 ms of drift per second.
+        let stepped_by_dts = next.and_then(|next| match (packet.dts, next.dts) {
+            (Some(current), Some(following)) => following
+                .checked_sub(current)
+                .and_then(|duration| TickDuration::try_from(duration).ok())
+                .filter(|duration| *duration > 0)
+                .map(|duration| (current, duration)),
+            _ => None,
+        });
+        // Without reordering, decode order is presentation order, so a PTS step
+        // describes the decode timeline exactly as a DTS step would.
+        let stepped_by_pts = (self.video_delay == 0).then_some(()).and_then(|()| {
+            next.and_then(|next| {
+                next.pts?
+                    .checked_sub(packet.pts?)
+                    .and_then(|duration| TickDuration::try_from(duration).ok())
+                    .filter(|duration| *duration > 0)
+                    .map(|duration| (packet.pts.expect("video PTS was validated"), duration))
             })
-            .or_else(|| {
-                (self.video_delay == 0).then_some(()).and_then(|()| {
-                    next.and_then(|next| {
-                        next.pts?
-                            .checked_sub(packet.pts?)
-                            .and_then(|duration| TickDuration::try_from(duration).ok())
-                            .filter(|duration| *duration > 0)
-                            .map(|duration| {
-                                (packet.pts.expect("video PTS was validated"), duration)
-                            })
-                    })
-                })
-            });
+        });
+        let source_interval = stepped_by_dts.or(stepped_by_pts).or(declared_by_packet);
         let observed = source_interval
             .map(|(start, duration)| {
                 project_interval(self.projection, start, duration, self.track_id)
