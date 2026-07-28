@@ -105,6 +105,12 @@ impl Timebase {
         clamp_u128_to_u64(div_ceil_unsigned(num, den))
     }
 
+    /// Converts ticks to the nearest nanosecond representable by [`Duration`].
+    ///
+    /// Rounding is deliberately independent for each call so this conversion
+    /// remains deterministic and context-free. Repeated rational durations can
+    /// therefore accumulate at most half a nanosecond of representation error
+    /// per value, which is negligible even for long-running media timelines.
     pub fn ticks_to_duration(self, ticks: TickDuration) -> Duration {
         if ticks == 0 {
             return Duration::ZERO;

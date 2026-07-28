@@ -27,7 +27,7 @@ use super::{
 };
 
 /// Process-level configuration for one self-contained origin.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeConfig {
     pub rtmp_address: SocketAddr,
     pub http_address: SocketAddr,
@@ -125,7 +125,7 @@ impl Node {
             meters: meters.clone(),
             events,
         };
-        let origin = Arc::new(Origin::new(store.clone(), config.delivery));
+        let origin = Arc::new(Origin::new(store.clone(), config.delivery.clone()));
         let metrics = MetricsReader::new(meters, sessions, store.clone(), config.metrics);
 
         Ok(Self {

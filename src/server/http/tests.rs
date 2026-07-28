@@ -130,7 +130,7 @@ async fn a_playlist_is_served_with_its_media_type_and_no_caching() {
     write(&lease, initialization(0, 1));
     write_segment(&lease, 0, 0, 0);
 
-    let reply = request(harness.address, "GET", "/live/camera/0/media.m3u8", &[]).await;
+    let reply = request(harness.address, "GET", "/live/camera/0/video.m3u8", &[]).await;
 
     assert_eq!(reply.status, 200);
     assert_eq!(
@@ -151,12 +151,12 @@ async fn a_multivariant_playlist_names_its_renditions() {
     let harness = Harness::start().await;
     let _lease = lease(&harness.store, vec![video(0)]);
 
-    let reply = request(harness.address, "GET", "/live/camera/master.m3u8", &[]).await;
+    let reply = request(harness.address, "GET", "/live/camera/index.m3u8", &[]).await;
 
     assert_eq!(reply.status, 200);
     let body = String::from_utf8(reply.body).expect("a playlist is text");
     assert!(body.contains("#EXT-X-STREAM-INF:"));
-    assert!(body.contains("\n0/media.m3u8\n"));
+    assert!(body.contains("\n0/video.m3u8\n"));
 
     harness.stop().await;
 }
@@ -260,17 +260,17 @@ async fn unknown_resources_and_bad_directives_are_told_apart() {
     write_segment(&lease, 0, 0, 0);
 
     for (target, expected) in [
-        ("/nobody/here/master.m3u8", 404),
-        ("/live/camera/9/media.m3u8", 404),
+        ("/nobody/here/index.m3u8", 404),
+        ("/live/camera/9/video.m3u8", 404),
         ("/live/camera/0/segment/999.m4s", 404),
-        ("/live/camera/0/media.m3u8?_HLS_part=2", 400),
-        ("/live/camera/0/media.m3u8?_HLS_msn=9999", 400),
+        ("/live/camera/0/video.m3u8?_HLS_part=2", 400),
+        ("/live/camera/0/video.m3u8?_HLS_msn=9999", 400),
     ] {
         let reply = request(harness.address, "GET", target, &[]).await;
         assert_eq!(reply.status, expected, "{target}");
     }
 
-    let rejected = request(harness.address, "POST", "/live/camera/master.m3u8", &[]).await;
+    let rejected = request(harness.address, "POST", "/live/camera/index.m3u8", &[]).await;
     assert_eq!(rejected.status, 405);
     assert_eq!(rejected.header("allow"), Some("GET, HEAD"));
 
@@ -290,7 +290,7 @@ async fn a_blocking_reload_holds_the_connection_until_its_part_arrives() {
         request(
             address,
             "GET",
-            "/live/camera/0/media.m3u8?_HLS_msn=1&_HLS_part=1",
+            "/live/camera/0/video.m3u8?_HLS_msn=1&_HLS_part=1",
             &[],
         )
         .await
@@ -333,7 +333,7 @@ async fn an_unsatisfiable_wait_ends_in_503_with_a_retry_hint() {
     let reply = request(
         harness.address,
         "GET",
-        "/live/camera/0/media.m3u8?_HLS_msn=2",
+        "/live/camera/0/video.m3u8?_HLS_msn=2",
         &[],
     )
     .await;
@@ -362,7 +362,7 @@ async fn shutdown_lets_an_in_flight_blocking_reload_finish() {
         request(
             address,
             "GET",
-            "/live/camera/0/media.m3u8?_HLS_msn=1&_HLS_part=1",
+            "/live/camera/0/video.m3u8?_HLS_msn=1&_HLS_part=1",
             &[],
         )
         .await
@@ -517,14 +517,16 @@ mod end_to_end {
             },
         ));
 
-        let master = request(address, "GET", "/live/camera/master.m3u8", &[]).await;
-        assert_eq!(master.status, 200);
+        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
+        assert_eq!(multivariant.status, 200);
         assert!(
-            String::from_utf8(master.body)
-                .expect("master is text")
-                .contains("\n0/media.m3u8\n")
+            String::from_utf8(multivariant.body)
+                .expect("the multivariant playlist is text")
+                // The fixture publishes audio alone, and the playlist name says
+                // so without anyone having to resolve rendition 0 first.
+                .contains("\n0/audio.m3u8\n")
         );
-        let media = request(address, "GET", "/live/camera/0/media.m3u8", &[]).await;
+        let media = request(address, "GET", "/live/camera/0/audio.m3u8", &[]).await;
         assert_eq!(media.status, 200);
         let media = String::from_utf8(media.body).expect("media playlist is text");
         assert!(media.contains("#EXT-X-MAP:"));
@@ -552,7 +554,7 @@ mod end_to_end {
         validate_with_ffprobe(&initialization.body, &segment.body);
 
         if command_exists("mediastreamvalidator") {
-            let url = format!("http://{address}/live/camera/master.m3u8");
+            let url = format!("http://{address}/live/camera/index.m3u8");
             let report = temporary_path("json");
             let validation = Command::new("mediastreamvalidator")
                 .args(["--timeout", "10", "--validation-data-path"])

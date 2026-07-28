@@ -2,6 +2,7 @@ use std::{env, error::Error, net::SocketAddr, sync::Arc};
 
 use rushls::{
     admission::{FixedStreamAuthenticator, Principal, PublishGrant, StreamPolicy},
+    delivery::hls::project::uri::UriBase,
     domain::{SessionId, StreamId},
     observe::{EventObserver, Events, SessionEvent},
     server::{Node, NodeConfig},
@@ -11,6 +12,8 @@ const PUBLISH_KEY_ENV: &str = "RUSHLS_PUBLISH_KEY";
 const STREAM_ID_ENV: &str = "RUSHLS_STREAM_ID";
 const RTMP_ADDRESS_ENV: &str = "RUSHLS_RTMP_LISTEN";
 const HTTP_ADDRESS_ENV: &str = "RUSHLS_HTTP_LISTEN";
+/// Where playlists root the names they emit, e.g. `https://cdn.example.com/hls`.
+const PUBLIC_BASE_ENV: &str = "RUSHLS_PUBLIC_BASE";
 
 struct StderrEvents;
 
@@ -31,6 +34,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut config = NodeConfig::default();
     config.rtmp_address = socket_address(RTMP_ADDRESS_ENV, config.rtmp_address)?;
     config.http_address = socket_address(HTTP_ADDRESS_ENV, config.http_address)?;
+    // Unset leaves every playlist name relative, which is correct behind any
+    // host or path prefix. Set, playlists name their resources absolutely.
+    if let Ok(base) = env::var(PUBLIC_BASE_ENV) {
+        config.delivery.uri_base = UriBase::new(base);
+    }
     let stream_id = StreamId::new(env::var(STREAM_ID_ENV).unwrap_or_else(|_| "live/camera".into()));
     let authenticator = FixedStreamAuthenticator::new(
         publish_key,
@@ -40,16 +48,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             policy: StreamPolicy::permissive(),
         },
     );
+    eprintln!(
+        "RTMP listening on {}; HLS listening on {}; publishing to {stream_id}",
+        config.rtmp_address, config.http_address
+    );
     let node = Node::new(
         config,
         Arc::new(authenticator),
         Events::new(Arc::new(StderrEvents)),
     )?;
-
-    eprintln!(
-        "RTMP listening on {}; HLS listening on {}; publishing to {stream_id}",
-        config.rtmp_address, config.http_address
-    );
     node.serve(shutdown_signal()).await?;
     Ok(())
 }

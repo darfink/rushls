@@ -32,10 +32,10 @@ use crate::{
             media::media_playlist,
             multivariant::multivariant_playlist,
             timing::blocking_reload_deadline,
-            uri::{Resource, ResourceNaming},
+            uri::{Resource, ResourceNaming, UriBase},
         },
     },
-    domain::{Payload, RenditionId, StreamId},
+    domain::{MediaKind, Payload, RenditionId, StreamId},
     mux::MediaSegmentFormat,
     observe::OriginMeters,
 };
@@ -59,11 +59,13 @@ pub enum PlaylistReadiness {
 }
 
 /// Everything the request path needs that is not in the store.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DeliveryConfig {
     pub playlist: PlaylistPolicy,
     pub timing: DeliveryTimingPolicy,
     pub readiness: PlaylistReadiness,
+    /// Where the names playlists emit are rooted. Relative by default.
+    pub uri_base: UriBase,
 }
 
 /// A blocking playlist reload: "do not answer until you have this".
@@ -103,6 +105,12 @@ pub enum Request {
     Multivariant,
     MediaPlaylist {
         rendition: RenditionId,
+        /// The kind the requested name claims the playlist carries.
+        ///
+        /// Checked against the rendition once it has been resolved: a playlist
+        /// served under a name that misdescribes it would make the naming
+        /// scheme decorative.
+        kind: MediaKind,
         blocking: Option<BlockingReload>,
     },
     Initialization {
@@ -127,8 +135,9 @@ impl Request {
     ) -> Result<Self, DeliveryError> {
         Ok(match resource {
             Resource::Multivariant => Self::Multivariant,
-            Resource::MediaPlaylist(rendition) => Self::MediaPlaylist {
+            Resource::MediaPlaylist(rendition, kind) => Self::MediaPlaylist {
                 rendition,
+                kind,
                 blocking,
             },
             Resource::Initialization(rendition, initialization) => Self::Initialization {
@@ -366,9 +375,10 @@ impl Origin {
             Request::Multivariant => self.multivariant(stream, &live),
             Request::MediaPlaylist {
                 rendition,
+                kind,
                 blocking,
             } => {
-                self.media_playlist(stream, &live, rendition, blocking)
+                self.media_playlist(stream, &live, rendition, kind, blocking)
                     .await
             }
             Request::Initialization {
@@ -415,10 +425,13 @@ impl Origin {
             return Err(DeliveryError::UnknownResource);
         }
         let caches = self.cache_for(stream_id);
+        // The base is configuration rather than request context, so one render
+        // still answers every viewer of this stream.
+        let uris = self.config.uri_base.uris(stream_id);
         let rendered = caches.multivariant().get_or_render(
             PlaylistKey::multivariant(&stream),
             || -> Result<String, DeliveryError> {
-                multivariant_playlist(&stream, &self.config.playlist)?
+                multivariant_playlist(&stream, &self.config.playlist, &uris)?
                     .ok_or(DeliveryError::UnknownResource)
             },
         )?;
@@ -435,9 +448,17 @@ impl Origin {
         stream_id: &StreamId,
         live: &Arc<LiveStream>,
         rendition: RenditionId,
+        kind: MediaKind,
         blocking: Option<BlockingReload>,
     ) -> Result<Response, DeliveryError> {
         let snapshot = self.rendition_snapshot(live, rendition)?;
+        // A media playlist is named after what it carries, so asking for the
+        // wrong kind names no resource this origin serves. Answering with the
+        // right rendition under the wrong name would be worse than a miss: a
+        // client would cache the lie.
+        if !carries_kind(live, rendition, kind) {
+            return Err(DeliveryError::UnknownResource);
+        }
         let deadline = blocking_reload_deadline(snapshot.contract, self.config.timing);
 
         if let Some(blocking) = blocking {
@@ -465,6 +486,7 @@ impl Origin {
         let stream = live.snapshot();
         let snapshot = self.rendition_snapshot(live, rendition)?;
         let caches = self.cache_for(stream_id);
+        let uris = self.config.uri_base.uris(stream_id);
         let rendered = caches.rendition(rendition).get_or_render(
             PlaylistKey::media(&stream),
             || -> Result<String, DeliveryError> {
@@ -474,6 +496,7 @@ impl Origin {
                     &snapshot,
                     control,
                     &self.config.playlist,
+                    &uris,
                 )?)
             },
         )?;
@@ -617,6 +640,14 @@ impl Origin {
         live.rendition(rendition)
             .ok_or(DeliveryError::UnknownRendition)
     }
+}
+
+/// Whether a rendition carries the media its playlist's name claims.
+///
+/// Read from the stream catalog rather than the media snapshot because the kind
+/// is a slow-changing advertised attribute, not something a chunk changes.
+fn carries_kind(live: &Arc<LiveStream>, rendition: RenditionId, kind: MediaKind) -> bool {
+    rendition_entry(&live.snapshot(), rendition).is_some_and(|entry| entry.media.kind() == kind)
 }
 
 fn playlist_is_ready(readiness: PlaylistReadiness, edge: &RenditionLiveEdge) -> bool {
@@ -775,6 +806,37 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_playlist_named_after_the_wrong_kind_is_a_miss() {
+        let store = StreamStore::default();
+        let origin = origin(&store);
+        let lease = lease(&store, vec![video(0)]);
+        write(&lease, initialization(0, 1));
+        write_segment(&lease, 0, 0, 0);
+
+        let request = |kind| Request::MediaPlaylist {
+            rendition: RenditionId(0),
+            kind,
+            blocking: None,
+        };
+
+        assert!(
+            origin
+                .serve(&stream_id(), request(MediaKind::Video))
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            origin
+                .serve(&stream_id(), request(MediaKind::Audio))
+                .await
+                .unwrap_err(),
+            DeliveryError::UnknownResource,
+            "answering under a name that misdescribes the playlist would let a \
+             client cache the lie"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_completed_chunked_segment_is_served_from_the_parts_that_composed_it() {
         let store = StreamStore::default();
         let origin = origin(&store);
@@ -846,6 +908,7 @@ mod tests {
 
         let request = Request::MediaPlaylist {
             rendition: RenditionId(0),
+            kind: MediaKind::Video,
             blocking: None,
         };
         let held = tokio::spawn({
@@ -882,6 +945,7 @@ mod tests {
                         &stream_id(),
                         Request::MediaPlaylist {
                             rendition: RenditionId(0),
+                            kind: MediaKind::Video,
                             blocking: None,
                         },
                     )
@@ -940,6 +1004,7 @@ mod tests {
 
         let request = Request::MediaPlaylist {
             rendition: RenditionId(0),
+            kind: MediaKind::Video,
             blocking: BlockingReload::from_directives(Some(1), Some(1))
                 .expect("the directive is well formed"),
         };
@@ -972,6 +1037,7 @@ mod tests {
                 &stream_id(),
                 Request::MediaPlaylist {
                     rendition: RenditionId(0),
+                    kind: MediaKind::Video,
                     blocking: BlockingReload::from_directives(Some(0), Some(5))
                         .expect("the directive is well formed"),
                 },
@@ -995,6 +1061,7 @@ mod tests {
                 &stream_id(),
                 Request::MediaPlaylist {
                     rendition: RenditionId(0),
+                    kind: MediaKind::Video,
                     blocking: BlockingReload::from_directives(Some(2), None)
                         .expect("the directive is well formed"),
                 },
@@ -1024,6 +1091,7 @@ mod tests {
                     &stream_id(),
                     Request::MediaPlaylist {
                         rendition: RenditionId(0),
+                        kind: MediaKind::Video,
                         blocking: BlockingReload::from_directives(Some(99), None).unwrap(),
                     }
                 )
@@ -1047,6 +1115,7 @@ mod tests {
                 &stream_id(),
                 Request::MediaPlaylist {
                     rendition: RenditionId(0),
+                    kind: MediaKind::Video,
                     blocking: BlockingReload::from_directives(Some(50), Some(9)).unwrap(),
                 },
             )
@@ -1143,6 +1212,7 @@ mod cache_tests {
 
         let request = || Request::MediaPlaylist {
             rendition: RenditionId(0),
+            kind: MediaKind::Video,
             blocking: None,
         };
         for _ in 0..5 {
@@ -1183,6 +1253,7 @@ mod cache_tests {
                 &stream_id(),
                 Request::MediaPlaylist {
                     rendition: RenditionId(0),
+                    kind: MediaKind::Video,
                     blocking: None,
                 },
             )

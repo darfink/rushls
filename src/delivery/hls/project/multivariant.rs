@@ -24,7 +24,7 @@ use crate::{
     mux::{RenditionGroupKey, RenditionMedia, VideoRange as MuxVideoRange},
 };
 
-use super::{PlaylistPolicy, ProjectionError, uri::multivariant_relative};
+use super::{PlaylistPolicy, ProjectionError, uri::PlaylistUris};
 
 /// Version 6 covers everything this projection emits.
 const VERSION: u8 = 6;
@@ -40,6 +40,7 @@ const VERSION: u8 = 6;
 pub fn multivariant_playlist(
     stream: &StreamSnapshot,
     policy: &PlaylistPolicy,
+    uris: &PlaylistUris,
 ) -> Result<Option<String>, ProjectionError> {
     let Some(presentation) = &stream.presentation else {
         return Ok(None);
@@ -103,7 +104,7 @@ pub fn multivariant_playlist(
                 // choice; a rendition nobody should select automatically would
                 // not be in the topology.
                 autoselect: true,
-                uri: Some(&multivariant_relative(entry.rendition_id)),
+                uri: Some(&uris.in_multivariant(entry.rendition_id, group.media_kind)),
             })?;
         }
     }
@@ -129,7 +130,7 @@ pub fn multivariant_playlist(
             if !written.insert(entry.rendition_id) {
                 continue;
             }
-            write_variant(&mut writer, entry, &alternate_groups, policy)?;
+            write_variant(&mut writer, entry, &alternate_groups, policy, uris)?;
         }
     }
 
@@ -141,6 +142,7 @@ fn write_variant<W: Write + ?Sized>(
     primary: &RenditionCatalogEntry,
     alternates: &[&&ResolvedGroup<'_>],
     policy: &PlaylistPolicy,
+    uris: &PlaylistUris,
 ) -> Result<(), ProjectionError> {
     let mut bandwidth = effective_bandwidth(primary, policy);
     // Only the *largest* selectable alternate from each group counts: the
@@ -213,7 +215,7 @@ fn write_variant<W: Write + ?Sized>(
         video_group_id: group_id(MediaKind::Video),
         audio_group_id: group_id(MediaKind::Audio),
         subtitle_group_id: group_id(MediaKind::Subtitle),
-        uri: &multivariant_relative(primary.rendition_id),
+        uri: &uris.in_multivariant(primary.rendition_id, primary.media.kind()),
     })?;
     Ok(())
 }

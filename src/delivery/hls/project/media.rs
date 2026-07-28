@@ -24,7 +24,7 @@ use crate::{
 use super::{
     PlaylistPolicy, ProgramDateTimePolicy, ProjectionError,
     timing::program_date_time,
-    uri::{Resource, ResourceNaming},
+    uri::{PlaylistUris, Resource, ResourceNaming},
 };
 
 /// Version 6 is the floor for `EXT-X-MAP` in a playlist of media segments.
@@ -42,9 +42,13 @@ pub fn media_playlist(
     rendition: &RenditionSnapshot,
     server_control: Option<ServerControl>,
     policy: &PlaylistPolicy,
+    uris: &PlaylistUris,
 ) -> Result<String, ProjectionError> {
     let contract = rendition.contract;
-    let naming = ResourceNaming::for_format(contract.segment_format);
+    let names = Names {
+        uris,
+        naming: ResourceNaming::for_format(contract.segment_format),
+    };
     let timebase = rendition
         .config
         .ok_or(ProjectionError::RenditionUnconfigured {
@@ -78,18 +82,15 @@ pub fn media_playlist(
             ParentSegment::Completed(segment),
             stream,
             rendition,
-            naming,
+            &names,
             timebase,
             policy,
         )?;
         for part in &segment.parts {
-            write_part(&mut writer, rendition.rendition_id, part, naming, timebase)?;
+            write_part(&mut writer, rendition.rendition_id, part, &names, timebase)?;
         }
         writer.segment(Segment {
-            uri: &resource(
-                naming,
-                Resource::Segment(rendition.rendition_id, segment.id),
-            )?,
+            uri: &names.name(Resource::Segment(rendition.rendition_id, segment.id))?,
             duration: timebase.ticks_to_duration(segment.duration),
             gap: matches!(segment.kind, StoredSegmentKind::Gap),
         })?;
@@ -102,12 +103,12 @@ pub fn media_playlist(
             ParentSegment::Open(open),
             stream,
             rendition,
-            naming,
+            &names,
             timebase,
             policy,
         )?;
         for part in &open.parts {
-            write_part(&mut writer, rendition.rendition_id, part, naming, timebase)?;
+            write_part(&mut writer, rendition.rendition_id, part, &names, timebase)?;
         }
     }
 
@@ -116,16 +117,38 @@ pub fn media_playlist(
     if let Some(next) = rendition.live_edge.next_part_id {
         writer.preload_hint(PreloadHint {
             hint_type: PreloadHintType::Part,
-            uri: &resource(naming, Resource::Part(rendition.rendition_id, next))?,
+            uri: &names.name(Resource::Part(rendition.rendition_id, next))?,
         })?;
     }
 
-    write_rendition_reports(&mut writer, stream, rendition.rendition_id, naming)?;
+    write_rendition_reports(&mut writer, stream, rendition.rendition_id, &names)?;
 
     if rendition.live_edge.ended {
         writer.endlist()?;
     }
     Ok(out)
+}
+
+/// Names one rendition's resources the way its own media playlist must.
+///
+/// The pair travels together everywhere below: the format decides how a
+/// resource is spelled, and the stream's configured base decides where that
+/// spelling is rooted.
+struct Names<'a> {
+    uris: &'a PlaylistUris,
+    naming: ResourceNaming,
+}
+
+impl Names<'_> {
+    fn name(&self, resource: Resource) -> Result<String, ProjectionError> {
+        self.uris
+            .in_media_playlist(self.naming, resource)
+            .ok_or(ProjectionError::UnnameableResource)
+    }
+
+    fn has_initialization(&self) -> bool {
+        self.naming.has_initialization()
+    }
 }
 
 /// Whichever parent segment the playlist is currently describing.
@@ -186,7 +209,7 @@ fn write_parent_tags<W: Write + ?Sized>(
     segment: ParentSegment<'_>,
     stream: &StreamSnapshot,
     rendition: &RenditionSnapshot,
-    naming: ResourceNaming,
+    names: &Names<'_>,
     timebase: Timebase,
     policy: &PlaylistPolicy,
 ) -> Result<(), ProjectionError> {
@@ -197,7 +220,7 @@ fn write_parent_tags<W: Write + ?Sized>(
         writer.discontinuity()?;
     }
 
-    if naming.has_initialization() {
+    if names.has_initialization() {
         let initialization = segment.initialization();
         if state.initialization != Some(initialization) {
             let held = rendition.initialization_for(initialization).ok_or(
@@ -206,10 +229,9 @@ fn write_parent_tags<W: Write + ?Sized>(
                     initialization,
                 },
             )?;
-            writer.initialization_map(&resource(
-                naming,
-                Resource::Initialization(rendition.rendition_id, held.id),
-            )?)?;
+            writer.initialization_map(
+                &names.name(Resource::Initialization(rendition.rendition_id, held.id))?,
+            )?;
             state.initialization = Some(initialization);
         }
     }
@@ -236,11 +258,11 @@ fn write_part<W: Write + ?Sized>(
     writer: &mut MediaPlaylistWriter<'_, W>,
     rendition_id: RenditionId,
     part: &StoredPart,
-    naming: ResourceNaming,
+    names: &Names<'_>,
     timebase: Timebase,
 ) -> Result<(), ProjectionError> {
     writer.part(Part {
-        uri: &resource(naming, Resource::Part(rendition_id, part.id))?,
+        uri: &names.name(Resource::Part(rendition_id, part.id))?,
         duration: timebase.ticks_to_duration(part.duration),
         independent: part.independent,
         gap: false,
@@ -254,7 +276,7 @@ fn write_rendition_reports<W: Write + ?Sized>(
     writer: &mut MediaPlaylistWriter<'_, W>,
     stream: &StreamSnapshot,
     self_id: RenditionId,
-    naming: ResourceNaming,
+    names: &Names<'_>,
 ) -> Result<(), ProjectionError> {
     for entry in stream.renditions.iter() {
         if entry.rendition_id == self_id || !entry.active {
@@ -270,18 +292,15 @@ fn write_rendition_reports<W: Write + ?Sized>(
             (None, None) => continue,
         };
         writer.rendition_report(RenditionReport {
-            uri: &resource(naming, Resource::MediaPlaylist(entry.rendition_id))?,
+            uri: &names.name(Resource::MediaPlaylist(
+                entry.rendition_id,
+                entry.media.kind(),
+            ))?,
             last_media_sequence,
             last_part,
         })?;
     }
     Ok(())
-}
-
-fn resource(naming: ResourceNaming, resource: Resource) -> Result<String, ProjectionError> {
-    naming
-        .media_relative(resource)
-        .ok_or(ProjectionError::UnnameableResource)
 }
 
 fn version(chunked: bool) -> NonZeroU8 {

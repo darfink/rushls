@@ -11,8 +11,11 @@ use crate::{
             write_segment,
         },
         project::{
-            DeliveryTimingPolicy, PlaylistPolicy, ProgramDateTimePolicy, media::media_playlist,
-            multivariant::multivariant_playlist, presentation_server_control,
+            DeliveryTimingPolicy, PlaylistPolicy, ProgramDateTimePolicy,
+            media::media_playlist,
+            multivariant::multivariant_playlist,
+            presentation_server_control,
+            uri::{PlaylistUris, UriBase},
         },
     },
     domain::RenditionId,
@@ -20,6 +23,11 @@ use crate::{
 
 fn policy() -> PlaylistPolicy {
     PlaylistPolicy::default()
+}
+
+/// The default: every name relative to the playlist that emits it.
+fn uris() -> PlaylistUris {
+    UriBase::default().uris(&stream_id())
 }
 
 fn snapshots(lease: &StreamLease, rendition: u32) -> (Arc<StreamSnapshot>, Arc<RenditionSnapshot>) {
@@ -34,7 +42,7 @@ fn snapshots(lease: &StreamLease, rendition: u32) -> (Arc<StreamSnapshot>, Arc<R
 fn render(lease: &StreamLease, rendition: u32, policy: &PlaylistPolicy) -> String {
     let (stream, media) = snapshots(lease, rendition);
     let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
-    media_playlist(&stream, &media, control, policy).expect("the playlist projects")
+    media_playlist(&stream, &media, control, policy, &uris()).expect("the playlist projects")
 }
 
 #[test]
@@ -189,14 +197,47 @@ fn siblings_are_reported_so_a_switching_client_knows_where_to_resume() {
 
     assert!(
         rendered
-            .contains("#EXT-X-RENDITION-REPORT:URI=\"../1/media.m3u8\",LAST-MSN=1,LAST-PART=0\n"),
+            .contains("#EXT-X-RENDITION-REPORT:URI=\"../1/audio.m3u8\",LAST-MSN=1,LAST-PART=0\n"),
         "the audio rendition has a part open in MSN 1, which is where a client \
          switching to it should ask to continue: {rendered}"
     );
     assert!(
-        !rendered.contains("../0/media.m3u8"),
+        !rendered.contains("../0/video.m3u8"),
         "a playlist does not report itself"
     );
+}
+
+#[test]
+fn a_configured_base_makes_every_name_absolute() {
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0), audio(1)]);
+    for local in [0, 1] {
+        write(&lease, initialization(local, 1));
+        write_segment(&lease, local, 0, 0);
+    }
+
+    let (stream, media) = snapshots(&lease, 0);
+    let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
+    let uris = UriBase::new("https://cdn.example.com/hls").uris(&stream_id());
+    let rendered =
+        media_playlist(&stream, &media, control, &policy(), &uris).expect("the playlist projects");
+    let multivariant = multivariant_playlist(&stream, &policy(), &uris)
+        .expect("the presentation projects")
+        .expect("an attached publication has a topology");
+
+    assert!(
+        rendered
+            .contains("#EXT-X-MAP:URI=\"https://cdn.example.com/hls/live/camera/0/init/1.mp4\"\n")
+    );
+    assert!(
+        rendered.contains("#EXTINF:6,\nhttps://cdn.example.com/hls/live/camera/0/segment/1.m4s\n")
+    );
+    assert!(
+        rendered.contains("URI=\"https://cdn.example.com/hls/live/camera/1/audio.m3u8\""),
+        "a sibling is reached through the base rather than by stepping out of \
+         a directory that a rooted name never entered: {rendered}"
+    );
+    assert!(multivariant.contains("\nhttps://cdn.example.com/hls/live/camera/0/video.m3u8\n"));
 }
 
 #[test]
@@ -275,7 +316,7 @@ fn a_variant_advertises_what_playing_it_actually_costs() {
     write_direct(&lease, 2, 0, 0);
 
     let stream = lease.live().snapshot();
-    let rendered = multivariant_playlist(&stream, &policy())
+    let rendered = multivariant_playlist(&stream, &policy(), &uris())
         .expect("the presentation projects")
         .expect("an attached publication has a topology");
 
@@ -293,9 +334,13 @@ fn a_variant_advertises_what_playing_it_actually_costs() {
     );
     assert!(rendered.contains("AUDIO=\"audio\""));
     assert!(rendered.contains("SUBTITLES=\"subtitle\""));
-    assert!(rendered.contains("\n0/media.m3u8\n"));
+    assert!(rendered.contains("\n0/video.m3u8\n"));
     assert!(rendered.contains("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\""));
-    assert!(rendered.contains("URI=\"1/media.m3u8\""));
+    assert!(rendered.contains("URI=\"1/audio.m3u8\""));
+    assert!(
+        rendered.contains("URI=\"2/subtitles.m3u8\""),
+        "a playlist's file name says what it carries: {rendered}"
+    );
     assert!(
         !rendered.contains("#EXT-X-MEDIA:TYPE=VIDEO"),
         "the primary group's renditions are the variants themselves"
@@ -308,7 +353,7 @@ fn an_unmeasured_presentation_is_servable_immediately() {
     let lease = lease(&store, vec![video(0), audio(1)]);
 
     let stream = lease.live().snapshot();
-    let rendered = multivariant_playlist(&stream, &policy())
+    let rendered = multivariant_playlist(&stream, &policy(), &uris())
         .expect("the presentation projects")
         .expect("a topology exists as soon as a publisher attaches");
 
@@ -330,7 +375,7 @@ fn an_optimistic_declaration_is_not_lowered_by_a_smaller_measurement() {
     declared.declared_bandwidth = Some(9_000_000);
     let lease = lease(&store, vec![declared]);
 
-    let before = multivariant_playlist(&lease.live().snapshot(), &policy())
+    let before = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())
         .expect("projects")
         .expect("has a topology");
     assert!(before.contains("BANDWIDTH=9000000"));
@@ -343,7 +388,7 @@ fn an_optimistic_declaration_is_not_lowered_by_a_smaller_measurement() {
         .peak_bits_per_second
         .expect("a completed segment has been measured");
 
-    let after = multivariant_playlist(&stream, &policy())
+    let after = multivariant_playlist(&stream, &policy(), &uris())
         .expect("projects")
         .expect("has a topology");
     assert!(
@@ -361,7 +406,7 @@ fn a_stream_nobody_has_published_to_has_no_presentation() {
         .expect("the store has room");
 
     assert!(
-        multivariant_playlist(&lease.live().snapshot(), &policy())
+        multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())
             .expect("projects")
             .is_none()
     );

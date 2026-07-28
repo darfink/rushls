@@ -115,7 +115,7 @@ impl Directives {
 mod tests {
     use crate::{
         delivery::hls::{Msn, PartId, PartIndex, SegmentId},
-        domain::RenditionId,
+        domain::{MediaKind, RenditionId},
     };
 
     use super::*;
@@ -123,17 +123,18 @@ mod tests {
     #[test]
     fn a_stream_name_may_contain_slashes() {
         assert_eq!(
-            route("/live/camera/3/media.m3u8", None).expect("routes"),
+            route("/live/camera/3/video.m3u8", None).expect("routes"),
             Routed {
                 stream: StreamId::new("live/camera"),
                 request: Request::MediaPlaylist {
                     rendition: RenditionId(3),
+                    kind: MediaKind::Video,
                     blocking: None
                 }
             }
         );
         assert_eq!(
-            route("/a/b/c/d/master.m3u8", None).expect("routes").stream,
+            route("/a/b/c/d/index.m3u8", None).expect("routes").stream,
             StreamId::new("a/b/c/d")
         );
     }
@@ -159,13 +160,13 @@ mod tests {
     #[test]
     fn a_percent_encoded_stream_decodes_to_one_identity() {
         assert_eq!(
-            route("/live%20one/0/media.m3u8", None)
+            route("/live%20one/0/video.m3u8", None)
                 .expect("routes")
                 .stream,
             StreamId::new("live one")
         );
         assert_eq!(
-            route("/live%zz/0/media.m3u8", None).unwrap_err(),
+            route("/live%zz/0/video.m3u8", None).unwrap_err(),
             DeliveryError::UnknownResource,
             "an invalid escape would let two spellings name one stream"
         );
@@ -174,11 +175,12 @@ mod tests {
     #[test]
     fn blocking_directives_are_read_and_validated() {
         assert_eq!(
-            route("/s/0/media.m3u8", Some("_HLS_msn=4&_HLS_part=2"))
+            route("/s/0/video.m3u8", Some("_HLS_msn=4&_HLS_part=2"))
                 .expect("routes")
                 .request,
             Request::MediaPlaylist {
                 rendition: RenditionId(0),
+                kind: MediaKind::Video,
                 blocking: Some(BlockingReload {
                     msn: Msn(4),
                     part: Some(PartIndex(2))
@@ -186,19 +188,20 @@ mod tests {
             }
         );
         assert!(matches!(
-            route("/s/0/media.m3u8", Some("_HLS_part=2")).unwrap_err(),
+            route("/s/0/video.m3u8", Some("_HLS_part=2")).unwrap_err(),
             DeliveryError::InvalidDirective(_)
         ));
         assert!(matches!(
-            route("/s/0/media.m3u8", Some("_HLS_msn=soon")).unwrap_err(),
+            route("/s/0/video.m3u8", Some("_HLS_msn=soon")).unwrap_err(),
             DeliveryError::InvalidDirective(_)
         ));
         assert_eq!(
-            route("/s/0/media.m3u8", Some("_HLS_future=1&x=2"))
+            route("/s/0/video.m3u8", Some("_HLS_future=1&x=2"))
                 .expect("routes")
                 .request,
             Request::MediaPlaylist {
                 rendition: RenditionId(0),
+                kind: MediaKind::Video,
                 blocking: None
             },
             "a directive this origin has not learned yet is not a client error"
@@ -209,7 +212,7 @@ mod tests {
     fn paths_that_name_nothing_are_misses_rather_than_lookups() {
         for path in [
             "/",
-            "/master.m3u8",
+            "/index.m3u8",
             "/s/0/../../etc/passwd",
             "/s/0/segment/7",
             "/s/0/elsewhere/7.m4s",
