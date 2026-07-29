@@ -39,11 +39,11 @@ fn the_reference_file_resolves_to_the_runtime_defaults() -> Result<(), Box<dyn E
 fn cli_overrides_environment_which_overrides_toml() -> Result<(), Box<dyn Error>> {
     let file = TempConfig::new(
         r#"
-[node]
-maximum_sessions = 10
+[server]
+maximum_concurrent_publishers = 10
 
-[auth]
-publish_key = "from-file"
+[publishing]
+key = "from-file"
 "#,
     )?;
     let config = AppConfig::load_from(
@@ -51,12 +51,12 @@ publish_key = "from-file"
             "rushls",
             "--config",
             file.path.to_str().ok_or("temporary path is not UTF-8")?,
-            "--node-maximum-sessions",
+            "--server-maximum-concurrent-publishers",
             "30",
         ]),
         env([
-            ("RUSHLS_NODE_MAXIMUM_SESSIONS", "20"),
-            ("RUSHLS_AUTH_PUBLISH_KEY", "from-env"),
+            ("RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHERS", "20"),
+            ("RUSHLS_PUBLISHING_KEY", "from-env"),
         ]),
     )?
     .resolve()?;
@@ -96,7 +96,7 @@ fn the_canonical_environment_name_wins_over_its_legacy_alias() -> Result<(), Box
         os(["rushls"]),
         env([
             ("RUSHLS_PUBLISH_KEY", "legacy"),
-            ("RUSHLS_AUTH_PUBLISH_KEY", "canonical"),
+            ("RUSHLS_PUBLISHING_KEY", "canonical"),
         ]),
     )?
     .resolve()?;
@@ -110,7 +110,7 @@ fn credentialed_wildcard_cors_is_rejected() -> Result<(), Box<dyn Error>> {
     let result = AppConfig::load_from(
         os(["rushls"]),
         env([
-            ("RUSHLS_AUTH_PUBLISH_KEY", "key"),
+            ("RUSHLS_PUBLISHING_KEY", "key"),
             ("RUSHLS_HTTP_CORS_ALLOW_CREDENTIALS", "true"),
         ]),
     )?
@@ -125,10 +125,10 @@ fn metrics_endpoint_and_authentication_resolve_from_configuration() -> Result<()
     let config = AppConfig::load_from(
         os(["rushls"]),
         env([
-            ("RUSHLS_AUTH_PUBLISH_KEY", "key"),
-            ("RUSHLS_OBSERVABILITY_METRICS_ENABLED", "true"),
-            ("RUSHLS_OBSERVABILITY_METRICS_TOKEN", "scrape-secret"),
-            ("RUSHLS_OBSERVABILITY_METRICS_PER_STREAM", "true"),
+            ("RUSHLS_PUBLISHING_KEY", "key"),
+            ("RUSHLS_METRICS_ENABLED", "true"),
+            ("RUSHLS_METRICS_TOKEN", "scrape-secret"),
+            ("RUSHLS_METRICS_PER_STREAM", "true"),
         ]),
     )?
     .resolve()?;
@@ -144,8 +144,8 @@ fn an_empty_metrics_token_is_rejected() -> Result<(), Box<dyn Error>> {
     let result = AppConfig::load_from(
         os(["rushls"]),
         env([
-            ("RUSHLS_AUTH_PUBLISH_KEY", "key"),
-            ("RUSHLS_OBSERVABILITY_METRICS_TOKEN", ""),
+            ("RUSHLS_PUBLISHING_KEY", "key"),
+            ("RUSHLS_METRICS_TOKEN", ""),
         ]),
     )?
     .resolve();
@@ -159,7 +159,7 @@ fn tls_requires_both_the_certificate_and_key() {
     let result = AppConfig::load_from(
         os(["rushls"]),
         env([
-            ("RUSHLS_AUTH_PUBLISH_KEY", "key"),
+            ("RUSHLS_PUBLISHING_KEY", "key"),
             ("RUSHLS_HTTP_TLS_CERTIFICATE", "/tmp/certificate.pem"),
         ]),
     );
@@ -171,12 +171,38 @@ fn tls_requires_both_the_certificate_and_key() {
 fn unknown_toml_keys_are_rejected() -> Result<(), Box<dyn Error>> {
     let file = TempConfig::new(
         r#"
-[auth]
-publish_key = "key"
+[publishing]
+key = "key"
 
-[node]
-maximum_sessions = 10
-maximum_sessionz = 11
+[server]
+maximum_concurrent_publishers = 10
+maximum_concurrent_publisherz = 11
+"#,
+    )?;
+
+    assert!(
+        AppConfig::load_from(
+            os([
+                "rushls",
+                "--config",
+                file.path.to_str().ok_or("temporary path is not UTF-8")?,
+            ]),
+            std::iter::empty(),
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn low_level_pipeline_settings_are_not_part_of_the_public_schema() -> Result<(), Box<dyn Error>> {
+    let file = TempConfig::new(
+        r#"
+[publishing]
+key = "key"
+
+[ingest.rtmp.avformat]
+io_buffer_size = "64KiB"
 "#,
     )?;
 

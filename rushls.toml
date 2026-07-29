@@ -1,160 +1,94 @@
-# Complete Rushls configuration reference.
+# Complete Rushls administrator configuration reference.
 #
-# This file spells out every setting and its built-in default. Rushls only
+# This file contains every supported setting and its built-in default. Rushls
 # reads it when selected with `--config rushls.toml` or `RUSHLS_CONFIG`.
 # Environment variables and CLI arguments override values from this file.
 #
-# The publishing key below is intentionally not usable as a production secret.
-# Replace it before starting Rushls with this file.
+# Environment names follow the section path, for example:
+#   RUSHLS_HTTP_LISTEN=127.0.0.1:8080
+# CLI names use dashes:
+#   --http-listen 127.0.0.1:8080
+#
+# The publishing key below is only a placeholder. Replace it before starting
+# Rushls with this file.
 
-[node]
-# Maximum simultaneous publishing sessions.
-maximum_sessions = 256
-# Store and playlist-cache maintenance cadence.
-maintenance_interval = "1s"
+[server]
+# Maximum publishers that may be connected and actively publishing at once.
+maximum_concurrent_publishers = 256
 
-[auth]
-publish_key = "replace-with-a-publishing-key"
+[publishing]
+# Shared credential presented by RTMP and SRT publishers. For secrets, prefer
+# this file with restricted permissions or RUSHLS_PUBLISHING_KEY.
+key = "replace-with-a-publishing-key"
+# Public stream name used in HLS URLs. Slashes may be used for organization.
 stream_id = "live/camera"
-principal = "configured-publisher"
+# A reconnect or replacement publisher may take over from the current one.
+allow_takeover = true
 
-[auth.stream_policy]
-takeovers = "allow"
-# `pace` applies backpressure; `require-realtime` rejects excessive lead.
-ingest_timing = "pace"
-initial_lead = "2s"
-maximum_timestamp_jump = "10s"
-maximum_lead = "2s"
-accepted_video_codecs = ["h264", "hevc", "av1"]
-accepted_audio_codecs = ["aac", "opus"]
-accepted_subtitle_codecs = ["webvtt", "subrip"]
+[publishing.media]
+# These are codec admission rules, not container formats. Rushls detects
+# supported containers automatically for each ingest protocol.
+video_codecs = ["h264", "hevc", "av1"]
+audio_codecs = ["aac", "opus"]
+subtitle_codecs = ["webvtt", "subrip"]
+
+# Multi-language and alternate tracks count separately.
+maximum_video_tracks = 8
 maximum_audio_tracks = 8
 maximum_subtitle_tracks = 8
-maximum_video_tracks = 8
-maximum_video_width = 7680
-maximum_video_height = 4320
-maximum_video_frame_rate = "240/1"
-maximum_audio_sample_rate = 192000
-maximum_audio_channels = 32
+
+# Video above either limit is rejected before publication begins. Exact rates
+# such as NTSC may be written as "60000/1001".
+maximum_video_resolution = "7680x4320"
+maximum_video_frame_rate = "240"
 
 [ingest.rtmp]
+# Use 127.0.0.1 when a local proxy is the only intended RTMP client.
 listen = "0.0.0.0:1935"
-maximum_publish_wait = "10s"
-maximum_buffered_flv_bytes = "16MiB"
-maximum_tag_payload_bytes = "8MiB"
-
-[ingest.rtmp.avformat]
-io_buffer_size = "32KiB"
-packet_channel_capacity = 64
-maximum_queued_payload_bytes = "16MiB"
 
 [ingest.srt]
-# `[::]` is explicitly configured as a dual-stack SRT wildcard.
+# `[::]` is the dual-stack wildcard used by the SRT listener.
 listen = "[::]:9000"
+# Increase this on lossy or long-distance networks, at the cost of latency.
 latency = "120ms"
-peer_idle_timeout = "5s"
-receive_poll_interval = "25ms"
-receive_buffer_bytes = "16MiB"
-maximum_message_bytes = "1456B"
-maximum_stream_id_bytes = "512B"
+
 # Uncomment to require encrypted SRT. Passphrases contain 10 to 79 UTF-8 bytes.
 # passphrase = "replace-with-an-srt-passphrase"
-key_length = "aes256"
+encryption_key_length = "aes256"
 
-[ingest.srt.avformat]
-io_buffer_size = "32KiB"
-packet_channel_capacity = 64
-maximum_queued_payload_bytes = "16MiB"
+[hls]
+# Empty produces relative playlist URLs, which is normally right behind a
+# reverse proxy or CDN. Set an absolute prefix only when playlists must point
+# somewhere else, for example "https://cdn.example.com/live".
+public_base_url = ""
 
-[session]
-maximum_admission_time = "10s"
+# Rushls aims for these durations, but input keyframes and sample cadence may
+# require nearby boundaries. Shorter values lower latency and increase request
+# and storage overhead.
+segment_duration = "6s"
+part_duration = "1s"
 
-[session.discovery]
-maximum_probe_bytes = "8MiB"
-maximum_wall_time = "10s"
+# Minimum completed segments retained in each live playlist.
+playlist_segments = 6
 
-[session.input]
-maximum_packets_per_batch = 4096
-maximum_payload_bytes_per_packet = "8MiB"
-maximum_payload_bytes_per_batch = "16MiB"
-maximum_samples_per_batch = 16384
-maximum_bytes_per_media_second = "12.5MB"
-maximum_packets_per_media_second = 50000
-maximum_samples_per_media_second = 50000
-media_density_window = "1s"
-
-[session.preroll]
-maximum_buffered_bytes = "64MiB"
-maximum_buffered_samples = 16384
-maximum_wall_time = "15s"
-maximum_media_duration = "30s"
-
-[session.segmentation]
-desired_segment_duration = "6s"
-desired_part_duration = "1s"
-boundary_search = "extend-to-next"
-maximum_search_extension = "6s"
-
-[session.supervision]
-health_interval = "1s"
-source_stall_timeout = "5s"
-media_stall_timeout = "5s"
-stalled_publication_multiplier = 3
-minimum_publication_stall_tolerance = "1s"
-
-[packaging.cmaf]
-io_buffer_size = "32KiB"
-segment_boundary = "strict"
-maximum_boundary_extension = "6s"
-
-[delivery]
-# Empty keeps playlist resource names relative.
-public_base = ""
-playlist_readiness = "completed-segment"
-
-[delivery.playlist]
-program_date_time = "at-discontinuities"
-assumed_bandwidth = 6000000
-
-[delivery.timing]
-# Exact multiples use `Nx` or `N/Dx`.
-hold_back = "3x"
-part_hold_back = "3x"
-blocking_reload = "3x"
-can_block_reload = true
-
-[delivery.cache]
-# Cache rules accept target-duration multiples or fixed human durations.
-blocking_playlist = "6x"
-playlist = "1/2x"
-media = "6x"
-blocking_missing = "4x"
-missing = "1x"
-assumed_target_duration = "6s"
-
-[delivery.store]
+[storage]
+# Includes active streams and recently inactive streams retained for reconnect.
 maximum_streams = 1024
-idle_retention = "30s"
-
-[delivery.store.retention]
-minimum_playlist_segments = 6
-minimum_playlist_duration = "3x"
-part_tag_retention = "3x"
-part_fetch_grace_period = "3x"
-# `protocol` derives segment availability from HLS rules. A duration or
-# target-duration multiple overrides it.
-segment_fetch_grace_period = "protocol"
-maximum_payload_bytes = "512MiB"
-maximum_parts = 16384
-maximum_segments = 4096
+# An inactive stream remains playable for this long while awaiting a publisher.
+inactive_stream_retention = "30s"
+# Payload budget for one stream. Metadata has separate internal safety limits.
+maximum_media_per_stream = "512MiB"
 
 [http]
+# Serves HLS, and `/metrics` when metrics are enabled.
 listen = "0.0.0.0:8080"
 
 [http.cors]
-# Use `"*"`, `"off"`, or an array such as
-# `["https://player.example.com", "https://admin.example.com"]`.
+# Use "*", "off", or an explicit array of web player origins:
+# origins = ["https://player.example.com", "https://admin.example.com"]
 origins = "*"
+# Browser credentials require an explicit origin list; they cannot be used
+# together with "*".
 allow_credentials = false
 max_age = "10min"
 
@@ -164,14 +98,12 @@ max_age = "10min"
 # [http.tls]
 # certificate = "/etc/rushls/tls/fullchain.pem"
 # key = "/etc/rushls/tls/private-key.pem"
-# handshake_timeout = "10s"
-# maximum_pending_handshakes = 256
 
-[observability]
+[metrics]
 # Prometheus metrics are served at `/metrics` on the HTTP listener when enabled.
-metrics_enabled = false
-# Set a bearer token to authenticate scrapes. When omitted, the enabled
-# endpoint is accessible without authentication.
-# metrics_token = "replace-with-a-metrics-token"
-# Per-stream metrics have unbounded label cardinality and are off by default.
-metrics_per_stream = false
+enabled = false
+# Set a bearer token to authenticate scrapes. For secrets, prefer this file with
+# restricted permissions or RUSHLS_METRICS_TOKEN.
+# token = "replace-with-a-metrics-token"
+# Per-stream series use stream names as labels and may create high cardinality.
+per_stream = false
