@@ -192,7 +192,7 @@ async fn handle(
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let mut response = match into_http(response, range.as_deref()) {
+    let mut response = match into_http(response, range.as_deref(), accepts_gzip(&headers)) {
         Ok(response) => response,
         Err(status) => status.into_response(),
     };
@@ -200,42 +200,123 @@ async fn handle(
     response
 }
 
-fn into_http(response: DeliveryResponse, range: Option<&str>) -> Result<Response, StatusCode> {
-    let content_type = HeaderValue::from_static(response.content_type);
-    let cache = response.cache_control.into();
+/// Whether the client is prepared to accept gzip.
+///
+/// `q=0` is a refusal rather than a preference, so an explicit `gzip;q=0` wins
+/// over a wildcard that would otherwise allow it. Absent the header entirely,
+/// the answer is no: HLS asks servers to compress text *if the client indicates
+/// that it is prepared to accept it*, and silence is not an indication.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let mut wildcard = false;
+    for entry in value.split(',') {
+        let mut parts = entry.split(';');
+        let coding = parts.next().unwrap_or_default().trim();
+        let acceptable = !parts.any(|parameter| {
+            parameter
+                .trim()
+                .strip_prefix("q=")
+                .and_then(|quality| quality.trim().parse::<f32>().ok())
+                .is_some_and(|quality| quality <= 0.0)
+        });
+        if coding.eq_ignore_ascii_case("gzip") {
+            return acceptable;
+        }
+        if coding == "*" {
+            wildcard = acceptable;
+        }
+    }
+    wildcard
+}
 
-    match response.body {
-        DeliveryBody::Playlist(bytes) => Ok((
+fn into_http(
+    response: DeliveryResponse,
+    range: Option<&str>,
+    accepts_gzip: bool,
+) -> Result<Response, StatusCode> {
+    let content_type = HeaderValue::from_static(response.content_type.name());
+    let cache = response.cache_control.into();
+    // Announced only where an encoding was actually available to choose. Saying
+    // it on already-compressed media would split every cache entry downstream
+    // for a resource that never varies — and those are the entries this origin
+    // asks caches to hold for six target durations.
+    let varies = response.gzip.is_some();
+    // A range names bytes of the identity representation, so the two cannot be
+    // combined: a range of a gzip stream describes a different resource.
+    let encoded = response.gzip.filter(|_| accepts_gzip && range.is_none());
+
+    if let Some(gzip) = encoded {
+        let length = gzip.len();
+        let mut encoded = (
             [
                 (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, cache),
+                (header::CONTENT_ENCODING, HeaderValue::from_static("gzip")),
             ],
-            bytes,
+            gzip,
         )
-            .into_response()),
+            .into_response();
+        if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+            encoded.headers_mut().insert(header::CONTENT_LENGTH, value);
+        }
+        return Ok(with_vary(encoded, varies));
+    }
+
+    match response.body {
+        DeliveryBody::Playlist(bytes) => Ok(with_vary(
+            (
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::CACHE_CONTROL, cache),
+                ],
+                bytes,
+            )
+                .into_response(),
+            varies,
+        )),
         DeliveryBody::Media(media) => {
             let length = media.len();
             let Some(range) = range else {
-                return Ok(media_response(media, content_type, cache, None, length));
+                return Ok(with_vary(
+                    media_response(media, content_type, cache, None, length),
+                    varies,
+                ));
             };
             match parse_range(range, length) {
-                RangeOutcome::Ignore => {
-                    Ok(media_response(media, content_type, cache, None, length))
-                }
+                RangeOutcome::Ignore => Ok(with_vary(
+                    media_response(media, content_type, cache, None, length),
+                    varies,
+                )),
                 RangeOutcome::Unsatisfiable => Err(StatusCode::RANGE_NOT_SATISFIABLE),
                 RangeOutcome::Satisfiable(range) => {
                     let clipped = media.range(range.start, range.end);
-                    Ok(media_response(
-                        clipped,
-                        content_type,
-                        cache,
-                        Some((range.start, range.end)),
-                        length,
+                    Ok(with_vary(
+                        media_response(
+                            clipped,
+                            content_type,
+                            cache,
+                            Some((range.start, range.end)),
+                            length,
+                        ),
+                        varies,
                     ))
                 }
             }
         }
     }
+}
+
+/// Tells caches that this resource is negotiated, where it actually is.
+fn with_vary(mut response: Response, varies: bool) -> Response {
+    if varies {
+        cors::append_vary(response.headers_mut(), "Accept-Encoding");
+    }
+    response
 }
 
 fn media_response(

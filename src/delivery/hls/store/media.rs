@@ -19,6 +19,13 @@ pub struct StoredInitialization {
     pub id: InitializationId,
     pub version: u64,
     pub payload: Payload,
+    /// The gzip encoding of this resource, for the text formats HLS asks
+    /// servers to transfer compressed.
+    ///
+    /// Computed once by the publisher rather than per request, and held here
+    /// opaquely: the store never inspects it and does not know which formats
+    /// are text.
+    pub gzip: Option<Payload>,
 }
 
 /// A partial segment retained for playlist and standalone-resource delivery.
@@ -36,6 +43,13 @@ pub struct StoredPart {
     pub timebase: Timebase,
     pub independent: bool,
     pub payload: Payload,
+    /// The gzip encoding of this resource, for the text formats HLS asks
+    /// servers to transfer compressed.
+    ///
+    /// Computed once by the publisher rather than per request, and held here
+    /// opaquely: the store never inspects it and does not know which formats
+    /// are text.
+    pub gzip: Option<Payload>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +98,13 @@ pub struct StoredSegment {
     /// together silently.
     pub discontinuity_before: bool,
     pub kind: StoredSegmentKind,
+    /// The gzip encoding of this resource, for the text formats HLS asks
+    /// servers to transfer compressed.
+    ///
+    /// Computed once by the publisher rather than per request, and held here
+    /// opaquely: the store never inspects it and does not know which formats
+    /// are text.
+    pub gzip: Option<Payload>,
 }
 
 /// Completed segments and the prefix frontier controlling their PART tags.

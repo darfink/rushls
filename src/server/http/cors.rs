@@ -217,7 +217,7 @@ pub fn preflight(config: &CorsConfig, request: &HeaderMap) -> Option<axum::respo
 ///
 /// Inserting would silently discard a `Vary` a lower layer had set, which is
 /// the kind of bug that only shows up as a cache serving the wrong body.
-fn append_vary(headers: &mut HeaderMap, name: &str) {
+pub(super) fn append_vary(headers: &mut HeaderMap, name: &str) {
     if let Some(existing) = headers.get(header::VARY) {
         let Ok(existing) = existing.to_str() else {
             return;

@@ -26,13 +26,13 @@ use crate::{
         LiveStream, Msn, PartId, PartIndex, PlaylistContract, RenditionCatalogEntry,
         RenditionLiveEdge, RenditionSnapshot, SegmentBody, StoredSegment, StoredSegmentKind,
         StreamSnapshot, StreamStore,
-        cache::{PlaylistKey, StreamPlaylistCache},
+        cache::{PlaylistKey, Rendered, StreamPlaylistCache},
         cache_control::{CacheControl, CacheControlPolicy},
         project::{
             self, DeliveryTimingPolicy, PlaylistPolicy, ProjectionError, media::media_playlist,
             multivariant::multivariant_playlist, timing::blocking_reload_deadline,
         },
-        uri::{PLAYLIST_CONTENT_TYPE, Resource, UriBase},
+        uri::{ContentType, Resource, UriBase},
     },
     domain::{Payload, RenditionId, StreamId},
     observe::OriginMeters,
@@ -268,7 +268,15 @@ pub enum Body {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Response {
     pub body: Body,
-    pub content_type: &'static str,
+    /// The gzip encoding of [`Self::body`], where the format has one.
+    ///
+    /// `None` means this media type is never compressed — not that compression
+    /// was tried and rejected. Nothing here is decided per request: both
+    /// encodings exist before the request arrives, so a client's
+    /// `Accept-Encoding` chooses between two refcounts rather than selecting a
+    /// code path that does work proportional to the response.
+    pub gzip: Option<Bytes>,
+    pub content_type: ContentType,
     pub cache_control: CacheControl,
 }
 
@@ -279,11 +287,22 @@ impl Response {
     /// is called and what it is served as cannot disagree.
     fn media(
         body: MediaBody,
+        gzip: Option<Bytes>,
         resource: &Resource,
         cache_control: CacheControl,
     ) -> Result<Self, DeliveryError> {
+        // An implication rather than an equivalence: a text resource *may*
+        // arrive without one — a completed chunked segment is served from its
+        // parts and was never a single buffer to encode — but a binary one must
+        // never arrive with one, which is the direction that would put a client
+        // in front of bytes its media type does not describe.
+        debug_assert!(
+            gzip.is_none() || resource.compressible(),
+            "only a text media type has a gzip encoding"
+        );
         Ok(Self {
             body: Body::Media(body),
+            gzip,
             content_type: resource
                 .content_type()
                 .ok_or(DeliveryError::UnknownResource)?,
@@ -293,10 +312,11 @@ impl Response {
 
     /// A playlist, whose lifetime depends on whether its request named a
     /// position or the moving live edge.
-    fn playlist(bytes: Bytes, cache_control: CacheControl) -> Self {
+    fn playlist(rendered: Rendered, cache_control: CacheControl) -> Self {
         Self {
-            body: Body::Playlist(bytes),
-            content_type: PLAYLIST_CONTENT_TYPE,
+            body: Body::Playlist(rendered.bytes),
+            gzip: Some(rendered.gzip),
+            content_type: ContentType::Playlist,
             cache_control,
         }
     }
@@ -495,6 +515,7 @@ impl Origin {
                     .ok_or(DeliveryError::UnknownResource)?;
                 Ok(Response::media(
                     MediaBody::single(held.payload.clone()),
+                    held.gzip.as_ref().map(Payload::bytes).cloned(),
                     &request.resource,
                     self.media_cache_control(snapshot.contract),
                 )?)
@@ -508,6 +529,7 @@ impl Origin {
                     .ok_or(DeliveryError::UnknownResource)?;
                 Ok(Response::media(
                     MediaBody::from_segment(&stored),
+                    stored.gzip.as_ref().map(Payload::bytes).cloned(),
                     &request.resource,
                     self.media_cache_control(snapshot.contract),
                 )?)
@@ -548,7 +570,7 @@ impl Origin {
         // by the widest cadence it points at, and it is never the target of a
         // blocking reload.
         Ok(Response::playlist(
-            rendered.bytes,
+            rendered,
             self.config
                 .cache_control
                 .playlist(longest_target_duration(&stream), false),
@@ -612,7 +634,7 @@ impl Origin {
         )?;
         self.meters.playlist_served(rendered.freshly_rendered);
         Ok(Response::playlist(
-            rendered.bytes,
+            rendered,
             self.config.cache_control.playlist(
                 Some(target_duration_of(snapshot.contract)),
                 blocking.is_some(),
@@ -639,6 +661,7 @@ impl Origin {
         if let Some(stored) = live.part(rendition, part) {
             return Response::media(
                 MediaBody::single(stored.payload.clone()),
+                stored.gzip.as_ref().map(Payload::bytes).cloned(),
                 &resource,
                 cache_control,
             );
@@ -668,6 +691,7 @@ impl Origin {
             .ok_or(DeliveryError::UnknownResource)?;
         Response::media(
             MediaBody::single(stored.payload.clone()),
+            stored.gzip.as_ref().map(Payload::bytes).cloned(),
             &resource,
             cache_control,
         )
@@ -1010,7 +1034,7 @@ mod tests {
             .expect("the segment is retained");
 
         assert_eq!(response.cache_control, media_cache_control());
-        assert_eq!(response.content_type, "video/iso.segment");
+        assert_eq!(response.content_type, ContentType::IsoSegment);
         assert_eq!(
             media(&response).clone().into_frames().count(),
             6,
@@ -1369,7 +1393,7 @@ mod tests {
             .await
             .expect("the header is retained");
 
-        assert_eq!(response.content_type, "video/mp4");
+        assert_eq!(response.content_type, ContentType::Mp4);
         assert_eq!(response.cache_control, media_cache_control());
     }
 }

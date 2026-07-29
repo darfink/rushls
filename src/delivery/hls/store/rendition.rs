@@ -21,7 +21,7 @@ use std::{
 use tokio::{sync::watch, time::Instant};
 
 use crate::{
-    domain::RenditionId,
+    domain::{Payload, RenditionId},
     mux::{
         InitializationSegment, PackagedChunk, PackagedMedia, PackagedRendition, PackagedSegment,
         PackagedSegmentCompletion, PackagingSegmentId, RenditionConfig,
@@ -570,18 +570,25 @@ impl RenditionState {
         Ok(())
     }
 
+    /// `gzip` is the encoding delivery will serve this media under, already
+    /// computed by the publisher. Stored beside the payload and never inspected
+    /// here; a completed chunked segment gets none, because it is served from
+    /// the parts that composed it and was never a single buffer to encode.
     pub fn apply(
         &mut self,
         publication: u64,
         media: PackagedMedia,
+        gzip: Option<Payload>,
         now: Instant,
         retention: RetentionPolicy,
     ) {
         match media {
-            PackagedMedia::Initialization(segment) => self.set_initialization(segment),
-            PackagedMedia::Chunk(chunk) => self.push_chunk(publication, chunk, now, retention),
+            PackagedMedia::Initialization(segment) => self.set_initialization(segment, gzip),
+            PackagedMedia::Chunk(chunk) => {
+                self.push_chunk(publication, chunk, gzip, now, retention)
+            }
             PackagedMedia::Segment(segment) => {
-                self.push_direct_segment(publication, segment, now, retention)
+                self.push_direct_segment(publication, segment, gzip, now, retention)
             }
             PackagedMedia::SegmentCompleted(completion) => {
                 self.complete_segment(completion, now, retention)
@@ -589,7 +596,7 @@ impl RenditionState {
         }
     }
 
-    fn set_initialization(&mut self, segment: InitializationSegment) {
+    fn set_initialization(&mut self, segment: InitializationSegment, gzip: Option<Payload>) {
         // Initialization updates are rare, and repeating one is not an error:
         // a reconnecting publisher commonly re-sends the header it already
         // sent, and issuing a second ID for identical bytes would keep media
@@ -605,6 +612,7 @@ impl RenditionState {
             id,
             version: segment.version,
             payload: segment.payload,
+            gzip,
         });
         self.initializations = initializations.into();
     }
@@ -613,6 +621,7 @@ impl RenditionState {
         &mut self,
         publication: u64,
         chunk: PackagedChunk,
+        gzip: Option<Payload>,
         now: Instant,
         retention: RetentionPolicy,
     ) {
@@ -654,6 +663,7 @@ impl RenditionState {
             timebase: config.timebase,
             independent: chunk.independent,
             payload: chunk.payload,
+            gzip,
         });
         open.duration = open.duration.saturating_add(chunk.duration);
         open.parts.push(Arc::clone(&part));
@@ -705,6 +715,9 @@ impl RenditionState {
             // the answer its already-published parts were tagged under.
             discontinuity_before: open.discontinuity_before,
             kind: StoredSegmentKind::Media(SegmentBody::Chunked(Arc::clone(&parts))),
+            // Served from the parts that composed it, so there is no single
+            // buffer anyone encoded.
+            gzip: None,
         };
         self.commit_segment(
             segment,
@@ -719,6 +732,7 @@ impl RenditionState {
         &mut self,
         publication: u64,
         packaged: PackagedSegment,
+        gzip: Option<Payload>,
         now: Instant,
         retention: RetentionPolicy,
     ) {
@@ -738,6 +752,7 @@ impl RenditionState {
             independent: packaged.independent,
             discontinuity_before: self.opens_discontinuity(publication),
             kind: StoredSegmentKind::Media(SegmentBody::Contiguous(packaged.payload)),
+            gzip,
         };
         self.last_parent_publication = Some(publication);
         self.commit_segment(
@@ -924,6 +939,8 @@ impl RenditionState {
             independent: false,
             discontinuity_before: open.discontinuity_before,
             kind: StoredSegmentKind::Gap,
+            // A gap has no bytes, so there is nothing to encode.
+            gzip: None,
         };
         self.advance_playlist(
             open.packaging_segment_id,

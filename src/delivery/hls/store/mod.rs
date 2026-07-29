@@ -36,7 +36,7 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 
 use crate::{
-    domain::{RenditionId, StreamId},
+    domain::{Payload, RenditionId, StreamId},
     mux::{PackagedMedia, PackagedPresentation, PackagingRenditionId},
 };
 
@@ -296,13 +296,27 @@ impl StreamLease {
     /// Revoked media is discarded rather than appended, so an incumbent
     /// flushing a stale tail cannot interleave it with successor media.
     pub fn write(&self, media: PackagedMedia) -> Result<bool, StoreWriteError> {
+        self.write_encoded(media, None)
+    }
+
+    /// The same, carrying the gzip encoding delivery will serve this media in.
+    ///
+    /// Separate because deciding *which* media is worth encoding needs the
+    /// packaging-to-media-type table, and the store is deliberately ignorant of
+    /// it: a publisher answers that question and hands the result down, so this
+    /// layer holds the bytes without knowing why they exist.
+    pub fn write_encoded(
+        &self,
+        media: PackagedMedia,
+        gzip: Option<Payload>,
+    ) -> Result<bool, StoreWriteError> {
         let packaging_rendition_id = media.rendition_id();
         let Some(&rendition_id) = self.renditions.get(&packaging_rendition_id) else {
             return Err(StoreWriteError::UnknownPackagingRendition {
                 rendition_id: packaging_rendition_id,
             });
         };
-        self.live.write(self.publication, rendition_id, media)
+        self.live.write(self.publication, rendition_id, media, gzip)
     }
 
     /// Marks the stream complete so readers stop waiting for new media.

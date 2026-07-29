@@ -1,13 +1,13 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use thiserror::Error;
 
 use crate::{
-    domain::StreamId,
-    mux::{FinishReason, PackagedMedia, PackagedPresentation},
+    domain::{Payload, StreamId},
+    mux::{FinishReason, PackagedMedia, PackagedPresentation, PackagingRenditionId},
 };
 
-use super::{StoreFull, StoreWriteError, StreamLease, StreamStore};
+use super::{StoreFull, StoreWriteError, StreamLease, StreamStore, gzip::gzip, uri};
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HlsError {
@@ -89,19 +89,52 @@ impl PublisherFactory for StorePublisherFactory {
         stream: &StreamId,
         presentation: Arc<PackagedPresentation>,
     ) -> Result<Box<dyn HlsPublisher>, HlsError> {
+        // Which renditions carry text is fixed for the publication, so the
+        // question is answered once here rather than per published object.
+        let text = presentation
+            .renditions
+            .iter()
+            .filter(|rendition| uri::is_text(rendition.config.segment_format))
+            .map(|rendition| rendition.packaging_rendition_id)
+            .collect();
         Ok(Box::new(StorePublisher {
             lease: self.store.lease(stream.clone(), presentation)?,
+            text,
         }))
     }
 }
 
 struct StorePublisher {
     lease: StreamLease,
+    /// The renditions whose media is text, and so is worth compressing.
+    text: HashSet<PackagingRenditionId>,
+}
+
+impl StorePublisher {
+    /// The encoding delivery will serve this media under, if any.
+    ///
+    /// Computed on the way in, where the bytes are already in hand and the work
+    /// happens once per object. A completed segment carries no payload of its
+    /// own — it is served from the parts already published — so there is
+    /// nothing here to encode.
+    fn encoding(&self, media: &PackagedMedia) -> Option<Payload> {
+        if !self.text.contains(&media.rendition_id()) {
+            return None;
+        }
+        let payload = match media {
+            PackagedMedia::Initialization(segment) => &segment.payload,
+            PackagedMedia::Chunk(chunk) => &chunk.payload,
+            PackagedMedia::Segment(segment) => &segment.payload,
+            PackagedMedia::SegmentCompleted(_) => return None,
+        };
+        Some(Payload::from_bytes(gzip(payload.bytes())))
+    }
 }
 
 impl HlsPublisher for StorePublisher {
     fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
-        match self.lease.write(media)? {
+        let gzip = self.encoding(&media);
+        match self.lease.write_encoded(media, gzip)? {
             true => Ok(PublishOutcome::Published),
             false => Ok(PublishOutcome::Superseded),
         }

@@ -155,6 +155,121 @@ async fn a_playlist_is_served_with_its_media_type_and_half_a_target_duration() {
     harness.stop().await;
 }
 
+/// Decompresses a response body the origin said was gzipped.
+fn ungzip(body: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(body)
+        .read_to_end(&mut decoded)
+        .expect("the origin emits a well-formed gzip member");
+    decoded
+}
+
+#[tokio::test]
+async fn a_playlist_is_gzipped_for_a_client_that_accepts_it() {
+    let harness = Harness::start().await;
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+
+    let plain = request(harness.address, "GET", "/live/camera/0/video.m3u8", &[]).await;
+    let encoded = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8",
+        &[("Accept-Encoding", "gzip, deflate")],
+    )
+    .await;
+
+    assert_eq!(
+        plain.header("content-encoding"),
+        None,
+        "silence is not an indication that a client accepts gzip"
+    );
+    assert_eq!(encoded.header("content-encoding"), Some("gzip"));
+    assert_eq!(
+        encoded.header("content-type"),
+        Some("application/vnd.apple.mpegurl"),
+        "the media type describes the playlist, not the transfer encoding"
+    );
+    assert_eq!(
+        encoded.header("vary"),
+        Some("Accept-Encoding"),
+        "a cache that stored this must not hand it to a client that cannot \
+         decode it"
+    );
+    assert_eq!(
+        ungzip(&encoded.body),
+        plain.body,
+        "both encodings carry the same playlist"
+    );
+    assert!(
+        encoded.body.len() < plain.body.len(),
+        "repetitive playlist text is what the encoding is for"
+    );
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_client_refusing_gzip_is_answered_in_the_encoding_it_asked_for() {
+    let harness = Harness::start().await;
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+
+    // `q=0` is a refusal, and it outranks the wildcard beside it.
+    let refused = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8",
+        &[("Accept-Encoding", "*, gzip;q=0")],
+    )
+    .await;
+    let wildcard = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8",
+        &[("Accept-Encoding", "*")],
+    )
+    .await;
+
+    assert_eq!(refused.header("content-encoding"), None);
+    assert_eq!(wildcard.header("content-encoding"), Some("gzip"));
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn already_compressed_media_is_neither_gzipped_nor_negotiated() {
+    let harness = Harness::start().await;
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+
+    let reply = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/segment/1.m4s",
+        &[("Accept-Encoding", "gzip")],
+    )
+    .await;
+
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.header("content-encoding"), None);
+    assert_eq!(
+        reply.header("vary"),
+        None,
+        "announcing negotiation on a resource that never varies would split \
+         every downstream cache entry for the six target durations this origin \
+         asks caches to hold it"
+    );
+    assert_eq!(reply.body.len(), 6 * PART_BYTES);
+
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn a_multivariant_playlist_names_its_renditions() {
     let harness = Harness::start().await;
@@ -748,9 +863,10 @@ async fn an_allowlisted_origin_is_echoed_and_the_response_says_it_varies() {
         allowed.header("access-control-allow-origin"),
         Some("https://player.example")
     );
-    // Without this a CDN would hand this viewer's allowed origin to every
-    // other viewer, and playback would break for all of them.
-    assert_eq!(allowed.header("vary"), Some("Origin"));
+    // Without Origin here, a CDN would hand this viewer's allowed origin to
+    // every other viewer, and playback would break for all of them. A playlist
+    // is also content-negotiated, so both fields have to be listed.
+    assert_eq!(allowed.header("vary"), Some("Accept-Encoding, Origin"));
 
     let refused = request(
         harness.address,
@@ -761,7 +877,7 @@ async fn an_allowlisted_origin_is_echoed_and_the_response_says_it_varies() {
     .await;
     assert_eq!(refused.status, 200, "the media is not itself restricted");
     assert_eq!(refused.header("access-control-allow-origin"), None);
-    assert_eq!(refused.header("vary"), Some("Origin"));
+    assert_eq!(refused.header("vary"), Some("Accept-Encoding, Origin"));
 
     harness.stop().await;
 }

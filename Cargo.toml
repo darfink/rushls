@@ -31,6 +31,7 @@ urlencoding = "2"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "original-uri", "query", "tokio"] }
 http-body-util = "0.1.4"
 http-body = "1.1.0"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 
 [build-dependencies]
 cc = "1"

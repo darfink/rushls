@@ -24,7 +24,7 @@ use parking_lot::{RwLock, RwLockWriteGuard};
 use tokio::{sync::watch, time::Instant};
 
 use crate::{
-    domain::RenditionId,
+    domain::{Payload, RenditionId},
     mux::{PackagedMedia, PackagedPresentation, PackagingRenditionId},
 };
 
@@ -438,6 +438,7 @@ impl LiveStream {
         publication: u64,
         rendition_id: RenditionId,
         media: PackagedMedia,
+        gzip: Option<Payload>,
     ) -> Result<bool, StoreWriteError> {
         let now = Instant::now();
         let mut state = self.state.write();
@@ -489,7 +490,7 @@ impl LiveStream {
         }
 
         let advertised_before = state.renditions[index].bitrate.snapshot().advertised();
-        state.renditions[index].apply(publication, media, now, self.limits);
+        state.renditions[index].apply(publication, media, gzip, now, self.limits);
         state.renditions[index].forget_unreachable_initializations();
         state.recalculate_retained_bytes();
         let advertised_after = state.renditions[index].bitrate.snapshot().advertised();

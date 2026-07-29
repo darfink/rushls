@@ -57,8 +57,44 @@ use crate::{
 /// which is what the name should say.
 const MULTIVARIANT_NAME: &str = "index.m3u8";
 
-/// The media type every playlist is served as, whatever it describes.
-pub const PLAYLIST_CONTENT_TYPE: &str = "application/vnd.apple.mpegurl";
+/// A media type this origin serves.
+///
+/// A type rather than a string because what a resource is served as decides
+/// more than one thing: the `Content-Type` header it carries, and whether the
+/// instruction to transfer text files gzipped applies to it. Deriving the
+/// second from the first is what keeps a `text/vtt` from being declared
+/// incompressible, or an already-compressed segment from being gzipped twice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentType {
+    Mp4,
+    IsoSegment,
+    MpegTs,
+    WebVtt,
+    /// What every playlist is served as, whatever it describes.
+    Playlist,
+}
+
+impl ContentType {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Mp4 => "video/mp4",
+            Self::IsoSegment => "video/iso.segment",
+            Self::MpegTs => "video/mp2t",
+            Self::WebVtt => "text/vtt",
+            Self::Playlist => "application/vnd.apple.mpegurl",
+        }
+    }
+
+    /// Whether this is a text format.
+    ///
+    /// HLS asks servers to transfer text files — playlists and WebVTT segments
+    /// — with the `gzip` Content-Encoding where the client accepts it
+    /// (draft-pantos-hls-rfc8216bis-22 § 6.2.1). Everything else this origin
+    /// serves is already-compressed media, where gzip is spent CPU.
+    pub const fn is_text(self) -> bool {
+        matches!(self, Self::WebVtt | Self::Playlist)
+    }
+}
 
 const INITIALIZATION_DIRECTORY: &str = "init";
 const SEGMENT_DIRECTORY: &str = "segment";
@@ -131,9 +167,9 @@ impl Resource {
     /// `None` only for a resource its own packaging cannot produce — an
     /// MPEG-TS initialization section — which is also a name that cannot be
     /// written or parsed. The three answers agree because they read one table.
-    pub fn content_type(&self) -> Option<&'static str> {
+    pub fn content_type(&self) -> Option<ContentType> {
         match self {
-            Self::Multivariant | Self::MediaPlaylist(..) => Some(PLAYLIST_CONTENT_TYPE),
+            Self::Multivariant | Self::MediaPlaylist(..) => Some(ContentType::Playlist),
             Self::Initialization(_, _, format) => spellings(*format)
                 .initialization
                 .map(|spelling| spelling.content_type),
@@ -142,6 +178,22 @@ impl Resource {
             }
         }
     }
+
+    /// Whether this resource has a gzip representation.
+    ///
+    /// Read from the media type rather than tabulated beside it, so a format
+    /// cannot claim to be text in one column and binary in the other.
+    pub fn compressible(&self) -> bool {
+        self.content_type().is_some_and(ContentType::is_text)
+    }
+}
+
+/// Whether media in this packaging is text, and so has a gzip representation.
+///
+/// Answered from the same table that decides how the media is named and served,
+/// so a format cannot be text for compression and binary for its media type.
+pub fn is_text(format: MediaSegmentFormat) -> bool {
+    spellings(format).segment.content_type.is_text()
 }
 
 /// The absolute location this origin's resources are published under.
@@ -337,10 +389,12 @@ struct Spellings {
 }
 
 /// What one role of one format is called, and what it is served as.
+///
+/// Both fields are spellings: one in the path, one in a header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Spelling {
     extension: &'static str,
-    content_type: &'static str,
+    content_type: ContentType,
 }
 
 const fn spellings(format: MediaSegmentFormat) -> Spellings {
@@ -348,11 +402,11 @@ const fn spellings(format: MediaSegmentFormat) -> Spellings {
         MediaSegmentFormat::Cmaf => Spellings {
             initialization: Some(Spelling {
                 extension: "mp4",
-                content_type: "video/mp4",
+                content_type: ContentType::Mp4,
             }),
             segment: Spelling {
                 extension: "m4s",
-                content_type: "video/iso.segment",
+                content_type: ContentType::IsoSegment,
             },
         },
         // A WebVTT rendition's initialization is its `WEBVTT` header and
@@ -361,11 +415,11 @@ const fn spellings(format: MediaSegmentFormat) -> Spellings {
         MediaSegmentFormat::WebVtt => Spellings {
             initialization: Some(Spelling {
                 extension: "vtt",
-                content_type: "text/vtt",
+                content_type: ContentType::WebVtt,
             }),
             segment: Spelling {
                 extension: "vtt",
-                content_type: "text/vtt",
+                content_type: ContentType::WebVtt,
             },
         },
         // MPEG-TS segments are self-describing, so there is no initialization
@@ -374,7 +428,7 @@ const fn spellings(format: MediaSegmentFormat) -> Spellings {
             initialization: None,
             segment: Spelling {
                 extension: "ts",
-                content_type: "video/mp2t",
+                content_type: ContentType::MpegTs,
             },
         },
     }
@@ -662,23 +716,23 @@ mod tests {
     fn a_resource_is_served_as_its_own_name_says() {
         assert_eq!(
             Resource::Multivariant.content_type(),
-            Some(PLAYLIST_CONTENT_TYPE)
+            Some(ContentType::Playlist)
         );
         assert_eq!(
             Resource::MediaPlaylist(RenditionId(0), MediaKind::Audio).content_type(),
-            Some(PLAYLIST_CONTENT_TYPE)
+            Some(ContentType::Playlist)
         );
         assert_eq!(
             Resource::Segment(RenditionId(0), SegmentId(1), CMAF).content_type(),
-            Some("video/iso.segment")
+            Some(ContentType::IsoSegment)
         );
         assert_eq!(
             Resource::Part(RenditionId(0), PartId(1), WEBVTT).content_type(),
-            Some("text/vtt")
+            Some(ContentType::WebVtt)
         );
         assert_eq!(
             Resource::Initialization(RenditionId(0), InitializationId(1), CMAF).content_type(),
-            Some("video/mp4"),
+            Some(ContentType::Mp4),
             "an initialization section is not served as its own segments are"
         );
     }

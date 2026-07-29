@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 
 use crate::domain::RenditionId;
 
-use super::{StreamSnapshot, uri::PlaylistUris};
+use super::{StreamSnapshot, gzip::gzip, uri::PlaylistUris};
 
 /// Identifies exactly the inputs a rendered media playlist depends on.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -65,13 +65,16 @@ impl PlaylistKey {
     }
 }
 
-/// Playlist bytes, and whether producing them cost a render.
+/// Playlist bytes in both encodings, and whether producing them cost a render.
 ///
-/// Reported so the caller can meter cache effectiveness without the cache
-/// having to know what a meter is.
+/// Whether it was freshly rendered is reported so the caller can meter cache
+/// effectiveness without the cache having to know what a meter is.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Rendered {
     pub bytes: Bytes,
+    /// The same playlist gzipped, which is how HLS asks for text to be
+    /// transferred to a client that accepts it.
+    pub gzip: Bytes,
     pub freshly_rendered: bool,
 }
 
@@ -80,6 +83,7 @@ pub struct Rendered {
 struct Cached {
     key: PlaylistKey,
     rendered: Bytes,
+    gzip: Bytes,
 }
 
 /// One rendition's cached playlist text.
@@ -101,19 +105,20 @@ impl PlaylistCache {
 
     /// Returns the cached text if it was rendered from exactly `key`.
     pub fn get(&self, key: &PlaylistKey) -> Option<Bytes> {
+        self.hit(key).map(|rendered| rendered.bytes)
+    }
+
+    fn hit(&self, key: &PlaylistKey) -> Option<Rendered> {
         self.latest
             .load()
             .as_ref()
             .as_ref()
             .filter(|cached| &cached.key == key)
-            .map(|cached| cached.rendered.clone())
-    }
-
-    fn hit(&self, key: &PlaylistKey) -> Option<Rendered> {
-        self.get(key).map(|bytes| Rendered {
-            bytes,
-            freshly_rendered: false,
-        })
+            .map(|cached| Rendered {
+                bytes: cached.rendered.clone(),
+                gzip: cached.gzip.clone(),
+                freshly_rendered: false,
+            })
     }
 
     /// Returns the cached text, rendering it with `render` if it is stale.
@@ -166,12 +171,20 @@ impl PlaylistCache {
                 continue;
             }
             let bytes = Bytes::from(rendered.into_bytes());
+            // Compressed here, inside the section that already serialises
+            // rendering, so a publication that wakes a thousand blocked viewers
+            // costs one render and one compression rather than a thousand of
+            // each. Every viewer after that is handed a refcount whichever
+            // encoding they asked for.
+            let gzip = gzip(&bytes);
             self.latest.store(Arc::new(Some(Cached {
                 key,
                 rendered: bytes.clone(),
+                gzip: gzip.clone(),
             })));
             return Ok(Rendered {
                 bytes,
+                gzip,
                 freshly_rendered: true,
             });
         }
