@@ -86,9 +86,24 @@ listen = "0.0.0.0:8080"
 [http.cors]
 # Use "*", "off", or an explicit array of web player origins:
 # origins = ["https://player.example.com", "https://admin.example.com"]
+#
+# An entry may begin with a wildcard label. The scheme, the host boundary, and
+# the port are always matched exactly, so "https://*.example.com" admits
+# "https://a.example.com" but never "https://evil-example.com", the apex
+# "https://example.com", or a different scheme or port.
+#
+#   "https://*.example.com"         one label, as a TLS wildcard certificate
+#   "https://**.video.example.com"  any depth: a.video…, b.c.video…
+#   "https://*.example.com:8443"    a non-default port must be spelled out
+#
+# Two stars are deliberately separate from one: widening a wildcard enlarges
+# what a subdomain takeover would reach, so it is written down rather than
+# assumed. A wildcard only ever appears as the leftmost label; patterns like
+# "https://foo.*.example.com" are refused at startup.
 origins = "*"
 # Browser credentials require an explicit origin list; they cannot be used
-# together with "*".
+# together with "*". Note that combining them with a wildcard means any
+# takeover under that suffix reaches credentialed streams.
 allow_credentials = false
 max_age = "10min"
 

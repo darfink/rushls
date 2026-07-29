@@ -26,7 +26,9 @@ use crate::{
     session::Registry,
 };
 
-use super::{AllowedOrigins, CorsConfig, HttpConfig, bind, serve, serve_with_metrics};
+use super::{
+    AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, bind, serve, serve_with_metrics,
+};
 
 /// A raw HTTP/1.1 response, parsed just enough to assert on.
 struct Reply {
@@ -948,7 +950,9 @@ async fn a_preflight_is_answered_without_reaching_the_origin() {
 async fn an_allowlisted_origin_is_echoed_and_the_response_says_it_varies() {
     let harness = Harness::start_with(HttpConfig {
         cors: CorsConfig {
-            allowed_origins: AllowedOrigins::Only(vec!["https://player.example".into()]),
+            allowed_origins: AllowedOrigins::Only(vec![
+                OriginPattern::parse("https://player.example").expect("the pattern is valid"),
+            ]),
             ..CorsConfig::default()
         },
         ..HttpConfig::default()
@@ -985,6 +989,104 @@ async fn an_allowlisted_origin_is_echoed_and_the_response_says_it_varies() {
     assert_eq!(refused.header("vary"), Some("Accept-Encoding, Origin"));
 
     harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_wildcard_allowlist_admits_subdomains_and_refuses_lookalikes() {
+    let harness = Harness::start_with(HttpConfig {
+        cors: CorsConfig {
+            allowed_origins: AllowedOrigins::Only(vec![
+                OriginPattern::parse("https://*.example.com").expect("the pattern is valid"),
+            ]),
+            ..CorsConfig::default()
+        },
+        ..HttpConfig::default()
+    })
+    .await;
+    let _lease = lease(&harness.store, vec![video(0)]);
+
+    let allowed = cors_probe(&harness, "https://player.example.com").await;
+    assert_eq!(allowed, Some("https://player.example.com".to_owned()));
+
+    // Registrable by anyone; the naive suffix match would hand it the stream.
+    assert_eq!(cors_probe(&harness, "https://evil-example.com").await, None);
+    // The apex is not a subdomain of itself.
+    assert_eq!(cors_probe(&harness, "https://example.com").await, None);
+    // One label only, so a deeper name needs its own entry.
+    assert_eq!(cors_probe(&harness, "https://a.b.example.com").await, None);
+    // Scheme and port are part of the origin.
+    assert_eq!(
+        cors_probe(&harness, "http://player.example.com").await,
+        None
+    );
+    assert_eq!(
+        cors_probe(&harness, "https://player.example.com:8443").await,
+        None
+    );
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_double_wildcard_admits_any_depth_but_still_not_the_apex() {
+    let harness = Harness::start_with(HttpConfig {
+        cors: CorsConfig {
+            allowed_origins: AllowedOrigins::Only(vec![
+                OriginPattern::parse("https://**.video.example.com").expect("the pattern is valid"),
+            ]),
+            ..CorsConfig::default()
+        },
+        ..HttpConfig::default()
+    })
+    .await;
+    let _lease = lease(&harness.store, vec![video(0)]);
+
+    for origin in [
+        "https://a.video.example.com",
+        "https://b.c.video.example.com",
+    ] {
+        assert_eq!(
+            cors_probe(&harness, origin).await,
+            Some(origin.to_owned()),
+            "{origin}"
+        );
+    }
+    assert_eq!(
+        cors_probe(&harness, "https://video.example.com").await,
+        None
+    );
+    assert_eq!(
+        cors_probe(&harness, "https://video.example.com.evil.test").await,
+        None
+    );
+
+    harness.stop().await;
+}
+
+/// The `Access-Control-Allow-Origin` a real request gets back, if any.
+///
+/// Asserted over the wire rather than against the matcher, because what
+/// matters is the header a browser would actually receive.
+async fn cors_probe(harness: &Harness, origin: &str) -> Option<String> {
+    let reply = request(
+        harness.address,
+        "GET",
+        "/live/camera/index.m3u8",
+        &[("Origin", origin)],
+    )
+    .await;
+    assert_eq!(reply.status, 200, "the media itself is never restricted");
+    // Accumulated onto whatever content negotiation already set — gzip adds
+    // `Accept-Encoding` — because replacing it would let a cache serve a
+    // compressed body to a client that never asked for one.
+    let vary = reply.header("vary").expect("an allowlisted policy varies");
+    assert!(
+        vary.split(',').any(|field| field.trim() == "Origin"),
+        "a CDN must keep the answers apart, got `{vary}`"
+    );
+    reply
+        .header("access-control-allow-origin")
+        .map(str::to_owned)
 }
 
 /// TLS termination, ALPN, and certificate rotation without a restart.

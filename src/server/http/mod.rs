@@ -55,7 +55,7 @@ use crate::{
     server::metrics::MetricsEndpoint,
 };
 
-pub use cors::{AllowedOrigins, CorsConfig};
+pub use cors::{AllowedOrigins, CorsConfig, OriginPattern, OriginPatternError, WildcardDepth};
 
 use body::{RangeOutcome, StoredMediaBody, parse_range};
 use route::route;

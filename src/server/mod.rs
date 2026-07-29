@@ -9,5 +9,8 @@ pub mod metrics;
 mod runtime;
 
 pub use config::{AppConfig, ConfigError, ResolvedAppConfig};
-pub use http::{AllowedOrigins, CorsConfig, TlsError, TlsSettings};
+pub use http::{
+    AllowedOrigins, CorsConfig, OriginPattern, OriginPatternError, TlsError, TlsSettings,
+    WildcardDepth,
+};
 pub use runtime::{Node, NodeConfig, RuntimeError};

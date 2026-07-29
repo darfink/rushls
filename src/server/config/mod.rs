@@ -26,7 +26,7 @@ use crate::{
     segment::SegmentationPolicy,
     server::{
         NodeConfig,
-        http::{AllowedOrigins, CorsConfig, HttpConfig, TlsSettings},
+        http::{AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, TlsSettings},
         metrics::{ExportPolicy, MetricsConfig, MetricsToken},
     },
     source::transport::srt::{SrtEncryption, SrtKeyLength},
@@ -470,7 +470,9 @@ impl HttpAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct CorsAppConfig {
-    /// `*`, `off`, or an explicit list of browser origins.
+    /// `*`, `off`, or a list of origins, each optionally starting with a
+    /// wildcard label: `https://*.example.com` for one label, or
+    /// `https://**.example.com` for any depth.
     #[conf(
         parameter,
         long,
@@ -802,10 +804,16 @@ fn nonzero_bytes(label: &str, value: ByteSize) -> Result<usize, ConfigError> {
 
 fn origins(values: Vec<String>) -> Result<AllowedOrigins, ConfigError> {
     if values.is_empty() {
-        Err(invalid("a CORS origin allowlist must not be empty"))
-    } else {
-        Ok(AllowedOrigins::Only(values))
+        return Err(invalid("a CORS origin allowlist must not be empty"));
     }
+    // The pattern grammar is checked here, at startup, rather than per
+    // request: a malformed entry should stop the process, not quietly match
+    // nothing for as long as nobody notices.
+    let patterns = values
+        .iter()
+        .map(|value| OriginPattern::parse(value).map_err(|error| invalid(error.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AllowedOrigins::Only(patterns))
 }
 
 fn codecs_or_default(

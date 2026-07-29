@@ -16,9 +16,15 @@
 //! whenever `Access-Control-Allow-Credentials` is set. A configuration that
 //! asks for both is a configuration that silently does not work.
 
+mod pattern;
+
 use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+
+pub use pattern::{OriginPattern, OriginPatternError, WildcardDepth};
+
+use pattern::RequestOrigin;
 
 /// Headers a player needs to read to run its buffer accounting.
 ///
@@ -41,7 +47,10 @@ pub enum AllowedOrigins {
     Any,
     /// An allowlist. The matching origin is echoed back, with `Vary: Origin`
     /// so a shared cache keeps the answers apart.
-    Only(Vec<String>),
+    ///
+    /// Entries are [`OriginPattern`]s rather than strings so the grammar is
+    /// checked once at startup, not re-interpreted per request.
+    Only(Vec<OriginPattern>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,7 +98,7 @@ impl CorsConfig {
     }
 
     /// What this policy answers a given request's `Origin` with, if anything.
-    fn allowance(&self, origin: Option<&str>) -> Option<Allowance> {
+    fn allowance<'a>(&self, origin: Option<&'a str>) -> Option<Allowance<'a>> {
         match &self.allowed_origins {
             AllowedOrigins::Disabled => None,
             AllowedOrigins::Any => Some(Allowance::Any),
@@ -97,11 +106,15 @@ impl CorsConfig {
                 // The response varies by `Origin` whether or not this
                 // particular one matched: a cache must not reuse a miss for a
                 // request that would have hit.
-                let origin = origin?;
+                let raw = origin?;
+                // Decomposed once here rather than by every pattern, and
+                // borrowed throughout, so a matched request allocates nothing
+                // until the header value itself is built.
+                let parsed = RequestOrigin::parse(raw)?;
                 allowed
                     .iter()
-                    .any(|candidate| candidate == origin)
-                    .then(|| Allowance::Echo(origin.to_owned()))
+                    .any(|candidate| candidate.matches(&parsed))
+                    .then_some(Allowance::Echo(raw))
             }
         }
     }
@@ -112,9 +125,11 @@ impl CorsConfig {
     }
 }
 
-enum Allowance {
+enum Allowance<'a> {
     Any,
-    Echo(String),
+    /// Borrowed from the request's own header: the echoed value is by
+    /// definition the bytes that arrived.
+    Echo(&'a str),
 }
 
 /// Writes the access-control headers a normal response carries.
@@ -137,7 +152,7 @@ pub fn apply(response: &mut axum::response::Response, config: &CorsConfig, reque
     };
     let allowed = match allowance {
         Allowance::Any => HeaderValue::from_static("*"),
-        Allowance::Echo(origin) => match HeaderValue::try_from(origin) {
+        Allowance::Echo(origin) => match HeaderValue::from_str(origin) {
             Ok(value) => value,
             Err(_) => return,
         },
@@ -200,7 +215,7 @@ pub fn preflight(config: &CorsConfig, request: &HeaderMap) -> Option<axum::respo
     let allowance = config.allowance(Some(origin))?;
     let allowed = match allowance {
         Allowance::Any => HeaderValue::from_static("*"),
-        Allowance::Echo(origin) => HeaderValue::try_from(origin).ok()?,
+        Allowance::Echo(origin) => HeaderValue::from_str(origin).ok()?,
     };
     let headers = response.headers_mut();
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allowed);
@@ -253,6 +268,10 @@ mod tests {
         headers
     }
 
+    fn pattern(value: &str) -> OriginPattern {
+        OriginPattern::parse(value).expect("the pattern is valid")
+    }
+
     fn applied(config: &CorsConfig, request: &HeaderMap) -> HeaderMap {
         let mut response = axum::response::Response::new(axum::body::Body::empty());
         apply(&mut response, config, request);
@@ -283,7 +302,7 @@ mod tests {
     #[test]
     fn an_allowlisted_origin_is_echoed_and_always_varies() {
         let config = CorsConfig {
-            allowed_origins: AllowedOrigins::Only(vec!["https://player.example".into()]),
+            allowed_origins: AllowedOrigins::Only(vec![pattern("https://player.example")]),
             ..CorsConfig::default()
         };
 
@@ -327,7 +346,7 @@ mod tests {
         assert!(wildcard.validate().is_err());
 
         let allowlisted = CorsConfig {
-            allowed_origins: AllowedOrigins::Only(vec!["https://player.example".into()]),
+            allowed_origins: AllowedOrigins::Only(vec![pattern("https://player.example")]),
             allow_credentials: true,
             ..CorsConfig::default()
         };
@@ -395,7 +414,7 @@ mod tests {
     #[test]
     fn an_unallowed_preflight_is_not_approved() {
         let config = CorsConfig {
-            allowed_origins: AllowedOrigins::Only(vec!["https://player.example".into()]),
+            allowed_origins: AllowedOrigins::Only(vec![pattern("https://player.example")]),
             ..CorsConfig::default()
         };
 

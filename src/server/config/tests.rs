@@ -9,7 +9,7 @@ use std::{
 use crate::{
     admission::{Principal, StreamPolicy},
     domain::StreamId,
-    server::NodeConfig,
+    server::{AllowedOrigins, NodeConfig},
 };
 
 use super::{AppConfig, ConfigError};
@@ -102,6 +102,54 @@ fn the_canonical_environment_name_wins_over_its_legacy_alias() -> Result<(), Box
     .resolve()?;
 
     assert_eq!(config.publish_key, "canonical");
+    Ok(())
+}
+
+#[test]
+fn a_malformed_cors_pattern_stops_startup() -> Result<(), Box<dyn Error>> {
+    // Silently matching nothing would be the alternative, and nobody would
+    // notice until a player could not reach the origin.
+    for rejected in [
+        "https://player.example.com/",
+        "https://*example.com",
+        "https://foo.*.example.com",
+        "player.example.com",
+    ] {
+        let result = AppConfig::load_from(
+            os(["rushls"]),
+            env([
+                ("RUSHLS_PUBLISHING_KEY", "key"),
+                ("RUSHLS_HTTP_CORS_ORIGINS", rejected),
+            ]),
+        )?
+        .resolve();
+
+        assert!(
+            matches!(result, Err(ConfigError::Invalid(_))),
+            "{rejected} should be refused"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_wildcard_cors_pattern_is_accepted() -> Result<(), Box<dyn Error>> {
+    let config = AppConfig::load_from(
+        os(["rushls"]),
+        env([
+            ("RUSHLS_PUBLISHING_KEY", "key"),
+            (
+                "RUSHLS_HTTP_CORS_ORIGINS",
+                "https://*.example.com,https://**.video.example.com",
+            ),
+        ]),
+    )?
+    .resolve()?;
+
+    let AllowedOrigins::Only(patterns) = &config.node.http.cors.allowed_origins else {
+        panic!("an allowlist was configured");
+    };
+    assert_eq!(patterns.len(), 2);
     Ok(())
 }
 
