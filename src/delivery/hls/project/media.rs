@@ -7,7 +7,7 @@
 //! to, so they have to be emitted before its first `EXT-X-PART` — long before
 //! the segment itself completes.
 
-use std::{fmt::Write, num::NonZeroU8};
+use std::num::NonZeroU8;
 
 use crate::{
     delivery::hls::{
@@ -180,8 +180,8 @@ struct Emitted {
 /// parts without them would decode the successor's media against the previous
 /// publication's initialization and timeline.
 #[allow(clippy::too_many_arguments)]
-fn write_parent_tags<W: Write + ?Sized>(
-    writer: &mut MediaPlaylistWriter<'_, W>,
+fn write_parent_tags(
+    writer: &mut MediaPlaylistWriter<'_>,
     state: &mut Emitted,
     segment: ParentSegment,
     stream: &StreamSnapshot,
@@ -234,8 +234,8 @@ fn write_parent_tags<W: Write + ?Sized>(
     Ok(())
 }
 
-fn write_part<W: Write + ?Sized>(
-    writer: &mut MediaPlaylistWriter<'_, W>,
+fn write_part(
+    writer: &mut MediaPlaylistWriter<'_>,
     part: &StoredPart,
     names: &RenditionUris<'_>,
     timebase: Timebase,
@@ -252,8 +252,8 @@ fn write_part<W: Write + ?Sized>(
 
 /// Reports every *other* rendition's live edge, so a client switching between
 /// them can request the right position without a blind reload first.
-fn write_rendition_reports<W: Write + ?Sized>(
-    writer: &mut MediaPlaylistWriter<'_, W>,
+fn write_rendition_reports(
+    writer: &mut MediaPlaylistWriter<'_>,
     stream: &StreamSnapshot,
     self_id: RenditionId,
     names: &RenditionUris<'_>,

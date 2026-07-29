@@ -335,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn segmentation_has_timing_for_every_track() {
+    fn segmentation_has_timing_for_every_track() -> Result<(), SegmentationPlanError> {
         let plan = presentation(vec![
             track(0, MediaKind::Video),
             track(1, MediaKind::Video),
@@ -344,8 +344,7 @@ mod tests {
         let segmentation = SegmentationPlan::new(
             &plan,
             vec![planned_track(0), planned_track(1), planned_track(2)],
-        )
-        .expect("segmentation plan is valid");
+        )?;
 
         assert_eq!(
             segmentation
@@ -361,6 +360,7 @@ mod tests {
             segmentation.longest_segment_duration(),
             Duration::from_secs(2)
         );
+        Ok(())
     }
 
     #[test]

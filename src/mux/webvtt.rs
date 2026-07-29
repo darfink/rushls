@@ -729,7 +729,8 @@ mod tests {
     }
 
     #[test]
-    fn initialization_precedes_segmented_webvtt_with_full_cue_timestamps() {
+    fn initialization_precedes_segmented_webvtt_with_full_cue_timestamps()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::WebVtt, 2);
         let mut output = Vec::new();
         let mut first = match sample(Codec::WebVtt, 0, 3 * SECOND, b"first") {
@@ -740,10 +741,8 @@ mod tests {
             identifier: Some(Arc::from("cue-one")),
             settings: Some(Arc::from("align:start")),
         };
-        mux.push(NormalizedSample::Subtitle(first), &mut output)
-            .expect("cue is accepted");
-        mux.finish(FinishReason::Final, &mut output)
-            .expect("tail flushes");
+        mux.push(NormalizedSample::Subtitle(first), &mut output)?;
+        mux.finish(FinishReason::Final, &mut output)?;
 
         assert!(matches!(
             &output[0],
@@ -758,58 +757,58 @@ mod tests {
         assert_eq!(segments[0].duration, 2 * SECOND);
         assert_eq!(segments[1].duration, SECOND);
         for segment in segments {
-            let body = str::from_utf8(segment.payload.as_bytes()).expect("body is text");
+            let body = str::from_utf8(segment.payload.as_bytes())?;
             assert!(body.contains("cue-one\n00:00:00.000 --> 00:00:03.000 align:start"));
         }
+        Ok(())
     }
 
     #[test]
-    fn long_cue_windows_stay_open_for_later_overlapping_cues() {
+    fn long_cue_windows_stay_open_for_later_overlapping_cues()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::WebVtt, 2);
         let mut output = Vec::new();
-        mux.push(sample(Codec::WebVtt, 0, 6 * SECOND, b"long"), &mut output)
-            .expect("long cue is accepted");
+        mux.push(sample(Codec::WebVtt, 0, 6 * SECOND, b"long"), &mut output)?;
         mux.push(
             sample(Codec::WebVtt, 3 * SECOND as i64, SECOND, b"overlap"),
             &mut output,
-        )
-        .expect("overlapping cue is accepted");
-        mux.finish(FinishReason::Final, &mut output)
-            .expect("windows flush");
+        )?;
+        mux.finish(FinishReason::Final, &mut output)?;
 
         let segments = segments(&output);
         assert_eq!(segments.len(), 3);
-        let middle = str::from_utf8(segments[1].payload.as_bytes()).expect("body is text");
+        let middle = str::from_utf8(segments[1].payload.as_bytes())?;
         assert!(middle.contains("long"));
         assert!(middle.contains("overlap"));
-        let last = str::from_utf8(segments[2].payload.as_bytes()).expect("body is text");
+        let last = str::from_utf8(segments[2].payload.as_bytes())?;
         assert!(last.contains("long"));
         assert!(!last.contains("overlap"));
+        Ok(())
     }
 
     #[test]
-    fn sparse_cues_emit_empty_windows_without_inventing_cue_text() {
+    fn sparse_cues_emit_empty_windows_without_inventing_cue_text()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::WebVtt, 2);
         let mut output = Vec::new();
-        mux.push(sample(Codec::WebVtt, 0, SECOND, b"first"), &mut output)
-            .expect("first cue is accepted");
+        mux.push(sample(Codec::WebVtt, 0, SECOND, b"first"), &mut output)?;
         mux.push(
             sample(Codec::WebVtt, 6 * SECOND as i64, SECOND, b"later"),
             &mut output,
-        )
-        .expect("later cue is accepted");
-        mux.finish(FinishReason::Interrupted, &mut output)
-            .expect("tail flushes");
+        )?;
+        mux.finish(FinishReason::Interrupted, &mut output)?;
 
         let segments = segments(&output);
         assert_eq!(segments.len(), 4);
         assert!(segments[1].payload.is_empty());
         assert!(segments[2].payload.is_empty());
         assert_eq!(segments[3].media_start, 6 * SECOND as i64);
+        Ok(())
     }
 
     #[test]
-    fn subrip_is_converted_and_positioned_cues_are_rejected_transactionally() {
+    fn subrip_is_converted_and_positioned_cues_are_rejected_transactionally()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::SubRip, 2);
         let mut output = Vec::new();
         mux.push(
@@ -820,8 +819,7 @@ mod tests {
                 b"<b>Hello &amp; <font color=\"red\">world</font></b>",
             ),
             &mut output,
-        )
-        .expect("ordinary SubRip converts");
+        )?;
         let output_before_error = output.len();
         let mut positioned = match sample(Codec::SubRip, SECOND as i64, SECOND, b"placed") {
             NormalizedSample::Subtitle(sample) => sample,
@@ -838,23 +836,21 @@ mod tests {
                 .is_err()
         );
         assert_eq!(output.len(), output_before_error);
-        mux.finish(FinishReason::Final, &mut output)
-            .expect("valid cue remains flushable");
-        let body = str::from_utf8(segments(&output)[0].payload.as_bytes()).expect("body is text");
+        mux.finish(FinishReason::Final, &mut output)?;
+        let body = str::from_utf8(segments(&output)[0].payload.as_bytes())?;
         assert!(body.contains("<b>Hello &amp; world</b>"));
         assert!(!body.contains("<font"));
+        Ok(())
     }
 
     #[test]
-    fn superseded_discards_unsealed_tail_and_finish_is_idempotent() {
+    fn superseded_discards_unsealed_tail_and_finish_is_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::WebVtt, 2);
         let mut output = Vec::new();
-        mux.push(sample(Codec::WebVtt, 0, SECOND, b"tail"), &mut output)
-            .expect("cue is accepted");
-        mux.finish(FinishReason::Superseded, &mut output)
-            .expect("tail is discarded");
-        mux.finish(FinishReason::Final, &mut output)
-            .expect("second finish is harmless");
+        mux.push(sample(Codec::WebVtt, 0, SECOND, b"tail"), &mut output)?;
+        mux.finish(FinishReason::Superseded, &mut output)?;
+        mux.finish(FinishReason::Final, &mut output)?;
 
         assert_eq!(
             output
@@ -863,6 +859,7 @@ mod tests {
                 .count(),
             0
         );
+        Ok(())
     }
 
     #[test]

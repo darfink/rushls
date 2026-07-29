@@ -9,19 +9,14 @@ use crate::domain::FrameRate;
 
 use super::{AttributeList, ManifestWriteResult, validate_uri};
 
-pub struct MultivariantPlaylistWriter<'a, W: Write + ?Sized> {
-    out: &'a mut W,
-    /// Reused by every attribute list this writer emits.
-    scratch: String,
+pub struct MultivariantPlaylistWriter<'a> {
+    out: &'a mut String,
 }
 
-impl<'a, W: Write + ?Sized> MultivariantPlaylistWriter<'a, W> {
-    pub fn new(out: &'a mut W) -> ManifestWriteResult<Self> {
+impl<'a> MultivariantPlaylistWriter<'a> {
+    pub fn new(out: &'a mut String) -> ManifestWriteResult<Self> {
         writeln!(out, "#EXTM3U")?;
-        Ok(Self {
-            out,
-            scratch: String::new(),
-        })
+        Ok(Self { out })
     }
 
     pub fn version(&mut self, version: NonZeroU8) -> ManifestWriteResult<&mut Self> {
@@ -35,7 +30,7 @@ impl<'a, W: Write + ?Sized> MultivariantPlaylistWriter<'a, W> {
     }
 
     pub fn rendition(&mut self, rendition: Rendition<'_>) -> ManifestWriteResult<&mut Self> {
-        let mut attributes = AttributeList::new(self.out, &mut self.scratch, "EXT-X-MEDIA");
+        let mut attributes = AttributeList::new(self.out, "EXT-X-MEDIA");
         attributes.plain("TYPE", rendition.media_type)?;
         attributes.quoted("GROUP-ID", rendition.group_id)?;
         attributes.quoted("NAME", rendition.name)?;
@@ -57,7 +52,7 @@ impl<'a, W: Write + ?Sized> MultivariantPlaylistWriter<'a, W> {
     }
 
     pub fn variant(&mut self, variant: Variant<'_>) -> ManifestWriteResult<&mut Self> {
-        let mut attributes = AttributeList::new(self.out, &mut self.scratch, "EXT-X-STREAM-INF");
+        let mut attributes = AttributeList::new(self.out, "EXT-X-STREAM-INF");
         attributes.plain("BANDWIDTH", variant.bandwidth)?;
         attributes.optional("AVERAGE-BANDWIDTH", variant.average_bandwidth)?;
         attributes.optional_quoted("CODECS", variant.codecs)?;
@@ -128,12 +123,14 @@ pub struct Variant<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::delivery::hls::manifest::ManifestWriteError;
+
     use super::*;
 
     #[test]
-    fn renders_renditions_and_variants() {
+    fn renders_renditions_and_variants() -> Result<(), ManifestWriteError> {
         let mut rendered = String::new();
-        let mut writer = MultivariantPlaylistWriter::new(&mut rendered).expect("header renders");
+        let mut writer = MultivariantPlaylistWriter::new(&mut rendered)?;
         writer
             .version(nz::u8!(10))
             .and_then(MultivariantPlaylistWriter::independent_segments)
@@ -163,8 +160,7 @@ mod tests {
                     subtitle_group_id: None,
                     uri: "video/1080p.m3u8",
                 })
-            })
-            .expect("playlist renders");
+            })?;
 
         assert_eq!(
             rendered,
@@ -181,12 +177,13 @@ mod tests {
                 "video/1080p.m3u8\n",
             )
         );
+        Ok(())
     }
 
     #[test]
-    fn rejects_invalid_values_before_starting_a_tag() {
+    fn rejects_invalid_values_before_starting_a_tag() -> Result<(), ManifestWriteError> {
         let mut rendered = String::new();
-        let mut writer = MultivariantPlaylistWriter::new(&mut rendered).expect("header renders");
+        let mut writer = MultivariantPlaylistWriter::new(&mut rendered)?;
 
         assert!(
             writer
@@ -204,5 +201,6 @@ mod tests {
                 .is_err()
         );
         assert_eq!(rendered, "#EXTM3U\n");
+        Ok(())
     }
 }

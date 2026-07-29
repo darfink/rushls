@@ -9,19 +9,14 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{AttributeList, DecimalSeconds, ManifestWriteError, ManifestWriteResult, validate_uri};
 
-pub struct MediaPlaylistWriter<'a, W: Write + ?Sized> {
-    out: &'a mut W,
-    /// Reused by every attribute list this writer emits.
-    scratch: String,
+pub struct MediaPlaylistWriter<'a> {
+    out: &'a mut String,
 }
 
-impl<'a, W: Write + ?Sized> MediaPlaylistWriter<'a, W> {
-    pub fn new(out: &'a mut W) -> ManifestWriteResult<Self> {
+impl<'a> MediaPlaylistWriter<'a> {
+    pub fn new(out: &'a mut String) -> ManifestWriteResult<Self> {
         writeln!(out, "#EXTM3U")?;
-        Ok(Self {
-            out,
-            scratch: String::new(),
-        })
+        Ok(Self { out })
     }
 
     pub fn version(&mut self, version: NonZeroU8) -> ManifestWriteResult<&mut Self> {
@@ -80,8 +75,7 @@ impl<'a, W: Write + ?Sized> MediaPlaylistWriter<'a, W> {
             }
         }
 
-        let mut attributes =
-            AttributeList::new(self.out, &mut self.scratch, "EXT-X-SERVER-CONTROL");
+        let mut attributes = AttributeList::new(self.out, "EXT-X-SERVER-CONTROL");
         attributes.optional("HOLD-BACK", control.hold_back.map(DecimalSeconds))?;
         attributes.optional("PART-HOLD-BACK", control.part_hold_back.map(DecimalSeconds))?;
         attributes.flag("CAN-BLOCK-RELOAD", control.can_block_reload)?;
@@ -93,7 +87,7 @@ impl<'a, W: Write + ?Sized> MediaPlaylistWriter<'a, W> {
     }
 
     pub fn initialization_map(&mut self, uri: &str) -> ManifestWriteResult<&mut Self> {
-        let mut attributes = AttributeList::new(self.out, &mut self.scratch, "EXT-X-MAP");
+        let mut attributes = AttributeList::new(self.out, "EXT-X-MAP");
         attributes.uri("URI", uri)?;
         attributes.end()?;
         Ok(self)
@@ -113,7 +107,7 @@ impl<'a, W: Write + ?Sized> MediaPlaylistWriter<'a, W> {
     pub fn part(&mut self, part: Part<'_>) -> ManifestWriteResult<&mut Self> {
         require_nonzero(part.duration, "EXT-X-PART DURATION")?;
 
-        let mut attributes = AttributeList::new(self.out, &mut self.scratch, "EXT-X-PART");
+        let mut attributes = AttributeList::new(self.out, "EXT-X-PART");
         attributes.plain("DURATION", DecimalSeconds(part.duration))?;
         attributes.uri("URI", part.uri)?;
         attributes.flag("INDEPENDENT", part.independent)?;
@@ -142,8 +136,7 @@ impl<'a, W: Write + ?Sized> MediaPlaylistWriter<'a, W> {
         &mut self,
         report: RenditionReport<'_>,
     ) -> ManifestWriteResult<&mut Self> {
-        let mut attributes =
-            AttributeList::new(self.out, &mut self.scratch, "EXT-X-RENDITION-REPORT");
+        let mut attributes = AttributeList::new(self.out, "EXT-X-RENDITION-REPORT");
         attributes.uri("URI", report.uri)?;
         attributes.optional("LAST-MSN", report.last_media_sequence)?;
         attributes.optional("LAST-PART", report.last_part)?;
@@ -152,7 +145,7 @@ impl<'a, W: Write + ?Sized> MediaPlaylistWriter<'a, W> {
     }
 
     pub fn preload_hint(&mut self, hint: PreloadHint<'_>) -> ManifestWriteResult<&mut Self> {
-        let mut attributes = AttributeList::new(self.out, &mut self.scratch, "EXT-X-PRELOAD-HINT");
+        let mut attributes = AttributeList::new(self.out, "EXT-X-PRELOAD-HINT");
         attributes.plain("TYPE", hint.hint_type)?;
         attributes.uri("URI", hint.uri)?;
         attributes.end()?;
@@ -308,28 +301,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_unsafe_uri_before_writing_its_tag() {
+    fn rejects_an_unsafe_uri_before_writing_its_tag() -> Result<(), ManifestWriteError> {
         let mut rendered = String::new();
-        let mut writer = MediaPlaylistWriter::new(&mut rendered).expect("header renders");
+        let mut writer = MediaPlaylistWriter::new(&mut rendered)?;
 
         assert!(matches!(
             writer.initialization_map("init.mp4\"\n#EXT-X-ENDLIST"),
             Err(ManifestWriteError::InvalidUri { .. })
         ));
         assert_eq!(rendered, "#EXTM3U\n");
+        Ok(())
     }
 
     #[test]
-    fn renders_program_date_time_as_rfc3339_utc() {
+    fn renders_program_date_time_as_rfc3339_utc() -> Result<(), Box<dyn std::error::Error>> {
         let timestamp = SystemTime::UNIX_EPOCH
             .checked_add(Duration::new(1_700_000_000, 123_456_789))
-            .expect("test timestamp is representable");
+            .ok_or_else(|| std::io::Error::other("test timestamp is representable"))?;
         let mut rendered = String::new();
-        let mut writer = MediaPlaylistWriter::new(&mut rendered).expect("header renders");
+        let mut writer = MediaPlaylistWriter::new(&mut rendered)?;
 
-        writer
-            .program_date_time(timestamp)
-            .expect("timestamp renders");
+        writer.program_date_time(timestamp)?;
 
         assert_eq!(
             rendered,
@@ -338,5 +330,6 @@ mod tests {
                 "#EXT-X-PROGRAM-DATE-TIME:2023-11-14T22:13:20.123456789Z\n",
             )
         );
+        Ok(())
     }
 }

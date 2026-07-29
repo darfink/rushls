@@ -13,7 +13,7 @@
 //! variant on its codec list and then meets an unlisted one has already
 //! committed.
 
-use std::{collections::BTreeSet, fmt::Write, num::NonZeroU64};
+use std::{collections::BTreeSet, num::NonZeroU64};
 
 use crate::{
     delivery::hls::{
@@ -148,8 +148,8 @@ impl<'a> Playable<'a> {
     }
 }
 
-fn write_variant<W: Write + ?Sized>(
-    writer: &mut MultivariantPlaylistWriter<'_, W>,
+fn write_variant(
+    writer: &mut MultivariantPlaylistWriter<'_>,
     primary: &RenditionCatalogEntry,
     alternates: &[&ResolvedGroup<'_>],
     policy: &PlaylistPolicy,

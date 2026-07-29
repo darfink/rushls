@@ -228,52 +228,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_key_renders_once_however_many_viewers_ask() {
+    fn one_key_renders_once_however_many_viewers_ask() -> Result<(), ()> {
         let cache = PlaylistCache::new();
         let key = PlaylistKey::default();
         let mut renders = 0;
 
         for _ in 0..3 {
-            let rendered = cache
-                .get_or_render::<()>(key, || {
-                    renders += 1;
-                    Ok("#EXTM3U\n".to_owned())
-                })
-                .expect("rendering succeeds");
+            let rendered = cache.get_or_render::<()>(key, || {
+                renders += 1;
+                Ok("#EXTM3U\n".to_owned())
+            })?;
             assert_eq!(rendered.bytes.as_ref(), b"#EXTM3U\n");
         }
 
         assert_eq!(renders, 1);
+        Ok(())
     }
 
     #[test]
-    fn a_revision_change_during_projection_is_rendered_again_before_caching() {
+    fn a_revision_change_during_projection_is_rendered_again_before_caching() -> Result<(), ()> {
         let cache = PlaylistCache::new();
         let revision = Cell::new(0);
         let renders = Cell::new(0);
-        let rendered = cache
-            .get_or_render_stable::<_, ()>(
-                || {
-                    Ok((
-                        PlaylistKey {
-                            catalog_revision: 1,
-                            media_revision: revision.get(),
-                        },
-                        (),
-                    ))
-                },
-                |_| {
-                    let attempt = renders.get();
-                    renders.set(attempt + 1);
-                    if attempt == 0 {
-                        revision.set(1);
-                        Ok("mixed".to_owned())
-                    } else {
-                        Ok("stable".to_owned())
-                    }
-                },
-            )
-            .expect("stable rendering succeeds");
+        let rendered = cache.get_or_render_stable::<_, ()>(
+            || {
+                Ok((
+                    PlaylistKey {
+                        catalog_revision: 1,
+                        media_revision: revision.get(),
+                    },
+                    (),
+                ))
+            },
+            |_| {
+                let attempt = renders.get();
+                renders.set(attempt + 1);
+                if attempt == 0 {
+                    revision.set(1);
+                    Ok("mixed".to_owned())
+                } else {
+                    Ok("stable".to_owned())
+                }
+            },
+        )?;
 
         assert_eq!(rendered.bytes, "stable");
         assert_eq!(renders.get(), 2);
@@ -286,10 +283,11 @@ mod tests {
                 .is_none(),
             "bytes observed across a revision change are never cached"
         );
+        Ok(())
     }
 
     #[test]
-    fn a_siblings_advance_invalidates_a_playlist_that_reports_it() {
+    fn a_siblings_advance_invalidates_a_playlist_that_reports_it() -> Result<(), ()> {
         let store = StreamStore::default();
         let lease = lease(&store, vec![video(0), audio(1)]);
         for local in [0, 1] {
@@ -311,19 +309,18 @@ mod tests {
         );
 
         let cache = PlaylistCache::new();
-        cache
-            .get_or_render::<()>(before, || Ok("stale".to_owned()))
-            .expect("renders");
+        cache.get_or_render::<()>(before, || Ok("stale".to_owned()))?;
         assert!(cache.get(&after).is_none());
         assert_eq!(
             cache.get(&before).as_deref(),
             Some(&b"stale"[..]),
             "the previous value is still identifiable as what it was"
         );
+        Ok(())
     }
 
     #[test]
-    fn an_unchanged_stream_keeps_serving_the_same_bytes() {
+    fn an_unchanged_stream_keeps_serving_the_same_bytes() -> Result<(), ()> {
         let store = StreamStore::default();
         let lease = lease(&store, vec![video(0)]);
         write(&lease, initialization(0, 1));
@@ -331,21 +328,18 @@ mod tests {
 
         let key = PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision());
         let cache = PlaylistCache::new();
-        let first = cache
-            .get_or_render::<()>(key, || Ok("#EXTM3U\n".to_owned()))
-            .expect("renders");
-        let second = cache
-            .get_or_render::<()>(
-                PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision()),
-                || panic!("nothing changed, so nothing should be re-rendered"),
-            )
-            .expect("reuses");
+        let first = cache.get_or_render::<()>(key, || Ok("#EXTM3U\n".to_owned()))?;
+        let second = cache.get_or_render::<()>(
+            PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision()),
+            || panic!("nothing changed, so nothing should be re-rendered"),
+        )?;
 
         assert!(
             !second.freshly_rendered,
             "an unchanged stream is answered from the cache"
         );
         assert_eq!(first.bytes, second.bytes);
+        Ok(())
     }
 
     #[test]

@@ -485,7 +485,8 @@ mod tests {
     }
 
     #[test]
-    fn default_topology_combines_video_and_audio_alternatives() {
+    fn default_topology_combines_video_and_audio_alternatives()
+    -> Result<(), PackagedPresentationError> {
         let input = input();
         let presentation = PackagedPresentation::with_default_topology(
             SystemTime::UNIX_EPOCH,
@@ -495,8 +496,7 @@ mod tests {
                 rendition(1, 1, MediaKind::Audio),
                 rendition(2, 1, MediaKind::Audio),
             ],
-        )
-        .expect("default topology is valid");
+        )?;
 
         assert_eq!(presentation.groups.len(), 2);
         assert_eq!(presentation.groups[0].media_kind, MediaKind::Video);
@@ -504,6 +504,7 @@ mod tests {
         assert_eq!(presentation.combinations[0].groups.len(), 2);
         assert!(presentation.renditions[1].is_default);
         assert!(!presentation.renditions[2].is_default);
+        Ok(())
     }
 
     #[test]

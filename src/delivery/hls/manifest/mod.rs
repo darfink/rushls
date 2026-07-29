@@ -85,20 +85,32 @@ pub fn validate_uri(
 /// checked at the moment it is written rather than in a separate pass, so
 /// adding an attribute cannot leave a validation list one entry behind.
 ///
-/// The tag is assembled in a scratch buffer and copied out only once it is
-/// complete, so a value refused halfway through leaves no partial tag behind.
-/// The buffer belongs to the writer and is reused by every tag it emits, which
-/// is what keeps that guarantee from costing an allocation apiece.
-pub struct AttributeList<'a, W: Write + ?Sized> {
-    out: &'a mut W,
-    scratch: &'a mut String,
+/// A tag is written straight into the playlist, and a value refused partway
+/// through rewinds the output to where the tag began. That keeps a half-written
+/// tag from ever being observable without needing a buffer to assemble it in:
+/// the playlist reserves its whole capacity up front, so these bytes land in
+/// memory that is already there.
+pub struct AttributeList<'a> {
+    out: &'a mut String,
+    /// Where this tag begins, which is how far back a refusal rewinds.
+    start: usize,
     tag: &'static str,
+    first: bool,
 }
 
-impl<'a, W: Write + ?Sized> AttributeList<'a, W> {
-    pub fn new(out: &'a mut W, scratch: &'a mut String, tag: &'static str) -> Self {
-        scratch.clear();
-        Self { out, scratch, tag }
+impl<'a> AttributeList<'a> {
+    /// Opens `#{tag}:` and prepares to write its attributes.
+    pub fn new(out: &'a mut String, tag: &'static str) -> Self {
+        let start = out.len();
+        out.push('#');
+        out.push_str(tag);
+        out.push(':');
+        Self {
+            out,
+            start,
+            tag,
+            first: true,
+        }
     }
 
     /// A value HLS represents without quoting.
@@ -108,7 +120,7 @@ impl<'a, W: Write + ?Sized> AttributeList<'a, W> {
         value: impl fmt::Display,
     ) -> ManifestWriteResult<&mut Self> {
         self.separate();
-        let _ = write!(self.scratch, "{attribute}={value}");
+        let _ = write!(self.out, "{attribute}={value}");
         Ok(self)
     }
 
@@ -130,9 +142,11 @@ impl<'a, W: Write + ?Sized> AttributeList<'a, W> {
         attribute: &'static str,
         value: &str,
     ) -> ManifestWriteResult<&mut Self> {
-        validate_quoted(value, self.tag, attribute)?;
+        if let Err(error) = validate_quoted(value, self.tag, attribute) {
+            return Err(self.abandon(error));
+        }
         self.separate();
-        let _ = write!(self.scratch, r#"{attribute}="{value}""#);
+        let _ = write!(self.out, r#"{attribute}="{value}""#);
         Ok(self)
     }
 
@@ -150,9 +164,11 @@ impl<'a, W: Write + ?Sized> AttributeList<'a, W> {
 
     /// A quoted string naming a resource, which must already be encoded.
     pub fn uri(&mut self, attribute: &'static str, value: &str) -> ManifestWriteResult<&mut Self> {
-        validate_uri(value, self.tag, attribute)?;
+        if let Err(error) = validate_uri(value, self.tag, attribute) {
+            return Err(self.abandon(error));
+        }
         self.separate();
-        let _ = write!(self.scratch, r#"{attribute}="{value}""#);
+        let _ = write!(self.out, r#"{attribute}="{value}""#);
         Ok(self)
     }
 
@@ -170,20 +186,27 @@ impl<'a, W: Write + ?Sized> AttributeList<'a, W> {
         Ok(self)
     }
 
-    /// Emits the completed tag, or refuses a tag that would carry no
-    /// attributes.
-    pub fn end(self) -> ManifestWriteResult<()> {
-        if self.scratch.is_empty() {
-            return Err(ManifestWriteError::EmptyAttributeList { tag: self.tag });
+    /// Closes the tag, or refuses one that would carry no attributes.
+    pub fn end(mut self) -> ManifestWriteResult<()> {
+        if self.first {
+            let error = ManifestWriteError::EmptyAttributeList { tag: self.tag };
+            return Err(self.abandon(error));
         }
-        writeln!(self.out, "#{}:{}", self.tag, self.scratch)?;
+        self.out.push('\n');
         Ok(())
     }
 
     fn separate(&mut self) {
-        if !self.scratch.is_empty() {
-            self.scratch.push(',');
+        if !self.first {
+            self.out.push(',');
         }
+        self.first = false;
+    }
+
+    /// Unwrites the tag, so a refused value leaves no trace of it behind.
+    fn abandon(&mut self, error: ManifestWriteError) -> ManifestWriteError {
+        self.out.truncate(self.start);
+        error
     }
 }
 

@@ -122,8 +122,8 @@ mod tests {
     use crate::ffmpeg::OwnedPacket;
 
     #[test]
-    fn webvtt_text_side_data_is_copied_into_semantic_metadata() {
-        let packet = OwnedPacket::new().expect("packet allocation succeeds");
+    fn webvtt_text_side_data_is_copied_into_semantic_metadata() -> Result<(), Box<str>> {
+        let packet = OwnedPacket::new().ok_or("packet allocation succeeds")?;
         for (kind, value) in [
             (
                 ffmpeg::AVPacketSideDataType::AV_PKT_DATA_WEBVTT_IDENTIFIER,
@@ -143,15 +143,15 @@ mod tests {
         }
 
         // SAFETY: the packet remains live for the read.
-        let metadata =
-            unsafe { read_webvtt_metadata(packet.as_ptr(), usize::MAX) }.expect("metadata parses");
+        let metadata = unsafe { read_webvtt_metadata(packet.as_ptr(), usize::MAX) }?;
         assert_eq!(metadata.identifier.as_deref(), Some("cue-7"));
         assert_eq!(metadata.settings.as_deref(), Some("align:start"));
+        Ok(())
     }
 
     #[test]
-    fn webvtt_metadata_is_bounded_before_it_is_retained() {
-        let packet = OwnedPacket::new().expect("packet allocation succeeds");
+    fn webvtt_metadata_is_bounded_before_it_is_retained() -> Result<(), Box<str>> {
+        let packet = OwnedPacket::new().ok_or("packet allocation succeeds")?;
         // SAFETY: the test exclusively owns this live packet.
         let data = unsafe {
             ffmpeg::av_packet_new_side_data(
@@ -168,11 +168,12 @@ mod tests {
         let error = unsafe { read_webvtt_metadata(packet.as_ptr(), 4) }
             .expect_err("metadata above the packet limit is rejected");
         assert!(error.contains("above the 4-byte limit"));
+        Ok(())
     }
 
     #[test]
-    fn subtitle_position_requires_the_exact_ffmpeg_layout() {
-        let packet = OwnedPacket::new().expect("packet allocation succeeds");
+    fn subtitle_position_requires_the_exact_ffmpeg_layout() -> Result<(), Box<str>> {
+        let packet = OwnedPacket::new().ok_or("packet allocation succeeds")?;
         // SAFETY: the test exclusively owns this live packet.
         let data = unsafe {
             ffmpeg::av_packet_new_side_data(
@@ -189,5 +190,6 @@ mod tests {
                 .expect_err("short position is malformed")
                 .contains("expected 16")
         );
+        Ok(())
     }
 }

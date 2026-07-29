@@ -85,9 +85,9 @@ mod tests {
     }
 
     #[test]
-    fn a_resolved_path_carries_its_stream_and_resource() {
+    fn a_resolved_path_carries_its_stream_and_resource() -> Result<(), DeliveryError> {
         assert_eq!(
-            route("/live/camera/0/video.m3u8", None).expect("routes"),
+            route("/live/camera/0/video.m3u8", None)?,
             Routed {
                 stream: StreamId::new("live/camera"),
                 request: Request::new(video(), None)
@@ -99,14 +99,13 @@ mod tests {
             "a name this origin never produced is a miss, whatever made it \
              unparseable"
         );
+        Ok(())
     }
 
     #[test]
-    fn blocking_directives_are_read_and_validated() {
+    fn blocking_directives_are_read_and_validated() -> Result<(), DeliveryError> {
         assert_eq!(
-            route("/s/0/video.m3u8", Some("_HLS_msn=4&_HLS_part=2"))
-                .expect("routes")
-                .request,
+            route("/s/0/video.m3u8", Some("_HLS_msn=4&_HLS_part=2"))?.request,
             Request::new(
                 video(),
                 Some(BlockingReload {
@@ -124,11 +123,10 @@ mod tests {
             DeliveryError::InvalidDirective(_)
         ));
         assert_eq!(
-            route("/s/0/video.m3u8", Some("_HLS_future=1&x=2"))
-                .expect("routes")
-                .request,
+            route("/s/0/video.m3u8", Some("_HLS_future=1&x=2"))?.request,
             Request::new(video(), None),
             "a directive this origin has not learned yet is not a client error"
         );
+        Ok(())
     }
 }

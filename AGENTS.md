@@ -7,6 +7,7 @@
 
 ## Code Style & Comments Rule
 - **Move shared test code setups to fixtures.rs for duplicated code:** If test code is shared between files, move common code to fixtures.rs
+- Return `Result<(), Error>` from tests and use `?` for fallible setup; keep `expect`/`unwrap` for intentional failure assertions or invariants.
 - **Preserve Existing Comments:** Do not strip, remove, or alter existing inline/docstring comments unless they're no longer of relevance.
 - **Add Informative Comments:** Include concise, meaningful inline comments for non-trivial logic, type signatures, edge cases, and public interface methods.
 - **Explain 'Why', Not 'What':** Avoid trivial self-explanatory comments (e.g., `i += 1 // increment i`), but document complex business logic, architectural constraints, or math optimizations.

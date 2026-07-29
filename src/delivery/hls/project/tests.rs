@@ -28,29 +28,36 @@ fn uris() -> PlaylistUris {
     UriBase::default().uris(&stream_id())
 }
 
-fn snapshots(lease: &StreamLease, rendition: u32) -> (Arc<StreamSnapshot>, Arc<RenditionSnapshot>) {
+fn snapshots(
+    lease: &StreamLease,
+    rendition: u32,
+) -> Result<(Arc<StreamSnapshot>, Arc<RenditionSnapshot>), Box<dyn std::error::Error>> {
     let stream = lease.live().snapshot();
     let media = lease
         .live()
         .rendition(RenditionId(rendition))
-        .expect("the rendition is in the catalog");
-    (stream, media)
+        .ok_or_else(|| std::io::Error::other("the rendition is in the catalog"))?;
+    Ok((stream, media))
 }
 
-fn render(lease: &StreamLease, rendition: u32, policy: &PlaylistPolicy) -> String {
-    let (stream, media) = snapshots(lease, rendition);
+fn render(
+    lease: &StreamLease,
+    rendition: u32,
+    policy: &PlaylistPolicy,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (stream, media) = snapshots(lease, rendition)?;
     let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
-    media_playlist(&stream, &media, control, policy, &uris()).expect("the playlist projects")
+    Ok(media_playlist(&stream, &media, control, policy, &uris())?)
 }
 
 #[test]
-fn a_live_playlist_states_its_terms_before_any_media() {
+fn a_live_playlist_states_its_terms_before_any_media() -> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0)]);
     write(&lease, initialization(0, 1));
     write_segment(&lease, 0, 0, 0);
 
-    let rendered = render(&lease, 0, &policy());
+    let rendered = render(&lease, 0, &policy())?;
     let header: Vec<&str> = rendered
         .lines()
         .take_while(|line| !line.starts_with("#EXT-X-MAP"))
@@ -69,16 +76,17 @@ fn a_live_playlist_states_its_terms_before_any_media() {
         "the target, the part target, and the hold-backs all come from the \
          locked plan, so they are known before a single segment exists"
     );
+    Ok(())
 }
 
 #[test]
-fn a_completed_segment_carries_its_map_and_its_parts() {
+fn a_completed_segment_carries_its_map_and_its_parts() -> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0)]);
     write(&lease, initialization(0, 1));
     write_segment(&lease, 0, 0, 0);
 
-    let rendered = render(&lease, 0, &policy());
+    let rendered = render(&lease, 0, &policy())?;
 
     assert!(rendered.contains("#EXT-X-MAP:URI=\"init/1.mp4\"\n"));
     assert!(rendered.contains("#EXT-X-PROGRAM-DATE-TIME:2023-11-14T22:13:20Z\n"));
@@ -92,10 +100,12 @@ fn a_completed_segment_carries_its_map_and_its_parts() {
         1,
         "the map is restated only where the initialization changes"
     );
+    Ok(())
 }
 
 #[test]
-fn an_open_segment_is_described_before_its_first_part_is_offered() {
+fn an_open_segment_is_described_before_its_first_part_is_offered()
+-> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let first = lease(&store, vec![video(0)]);
     write(&first, initialization(0, 1));
@@ -107,10 +117,10 @@ fn an_open_segment_is_described_before_its_first_part_is_offered() {
     write(&second, initialization(0, 2));
     write(&second, chunk(0, 0, 0, 0));
 
-    let rendered = render(&second, 0, &policy());
+    let rendered = render(&second, 0, &policy())?;
     let leading_up_to_the_part = rendered
         .split_once("#EXT-X-PART:DURATION=1,URI=\"part/7.m4s\"")
-        .expect("the successor's first part is tagged")
+        .ok_or_else(|| std::io::Error::other("the successor's first part is tagged"))?
         .0;
     let leading: Vec<&str> = leading_up_to_the_part.lines().rev().take(3).collect();
 
@@ -124,10 +134,12 @@ fn an_open_segment_is_described_before_its_first_part_is_offered() {
         "a client fetching this part must already know it decodes against a new \
          initialization on a new timeline"
     );
+    Ok(())
 }
 
 #[test]
-fn a_departed_discontinuity_survives_as_a_sequence_number() {
+fn a_departed_discontinuity_survives_as_a_sequence_number() -> Result<(), Box<dyn std::error::Error>>
+{
     let store = StreamStore::default();
     let first = lease(&store, vec![video(0)]);
     write(&first, initialization(0, 1));
@@ -139,7 +151,7 @@ fn a_departed_discontinuity_survives_as_a_sequence_number() {
         write_segment(&second, 0, id, id as i64 * 6);
     }
 
-    let rendered = render(&second, 0, &policy());
+    let rendered = render(&second, 0, &policy())?;
 
     assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:2\n"));
     assert!(rendered.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
@@ -147,31 +159,35 @@ fn a_departed_discontinuity_survives_as_a_sequence_number() {
         !rendered.contains("#EXT-X-DISCONTINUITY\n"),
         "the tag left with its segment; the sequence number is what remains"
     );
+    Ok(())
 }
 
 #[test]
-fn a_preload_hint_names_the_part_that_does_not_exist_yet() {
+fn a_preload_hint_names_the_part_that_does_not_exist_yet() -> Result<(), Box<dyn std::error::Error>>
+{
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0)]);
     write(&lease, initialization(0, 1));
     write(&lease, chunk(0, 0, 0, 0));
 
-    let rendered = render(&lease, 0, &policy());
+    let rendered = render(&lease, 0, &policy())?;
 
     assert!(rendered.contains("#EXT-X-PART:DURATION=1,URI=\"part/1.m4s\",INDEPENDENT=YES\n"));
     assert!(rendered.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part/2.m4s\"\n"));
     assert!(!rendered.contains("#EXT-X-ENDLIST"));
+    Ok(())
 }
 
 #[test]
-fn ending_a_publication_closes_every_playlist_and_withdraws_the_hint() {
+fn ending_a_publication_closes_every_playlist_and_withdraws_the_hint()
+-> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0)]);
     write(&lease, initialization(0, 1));
     write_segment(&lease, 0, 0, 0);
     lease.end();
 
-    let rendered = render(&lease, 0, &policy());
+    let rendered = render(&lease, 0, &policy())?;
 
     assert!(rendered.ends_with("#EXT-X-ENDLIST\n"));
     assert!(
@@ -179,10 +195,12 @@ fn ending_a_publication_closes_every_playlist_and_withdraws_the_hint() {
         "hinting media after an ENDLIST would park a client on a fetch that \
          can never be satisfied"
     );
+    Ok(())
 }
 
 #[test]
-fn siblings_are_reported_so_a_switching_client_knows_where_to_resume() {
+fn siblings_are_reported_so_a_switching_client_knows_where_to_resume()
+-> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0), audio(1)]);
     for local in [0, 1] {
@@ -191,7 +209,7 @@ fn siblings_are_reported_so_a_switching_client_knows_where_to_resume() {
     }
     write(&lease, chunk(1, 1, 0, 6));
 
-    let rendered = render(&lease, 0, &policy());
+    let rendered = render(&lease, 0, &policy())?;
 
     assert!(
         rendered
@@ -203,10 +221,11 @@ fn siblings_are_reported_so_a_switching_client_knows_where_to_resume() {
         !rendered.contains("../0/video.m3u8"),
         "a playlist does not report itself"
     );
+    Ok(())
 }
 
 #[test]
-fn a_configured_base_makes_every_name_absolute() {
+fn a_configured_base_makes_every_name_absolute() -> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0), audio(1)]);
     for local in [0, 1] {
@@ -214,14 +233,12 @@ fn a_configured_base_makes_every_name_absolute() {
         write_segment(&lease, local, 0, 0);
     }
 
-    let (stream, media) = snapshots(&lease, 0);
+    let (stream, media) = snapshots(&lease, 0)?;
     let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
     let uris = UriBase::new("https://cdn.example.com/hls").uris(&stream_id());
-    let rendered =
-        media_playlist(&stream, &media, control, &policy(), &uris).expect("the playlist projects");
-    let multivariant = multivariant_playlist(&stream, &policy(), &uris)
-        .expect("the presentation projects")
-        .expect("an attached publication has a topology");
+    let rendered = media_playlist(&stream, &media, control, &policy(), &uris)?;
+    let multivariant = multivariant_playlist(&stream, &policy(), &uris)?
+        .ok_or_else(|| std::io::Error::other("an attached publication has a topology"))?;
 
     assert!(
         rendered
@@ -236,16 +253,18 @@ fn a_configured_base_makes_every_name_absolute() {
          a directory that a rooted name never entered: {rendered}"
     );
     assert!(multivariant.contains("\nhttps://cdn.example.com/hls/live/camera/0/video.m3u8\n"));
+    Ok(())
 }
 
 #[test]
-fn a_webvtt_playlist_names_vtt_resources_and_advertises_no_parts() {
+fn a_webvtt_playlist_names_vtt_resources_and_advertises_no_parts()
+-> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0), subtitle(1)]);
     write(&lease, initialization(1, 1));
     write_direct(&lease, 1, 0, 0);
 
-    let rendered = render(&lease, 1, &policy());
+    let rendered = render(&lease, 1, &policy())?;
 
     assert!(rendered.contains("#EXT-X-VERSION:6\n"));
     assert!(rendered.contains("#EXT-X-MAP:URI=\"init/1.vtt\"\n"));
@@ -259,10 +278,11 @@ fn a_webvtt_playlist_names_vtt_resources_and_advertises_no_parts() {
         "but it still carries the presentation-wide server control, which its \
          chunked sibling requires"
     );
+    Ok(())
 }
 
 #[test]
-fn a_gap_is_tagged_rather_than_omitted() {
+fn a_gap_is_tagged_rather_than_omitted() -> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let first = lease(&store, vec![video(0)]);
     write(&first, initialization(0, 1));
@@ -274,20 +294,21 @@ fn a_gap_is_tagged_rather_than_omitted() {
     write(&second, initialization(0, 2));
     write(&second, chunk(0, 0, 0, 0));
 
-    let rendered = render(&second, 0, &policy());
+    let rendered = render(&second, 0, &policy())?;
 
     assert!(rendered.contains("#EXT-X-GAP\n#EXTINF:6,\nsegment/1.m4s\n"));
+    Ok(())
 }
 
 #[test]
-fn program_date_time_can_be_restated_on_every_segment() {
+fn program_date_time_can_be_restated_on_every_segment() -> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0)]);
     write(&lease, initialization(0, 1));
     write_segment(&lease, 0, 0, 0);
     write_segment(&lease, 0, 1, 6);
 
-    let sparse = render(&lease, 0, &policy());
+    let sparse = render(&lease, 0, &policy())?;
     let dense = render(
         &lease,
         0,
@@ -295,15 +316,16 @@ fn program_date_time_can_be_restated_on_every_segment() {
             program_date_time: ProgramDateTimePolicy::EverySegment,
             ..policy()
         },
-    );
+    )?;
 
     assert_eq!(sparse.matches("#EXT-X-PROGRAM-DATE-TIME").count(), 1);
     assert_eq!(dense.matches("#EXT-X-PROGRAM-DATE-TIME").count(), 2);
     assert!(dense.contains("#EXT-X-PROGRAM-DATE-TIME:2023-11-14T22:13:26Z\n"));
+    Ok(())
 }
 
 #[test]
-fn a_variant_advertises_what_playing_it_actually_costs() {
+fn a_variant_advertises_what_playing_it_actually_costs() -> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0), audio(1), subtitle(2)]);
     for local in [0, 1] {
@@ -314,19 +336,18 @@ fn a_variant_advertises_what_playing_it_actually_costs() {
     write_direct(&lease, 2, 0, 0);
 
     let stream = lease.live().snapshot();
-    let rendered = multivariant_playlist(&stream, &policy(), &uris())
-        .expect("the presentation projects")
-        .expect("an attached publication has a topology");
+    let rendered = multivariant_playlist(&stream, &policy(), &uris())?
+        .ok_or_else(|| std::io::Error::other("an attached publication has a topology"))?;
 
-    let rate = |index: usize| {
+    let rate = |index: usize| -> Result<_, std::io::Error> {
         stream.renditions[index]
             .bandwidth
             .peak_bits_per_second
-            .expect("a completed segment has been measured")
+            .ok_or_else(|| std::io::Error::other("a completed segment has been measured"))
     };
 
     assert!(
-        rendered.contains(&format!("BANDWIDTH={}", rate(0) + rate(1) + rate(2))),
+        rendered.contains(&format!("BANDWIDTH={}", rate(0)? + rate(1)? + rate(2)?)),
         "the advertised rate is the primary plus one selectable rendition from \
          each group the variant references, not the video rate alone: {rendered}"
     );
@@ -343,31 +364,33 @@ fn a_variant_advertises_what_playing_it_actually_costs() {
         !rendered.contains("#EXT-X-MEDIA:TYPE=VIDEO"),
         "the primary group's renditions are the variants themselves"
     );
+    Ok(())
 }
 
 #[test]
-fn a_multivariant_playlist_preserves_canonical_language_metadata() {
+fn a_multivariant_playlist_preserves_canonical_language_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let mut french = audio(1);
     french.language = Some(Arc::from("fr-CA"));
     let lease = lease(&store, vec![video(0), french]);
 
-    let rendered = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())
-        .expect("the presentation projects")
-        .expect("an attached publication has a topology");
+    let rendered = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?
+        .ok_or_else(|| std::io::Error::other("an attached publication has a topology"))?;
 
     assert!(rendered.contains("LANGUAGE=\"fr-CA\""));
+    Ok(())
 }
 
 #[test]
-fn an_unmeasured_presentation_is_servable_immediately() {
+fn an_unmeasured_presentation_is_servable_immediately() -> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0), audio(1)]);
 
     let stream = lease.live().snapshot();
-    let rendered = multivariant_playlist(&stream, &policy(), &uris())
-        .expect("the presentation projects")
-        .expect("a topology exists as soon as a publisher attaches");
+    let rendered = multivariant_playlist(&stream, &policy(), &uris())?.ok_or_else(|| {
+        std::io::Error::other("a topology exists as soon as a publisher attaches")
+    })?;
 
     assert!(
         rendered.contains(&format!("BANDWIDTH={}", 6_000_000 * 2)),
@@ -378,18 +401,19 @@ fn an_unmeasured_presentation_is_servable_immediately() {
         !rendered.contains("AVERAGE-BANDWIDTH"),
         "an average nobody has measured would describe nothing"
     );
+    Ok(())
 }
 
 #[test]
-fn an_optimistic_declaration_is_not_lowered_by_a_smaller_measurement() {
+fn an_optimistic_declaration_is_not_lowered_by_a_smaller_measurement()
+-> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let mut declared = video(0);
     declared.declared_bandwidth = Some(9_000_000);
     let lease = lease(&store, vec![declared]);
 
-    let before = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())
-        .expect("projects")
-        .expect("has a topology");
+    let before = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?
+        .ok_or_else(|| std::io::Error::other("has a topology"))?;
     assert!(before.contains("BANDWIDTH=9000000"));
 
     write(&lease, initialization(0, 1));
@@ -398,28 +422,24 @@ fn an_optimistic_declaration_is_not_lowered_by_a_smaller_measurement() {
     let measured = stream.renditions[0]
         .bandwidth
         .peak_bits_per_second
-        .expect("a completed segment has been measured");
+        .ok_or_else(|| std::io::Error::other("a completed segment has been measured"))?;
 
-    let after = multivariant_playlist(&stream, &policy(), &uris())
-        .expect("projects")
-        .expect("has a topology");
+    let after = multivariant_playlist(&stream, &policy(), &uris())?
+        .ok_or_else(|| std::io::Error::other("has a topology"))?;
     assert!(
         after.contains("BANDWIDTH=9000000"),
         "under-advertising is what makes a client pick a variant it cannot \
          sustain, so the larger of the two wins: measured {measured}"
     );
+    Ok(())
 }
 
 #[test]
-fn a_stream_nobody_has_published_to_has_no_presentation() {
+fn a_stream_nobody_has_published_to_has_no_presentation() -> Result<(), Box<dyn std::error::Error>>
+{
     let store = StreamStore::default();
-    let lease = store
-        .lease_without_presentation(stream_id())
-        .expect("the store has room");
+    let lease = store.lease_without_presentation(stream_id())?;
 
-    assert!(
-        multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())
-            .expect("projects")
-            .is_none()
-    );
+    assert!(multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?.is_none());
+    Ok(())
 }
