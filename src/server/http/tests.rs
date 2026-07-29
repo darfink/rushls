@@ -646,8 +646,9 @@ mod end_to_end {
 
     use crate::{
         admission::{
-            ClientInfo, FixedStreamAuthenticator, IngestProtocol, PresentedCredential, Principal,
-            PublishGrant, PublishRequest, PublishResource, StreamPolicy,
+            ClientInfo, IngestProtocol, PresentedCredential, Principal, PublishGrant,
+            PublishRequest, PublishResource, StaticPublisher, StaticStreamAuthenticator,
+            StreamPolicy,
         },
         delivery::hls::serve::PlaylistReadiness,
         domain::{BoxFuture, StreamId},
@@ -736,14 +737,14 @@ mod end_to_end {
         let session = config.session;
         let node = Node::new(
             config,
-            Arc::new(FixedStreamAuthenticator::new(
+            Arc::new(StaticStreamAuthenticator::new(vec![StaticPublisher::new(
                 "secret",
                 PublishGrant {
                     stream_id: StreamId::new("live/camera"),
                     principal: Principal("fixture".into()),
                     policy: StreamPolicy::permissive(),
                 },
-            )),
+            )])),
             Events::default(),
         )
         .expect("node configuration is valid");

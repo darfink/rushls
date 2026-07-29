@@ -5,12 +5,14 @@
 //! the deliberately supported operator choices are applied here.
 
 use std::{
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt, fs,
     net::SocketAddr,
     num::NonZeroU32,
     path::PathBuf,
     str::FromStr,
+    sync::Arc,
     time::Duration,
 };
 
@@ -20,7 +22,10 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    admission::{Principal, StreamPolicy, TakeoverPolicy},
+    admission::{
+        Authenticator, Principal, PublishGrant, StaticPublisher, StaticStreamAuthenticator,
+        StreamPolicy, TakeoverPolicy,
+    },
     delivery::hls::uri::UriBase,
     domain::{Codec, FrameRate, StreamId},
     segment::SegmentationPolicy,
@@ -32,15 +37,10 @@ use crate::{
     source::transport::srt::{SrtEncryption, SrtKeyLength},
 };
 
-const CONFIGURED_PUBLISHER: &str = "configured-publisher";
-
 /// Configuration after all external values have been validated and translated.
 pub struct ResolvedAppConfig {
     pub node: NodeConfig,
-    pub publish_key: String,
-    pub stream_id: StreamId,
-    pub principal: Principal,
-    pub stream_policy: StreamPolicy,
+    pub authenticator: Arc<dyn Authenticator>,
 }
 
 /// Failures while locating, reading, parsing, or resolving configuration.
@@ -55,6 +55,12 @@ pub enum ConfigError {
     Toml {
         path: PathBuf,
         source: toml::de::Error,
+    },
+    #[error("could not read {secret} from {path}: {source}")]
+    SecretRead {
+        secret: String,
+        path: PathBuf,
+        source: std::io::Error,
     },
     #[error(transparent)]
     Sources(#[from] conf::Error),
@@ -91,7 +97,7 @@ pub struct AppConfig {
     #[conf(flatten, prefix)]
     pub server: ServerAppConfig,
     #[conf(flatten, prefix)]
-    pub publishing: PublishingAppConfig,
+    pub auth: AuthAppConfig,
     #[conf(flatten, prefix)]
     pub ingest: IngestAppConfig,
     #[conf(flatten, prefix)]
@@ -117,7 +123,7 @@ impl AppConfig {
         env: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> Result<Self, ConfigError> {
         let args: Vec<OsString> = args.into_iter().collect();
-        let env = normalize_legacy_env(env.into_iter().collect());
+        let env: Vec<(OsString, OsString)> = env.into_iter().collect();
         let path = find_parameter("config", args.clone())
             .map(PathBuf::from)
             .or_else(|| env_value(&env, "RUSHLS_CONFIG").map(PathBuf::from));
@@ -146,7 +152,7 @@ impl AppConfig {
     /// Applies supported operator choices to independently evolving runtime
     /// defaults.
     pub fn resolve(self) -> Result<ResolvedAppConfig, ConfigError> {
-        let publishing = self.publishing.resolve()?;
+        let authenticator = self.auth.resolve()?;
         let mut node = NodeConfig {
             maximum_sessions: self.server.maximum_concurrent_publishers,
             rtmp_address: self.ingest.rtmp.listen,
@@ -162,10 +168,7 @@ impl AppConfig {
 
         Ok(ResolvedAppConfig {
             node,
-            publish_key: publishing.key,
-            stream_id: StreamId::new(publishing.stream_id),
-            principal: Principal(CONFIGURED_PUBLISHER.into()),
-            stream_policy: publishing.policy,
+            authenticator,
         })
     }
 }
@@ -180,107 +183,232 @@ pub struct ServerAppConfig {
 
 #[derive(Conf)]
 #[conf(serde)]
-pub struct PublishingAppConfig {
-    /// Shared credential accepted from publishers.
-    #[conf(parameter, env, secret)]
-    key: String,
-    /// HLS stream name populated by the configured publisher.
-    #[conf(parameter, long, env, default_value = "live/camera")]
-    stream_id: String,
-    /// Let a new publisher replace the current publisher of this stream.
-    #[conf(parameter, long, env, default_value = "true")]
-    allow_takeover: bool,
-    #[conf(flatten, prefix)]
-    media: MediaPolicyAppConfig,
+pub struct AuthAppConfig {
+    /// Authentication implementation used for publisher admission.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "static",
+        serde(use_value_parser)
+    )]
+    provider: AuthProviderValue,
+    /// Named policy profiles selected by configured publishers.
+    #[conf(parameter, value_parser = PolicyProfiles::from_str)]
+    policies: Option<PolicyProfiles>,
+    #[conf(flatten, prefix, serde(rename = "static"))]
+    static_provider: StaticAuthAppConfig,
 }
 
-struct ResolvedPublishing {
-    key: String,
-    stream_id: String,
-    policy: StreamPolicy,
-}
-
-impl PublishingAppConfig {
-    fn resolve(self) -> Result<ResolvedPublishing, ConfigError> {
-        if self.key.is_empty() {
-            return Err(invalid("publishing key must not be empty"));
+impl AuthAppConfig {
+    fn resolve(self) -> Result<Arc<dyn Authenticator>, ConfigError> {
+        match self.provider {
+            AuthProviderValue::Static => self
+                .static_provider
+                .resolve(self.policies.unwrap_or_default())
+                .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>),
         }
-        let mut policy = self.media.resolve()?;
-        policy.takeovers = if self.allow_takeover {
-            TakeoverPolicy::Allow
-        } else {
-            TakeoverPolicy::Deny
-        };
-        Ok(ResolvedPublishing {
-            key: self.key,
-            stream_id: self.stream_id,
-            policy,
-        })
     }
 }
 
 #[derive(Conf)]
 #[conf(serde)]
-pub struct MediaPolicyAppConfig {
-    /// Video codecs publishers may send. Containers are detected automatically.
-    #[conf(repeat, long, env, serde(use_value_parser))]
-    video_codecs: Vec<CodecValue>,
-    /// Audio codecs publishers may send. Containers are detected automatically.
-    #[conf(repeat, long, env, serde(use_value_parser))]
-    audio_codecs: Vec<CodecValue>,
-    /// Subtitle codecs publishers may send.
-    #[conf(repeat, long, env, serde(use_value_parser))]
-    subtitle_codecs: Vec<CodecValue>,
-    /// Maximum number of simultaneous tracks of each media kind.
-    #[conf(parameter, long, env, default_value = "8")]
-    maximum_video_tracks: usize,
-    /// Maximum simultaneous audio tracks, including alternate languages.
-    #[conf(parameter, long, env, default_value = "8")]
-    maximum_audio_tracks: usize,
-    /// Maximum simultaneous subtitle tracks, including alternate languages.
-    #[conf(parameter, long, env, default_value = "8")]
-    maximum_subtitle_tracks: usize,
-    /// Largest accepted video dimensions, written as `WIDTHxHEIGHT`.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "7680x4320",
-        serde(use_value_parser)
-    )]
-    maximum_video_resolution: ResolutionValue,
-    /// Largest frame rate, written as an integer or exact fraction.
-    #[conf(parameter, long, env, default_value = "240", serde(use_value_parser))]
-    maximum_video_frame_rate: FrameRateValue,
+pub struct StaticAuthAppConfig {
+    /// Statically authorized publishers, keyed by their stable principal name.
+    #[conf(parameter, value_parser = StaticPublishers::from_str)]
+    publishers: Option<StaticPublishers>,
 }
 
-impl MediaPolicyAppConfig {
-    fn resolve(self) -> Result<StreamPolicy, ConfigError> {
+impl StaticAuthAppConfig {
+    fn resolve(
+        self,
+        mut profiles: PolicyProfiles,
+    ) -> Result<StaticStreamAuthenticator, ConfigError> {
+        profiles.0.entry("default".into()).or_default();
+        let policies = profiles.resolve()?;
+        let configured_publishers = self.publishers.unwrap_or_default().0;
+        if configured_publishers.is_empty() {
+            return Err(invalid(
+                "auth provider `static` requires at least one publisher",
+            ));
+        }
+
+        let mut credentials: Vec<Vec<u8>> = Vec::with_capacity(configured_publishers.len());
+        let mut publishers = Vec::with_capacity(configured_publishers.len());
+        for (name, configured) in configured_publishers {
+            if name.is_empty() {
+                return Err(invalid("static publisher name must not be empty"));
+            }
+            if configured.stream.is_empty() {
+                return Err(invalid(format!(
+                    "static publisher `{name}` has an empty stream"
+                )));
+            }
+
+            let credential = configured.resolve_key(&name)?;
+            if credential.is_empty() {
+                return Err(invalid(format!(
+                    "static publisher `{name}` has an empty key"
+                )));
+            }
+            if credentials.iter().any(|existing| existing == &credential) {
+                return Err(invalid(
+                    "the same static publishing key is configured more than once",
+                ));
+            }
+            credentials.push(credential.clone());
+
+            let policy_name = configured.policy.as_deref().unwrap_or("default");
+            let policy = policies.get(policy_name).ok_or_else(|| {
+                invalid(format!(
+                    "static publisher `{name}` selects unknown policy `{policy_name}`"
+                ))
+            })?;
+            publishers.push(StaticPublisher::new(
+                credential,
+                PublishGrant {
+                    stream_id: StreamId::new(configured.stream),
+                    principal: Principal(name),
+                    policy: policy.clone(),
+                },
+            ));
+        }
+        Ok(StaticStreamAuthenticator::new(publishers))
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(transparent)]
+struct StaticPublishers(BTreeMap<String, StaticPublisherAppConfig>);
+
+impl FromStr for StaticPublishers {
+    type Err = toml::de::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        toml::from_str(value)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticPublisherAppConfig {
+    /// Authoritative stream populated by this publisher.
+    stream: String,
+    /// Inline publishing key. Prefer `key_file` in managed deployments.
+    key: Option<String>,
+    /// File containing the publishing key.
+    key_file: Option<PathBuf>,
+    /// Named policy profile; omitted selects `default`.
+    policy: Option<String>,
+}
+
+impl StaticPublisherAppConfig {
+    fn resolve_key(&self, name: &str) -> Result<Vec<u8>, ConfigError> {
+        match (&self.key, &self.key_file) {
+            (Some(_), Some(_)) => Err(invalid(format!(
+                "static publisher `{name}` must configure only one of `key` and `key_file`"
+            ))),
+            (None, None) => Err(invalid(format!(
+                "static publisher `{name}` must configure one of `key` and `key_file`"
+            ))),
+            (Some(key), None) => Ok(key.as_bytes().to_vec()),
+            (None, Some(path)) => fs::read(path).map_err(|source| ConfigError::SecretRead {
+                secret: format!("static publisher `{name}` key"),
+                path: path.clone(),
+                source,
+            }),
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(transparent)]
+struct PolicyProfiles(BTreeMap<String, PolicyAppConfig>);
+
+impl PolicyProfiles {
+    fn resolve(self) -> Result<BTreeMap<String, StreamPolicy>, ConfigError> {
+        self.0
+            .into_iter()
+            .map(|(name, configured)| {
+                if name.is_empty() {
+                    return Err(invalid("auth policy name must not be empty"));
+                }
+                configured.resolve(&name).map(|policy| (name, policy))
+            })
+            .collect()
+    }
+}
+
+impl FromStr for PolicyProfiles {
+    type Err = toml::de::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        toml::from_str(value)
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyAppConfig {
+    takeovers: Option<TakeoversValue>,
+    video_codecs: Option<Vec<CodecValue>>,
+    audio_codecs: Option<Vec<CodecValue>>,
+    subtitle_codecs: Option<Vec<CodecValue>>,
+    maximum_video_tracks: Option<usize>,
+    maximum_audio_tracks: Option<usize>,
+    maximum_subtitle_tracks: Option<usize>,
+    maximum_video_resolution: Option<String>,
+    maximum_video_frame_rate: Option<String>,
+}
+
+impl PolicyAppConfig {
+    fn resolve(self, name: &str) -> Result<StreamPolicy, ConfigError> {
         let mut policy = StreamPolicy::permissive();
-        policy.accepted_video_codecs = codecs_or_default(
-            "video codecs",
-            self.video_codecs,
-            policy.accepted_video_codecs,
-            &[Codec::H264, Codec::Hevc, Codec::Av1],
-        )?;
-        policy.accepted_audio_codecs = codecs_or_default(
-            "audio codecs",
-            self.audio_codecs,
-            policy.accepted_audio_codecs,
-            &[Codec::Aac, Codec::Opus],
-        )?;
-        policy.accepted_subtitle_codecs = codecs_or_default(
-            "subtitle codecs",
-            self.subtitle_codecs,
-            policy.accepted_subtitle_codecs,
-            &[Codec::WebVtt, Codec::SubRip],
-        )?;
-        policy.maximum_video_tracks = self.maximum_video_tracks;
-        policy.maximum_audio_tracks = self.maximum_audio_tracks;
-        policy.maximum_subtitle_tracks = self.maximum_subtitle_tracks;
-        policy.maximum_video_width = self.maximum_video_resolution.width;
-        policy.maximum_video_height = self.maximum_video_resolution.height;
-        policy.maximum_video_frame_rate = self.maximum_video_frame_rate.0;
+        if let Some(takeovers) = self.takeovers {
+            policy.takeovers = takeovers.into();
+        }
+        if let Some(codecs) = self.video_codecs {
+            policy.accepted_video_codecs = validate_codecs(
+                name,
+                "video codecs",
+                codecs,
+                &[Codec::H264, Codec::Hevc, Codec::Av1],
+            )?;
+        }
+        if let Some(codecs) = self.audio_codecs {
+            policy.accepted_audio_codecs =
+                validate_codecs(name, "audio codecs", codecs, &[Codec::Aac, Codec::Opus])?;
+        }
+        if let Some(codecs) = self.subtitle_codecs {
+            policy.accepted_subtitle_codecs = validate_codecs(
+                name,
+                "subtitle codecs",
+                codecs,
+                &[Codec::WebVtt, Codec::SubRip],
+            )?;
+        }
+        if let Some(maximum) = self.maximum_video_tracks {
+            policy.maximum_video_tracks = maximum;
+        }
+        if let Some(maximum) = self.maximum_audio_tracks {
+            policy.maximum_audio_tracks = maximum;
+        }
+        if let Some(maximum) = self.maximum_subtitle_tracks {
+            policy.maximum_subtitle_tracks = maximum;
+        }
+        if let Some(resolution) = self.maximum_video_resolution {
+            let resolution = resolution
+                .parse::<ResolutionValue>()
+                .map_err(|error| invalid(format!("auth policy `{name}`: {error}")))?;
+            policy.maximum_video_width = resolution.width;
+            policy.maximum_video_height = resolution.height;
+        }
+        if let Some(frame_rate) = self.maximum_video_frame_rate {
+            policy.maximum_video_frame_rate = frame_rate
+                .parse::<FrameRateValue>()
+                .map_err(|error| invalid(format!("auth policy `{name}`: {error}")))?
+                .0;
+        }
         Ok(policy)
     }
 }
@@ -321,6 +449,9 @@ pub struct SrtAppConfig {
     /// Optional passphrase; absent accepts unencrypted SRT.
     #[conf(parameter, env, secret)]
     passphrase: Option<String>,
+    /// File containing the optional SRT passphrase.
+    #[conf(parameter, long, env)]
+    passphrase_file: Option<PathBuf>,
     /// Encryption strength used when a passphrase is configured.
     #[conf(
         parameter,
@@ -337,9 +468,13 @@ impl SrtAppConfig {
         if self.latency.is_zero() {
             return Err(invalid("SRT latency must be nonzero"));
         }
+        let passphrase = resolve_optional_text_secret(
+            "SRT passphrase",
+            self.passphrase.as_ref(),
+            self.passphrase_file.as_ref(),
+        )?;
         node.srt.latency = self.latency;
-        node.srt.encryption = self
-            .passphrase
+        node.srt.encryption = passphrase
             .as_ref()
             .map(|passphrase| {
                 SrtEncryption::new(passphrase.clone(), self.encryption_key_length.into())
@@ -536,6 +671,9 @@ pub struct MetricsAppConfig {
     /// Optional bearer token required to scrape `/metrics`.
     #[conf(parameter, env, secret)]
     token: Option<String>,
+    /// File containing the optional metrics bearer token.
+    #[conf(parameter, long, env)]
+    token_file: Option<PathBuf>,
     /// Include per-stream series. Avoid this with unbounded stream names.
     #[conf(parameter, long, env, default_value = "false")]
     per_stream: bool,
@@ -543,12 +681,17 @@ pub struct MetricsAppConfig {
 
 impl MetricsAppConfig {
     fn resolve(self) -> Result<MetricsConfig, ConfigError> {
-        if self.token.as_ref().is_some_and(String::is_empty) {
+        let token = resolve_optional_text_secret(
+            "metrics token",
+            self.token.as_ref(),
+            self.token_file.as_ref(),
+        )?;
+        if token.as_ref().is_some_and(String::is_empty) {
             return Err(invalid("metrics token must not be empty"));
         }
         Ok(MetricsConfig {
             enabled: self.enabled,
-            token: self.token.map(MetricsToken::new),
+            token: token.map(MetricsToken::new),
             export: ExportPolicy {
                 per_stream: self.per_stream,
             },
@@ -598,6 +741,44 @@ impl fmt::Display for OriginsValue {
         match self {
             Self::Text(value) => output.write_str(value),
             Self::List(values) => output.write_str(&values.join(",")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AuthProviderValue {
+    Static,
+}
+
+impl FromStr for AuthProviderValue {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "static" => Ok(Self::Static),
+            _ => Err("expected `static`".into()),
+        }
+    }
+}
+
+impl fmt::Display for AuthProviderValue {
+    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+        output.write_str("static")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TakeoversValue {
+    Allow,
+    Deny,
+}
+
+impl From<TakeoversValue> for TakeoverPolicy {
+    fn from(value: TakeoversValue) -> Self {
+        match value {
+            TakeoversValue::Allow => Self::Allow,
+            TakeoversValue::Deny => Self::Deny,
         }
     }
 }
@@ -695,14 +876,19 @@ impl From<SrtKeyLengthValue> for SrtKeyLength {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum CodecValue {
     Aac,
     Av1,
+    #[serde(alias = "avc")]
     H264,
+    #[serde(alias = "h265")]
     Hevc,
     Opus,
+    #[serde(alias = "srt")]
     SubRip,
+    #[serde(alias = "vtt")]
     WebVtt,
 }
 
@@ -751,42 +937,33 @@ impl From<CodecValue> for Codec {
     }
 }
 
-fn normalize_legacy_env(mut env: Vec<(OsString, OsString)>) -> Vec<(OsString, OsString)> {
-    for (legacy, canonical) in [
-        ("RUSHLS_PUBLISH_KEY", "PUBLISHING_KEY"),
-        ("RUSHLS_AUTH_PUBLISH_KEY", "PUBLISHING_KEY"),
-        ("RUSHLS_STREAM_ID", "PUBLISHING_STREAM_ID"),
-        ("RUSHLS_AUTH_STREAM_ID", "PUBLISHING_STREAM_ID"),
-        ("RUSHLS_RTMP_LISTEN", "INGEST_RTMP_LISTEN"),
-        ("RUSHLS_SRT_LISTEN", "INGEST_SRT_LISTEN"),
-        ("RUSHLS_SRT_PASSPHRASE", "INGEST_SRT_PASSPHRASE"),
-        ("RUSHLS_TLS_CERT", "HTTP_TLS_CERTIFICATE"),
-        ("RUSHLS_TLS_KEY", "HTTP_TLS_KEY"),
-        ("RUSHLS_PUBLIC_BASE", "HLS_PUBLIC_BASE_URL"),
-        ("RUSHLS_DELIVERY_PUBLIC_BASE", "HLS_PUBLIC_BASE_URL"),
-        ("RUSHLS_CORS_ORIGINS", "HTTP_CORS_ORIGINS"),
-        ("RUSHLS_CORS_CREDENTIALS", "HTTP_CORS_ALLOW_CREDENTIALS"),
-        ("RUSHLS_OBSERVABILITY_METRICS_ENABLED", "METRICS_ENABLED"),
-        ("RUSHLS_OBSERVABILITY_METRICS_TOKEN", "METRICS_TOKEN"),
-        (
-            "RUSHLS_OBSERVABILITY_METRICS_PER_STREAM",
-            "METRICS_PER_STREAM",
-        ),
-    ] {
-        let canonical = format!("RUSHLS_{canonical}");
-        if env_value(&env, &canonical).is_none()
-            && let Some(value) = env_value(&env, legacy).map(OsStr::to_owned)
-        {
-            env.push((canonical.into(), value));
-        }
-    }
-    env
-}
-
 fn env_value<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsStr> {
     env.iter()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.as_os_str())
+}
+
+fn resolve_optional_text_secret(
+    label: &str,
+    inline: Option<&String>,
+    file: Option<&PathBuf>,
+) -> Result<Option<String>, ConfigError> {
+    match (inline, file) {
+        (Some(_), Some(_)) => Err(invalid(format!(
+            "{label} must configure only one of its inline value and `_file`"
+        ))),
+        (Some(value), None) => Ok(Some(value.clone())),
+        (None, Some(path)) => {
+            fs::read_to_string(path)
+                .map(Some)
+                .map_err(|source| ConfigError::SecretRead {
+                    secret: label.to_owned(),
+                    path: path.clone(),
+                    source,
+                })
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn nonzero_bytes(label: &str, value: ByteSize) -> Result<usize, ConfigError> {
@@ -816,19 +993,16 @@ fn origins(values: Vec<String>) -> Result<AllowedOrigins, ConfigError> {
     Ok(AllowedOrigins::Only(patterns))
 }
 
-fn codecs_or_default(
+fn validate_codecs(
+    policy: &str,
     label: &str,
     configured: Vec<CodecValue>,
-    defaults: Vec<Codec>,
     permitted: &[Codec],
 ) -> Result<Vec<Codec>, ConfigError> {
-    if configured.is_empty() {
-        return Ok(defaults);
-    }
     let configured: Vec<Codec> = configured.into_iter().map(Into::into).collect();
     if let Some(codec) = configured.iter().find(|codec| !permitted.contains(codec)) {
         return Err(invalid(format!(
-            "{label} contains {codec:?}, which is not valid for that media kind"
+            "auth policy `{policy}` {label} contains {codec:?}, which is not valid for that media kind"
         )));
     }
     Ok(configured)

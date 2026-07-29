@@ -1,7 +1,6 @@
 use std::{error::Error, sync::Arc};
 
 use rushls::{
-    admission::{FixedStreamAuthenticator, PublishGrant},
     domain::SessionId,
     observe::{EventObserver, Events, NodeEvent, SessionEvent},
     server::{AppConfig, Node},
@@ -44,19 +43,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let resolved = AppConfig::load()
         .and_then(AppConfig::resolve)
         .unwrap_or_else(|error| error.exit());
-    let stream_id = resolved.stream_id.clone();
-    let authenticator = FixedStreamAuthenticator::new(
-        resolved.publish_key,
-        PublishGrant {
-            stream_id: stream_id.clone(),
-            principal: resolved.principal,
-            policy: resolved.stream_policy,
-        },
-    );
-    eprintln!("publishing to {stream_id}");
+    eprintln!("publisher authentication configured");
     let node = Node::new(
         resolved.node,
-        Arc::new(authenticator),
+        resolved.authenticator,
         Events::new(Arc::new(StderrEvents)),
     )?;
     node.serve(shutdown_signal()).await?;

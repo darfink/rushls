@@ -1,7 +1,4 @@
 - Input tracks may in theory have PTS belonging to different epochs
-- Run `StreamStore::maintain` on a timer once the server has a task to own it,
-  and call `Origin::prune` on the same tick so playlist caches do not outlive
-  the streams they describe
 - Delta playlists: `CAN-SKIP-UNTIL` is deliberately never advertised, since
   advertising it commits the origin to rendering `EXT-X-SKIP`. Implement both
   together or neither.
@@ -26,6 +23,7 @@
 - Maybe re-use/ffmpeg refcounter buffers with cmaf muxer?
 - Add h264 profile/level to accepted codecs logic?
 - Test with non-paced source stream?
+- Invert so http exports types for HLS instead of vice versa?
 
 # MUST DOES
 

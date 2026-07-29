@@ -10,24 +10,22 @@
 #   --http-listen 127.0.0.1:8080
 #
 # The publishing key below is only a placeholder. Replace it before starting
-# Rushls with this file.
+# Rushls with this file, or use `key_file` to read it from a secret mount.
 
 [server]
 # Maximum publishers that may be connected and actively publishing at once.
 maximum_concurrent_publishers = 256
 
-[publishing]
-# Shared credential presented by RTMP and SRT publishers. For secrets, prefer
-# this file with restricted permissions or RUSHLS_PUBLISHING_KEY.
-key = "replace-with-a-publishing-key"
-# Public stream name used in HLS URLs. Slashes may be used for organization.
-stream_id = "live/camera"
-# A reconnect or replacement publisher may take over from the current one.
-allow_takeover = true
+[auth]
+provider = "static"
 
-[publishing.media]
-# These are codec admission rules, not container formats. Rushls detects
-# supported containers automatically for each ingest protocol.
+# Every publisher selects a named policy. The `default` policy exists with
+# built-in values even when this section is omitted; it is written out here
+# because this file is the complete configuration reference.
+[auth.policies.default]
+takeovers = "allow"
+# These are codec admission rules, not container formats. Rushls detects the
+# container automatically for each ingest protocol.
 video_codecs = ["h264", "hevc", "av1"]
 audio_codecs = ["aac", "opus"]
 subtitle_codecs = ["webvtt", "subrip"]
@@ -42,6 +40,18 @@ maximum_subtitle_tracks = 8
 maximum_video_resolution = "7680x4320"
 maximum_video_frame_rate = "240"
 
+[auth.static.publishers.configured-publisher]
+# The final table key is the stable identity used for logs, metrics, and future
+# lifecycle hooks.
+# Public stream name used in HLS URLs. Slashes may be used for organization.
+stream = "live/camera"
+# Configure exactly one of `key` and `key_file`. A key file is read exactly,
+# including whitespace, so mounted secrets have unambiguous credentials.
+key = "replace-with-a-publishing-key"
+# key_file = "/run/secrets/rushls-publish-key"
+# Omit this field to select `default`.
+policy = "default"
+
 [ingest.rtmp]
 # Use 127.0.0.1 when a local proxy is the only intended RTMP client.
 listen = "0.0.0.0:1935"
@@ -54,6 +64,7 @@ latency = "120ms"
 
 # Uncomment to require encrypted SRT. Passphrases contain 10 to 79 UTF-8 bytes.
 # passphrase = "replace-with-an-srt-passphrase"
+# passphrase_file = "/run/secrets/rushls-srt-passphrase"
 encryption_key_length = "aes256"
 
 [hls]
@@ -118,7 +129,8 @@ max_age = "10min"
 # Prometheus metrics are served at `/metrics` on the HTTP listener when enabled.
 enabled = false
 # Set a bearer token to authenticate scrapes. For secrets, prefer this file with
-# restricted permissions or RUSHLS_METRICS_TOKEN.
+# restricted permissions, RUSHLS_METRICS_TOKEN, or a mounted secret file.
 # token = "replace-with-a-metrics-token"
+# token_file = "/run/secrets/rushls-metrics-token"
 # Per-stream series use stream names as labels and may create high cardinality.
 per_stream = false
