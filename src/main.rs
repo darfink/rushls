@@ -1,11 +1,11 @@
-use std::{env, error::Error, net::SocketAddr, sync::Arc};
+use std::{env, error::Error, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use rushls::{
     admission::{FixedStreamAuthenticator, Principal, PublishGrant, StreamPolicy},
     delivery::hls::uri::UriBase,
     domain::{SessionId, StreamId},
-    observe::{EventObserver, Events, SessionEvent},
-    server::{Node, NodeConfig},
+    observe::{EventObserver, Events, NodeEvent, SessionEvent},
+    server::{Node, NodeConfig, TlsSettings},
     source::transport::srt::{SrtEncryption, SrtKeyLength},
 };
 
@@ -15,6 +15,9 @@ const RTMP_ADDRESS_ENV: &str = "RUSHLS_RTMP_LISTEN";
 const SRT_ADDRESS_ENV: &str = "RUSHLS_SRT_LISTEN";
 const SRT_PASSPHRASE_ENV: &str = "RUSHLS_SRT_PASSPHRASE";
 const HTTP_ADDRESS_ENV: &str = "RUSHLS_HTTP_LISTEN";
+/// PEM, leaf first. Set together with the key to serve HTTPS directly.
+const TLS_CERTIFICATE_ENV: &str = "RUSHLS_TLS_CERT";
+const TLS_KEY_ENV: &str = "RUSHLS_TLS_KEY";
 /// Where playlists root the names they emit, e.g. `https://cdn.example.com/hls`.
 const PUBLIC_BASE_ENV: &str = "RUSHLS_PUBLIC_BASE";
 
@@ -23,6 +26,27 @@ struct StderrEvents;
 impl EventObserver for StderrEvents {
     fn observe(&self, session: SessionId, event: SessionEvent) {
         eprintln!("session {session:?}: {event:?}");
+    }
+
+    fn observe_node(&self, event: NodeEvent) {
+        match event {
+            NodeEvent::ListenerBound { protocol, address } => {
+                eprintln!("{protocol} listening on {address}");
+            }
+            NodeEvent::CertificateLoaded { certificate } => {
+                eprintln!("serving the certificate at {}", certificate.display());
+            }
+            NodeEvent::CertificateRejected {
+                certificate,
+                reason,
+            } => eprintln!(
+                "keeping the previous certificate; {} was rejected: {reason}",
+                certificate.display()
+            ),
+            NodeEvent::CertificateWatchLost { reason } => {
+                eprintln!("certificate rotations will no longer be noticed: {reason}");
+            }
+        }
     }
 }
 
@@ -41,6 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Ok(passphrase) = env::var(SRT_PASSPHRASE_ENV) {
         config.srt.encryption = Some(SrtEncryption::new(passphrase, SrtKeyLength::Aes256)?);
     }
+    config.http.tls = tls_settings()?;
     // Unset leaves every playlist name relative, which is correct behind any
     // host or path prefix. Set, playlists name their resources absolutely.
     if let Ok(base) = env::var(PUBLIC_BASE_ENV) {
@@ -55,10 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             policy: StreamPolicy::permissive(),
         },
     );
-    eprintln!(
-        "RTMP listening on {}; SRT listening on {}; HLS listening on {}; publishing to {stream_id}",
-        config.rtmp_address, config.srt_address, config.http_address
-    );
+    eprintln!("publishing to {stream_id}");
     let node = Node::new(
         config,
         Arc::new(authenticator),
@@ -66,6 +88,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     node.serve(shutdown_signal()).await?;
     Ok(())
+}
+
+/// Both paths or neither.
+///
+/// Refusing the half-configured case rather than silently falling back to
+/// cleartext: an operator who set one of the two believes the origin is
+/// serving HTTPS, and quietly proving them wrong is worse than not starting.
+fn tls_settings() -> Result<Option<TlsSettings>, Box<dyn Error>> {
+    let certificate = env::var(TLS_CERTIFICATE_ENV).ok();
+    let key = env::var(TLS_KEY_ENV).ok();
+    match (certificate, key) {
+        (Some(certificate), Some(key)) => Ok(Some(TlsSettings {
+            certificate: PathBuf::from(certificate),
+            key: PathBuf::from(key),
+            ..TlsSettings::default()
+        })),
+        (None, None) => Ok(None),
+        (Some(_), None) => {
+            Err(format!("{TLS_CERTIFICATE_ENV} is set without {TLS_KEY_ENV}").into())
+        }
+        (None, Some(_)) => {
+            Err(format!("{TLS_KEY_ENV} is set without {TLS_CERTIFICATE_ENV}").into())
+        }
+    }
 }
 
 fn socket_address(

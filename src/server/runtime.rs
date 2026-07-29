@@ -16,7 +16,7 @@ use crate::{
     },
     media::PassThroughNormalizerFactory,
     mux::{CmafMuxerConfig, PassThroughMuxerFactory},
-    observe::{Events, ProcessMeters},
+    observe::{Events, NodeEvent, ProcessMeters, Protocol},
     session::{Registry, Services, SessionConfig, StopReason, run_session},
     source::transport::{
         rtmp::{RtmpConfig, RtmpPendingPublish},
@@ -25,7 +25,7 @@ use crate::{
 };
 
 use super::{
-    http::{self, HttpConfig},
+    http::{self, HttpConfig, TlsError},
     metrics::{ExportPolicy, MetricsReader},
 };
 
@@ -86,6 +86,11 @@ pub enum RuntimeError {
         address: SocketAddr,
         source: std::io::Error,
     },
+    /// Kept apart from [`Self::BindHttp`] because the remedies have nothing in
+    /// common: one is an address already in use, the other a certificate an
+    /// operator has to go and fix.
+    #[error("could not start TLS: {0}")]
+    Tls(#[from] TlsError),
     #[error("RTMP listener failed: {0}")]
     Rtmp(std::io::Error),
     #[error("SRT listener stopped unexpectedly")]
@@ -197,6 +202,13 @@ impl Node {
                     source,
                 })?;
 
+        let events = self.services.events.clone();
+        // Reported from the bound listeners rather than from configuration,
+        // because with an ephemeral port the configured value is a zero and
+        // the real one exists nowhere else.
+        report_bound(&events, Protocol::Rtmp, rtmp_listener.local_addr());
+        report_bound(&events, Protocol::Srt, Ok(srt_listener.local_address()));
+
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
         tasks.spawn(run_rtmp(
@@ -212,12 +224,39 @@ impl Node {
             self.config.session,
             stop_rx.clone(),
         ));
-        tasks.spawn(run_http(
-            http_listener,
-            Arc::clone(&self.origin),
-            self.config.http,
-            stop_rx.clone(),
-        ));
+        // The listener type differs but the server does not: both arms run the
+        // same router, the same graceful shutdown, and the same task.
+        //
+        // HTTPS is announced only once TLS is actually up. Announcing it
+        // alongside the other listeners would put "HTTPS listening on …" in
+        // the log immediately above the certificate error that stopped the
+        // process from ever serving.
+        match self.config.http.tls.clone() {
+            Some(settings) => {
+                let listener = http::bind_tls(
+                    http_listener,
+                    settings,
+                    self.services.meters.clone(),
+                    events.clone(),
+                )?;
+                report_bound(&events, Protocol::Https, listener.local_addr());
+                tasks.spawn(run_http(
+                    listener,
+                    Arc::clone(&self.origin),
+                    self.config.http.clone(),
+                    stop_rx.clone(),
+                ));
+            }
+            None => {
+                report_bound(&events, Protocol::Http, http_listener.local_addr());
+                tasks.spawn(run_http(
+                    http_listener,
+                    Arc::clone(&self.origin),
+                    self.config.http.clone(),
+                    stop_rx.clone(),
+                ));
+            }
+        }
         tasks.spawn(run_maintenance(
             self.store.clone(),
             Arc::clone(&self.origin),
@@ -354,15 +393,31 @@ async fn run_rtmp(
     Ok(())
 }
 
-async fn run_http(
-    listener: TcpListener,
+async fn run_http<L>(
+    listener: L,
     origin: Arc<Origin>,
     config: HttpConfig,
     stop: watch::Receiver<bool>,
-) -> Result<(), RuntimeError> {
+) -> Result<(), RuntimeError>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+{
     http::serve(listener, origin, config, wait_for_stop(stop))
         .await
         .map_err(RuntimeError::Http)
+}
+
+/// Reports a listener's real address, or the failure to learn it.
+///
+/// A listener that bound but cannot name itself is not worth failing startup
+/// over — it serves perfectly well — but it is worth saying out loud, because
+/// every subsequent log line about that port will be missing.
+fn report_bound(events: &Events, protocol: Protocol, address: std::io::Result<SocketAddr>) {
+    match address {
+        Ok(address) => events.emit(NodeEvent::ListenerBound { protocol, address }),
+        Err(error) => eprintln!("{protocol} listener bound but has no local address: {error}"),
+    }
 }
 
 async fn run_maintenance(

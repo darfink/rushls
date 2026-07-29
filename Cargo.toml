@@ -13,14 +13,20 @@ bytes = "1.12.1"
 ffmpeg-sys-next = { version = "8.1.0", default-features = false, features = ["avformat"] }
 isolang = { version = "2.4.0", default-features = false }
 libc = "0.2"
+notify = "8"
+notify-debouncer-full = "0.7"
 nz = "0.4"
 parking_lot = "0.12"
+# `ring` rather than the default `aws-lc-rs`: the latter wants cmake and nasm,
+# and this build already carries as much C toolchain dependency as it should.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 scuffle-rtmp = "0.2.3"
 socket2 = "0.6"
 subtle = "2"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 urlencoding = "2"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "original-uri", "query", "tokio"] }
 http-body-util = "0.1.4"
@@ -32,6 +38,7 @@ pkg-config = "0.3"
 
 [dev-dependencies]
 base64 = "0.22"
+rcgen = "0.14"
 tokio = { version = "1", features = ["test-util"] }
 
 [patch.crates-io]

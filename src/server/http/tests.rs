@@ -688,3 +688,376 @@ mod end_to_end {
         ))
     }
 }
+
+/// TLS termination, ALPN, and certificate rotation without a restart.
+///
+/// Driven with a real rustls client rather than by inspecting the resolver,
+/// because the claim being tested is about what a peer sees on the wire: which
+/// certificate it is handed, and that a rotation changes the answer for new
+/// connections while the origin keeps serving throughout.
+mod tls {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use parking_lot::Mutex;
+    use rustls::{
+        ClientConfig, DigitallySignedStruct, SignatureScheme,
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
+        pki_types::{CertificateDer, ServerName, UnixTime},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+    use tokio_rustls::TlsConnector;
+
+    use crate::{
+        delivery::hls::{
+            StreamStore,
+            fixtures::{lease, video},
+            serve::{DeliveryConfig, Origin},
+        },
+        observe::{NodeEvent, ProcessMeters},
+        server::http::fixtures::{
+            NodeEventRecorder, scratch, write_atomically, write_pair, write_projected_pair,
+        },
+    };
+
+    use super::super::{HttpConfig, TlsSettings, bind, bind_tls, serve};
+
+    /// Accepts any certificate and remembers what it was handed.
+    ///
+    /// The alternative — trusting the generated certificate as a root — does
+    /// not work for a self-signed leaf, and would in any case answer a
+    /// different question than the one these tests ask.
+    #[derive(Debug)]
+    struct Capturing {
+        presented: Mutex<Vec<Vec<u8>>>,
+        provider: Arc<CryptoProvider>,
+    }
+
+    impl ServerCertVerifier for Capturing {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            self.presented.lock().push(end_entity.to_vec());
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.provider.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.provider
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// A TLS origin, plus the recorder its process events land in.
+    struct TlsHarness {
+        address: std::net::SocketAddr,
+        store: StreamStore,
+        events: Arc<NodeEventRecorder>,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        served: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    }
+
+    impl TlsHarness {
+        async fn start(settings: TlsSettings) -> Self {
+            let store = StreamStore::default();
+            let origin = Arc::new(Origin::new(store.clone(), DeliveryConfig::default()));
+            let tcp = bind("127.0.0.1:0".parse().expect("a valid address"))
+                .await
+                .expect("an ephemeral port is available");
+            let address = tcp.local_addr().expect("the listener is bound");
+            let (recorder, events) = NodeEventRecorder::install();
+            let listener = bind_tls(tcp, settings, ProcessMeters::default(), events)
+                .expect("the certificate loads");
+            let config = HttpConfig::default();
+            let (shutdown, signal) = tokio::sync::oneshot::channel();
+            let served = tokio::spawn(serve(listener, origin, config, async {
+                let _ = signal.await;
+            }));
+            Self {
+                address,
+                store,
+                events: recorder,
+                shutdown: Some(shutdown),
+                served: Some(served),
+            }
+        }
+
+        /// Handshakes once, returning the certificate presented and the
+        /// protocol ALPN settled on.
+        async fn handshake(&self, offer: &[&[u8]]) -> (Vec<u8>, Option<Vec<u8>>) {
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let verifier = Arc::new(Capturing {
+                presented: Mutex::new(Vec::new()),
+                provider: Arc::clone(&provider),
+            });
+            let mut config = ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("the default versions are supported")
+                .dangerous()
+                .with_custom_certificate_verifier(
+                    Arc::clone(&verifier) as Arc<dyn ServerCertVerifier>
+                )
+                .with_no_client_auth();
+            config.alpn_protocols = offer.iter().map(|name| name.to_vec()).collect();
+
+            let stream = TcpStream::connect(self.address)
+                .await
+                .expect("the origin is up");
+            let name = ServerName::try_from("origin.test").expect("a valid name");
+            let stream = TlsConnector::from(Arc::new(config))
+                .connect(name, stream)
+                .await
+                .expect("the handshake completes");
+            let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+            let presented = verifier
+                .presented
+                .lock()
+                .first()
+                .cloned()
+                .expect("the server presented a certificate");
+            (presented, alpn)
+        }
+
+        /// Handshakes until the expected certificate shows up, or gives up.
+        ///
+        /// Polling rather than sleeping a fixed interval: the reload is gated
+        /// on a filesystem notification and a debounce, and pinning the test to
+        /// a guessed duration would make it flaky on a loaded machine without
+        /// making it any stricter.
+        async fn await_certificate(&self, expected: &[u8]) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < deadline {
+                if self.handshake(&[b"http/1.1"]).await.0 == expected {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            false
+        }
+
+        async fn stop(mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(served) = self.served.take() {
+                let _ = served.await;
+            }
+        }
+    }
+
+    /// One HTTPS GET, spoken by hand over the TLS stream.
+    ///
+    /// HTTP/1.1 is offered alone so the reply is the same wire format the
+    /// cleartext tests parse; that ALPN can also settle on h2 is asserted
+    /// separately.
+    async fn https_get(harness: &TlsHarness, target: &str) -> String {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = Arc::new(Capturing {
+            presented: Mutex::new(Vec::new()),
+            provider: Arc::clone(&provider),
+        });
+        let mut config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("the default versions are supported")
+            .dangerous()
+            .with_custom_certificate_verifier(verifier as Arc<dyn ServerCertVerifier>)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        let stream = TcpStream::connect(harness.address)
+            .await
+            .expect("the origin is up");
+        let name = ServerName::try_from("origin.test").expect("a valid name");
+        let mut stream = TlsConnector::from(Arc::new(config))
+            .connect(name, stream)
+            .await
+            .expect("the handshake completes");
+        stream
+            .write_all(
+                format!("GET {target} HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .expect("the request is sent");
+        let mut raw = Vec::new();
+        stream
+            .read_to_end(&mut raw)
+            .await
+            .expect("the response completes");
+        String::from_utf8_lossy(&raw).into_owned()
+    }
+
+    fn loaded_certificates(harness: &TlsHarness) -> usize {
+        harness
+            .events
+            .recorded()
+            .iter()
+            .filter(|event| matches!(event, NodeEvent::CertificateLoaded { .. }))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_playlist_is_served_over_tls_and_alpn_offers_http_2() {
+        let directory = scratch("serves");
+        let (settings, _) = write_pair(&directory, "origin.test");
+        let harness = TlsHarness::start(settings).await;
+        let _lease = lease(&harness.store, vec![video(0)]);
+
+        let response = https_get(&harness, "/live/camera/index.m3u8").await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "expected a playlist, got: {response}"
+        );
+        assert!(response.contains("#EXT-X-STREAM-INF:"));
+
+        // The reason to terminate TLS in-process at all: a browser reaches
+        // HTTP/2 only this way, and the Low-Latency profile expects it.
+        let (_, alpn) = harness.handshake(&[b"h2", b"http/1.1"]).await;
+        assert_eq!(alpn.as_deref(), Some(b"h2".as_slice()));
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_rotated_certificate_is_presented_without_a_restart() {
+        let directory = scratch("rotates");
+        let (settings, first) = write_pair(&directory, "origin.test");
+        let harness = TlsHarness::start(settings.clone()).await;
+
+        assert_eq!(harness.handshake(&[b"http/1.1"]).await.0, first);
+
+        let (_, second) = write_pair(&directory, "origin.test");
+        assert_ne!(first, second, "the rotation produced a new certificate");
+
+        assert!(
+            harness.await_certificate(&second).await,
+            "the rotated certificate was never presented"
+        );
+        // Once at startup and once for the rotation: the event stream alone
+        // answers which certificate this process is serving.
+        assert_eq!(loaded_certificates(&harness), 2);
+
+        harness.stop().await;
+    }
+
+    /// The deployment this feature exists for.
+    ///
+    /// A Kubernetes secret mount rotates by swapping the `..data` symlink, so
+    /// no filesystem event ever names the configured `tls.crt`. Filtering
+    /// events by path — the obvious implementation — silently never reloads
+    /// here while passing every test that writes files directly.
+    #[tokio::test]
+    async fn a_projected_secret_rotates_even_though_no_event_names_the_certificate() {
+        let directory = scratch("projected");
+        let (settings, first) = write_projected_pair(&directory, "origin.test");
+        let harness = TlsHarness::start(settings).await;
+
+        assert_eq!(harness.handshake(&[b"http/1.1"]).await.0, first);
+
+        let (_, second) = write_projected_pair(&directory, "origin.test");
+        assert_ne!(first, second, "the rotation produced a new certificate");
+
+        assert!(
+            harness.await_certificate(&second).await,
+            "a secret-mount rotation was never picked up"
+        );
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_broken_rotation_leaves_the_previous_certificate_serving() {
+        let directory = scratch("broken");
+        let (settings, first) = write_pair(&directory, "origin.test");
+        let harness = TlsHarness::start(settings.clone()).await;
+
+        // A key that belongs to some other certificate: the shape a rotation
+        // takes when only one of the two files has landed.
+        let elsewhere = scratch("broken-source");
+        let (foreign, _) = write_pair(&elsewhere, "other.test");
+        let key = std::fs::read(&foreign.key).expect("the foreign key is readable");
+        write_atomically(&settings.key, &key);
+
+        let rejected = await_rejection(&harness).await;
+        assert!(rejected, "the mismatched pair was never reported");
+        assert_eq!(
+            harness.handshake(&[b"http/1.1"]).await.0,
+            first,
+            "a rejected rotation must not disturb what is being served"
+        );
+        assert_eq!(loaded_certificates(&harness), 1);
+
+        harness.stop().await;
+    }
+
+    async fn await_rejection(harness: &TlsHarness) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if harness
+                .events
+                .recorded()
+                .iter()
+                .any(|event| matches!(event, NodeEvent::CertificateRejected { .. }))
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_missing_certificate_fails_the_bind_rather_than_serving_cleartext() {
+        let directory = scratch("missing");
+        let settings = TlsSettings {
+            certificate: directory.join("absent.pem"),
+            key: directory.join("absent.key"),
+            ..TlsSettings::default()
+        };
+        let tcp = bind("127.0.0.1:0".parse().expect("a valid address"))
+            .await
+            .expect("an ephemeral port is available");
+        let (_, events) = NodeEventRecorder::install();
+
+        assert!(bind_tls(tcp, settings, ProcessMeters::default(), events).is_err());
+    }
+}

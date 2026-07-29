@@ -70,6 +70,8 @@ struct ProcessCounters {
     packets_lost: AtomicU64,
     parts_published: AtomicU64,
     segments_published: AtomicU64,
+    tls_handshakes_completed: AtomicU64,
+    tls_handshakes_failed: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -87,6 +89,11 @@ pub struct ProcessSnapshot {
     pub packets_lost: u64,
     pub parts_published: u64,
     pub segments_published: u64,
+    pub tls_handshakes_completed: u64,
+    /// Includes handshakes that simply timed out, which is what a port scan
+    /// looks like. A counter rather than an event precisely because the rate
+    /// is chosen by whoever is connecting.
+    pub tls_handshakes_failed: u64,
 }
 
 impl ProcessMeters {
@@ -131,6 +138,14 @@ impl ProcessMeters {
         add(&self.counters.drain_failures, 1);
     }
 
+    pub fn tls_handshake_completed(&self) {
+        add(&self.counters.tls_handshakes_completed, 1);
+    }
+
+    pub fn tls_handshake_failed(&self) {
+        add(&self.counters.tls_handshakes_failed, 1);
+    }
+
     pub fn snapshot(&self) -> ProcessSnapshot {
         let counters = &self.counters;
         ProcessSnapshot {
@@ -147,6 +162,8 @@ impl ProcessMeters {
             packets_lost: get(&counters.packets_lost),
             parts_published: get(&counters.parts_published),
             segments_published: get(&counters.segments_published),
+            tls_handshakes_completed: get(&counters.tls_handshakes_completed),
+            tls_handshakes_failed: get(&counters.tls_handshakes_failed),
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use derive_more::{Debug, Display};
 
@@ -78,8 +78,57 @@ pub enum SessionEnd {
     Failed,
 }
 
+/// A rare, structured fact about the process rather than about one session.
+///
+/// The same rule that separates [`SessionEvent`] from
+/// [`SessionMeters`](super::SessionMeters) applies here, and TLS is the clean
+/// illustration of both sides of it: a certificate rotation is a rare
+/// structured fact and belongs here, while a failed handshake happens as often
+/// as a remote peer decides it should and belongs in
+/// [`ProcessMeters`](super::ProcessMeters).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NodeEvent {
+    /// Carries the address that was actually bound, which with an ephemeral
+    /// port is the only place it exists.
+    ListenerBound {
+        protocol: Protocol,
+        address: SocketAddr,
+    },
+    /// A certificate and key became the pair new handshakes are answered with.
+    ///
+    /// Emitted for the initial load as well as every reload, so "which
+    /// certificate is this process serving" is answerable from the event
+    /// stream alone.
+    CertificateLoaded { certificate: PathBuf },
+    /// A rotation was seen but not adopted; the previous pair still serves.
+    CertificateRejected {
+        certificate: PathBuf,
+        reason: String,
+    },
+    /// Rotations will no longer be noticed, while TLS keeps working.
+    ///
+    /// Reported separately because it is otherwise invisible: nothing breaks
+    /// until the loaded certificate expires, by which point the cause is long
+    /// out of the logs.
+    CertificateWatchLost { reason: String },
+}
+
+/// Which listener an event is about.
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
+#[display(rename_all = "UPPERCASE")]
+pub enum Protocol {
+    Rtmp,
+    Srt,
+    Http,
+    Https,
+}
+
 pub trait EventObserver: Send + Sync {
     fn observe(&self, session: SessionId, event: SessionEvent);
+
+    /// Defaulted so an observer that only cares about sessions stays a
+    /// one-method impl.
+    fn observe_node(&self, _event: NodeEvent) {}
 }
 
 /// The process-wide event destination.
@@ -99,6 +148,11 @@ impl Events {
             observer: Arc::clone(&self.0),
             session,
         }
+    }
+
+    /// Reports a fact about the process, which has no session to scope to.
+    pub fn emit(&self, event: NodeEvent) {
+        self.0.observe_node(event);
     }
 }
 
@@ -142,11 +196,16 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         events: Mutex<Vec<(SessionId, SessionEvent)>>,
+        node: Mutex<Vec<NodeEvent>>,
     }
 
     impl EventObserver for Recorder {
         fn observe(&self, session: SessionId, event: SessionEvent) {
             self.events.lock().push((session, event));
+        }
+
+        fn observe_node(&self, event: NodeEvent) {
+            self.node.lock().push(event);
         }
     }
 
@@ -164,8 +223,24 @@ mod tests {
     }
 
     #[test]
+    fn process_events_reach_the_same_destination_without_a_session() {
+        let recorder = Arc::new(Recorder::default());
+        let events = Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>);
+
+        events.emit(NodeEvent::CertificateLoaded {
+            certificate: PathBuf::from("/etc/tls/fullchain.pem"),
+        });
+
+        assert_eq!(recorder.node.lock().len(), 1);
+        assert!(recorder.events.lock().is_empty());
+    }
+
+    #[test]
     fn the_default_destination_discards() {
         let id = SessionId(nz::u64!(1));
         Events::default().scoped(id).emit(SessionEvent::Draining);
+        Events::default().emit(NodeEvent::CertificateWatchLost {
+            reason: "gone".into(),
+        });
     }
 }

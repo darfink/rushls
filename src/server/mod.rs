@@ -7,4 +7,5 @@ pub mod http;
 pub mod metrics;
 mod runtime;
 
+pub use http::{TlsError, TlsSettings};
 pub use runtime::{Node, NodeConfig, RuntimeError};
