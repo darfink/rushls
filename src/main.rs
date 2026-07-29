@@ -16,6 +16,9 @@ impl EventObserver for StderrEvents {
 
     fn observe_node(&self, event: NodeEvent) {
         match event {
+            NodeEvent::ShuttingDown => {
+                eprintln!("shutting down");
+            }
             NodeEvent::ListenerBound { protocol, address } => {
                 eprintln!("{protocol} listening on {address}");
             }

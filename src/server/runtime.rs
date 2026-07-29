@@ -284,11 +284,14 @@ impl Node {
         ));
 
         tokio::pin!(shutdown);
-        let mut first_error = tokio::select! {
-            _ = &mut shutdown => None,
-            joined = tasks.join_next() => joined.and_then(task_error),
+        let (shutdown_requested, mut first_error) = tokio::select! {
+            _ = &mut shutdown => (true, None),
+            joined = tasks.join_next() => (false, joined.and_then(task_error)),
         };
 
+        if shutdown_requested {
+            self.services.events.emit(NodeEvent::ShuttingDown);
+        }
         self.services.sessions.stop_all(StopReason::Cancelled);
         let _ = stop_tx.send(true);
         while let Some(joined) = tasks.join_next().await {
@@ -499,12 +502,17 @@ mod tests {
     use crate::{
         admission::{FixedStreamAuthenticator, Principal, PublishGrant, StreamPolicy},
         domain::StreamId,
+        observe::{EventObserver, Events, NodeEvent, SessionEvent},
         server::metrics::MetricsToken,
     };
 
     use super::*;
 
     fn node(config: NodeConfig) -> Result<Node, RuntimeError> {
+        node_with_events(config, Events::default())
+    }
+
+    fn node_with_events(config: NodeConfig, events: Events) -> Result<Node, RuntimeError> {
         Node::new(
             config,
             Arc::new(FixedStreamAuthenticator::new(
@@ -515,7 +523,7 @@ mod tests {
                     policy: StreamPolicy::permissive(),
                 },
             )),
-            Events::default(),
+            events,
         )
     }
 
@@ -565,15 +573,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_immediate_shutdown_stops_every_runtime_task() {
-        let node = node(NodeConfig {
-            rtmp_address: "127.0.0.1:0".parse().expect("constant is valid"),
-            srt_address: "127.0.0.1:0".parse().expect("constant is valid"),
-            http_address: "127.0.0.1:0".parse().expect("constant is valid"),
-            ..NodeConfig::default()
-        })
-        .expect("configuration is valid");
+    async fn an_immediate_shutdown_stops_every_runtime_task() -> Result<(), RuntimeError> {
+        #[derive(Default)]
+        struct Recorder(parking_lot::Mutex<Vec<NodeEvent>>);
 
-        node.serve(async {}).await.expect("node stops cleanly");
+        impl EventObserver for Recorder {
+            fn observe(&self, _session: crate::domain::SessionId, _event: SessionEvent) {}
+
+            fn observe_node(&self, event: NodeEvent) {
+                self.0.lock().push(event);
+            }
+        }
+
+        let recorder = Arc::new(Recorder::default());
+        let node = node_with_events(
+            NodeConfig {
+                rtmp_address: "127.0.0.1:0".parse().expect("constant is valid"),
+                srt_address: "127.0.0.1:0".parse().expect("constant is valid"),
+                http_address: "127.0.0.1:0".parse().expect("constant is valid"),
+                ..NodeConfig::default()
+            },
+            Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>),
+        )?;
+
+        node.serve(async {}).await?;
+        assert!(matches!(
+            recorder.0.lock().last(),
+            Some(NodeEvent::ShuttingDown)
+        ));
+        Ok(())
     }
 }

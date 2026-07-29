@@ -20,10 +20,12 @@
   grace, and blocking reloads; the AAC AVFormat → HTTP path and ffprobe/Apple
   validation are covered.
 - Support discontinuities when muxing? PaceToRealtime "maximum_timestamp_jump" doesn't make sense?
+- Support closed-captions/SEI
 - Delta playlists
 - Do we want enriched content-types? E.g. codecs, charset etc
 - Maybe re-use/ffmpeg refcounter buffers with cmaf muxer?
 - Add h264 profile/level to accepted codecs logic?
+- Test with non-paced source stream?
 
 # MUST DOES
 

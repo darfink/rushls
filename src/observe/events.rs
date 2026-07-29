@@ -88,6 +88,9 @@ pub enum SessionEnd {
 /// [`ProcessMeters`](super::ProcessMeters).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NodeEvent {
+    /// The process received its shutdown request and is beginning graceful
+    /// termination.
+    ShuttingDown,
     /// Carries the address that was actually bound, which with an ephemeral
     /// port is the only place it exists.
     ListenerBound {
