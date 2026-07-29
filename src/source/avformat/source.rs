@@ -213,7 +213,7 @@ mod tests {
     };
 
     use crate::{
-        domain::MediaParameters,
+        domain::{MediaParameters, TrackId},
         observe::{ProcessMeters, SessionMeters},
     };
 
@@ -374,6 +374,126 @@ mod tests {
         drop(source);
         assert!(!retained_payload.is_empty());
         assert_eq!(retained_trim, packets[0].audio_trim);
+    }
+
+    #[tokio::test]
+    async fn adapts_mpeg_ts_aac_without_consuming_its_first_packet() {
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let mut source = AvformatPacketSource::new(
+            Box::new(ReadInput::closed(Cursor::new(
+                crate::source::avformat::fixtures::h264_adts_aac_mpeg_ts(),
+            ))),
+            AvformatConfig::default(),
+            InputLimits::permissive(),
+            meters.source_view(),
+        )
+        .expect("fixture source opens");
+
+        let discovery = source
+            .discover(discovery_limits())
+            .await
+            .expect("H.264 and ADTS AAC in MPEG-TS are discovered");
+        let tracks = discovery.tracks.tracks();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].codec, crate::domain::Codec::H264);
+        assert_eq!(tracks[1].codec, crate::domain::Codec::Aac);
+        assert!(tracks.iter().all(|track| {
+            track.timebase == crate::domain::Timebase::new(nz::u32!(1), nz::u32!(90_000))
+        }));
+        assert!(
+            tracks.iter().all(|track| !track.codec_extradata.is_empty()),
+            "Annex-B video and filtered AAC both expose decoder configuration"
+        );
+        assert_eq!(tracks[0].rfc6381_codec().as_deref(), Some("avc1.42c01e"));
+        assert_eq!(tracks[1].rfc6381_codec().as_deref(), Some("mp4a.40.2"));
+
+        let (packets, state) = drain(&mut source).await;
+        assert_eq!(state, InputState::Closed);
+        assert_eq!(packets.len(), 8, "one video plus all seven AAC packets");
+        assert_eq!(
+            packets
+                .iter()
+                .map(|packet| packet.track_id)
+                .collect::<Vec<_>>(),
+            [
+                TrackId(1),
+                TrackId(1),
+                TrackId(1),
+                TrackId(1),
+                TrackId(1),
+                TrackId(1),
+                TrackId(1),
+                TrackId(0),
+            ],
+            "discovery prefetch preserves the demuxer's interleaving"
+        );
+        let audio = packets
+            .iter()
+            .filter(|packet| packet.track_id == TrackId(1));
+        assert!(audio.clone().all(|packet| {
+            !matches!(
+                packet.payload.as_bytes(),
+                [0xff, second, ..] if second & 0xf6 == 0xf0
+            )
+        }));
+        assert_eq!(
+            audio.map(|packet| packet.pts).collect::<Vec<_>>(),
+            [Some(126_000), None, None, None, None, None, None,],
+            "MPEG-TS timestamps the PES; the audio normalizer derives each AAC frame's cadence"
+        );
+    }
+
+    #[tokio::test]
+    async fn mpeg_ts_prefetch_remains_inside_the_discovery_budget() {
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let mut source = AvformatPacketSource::new(
+            Box::new(ReadInput::closed(Cursor::new(
+                crate::source::avformat::fixtures::h264_adts_aac_mpeg_ts(),
+            ))),
+            AvformatConfig::default(),
+            InputLimits::permissive(),
+            meters.source_view(),
+        )
+        .expect("fixture source opens");
+
+        let error = source
+            .discover(DiscoveryLimits {
+                maximum_probe_bytes: 188,
+                maximum_wall_time: Duration::from_secs(2),
+            })
+            .await
+            .expect_err("one transport packet cannot finish discovery and AAC prefetch");
+        assert_eq!(
+            error,
+            SourceError::Discovery(DiscoveryProblem::ProbeLimitExceeded)
+        );
+    }
+
+    #[tokio::test]
+    async fn mpeg_ts_without_an_aac_access_unit_reports_missing_configuration() {
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let mut bytes = crate::source::avformat::fixtures::h264_adts_aac_mpeg_ts();
+        // PAT, PMT, and SDT describe the AAC stream, but no PES follows from
+        // which the bitstream filter could derive AudioSpecificConfig.
+        bytes.truncate(3 * 188);
+        let mut source = AvformatPacketSource::new(
+            Box::new(ReadInput::closed(Cursor::new(bytes))),
+            AvformatConfig::default(),
+            InputLimits::permissive(),
+            meters.source_view(),
+        )
+        .expect("fixture source opens");
+
+        let error = source
+            .discover(discovery_limits())
+            .await
+            .expect_err("AAC configuration never arrives");
+        assert_eq!(
+            error,
+            SourceError::Discovery(DiscoveryProblem::Missing {
+                field: "MPEG-TS AAC codec configuration",
+            })
+        );
     }
 
     #[tokio::test]

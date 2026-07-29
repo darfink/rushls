@@ -12,12 +12,10 @@
 //! constraints, and level, and those live only in the codec configuration
 //! record — which is why this takes the bytes rather than the [`Codec`] alone.
 //!
-//! The bytes are expected in their MP4 form: an `AVCDecoderConfigurationRecord`
-//! for H.264, an `AudioSpecificConfig` for AAC. That is what
-//! [`DiscoveredTrack::codec_extradata`](super::DiscoveredTrack::codec_extradata)
-//! carries for MP4-family containers. An input that supplies Annex B start
-//! codes instead fails the version check below and falls back to the generic
-//! string rather than emitting a wrong one.
+//! MP4-family inputs carry H.264 as an `AVCDecoderConfigurationRecord`, while
+//! MPEG-TS exposes the same SPS/PPS configuration in Annex B form. AAC uses an
+//! `AudioSpecificConfig`. The projection recognizes both H.264 representations
+//! without making the domain track claim one container's framing universally.
 
 use std::sync::Arc;
 
@@ -43,22 +41,53 @@ pub fn rfc6381(codec: Codec, config: Option<&[u8]>) -> Option<Arc<str>> {
 
 /// `avc1.PPCCLL` from the profile, constraint flags, and level of an avcC.
 fn h264(config: Option<&[u8]>) -> Arc<str> {
-    let Some(avcc) = config else {
+    let Some(config) = config else {
         return Arc::from("avc1");
     };
 
     // AVCDecoderConfigurationRecord: [configurationVersion=1,
     // AVCProfileIndication, profile_compatibility, AVCLevelIndication, ...].
-    // The version byte is the guard: anything else is not an avcC, and
-    // reading bytes 1..4 out of it would advertise a profile at random.
-    if avcc.len() >= 4 && avcc[0] == 1 {
+    let identity = if config.len() >= 4 && config[0] == 1 {
+        Some([config[1], config[2], config[3]])
+    } else {
+        annex_b_sps_identity(config)
+    };
+    if let Some([profile, constraints, level]) = identity {
         Arc::from(format!(
             "avc1.{:02x}{:02x}{:02x}",
-            avcc[1], avcc[2], avcc[3]
+            profile, constraints, level
         ))
     } else {
         Arc::from("avc1")
     }
+}
+
+/// Finds the first SPS and reads the three bytes shared with avcC.
+///
+/// They immediately follow the SPS NAL header, before fields whose Exp-Golomb
+/// coding or emulation-prevention bytes would require a full H.264 parser.
+fn annex_b_sps_identity(config: &[u8]) -> Option<[u8; 3]> {
+    let mut offset = 0_usize;
+    while offset + 4 <= config.len() {
+        let start_length = if config[offset..].starts_with(&[0, 0, 0, 1]) {
+            4
+        } else if config[offset..].starts_with(&[0, 0, 1]) {
+            3
+        } else {
+            offset += 1;
+            continue;
+        };
+        let nal = offset + start_length;
+        if config.get(nal).is_some_and(|header| header & 0x1f == 7) {
+            return Some([
+                *config.get(nal + 1)?,
+                *config.get(nal + 2)?,
+                *config.get(nal + 3)?,
+            ]);
+        }
+        offset = nal + 1;
+    }
+    None
 }
 
 /// `mp4a.40.N` from the audio object type of an AudioSpecificConfig.
@@ -90,11 +119,21 @@ mod tests {
     }
 
     #[test]
-    fn h264_falls_back_rather_than_advertising_a_guess() {
-        // Annex B start code, not an avcC: the version byte is 0.
-        let annex_b = [0_u8, 0x00, 0x00, 0x01, 0x67];
+    fn h264_refines_from_annex_b_sps_configuration() {
+        let annex_b = [
+            0, 0, 0, 1, 0x67, 0x64, 0x00, 0x28, 0xac, 0xd9, 0x40, 0, 0, 1, 0x68, 0xee,
+        ];
         assert_eq!(
             rfc6381(Codec::H264, Some(&annex_b)).as_deref(),
+            Some("avc1.640028")
+        );
+    }
+
+    #[test]
+    fn h264_falls_back_rather_than_advertising_a_guess() {
+        let truncated_annex_b = [0_u8, 0x00, 0x00, 0x01, 0x67];
+        assert_eq!(
+            rfc6381(Codec::H264, Some(&truncated_annex_b)).as_deref(),
             Some("avc1")
         );
         assert_eq!(

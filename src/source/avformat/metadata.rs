@@ -240,22 +240,8 @@ impl TrackSnapshot {
             return false;
         }
 
-        let mut side_data_size = 0_usize;
-        // SAFETY: `packet` is live for this call and the returned slice is only
-        // inspected before the packet is unreferenced.
-        let side_data = unsafe {
-            ffmpeg::av_packet_get_side_data(
-                packet,
-                ffmpeg::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
-                &mut side_data_size,
-            )
-        };
-        side_data.is_null()
-            || (
-                // SAFETY: FFmpeg returned `side_data_size` readable bytes.
-                unsafe { slice::from_raw_parts(side_data, side_data_size) }
-                    == self.track.codec_extradata.as_bytes()
-            )
+        // SAFETY: `packet` remains live through this comparison.
+        unsafe { packet_configuration_matches(self.track.codec_extradata.as_bytes(), packet) }
     }
 }
 
@@ -428,6 +414,21 @@ fn same_extradata(expected: &[u8], parameters: &ffmpeg::AVCodecParameters) -> bo
     unsafe { slice::from_raw_parts(parameters.extradata, size) == expected }
 }
 
+/// Accepts no packet-level update or an exact restatement of the configuration
+/// frozen at discovery. A different in-band configuration starts a new
+/// publication rather than silently changing an existing rendition.
+unsafe fn packet_configuration_matches(expected: &[u8], packet: *const ffmpeg::AVPacket) -> bool {
+    let mut size = 0_usize;
+    let data = unsafe {
+        ffmpeg::av_packet_get_side_data(
+            packet,
+            ffmpeg::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+            &mut size,
+        )
+    };
+    data.is_null() || unsafe { slice::from_raw_parts(data, size) == expected }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +458,26 @@ mod tests {
             ),
             Some(FrameRate::new(nz::u32!(30_000), nz::u32!(1_001)))
         );
+    }
+
+    #[test]
+    fn in_band_configuration_must_match_discovery() {
+        let packet = crate::ffmpeg::OwnedPacket::new().expect("packet allocation succeeds");
+        let expected = [0x12, 0x10];
+        let replacement = [0x11, 0x90];
+        let side_data = unsafe {
+            ffmpeg::av_packet_new_side_data(
+                packet.as_ptr(),
+                ffmpeg::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+                replacement.len(),
+            )
+        };
+        assert!(!side_data.is_null());
+        unsafe {
+            std::ptr::copy_nonoverlapping(replacement.as_ptr(), side_data, replacement.len());
+        }
+
+        assert!(!unsafe { packet_configuration_matches(&expected, packet.as_ptr()) });
+        assert!(unsafe { packet_configuration_matches(&replacement, packet.as_ptr()) });
     }
 }

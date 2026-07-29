@@ -16,6 +16,7 @@ use crate::{
 };
 
 use super::{
+    bitstream::MpegTsBitstreams,
     control::Control,
     input::{AvformatInput, AvformatInputError},
     metadata::StreamCatalog,
@@ -146,6 +147,7 @@ pub struct FormatInput {
     context: NonNull<ffmpeg::AVFormatContext>,
     _io: Avio,
     control: Arc<Control>,
+    mpegts: Option<MpegTsBitstreams>,
 }
 
 impl FormatInput {
@@ -209,6 +211,7 @@ impl FormatInput {
             context,
             _io: io,
             control,
+            mpegts: None,
         };
 
         // SAFETY: the context is open and exclusively owned by `format`.
@@ -227,6 +230,14 @@ impl FormatInput {
         if format.control.interrupted() {
             return Err(DiscoveryProblem::DeadlineExceeded.into());
         }
+        let mut format = format;
+        // MPEG-TS carries AAC configuration in-band. Adapt and retain only the
+        // packets needed to expose it before freezing the public track catalog.
+        let mut mpegts = unsafe { MpegTsBitstreams::for_input(format.context()) }?;
+        if let Some(bitstreams) = &mut mpegts {
+            unsafe { bitstreams.prime(format.context(), &format.control) }?;
+        }
+        format.mpegts = mpegts;
         format.control.set_deadline(None);
         format.control.finish_probe();
         // SAFETY: stream discovery has completed on this open context.
@@ -239,8 +250,12 @@ impl FormatInput {
     }
 
     pub fn read(&mut self, packet: &mut AvPacket) -> i32 {
-        // SAFETY: both objects are live and uniquely borrowed.
-        unsafe { ffmpeg::av_read_frame(self.context.as_ptr(), packet.as_ptr()) }
+        // SAFETY: both objects are live and uniquely borrowed. Non-MPEG-TS
+        // inputs retain the direct AVFormat path with no adapter allocation.
+        match &mut self.mpegts {
+            Some(bitstreams) => unsafe { bitstreams.read(self.context.as_ptr(), packet.as_ptr()) },
+            None => unsafe { ffmpeg::av_read_frame(self.context.as_ptr(), packet.as_ptr()) },
+        }
     }
 
     pub fn read_error(&self, code: i32) -> ReadError {
@@ -422,5 +437,33 @@ fn discovery_error(code: i32, control: &Control) -> SourceError {
         SourceError::Input(error)
     } else {
         SourceError::Demux(AvError::new(code).to_string().into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{io::Cursor, sync::Arc, time::Duration};
+
+    use super::*;
+    use crate::source::avformat::{ReadInput, fixtures};
+
+    #[test]
+    fn non_mpeg_ts_inputs_keep_the_direct_read_path() {
+        let control = Arc::new(Control::new());
+        let (format, _) = FormatInput::open(
+            Box::new(ReadInput::closed(Cursor::new(fixtures::primed_aac_mkv()))),
+            control,
+            DiscoveryLimits {
+                maximum_probe_bytes: 1024 * 1024,
+                maximum_wall_time: Duration::from_secs(2),
+            },
+            32 * 1024,
+        )
+        .expect("Matroska fixture opens");
+
+        assert!(
+            format.mpegts.is_none(),
+            "non-MPEG-TS inputs allocate neither a filter nor a prefetch FIFO"
+        );
     }
 }

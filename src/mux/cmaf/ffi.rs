@@ -10,7 +10,8 @@ use ffmpeg_sys_next as av;
 use crate::{
     domain::{Codec, DiscoveredTrack, MediaParameters, Payload},
     ffmpeg::{
-        AvError, Dictionary, OwnedPacket, from_av_rational, to_av_rational, write_audio_trim,
+        AvError, Dictionary, OwnedPacket, from_av_rational, replace_extradata, to_av_rational,
+        write_audio_trim,
     },
     media::NormalizedSample,
 };
@@ -245,7 +246,10 @@ impl FormatOutput {
                     return Err("subtitle tracks are not supported by the CMAF muxer".into());
                 }
             }
-            copy_extradata(parameters, &track.codec_extradata)?;
+            require_extradata(&track.codec_extradata)?;
+            // SAFETY: these codec parameters belong exclusively to the
+            // not-yet-open output stream.
+            replace_extradata(parameters, track.codec_extradata.as_bytes())?;
         }
         Ok(())
     }
@@ -371,33 +375,9 @@ fn media_type(track: &DiscoveredTrack) -> av::AVMediaType {
     }
 }
 
-unsafe fn copy_extradata(
-    parameters: *mut av::AVCodecParameters,
-    extradata: &Payload,
-) -> Result<(), Box<str>> {
+fn require_extradata(extradata: &Payload) -> Result<(), Box<str>> {
     if extradata.is_empty() {
         return Err("CMAF pass-through requires codec extradata".into());
-    }
-    let size = i32::try_from(extradata.len())
-        .map_err(|_| Box::<str>::from("codec extradata exceeds FFmpeg range"))?;
-    let allocation = extradata
-        .len()
-        .checked_add(av::AV_INPUT_BUFFER_PADDING_SIZE as usize)
-        .ok_or_else(|| Box::<str>::from("codec extradata size overflowed"))?;
-    // SAFETY: caller supplied live, uniquely owned codec parameters.
-    let data = unsafe { av::av_mallocz(allocation) }.cast::<u8>();
-    let Some(data) = NonNull::new(data) else {
-        return Err("could not allocate codec extradata".into());
-    };
-    // SAFETY: allocation fits the source plus required zero padding.
-    unsafe {
-        ptr::copy_nonoverlapping(
-            extradata.as_bytes().as_ptr(),
-            data.as_ptr(),
-            extradata.len(),
-        );
-        (*parameters).extradata = data.as_ptr();
-        (*parameters).extradata_size = size;
     }
     Ok(())
 }

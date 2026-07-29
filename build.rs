@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/source/transport/srt/native.c");
+    println!("cargo:rerun-if-changed=src/source/avformat/bitstream.c");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
 
     let library = pkg_config::Config::new()
@@ -16,6 +17,22 @@ fn main() {
         shim.include(include);
     }
     shim.compile("rushls_srt_native");
+
+    // ffmpeg-sys-next intentionally binds avcodec.h but not the separate
+    // bitstream-filter header. A tiny C boundary keeps that omitted ABI opaque
+    // rather than reproducing AVBSFContext's layout in Rust.
+    let avcodec = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .probe("libavcodec")
+        .expect("libavcodec must be discoverable through pkg-config");
+    let mut bitstream = cc::Build::new();
+    bitstream
+        .file("src/source/avformat/bitstream.c")
+        .warnings(true);
+    for include in &avcodec.include_paths {
+        bitstream.include(include);
+    }
+    bitstream.compile("rushls_avformat_bitstream");
 
     for path in &library.link_paths {
         println!("cargo:rustc-link-search=native={}", path.display());

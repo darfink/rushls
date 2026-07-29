@@ -634,7 +634,10 @@ mod tests {
             Timebase, TrackId,
             fixtures::{TrackBuilder, catalog},
         },
-        media::{NormalizedSample, VideoSample, validate},
+        media::{
+            NormalizedSample, NormalizerFactory, PassThroughNormalizerFactory, VideoSample,
+            calibrate, validate,
+        },
         mux::{
             InitializationSegment, MuxerStartRequest, PackagedMedia, SegmentBoundaryPolicy,
             fixtures::{
@@ -1843,6 +1846,173 @@ mod tests {
         {}
         assert_eq!(packets.len(), 4);
         assert!(packets[0].random_access);
+    }
+
+    #[tokio::test]
+    async fn mpeg_ts_normalizes_and_packages_as_demuxable_cmaf() {
+        let process = crate::observe::ProcessMeters::default();
+        let session = crate::observe::SessionMeters::new(process);
+        let mut source = AvformatPacketSource::new(
+            Box::new(ReadInput::closed(Cursor::new(
+                crate::source::avformat::fixtures::h264_adts_aac_mpeg_ts(),
+            ))),
+            AvformatConfig::default(),
+            InputLimits::permissive(),
+            session.source_view(),
+        )
+        .expect("MPEG-TS source starts");
+        let discovery = source
+            .discover(DiscoveryLimits {
+                maximum_probe_bytes: 1024 * 1024,
+                maximum_wall_time: Duration::from_secs(2),
+            })
+            .await
+            .expect("MPEG-TS tracks are discoverable");
+        let input = validate(&discovery.tracks, &StreamPolicy::permissive())
+            .expect("fixture tracks are admitted");
+        let timeline = calibrate(&input).expect("fixture timeline calibrates");
+        let mut normalized = PassThroughNormalizerFactory
+            .start(&input, &timeline)
+            .expect("fixture normalization starts");
+
+        let mut packets = Vec::new();
+        while source
+            .fill(&mut packets)
+            .await
+            .expect("MPEG-TS packets demux")
+            .is_open()
+        {}
+        let mut samples = Vec::new();
+        for packet in packets {
+            normalized
+                .normalizer
+                .push(packet, &mut samples)
+                .expect("MPEG-TS packet normalizes");
+        }
+        normalized
+            .normalizer
+            .finish(&mut samples)
+            .expect("held video timing resolves at end of input");
+        assert!(
+            samples
+                .iter()
+                .any(|sample| matches!(sample, NormalizedSample::Video(_)))
+                && samples
+                    .iter()
+                    .any(|sample| matches!(sample, NormalizedSample::Audio(_)))
+        );
+
+        let tracks = normalized
+            .presentation
+            .tracks()
+            .iter()
+            .map(|track| {
+                let mut track_samples = samples
+                    .iter()
+                    .filter(|sample| sample.track_id() == track.id);
+                let first = track_samples
+                    .next()
+                    .expect("each discovered track produced media");
+                let longest = track_samples
+                    .map(NormalizedSample::duration)
+                    .fold(first.duration(), u64::max);
+                let segment_duration = track
+                    .timebase
+                    .duration_to_ticks_ceil(Duration::from_secs(2));
+                TrackSegmentationPlan {
+                    track_id: track.id,
+                    timebase: track.timebase,
+                    presentation_origin_pts: normalized
+                        .timeline
+                        .get(track.id)
+                        .expect("normalized track has a timeline")
+                        .origin_pts,
+                    segmentation_origin_pts: first.pts(),
+                    first_segment_boundary_pts: first
+                        .pts()
+                        .checked_add_unsigned(segment_duration)
+                        .expect("fixture segment boundary fits"),
+                    segment_duration: NonZero::new(segment_duration)
+                        .expect("two seconds is representable"),
+                    part_access_units: nz::u32!(1),
+                    part_duration: NonZero::new(longest).expect("samples have duration"),
+                    boundary_tolerance: 0,
+                }
+            })
+            .collect();
+        let segmentation = SegmentationPlan::new(&normalized.presentation, tracks)
+            .expect("fixture segmentation is valid");
+        let sink = event_sink();
+        let mut mux = PassThroughMuxerFactory::default()
+            .start(MuxerStartRequest {
+                presentation: &normalized.presentation,
+                segmentation: &segmentation,
+                time_anchor: SystemTime::UNIX_EPOCH,
+                events: &sink,
+            })
+            .expect("MPEG-TS presentation packages");
+        let mut media = Vec::new();
+        for sample in samples {
+            mux.muxer
+                .push(sample, &mut media)
+                .expect("normalized sample packages");
+        }
+        mux.muxer
+            .finish(crate::mux::FinishReason::Final, &mut media)
+            .expect("CMAF tails finish");
+
+        let mut outputs = [Vec::new(), Vec::new()];
+        let mut initialized = [false, false];
+        for event in media {
+            match event {
+                PackagedMedia::Initialization(initialization) => {
+                    let index = initialization.rendition_id.0 as usize;
+                    initialized[index] = true;
+                    outputs[index].extend_from_slice(initialization.payload.as_bytes());
+                }
+                PackagedMedia::Chunk(chunk) => {
+                    let index = chunk.rendition_id.0 as usize;
+                    assert!(
+                        initialized[index],
+                        "rendition initialization precedes its media"
+                    );
+                    outputs[index].extend_from_slice(chunk.payload.as_bytes());
+                }
+                PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) => {}
+            }
+        }
+
+        for (bytes, expected) in outputs
+            .into_iter()
+            .zip([crate::domain::Codec::H264, crate::domain::Codec::Aac])
+        {
+            assert!(!bytes.is_empty());
+            let session =
+                crate::observe::SessionMeters::new(crate::observe::ProcessMeters::default());
+            let mut output = AvformatPacketSource::new(
+                Box::new(ReadInput::closed(Cursor::new(bytes))),
+                AvformatConfig::default(),
+                InputLimits::permissive(),
+                session.source_view(),
+            )
+            .expect("CMAF source starts");
+            let discovery = output
+                .discover(DiscoveryLimits {
+                    maximum_probe_bytes: 1024 * 1024,
+                    maximum_wall_time: Duration::from_secs(2),
+                })
+                .await
+                .expect("CMAF output is readable");
+            assert_eq!(discovery.tracks.tracks()[0].codec, expected);
+            let mut round_trip = Vec::new();
+            while output
+                .fill(&mut round_trip)
+                .await
+                .expect("CMAF packets demux")
+                .is_open()
+            {}
+            assert!(!round_trip.is_empty());
+        }
     }
 
     #[test]
