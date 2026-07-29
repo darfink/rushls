@@ -23,6 +23,7 @@
 - Delta playlists
 - Do we want enriched content-types? E.g. codecs, charset etc
 - Maybe re-use/ffmpeg refcounter buffers with cmaf muxer?
+- Add h264 profile/level to accepted codecs logic?
 
 # MUST DOES
 

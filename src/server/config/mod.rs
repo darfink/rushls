@@ -35,7 +35,7 @@ use crate::{
     server::{
         NodeConfig,
         http::{AllowedOrigins, CorsConfig, HttpConfig, TlsSettings},
-        metrics::ExportPolicy,
+        metrics::{ExportPolicy, MetricsConfig, MetricsToken},
     },
     session::{HealthPolicy, SessionConfig, SupervisionPolicy},
     source::{
@@ -164,6 +164,14 @@ impl AppConfig {
         if self.auth.publish_key.is_empty() {
             return Err(invalid("publishing key must not be empty"));
         }
+        if self
+            .observability
+            .metrics_token
+            .as_ref()
+            .is_some_and(|token| token.is_empty())
+        {
+            return Err(invalid("metrics token must not be empty"));
+        }
 
         let stream_policy = self.auth.stream_policy.resolve()?;
         let input = self.session.input.resolve()?;
@@ -189,8 +197,12 @@ impl AppConfig {
                 store,
                 delivery,
                 http,
-                metrics: ExportPolicy {
-                    per_stream: self.observability.metrics_per_stream,
+                metrics: MetricsConfig {
+                    enabled: self.observability.metrics_enabled,
+                    token: self.observability.metrics_token.map(MetricsToken::new),
+                    export: ExportPolicy {
+                        per_stream: self.observability.metrics_per_stream,
+                    },
                 },
             },
             publish_key: self.auth.publish_key,
@@ -1148,6 +1160,12 @@ impl TlsAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct ObservabilityAppConfig {
+    /// Expose Prometheus text metrics at `/metrics` on the HTTP listener.
+    #[conf(parameter, long, env, default_value = "false")]
+    metrics_enabled: bool,
+    /// Optional bearer token required to scrape `/metrics`.
+    #[conf(parameter, long, env)]
+    metrics_token: Option<String>,
     /// Include per-stream series in exported metrics.
     #[conf(parameter, long, env, default_value = "false")]
     metrics_per_stream: bool,

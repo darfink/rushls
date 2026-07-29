@@ -52,6 +52,7 @@ use crate::{
         },
     },
     observe::{Events, ProcessMeters},
+    server::metrics::MetricsEndpoint,
 };
 
 pub use cors::{AllowedOrigins, CorsConfig};
@@ -91,10 +92,20 @@ impl HttpConfig {
 struct Service {
     origin: Arc<Origin>,
     cors: Arc<CorsConfig>,
+    metrics: Option<MetricsEndpoint>,
 }
 
 /// Builds the router that serves one origin.
 pub fn router(origin: Arc<Origin>, config: &HttpConfig) -> Router {
+    router_with_metrics(origin, config, None)
+}
+
+/// Builds the origin router with an optional operator metrics surface.
+pub fn router_with_metrics(
+    origin: Arc<Origin>,
+    config: &HttpConfig,
+    metrics: Option<MetricsEndpoint>,
+) -> Router {
     Router::new()
         // One catch-all rather than a route table: a stream identity may
         // contain slashes, so path structure is resolved by the router module
@@ -104,6 +115,7 @@ pub fn router(origin: Arc<Origin>, config: &HttpConfig) -> Router {
         .with_state(Service {
             origin,
             cors: Arc::new(config.cors.clone()),
+            metrics,
         })
 }
 
@@ -129,6 +141,26 @@ where
     axum::serve(listener, router(origin, &config).into_make_service())
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+/// Serves the origin and, when configured, Prometheus metrics on `/metrics`.
+pub async fn serve_with_metrics<L>(
+    listener: L,
+    origin: Arc<Origin>,
+    config: HttpConfig,
+    metrics: MetricsEndpoint,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+{
+    axum::serve(
+        listener,
+        router_with_metrics(origin, &config, Some(metrics)).into_make_service(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 /// The address a bound listener is actually on.
@@ -157,6 +189,12 @@ async fn handle(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    if uri.path() == "/metrics"
+        && let Some(metrics) = &service.metrics
+    {
+        return metrics_response(metrics, method, &headers);
+    }
+
     // A preflight is answered by policy alone and never reaches the origin:
     // the browser is asking what it may send, not for any media.
     if method == Method::OPTIONS
@@ -198,6 +236,45 @@ async fn handle(
     };
     cors::apply(&mut response, &service.cors, &headers);
     response
+}
+
+fn metrics_response(metrics: &MetricsEndpoint, method: Method, headers: &HeaderMap) -> Response {
+    if !matches!(method, Method::GET | Method::HEAD) {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, HeaderValue::from_static("GET, HEAD"))],
+        )
+            .into_response();
+    }
+
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(bearer_token);
+    if !metrics.authorize(presented) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))],
+        )
+            .into_response();
+    }
+
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        metrics.render(),
+    )
+        .into_response()
+}
+
+fn bearer_token(value: &str) -> Option<&str> {
+    let (scheme, token) = value.split_once(' ')?;
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
 /// Whether the client is prepared to accept gzip.

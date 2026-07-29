@@ -168,5 +168,10 @@ max_age = "10min"
 # maximum_pending_handshakes = 256
 
 [observability]
+# Prometheus metrics are served at `/metrics` on the HTTP listener when enabled.
+metrics_enabled = false
+# Set a bearer token to authenticate scrapes. When omitted, the enabled
+# endpoint is accessible without authentication.
+# metrics_token = "replace-with-a-metrics-token"
 # Per-stream metrics have unbounded label cardinality and are off by default.
 metrics_per_stream = false

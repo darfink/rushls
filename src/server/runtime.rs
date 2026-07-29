@@ -26,7 +26,7 @@ use crate::{
 
 use super::{
     http::{self, HttpConfig, TlsError},
-    metrics::{ExportPolicy, MetricsReader},
+    metrics::{MetricsConfig, MetricsEndpoint, MetricsReader},
 };
 
 /// Process-level configuration for one self-contained origin.
@@ -44,7 +44,7 @@ pub struct NodeConfig {
     pub store: StoreLimits,
     pub delivery: DeliveryConfig,
     pub http: HttpConfig,
-    pub metrics: ExportPolicy,
+    pub metrics: MetricsConfig,
 }
 
 impl Default for NodeConfig {
@@ -62,7 +62,7 @@ impl Default for NodeConfig {
             store: StoreLimits::default(),
             delivery: DeliveryConfig::default(),
             http: HttpConfig::default(),
-            metrics: ExportPolicy::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -126,6 +126,16 @@ impl Node {
                 "maintenance interval must be nonzero",
             ));
         }
+        if config
+            .metrics
+            .token
+            .as_ref()
+            .is_some_and(|token| token.is_empty())
+        {
+            return Err(RuntimeError::InvalidConfiguration(
+                "metrics token must not be empty",
+            ));
+        }
         // Rejected here rather than at the first cross-origin request, because
         // an unhonourable CORS policy fails inside the browser and leaves the
         // origin looking perfectly healthy.
@@ -153,7 +163,7 @@ impl Node {
             events,
         };
         let origin = Arc::new(Origin::new(store.clone(), config.delivery.clone()));
-        let metrics = MetricsReader::new(meters, sessions, store.clone(), config.metrics);
+        let metrics = MetricsReader::new(meters, sessions, store.clone(), config.metrics.export);
 
         Ok(Self {
             config,
@@ -251,6 +261,7 @@ impl Node {
                     listener,
                     Arc::clone(&self.origin),
                     self.config.http.clone(),
+                    self.metrics_endpoint(),
                     stop_rx.clone(),
                 ));
             }
@@ -260,6 +271,7 @@ impl Node {
                     http_listener,
                     Arc::clone(&self.origin),
                     self.config.http.clone(),
+                    self.metrics_endpoint(),
                     stop_rx.clone(),
                 ));
             }
@@ -289,6 +301,13 @@ impl Node {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    fn metrics_endpoint(&self) -> Option<MetricsEndpoint> {
+        self.config
+            .metrics
+            .enabled
+            .then(|| MetricsEndpoint::new(self.metrics.clone(), self.config.metrics.token.clone()))
     }
 }
 
@@ -404,15 +423,20 @@ async fn run_http<L>(
     listener: L,
     origin: Arc<Origin>,
     config: HttpConfig,
+    metrics: Option<MetricsEndpoint>,
     stop: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError>
 where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
 {
-    http::serve(listener, origin, config, wait_for_stop(stop))
-        .await
-        .map_err(RuntimeError::Http)
+    match metrics {
+        Some(metrics) => {
+            http::serve_with_metrics(listener, origin, config, metrics, wait_for_stop(stop)).await
+        }
+        None => http::serve(listener, origin, config, wait_for_stop(stop)).await,
+    }
+    .map_err(RuntimeError::Http)
 }
 
 /// Reports a listener's real address, or the failure to learn it.
@@ -475,6 +499,7 @@ mod tests {
     use crate::{
         admission::{FixedStreamAuthenticator, Principal, PublishGrant, StreamPolicy},
         domain::StreamId,
+        server::metrics::MetricsToken,
     };
 
     use super::*;
@@ -519,6 +544,20 @@ mod tests {
         assert!(matches!(
             node(NodeConfig {
                 maintenance_interval: Duration::ZERO,
+                ..NodeConfig::default()
+            }),
+            Err(RuntimeError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn an_empty_metrics_token_is_rejected_by_programmatic_configuration() {
+        assert!(matches!(
+            node(NodeConfig {
+                metrics: MetricsConfig {
+                    token: Some(MetricsToken::new("")),
+                    ..MetricsConfig::default()
+                },
                 ..NodeConfig::default()
             }),
             Err(RuntimeError::InvalidConfiguration(_))

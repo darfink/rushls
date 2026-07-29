@@ -1,8 +1,31 @@
+use std::fmt::Write;
+
+use subtle::ConstantTimeEq;
+
 use crate::{
     delivery::hls::StreamStore,
     observe::{ProcessMeters, ProcessSnapshot},
     session::{Registry, SessionSnapshot},
 };
+
+#[derive(Clone, Eq, PartialEq, derive_more::Debug)]
+#[debug("MetricsToken([REDACTED])")]
+pub struct MetricsToken(Vec<u8>);
+
+impl MetricsToken {
+    pub fn new(value: impl Into<Vec<u8>>) -> Self {
+        Self(value.into())
+    }
+
+    /// Whether this token could never be presented as a bearer credential.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn matches(&self, presented: &[u8]) -> bool {
+        self.0.as_slice().ct_eq(presented).into()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ExportPolicy {
@@ -11,6 +34,15 @@ pub struct ExportPolicy {
     /// Off by default: stream identity is unbounded cardinality, which is a
     /// good way to take down a metrics backend.
     pub per_stream: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MetricsConfig {
+    /// Whether the HTTP server exposes `/metrics`.
+    pub enabled: bool,
+    /// When present, scrapes must authenticate with this bearer token.
+    pub token: Option<MetricsToken>,
+    pub export: ExportPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -22,6 +54,31 @@ pub struct MetricsSnapshot {
     /// Streams still fetchable but waiting for a publisher to return.
     pub idle_streams: usize,
     pub streams: Vec<SessionSnapshot>,
+}
+
+/// A configured HTTP exporter backed by the node's live metrics reader.
+#[derive(Clone, Debug)]
+pub struct MetricsEndpoint {
+    reader: MetricsReader,
+    token: Option<MetricsToken>,
+}
+
+impl MetricsEndpoint {
+    pub fn new(reader: MetricsReader, token: Option<MetricsToken>) -> Self {
+        Self { reader, token }
+    }
+
+    /// Checks a parsed bearer token without leaking timing information about
+    /// matching prefixes of the configured secret.
+    pub fn authorize(&self, presented: Option<&str>) -> bool {
+        self.token.as_ref().is_none_or(|expected| {
+            presented.is_some_and(|token| expected.matches(token.as_bytes()))
+        })
+    }
+
+    pub fn render(&self) -> String {
+        render(&self.reader.snapshot())
+    }
 }
 
 /// Reads operational state for export.
@@ -67,6 +124,357 @@ impl MetricsReader {
             },
         }
     }
+}
+
+/// Serializes one atomic snapshot in Prometheus' text exposition format.
+pub fn render(snapshot: &MetricsSnapshot) -> String {
+    let mut output = String::with_capacity(4_096 + snapshot.streams.len() * 2_048);
+    let process = snapshot.process;
+
+    counter(
+        &mut output,
+        "rushls_sessions_started_total",
+        "Publishing sessions started.",
+        process.sessions_started,
+    );
+    counter(
+        &mut output,
+        "rushls_sessions_completed_total",
+        "Publishing sessions completed successfully.",
+        process.sessions_completed,
+    );
+    counter(
+        &mut output,
+        "rushls_sessions_failed_total",
+        "Publishing sessions that failed.",
+        process.sessions_failed,
+    );
+    counter(
+        &mut output,
+        "rushls_sessions_replaced_total",
+        "Publishing sessions displaced by a takeover.",
+        process.sessions_replaced,
+    );
+    counter(
+        &mut output,
+        "rushls_publishers_rejected_total",
+        "Publishers rejected before a session started.",
+        process.publishers_rejected,
+    );
+    counter(
+        &mut output,
+        "rushls_codec_parameter_changes_total",
+        "Mid-stream codec parameter changes detected.",
+        process.codec_parameter_changes,
+    );
+    counter(
+        &mut output,
+        "rushls_unhealthy_terminations_total",
+        "Sessions stopped by health supervision.",
+        process.unhealthy_terminations,
+    );
+    counter(
+        &mut output,
+        "rushls_drain_failures_total",
+        "Sessions that failed while flushing their tail.",
+        process.drain_failures,
+    );
+    counter(
+        &mut output,
+        "rushls_bytes_received_total",
+        "Bytes received from publishers.",
+        process.bytes_received,
+    );
+    counter(
+        &mut output,
+        "rushls_packets_received_total",
+        "Packets received from publishers.",
+        process.packets_received,
+    );
+    counter(
+        &mut output,
+        "rushls_packets_lost_total",
+        "Publisher packets reported lost.",
+        process.packets_lost,
+    );
+    counter(
+        &mut output,
+        "rushls_parts_published_total",
+        "HLS parts made available to viewers.",
+        process.parts_published,
+    );
+    counter(
+        &mut output,
+        "rushls_segments_published_total",
+        "HLS segments made available to viewers.",
+        process.segments_published,
+    );
+    counter(
+        &mut output,
+        "rushls_tls_handshakes_completed_total",
+        "TLS handshakes completed.",
+        process.tls_handshakes_completed,
+    );
+    counter(
+        &mut output,
+        "rushls_tls_handshakes_failed_total",
+        "TLS handshakes that failed or timed out.",
+        process.tls_handshakes_failed,
+    );
+    gauge(
+        &mut output,
+        "rushls_active_sessions",
+        "Publishing sessions currently active.",
+        snapshot.active_sessions,
+    );
+    gauge(
+        &mut output,
+        "rushls_published_streams",
+        "Streams with a publisher currently attached.",
+        snapshot.published_streams,
+    );
+    gauge(
+        &mut output,
+        "rushls_idle_streams",
+        "Retained streams waiting for a publisher to return.",
+        snapshot.idle_streams,
+    );
+
+    if !snapshot.streams.is_empty() {
+        render_sessions(&mut output, &snapshot.streams);
+    }
+    output
+}
+
+fn counter(output: &mut String, name: &str, help: &str, value: u64) {
+    metadata(output, name, help, "counter");
+    writeln!(output, "{name} {value}").expect("writing to a String cannot fail");
+}
+
+fn gauge(output: &mut String, name: &str, help: &str, value: usize) {
+    metadata(output, name, help, "gauge");
+    writeln!(output, "{name} {value}").expect("writing to a String cannot fail");
+}
+
+fn metadata(output: &mut String, name: &str, help: &str, kind: &str) {
+    writeln!(output, "# HELP {name} {help}").expect("writing to a String cannot fail");
+    writeln!(output, "# TYPE {name} {kind}").expect("writing to a String cannot fail");
+}
+
+fn render_sessions(output: &mut String, sessions: &[SessionSnapshot]) {
+    for (name, help, kind) in [
+        (
+            "rushls_session_info",
+            "Identity and current lifecycle phase of an active session.",
+            "gauge",
+        ),
+        (
+            "rushls_session_bytes_received_total",
+            "Bytes received by an active session.",
+            "counter",
+        ),
+        (
+            "rushls_session_packets_received_total",
+            "Packets received by an active session.",
+            "counter",
+        ),
+        (
+            "rushls_session_packets_lost_total",
+            "Packets reported lost by an active session.",
+            "counter",
+        ),
+        (
+            "rushls_session_packets_normalized_total",
+            "Packets normalized by an active session.",
+            "counter",
+        ),
+        (
+            "rushls_session_samples_normalized_total",
+            "Samples emitted by normalization for an active session.",
+            "counter",
+        ),
+        (
+            "rushls_session_chunks_muxed_total",
+            "Media chunks muxed by an active session.",
+            "counter",
+        ),
+        (
+            "rushls_session_segments_muxed_total",
+            "Segments muxed by an active session.",
+            "counter",
+        ),
+        (
+            "rushls_session_parts_published_total",
+            "HLS parts published by an active session.",
+            "counter",
+        ),
+        (
+            "rushls_session_segments_published_total",
+            "HLS segments published by an active session.",
+            "counter",
+        ),
+        (
+            "rushls_session_peak_packets_per_batch",
+            "Largest packet batch observed by an active session.",
+            "gauge",
+        ),
+        (
+            "rushls_session_peak_samples_per_batch",
+            "Largest sample batch observed by an active session.",
+            "gauge",
+        ),
+        (
+            "rushls_session_media_lead_seconds",
+            "Current normalized-media lead for an active session.",
+            "gauge",
+        ),
+        (
+            "rushls_session_pacing_delay_seconds_total",
+            "Pacing delay accumulated by an active session.",
+            "counter",
+        ),
+        (
+            "rushls_session_publisher_backpressured",
+            "Whether an active publisher is currently backpressured.",
+            "gauge",
+        ),
+        (
+            "rushls_session_tracks",
+            "Discovered tracks in an active session by media kind.",
+            "gauge",
+        ),
+    ] {
+        metadata(output, name, help, kind);
+    }
+
+    for session in sessions {
+        let labels = session_labels(session);
+        writeln!(
+            output,
+            "rushls_session_info{{{labels},phase=\"{}\"}} 1",
+            session.phase
+        )
+        .expect("writing to a String cannot fail");
+        session_metric(
+            output,
+            "rushls_session_bytes_received_total",
+            &labels,
+            session.meters.bytes_received,
+        );
+        session_metric(
+            output,
+            "rushls_session_packets_received_total",
+            &labels,
+            session.meters.packets_received,
+        );
+        session_metric(
+            output,
+            "rushls_session_packets_lost_total",
+            &labels,
+            session.meters.packets_lost,
+        );
+        session_metric(
+            output,
+            "rushls_session_packets_normalized_total",
+            &labels,
+            session.meters.packets_normalized,
+        );
+        session_metric(
+            output,
+            "rushls_session_samples_normalized_total",
+            &labels,
+            session.meters.samples_normalized,
+        );
+        session_metric(
+            output,
+            "rushls_session_chunks_muxed_total",
+            &labels,
+            session.meters.chunks_muxed,
+        );
+        session_metric(
+            output,
+            "rushls_session_segments_muxed_total",
+            &labels,
+            session.meters.segments_muxed,
+        );
+        session_metric(
+            output,
+            "rushls_session_parts_published_total",
+            &labels,
+            session.meters.parts_published,
+        );
+        session_metric(
+            output,
+            "rushls_session_segments_published_total",
+            &labels,
+            session.meters.segments_published,
+        );
+        session_metric(
+            output,
+            "rushls_session_peak_packets_per_batch",
+            &labels,
+            session.meters.peak_packets_per_batch,
+        );
+        session_metric(
+            output,
+            "rushls_session_peak_samples_per_batch",
+            &labels,
+            session.meters.peak_samples_per_batch,
+        );
+        session_float_metric(
+            output,
+            "rushls_session_media_lead_seconds",
+            &labels,
+            session.meters.media_lead.as_secs_f64(),
+        );
+        session_float_metric(
+            output,
+            "rushls_session_pacing_delay_seconds_total",
+            &labels,
+            session.meters.pacing_delay.as_secs_f64(),
+        );
+        session_metric(
+            output,
+            "rushls_session_publisher_backpressured",
+            &labels,
+            u64::from(session.meters.publisher_backpressured),
+        );
+        for (kind, count) in [
+            ("audio", session.tracks.audio),
+            ("subtitle", session.tracks.subtitle),
+            ("video", session.tracks.video),
+        ] {
+            writeln!(
+                output,
+                "rushls_session_tracks{{{labels},kind=\"{kind}\"}} {count}"
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+}
+
+fn session_labels(session: &SessionSnapshot) -> String {
+    format!(
+        "session=\"{}\",stream=\"{}\",principal=\"{}\"",
+        escape_label(&session.id.to_string()),
+        escape_label(session.stream.as_str()),
+        escape_label(&session.principal.0)
+    )
+}
+
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', r"\\")
+        .replace('\n', r"\n")
+        .replace('"', r#"\""#)
+}
+
+fn session_metric(output: &mut String, name: &str, labels: &str, value: u64) {
+    writeln!(output, "{name}{{{labels}}} {value}").expect("writing to a String cannot fail");
+}
+
+fn session_float_metric(output: &mut String, name: &str, labels: &str, value: f64) {
+    writeln!(output, "{name}{{{labels}}} {value}").expect("writing to a String cannot fail");
 }
 
 #[cfg(test)]
@@ -130,5 +538,44 @@ mod tests {
         assert!(terse.streams.is_empty());
         assert_eq!(terse.process.sessions_started, 1);
         assert_eq!(terse.process.bytes_received, 512);
+    }
+
+    #[test]
+    fn endpoint_authentication_is_optional_and_exact() {
+        let reader = MetricsReader::new(
+            ProcessMeters::default(),
+            Registry::default(),
+            StreamStore::default(),
+            ExportPolicy::default(),
+        );
+        let open = MetricsEndpoint::new(reader.clone(), None);
+        assert!(open.authorize(None));
+
+        let protected = MetricsEndpoint::new(reader, Some(MetricsToken::new("scrape-secret")));
+        assert!(protected.authorize(Some("scrape-secret")));
+        assert!(!protected.authorize(None));
+        assert!(!protected.authorize(Some("scrape")));
+        assert!(!protected.authorize(Some("scrape-secret ")));
+    }
+
+    #[test]
+    fn prometheus_output_contains_typed_process_metrics() {
+        let output = render(&MetricsSnapshot {
+            process: ProcessSnapshot {
+                sessions_started: 3,
+                bytes_received: 1_024,
+                ..ProcessSnapshot::default()
+            },
+            active_sessions: 2,
+            published_streams: 1,
+            idle_streams: 4,
+            streams: Vec::new(),
+        });
+
+        assert!(output.contains("# TYPE rushls_sessions_started_total counter\n"));
+        assert!(output.contains("rushls_sessions_started_total 3\n"));
+        assert!(output.contains("rushls_bytes_received_total 1024\n"));
+        assert!(output.contains("# TYPE rushls_active_sessions gauge\n"));
+        assert!(output.contains("rushls_active_sessions 2\n"));
     }
 }

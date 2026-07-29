@@ -20,8 +20,13 @@ use crate::delivery::hls::{
     },
     serve::{DeliveryConfig, Origin},
 };
+use crate::{
+    observe::ProcessMeters,
+    server::metrics::{ExportPolicy, MetricsEndpoint, MetricsReader, MetricsToken},
+    session::Registry,
+};
 
-use super::{AllowedOrigins, CorsConfig, HttpConfig, bind, serve};
+use super::{AllowedOrigins, CorsConfig, HttpConfig, bind, serve, serve_with_metrics};
 
 /// A raw HTTP/1.1 response, parsed just enough to assert on.
 struct Reply {
@@ -93,12 +98,25 @@ struct Harness {
     served: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 
+enum MetricsMode {
+    Disabled,
+    Enabled(Option<MetricsToken>),
+}
+
 impl Harness {
     async fn start() -> Self {
         Self::start_with(HttpConfig::default()).await
     }
 
     async fn start_with(config: HttpConfig) -> Self {
+        Self::start_config(config, MetricsMode::Disabled).await
+    }
+
+    async fn start_with_metrics(config: HttpConfig, token: Option<MetricsToken>) -> Self {
+        Self::start_config(config, MetricsMode::Enabled(token)).await
+    }
+
+    async fn start_config(config: HttpConfig, metrics: MetricsMode) -> Self {
         let store = StreamStore::default();
         let origin = Arc::new(Origin::new(store.clone(), DeliveryConfig::default()));
         let listener = bind("127.0.0.1:0".parse().expect("a valid address"))
@@ -106,9 +124,31 @@ impl Harness {
             .expect("an ephemeral port is available");
         let address = listener.local_addr().expect("the listener is bound");
         let (shutdown, signal) = tokio::sync::oneshot::channel();
-        let served = tokio::spawn(serve(listener, origin, config, async {
-            let _ = signal.await;
-        }));
+        let served = match metrics {
+            MetricsMode::Enabled(token) => {
+                let metrics = MetricsEndpoint::new(
+                    MetricsReader::new(
+                        ProcessMeters::default(),
+                        Registry::default(),
+                        store.clone(),
+                        ExportPolicy::default(),
+                    ),
+                    token,
+                );
+                tokio::spawn(serve_with_metrics(
+                    listener,
+                    origin,
+                    config,
+                    metrics,
+                    async {
+                        let _ = signal.await;
+                    },
+                ))
+            }
+            MetricsMode::Disabled => tokio::spawn(serve(listener, origin, config, async {
+                let _ = signal.await;
+            })),
+        };
         Self {
             address,
             store,
@@ -125,6 +165,71 @@ impl Harness {
             let _ = served.await;
         }
     }
+}
+
+#[tokio::test]
+async fn enabled_metrics_can_be_exposed_without_authentication() {
+    let harness = Harness::start_with_metrics(HttpConfig::default(), None).await;
+
+    let reply = request(harness.address, "GET", "/metrics", &[]).await;
+
+    assert_eq!(reply.status, 200);
+    assert!(
+        String::from_utf8(reply.body)
+            .expect("metrics are UTF-8")
+            .contains("rushls_active_sessions 0\n")
+    );
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn metrics_are_absent_unless_the_endpoint_is_enabled() {
+    let harness = Harness::start().await;
+
+    let reply = request(harness.address, "GET", "/metrics", &[]).await;
+
+    assert_eq!(reply.status, 404);
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn metrics_require_the_configured_bearer_token() {
+    let harness = Harness::start_with_metrics(
+        HttpConfig::default(),
+        Some(MetricsToken::new("scrape-secret")),
+    )
+    .await;
+
+    let missing = request(harness.address, "GET", "/metrics", &[]).await;
+    assert_eq!(missing.status, 401);
+    assert_eq!(missing.header("www-authenticate"), Some("Bearer"));
+
+    let wrong = request(
+        harness.address,
+        "GET",
+        "/metrics",
+        &[("Authorization", "Bearer wrong")],
+    )
+    .await;
+    assert_eq!(wrong.status, 401);
+
+    let accepted = request(
+        harness.address,
+        "GET",
+        "/metrics",
+        &[("Authorization", "Bearer scrape-secret")],
+    )
+    .await;
+    assert_eq!(accepted.status, 200);
+    assert_eq!(
+        accepted.header("content-type"),
+        Some("text/plain; version=0.0.4; charset=utf-8")
+    );
+    assert_eq!(accepted.header("cache-control"), Some("no-store"));
+    let body = String::from_utf8(accepted.body).expect("metrics are UTF-8");
+    assert!(body.contains("rushls_active_sessions 0\n"));
+
+    harness.stop().await;
 }
 
 #[tokio::test]

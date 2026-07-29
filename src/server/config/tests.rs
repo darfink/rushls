@@ -121,6 +121,40 @@ fn credentialed_wildcard_cors_is_rejected() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn metrics_endpoint_and_authentication_resolve_from_configuration() -> Result<(), Box<dyn Error>> {
+    let config = AppConfig::load_from(
+        os(["rushls"]),
+        env([
+            ("RUSHLS_AUTH_PUBLISH_KEY", "key"),
+            ("RUSHLS_OBSERVABILITY_METRICS_ENABLED", "true"),
+            ("RUSHLS_OBSERVABILITY_METRICS_TOKEN", "scrape-secret"),
+            ("RUSHLS_OBSERVABILITY_METRICS_PER_STREAM", "true"),
+        ]),
+    )?
+    .resolve()?;
+
+    assert!(config.node.metrics.enabled);
+    assert!(config.node.metrics.token.is_some());
+    assert!(config.node.metrics.export.per_stream);
+    Ok(())
+}
+
+#[test]
+fn an_empty_metrics_token_is_rejected() -> Result<(), Box<dyn Error>> {
+    let result = AppConfig::load_from(
+        os(["rushls"]),
+        env([
+            ("RUSHLS_AUTH_PUBLISH_KEY", "key"),
+            ("RUSHLS_OBSERVABILITY_METRICS_TOKEN", ""),
+        ]),
+    )?
+    .resolve();
+
+    assert!(matches!(result, Err(ConfigError::Invalid(_))));
+    Ok(())
+}
+
+#[test]
 fn tls_requires_both_the_certificate_and_key() {
     let result = AppConfig::load_from(
         os(["rushls"]),
