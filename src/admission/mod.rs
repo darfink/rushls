@@ -12,10 +12,18 @@ use std::{
 };
 
 use derive_more::{Debug, Display};
-use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::domain::{BoxFuture, Codec, FrameRate, StreamId};
+
+mod open;
+mod static_stream;
+
+pub use open::OpenStreamAuthenticator;
+pub use static_stream::{StaticPublisher, StaticStreamAuthenticator};
+
+#[cfg(test)]
+mod fixtures;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IngestProtocol {
@@ -27,6 +35,25 @@ pub enum IngestProtocol {
 pub struct PublishResource {
     pub namespace: Option<String>,
     pub name: String,
+}
+
+impl PublishResource {
+    /// Preserves the transport's requested resource as a canonical stream ID.
+    ///
+    /// The namespace may itself contain separators (for example an SRT
+    /// resource such as `organization/live/camera`), so joining happens only
+    /// at this already-normalized resource boundary.
+    pub fn stream_id(&self) -> Option<StreamId> {
+        if self.name.is_empty() {
+            return None;
+        }
+
+        match &self.namespace {
+            Some(namespace) if namespace.is_empty() => None,
+            Some(namespace) => Some(StreamId::new(format!("{namespace}/{}", self.name))),
+            None => Some(StreamId::new(self.name.clone())),
+        }
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
@@ -172,136 +199,4 @@ pub trait Authenticator: Send + Sync {
         &'a self,
         request: &'a PublishRequest,
     ) -> BoxFuture<'a, Result<PublishGrant, AdmissionError>>;
-}
-
-/// One statically configured publisher and the grant its credential selects.
-#[derive(Clone, derive_more::Debug)]
-pub struct StaticPublisher {
-    #[debug(skip)]
-    credential: Vec<u8>,
-    grant: PublishGrant,
-}
-
-impl StaticPublisher {
-    pub fn new(credential: impl Into<Vec<u8>>, grant: PublishGrant) -> Self {
-        Self {
-            credential: credential.into(),
-            grant,
-        }
-    }
-}
-
-/// Maps a configured set of credentials to their streams and policies.
-///
-/// A linear scan keeps credential comparison independent of secret-derived
-/// hashing and is appropriate for the deliberately operator-managed list this
-/// authenticator represents. Larger or dynamic publisher databases belong
-/// behind a different [`Authenticator`] implementation.
-#[derive(Clone, derive_more::Debug)]
-#[debug("StaticStreamAuthenticator {{ publishers: {} }}", publishers.len())]
-pub struct StaticStreamAuthenticator {
-    #[debug(skip)]
-    publishers: Vec<StaticPublisher>,
-}
-
-impl StaticStreamAuthenticator {
-    pub fn new(publishers: Vec<StaticPublisher>) -> Self {
-        Self { publishers }
-    }
-
-    pub fn len(&self) -> usize {
-        self.publishers.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.publishers.is_empty()
-    }
-}
-
-impl Authenticator for StaticStreamAuthenticator {
-    fn authenticate<'a>(
-        &'a self,
-        request: &'a PublishRequest,
-    ) -> BoxFuture<'a, Result<PublishGrant, AdmissionError>> {
-        Box::pin(async move {
-            let mut grant = None;
-            for publisher in &self.publishers {
-                if publisher
-                    .credential
-                    .as_slice()
-                    .ct_eq(request.credential.expose())
-                    .into()
-                {
-                    grant = Some(publisher.grant.clone());
-                }
-            }
-            grant.ok_or(AdmissionError::InvalidCredential)
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn request(credential: &str) -> PublishRequest {
-        PublishRequest {
-            protocol: IngestProtocol::Rtmp,
-            resource: PublishResource {
-                namespace: Some("live".into()),
-                name: "presented-key".into(),
-            },
-            credential: PresentedCredential::new(credential),
-            client: ClientInfo {
-                remote_address: "127.0.0.1:1935".parse().expect("constant is valid"),
-                encoder: None,
-                protocol_version: None,
-            },
-        }
-    }
-
-    fn publisher(credential: &str, stream: &str) -> StaticPublisher {
-        StaticPublisher::new(
-            credential,
-            PublishGrant {
-                stream_id: StreamId::new(stream),
-                principal: Principal(format!("{stream}-publisher")),
-                policy: StreamPolicy::permissive(),
-            },
-        )
-    }
-
-    fn authenticator() -> StaticStreamAuthenticator {
-        StaticStreamAuthenticator::new(vec![
-            publisher("camera-secret", "live/camera"),
-            publisher("stage-secret", "live/stage"),
-        ])
-    }
-
-    #[tokio::test]
-    async fn static_authentication_maps_each_key_to_its_configured_stream() {
-        let grant = authenticator()
-            .authenticate(&request("stage-secret"))
-            .await
-            .expect("credential matches");
-
-        assert_eq!(grant.stream_id, StreamId::new("live/stage"));
-        assert_eq!(grant.principal, Principal("live/stage-publisher".into()));
-    }
-
-    #[tokio::test]
-    async fn static_authentication_rejects_an_unknown_credential() {
-        assert!(matches!(
-            authenticator().authenticate(&request("wrong")).await,
-            Err(AdmissionError::InvalidCredential)
-        ));
-    }
-
-    #[test]
-    fn an_empty_static_authenticator_is_an_explicit_deny_all() {
-        let authenticator = StaticStreamAuthenticator::new(Vec::new());
-
-        assert!(authenticator.is_empty());
-        assert_eq!(authenticator.len(), 0);
-    }
 }

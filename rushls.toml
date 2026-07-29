@@ -9,15 +9,18 @@
 # CLI names use dashes:
 #   --http-listen 127.0.0.1:8080
 #
-# The publishing key below is only a placeholder. Replace it before starting
-# Rushls with this file, or use `key_file` to read it from a secret mount.
+# The static-provider publishing key shown below is only a placeholder. Replace
+# it before enabling that provider, or use `key_file` with a secret mount.
 
 [server]
 # Maximum publishers that may be connected and actively publishing at once.
 maximum_concurrent_publishers = 256
 
 [auth]
-provider = "static"
+# The default `open` provider accepts every publisher without checking a key
+# and exposes the requested app/stream unchanged. Select `static` when the
+# ingest listener is reachable from an untrusted network.
+provider = "open"
 
 # Every publisher selects a named policy. The `default` policy exists with
 # built-in values even when this section is omitted; it is written out here
@@ -40,17 +43,24 @@ maximum_subtitle_tracks = 8
 maximum_video_resolution = "7680x4320"
 maximum_video_frame_rate = "240"
 
-[auth.static.publishers.configured-publisher]
+[auth.open]
+# Every admitted publisher has the `anonymous` principal. Omit this field to
+# select the built-in `default` policy.
+policy = "default"
+
+# Alternative authenticated static-provider configuration. This table and
+# `[auth.open]` are mutually exclusive.
+#
+# [auth.static.publishers.configured-publisher]
 # The final table key is the stable identity used for logs, metrics, and future
 # lifecycle hooks.
-# Public stream name used in HLS URLs. Slashes may be used for organization.
-stream = "live/camera"
+# stream = "live/camera"
 # Configure exactly one of `key` and `key_file`. A key file is read exactly,
 # including whitespace, so mounted secrets have unambiguous credentials.
-key = "replace-with-a-publishing-key"
+# key = "replace-with-a-publishing-key"
 # key_file = "/run/secrets/rushls-publish-key"
 # Omit this field to select `default`.
-policy = "default"
+# policy = "default"
 
 [ingest.rtmp]
 # Use 127.0.0.1 when a local proxy is the only intended RTMP client.

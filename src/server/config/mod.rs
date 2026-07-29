@@ -23,8 +23,8 @@ use thiserror::Error;
 
 use crate::{
     admission::{
-        Authenticator, Principal, PublishGrant, StaticPublisher, StaticStreamAuthenticator,
-        StreamPolicy, TakeoverPolicy,
+        Authenticator, OpenStreamAuthenticator, Principal, PublishGrant, StaticPublisher,
+        StaticStreamAuthenticator, StreamPolicy, TakeoverPolicy,
     },
     delivery::hls::uri::UriBase,
     domain::{Codec, FrameRate, StreamId},
@@ -185,30 +185,64 @@ pub struct ServerAppConfig {
 #[conf(serde)]
 pub struct AuthAppConfig {
     /// Authentication implementation used for publisher admission.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "static",
-        serde(use_value_parser)
-    )]
+    #[conf(parameter, long, env, default_value = "open", serde(use_value_parser))]
     provider: AuthProviderValue,
     /// Named policy profiles selected by configured publishers.
     #[conf(parameter, value_parser = PolicyProfiles::from_str)]
     policies: Option<PolicyProfiles>,
-    #[conf(flatten, prefix, serde(rename = "static"))]
-    static_provider: StaticAuthAppConfig,
+    #[conf(flatten, prefix = "static", serde(rename = "static"))]
+    static_provider: Option<StaticAuthAppConfig>,
+    #[conf(flatten, prefix = "open", serde(rename = "open"))]
+    open: Option<OpenAuthAppConfig>,
 }
 
 impl AuthAppConfig {
     fn resolve(self) -> Result<Arc<dyn Authenticator>, ConfigError> {
+        let mut profiles = self.policies.unwrap_or_default();
+        profiles.0.entry("default".into()).or_default();
+        let policies = profiles.resolve()?;
+
         match self.provider {
-            AuthProviderValue::Static => self
-                .static_provider
-                .resolve(self.policies.unwrap_or_default())
-                .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>),
+            AuthProviderValue::Static => {
+                if self.open.is_some() {
+                    return Err(invalid(
+                        "auth provider `static` cannot be combined with `[auth.open]`",
+                    ));
+                }
+                self.static_provider
+                    .ok_or_else(|| {
+                        invalid("auth provider `static` requires `[auth.static.publishers]`")
+                    })?
+                    .resolve(&policies)
+                    .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
+            }
+            AuthProviderValue::Open => {
+                if self.static_provider.is_some() {
+                    return Err(invalid(
+                        "auth provider `open` cannot be combined with `[auth.static]`",
+                    ));
+                }
+                let policy_name = self
+                    .open
+                    .and_then(|provider| provider.policy)
+                    .unwrap_or_else(|| "default".into());
+                let policy = policies.get(&policy_name).ok_or_else(|| {
+                    invalid(format!(
+                        "open auth provider selects unknown policy `{policy_name}`"
+                    ))
+                })?;
+                Ok(Arc::new(OpenStreamAuthenticator::new(policy.clone())))
+            }
         }
     }
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct OpenAuthAppConfig {
+    /// Named policy applied to every unauthenticated publisher.
+    #[conf(parameter, long, env)]
+    policy: Option<String>,
 }
 
 #[derive(Conf)]
@@ -222,10 +256,8 @@ pub struct StaticAuthAppConfig {
 impl StaticAuthAppConfig {
     fn resolve(
         self,
-        mut profiles: PolicyProfiles,
+        policies: &BTreeMap<String, StreamPolicy>,
     ) -> Result<StaticStreamAuthenticator, ConfigError> {
-        profiles.0.entry("default".into()).or_default();
-        let policies = profiles.resolve()?;
         let configured_publishers = self.publishers.unwrap_or_default().0;
         if configured_publishers.is_empty() {
             return Err(invalid(
@@ -748,6 +780,7 @@ impl fmt::Display for OriginsValue {
 #[derive(Clone, Copy, Debug)]
 enum AuthProviderValue {
     Static,
+    Open,
 }
 
 impl FromStr for AuthProviderValue {
@@ -756,14 +789,18 @@ impl FromStr for AuthProviderValue {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "static" => Ok(Self::Static),
-            _ => Err("expected `static`".into()),
+            "open" => Ok(Self::Open),
+            _ => Err("expected `static` or `open`".into()),
         }
     }
 }
 
 impl fmt::Display for AuthProviderValue {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        output.write_str("static")
+        match self {
+            Self::Static => output.write_str("static"),
+            Self::Open => output.write_str("open"),
+        }
     }
 }
 

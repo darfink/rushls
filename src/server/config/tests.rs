@@ -42,10 +42,24 @@ async fn the_reference_file_resolves_to_the_runtime_defaults() -> Result<(), Box
     assert_eq!(config.node, NodeConfig::default());
     let grant = config
         .authenticator
-        .authenticate(&request("replace-with-a-publishing-key"))
+        .authenticate(&request("ignored"))
         .await?;
-    assert_eq!(grant.stream_id, StreamId::new("live/camera"));
-    assert_eq!(grant.principal, Principal("configured-publisher".into()));
+    assert_eq!(grant.stream_id, StreamId::new("live/presented-key"));
+    assert_eq!(grant.principal, Principal("anonymous".into()));
+    assert_eq!(grant.policy, StreamPolicy::permissive());
+    Ok(())
+}
+
+#[tokio::test]
+async fn open_authentication_is_the_builtin_default() -> Result<(), Box<dyn Error>> {
+    let config = AppConfig::load_from(os(["rushls"]), std::iter::empty())?.resolve()?;
+    let grant = config
+        .authenticator
+        .authenticate(&request("ignored"))
+        .await?;
+
+    assert_eq!(grant.stream_id, StreamId::new("live/presented-key"));
+    assert_eq!(grant.principal, Principal("anonymous".into()));
     assert_eq!(grant.policy, StreamPolicy::permissive());
     Ok(())
 }
@@ -179,6 +193,142 @@ policy = "protected"
     assert_eq!(stage.principal, Principal("stage".into()));
     assert_eq!(stage.policy.takeovers, TakeoverPolicy::Deny);
     assert_eq!(stage.policy.maximum_video_tracks, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn open_authentication_accepts_any_credential_and_preserves_the_resource()
+-> Result<(), Box<dyn Error>> {
+    let file = TempConfig::new(
+        r#"
+[auth]
+provider = "open"
+
+[auth.policies.restricted]
+takeovers = "deny"
+
+[auth.open]
+policy = "restricted"
+"#,
+    )?;
+    let config = AppConfig::load_from(
+        os([
+            "rushls",
+            "--config",
+            file.path.to_str().ok_or("temporary path is not UTF-8")?,
+        ]),
+        std::iter::empty(),
+    )?
+    .resolve()?;
+
+    let grant = config
+        .authenticator
+        .authenticate(&request("any-value"))
+        .await?;
+    assert_eq!(grant.stream_id, StreamId::new("live/presented-key"));
+    assert_eq!(grant.principal, Principal("anonymous".into()));
+    assert_eq!(grant.policy.takeovers, TakeoverPolicy::Deny);
+    Ok(())
+}
+
+#[tokio::test]
+async fn open_authentication_uses_the_builtin_policy_without_a_provider_table()
+-> Result<(), Box<dyn Error>> {
+    let file = TempConfig::new(
+        r#"
+[auth]
+provider = "open"
+"#,
+    )?;
+    let config = AppConfig::load_from(
+        os([
+            "rushls",
+            "--config",
+            file.path.to_str().ok_or("temporary path is not UTF-8")?,
+        ]),
+        std::iter::empty(),
+    )?
+    .resolve()?;
+
+    let grant = config
+        .authenticator
+        .authenticate(&request("ignored"))
+        .await?;
+    assert_eq!(grant.policy, StreamPolicy::permissive());
+    Ok(())
+}
+
+#[test]
+fn configured_but_unselected_auth_providers_are_rejected() -> Result<(), Box<dyn Error>> {
+    for configuration in [
+        r#"
+[auth]
+provider = "static"
+
+[auth.static.publishers.camera]
+stream = "live/camera"
+key = "key"
+
+[auth.open]
+policy = "default"
+"#,
+        r#"
+[auth]
+provider = "static"
+
+[auth.static.publishers.camera]
+stream = "live/camera"
+key = "key"
+
+[auth.open]
+"#,
+        r#"
+[auth]
+provider = "open"
+
+[auth.static.publishers.camera]
+stream = "live/camera"
+key = "key"
+"#,
+    ] {
+        let file = TempConfig::new(configuration)?;
+        let result = AppConfig::load_from(
+            os([
+                "rushls",
+                "--config",
+                file.path.to_str().ok_or("temporary path is not UTF-8")?,
+            ]),
+            std::iter::empty(),
+        )?
+        .resolve();
+
+        assert!(matches!(result, Err(ConfigError::Invalid(_))));
+    }
+    Ok(())
+}
+
+#[test]
+fn an_unknown_open_policy_is_rejected() -> Result<(), Box<dyn Error>> {
+    let file = TempConfig::new(
+        r#"
+[auth]
+provider = "open"
+
+[auth.open]
+policy = "missing"
+"#,
+    )?;
+    let result = AppConfig::load_from(
+        os([
+            "rushls",
+            "--config",
+            file.path.to_str().ok_or("temporary path is not UTF-8")?,
+        ]),
+        std::iter::empty(),
+    )?
+    .resolve();
+
+    assert!(matches!(result, Err(ConfigError::Invalid(_))));
     Ok(())
 }
 
