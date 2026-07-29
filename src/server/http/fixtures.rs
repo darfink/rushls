@@ -102,7 +102,7 @@ pub fn write_projected_pair(directory: &Path, name: &str) -> (TlsSettings, Vec<u
         (&settings.certificate, "..data/tls.crt"),
         (&settings.key, "..data/tls.key"),
     ] {
-        if !std::fs::symlink_metadata(link).is_ok() {
+        if std::fs::symlink_metadata(link).is_err() {
             std::os::unix::fs::symlink(target, link).expect("the stable link is created");
         }
     }

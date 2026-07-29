@@ -22,6 +22,7 @@
 //! does not happen on the accept path.
 
 mod body;
+mod cors;
 mod route;
 mod tls;
 
@@ -30,7 +31,7 @@ pub mod fixtures;
 #[cfg(test)]
 mod tests;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
@@ -53,6 +54,8 @@ use crate::{
     observe::{Events, ProcessMeters},
 };
 
+pub use cors::{AllowedOrigins, CorsConfig};
+
 use body::{RangeOutcome, StoredMediaBody, parse_range};
 use route::route;
 
@@ -64,36 +67,30 @@ pub use tls::{TlsError, TlsListener, TlsSettings};
 /// holding a copy for the blocked-reload round trip is exactly the point.
 const REVALIDATE: &str = "no-cache";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HttpConfig {
-    /// Rejects a connection that opens and then says nothing.
-    pub header_timeout: Duration,
-    /// Allows playback from a page this origin does not serve.
-    pub permissive_cors: bool,
+    /// Who may play this origin from a page it does not serve.
+    pub cors: CorsConfig,
     /// Absent serves cleartext, which is the right answer behind a proxy.
     pub tls: Option<TlsSettings>,
 }
 
-impl Default for HttpConfig {
-    fn default() -> Self {
-        Self {
-            header_timeout: Duration::from_secs(10),
-            permissive_cors: true,
-            tls: None,
-        }
+impl HttpConfig {
+    /// Rejects a configuration that cannot work, before anything binds.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.cors.validate()
     }
 }
 
-/// Per-request state, kept `Copy`-cheap beside the origin handle.
+/// Per-request state: the origin, and the policy answering a request needs.
 ///
-/// Only what answering a request actually needs. `HttpConfig` as a whole is
-/// not it: axum clones the state for every request, and the certificate paths
-/// would be two allocations per response for a value the response path never
-/// reads.
+/// The CORS policy is behind an `Arc` because axum clones this for every
+/// request and an allowlist is a `Vec<String>`; the certificate paths are not
+/// here at all, for the same reason.
 #[derive(Clone)]
 struct Service {
     origin: Arc<Origin>,
-    permissive_cors: bool,
+    cors: Arc<CorsConfig>,
 }
 
 /// Builds the router that serves one origin.
@@ -106,7 +103,7 @@ pub fn router(origin: Arc<Origin>, config: &HttpConfig) -> Router {
         .fallback(any(handle))
         .with_state(Service {
             origin,
-            permissive_cors: config.permissive_cors,
+            cors: Arc::new(config.cors.clone()),
         })
 }
 
@@ -160,35 +157,47 @@ async fn handle(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    // A preflight is answered by policy alone and never reaches the origin:
+    // the browser is asking what it may send, not for any media.
+    if method == Method::OPTIONS
+        && let Some(response) = cors::preflight(&service.cors, &headers)
+    {
+        return response;
+    }
+
     // HEAD is answered exactly like GET and then stripped of its body by the
     // server, so a client probing for size or existence sees the truth.
     if !matches!(method, Method::GET | Method::HEAD) {
-        return (
+        let mut response = (
             StatusCode::METHOD_NOT_ALLOWED,
-            [(header::ALLOW, "GET, HEAD")],
+            [(header::ALLOW, cors::ALLOWED_METHODS)],
         )
             .into_response();
+        cors::apply(&mut response, &service.cors, &headers);
+        return response;
     }
 
     let routed = match route(uri.path(), query.as_deref()) {
         Ok(routed) => routed,
         Err(error) => {
-            return error_response(service.origin.unrouted(error), service.permissive_cors);
+            return error_response(service.origin.unrouted(error), &service.cors, &headers);
         }
     };
     let response = match service.origin.serve(&routed.stream, routed.request).await {
         Ok(response) => response,
-        Err(failure) => return error_response(failure, service.permissive_cors),
+        Err(failure) => return error_response(failure, &service.cors, &headers),
     };
 
     let range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    match into_http(response, range.as_deref()) {
-        Ok(response) => with_common_headers(response, service.permissive_cors),
-        Err(status) => with_common_headers(status.into_response(), service.permissive_cors),
-    }
+    let mut response = match into_http(response, range.as_deref()) {
+        Ok(response) => response,
+        Err(status) => status.into_response(),
+    };
+    cors::apply(&mut response, &service.cors, &headers);
+    response
 }
 
 fn into_http(response: DeliveryResponse, range: Option<&str>) -> Result<Response, StatusCode> {
@@ -285,7 +294,7 @@ impl From<CacheControl> for HeaderValue {
 /// directive naming an impossible position is the client's mistake (400), a
 /// deadline passing without the media arriving is the origin failing to keep up
 /// (503), and an unknown resource is neither.
-fn error_response(failure: DeliveryFailure, permissive_cors: bool) -> Response {
+fn error_response(failure: DeliveryFailure, cors: &CorsConfig, request: &HeaderMap) -> Response {
     let status = match failure.error {
         DeliveryError::UnknownStream
         | DeliveryError::UnknownRendition
@@ -301,23 +310,8 @@ fn error_response(failure: DeliveryFailure, permissive_cors: bool) -> Response {
         // Tells a client to come back rather than to give up on the stream.
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     }
-    with_common_headers(response, permissive_cors)
-}
-
-fn with_common_headers(mut response: Response, permissive_cors: bool) -> Response {
-    if permissive_cors {
-        let headers = response.headers_mut();
-        headers.insert(
-            header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            HeaderValue::from_static("*"),
-        );
-        // Without this a browser player cannot read Content-Length or
-        // Content-Range from a cross-origin response, which is what its buffer
-        // accounting runs on.
-        headers.insert(
-            header::ACCESS_CONTROL_EXPOSE_HEADERS,
-            HeaderValue::from_static("Content-Length, Content-Range, Date"),
-        );
-    }
+    // Errors carry the same policy as successes: a player that cannot read a
+    // 404 cross-origin sees a network failure instead, and retries forever.
+    cors::apply(&mut response, cors, request);
     response
 }

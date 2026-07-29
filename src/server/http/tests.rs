@@ -21,7 +21,7 @@ use crate::delivery::hls::{
     serve::{DeliveryConfig, Origin},
 };
 
-use super::{HttpConfig, bind, serve};
+use super::{AllowedOrigins, CorsConfig, HttpConfig, bind, serve};
 
 /// A raw HTTP/1.1 response, parsed just enough to assert on.
 struct Reply {
@@ -95,6 +95,10 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Self {
+        Self::start_with(HttpConfig::default()).await
+    }
+
+    async fn start_with(config: HttpConfig) -> Self {
         let store = StreamStore::default();
         let origin = Arc::new(Origin::new(store.clone(), DeliveryConfig::default()));
         let listener = bind("127.0.0.1:0".parse().expect("a valid address"))
@@ -102,7 +106,7 @@ impl Harness {
             .expect("an ephemeral port is available");
         let address = listener.local_addr().expect("the listener is bound");
         let (shutdown, signal) = tokio::sync::oneshot::channel();
-        let served = tokio::spawn(serve(listener, origin, HttpConfig::default(), async {
+        let served = tokio::spawn(serve(listener, origin, config, async {
             let _ = signal.await;
         }));
         Self {
@@ -286,7 +290,8 @@ async fn unknown_resources_and_bad_directives_are_told_apart() {
 
     let rejected = request(harness.address, "POST", "/live/camera/index.m3u8", &[]).await;
     assert_eq!(rejected.status, 405);
-    assert_eq!(rejected.header("allow"), Some("GET, HEAD"));
+    // OPTIONS is advertised because the origin genuinely answers preflights.
+    assert_eq!(rejected.header("allow"), Some("GET, HEAD, OPTIONS"));
 
     harness.stop().await;
 }
@@ -687,6 +692,78 @@ mod end_to_end {
             std::process::id()
         ))
     }
+}
+
+#[tokio::test]
+async fn a_preflight_is_answered_without_reaching_the_origin() {
+    let harness = Harness::start().await;
+
+    let reply = request(
+        harness.address,
+        "OPTIONS",
+        "/live/camera/index.m3u8",
+        &[
+            ("Origin", "https://player.example"),
+            ("Access-Control-Request-Method", "GET"),
+            ("Access-Control-Request-Headers", "range"),
+        ],
+    )
+    .await;
+
+    // 204 rather than the 404 this unknown stream would otherwise produce:
+    // the browser asked what it may send, not for any media.
+    assert_eq!(reply.status, 204);
+    assert_eq!(reply.header("access-control-allow-origin"), Some("*"));
+    assert_eq!(
+        reply.header("access-control-allow-methods"),
+        Some("GET, HEAD, OPTIONS")
+    );
+    assert_eq!(reply.header("access-control-allow-headers"), Some("range"));
+    assert!(reply.body.is_empty());
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn an_allowlisted_origin_is_echoed_and_the_response_says_it_varies() {
+    let harness = Harness::start_with(HttpConfig {
+        cors: CorsConfig {
+            allowed_origins: AllowedOrigins::Only(vec!["https://player.example".into()]),
+            ..CorsConfig::default()
+        },
+        ..HttpConfig::default()
+    })
+    .await;
+    let _lease = lease(&harness.store, vec![video(0)]);
+
+    let allowed = request(
+        harness.address,
+        "GET",
+        "/live/camera/index.m3u8",
+        &[("Origin", "https://player.example")],
+    )
+    .await;
+    assert_eq!(allowed.status, 200);
+    assert_eq!(
+        allowed.header("access-control-allow-origin"),
+        Some("https://player.example")
+    );
+    // Without this a CDN would hand this viewer's allowed origin to every
+    // other viewer, and playback would break for all of them.
+    assert_eq!(allowed.header("vary"), Some("Origin"));
+
+    let refused = request(
+        harness.address,
+        "GET",
+        "/live/camera/index.m3u8",
+        &[("Origin", "https://elsewhere.test")],
+    )
+    .await;
+    assert_eq!(refused.status, 200, "the media is not itself restricted");
+    assert_eq!(refused.header("access-control-allow-origin"), None);
+    assert_eq!(refused.header("vary"), Some("Origin"));
+
+    harness.stop().await;
 }
 
 /// TLS termination, ALPN, and certificate rotation without a restart.

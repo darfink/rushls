@@ -126,6 +126,13 @@ impl Node {
                 "maintenance interval must be nonzero",
             ));
         }
+        // Rejected here rather than at the first cross-origin request, because
+        // an unhonourable CORS policy fails inside the browser and leaves the
+        // origin looking perfectly healthy.
+        config
+            .http
+            .validate()
+            .map_err(RuntimeError::InvalidConfiguration)?;
 
         // There is one input policy for a publication. Keeping both transport
         // adapters and the session driver on the same value prevents bytes

@@ -5,7 +5,7 @@ use rushls::{
     delivery::hls::uri::UriBase,
     domain::{SessionId, StreamId},
     observe::{EventObserver, Events, NodeEvent, SessionEvent},
-    server::{Node, NodeConfig, TlsSettings},
+    server::{AllowedOrigins, CorsConfig, Node, NodeConfig, TlsSettings},
     source::transport::srt::{SrtEncryption, SrtKeyLength},
 };
 
@@ -20,6 +20,11 @@ const TLS_CERTIFICATE_ENV: &str = "RUSHLS_TLS_CERT";
 const TLS_KEY_ENV: &str = "RUSHLS_TLS_KEY";
 /// Where playlists root the names they emit, e.g. `https://cdn.example.com/hls`.
 const PUBLIC_BASE_ENV: &str = "RUSHLS_PUBLIC_BASE";
+/// Comma-separated origins, or `*`. Unset allows any, which suits a public
+/// origin; `off` serves no access-control headers at all.
+const CORS_ORIGINS_ENV: &str = "RUSHLS_CORS_ORIGINS";
+/// Lets a player send cookies. Requires an explicit origin allowlist.
+const CORS_CREDENTIALS_ENV: &str = "RUSHLS_CORS_CREDENTIALS";
 
 struct StderrEvents;
 
@@ -66,6 +71,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.srt.encryption = Some(SrtEncryption::new(passphrase, SrtKeyLength::Aes256)?);
     }
     config.http.tls = tls_settings()?;
+    config.http.cors = cors_config()?;
     // Unset leaves every playlist name relative, which is correct behind any
     // host or path prefix. Set, playlists name their resources absolutely.
     if let Ok(base) = env::var(PUBLIC_BASE_ENV) {
@@ -88,6 +94,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     node.serve(shutdown_signal()).await?;
     Ok(())
+}
+
+/// Reads the cross-origin policy, defaulting to the public-origin answer.
+fn cors_config() -> Result<CorsConfig, Box<dyn Error>> {
+    let allowed_origins = match env::var(CORS_ORIGINS_ENV).ok().as_deref() {
+        None | Some("*") => AllowedOrigins::Any,
+        Some("off") => AllowedOrigins::Disabled,
+        Some(list) => {
+            let origins: Vec<String> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|origin| !origin.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if origins.is_empty() {
+                return Err(format!("{CORS_ORIGINS_ENV} names no origins").into());
+            }
+            AllowedOrigins::Only(origins)
+        }
+    };
+    let allow_credentials = match env::var(CORS_CREDENTIALS_ENV).ok().as_deref() {
+        None | Some("0") | Some("false") => false,
+        Some("1") | Some("true") => true,
+        Some(value) => {
+            return Err(format!("{CORS_CREDENTIALS_ENV} is not a boolean: {value}").into());
+        }
+    };
+    let config = CorsConfig {
+        allowed_origins,
+        allow_credentials,
+        ..CorsConfig::default()
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 /// Both paths or neither.

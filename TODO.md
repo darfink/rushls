@@ -26,17 +26,13 @@
 
 # MUST DOES
 
-- Config & CLI params (TLS is done: `RUSHLS_TLS_CERT`/`RUSHLS_TLS_KEY`, with
-  certificates reloaded in place on rotation)
-- `HttpConfig::header_timeout` is declared but never read; either enforce it on
-  the cleartext path or drop it. TLS carries its own `handshake_timeout`.
+- Config & CLI params (TLS and CORS are done: `RUSHLS_TLS_CERT`/`RUSHLS_TLS_KEY`
+  with in-place certificate reload, and `RUSHLS_CORS_ORIGINS`/`RUSHLS_CORS_CREDENTIALS`)
 - Test reconnects/evictions?
 - Automated test on macos w/ mediastreamvalidator?
 - Support dynamic publishers
 - Verify not stalling on publish?
 - Invoke callback once playlist exists?
-
-- CORS
 
 # LATER
 
