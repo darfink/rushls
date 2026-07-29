@@ -104,14 +104,6 @@ working-tree changes. Preserve unrelated existing edits in `TODO.md`.
 - Subtitle initialization is a WebVTT header with `X-TIMESTAMP-MAP`; future HLS
   rendering must expose it with `EXT-X-MAP`.
 
-## Running the node
-
-`RUSHLS_PUBLISH_KEY` is required. `RUSHLS_STREAM_ID` defaults to
-`live/camera`, `RUSHLS_RTMP_LISTEN` to `0.0.0.0:1935`, and
-`RUSHLS_HTTP_LISTEN` to `0.0.0.0:8080`. Publish with the configured key as the
-RTMP publish name; the fixed-stream authenticator maps it to the configured
-stream identity rather than exposing the key in HLS URLs.
-
 ## HLS projection and HTTP serving
 
 Built on top of the above. See `TODO.md` for what remains open.

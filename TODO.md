@@ -27,12 +27,9 @@
 
 # MUST DOES
 
-- Config & CLI params (TLS and CORS are done: `RUSHLS_TLS_CERT`/`RUSHLS_TLS_KEY`
-  with in-place certificate reload, and `RUSHLS_CORS_ORIGINS`/`RUSHLS_CORS_CREDENTIALS`)
 - Test reconnects/evictions?
 - Automated test on macos w/ mediastreamvalidator?
 - Support dynamic publishers
-- Verify not stalling on publish?
 - Invoke callback once playlist exists?
 
 # LATER

@@ -38,6 +38,27 @@ pub use handler::{SessionData, SessionHandler};
 // - https://github.com/FFmpeg/FFmpeg/blob/154c00514d889d27ae84a1001e00f9032fdc1c54/libavformat/rtmpproto.c#L2850
 const DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE: u32 = 2_500_000; // 2.5 MB
 
+fn write_initial_flow_control(
+    output: &mut Vec<u8>,
+    writer: &ChunkWriter,
+) -> Result<(), crate::error::RtmpError> {
+    // Flow-control windows are independent of RTMP chunk size. Advertising the
+    // 4 KiB chunk size here makes FFmpeg send an acknowledgement about every
+    // 2 KiB even though this receiver uses the conventional 2.5 MB window.
+    ProtocolControlMessageWindowAcknowledgementSize {
+        acknowledgement_window_size: DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE,
+    }
+    .write(output, writer)?;
+
+    ProtocolControlMessageSetPeerBandwidth {
+        acknowledgement_window_size: DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE,
+        limit_type: ProtocolControlMessageSetPeerBandwidthLimitType::Dynamic,
+    }
+    .write(output, writer)?;
+
+    Ok(())
+}
+
 /// A RTMP server session that is used to communicate with a client.
 ///
 /// This provides a high-level API to drive a RTMP session.
@@ -416,16 +437,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
         transaction_id: f64,
         connect: NetConnectionCommandConnect<'_>,
     ) -> Result<(), crate::error::RtmpError> {
-        ProtocolControlMessageWindowAcknowledgementSize {
-            acknowledgement_window_size: CHUNK_SIZE as u32,
-        }
-        .write(&mut self.write_buf, &self.chunk_writer)?;
-
-        ProtocolControlMessageSetPeerBandwidth {
-            acknowledgement_window_size: CHUNK_SIZE as u32,
-            limit_type: ProtocolControlMessageSetPeerBandwidthLimitType::Dynamic,
-        }
-        .write(&mut self.write_buf, &self.chunk_writer)?;
+        write_initial_flow_control(&mut self.write_buf, &self.chunk_writer)?;
 
         self.app_name = Some(connect.app.into_owned());
         self.caps_ex = connect.caps_ex;
@@ -535,6 +547,57 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
                 .map_err(ServerSessionError::Timeout)??;
             self.write_buf.clear();
         }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(all(test, coverage_nightly), coverage(off))]
+mod tests {
+    use std::io;
+
+    use bytes::BytesMut;
+
+    use super::*;
+    use crate::messages::MessageType;
+
+    #[test]
+    fn initial_flow_control_uses_the_receive_window_not_the_chunk_size()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut encoded = Vec::new();
+        write_initial_flow_control(&mut encoded, &ChunkWriter::default())?;
+
+        let mut encoded = BytesMut::from(encoded.as_slice());
+        let mut reader = ChunkReader::default();
+        let window = reader
+            .read_chunk(&mut encoded)?
+            .ok_or_else(|| io::Error::other("missing acknowledgement-window message"))?;
+        assert_eq!(
+            window.message_header.msg_type_id,
+            MessageType::WindowAcknowledgementSize
+        );
+        assert_eq!(
+            window.payload.as_ref(),
+            DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE.to_be_bytes()
+        );
+
+        let bandwidth = reader
+            .read_chunk(&mut encoded)?
+            .ok_or_else(|| io::Error::other("missing peer-bandwidth message"))?;
+        assert_eq!(
+            bandwidth.message_header.msg_type_id,
+            MessageType::SetPeerBandwidth
+        );
+        assert_eq!(
+            &bandwidth.payload[..4],
+            &DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE.to_be_bytes()
+        );
+        assert_eq!(
+            bandwidth.payload[4],
+            ProtocolControlMessageSetPeerBandwidthLimitType::Dynamic as u8
+        );
+        assert!(encoded.is_empty());
 
         Ok(())
     }

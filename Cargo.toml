@@ -49,5 +49,6 @@ tokio = { version = "1", features = ["test-util"] }
 
 [patch.crates-io]
 # 0.2.3 does not advance timestamps for new messages using type-3 chunk
-# headers. Keep the patch local until Scuffle publishes the upstream fix.
+# headers and conflates chunk size with the RTMP flow-control window. Keep the
+# patch local until Scuffle publishes the upstream fixes.
 scuffle-rtmp = { path = "vendor/scuffle-rtmp" }
