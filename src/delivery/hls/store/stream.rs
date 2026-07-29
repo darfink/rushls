@@ -20,7 +20,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockWriteGuard};
 use tokio::{sync::watch, time::Instant};
 
 use crate::{
@@ -34,6 +34,21 @@ use super::{
     StoreWriteError, StoredPart, StoredSegment, StreamSnapshot,
     rendition::{EdgeUpdate, RenditionState, notify_edges},
 };
+
+/// Whether a mutation changed what the catalog says about the stream.
+///
+/// Separate from the media revision because the two move at different rates: a
+/// chunk arrives many times per segment and never changes the catalog, and
+/// republishing the whole topology for each one is the cost this distinction
+/// exists to avoid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Catalog {
+    /// Readers keep the snapshot they already hold.
+    Unchanged,
+    /// The snapshot is replaced. Its revisions are bumped by the mutation
+    /// itself, which is the only place that knows which of the two moved.
+    Republished,
+}
 
 /// Live media for one logical stream, shared by publishers and readers.
 #[derive(Debug)]
@@ -204,6 +219,35 @@ impl LiveStream {
         }
     }
 
+    /// Ends a mutation: publishes what changed, then wakes whoever was waiting.
+    ///
+    /// Every mutating path finishes here rather than writing the sequence out
+    /// itself, because the order is load-bearing in two directions and neither
+    /// is visible from a call site. Both revisions have to be published while
+    /// the write lock is still held, or two concurrent mutations can make their
+    /// snapshots visible in the opposite order to the one they were applied in.
+    /// The edge updates have to be announced after it is released, or a woken
+    /// reader blocks on the very state it was woken to read.
+    ///
+    /// It also puts the [`Catalog`] decision in one place. The media revision
+    /// advances unconditionally: it is what invalidates rendered playlists, and
+    /// a mutation that skipped it would be served from the render cache until
+    /// something unrelated moved.
+    fn commit(
+        &self,
+        state: RwLockWriteGuard<'_, StreamState>,
+        catalog: Catalog,
+        edges: impl IntoIterator<Item = EdgeUpdate>,
+    ) {
+        if catalog == Catalog::Republished {
+            self.publish_catalog(&state);
+        }
+        self.advance_media_revision();
+        drop(state);
+
+        notify_edges(edges);
+    }
+
     fn publish_catalog(&self, state: &StreamState) {
         let renditions: Arc<[RenditionCatalogEntry]> = state
             .renditions
@@ -333,11 +377,7 @@ impl LiveStream {
         state.recalculate_retained_bytes();
         state.bump_catalog();
         state.bump_media_catalog();
-        self.publish_catalog(&state);
-        self.advance_media_revision();
-        drop(state);
-
-        notify_edges(edge_updates);
+        self.commit(state, Catalog::Republished, edge_updates);
         (publication, mapping)
     }
 
@@ -361,10 +401,7 @@ impl LiveStream {
             .collect();
         state.bump_catalog();
         state.bump_media_catalog();
-        self.publish_catalog(&state);
-        self.advance_media_revision();
-        drop(state);
-        notify_edges(edge_updates);
+        self.commit(state, Catalog::Republished, edge_updates);
     }
 
     pub fn retire_if_idle_for(&self, duration: Duration) -> bool {
@@ -385,11 +422,7 @@ impl LiveStream {
         // readers already holding its Arc still reach a terminal, internally
         // consistent state rather than waiting on media nobody will publish.
         let edge_updates = state.end(now, self.limits);
-        self.publish_catalog(&state);
-        self.advance_media_revision();
-        drop(state);
-
-        notify_edges(edge_updates);
+        self.commit(state, Catalog::Republished, edge_updates);
         true
     }
 
@@ -461,14 +494,13 @@ impl LiveStream {
         state.recalculate_retained_bytes();
         let advertised_after = state.renditions[index].bitrate.snapshot().advertised();
         let update = state.renditions[index].commit(false);
-        if advertised_before != advertised_after {
+        let catalog = if advertised_before == advertised_after {
+            Catalog::Unchanged
+        } else {
             state.bump_catalog();
-            self.publish_catalog(&state);
-        }
-        self.advance_media_revision();
-        drop(state);
-
-        notify_edges([update]);
+            Catalog::Republished
+        };
+        self.commit(state, catalog, [update]);
         Ok(true)
     }
 
@@ -479,11 +511,7 @@ impl LiveStream {
             return false;
         }
         let edge_updates = state.end(now, self.limits);
-        self.publish_catalog(&state);
-        self.advance_media_revision();
-        drop(state);
-
-        notify_edges(edge_updates);
+        self.commit(state, Catalog::Republished, edge_updates);
         true
     }
 

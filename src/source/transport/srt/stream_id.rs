@@ -140,43 +140,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn free_form_ids_remain_single_key_credentials() {
-        let parsed = parse("secret", 512).expect("free-form IDs are accepted");
+    fn free_form_ids_remain_single_key_credentials() -> Result<(), Box<str>> {
+        let parsed = parse("secret", 512)?;
 
         assert_eq!(parsed.resource.namespace, None);
         assert_eq!(parsed.resource.name, "secret");
         assert_eq!(parsed.credential.expose(), b"secret");
+        Ok(())
     }
 
     #[test]
-    fn compact_ids_are_the_operator_facing_publish_form() {
-        let parsed = parse("publish:live/camera:secret", 512).expect("compact IDs are accepted");
+    fn compact_ids_are_the_operator_facing_publish_form() -> Result<(), Box<str>> {
+        let parsed = parse("publish:live/camera:secret", 512)?;
 
         assert_eq!(parsed.resource.namespace.as_deref(), Some("live"));
         assert_eq!(parsed.resource.name, "camera");
         assert_eq!(parsed.credential.expose(), b"secret");
+        Ok(())
     }
 
     #[test]
-    fn compact_ids_support_single_keys_and_opaque_credentials() {
-        let single_key = parse("publish:camera", 512).expect("credential can be implicit");
+    fn compact_ids_support_single_keys_and_opaque_credentials() -> Result<(), Box<str>> {
+        let single_key = parse("publish:camera", 512)?;
         assert_eq!(single_key.resource.name, "camera");
         assert_eq!(single_key.credential.expose(), b"camera");
 
-        let user_password =
-            parse("publish:camera:user:password", 512).expect("credential remains opaque");
+        let user_password = parse("publish:camera:user:password", 512)?;
         assert_eq!(user_password.resource.name, "camera");
         assert_eq!(user_password.credential.expose(), b"user:password");
+        Ok(())
     }
 
     #[test]
-    fn structured_ids_separate_resource_and_authorization_identity() {
-        let parsed = parse("#!::u=secret,r=live/camera,m=publish,t=stream", 512)
-            .expect("standard fields are accepted");
+    fn structured_ids_separate_resource_and_authorization_identity() -> Result<(), Box<str>> {
+        let parsed = parse("#!::u=secret,r=live/camera,m=publish,t=stream", 512)?;
 
         assert_eq!(parsed.resource.namespace.as_deref(), Some("live"));
         assert_eq!(parsed.resource.name, "camera");
         assert_eq!(parsed.credential.expose(), b"secret");
+        Ok(())
     }
 
     #[test]

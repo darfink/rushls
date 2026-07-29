@@ -93,22 +93,23 @@ mod tests {
     use crate::ffmpeg::OwnedPacket;
 
     #[test]
-    fn skip_sample_side_data_round_trips_leading_and_trailing_trim() {
-        let packet = OwnedPacket::new().expect("packet allocation succeeds");
+    fn skip_sample_side_data_round_trips_leading_and_trailing_trim() -> Result<(), String> {
+        let packet = OwnedPacket::new().ok_or("packet allocation succeeds")?;
         let trim = AudioTrim {
             leading_samples: 1_024,
             trailing_samples: 127,
         };
 
         // SAFETY: the test exclusively owns this live packet.
-        unsafe { write_audio_trim(packet.as_ptr(), trim) }.expect("side data attaches");
+        unsafe { write_audio_trim(packet.as_ptr(), trim) }.map_err(|error| error.to_string())?;
         // SAFETY: the packet remains live for the read.
         assert_eq!(unsafe { read_audio_trim(packet.as_ptr()) }, Ok(Some(trim)));
+        Ok(())
     }
 
     #[test]
-    fn malformed_skip_sample_side_data_is_rejected() {
-        let packet = OwnedPacket::new().expect("packet allocation succeeds");
+    fn malformed_skip_sample_side_data_is_rejected() -> Result<(), String> {
+        let packet = OwnedPacket::new().ok_or("packet allocation succeeds")?;
         // SAFETY: the test exclusively owns this live packet.
         let data = unsafe {
             ffmpeg::av_packet_new_side_data(
@@ -123,5 +124,6 @@ mod tests {
         let error =
             unsafe { read_audio_trim(packet.as_ptr()) }.expect_err("short side data is malformed");
         assert!(error.contains("expected at least 10"));
+        Ok(())
     }
 }

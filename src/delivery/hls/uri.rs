@@ -31,9 +31,10 @@
 //! does not survive the trip.
 //!
 //! Resource names are built from durable store identities rather than media
-//! sequence numbers. An ID names one immutable object for as long as it is
-//! fetchable, which is what makes segment and part responses cacheable forever
-//! and what lets a URL outlive the playlist tag that introduced it.
+//! sequence numbers. An ID names one immutable object for as long as its stream
+//! incarnation lives, which lets a URL outlive the playlist tag that introduced
+//! it. HTTP caching remains bounded because a retired stream can later be
+//! recreated under the same name and issue those identities again.
 
 use std::{
     borrow::Cow,

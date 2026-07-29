@@ -7,16 +7,21 @@ use derive_more::Display;
 
 use crate::domain::FrameRate;
 
-use super::{AttributeList, ManifestWriteResult, validate_quoted, validate_uri};
+use super::{AttributeList, ManifestWriteResult, validate_uri};
 
 pub struct MultivariantPlaylistWriter<'a, W: Write + ?Sized> {
     out: &'a mut W,
+    /// Reused by every attribute list this writer emits.
+    scratch: String,
 }
 
 impl<'a, W: Write + ?Sized> MultivariantPlaylistWriter<'a, W> {
     pub fn new(out: &'a mut W) -> ManifestWriteResult<Self> {
         writeln!(out, "#EXTM3U")?;
-        Ok(Self { out })
+        Ok(Self {
+            out,
+            scratch: String::new(),
+        })
     }
 
     pub fn version(&mut self, version: NonZeroU8) -> ManifestWriteResult<&mut Self> {
@@ -30,93 +35,49 @@ impl<'a, W: Write + ?Sized> MultivariantPlaylistWriter<'a, W> {
     }
 
     pub fn rendition(&mut self, rendition: Rendition<'_>) -> ManifestWriteResult<&mut Self> {
-        validate_quoted(rendition.group_id, "GROUP-ID")?;
-        validate_quoted(rendition.name, "NAME")?;
-        if let Some(language) = rendition.language {
-            validate_quoted(language, "LANGUAGE")?;
-        }
-        if let Some(uri) = rendition.uri {
-            validate_uri(uri, "EXT-X-MEDIA URI")?;
-        }
-
-        self.out.write_str("#EXT-X-MEDIA:")?;
-        let mut attributes = AttributeList::new(self.out);
-        attributes.item(|out| write!(out, "TYPE={}", rendition.media_type))?;
-        attributes.item(|out| write!(out, r#"GROUP-ID="{}""#, rendition.group_id))?;
-        attributes.item(|out| write!(out, r#"NAME="{}""#, rendition.name))?;
-        attributes.item(|out| {
-            write!(
-                out,
-                "DEFAULT={}",
-                if rendition.default { "YES" } else { "NO" }
-            )
-        })?;
-        attributes.item(|out| {
-            write!(
-                out,
-                "AUTOSELECT={}",
-                if rendition.autoselect { "YES" } else { "NO" }
-            )
-        })?;
-        if let Some(language) = rendition.language {
-            attributes.item(|out| write!(out, r#"LANGUAGE="{language}""#))?;
-        }
-        if let Some(sample_rate) = rendition.sample_rate {
-            attributes.item(|out| write!(out, "SAMPLE-RATE={sample_rate}"))?;
-        }
+        let mut attributes = AttributeList::new(self.out, &mut self.scratch, "EXT-X-MEDIA");
+        attributes.plain("TYPE", rendition.media_type)?;
+        attributes.quoted("GROUP-ID", rendition.group_id)?;
+        attributes.quoted("NAME", rendition.name)?;
+        // Both default to NO, but a player reads them as a selection policy, so
+        // this writer states them rather than leaving them to be inferred.
+        attributes.boolean("DEFAULT", rendition.default)?;
+        attributes.boolean("AUTOSELECT", rendition.autoselect)?;
+        attributes.optional_quoted("LANGUAGE", rendition.language)?;
+        attributes.optional("SAMPLE-RATE", rendition.sample_rate)?;
         if let Some(channels) = rendition.channels {
-            attributes.item(|out| write!(out, r#"CHANNELS="{channels}""#))?;
+            // Quoted, but a number cannot carry a character the quoting rejects.
+            attributes.plain("CHANNELS", format_args!(r#""{channels}""#))?;
         }
         if let Some(uri) = rendition.uri {
-            attributes.item(|out| write!(out, r#"URI="{uri}""#))?;
+            attributes.uri("URI", uri)?;
         }
-        self.out.write_char('\n')?;
+        attributes.end()?;
         Ok(self)
     }
 
     pub fn variant(&mut self, variant: Variant<'_>) -> ManifestWriteResult<&mut Self> {
-        validate_uri(variant.uri, "variant URI")?;
-        for (value, field) in [
-            (variant.codecs, "CODECS"),
-            (variant.video_group_id, "VIDEO"),
-            (variant.audio_group_id, "AUDIO"),
-            (variant.subtitle_group_id, "SUBTITLES"),
-        ] {
-            if let Some(value) = value {
-                validate_quoted(value, field)?;
-            }
-        }
-
-        self.out.write_str("#EXT-X-STREAM-INF:")?;
-        let mut attributes = AttributeList::new(self.out);
-        attributes.item(|out| write!(out, "BANDWIDTH={}", variant.bandwidth))?;
-        if let Some(bandwidth) = variant.average_bandwidth {
-            attributes.item(|out| write!(out, "AVERAGE-BANDWIDTH={bandwidth}"))?;
-        }
-        if let Some(codecs) = variant.codecs {
-            attributes.item(|out| write!(out, r#"CODECS="{codecs}""#))?;
-        }
+        let mut attributes = AttributeList::new(self.out, &mut self.scratch, "EXT-X-STREAM-INF");
+        attributes.plain("BANDWIDTH", variant.bandwidth)?;
+        attributes.optional("AVERAGE-BANDWIDTH", variant.average_bandwidth)?;
+        attributes.optional_quoted("CODECS", variant.codecs)?;
         if let Some((width, height)) = variant.resolution {
-            attributes.item(|out| write!(out, "RESOLUTION={width}x{height}"))?;
+            attributes.plain("RESOLUTION", format_args!("{width}x{height}"))?;
         }
         if let Some(frame_rate) = variant.frame_rate {
-            let value =
+            let rate =
                 f64::from(frame_rate.numerator().get()) / f64::from(frame_rate.denominator().get());
-            attributes.item(|out| write!(out, "FRAME-RATE={value:.3}"))?;
+            attributes.plain("FRAME-RATE", format_args!("{rate:.3}"))?;
         }
-        if let Some(range) = variant.video_range {
-            attributes.item(|out| write!(out, "VIDEO-RANGE={range}"))?;
-        }
-        if let Some(group) = variant.video_group_id {
-            attributes.item(|out| write!(out, r#"VIDEO="{group}""#))?;
-        }
-        if let Some(group) = variant.audio_group_id {
-            attributes.item(|out| write!(out, r#"AUDIO="{group}""#))?;
-        }
-        if let Some(group) = variant.subtitle_group_id {
-            attributes.item(|out| write!(out, r#"SUBTITLES="{group}""#))?;
-        }
-        self.out.write_char('\n')?;
+        attributes.optional("VIDEO-RANGE", variant.video_range)?;
+        attributes.optional_quoted("VIDEO", variant.video_group_id)?;
+        attributes.optional_quoted("AUDIO", variant.audio_group_id)?;
+        attributes.optional_quoted("SUBTITLES", variant.subtitle_group_id)?;
+        attributes.end()?;
+
+        // The URI is a line of its own rather than an attribute, so it is
+        // checked by the same rule the writer applies to the ones that are.
+        validate_uri(variant.uri, "EXT-X-STREAM-INF", "URI")?;
         writeln!(self.out, "{}", variant.uri)?;
         Ok(self)
     }

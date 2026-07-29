@@ -91,11 +91,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn owns_options_and_copies_exact_values() {
+    fn owns_options_and_copies_exact_values() -> Result<(), AvError> {
         let mut dictionary = Dictionary::new();
-        dictionary
-            .set(c"title", c"Camera")
-            .expect("dictionary accepts strings");
+        dictionary.set(c"title", c"Camera")?;
 
         // SAFETY: the wrapper keeps its dictionary live.
         assert_eq!(
@@ -103,5 +101,6 @@ mod tests {
             Some("Camera".into())
         );
         assert_eq!(dictionary.first_key(), Some("title".into()));
+        Ok(())
     }
 }

@@ -27,57 +27,163 @@ pub use multivariant::{
 pub enum ManifestWriteError {
     #[error("the output rejected manifest text")]
     Output(#[from] fmt::Error),
-    #[error("{field} contains a character HLS cannot represent in a quoted string")]
-    InvalidQuotedString { field: &'static str },
-    #[error("{field} is not a safely serializable resource URI")]
-    InvalidUri { field: &'static str },
+    #[error("{tag} {attribute} contains a character HLS cannot represent in a quoted string")]
+    InvalidQuotedString {
+        tag: &'static str,
+        attribute: &'static str,
+    },
+    #[error("{tag} {attribute} is not a safely serializable resource URI")]
+    InvalidUri {
+        tag: &'static str,
+        attribute: &'static str,
+    },
     #[error("{field} must not be zero")]
     ZeroDuration { field: &'static str },
-    #[error("EXT-X-SERVER-CONTROL must contain at least one attribute")]
-    EmptyServerControl,
+    #[error("{tag} must contain at least one attribute")]
+    EmptyAttributeList { tag: &'static str },
     #[error("the program date-time could not be formatted as RFC 3339")]
     ProgramDateTime(#[from] time::error::Format),
 }
 
 pub type ManifestWriteResult<T> = Result<T, ManifestWriteError>;
 
-pub fn validate_quoted(value: &str, field: &'static str) -> ManifestWriteResult<()> {
+/// Refuses a value that could close its quote or the line holding it.
+pub fn validate_quoted(
+    value: &str,
+    tag: &'static str,
+    attribute: &'static str,
+) -> ManifestWriteResult<()> {
     if value.chars().any(|character| {
         character == '"' || character == '\r' || character == '\n' || character.is_control()
     }) {
-        return Err(ManifestWriteError::InvalidQuotedString { field });
+        return Err(ManifestWriteError::InvalidQuotedString { tag, attribute });
     }
     Ok(())
 }
 
-pub fn validate_uri(value: &str, field: &'static str) -> ManifestWriteResult<()> {
+/// Refuses a resource name that is not already encoded.
+pub fn validate_uri(
+    value: &str,
+    tag: &'static str,
+    attribute: &'static str,
+) -> ManifestWriteResult<()> {
     if value.is_empty()
         || value.chars().any(|character| {
             character == '"' || character.is_whitespace() || character.is_control()
         })
     {
-        return Err(ManifestWriteError::InvalidUri { field });
+        return Err(ManifestWriteError::InvalidUri { tag, attribute });
     }
     Ok(())
 }
 
+/// Writes one tag's comma-separated attribute list.
+///
+/// Every attribute goes through a method that knows how its value is encoded,
+/// so quoting and validation cannot be applied to some values and forgotten on
+/// others — which is the shape a manifest injection takes. Each value is
+/// checked at the moment it is written rather than in a separate pass, so
+/// adding an attribute cannot leave a validation list one entry behind.
+///
+/// The tag is assembled in a scratch buffer and copied out only once it is
+/// complete, so a value refused halfway through leaves no partial tag behind.
+/// The buffer belongs to the writer and is reused by every tag it emits, which
+/// is what keeps that guarantee from costing an allocation apiece.
 pub struct AttributeList<'a, W: Write + ?Sized> {
     out: &'a mut W,
-    first: bool,
+    scratch: &'a mut String,
+    tag: &'static str,
 }
 
 impl<'a, W: Write + ?Sized> AttributeList<'a, W> {
-    pub fn new(out: &'a mut W) -> Self {
-        Self { out, first: true }
+    pub fn new(out: &'a mut W, scratch: &'a mut String, tag: &'static str) -> Self {
+        scratch.clear();
+        Self { out, scratch, tag }
     }
 
-    pub fn item(&mut self, write: impl FnOnce(&mut W) -> fmt::Result) -> ManifestWriteResult<()> {
-        if !self.first {
-            self.out.write_char(',')?;
+    /// A value HLS represents without quoting.
+    pub fn plain(
+        &mut self,
+        attribute: &str,
+        value: impl fmt::Display,
+    ) -> ManifestWriteResult<&mut Self> {
+        self.separate();
+        let _ = write!(self.scratch, "{attribute}={value}");
+        Ok(self)
+    }
+
+    /// The same, written only when the value is present.
+    pub fn optional(
+        &mut self,
+        attribute: &str,
+        value: Option<impl fmt::Display>,
+    ) -> ManifestWriteResult<&mut Self> {
+        match value {
+            Some(value) => self.plain(attribute, value),
+            None => Ok(self),
         }
-        self.first = false;
-        write(self.out)?;
+    }
+
+    /// A quoted string, refused if it could close the quote or the line.
+    pub fn quoted(
+        &mut self,
+        attribute: &'static str,
+        value: &str,
+    ) -> ManifestWriteResult<&mut Self> {
+        validate_quoted(value, self.tag, attribute)?;
+        self.separate();
+        let _ = write!(self.scratch, r#"{attribute}="{value}""#);
+        Ok(self)
+    }
+
+    /// The same, written only when the value is present.
+    pub fn optional_quoted(
+        &mut self,
+        attribute: &'static str,
+        value: Option<&str>,
+    ) -> ManifestWriteResult<&mut Self> {
+        match value {
+            Some(value) => self.quoted(attribute, value),
+            None => Ok(self),
+        }
+    }
+
+    /// A quoted string naming a resource, which must already be encoded.
+    pub fn uri(&mut self, attribute: &'static str, value: &str) -> ManifestWriteResult<&mut Self> {
+        validate_uri(value, self.tag, attribute)?;
+        self.separate();
+        let _ = write!(self.scratch, r#"{attribute}="{value}""#);
+        Ok(self)
+    }
+
+    /// `YES` or `NO`, for an attribute whose default is not what silence means.
+    pub fn boolean(&mut self, attribute: &str, value: bool) -> ManifestWriteResult<&mut Self> {
+        self.plain(attribute, if value { "YES" } else { "NO" })
+    }
+
+    /// `YES` when set and omitted otherwise, for the attributes whose absence
+    /// already says `NO`.
+    pub fn flag(&mut self, attribute: &str, value: bool) -> ManifestWriteResult<&mut Self> {
+        if value {
+            self.plain(attribute, "YES")?;
+        }
+        Ok(self)
+    }
+
+    /// Emits the completed tag, or refuses a tag that would carry no
+    /// attributes.
+    pub fn end(self) -> ManifestWriteResult<()> {
+        if self.scratch.is_empty() {
+            return Err(ManifestWriteError::EmptyAttributeList { tag: self.tag });
+        }
+        writeln!(self.out, "#{}:{}", self.tag, self.scratch)?;
         Ok(())
+    }
+
+    fn separate(&mut self) {
+        if !self.scratch.is_empty() {
+            self.scratch.push(',');
+        }
     }
 }
 
@@ -124,16 +230,22 @@ mod tests {
     #[test]
     fn quoted_values_reject_manifest_injection() {
         assert!(matches!(
-            validate_quoted("English\"\n#EXT-X-ENDLIST", "NAME"),
-            Err(ManifestWriteError::InvalidQuotedString { field: "NAME" })
+            validate_quoted("English\"\n#EXT-X-ENDLIST", "EXT-X-MEDIA", "NAME"),
+            Err(ManifestWriteError::InvalidQuotedString {
+                tag: "EXT-X-MEDIA",
+                attribute: "NAME"
+            })
         ));
     }
 
     #[test]
     fn resource_uris_must_already_be_encoded() {
         assert!(matches!(
-            validate_uri("parts/next part.m4s", "URI"),
-            Err(ManifestWriteError::InvalidUri { field: "URI" })
+            validate_uri("parts/next part.m4s", "EXT-X-PART", "URI"),
+            Err(ManifestWriteError::InvalidUri {
+                tag: "EXT-X-PART",
+                attribute: "URI"
+            })
         ));
     }
 }

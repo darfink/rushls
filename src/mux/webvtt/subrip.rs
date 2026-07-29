@@ -168,22 +168,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn common_styles_and_entities_become_webvtt_cue_text() {
+    fn common_styles_and_entities_become_webvtt_cue_text() -> Result<(), MuxError> {
         let converted =
-            convert(b"<B>Hello &amp; <font color=\"#f00\"><i>world</i></font></B>\r\nSecond line")
-                .expect("supported SubRip converts");
+            convert(b"<B>Hello &amp; <font color=\"#f00\"><i>world</i></font></B>\r\nSecond line")?;
 
         assert_eq!(
             converted.as_ref(),
             "<b>Hello &amp; <i>world</i></b>\nSecond line"
         );
+        Ok(())
     }
 
     #[test]
-    fn angle_brackets_in_ordinary_text_are_escaped() {
-        let converted = convert(b"1 < 5 > 3").expect("non-tag angle brackets are ordinary text");
+    fn angle_brackets_in_ordinary_text_are_escaped() -> Result<(), MuxError> {
+        let converted = convert(b"1 < 5 > 3")?;
 
         assert_eq!(converted.as_ref(), "1 &lt; 5 &gt; 3");
+        Ok(())
     }
 
     #[test]

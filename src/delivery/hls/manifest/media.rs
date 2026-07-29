@@ -11,12 +11,17 @@ use super::{AttributeList, DecimalSeconds, ManifestWriteError, ManifestWriteResu
 
 pub struct MediaPlaylistWriter<'a, W: Write + ?Sized> {
     out: &'a mut W,
+    /// Reused by every attribute list this writer emits.
+    scratch: String,
 }
 
 impl<'a, W: Write + ?Sized> MediaPlaylistWriter<'a, W> {
     pub fn new(out: &'a mut W) -> ManifestWriteResult<Self> {
         writeln!(out, "#EXTM3U")?;
-        Ok(Self { out })
+        Ok(Self {
+            out,
+            scratch: String::new(),
+        })
     }
 
     pub fn version(&mut self, version: NonZeroU8) -> ManifestWriteResult<&mut Self> {
@@ -63,43 +68,34 @@ impl<'a, W: Write + ?Sized> MediaPlaylistWriter<'a, W> {
     }
 
     pub fn server_control(&mut self, control: ServerControl) -> ManifestWriteResult<&mut Self> {
-        if control.is_empty() {
-            return Err(ManifestWriteError::EmptyServerControl);
-        }
-        if let Some(duration) = control.hold_back {
-            require_nonzero(duration, "HOLD-BACK")?;
-        }
-        if let Some(duration) = control.part_hold_back {
-            require_nonzero(duration, "PART-HOLD-BACK")?;
-        }
-        if let Some(duration) = control.can_skip_until {
-            require_nonzero(duration, "CAN-SKIP-UNTIL")?;
+        // A hold-back of zero would tell a client to play from the live edge
+        // itself, which is the one position it can never sustain.
+        for (duration, field) in [
+            (control.hold_back, "HOLD-BACK"),
+            (control.part_hold_back, "PART-HOLD-BACK"),
+            (control.can_skip_until, "CAN-SKIP-UNTIL"),
+        ] {
+            if let Some(duration) = duration {
+                require_nonzero(duration, field)?;
+            }
         }
 
-        self.out.write_str("#EXT-X-SERVER-CONTROL:")?;
-        let mut attributes = AttributeList::new(self.out);
-        if let Some(duration) = control.hold_back {
-            attributes.item(|out| write!(out, "HOLD-BACK={}", DecimalSeconds(duration)))?;
-        }
-        if let Some(duration) = control.part_hold_back {
-            attributes.item(|out| write!(out, "PART-HOLD-BACK={}", DecimalSeconds(duration)))?;
-        }
-        if control.can_block_reload {
-            attributes.item(|out| out.write_str("CAN-BLOCK-RELOAD=YES"))?;
-        }
-        if let Some(duration) = control.can_skip_until {
-            attributes.item(|out| write!(out, "CAN-SKIP-UNTIL={}", DecimalSeconds(duration)))?;
-        }
-        if control.can_skip_dateranges {
-            attributes.item(|out| out.write_str("CAN-SKIP-DATERANGES=YES"))?;
-        }
-        self.out.write_char('\n')?;
+        let mut attributes =
+            AttributeList::new(self.out, &mut self.scratch, "EXT-X-SERVER-CONTROL");
+        attributes.optional("HOLD-BACK", control.hold_back.map(DecimalSeconds))?;
+        attributes.optional("PART-HOLD-BACK", control.part_hold_back.map(DecimalSeconds))?;
+        attributes.flag("CAN-BLOCK-RELOAD", control.can_block_reload)?;
+        attributes.optional("CAN-SKIP-UNTIL", control.can_skip_until.map(DecimalSeconds))?;
+        attributes.flag("CAN-SKIP-DATERANGES", control.can_skip_dateranges)?;
+        // A control advertising nothing is refused by the list itself.
+        attributes.end()?;
         Ok(self)
     }
 
     pub fn initialization_map(&mut self, uri: &str) -> ManifestWriteResult<&mut Self> {
-        validate_uri(uri, "EXT-X-MAP URI")?;
-        writeln!(self.out, r#"#EXT-X-MAP:URI="{uri}""#)?;
+        let mut attributes = AttributeList::new(self.out, &mut self.scratch, "EXT-X-MAP");
+        attributes.uri("URI", uri)?;
+        attributes.end()?;
         Ok(self)
     }
 
@@ -115,25 +111,19 @@ impl<'a, W: Write + ?Sized> MediaPlaylistWriter<'a, W> {
     }
 
     pub fn part(&mut self, part: Part<'_>) -> ManifestWriteResult<&mut Self> {
-        validate_uri(part.uri, "EXT-X-PART URI")?;
         require_nonzero(part.duration, "EXT-X-PART DURATION")?;
 
-        self.out.write_str("#EXT-X-PART:")?;
-        let mut attributes = AttributeList::new(self.out);
-        attributes.item(|out| write!(out, "DURATION={}", DecimalSeconds(part.duration)))?;
-        attributes.item(|out| write!(out, r#"URI="{}""#, part.uri))?;
-        if part.independent {
-            attributes.item(|out| out.write_str("INDEPENDENT=YES"))?;
-        }
-        if part.gap {
-            attributes.item(|out| out.write_str("GAP=YES"))?;
-        }
-        self.out.write_char('\n')?;
+        let mut attributes = AttributeList::new(self.out, &mut self.scratch, "EXT-X-PART");
+        attributes.plain("DURATION", DecimalSeconds(part.duration))?;
+        attributes.uri("URI", part.uri)?;
+        attributes.flag("INDEPENDENT", part.independent)?;
+        attributes.flag("GAP", part.gap)?;
+        attributes.end()?;
         Ok(self)
     }
 
     pub fn segment(&mut self, segment: Segment<'_>) -> ManifestWriteResult<&mut Self> {
-        validate_uri(segment.uri, "segment URI")?;
+        validate_uri(segment.uri, "EXTINF", "URI")?;
         require_nonzero(segment.duration, "EXTINF")?;
         if segment.gap {
             writeln!(self.out, "#EXT-X-GAP")?;
@@ -152,27 +142,20 @@ impl<'a, W: Write + ?Sized> MediaPlaylistWriter<'a, W> {
         &mut self,
         report: RenditionReport<'_>,
     ) -> ManifestWriteResult<&mut Self> {
-        validate_uri(report.uri, "EXT-X-RENDITION-REPORT URI")?;
-        self.out.write_str("#EXT-X-RENDITION-REPORT:")?;
-        let mut attributes = AttributeList::new(self.out);
-        attributes.item(|out| write!(out, r#"URI="{}""#, report.uri))?;
-        if let Some(sequence) = report.last_media_sequence {
-            attributes.item(|out| write!(out, "LAST-MSN={sequence}"))?;
-        }
-        if let Some(part) = report.last_part {
-            attributes.item(|out| write!(out, "LAST-PART={part}"))?;
-        }
-        self.out.write_char('\n')?;
+        let mut attributes =
+            AttributeList::new(self.out, &mut self.scratch, "EXT-X-RENDITION-REPORT");
+        attributes.uri("URI", report.uri)?;
+        attributes.optional("LAST-MSN", report.last_media_sequence)?;
+        attributes.optional("LAST-PART", report.last_part)?;
+        attributes.end()?;
         Ok(self)
     }
 
     pub fn preload_hint(&mut self, hint: PreloadHint<'_>) -> ManifestWriteResult<&mut Self> {
-        validate_uri(hint.uri, "EXT-X-PRELOAD-HINT URI")?;
-        writeln!(
-            self.out,
-            r#"#EXT-X-PRELOAD-HINT:TYPE={},URI="{}""#,
-            hint.hint_type, hint.uri
-        )?;
+        let mut attributes = AttributeList::new(self.out, &mut self.scratch, "EXT-X-PRELOAD-HINT");
+        attributes.plain("TYPE", hint.hint_type)?;
+        attributes.uri("URI", hint.uri)?;
+        attributes.end()?;
         Ok(self)
     }
 
@@ -212,16 +195,6 @@ pub struct ServerControl {
     pub can_skip_dateranges: bool,
 }
 
-impl ServerControl {
-    fn is_empty(self) -> bool {
-        self.hold_back.is_none()
-            && self.part_hold_back.is_none()
-            && !self.can_block_reload
-            && self.can_skip_until.is_none()
-            && !self.can_skip_dateranges
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Part<'a> {
     pub uri: &'a str,
@@ -255,9 +228,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renders_a_low_latency_media_playlist() {
+    fn renders_a_low_latency_media_playlist() -> Result<(), ManifestWriteError> {
         let mut rendered = String::new();
-        let mut writer = MediaPlaylistWriter::new(&mut rendered).expect("header renders");
+        let mut writer = MediaPlaylistWriter::new(&mut rendered)?;
         writer
             .version(nz::u8!(10))
             .and_then(|writer| writer.target_duration(nz::u64!(2)))
@@ -285,8 +258,7 @@ mod tests {
                     hint_type: PreloadHintType::Part,
                     uri: "part/42/1.m4s",
                 })
-            })
-            .expect("playlist renders");
+            })?;
 
         assert_eq!(
             rendered,
@@ -303,12 +275,13 @@ mod tests {
                 "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part/42/1.m4s\"\n",
             )
         );
+        Ok(())
     }
 
     #[test]
-    fn renders_discontinuities_gaps_and_a_terminal_segment() {
+    fn renders_discontinuities_gaps_and_a_terminal_segment() -> Result<(), ManifestWriteError> {
         let mut rendered = String::new();
-        let mut writer = MediaPlaylistWriter::new(&mut rendered).expect("header renders");
+        let mut writer = MediaPlaylistWriter::new(&mut rendered)?;
         writer
             .discontinuity()
             .and_then(|writer| {
@@ -318,8 +291,7 @@ mod tests {
                     gap: true,
                 })
             })
-            .and_then(MediaPlaylistWriter::endlist)
-            .expect("playlist renders");
+            .and_then(MediaPlaylistWriter::endlist)?;
 
         assert_eq!(
             rendered,
@@ -332,6 +304,7 @@ mod tests {
                 "#EXT-X-ENDLIST\n",
             )
         );
+        Ok(())
     }
 
     #[test]
