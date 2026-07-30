@@ -7,6 +7,7 @@ use tokio::{sync::watch, task::JoinSet};
 
 use crate::{
     domain::StreamId,
+    observe::{Events, NodeEvent},
     outbound::{HttpClient, OutboundError, Response},
 };
 
@@ -28,6 +29,7 @@ impl Dispatchers {
                 shared,
                 self.client.clone(),
                 self.drain_timeout,
+                self.events.clone(),
                 stop.clone(),
             ));
         }
@@ -45,12 +47,13 @@ async fn run_hook(
     shared: Arc<Shared>,
     client: HttpClient,
     drain_timeout: Duration,
+    events: Events,
     mut stop: watch::Receiver<bool>,
 ) {
     let mut sending = JoinSet::new();
 
     loop {
-        start_available(&shared, &client, &mut sending);
+        start_available(&shared, &client, &events, &mut sending);
 
         tokio::select! {
             biased;
@@ -69,16 +72,29 @@ async fn run_hook(
         }
     }
 
-    drain(shared, client, drain_timeout, sending).await;
+    drain(shared, client, drain_timeout, events, sending).await;
 }
 
 /// Starts requests for as many idle streams as the concurrency limit allows.
-fn start_available(shared: &Arc<Shared>, client: &HttpClient, sending: &mut JoinSet<StreamId>) {
+fn start_available(
+    shared: &Arc<Shared>,
+    client: &HttpClient,
+    events: &Events,
+    sending: &mut JoinSet<StreamId>,
+) {
     while sending.len() < shared.config.maximum_in_flight {
+        // Taken under the lock, sent outside it: reporting a failure emits a
+        // node event, and doing that while holding the queue would put an
+        // observer's work on the path of every other stream's delivery.
         let Some(envelope) = shared.queue.lock().take_ready() else {
             break;
         };
-        sending.spawn(send(Arc::clone(shared), client.clone(), envelope));
+        sending.spawn(send(
+            Arc::clone(shared),
+            client.clone(),
+            events.clone(),
+            envelope,
+        ));
     }
 }
 
@@ -97,7 +113,12 @@ fn release(shared: &Arc<Shared>, subject: Option<StreamId>) {
 /// the reordering the per-stream rule exists to prevent. The cost is that one
 /// unreachable endpoint stalls that stream for up to
 /// `maximum_attempts` × backoff.
-async fn send(shared: Arc<Shared>, client: HttpClient, envelope: Envelope) -> StreamId {
+async fn send(
+    shared: Arc<Shared>,
+    client: HttpClient,
+    events: Events,
+    envelope: Envelope,
+) -> StreamId {
     let mut backoff = INITIAL_BACKOFF;
 
     for attempt in 1..=shared.config.maximum_attempts {
@@ -119,11 +140,11 @@ async fn send(shared: Arc<Shared>, client: HttpClient, envelope: Envelope) -> St
                 return envelope.subject;
             }
             Verdict::Rejected => {
-                report(&shared, &envelope, Loss::Rejected, &result);
+                report(&shared, &events, &envelope, Loss::Rejected, &result);
                 return envelope.subject;
             }
             Verdict::Retry if attempt == shared.config.maximum_attempts => {
-                report(&shared, &envelope, Loss::Exhausted, &result);
+                report(&shared, &events, &envelope, Loss::Exhausted, &result);
                 return envelope.subject;
             }
             Verdict::Retry => {
@@ -182,22 +203,22 @@ fn verdict(result: &Result<Response, OutboundError>) -> Verdict {
 
 fn report(
     shared: &Arc<Shared>,
+    events: &Events,
     envelope: &Envelope,
     loss: Loss,
     result: &Result<Response, OutboundError>,
 ) {
     shared.meters.record_loss(loss);
-    let detail = match result {
-        Ok(response) => format!("HTTP {}", response.status),
-        Err(error) => error.to_string(),
-    };
-    // The id is logged so an operator can match a consumer's complaint against
-    // what this node believed it sent. The body never is: it names streams and
-    // principals, and a log is a much wider audience than one endpoint.
-    eprintln!(
-        "hook {}: {} {} {} ({detail})",
-        shared.config.name, envelope.kind, envelope.id, loss
-    );
+    events.emit(NodeEvent::HookEventDropped {
+        hook: Arc::clone(&shared.config.name),
+        event: envelope.id.clone(),
+        kind: envelope.kind,
+        reason: loss.as_str(),
+        detail: match result {
+            Ok(response) => format!("HTTP {}", response.status),
+            Err(error) => error.to_string(),
+        },
+    });
 }
 
 /// Finishes what is in flight, then what is queued, until the deadline.
@@ -205,13 +226,14 @@ async fn drain(
     shared: Arc<Shared>,
     client: HttpClient,
     timeout: Duration,
+    events: Events,
     mut sending: JoinSet<StreamId>,
 ) {
     let deadline = tokio::time::Instant::now() + timeout;
 
     let drained = tokio::time::timeout_at(deadline, async {
         loop {
-            start_available(&shared, &client, &mut sending);
+            start_available(&shared, &client, &events, &mut sending);
             let Some(finished) = sending.join_next().await else {
                 break;
             };
@@ -230,9 +252,9 @@ async fn drain(
         shared.meters.record_loss(Loss::Shutdown);
     }
     if lost > 0 {
-        eprintln!(
-            "hook {}: dropped {lost} undelivered events",
-            shared.config.name
-        );
+        events.emit(NodeEvent::HookEventsAbandoned {
+            hook: Arc::clone(&shared.config.name),
+            dropped: lost,
+        });
     }
 }

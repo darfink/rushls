@@ -4,6 +4,8 @@ use derive_more::{Debug, Display};
 
 use crate::domain::{SessionId, StreamId, TrackCounts, TrackId};
 
+use super::lifecycle;
+
 /// A rare, structured fact about a session's progress through its lifecycle.
 ///
 /// Payloads stay primitive so this layer never depends on a domain aggregate.
@@ -114,6 +116,28 @@ pub enum NodeEvent {
     /// until the loaded certificate expires, by which point the cause is long
     /// out of the logs.
     CertificateWatchLost { reason: String },
+    /// A lifecycle event reached its last attempt without being delivered.
+    ///
+    /// Carries the event id so an operator can match a consumer's complaint
+    /// against what this node believed it sent. Never the body: that names
+    /// streams and principals, and a log has a far wider audience than the one
+    /// endpoint the event was addressed to.
+    HookEventDropped {
+        hook: Arc<str>,
+        /// The CloudEvents `id`, which is what the consumer would quote.
+        event: String,
+        kind: lifecycle::Kind,
+        /// Why it will not be attempted again.
+        reason: &'static str,
+        detail: String,
+    },
+    /// Events still queued when the drain deadline passed.
+    HookEventsAbandoned { hook: Arc<str>, dropped: usize },
+    /// An event could not be turned into bytes at all.
+    ///
+    /// A fault in this process rather than in delivery, so it names no hook:
+    /// nothing was addressed yet when it failed.
+    HookEventUnrenderable { reason: String },
 }
 
 /// Which listener an event is about.

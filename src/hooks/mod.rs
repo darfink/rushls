@@ -43,7 +43,10 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::{
-    observe::lifecycle::{Event, Kind},
+    observe::{
+        Events, NodeEvent,
+        lifecycle::{Event, Kind},
+    },
     outbound::{BearerToken, Endpoint, HttpClient},
 };
 
@@ -126,6 +129,18 @@ pub struct HookMeters {
     filtered: AtomicU64,
 }
 
+impl Loss {
+    /// Stable enough to appear in a log or a metric label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Overflow => "overflow",
+            Self::Rejected => "rejected",
+            Self::Exhausted => "exhausted",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
 impl HookMeters {
     fn record_loss(&self, loss: Loss) {
         match loss {
@@ -176,6 +191,15 @@ struct Shared {
 pub struct Hooks {
     renderer: Renderer,
     hooks: Arc<Vec<Arc<Shared>>>,
+    /// Where this module reports its own failures.
+    ///
+    /// Deliberately the same sink the rest of the process uses, so an embedder
+    /// that redirects output redirects all of it. Emitting here cannot loop
+    /// back: only session events reach [`Hooks::deliver`], and these are node
+    /// events. Anything that later projects `NodeEvent` into the public
+    /// vocabulary must keep it that way, or a dead endpoint would generate
+    /// failure events addressed to the dead endpoint.
+    events: Events,
 }
 
 impl Hooks {
@@ -206,7 +230,9 @@ impl Hooks {
             // Rendering fails only if the clock or the serializer does, which
             // is a process-level fault rather than a delivery one.
             Err(error) => {
-                eprintln!("a lifecycle event could not be rendered: {error}");
+                self.events.emit(NodeEvent::HookEventUnrenderable {
+                    reason: error.to_string(),
+                });
                 return;
             }
         };
@@ -237,13 +263,14 @@ pub struct Dispatchers {
     shared: Vec<Arc<Shared>>,
     client: HttpClient,
     drain_timeout: Duration,
+    events: Events,
 }
 
 /// Builds the enqueue side and the dispatchers that drain it.
 ///
 /// Split so the caller owns where the dispatchers run: they belong in the
 /// node's task set, alongside the listeners they outlive.
-pub fn build(config: HooksConfig, client: HttpClient) -> (Hooks, Dispatchers) {
+pub fn build(config: HooksConfig, client: HttpClient, events: Events) -> (Hooks, Dispatchers) {
     let shared: Vec<Arc<Shared>> = config
         .hooks
         .into_iter()
@@ -261,11 +288,13 @@ pub fn build(config: HooksConfig, client: HttpClient) -> (Hooks, Dispatchers) {
         Hooks {
             renderer: Renderer::new(config.source, config.schema_version),
             hooks: Arc::new(shared.clone()),
+            events: events.clone(),
         },
         Dispatchers {
             shared,
             client,
             drain_timeout: config.drain_timeout,
+            events,
         },
     )
 }

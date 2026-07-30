@@ -24,11 +24,19 @@ pub const CONTENT_TYPE: &str = "application/cloudevents+json";
 const SPEC_VERSION: &str = "1.0";
 const JSON: &str = "application/json";
 
-/// Reverse-DNS prefix for every `type` this node emits.
+/// Prefix for every `type` this node emits.
+///
+/// Deliberately not reverse-DNS. The convention is a SHOULD in the
+/// specification, and it exists so producers sharing a bus can be told apart —
+/// a job `source` already does here, since that is what an operator sets per
+/// deployment and what consumers deduplicate on. Claiming a domain this
+/// project does not own to repeat that would be a statement about semantics
+/// ownership that is not true.
 ///
 /// Fixed rather than configurable: `type` is what a consumer routes on, so an
 /// operator changing it would break the very contract the name exists to keep.
-const TYPE_PREFIX: &str = "dev.rushls";
+/// A fork changes this line.
+const TYPE_PREFIX: &str = "rushls";
 
 /// One rendered event, immutable from here on.
 #[derive(Clone, Debug, Eq, PartialEq)]

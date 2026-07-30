@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use crate::{
     domain::{SessionId, StreamId},
     observe::{
-        SessionEnd, SessionEvent,
+        EventObserver, Events, NodeEvent, SessionEnd, SessionEvent,
         lifecycle::{self, Event, Projector, SessionStarted},
     },
     outbound::{ClientConfig, Endpoint, HttpClient},
@@ -98,8 +98,30 @@ fn envelope(stream: &str) -> Envelope {
         .expect("an event renders")
 }
 
+/// Collects what the node reported about its own delivery.
+#[derive(Clone, Default)]
+struct NodeLog(Arc<Mutex<Vec<NodeEvent>>>);
+
+impl EventObserver for NodeLog {
+    fn observe(&self, _session: SessionId, _event: SessionEvent) {}
+
+    fn observe_node(&self, event: NodeEvent) {
+        self.0.lock().push(event);
+    }
+}
+
 /// Runs the dispatchers until every expected request has arrived, then stops.
 async fn deliver(hooks: HookConfig, events: &[Event], expected: usize, recorder: &Recorder) {
+    deliver_reporting(hooks, events, expected, recorder, Events::default()).await;
+}
+
+async fn deliver_reporting(
+    hooks: HookConfig,
+    events: &[Event],
+    expected: usize,
+    recorder: &Recorder,
+    reported: Events,
+) {
     let client = HttpClient::new(ClientConfig {
         request_timeout: Duration::from_secs(2),
         ..ClientConfig::default()
@@ -113,6 +135,7 @@ async fn deliver(hooks: HookConfig, events: &[Event], expected: usize, recorder:
             ..HooksConfig::default()
         },
         client,
+        reported,
     );
     let (stop_tx, stop_rx) = watch::channel(false);
     let running = tokio::spawn(dispatchers.run(stop_rx));
@@ -148,7 +171,7 @@ async fn an_event_arrives_as_a_cloudevent_naming_its_stream() {
         .cloned()
         .expect("one event arrived");
     assert_eq!(body["specversion"], "1.0");
-    assert_eq!(body["type"], "dev.rushls.session.started.v1");
+    assert_eq!(body["type"], "rushls.session.started.v1");
     assert_eq!(body["source"], "urn:rushls:node:test");
     assert_eq!(body["subject"], "live/camera");
     assert_eq!(body["datacontenttype"], "application/json");
@@ -215,6 +238,48 @@ async fn a_client_rejection_is_not_retried() {
 }
 
 #[tokio::test]
+async fn a_dropped_event_is_reported_through_the_node_observer() {
+    let recorder = Recorder::default();
+    recorder
+        .failing_status
+        .store(StatusCode::BAD_REQUEST.as_u16(), Ordering::Relaxed);
+    recorder.failures.store(10, Ordering::Relaxed);
+    let address = start(recorder.clone()).await;
+    let log = NodeLog::default();
+
+    deliver_reporting(
+        hook(address, &[lifecycle::Kind::SessionStarted]),
+        &[started("live/camera", 1)],
+        1,
+        &recorder,
+        Events::new(Arc::new(log.clone())),
+    )
+    .await;
+
+    // Nothing here writes to stderr itself: the process owns its output, so an
+    // embedder that redirects it redirects this too.
+    let reported = log.0.lock().clone();
+    let dropped = reported
+        .iter()
+        .find_map(|event| match event {
+            NodeEvent::HookEventDropped {
+                hook, kind, reason, ..
+            } => Some((hook.to_string(), *kind, *reason)),
+            _ => None,
+        })
+        .expect("a permanently rejected event is reported");
+
+    assert_eq!(
+        dropped,
+        (
+            "test".to_owned(),
+            lifecycle::Kind::SessionStarted,
+            "rejected"
+        )
+    );
+}
+
+#[tokio::test]
 async fn only_subscribed_events_are_delivered() {
     let recorder = Recorder::default();
     let address = start(recorder.clone()).await;
@@ -236,7 +301,7 @@ async fn only_subscribed_events_are_delivered() {
     )
     .await;
 
-    assert_eq!(recorder.types(), ["dev.rushls.session.ended.v1"]);
+    assert_eq!(recorder.types(), ["rushls.session.ended.v1"]);
 }
 
 #[test]

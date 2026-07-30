@@ -34,6 +34,19 @@ impl EventObserver for StderrEvents {
             NodeEvent::CertificateWatchLost { reason } => {
                 eprintln!("certificate rotations will no longer be noticed: {reason}");
             }
+            NodeEvent::HookEventDropped {
+                hook,
+                event,
+                kind,
+                reason,
+                detail,
+            } => eprintln!("hook {hook}: dropped {kind} {event}, {reason} ({detail})"),
+            NodeEvent::HookEventsAbandoned { hook, dropped } => {
+                eprintln!("hook {hook}: abandoned {dropped} undelivered events at shutdown");
+            }
+            NodeEvent::HookEventUnrenderable { reason } => {
+                eprintln!("a lifecycle event could not be rendered: {reason}");
+            }
         }
     }
 }
