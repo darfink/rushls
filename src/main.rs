@@ -47,6 +47,21 @@ impl EventObserver for StderrEvents {
             NodeEvent::HookEventUnrenderable { reason } => {
                 eprintln!("a lifecycle event could not be rendered: {reason}");
             }
+            NodeEvent::PublisherHandshakeFailed { protocol, reason } => {
+                eprintln!("{protocol} handshake rejected: {reason}");
+            }
+            NodeEvent::PublisherSessionFailed { protocol, reason } => {
+                eprintln!("{protocol} publishing session failed: {reason}");
+            }
+            NodeEvent::ConnectionTaskPanicked { protocol, reason } => {
+                eprintln!("{protocol} connection task panicked: {reason}");
+            }
+            NodeEvent::ListenerAddressUnavailable { protocol, reason } => {
+                eprintln!("{protocol} listener bound but has no local address: {reason}");
+            }
+            NodeEvent::ListenerAcceptFailed { protocol, reason } => {
+                eprintln!("{protocol} listener could not accept: {reason}");
+            }
         }
     }
 }

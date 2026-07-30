@@ -138,6 +138,34 @@ pub enum NodeEvent {
     /// A fault in this process rather than in delivery, so it names no hook:
     /// nothing was addressed yet when it failed.
     HookEventUnrenderable { reason: String },
+    /// A connection ended before it said what it wanted to publish.
+    ///
+    /// How often this happens is up to whoever is connecting, so the count
+    /// belongs in [`ProcessMeters`](super::ProcessMeters); this carries the
+    /// reason, which a counter cannot.
+    PublisherHandshakeFailed { protocol: Protocol, reason: String },
+    /// An admitted publication ended in an error.
+    ///
+    /// Overlaps [`SessionEvent::Failed`] for a session that got as far as
+    /// registering, and is the only report for one that did not — admission
+    /// runs before a session context exists. Narrowing that belongs with the
+    /// revision `SessionEvent` is already due.
+    PublisherSessionFailed { protocol: Protocol, reason: String },
+    /// A task running one connection panicked.
+    ///
+    /// Always a defect: a session reports its own failures through
+    /// [`SessionEvent`], so reaching this means one did not get the chance.
+    ConnectionTaskPanicked { protocol: Protocol, reason: String },
+    /// A listener is accepting but could not say where.
+    ///
+    /// Only interesting because it makes an ephemeral port unknowable, which
+    /// is the one case where nothing else can report the address.
+    ListenerAddressUnavailable { protocol: Protocol, reason: String },
+    /// A listener could not accept, and will retry shortly.
+    ///
+    /// Local rather than remote: the peer is gone by definition, so this is
+    /// descriptor exhaustion or something like it.
+    ListenerAcceptFailed { protocol: Protocol, reason: String },
 }
 
 /// Which listener an event is about.

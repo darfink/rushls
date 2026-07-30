@@ -44,7 +44,7 @@ use tokio::{
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
-use crate::observe::{Events, NodeEvent, ProcessMeters};
+use crate::observe::{Events, NodeEvent, ProcessMeters, Protocol};
 
 /// Advertised so a browser can reach HTTP/2, which is what Apple's Low-Latency
 /// profile expects. Order is preference order: h2 first, HTTP/1.1 as the
@@ -158,6 +158,7 @@ pub struct TlsListener {
     handshakes: JoinSet<Option<(TlsStream<TcpStream>, SocketAddr)>>,
     settings: TlsSettings,
     meters: ProcessMeters,
+    events: Events,
     _watcher: CertificateWatch,
 }
 
@@ -190,7 +191,8 @@ impl TlsListener {
             .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
         config.alpn_protocols = ALPN_PROTOCOLS.iter().map(|name| name.to_vec()).collect();
 
-        let watcher = CertificateWatch::start(settings.clone(), resolver, provider, events)?;
+        let watcher =
+            CertificateWatch::start(settings.clone(), resolver, provider, events.clone())?;
 
         Ok(Self {
             tcp,
@@ -198,6 +200,7 @@ impl TlsListener {
             handshakes: JoinSet::new(),
             settings,
             meters,
+            events,
             _watcher: watcher,
         })
     }
@@ -227,7 +230,10 @@ impl axum::serve::Listener for TlsListener {
                         // accept error is never fatal to the listener, and
                         // spinning on it would burn a core.
                         Err(error) => {
-                            eprintln!("TLS accept failed: {error}");
+                            self.events.emit(NodeEvent::ListenerAcceptFailed {
+                                protocol: Protocol::Https,
+                                reason: error.to_string(),
+                            });
                             tokio::time::sleep(Duration::from_millis(50)).await;
                             continue;
                         }

@@ -356,7 +356,10 @@ async fn run_srt(
 
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = completed {
-                    eprintln!("SRT connection task failed: {error}");
+                    services.events.emit(NodeEvent::ConnectionTaskPanicked {
+                        protocol: Protocol::Srt,
+                        reason: error.to_string(),
+                    });
                 }
                 continue;
             }
@@ -380,7 +383,10 @@ async fn run_srt(
                 let pending = match accepted {
                     Ok(pending) => pending,
                     Err(error) => {
-                        eprintln!("SRT handshake rejected: {error}");
+                        services.events.emit(NodeEvent::PublisherHandshakeFailed {
+                            protocol: Protocol::Srt,
+                            reason: error.to_string(),
+                        });
                         continue;
                     }
                 };
@@ -389,7 +395,10 @@ async fn run_srt(
                     if let Err(error) =
                         run_session(Box::new(pending), &services, &session_config, slot).await
                     {
-                        eprintln!("publishing session failed: {error}");
+                        services.events.emit(NodeEvent::PublisherSessionFailed {
+                            protocol: Protocol::Srt,
+                            reason: error.to_string(),
+                        });
                     }
                 });
             }
@@ -399,7 +408,10 @@ async fn run_srt(
     drop(listener);
     while let Some(completed) = connections.join_next().await {
         if let Err(error) = completed {
-            eprintln!("SRT connection task failed during shutdown: {error}");
+            services.events.emit(NodeEvent::ConnectionTaskPanicked {
+                protocol: Protocol::Srt,
+                reason: error.to_string(),
+            });
         }
     }
     Ok(())
@@ -432,7 +444,10 @@ async fn run_rtmp(
 
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = completed {
-                    eprintln!("RTMP connection task failed: {error}");
+                    services.events.emit(NodeEvent::ConnectionTaskPanicked {
+                        protocol: Protocol::Rtmp,
+                        reason: error.to_string(),
+                    });
                 }
                 continue;
             }
@@ -456,14 +471,20 @@ async fn run_rtmp(
                     let pending = match RtmpPendingPublish::handshake_tcp(stream, config).await {
                         Ok(pending) => pending,
                         Err(error) => {
-                            eprintln!("RTMP handshake rejected: {error}");
+                            services.events.emit(NodeEvent::PublisherHandshakeFailed {
+                            protocol: Protocol::Rtmp,
+                            reason: error.to_string(),
+                        });
                             return;
                         }
                     };
                     if let Err(error) =
                         run_session(Box::new(pending), &services, &session_config, slot).await
                     {
-                        eprintln!("publishing session failed: {error}");
+                        services.events.emit(NodeEvent::PublisherSessionFailed {
+                            protocol: Protocol::Rtmp,
+                            reason: error.to_string(),
+                        });
                     }
                 });
             }
@@ -472,7 +493,10 @@ async fn run_rtmp(
 
     while let Some(completed) = connections.join_next().await {
         if let Err(error) = completed {
-            eprintln!("RTMP connection task failed during shutdown: {error}");
+            services.events.emit(NodeEvent::ConnectionTaskPanicked {
+                protocol: Protocol::Rtmp,
+                reason: error.to_string(),
+            });
         }
     }
     Ok(())
@@ -506,7 +530,10 @@ where
 fn report_bound(events: &Events, protocol: Protocol, address: std::io::Result<SocketAddr>) {
     match address {
         Ok(address) => events.emit(NodeEvent::ListenerBound { protocol, address }),
-        Err(error) => eprintln!("{protocol} listener bound but has no local address: {error}"),
+        Err(error) => events.emit(NodeEvent::ListenerAddressUnavailable {
+            protocol,
+            reason: error.to_string(),
+        }),
     }
 }
 

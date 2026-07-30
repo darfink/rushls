@@ -76,6 +76,11 @@ impl ConfigError {
     pub fn exit(self) -> ! {
         match self {
             Self::Sources(error) => error.exit(),
+            // The one place in the library that writes to stderr itself, and
+            // deliberately: configuration is read before a `Node` exists, so
+            // there is no observer to report through and nothing downstream
+            // that could route this anywhere. Everything after start-up goes
+            // through `Events`.
             error => {
                 eprintln!("error: {error}");
                 std::process::exit(2);

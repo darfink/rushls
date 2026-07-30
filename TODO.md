@@ -41,6 +41,12 @@
 
 # Problems w/ hooks:
 
+An endpoint rejecting everything produces one node event per delivery. No worse
+than the `eprintln!` it replaced, but if it floods, report transitions instead:
+`HookUnhealthy` on the first failure after a healthy stretch, `HookRecovered`
+when one lands again, plus a periodic aggregate. The per-event counters already
+carry the rate, so the events only need to carry what changed.
+
 Sign hook bodies with HMAC over the timestamp, event id, and the exact bytes
 sent, so a consumer can tell a genuine delivery from anything that can reach
 its URL. Needs a `headers` parameter on `outbound::HttpClient::post` and a
