@@ -669,6 +669,111 @@ maximum_pending_publishers_per_listener = 7
     Ok(())
 }
 
+#[test]
+fn the_http_auth_provider_resolves_and_guards_its_own_settings() -> Result<(), Box<dyn Error>> {
+    let valid = r#"
+[auth]
+provider = "http"
+
+[auth.http]
+url = "http://auth-sidecar:8081/v1/publish/admit"
+"#;
+    assert!(
+        resolve_toml(valid)?.is_ok(),
+        "a minimal http provider works"
+    );
+
+    // The internal admission deadline is 10s. A longer request timeout never
+    // takes effect: the session gives up first and blames a stage rather than
+    // the service that did not answer.
+    let outlives_admission = r#"
+[auth]
+provider = "http"
+
+[auth.http]
+url = "http://auth-sidecar:8081/admit"
+request_timeout = "30s"
+"#;
+    // A response may only name a policy this node actually has.
+    let unknown_default = r#"
+[auth]
+provider = "http"
+
+[auth.http]
+url = "http://auth-sidecar:8081/admit"
+default_policy = "nonexistent"
+"#;
+    let unusable_url = r#"
+[auth]
+provider = "http"
+
+[auth.http]
+url = "not-a-url"
+"#;
+    let missing_table = r#"
+[auth]
+provider = "http"
+"#;
+    for configuration in [
+        outlives_admission,
+        unknown_default,
+        unusable_url,
+        missing_table,
+    ] {
+        assert!(
+            resolve_toml(configuration)?.is_err(),
+            "expected a startup error for:{configuration}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_http_provider_cannot_be_combined_with_another() -> Result<(), Box<dyn Error>> {
+    let with_static = r#"
+[auth]
+provider = "http"
+
+[auth.http]
+url = "http://auth-sidecar:8081/admit"
+
+[auth.static.publishers.camera]
+stream = "live/camera"
+key = "key"
+"#;
+    let unselected_http = r#"
+[auth]
+provider = "open"
+
+[auth.http]
+url = "http://auth-sidecar:8081/admit"
+"#;
+
+    for configuration in [with_static, unselected_http] {
+        assert!(
+            resolve_toml(configuration)?.is_err(),
+            "a provider table nobody reads is a typo, not a fallback:{configuration}"
+        );
+    }
+    Ok(())
+}
+
+/// Loads one TOML fragment, separating "could not parse" from "would not run".
+fn resolve_toml(
+    configuration: &str,
+) -> Result<Result<ResolvedAppConfig, ConfigError>, Box<dyn Error>> {
+    let file = TempConfig::new(configuration)?;
+    Ok(AppConfig::load_from(
+        os([
+            "rushls",
+            "--config",
+            file.path.to_str().ok_or("temporary path is not UTF-8")?,
+        ]),
+        std::iter::empty(),
+    )
+    .and_then(AppConfig::resolve))
+}
+
 fn resolve_with_env<const N: usize>(
     values: [(&str, &str); N],
 ) -> Result<ResolvedAppConfig, ConfigError> {

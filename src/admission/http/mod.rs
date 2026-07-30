@@ -1,0 +1,244 @@
+//! Asking a service the operator runs whether a publisher may publish.
+//!
+//! # Fail closed
+//!
+//! Every way this can go wrong denies the publication. A timeout, an
+//! unreachable service, a 500, a body that is not the agreed shape — all of it
+//! becomes [`AdmissionError::Service`]. An authenticator that let a publisher
+//! through because its authority was unreachable would be worse than one that
+//! was never configured.
+//!
+//! # No retries
+//!
+//! This sits directly on the publisher's admission deadline, and the service
+//! may have side effects — a seat taken, a session recorded. Retrying would
+//! spend the deadline twice and duplicate whatever the first attempt did. The
+//! `request_id` is there so a service that wants idempotence can have it.
+//!
+//! # What the response may decide
+//!
+//! Identity, and a policy *by name*. Never the policy itself. Letting a
+//! response carry codec limits or track counts would make the sidecar's JSON a
+//! second definition of [`StreamPolicy`], free to drift from the one this node
+//! can actually enforce, and would move the safety ceiling outside the
+//! process. Names are looked up locally, and an unknown one denies.
+
+use std::collections::BTreeMap;
+
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{
+    domain::{BoxFuture, StreamId},
+    outbound::{BearerToken, Endpoint, HttpClient, OutboundError, Response},
+};
+
+use super::{
+    AdmissionError, Authenticator, IngestProtocol, Principal, PublishGrant, PublishRequest,
+    StreamPolicy,
+};
+
+const JSON: &str = "application/json";
+const DEFAULT_POLICY: &str = "default";
+
+/// Where to ask, and what the answer may select.
+#[derive(Clone, derive_more::Debug)]
+pub struct HttpAuthConfig {
+    pub endpoint: Endpoint,
+    /// Selected when an allowing response names no policy.
+    pub default_policy: String,
+    /// Every policy a response may name, resolved at start-up.
+    pub policies: BTreeMap<String, StreamPolicy>,
+    #[debug(skip)]
+    pub bearer: Option<BearerToken>,
+}
+
+/// Delegates admission to an operator-run service.
+#[derive(Clone, derive_more::Debug)]
+#[debug("HttpAuthenticator {{ endpoint: {} }}", config.endpoint)]
+pub struct HttpAuthenticator {
+    config: HttpAuthConfig,
+    client: HttpClient,
+}
+
+impl HttpAuthenticator {
+    pub fn new(config: HttpAuthConfig, client: HttpClient) -> Self {
+        Self { config, client }
+    }
+
+    fn grant(&self, allowed: Allowed) -> Result<PublishGrant, AdmissionError> {
+        if allowed.stream_id.trim().is_empty() {
+            return Err(service("the response named an empty stream"));
+        }
+        let name = allowed
+            .policy
+            .as_deref()
+            .unwrap_or(&self.config.default_policy);
+        let policy = self
+            .config
+            .policies
+            .get(name)
+            // Fails closed rather than falling back to the default: a service
+            // naming a policy this node does not have is either misconfigured
+            // or looking at a different version of the configuration, and
+            // quietly substituting a policy would apply limits nobody chose.
+            .ok_or_else(|| service(format!("the response named unknown policy `{name}`")))?;
+
+        Ok(PublishGrant {
+            stream_id: StreamId::new(allowed.stream_id),
+            principal: Principal(allowed.principal),
+            policy: policy.clone(),
+        })
+    }
+}
+
+impl Authenticator for HttpAuthenticator {
+    fn authenticate<'a>(
+        &'a self,
+        request: &'a PublishRequest,
+    ) -> BoxFuture<'a, Result<PublishGrant, AdmissionError>> {
+        Box::pin(async move {
+            let body = serde_json::to_vec(&AdmissionRequest::new(request))
+                .map_err(|error| service(format!("the request could not be built: {error}")))?;
+
+            let response = self
+                .client
+                .post(
+                    &self.config.endpoint,
+                    JSON,
+                    self.config.bearer.as_ref(),
+                    Bytes::from(body),
+                )
+                .await
+                .map_err(unreachable)?;
+
+            match decision(&response)? {
+                Decision::Allow(allowed) => self.grant(allowed),
+                // A deny is the service working, so its reason is the
+                // publisher's answer rather than a service failure. The reason
+                // is deliberately not relayed to the publisher: the protocol
+                // has no field for it, and it is the service's own vocabulary.
+                Decision::Deny { .. } => Err(AdmissionError::InvalidCredential),
+            }
+        })
+    }
+}
+
+/// Reads the decision, treating anything unexpected as a failure to decide.
+fn decision(response: &Response) -> Result<Decision, AdmissionError> {
+    if !response.status.is_success() {
+        return Err(service(format!("the service answered {}", response.status)));
+    }
+    serde_json::from_slice(&response.body)
+        .map_err(|error| service(format!("the response was not a decision: {error}")))
+}
+
+fn unreachable(error: OutboundError) -> AdmissionError {
+    service(error.to_string())
+}
+
+fn service(reason: impl Into<String>) -> AdmissionError {
+    AdmissionError::Service(reason.into().into_boxed_str())
+}
+
+/// What this node asks.
+///
+/// Versioned so a service can tell which shape it is being sent without
+/// guessing from which fields are present.
+#[derive(Debug, Serialize)]
+struct AdmissionRequest<'a> {
+    version: u8,
+    /// Unique per attempt, so a service that wants idempotence has a key.
+    request_id: String,
+    protocol: &'static str,
+    resource: Resource<'a>,
+    credential: Credential,
+    client: Client<'a>,
+}
+
+impl<'a> AdmissionRequest<'a> {
+    fn new(request: &'a PublishRequest) -> Self {
+        Self {
+            version: 1,
+            request_id: Uuid::now_v7().to_string(),
+            protocol: match request.protocol {
+                IngestProtocol::Rtmp => "rtmp",
+                IngestProtocol::Srt => "srt",
+            },
+            resource: Resource {
+                namespace: request.resource.namespace.as_deref(),
+                name: &request.resource.name,
+            },
+            credential: Credential {
+                // A credential is bytes, not text: SRT and RTMP both let a
+                // publisher present whatever it likes, so encoding it keeps a
+                // non-UTF-8 key from being mangled or from failing the whole
+                // request.
+                encoding: "base64",
+                value: BASE64.encode(request.credential.expose()),
+            },
+            client: Client {
+                remote_address: request.client.remote_address.to_string(),
+                encoder: request.client.encoder.as_deref(),
+                protocol_version: request.client.protocol_version.as_deref(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct Resource<'a> {
+    namespace: Option<&'a str>,
+    name: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct Credential {
+    encoding: &'static str,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct Client<'a> {
+    remote_address: String,
+    encoder: Option<&'a str>,
+    protocol_version: Option<&'a str>,
+}
+
+/// What the service answers.
+///
+/// Narrow on purpose. Everything absent here is something this node keeps
+/// authority over.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "decision", rename_all = "lowercase")]
+enum Decision {
+    Allow(Allowed),
+    Deny {
+        #[allow(dead_code, reason = "the service's own vocabulary, read by a human")]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct Allowed {
+    stream_id: String,
+    principal: String,
+    policy: Option<String>,
+}
+
+impl Default for HttpAuthConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: Endpoint::parse("http://127.0.0.1:8081/admit")
+                .expect("a constant endpoint is valid"),
+            default_policy: DEFAULT_POLICY.into(),
+            policies: BTreeMap::from([(DEFAULT_POLICY.into(), StreamPolicy::permissive())]),
+            bearer: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

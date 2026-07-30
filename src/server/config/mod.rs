@@ -23,11 +23,12 @@ use thiserror::Error;
 
 use crate::{
     admission::{
-        Authenticator, OpenStreamAuthenticator, Principal, PublishGrant, StaticPublisher,
-        StaticStreamAuthenticator, StreamPolicy, TakeoverPolicy,
+        Authenticator, HttpAuthConfig, HttpAuthenticator, OpenStreamAuthenticator, Principal,
+        PublishGrant, StaticPublisher, StaticStreamAuthenticator, StreamPolicy, TakeoverPolicy,
     },
     delivery::hls::uri::UriBase,
     domain::{Codec, FrameRate, StreamId},
+    outbound::{BearerToken, ClientConfig, Endpoint, HttpClient},
     segment::SegmentationPolicy,
     server::{
         NodeConfig,
@@ -157,7 +158,11 @@ impl AppConfig {
     /// Applies supported operator choices to independently evolving runtime
     /// defaults.
     pub fn resolve(self) -> Result<ResolvedAppConfig, ConfigError> {
-        let authenticator = self.auth.resolve()?;
+        let defaults = NodeConfig::default();
+        let mut client = LazyHttpClient::default();
+        let authenticator = self
+            .auth
+            .resolve(defaults.session.maximum_admission_time, &mut client)?;
         let mut node = NodeConfig {
             maximum_sessions: self.server.maximum_concurrent_publishers,
             maximum_pending_publishers_per_listener: self
@@ -205,21 +210,24 @@ pub struct AuthAppConfig {
     static_provider: Option<StaticAuthAppConfig>,
     #[conf(flatten, prefix = "open", serde(rename = "open"))]
     open: Option<OpenAuthAppConfig>,
+    #[conf(flatten, prefix = "http", serde(rename = "http"))]
+    http: Option<HttpAuthAppConfig>,
 }
 
 impl AuthAppConfig {
-    fn resolve(self) -> Result<Arc<dyn Authenticator>, ConfigError> {
+    fn resolve(
+        self,
+        admission_deadline: Duration,
+        client: &mut LazyHttpClient,
+    ) -> Result<Arc<dyn Authenticator>, ConfigError> {
         let mut profiles = self.policies.unwrap_or_default();
         profiles.0.entry("default".into()).or_default();
         let policies = profiles.resolve()?;
 
         match self.provider {
             AuthProviderValue::Static => {
-                if self.open.is_some() {
-                    return Err(invalid(
-                        "auth provider `static` cannot be combined with `[auth.open]`",
-                    ));
-                }
+                unselected(self.open.is_some(), "static", "open")?;
+                unselected(self.http.is_some(), "static", "http")?;
                 self.static_provider
                     .ok_or_else(|| {
                         invalid("auth provider `static` requires `[auth.static.publishers]`")
@@ -228,11 +236,8 @@ impl AuthAppConfig {
                     .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
             }
             AuthProviderValue::Open => {
-                if self.static_provider.is_some() {
-                    return Err(invalid(
-                        "auth provider `open` cannot be combined with `[auth.static]`",
-                    ));
-                }
+                unselected(self.static_provider.is_some(), "open", "static")?;
+                unselected(self.http.is_some(), "open", "http")?;
                 let policy_name = self
                     .open
                     .and_then(|provider| provider.policy)
@@ -243,6 +248,137 @@ impl AuthAppConfig {
                     ))
                 })?;
                 Ok(Arc::new(OpenStreamAuthenticator::new(policy.clone())))
+            }
+            AuthProviderValue::Http => {
+                unselected(self.static_provider.is_some(), "http", "static")?;
+                unselected(self.open.is_some(), "http", "open")?;
+                self.http
+                    .ok_or_else(|| invalid("auth provider `http` requires `[auth.http]`"))?
+                    .resolve(policies, admission_deadline, client)
+                    .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
+            }
+        }
+    }
+}
+
+/// Refuses a provider table that is configured but not selected.
+///
+/// A table nobody reads is a typo, and reporting it is free.
+fn unselected(present: bool, selected: &str, other: &str) -> Result<(), ConfigError> {
+    if present {
+        return Err(invalid(format!(
+            "auth provider `{selected}` cannot be combined with `[auth.{other}]`"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct HttpAuthAppConfig {
+    /// Service asked to admit each publisher.
+    #[conf(parameter, long, env)]
+    url: String,
+    /// Deadline for the whole call, connection included.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "2s",
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    request_timeout: Duration,
+    /// Deadline for establishing the connection alone.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "500ms",
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    connect_timeout: Duration,
+    /// Largest decision this node will read.
+    #[conf(parameter, long, env, default_value = "64KiB", serde(use_value_parser))]
+    maximum_response_bytes: ByteSize,
+    /// Policy applied when an allowing response names none.
+    #[conf(parameter, long, env, default_value = "default")]
+    default_policy: String,
+    /// Bearer credential presented to the service.
+    #[conf(parameter, env, secret)]
+    token: Option<String>,
+    /// Reads the bearer credential from a mounted secret instead.
+    #[conf(parameter, env)]
+    token_file: Option<PathBuf>,
+}
+
+impl HttpAuthAppConfig {
+    fn resolve(
+        self,
+        policies: BTreeMap<String, StreamPolicy>,
+        admission_deadline: Duration,
+        client: &mut LazyHttpClient,
+    ) -> Result<HttpAuthenticator, ConfigError> {
+        // A call allowed to outlive the admission deadline never gets to fail
+        // on its own terms: the session times out first and reports a stage
+        // rather than the service that did not answer.
+        if self.request_timeout >= admission_deadline {
+            return Err(invalid(format!(
+                "the auth request timeout ({:?}) must be shorter than the admission deadline ({admission_deadline:?})",
+                self.request_timeout
+            )));
+        }
+        if !policies.contains_key(&self.default_policy) {
+            return Err(invalid(format!(
+                "the http auth provider selects unknown default policy `{}`",
+                self.default_policy
+            )));
+        }
+        let token = resolve_optional_text_secret(
+            "the auth service token",
+            self.token.as_ref(),
+            self.token_file.as_ref(),
+        )?;
+
+        Ok(HttpAuthenticator::new(
+            HttpAuthConfig {
+                endpoint: Endpoint::parse(&self.url).map_err(|error| invalid(error.to_string()))?,
+                default_policy: self.default_policy,
+                policies,
+                bearer: token
+                    .map(|token| BearerToken::new(&token))
+                    .transpose()
+                    .map_err(|error| invalid(error.to_string()))?,
+            },
+            client.get_or_build(ClientConfig {
+                connect_timeout: self.connect_timeout,
+                request_timeout: self.request_timeout,
+                maximum_response_bytes: nonzero_bytes(
+                    "the maximum auth response size",
+                    self.maximum_response_bytes,
+                )?,
+            })?,
+        ))
+    }
+}
+
+/// Builds at most one outbound client, and only if something needs it.
+///
+/// Reading the platform trust store is real work, and a configuration that
+/// selects neither an external auth provider nor a hook should not pay for it
+/// — nor should the tests that cover those configurations. When both do want
+/// one they share it, so the process keeps a single connection pool.
+#[derive(Default)]
+pub struct LazyHttpClient(Option<HttpClient>);
+
+impl LazyHttpClient {
+    fn get_or_build(&mut self, config: ClientConfig) -> Result<HttpClient, ConfigError> {
+        match &self.0 {
+            Some(client) => Ok(client.clone()),
+            None => {
+                let client = HttpClient::new(config).map_err(|error| invalid(error.to_string()))?;
+                Ok(self.0.insert(client).clone())
             }
         }
     }
@@ -792,6 +928,7 @@ impl fmt::Display for OriginsValue {
 enum AuthProviderValue {
     Static,
     Open,
+    Http,
 }
 
 impl FromStr for AuthProviderValue {
@@ -801,6 +938,7 @@ impl FromStr for AuthProviderValue {
         match value {
             "static" => Ok(Self::Static),
             "open" => Ok(Self::Open),
+            "http" => Ok(Self::Http),
             _ => Err("expected `static` or `open`".into()),
         }
     }
@@ -811,6 +949,7 @@ impl fmt::Display for AuthProviderValue {
         match self {
             Self::Static => output.write_str("static"),
             Self::Open => output.write_str("open"),
+            Self::Http => output.write_str("http"),
         }
     }
 }

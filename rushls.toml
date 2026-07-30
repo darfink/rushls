@@ -74,6 +74,38 @@ policy = "default"
 # Omit this field to select `default`.
 # policy = "default"
 
+# Alternative external-provider configuration, mutually exclusive with the two
+# tables above. Each publisher is admitted by asking a service you run, which
+# answers with an identity and the name of a policy defined above:
+#
+#   {"decision": "allow", "stream_id": "events/main", "principal": "account-42"}
+#   {"decision": "deny",  "reason": "subscription_inactive"}
+#
+# The response selects a policy by name and never carries limits of its own, so
+# what a publisher may send stays defined here. An unknown name denies.
+#
+# Anything other than a decision — a timeout, an unreachable service, a 5xx, a
+# body that is not the agreed shape — denies the publication. Nothing is
+# retried: this runs inside the publisher's admission deadline, and the service
+# may have side effects. Each request carries a unique `request_id` so a service
+# that wants idempotence has a key to use.
+#
+# Concurrent requests are bounded by `maximum_pending_publishers_per_listener`
+# above, times the number of ingest listeners.
+#
+# [auth.http]
+# url = "http://auth-sidecar:8081/v1/publish/admit"
+# The request timeout must be shorter than the internal admission deadline,
+# which is 10 seconds; otherwise the session gives up before the service does
+# and reports a stage rather than the service that failed to answer.
+# request_timeout = "2s"
+# connect_timeout = "500ms"
+# maximum_response_bytes = "64KiB"
+# Applied when an allowing response names no policy.
+# default_policy = "default"
+# token = "replace-with-an-auth-token"
+# token_file = "/run/secrets/rushls-auth-token"
+
 [ingest.rtmp]
 # Use 127.0.0.1 when a local proxy is the only intended RTMP client.
 listen = "0.0.0.0:1935"
