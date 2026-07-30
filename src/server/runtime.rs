@@ -17,7 +17,7 @@ use crate::{
     media::PassThroughNormalizerFactory,
     mux::{CmafMuxerConfig, PassThroughMuxerFactory},
     observe::{Events, NodeEvent, ProcessMeters, Protocol},
-    session::{Registry, Services, SessionConfig, StopReason, run_session},
+    session::{PendingPublishers, Registry, Services, SessionConfig, StopReason, run_session},
     source::transport::{
         rtmp::{RtmpConfig, RtmpPendingPublish},
         srt::{SrtConfig, SrtListener},
@@ -37,6 +37,14 @@ pub struct NodeConfig {
     pub http_address: SocketAddr,
     pub maintenance_interval: Duration,
     pub maximum_sessions: usize,
+    /// Connections each ingest listener may be admitting at once.
+    ///
+    /// Counted per listener rather than process-wide so that a flood on one
+    /// transport cannot deny admission on the other. Separate from
+    /// [`Self::maximum_sessions`], which bounds publishers that already
+    /// authenticated: a node at its session capacity keeps its full admission
+    /// headroom, and still rejects the surplus in the source protocol.
+    pub maximum_pending_publishers: usize,
     pub rtmp: RtmpConfig,
     pub srt: SrtConfig,
     pub session: SessionConfig,
@@ -55,6 +63,7 @@ impl Default for NodeConfig {
             http_address: "0.0.0.0:8080".parse().expect("constant address is valid"),
             maintenance_interval: Duration::from_secs(1),
             maximum_sessions: 256,
+            maximum_pending_publishers: 64,
             rtmp: RtmpConfig::default(),
             srt: SrtConfig::default(),
             session: SessionConfig::default(),
@@ -119,6 +128,11 @@ impl Node {
         if config.maximum_sessions == 0 {
             return Err(RuntimeError::InvalidConfiguration(
                 "maximum sessions must be nonzero",
+            ));
+        }
+        if config.maximum_pending_publishers == 0 {
+            return Err(RuntimeError::InvalidConfiguration(
+                "maximum pending publishers must be nonzero",
             ));
         }
         if config.maintenance_interval.is_zero() {
@@ -228,17 +242,21 @@ impl Node {
 
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
+        // One budget each: a transport being flooded with connections that
+        // never authenticate should not stop the other from admitting anyone.
         tasks.spawn(run_rtmp(
             rtmp_listener,
             self.config.rtmp,
             self.services.clone(),
             self.config.session,
+            PendingPublishers::new(self.config.maximum_pending_publishers),
             stop_rx.clone(),
         ));
         tasks.spawn(run_srt(
             srt_listener,
             self.services.clone(),
             self.config.session,
+            PendingPublishers::new(self.config.maximum_pending_publishers),
             stop_rx.clone(),
         ));
         // The listener type differs but the server does not: both arms run the
@@ -318,22 +336,40 @@ async fn run_srt(
     mut listener: SrtListener,
     services: Services,
     session_config: SessionConfig,
+    pending_publishers: PendingPublishers,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
     let mut connections = JoinSet::new();
     loop {
-        tokio::select! {
+        // Reserved before accepting, for the reason given in `run_rtmp`. SRT's
+        // own listener backlog bounds what waits ahead of `accept`; nothing
+        // bounded what came after it.
+        let slot = tokio::select! {
             biased;
 
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
                     break;
                 }
+                continue;
             }
 
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = completed {
                     eprintln!("SRT connection task failed: {error}");
+                }
+                continue;
+            }
+
+            slot = pending_publishers.reserve() => slot,
+        };
+
+        tokio::select! {
+            biased;
+
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
                 }
             }
 
@@ -351,7 +387,7 @@ async fn run_srt(
                 let services = services.clone();
                 connections.spawn(async move {
                     if let Err(error) =
-                        run_session(Box::new(pending), &services, &session_config).await
+                        run_session(Box::new(pending), &services, &session_config, slot).await
                     {
                         eprintln!("publishing session failed: {error}");
                     }
@@ -374,22 +410,42 @@ async fn run_rtmp(
     config: RtmpConfig,
     services: Services,
     session_config: SessionConfig,
+    pending_publishers: PendingPublishers,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
     let mut connections = JoinSet::new();
     loop {
-        tokio::select! {
+        // Capacity is reserved *before* accepting, so a surplus of connections
+        // waits in the kernel's backlog instead of becoming tasks that nothing
+        // has authenticated. Accepting and then closing would give an attacker
+        // cheap connection churn and give a well-behaved encoder nothing to
+        // retry against.
+        let slot = tokio::select! {
             biased;
 
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() {
                     break;
                 }
+                continue;
             }
 
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = completed {
                     eprintln!("RTMP connection task failed: {error}");
+                }
+                continue;
+            }
+
+            slot = pending_publishers.reserve() => slot,
+        };
+
+        tokio::select! {
+            biased;
+
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
                 }
             }
 
@@ -405,7 +461,7 @@ async fn run_rtmp(
                         }
                     };
                     if let Err(error) =
-                        run_session(Box::new(pending), &services, &session_config).await
+                        run_session(Box::new(pending), &services, &session_config, slot).await
                     {
                         eprintln!("publishing session failed: {error}");
                     }
@@ -554,6 +610,13 @@ mod tests {
         assert!(matches!(
             node(NodeConfig {
                 maintenance_interval: Duration::ZERO,
+                ..NodeConfig::default()
+            }),
+            Err(RuntimeError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            node(NodeConfig {
+                maximum_pending_publishers: 0,
                 ..NodeConfig::default()
             }),
             Err(RuntimeError::InvalidConfiguration(_))

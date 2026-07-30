@@ -31,8 +31,9 @@ use crate::{
 };
 
 use super::{
-    AtCapacity, HealthPolicy, Registry, RegistryError, Services, SessionConfig, SessionError,
-    SessionOutcome, StopReason, SupervisionError, SupervisionPolicy, run_session,
+    AtCapacity, HealthPolicy, PendingPermit, PendingPublishers, Registry, RegistryError, Services,
+    SessionConfig, SessionError, SessionOutcome, StopReason, SupervisionError, SupervisionPolicy,
+    run_session,
 };
 
 const SECOND: i64 = 90_000;
@@ -557,7 +558,13 @@ impl Harness {
     }
 
     async fn run(&self, ending: Ending) -> Result<SessionOutcome, SessionError> {
-        run_session(self.pending(ending), &self.services, &config()).await
+        run_session(
+            self.pending(ending),
+            &self.services,
+            &config(),
+            PendingPermit::unlimited(),
+        )
+        .await
     }
 
     async fn run_with(
@@ -565,7 +572,13 @@ impl Harness {
         ending: Ending,
         config: &SessionConfig,
     ) -> Result<SessionOutcome, SessionError> {
-        run_session(self.pending(ending), &self.services, config).await
+        run_session(
+            self.pending(ending),
+            &self.services,
+            config,
+            PendingPermit::unlimited(),
+        )
+        .await
     }
 
     fn calls(&self) -> Vec<&'static str> {
@@ -753,12 +766,45 @@ async fn a_midstream_codec_change_is_counted_by_the_source_that_saw_it() {
 }
 
 #[tokio::test]
+async fn an_admission_slot_is_returned_before_the_session_it_admitted_ends() {
+    let harness = Harness::healthy();
+    let services = harness.services.clone();
+    let pending = harness.pending(Ending::Stall);
+    // One slot, so a session still holding it would make the budget observably
+    // empty for as long as the publisher stays connected.
+    let publishers = PendingPublishers::new(1);
+    let slot = publishers.reserve().await;
+    assert_eq!(publishers.available(), 0);
+
+    let session =
+        tokio::spawn(async move { run_session(pending, &services, &config(), slot).await });
+    let live = await_published(&harness.store).await;
+
+    assert_eq!(
+        publishers.available(),
+        1,
+        "a running publisher must not hold admission capacity: the budget \
+         exists to absorb connection bursts, not to shadow the session cap"
+    );
+
+    harness.sessions.stop_all(StopReason::Cancelled);
+    tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("the session stops")
+        .expect("the session task succeeds")
+        .expect("cancellation is not a failure");
+    assert!(live.is_ended());
+}
+
+#[tokio::test]
 async fn a_cancelled_session_still_leaves_a_playable_stream() {
     let harness = Harness::healthy();
     let services = harness.services.clone();
     let pending = harness.pending(Ending::Stall);
 
-    let session = tokio::spawn(async move { run_session(pending, &services, &config()).await });
+    let session = tokio::spawn(async move {
+        run_session(pending, &services, &config(), PendingPermit::unlimited()).await
+    });
 
     // Wait for the pipeline to reach the live loop and publish its pre-roll.
     let live = await_published(&harness.store).await;
@@ -797,16 +843,27 @@ async fn a_second_publisher_takes_the_stream_over() {
     let incumbent_pending = harness.pending(Ending::Stall);
 
     let incumbent = tokio::spawn(async move {
-        run_session(incumbent_pending, &incumbent_services, &config()).await
+        run_session(
+            incumbent_pending,
+            &incumbent_services,
+            &config(),
+            PendingPermit::unlimited(),
+        )
+        .await
     });
     await_published(&harness.store).await;
 
     let takeover_services = harness.services.clone();
     let takeover_pending = harness.pending(Ending::Stall);
-    let takeover =
-        tokio::spawn(
-            async move { run_session(takeover_pending, &takeover_services, &config()).await },
-        );
+    let takeover = tokio::spawn(async move {
+        run_session(
+            takeover_pending,
+            &takeover_services,
+            &config(),
+            PendingPermit::unlimited(),
+        )
+        .await
+    });
 
     let outcome = tokio::time::timeout(Duration::from_secs(5), incumbent)
         .await
@@ -852,7 +909,13 @@ async fn a_stream_policy_can_reject_takeovers_before_transport_acceptance() {
     let incumbent_services = harness.services.clone();
     let incumbent_pending = harness.pending(Ending::Stall);
     let incumbent = tokio::spawn(async move {
-        run_session(incumbent_pending, &incumbent_services, &config()).await
+        run_session(
+            incumbent_pending,
+            &incumbent_services,
+            &config(),
+            PendingPermit::unlimited(),
+        )
+        .await
     });
     await_published(&harness.store).await;
 
@@ -904,7 +967,7 @@ async fn a_stalled_publisher_is_terminated_as_unhealthy() {
 
     let error = tokio::time::timeout(
         Duration::from_secs(5),
-        run_session(pending, &services, &config),
+        run_session(pending, &services, &config, PendingPermit::unlimited()),
     )
     .await
     .expect("supervision gives up")
@@ -925,7 +988,9 @@ async fn the_registry_reports_the_phase_a_session_is_in() {
     let services = harness.services.clone();
     let pending = harness.pending(Ending::Stall);
 
-    let session = tokio::spawn(async move { run_session(pending, &services, &config()).await });
+    let session = tokio::spawn(async move {
+        run_session(pending, &services, &config(), PendingPermit::unlimited()).await
+    });
     await_published(&harness.store).await;
 
     let snapshots = harness.sessions.snapshot();
@@ -976,7 +1041,9 @@ async fn cancelling_still_flushes_media_the_normalizer_was_holding_back() {
     let services = harness.services.clone();
     let pending = harness.pending(Ending::Stall);
 
-    let session = tokio::spawn(async move { run_session(pending, &services, &config()).await });
+    let session = tokio::spawn(async move {
+        run_session(pending, &services, &config(), PendingPermit::unlimited()).await
+    });
     await_published(&harness.store).await;
     harness.sessions.stop_all(StopReason::Cancelled);
 
@@ -1099,9 +1166,14 @@ async fn a_handshake_that_never_completes_does_not_hold_a_task_forever() {
         ..config()
     };
 
-    let error = run_session(Box::new(SilentPending), &harness.services, &config)
-        .await
-        .expect_err("a silent peer is timed out");
+    let error = run_session(
+        Box::new(SilentPending),
+        &harness.services,
+        &config,
+        PendingPermit::unlimited(),
+    )
+    .await
+    .expect_err("a silent peer is timed out");
 
     assert_eq!(
         error,
@@ -1123,9 +1195,14 @@ async fn a_source_that_hangs_while_probing_does_not_hold_a_task_forever() {
     };
     let pending = harness.pending_for("camera", Ending::HangOnDiscovery);
 
-    let error = run_session(pending, &harness.services, &config)
-        .await
-        .expect_err("a hanging probe is timed out");
+    let error = run_session(
+        pending,
+        &harness.services,
+        &config,
+        PendingPermit::unlimited(),
+    )
+    .await
+    .expect_err("a hanging probe is timed out");
 
     assert_eq!(
         error,
@@ -1146,13 +1223,15 @@ async fn a_node_at_capacity_turns_a_new_publisher_away_in_the_protocol() {
     };
     let held = services.clone();
     let pending = harness.pending(Ending::Stall);
-    let incumbent = tokio::spawn(async move { run_session(pending, &held, &config()).await });
+    let incumbent = tokio::spawn(async move {
+        run_session(pending, &held, &config(), PendingPermit::unlimited()).await
+    });
     await_published(&harness.store).await;
 
     // A different stream, so this is a genuinely new session rather than a
     // takeover of the one already running.
     let overflow = harness.pending_for("other", Ending::Eof);
-    let error = run_session(overflow, &services, &config())
+    let error = run_session(overflow, &services, &config(), PendingPermit::unlimited())
         .await
         .expect_err("a full node refuses the publication");
 

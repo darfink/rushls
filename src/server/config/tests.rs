@@ -629,6 +629,46 @@ io_buffer_size = "64KiB"
     Ok(())
 }
 
+#[test]
+fn the_two_publisher_limits_are_configured_independently() -> Result<(), Box<dyn Error>> {
+    let file = TempConfig::new(
+        r#"
+[server]
+maximum_concurrent_publishers = 40
+maximum_pending_publishers = 7
+"#,
+    )?;
+    let config = AppConfig::load_from(
+        os([
+            "rushls",
+            "--config",
+            file.path.to_str().ok_or("temporary path is not UTF-8")?,
+        ]),
+        std::iter::empty(),
+    )?
+    .resolve()?;
+
+    assert_eq!(config.node.maximum_sessions, 40);
+    assert_eq!(config.node.maximum_pending_publishers, 7);
+
+    // The admission budget deliberately need not exceed the session cap: it
+    // covers a different population, and a slot is returned as soon as a
+    // publisher authenticates rather than being held for the session.
+    let raised = AppConfig::load_from(
+        os([
+            "rushls",
+            "--config",
+            file.path.to_str().ok_or("temporary path is not UTF-8")?,
+            "--server-maximum-pending-publishers",
+            "9",
+        ]),
+        env([("RUSHLS_SERVER_MAXIMUM_PENDING_PUBLISHERS", "8")]),
+    )?
+    .resolve()?;
+    assert_eq!(raised.node.maximum_pending_publishers, 9);
+    Ok(())
+}
+
 fn resolve_with_env<const N: usize>(
     values: [(&str, &str); N],
 ) -> Result<ResolvedAppConfig, ConfigError> {

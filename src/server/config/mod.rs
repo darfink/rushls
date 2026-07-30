@@ -155,6 +155,7 @@ impl AppConfig {
         let authenticator = self.auth.resolve()?;
         let mut node = NodeConfig {
             maximum_sessions: self.server.maximum_concurrent_publishers,
+            maximum_pending_publishers: self.server.maximum_pending_publishers,
             rtmp_address: self.ingest.rtmp.listen,
             srt_address: self.ingest.srt.listen,
             http_address: self.http.listen,
@@ -179,6 +180,9 @@ pub struct ServerAppConfig {
     /// Maximum publishers that may be active at the same time.
     #[conf(parameter, long, env, default_value = "256")]
     pub maximum_concurrent_publishers: usize,
+    /// Maximum publishers each ingest listener may be authenticating at once.
+    #[conf(parameter, long, env, default_value = "64")]
+    pub maximum_pending_publishers: usize,
 }
 
 #[derive(Conf)]

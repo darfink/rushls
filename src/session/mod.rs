@@ -25,6 +25,7 @@ mod context;
 mod control;
 mod health;
 mod live;
+mod pending;
 mod phase;
 mod registry;
 mod services;
@@ -34,6 +35,7 @@ pub use context::SessionContext;
 pub use control::{StopReason, StopToken};
 pub use health::{HealthEvaluation, HealthPolicy, evaluate as evaluate_health};
 pub use live::{ExecutionError, LiveSession, MediaHead, MediaTail};
+pub use pending::{PendingPermit, PendingPublishers};
 pub use phase::Phase;
 pub use registry::{
     AtCapacity, Registration, Registry, RegistryError, SessionShared, SessionSnapshot,
@@ -131,10 +133,15 @@ pub enum SessionError {
 }
 
 /// Runs one publication for its entire life.
+///
+/// `slot` is the caller's reservation from [`PendingPublishers`], released as
+/// soon as admission concludes: everything past that point is bounded by the
+/// registry's session capacity instead.
 pub async fn run_session(
     pending: Box<dyn PendingPublish>,
     services: &Services,
     config: &SessionConfig,
+    slot: PendingPermit,
 ) -> Result<SessionOutcome, SessionError> {
     let meters = SessionMeters::new(services.meters.clone());
     // Admission is bounded from out here rather than inside, because the thing
@@ -147,8 +154,12 @@ pub async fn run_session(
     .await
     .map_err(|_| SessionError::TimedOut {
         phase: Phase::Accepted,
-    })?;
-    let AcceptedPublish { source, grant } = admitted?;
+    });
+    // Explicit rather than left to scope, because *when* this is released is
+    // the whole point: a session that runs for hours must not still be holding
+    // a slot that exists to absorb connection bursts.
+    drop(slot);
+    let AcceptedPublish { source, grant } = admitted??;
     services.meters.session_started();
 
     let stop = StopToken::new();

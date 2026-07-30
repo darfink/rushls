@@ -15,6 +15,13 @@
 [server]
 # Maximum publishers that may be connected and actively publishing at once.
 maximum_concurrent_publishers = 256
+# Maximum publishers each ingest listener may be authenticating at once. This
+# bounds the window between a connection arriving and it proving who it is,
+# which the limit above does not cover: it counts only publishers that already
+# authenticated. Surplus connections wait in the listener's backlog rather than
+# being refused, and each listener has its own budget, so a flood of anonymous
+# connections on one protocol cannot stop the other from admitting anyone.
+maximum_pending_publishers = 64
 
 [auth]
 # The default `open` provider accepts every publisher without checking a key

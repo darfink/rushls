@@ -655,7 +655,7 @@ mod end_to_end {
         observe::{Events, SourceMeters},
         segment::SegmentationPolicy,
         server::{Node, NodeConfig},
-        session::{SessionOutcome, run_session},
+        session::{PendingPermit, SessionOutcome, run_session},
         source::{
             AcceptedPublish, PendingPublish, PublishRejection, TransportError,
             avformat::{AvformatConfig, AvformatPacketSource, ReadInput},
@@ -754,7 +754,13 @@ mod end_to_end {
     #[tokio::test]
     async fn avformat_through_normalization_cmaf_hls_and_http_is_playable() {
         let (node, session) = node();
-        let outcome = run_session(publish(session.input), node.services(), &session).await;
+        let outcome = run_session(
+            publish(session.input),
+            node.services(),
+            &session,
+            PendingPermit::unlimited(),
+        )
+        .await;
         assert_eq!(outcome, Ok(SessionOutcome::Ended));
 
         let listener = bind("127.0.0.1:0".parse().expect("constant is valid"))
