@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     fs,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::{
@@ -719,15 +719,23 @@ struct TempConfig {
     path: PathBuf,
 }
 
+/// Distinguishes files within one test binary.
+///
+/// A clock reading cannot: `SystemTime` is not nanosecond-granular on every
+/// platform, so two calls close together can produce the same name. A test that
+/// writes a secret and then the configuration pointing at it would then have
+/// the second file overwrite the first, leaving the secret's path holding TOML
+/// — and the first `Drop` deleting the file the second still needed.
+static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
+
 impl TempConfig {
     fn new(contents: &str) -> std::io::Result<Self> {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+        // The process id separates concurrent test binaries; the counter
+        // separates files within one of them.
         let path = std::env::temp_dir().join(format!(
-            "rushls-config-test-{}-{unique}.toml",
-            std::process::id()
+            "rushls-config-test-{}-{}.toml",
+            std::process::id(),
+            NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&path, contents)?;
         Ok(Self { path })
