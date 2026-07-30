@@ -37,14 +37,18 @@ pub struct NodeConfig {
     pub http_address: SocketAddr,
     pub maintenance_interval: Duration,
     pub maximum_sessions: usize,
-    /// Connections each ingest listener may be admitting at once.
+    /// Connections one ingest listener may be admitting at once.
     ///
     /// Counted per listener rather than process-wide so that a flood on one
-    /// transport cannot deny admission on the other. Separate from
+    /// transport cannot deny admission on the other; the process ceiling is
+    /// this value times the number of ingest listeners. Separate from
     /// [`Self::maximum_sessions`], which bounds publishers that already
     /// authenticated: a node at its session capacity keeps its full admission
     /// headroom, and still rejects the surplus in the source protocol.
-    pub maximum_pending_publishers: usize,
+    ///
+    /// A permit is held across authentication, so this is also what bounds
+    /// concurrent requests to an external authentication provider.
+    pub maximum_pending_publishers_per_listener: usize,
     pub rtmp: RtmpConfig,
     pub srt: SrtConfig,
     pub session: SessionConfig,
@@ -63,7 +67,7 @@ impl Default for NodeConfig {
             http_address: "0.0.0.0:8080".parse().expect("constant address is valid"),
             maintenance_interval: Duration::from_secs(1),
             maximum_sessions: 256,
-            maximum_pending_publishers: 64,
+            maximum_pending_publishers_per_listener: 64,
             rtmp: RtmpConfig::default(),
             srt: SrtConfig::default(),
             session: SessionConfig::default(),
@@ -130,7 +134,7 @@ impl Node {
                 "maximum sessions must be nonzero",
             ));
         }
-        if config.maximum_pending_publishers == 0 {
+        if config.maximum_pending_publishers_per_listener == 0 {
             return Err(RuntimeError::InvalidConfiguration(
                 "maximum pending publishers must be nonzero",
             ));
@@ -249,14 +253,14 @@ impl Node {
             self.config.rtmp,
             self.services.clone(),
             self.config.session,
-            PendingPublishers::new(self.config.maximum_pending_publishers),
+            PendingPublishers::new(self.config.maximum_pending_publishers_per_listener),
             stop_rx.clone(),
         ));
         tasks.spawn(run_srt(
             srt_listener,
             self.services.clone(),
             self.config.session,
-            PendingPublishers::new(self.config.maximum_pending_publishers),
+            PendingPublishers::new(self.config.maximum_pending_publishers_per_listener),
             stop_rx.clone(),
         ));
         // The listener type differs but the server does not: both arms run the
@@ -643,7 +647,7 @@ mod tests {
         ));
         assert!(matches!(
             node(NodeConfig {
-                maximum_pending_publishers: 0,
+                maximum_pending_publishers_per_listener: 0,
                 ..NodeConfig::default()
             }),
             Err(RuntimeError::InvalidConfiguration(_))

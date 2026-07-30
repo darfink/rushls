@@ -5,6 +5,9 @@
 ## Visibility
 - Prefer plain `pub` or private items. Use restricted visibility like `pub(crate)` or `pub(super)` only when a boundary genuinely needs it and the simpler choice would leak an internal API.
 
+## Logging
+- Avoid `eprintln!` outside the event consumer; emit observe events instead.
+
 ## Code Style & Comments Rule
 - **Move shared test code setups to fixtures.rs for duplicated code:** If test code is shared between files, move common code to fixtures.rs
 - Return `Result<(), Error>` from tests and use `?` for fallible setup; keep `expect`/`unwrap` for intentional failure assertions or invariants.

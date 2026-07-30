@@ -635,7 +635,7 @@ fn the_two_publisher_limits_are_configured_independently() -> Result<(), Box<dyn
         r#"
 [server]
 maximum_concurrent_publishers = 40
-maximum_pending_publishers = 7
+maximum_pending_publishers_per_listener = 7
 "#,
     )?;
     let config = AppConfig::load_from(
@@ -649,7 +649,7 @@ maximum_pending_publishers = 7
     .resolve()?;
 
     assert_eq!(config.node.maximum_sessions, 40);
-    assert_eq!(config.node.maximum_pending_publishers, 7);
+    assert_eq!(config.node.maximum_pending_publishers_per_listener, 7);
 
     // The admission budget deliberately need not exceed the session cap: it
     // covers a different population, and a slot is returned as soon as a
@@ -659,13 +659,13 @@ maximum_pending_publishers = 7
             "rushls",
             "--config",
             file.path.to_str().ok_or("temporary path is not UTF-8")?,
-            "--server-maximum-pending-publishers",
+            "--server-maximum-pending-publishers-per-listener",
             "9",
         ]),
-        env([("RUSHLS_SERVER_MAXIMUM_PENDING_PUBLISHERS", "8")]),
+        env([("RUSHLS_SERVER_MAXIMUM_PENDING_PUBLISHERS_PER_LISTENER", "8")]),
     )?
     .resolve()?;
-    assert_eq!(raised.node.maximum_pending_publishers, 9);
+    assert_eq!(raised.node.maximum_pending_publishers_per_listener, 9);
     Ok(())
 }
 
