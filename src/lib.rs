@@ -15,8 +15,13 @@
 //! source      transports and demux, fused: a protocol implies its container
 //! admission   who may publish what
 //! observe     meters and lifecycle events
+//! outbound    requests to operator-configured services
 //! domain      identities, tick arithmetic, tracks, payloads
 //! ```
+//!
+//! `outbound` sits near the bottom because both `admission` and `observe` call
+//! out to endpoints an administrator configured, and neither may depend on the
+//! other. It knows nothing about publishers, streams, or events.
 //!
 //! # The streaming path
 //!
@@ -41,6 +46,7 @@ mod ffmpeg;
 pub mod media;
 pub mod mux;
 pub mod observe;
+pub mod outbound;
 pub mod segment;
 pub mod server;
 pub mod session;
