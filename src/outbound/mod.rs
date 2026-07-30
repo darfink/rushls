@@ -180,6 +180,27 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
+    /// The same connection pool under different per-request limits.
+    ///
+    /// A deadline and a response ceiling are properties of a request, not of a
+    /// pool, and admission and hooks want different ones: admission runs inside
+    /// a publisher's handshake, while a hook is free to wait. Sharing the
+    /// client keeps the platform trust store read once and the TLS
+    /// configuration built once, which is the part worth sharing.
+    ///
+    /// `connect_timeout` is fixed when the connector is built and so is not
+    /// overridable here.
+    pub fn with_limits(&self, request_timeout: Duration, maximum_response_bytes: usize) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            config: ClientConfig {
+                request_timeout,
+                maximum_response_bytes,
+                ..self.config
+            },
+        }
+    }
+
     /// Builds a client trusting the platform's certificate store.
     ///
     /// The platform store rather than a bundled root set, so an endpoint behind

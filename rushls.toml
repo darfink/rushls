@@ -99,7 +99,6 @@ policy = "default"
 # which is 10 seconds; otherwise the session gives up before the service does
 # and reports a stage rather than the service that failed to answer.
 # request_timeout = "2s"
-# connect_timeout = "500ms"
 # maximum_response_bytes = "64KiB"
 # Applied when an allowing response names no policy.
 # default_policy = "default"
@@ -188,3 +187,59 @@ enabled = false
 # token_file = "/run/secrets/rushls-metrics-token"
 # Per-stream series use stream names as labels and may create high cardinality.
 per_stream = false
+
+[hooks]
+# Lifecycle events delivered to services you run. Nothing is sent unless
+# `[hooks.endpoints]` below names at least one destination.
+#
+# Delivery is best-effort and at-least-once while the process lives. Every event
+# carries a stable id that retries reuse, so deduplicate on `source` + `id`.
+# Events for one stream arrive in the order they occurred, though a prefix may
+# be missing after an outage; nothing is promised across different streams, and
+# nothing survives a crash. Hooks are a notification channel, not a ledger: make
+# anything correctness-critical reconcile against the node's own state.
+
+# CloudEvents `source`, identifying this deployment. With the per-event id it
+# identifies an occurrence, so keep it stable across restarts. Several nodes may
+# share one, in which case consumers see a single logical producer.
+source = "urn:rushls:node"
+# How long a shutdown waits for queued events before abandoning them.
+drain_timeout = "5s"
+# Deadline for one delivery attempt, and the largest response read from an
+# endpoint. Both are per-request, so they are independent of the shorter
+# deadline publisher admission runs under.
+request_timeout = "5s"
+maximum_response_bytes = "64KiB"
+
+# Each destination is a named table. The name identifies it in logs and metrics.
+#
+# Bodies are structured-mode CloudEvents:
+#
+#   {"specversion": "1.0", "id": "...", "source": "urn:rushls:node",
+#    "type": "rushls.session.started.v1", "subject": "live/camera",
+#    "time": "...", "datacontenttype": "application/json", "data": {...}}
+#
+# Answer 2xx to acknowledge. A 408, 425, 429 or 5xx is retried with backoff,
+# honouring `Retry-After` up to 30 seconds; any other 4xx is taken as "this
+# request is wrong" and is not retried, since retrying would hold up everything
+# queued behind it for that stream.
+#
+# [hooks.endpoints.automation]
+# url = "http://automation:9000/rushls/events"
+# Required rather than defaulting to everything, so a consumer written today is
+# never sent an event type added after it. One or more of:
+#   "session.started"  a publisher was admitted
+#   "stream.available" the stream can be played
+#   "session.ended"    a publisher stopped, for any reason
+# events = ["session.started", "stream.available", "session.ended"]
+# Events held for this endpoint before the oldest waiting one is dropped. The
+# oldest, never the newest: what survives stays in order and the most recent
+# state is what is kept.
+# queue_capacity = 1000
+# Distinct streams delivered at once. One request per stream is the ordering
+# rule, so this is also the concurrency.
+# maximum_in_flight = 8
+# Attempts per event, the first included.
+# maximum_attempts = 5
+# token = "replace-with-a-hook-token"
+# token_file = "/run/secrets/rushls-hook-token"

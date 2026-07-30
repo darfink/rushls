@@ -5,7 +5,7 @@
 //! the deliberately supported operator choices are applied here.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fmt, fs,
     net::SocketAddr,
@@ -28,6 +28,8 @@ use crate::{
     },
     delivery::hls::uri::UriBase,
     domain::{Codec, FrameRate, StreamId},
+    hooks::{HookConfig, HooksConfig},
+    observe::lifecycle::Kind,
     outbound::{BearerToken, ClientConfig, Endpoint, HttpClient},
     segment::SegmentationPolicy,
     server::{
@@ -42,6 +44,14 @@ use crate::{
 pub struct ResolvedAppConfig {
     pub node: NodeConfig,
     pub authenticator: Arc<dyn Authenticator>,
+    /// `None` unless `[hooks.endpoints]` names at least one destination.
+    pub hooks: Option<ResolvedHooks>,
+}
+
+/// Hooks and the client they deliver with, which carries their own deadline.
+pub struct ResolvedHooks {
+    pub config: HooksConfig,
+    pub client: HttpClient,
 }
 
 /// Failures while locating, reading, parsing, or resolving configuration.
@@ -114,6 +124,8 @@ pub struct AppConfig {
     pub http: HttpAppConfig,
     #[conf(flatten, prefix)]
     pub metrics: MetricsAppConfig,
+    #[conf(flatten, prefix)]
+    pub hooks: HooksAppConfig,
 }
 
 impl AppConfig {
@@ -178,10 +190,12 @@ impl AppConfig {
         self.storage.apply(&mut node)?;
         node.http = self.http.resolve()?;
         node.metrics = self.metrics.resolve()?;
+        let hooks = self.hooks.resolve(&mut client)?;
 
         Ok(ResolvedAppConfig {
             node,
             authenticator,
+            hooks,
         })
     }
 }
@@ -289,16 +303,6 @@ pub struct HttpAuthAppConfig {
         serde(use_value_parser)
     )]
     request_timeout: Duration,
-    /// Deadline for establishing the connection alone.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "500ms",
-        value_parser = humantime::parse_duration,
-        serde(use_value_parser)
-    )]
-    connect_timeout: Duration,
     /// Largest decision this node will read.
     #[conf(parameter, long, env, default_value = "64KiB", serde(use_value_parser))]
     maximum_response_bytes: ByteSize,
@@ -351,36 +355,213 @@ impl HttpAuthAppConfig {
                     .transpose()
                     .map_err(|error| invalid(error.to_string()))?,
             },
-            client.get_or_build(ClientConfig {
-                connect_timeout: self.connect_timeout,
-                request_timeout: self.request_timeout,
-                maximum_response_bytes: nonzero_bytes(
+            client.with_limits(
+                self.request_timeout,
+                nonzero_bytes(
                     "the maximum auth response size",
                     self.maximum_response_bytes,
                 )?,
-            })?,
+            )?,
         ))
+    }
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct HooksAppConfig {
+    /// CloudEvents `source`, identifying this deployment to consumers.
+    ///
+    /// With the per-event id it identifies an occurrence, so it must be stable
+    /// across restarts. Nodes may share one, in which case consumers see a
+    /// single logical producer.
+    #[conf(parameter, long, env, default_value = "urn:rushls:node")]
+    source: String,
+    /// How long a shutdown waits for queued events before abandoning them.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "5s",
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    drain_timeout: Duration,
+    /// Deadline for one delivery attempt, connection included.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "5s",
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    request_timeout: Duration,
+    /// Largest response this node will read from an endpoint.
+    #[conf(parameter, long, env, default_value = "64KiB", serde(use_value_parser))]
+    maximum_response_bytes: ByteSize,
+    /// Destinations, keyed by a name that identifies them in logs and metrics.
+    #[conf(parameter, value_parser = HookEndpoints::from_str)]
+    endpoints: Option<HookEndpoints>,
+}
+
+impl HooksAppConfig {
+    fn resolve(self, client: &mut LazyHttpClient) -> Result<Option<ResolvedHooks>, ConfigError> {
+        let endpoints = self.endpoints.unwrap_or_default();
+        if endpoints.0.is_empty() {
+            // Nothing configured, so nothing is built — including the outbound
+            // client, which a node delivering no events should not pay for.
+            return Ok(None);
+        }
+
+        let mut hooks = Vec::with_capacity(endpoints.0.len());
+        for (name, endpoint) in endpoints.0 {
+            hooks.push(endpoint.resolve(&name)?);
+        }
+
+        Ok(Some(ResolvedHooks {
+            config: HooksConfig {
+                source: self.source,
+                drain_timeout: self.drain_timeout,
+                hooks,
+                ..HooksConfig::default()
+            },
+            // A hook may wait far longer than admission may, which is why the
+            // limits are per-request rather than baked into a shared client.
+            client: client.with_limits(
+                self.request_timeout,
+                nonzero_bytes(
+                    "the maximum hook response size",
+                    self.maximum_response_bytes,
+                )?,
+            )?,
+        }))
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(transparent)]
+struct HookEndpoints(BTreeMap<String, HookEndpointAppConfig>);
+
+impl FromStr for HookEndpoints {
+    type Err = toml::de::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        toml::from_str(value)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookEndpointAppConfig {
+    /// Where deliveries are posted.
+    url: String,
+    /// Which events this endpoint receives.
+    ///
+    /// Required rather than defaulting to everything, so a consumer written
+    /// today cannot be sent an event type added after it.
+    events: Vec<String>,
+    /// Events held for this endpoint before the oldest is dropped.
+    #[serde(default = "default_queue_capacity")]
+    queue_capacity: usize,
+    /// Distinct streams delivered at once. One request per stream is the
+    /// ordering rule, so this is also the concurrency.
+    #[serde(default = "default_maximum_in_flight")]
+    maximum_in_flight: usize,
+    /// Attempts per event, the first included.
+    #[serde(default = "default_maximum_attempts")]
+    maximum_attempts: u32,
+    /// Bearer credential presented to this endpoint.
+    token: Option<String>,
+    /// Reads the bearer credential from a mounted secret instead.
+    token_file: Option<PathBuf>,
+}
+
+fn default_queue_capacity() -> usize {
+    1_000
+}
+
+fn default_maximum_in_flight() -> usize {
+    8
+}
+
+fn default_maximum_attempts() -> u32 {
+    5
+}
+
+impl HookEndpointAppConfig {
+    fn resolve(self, name: &str) -> Result<HookConfig, ConfigError> {
+        if self.events.is_empty() {
+            return Err(invalid(format!(
+                "hook `{name}` subscribes to no events, so it would never be called"
+            )));
+        }
+        let mut events = BTreeSet::new();
+        for event in &self.events {
+            events.insert(
+                Kind::from_str(event)
+                    .map_err(|error| invalid(format!("hook `{name}`: {error}")))?,
+            );
+        }
+        for (label, value) in [
+            ("queue_capacity", self.queue_capacity),
+            ("maximum_in_flight", self.maximum_in_flight),
+        ] {
+            if value == 0 {
+                return Err(invalid(format!("hook `{name}` sets {label} to zero")));
+            }
+        }
+        if self.maximum_attempts == 0 {
+            return Err(invalid(format!(
+                "hook `{name}` sets maximum_attempts to zero, so nothing would be sent"
+            )));
+        }
+        let token = resolve_optional_text_secret(
+            &format!("the token for hook `{name}`"),
+            self.token.as_ref(),
+            self.token_file.as_ref(),
+        )?;
+
+        Ok(HookConfig {
+            name: Arc::from(name),
+            endpoint: Endpoint::parse(&self.url).map_err(|error| invalid(error.to_string()))?,
+            events,
+            queue_capacity: self.queue_capacity,
+            maximum_in_flight: self.maximum_in_flight,
+            maximum_attempts: self.maximum_attempts,
+            bearer: token
+                .map(|token| BearerToken::new(&token))
+                .transpose()
+                .map_err(|error| invalid(error.to_string()))?,
+        })
     }
 }
 
 /// Builds at most one outbound client, and only if something needs it.
 ///
-/// Reading the platform trust store is real work, and a configuration that
-/// selects neither an external auth provider nor a hook should not pay for it
-/// — nor should the tests that cover those configurations. When both do want
-/// one they share it, so the process keeps a single connection pool.
+/// Reading the platform trust store and building a TLS configuration is real
+/// work, and a node that calls nothing out should not pay for it — nor should
+/// the tests covering those configurations. Callers ask for their own deadline
+/// and response ceiling, which are per-request and so cost nothing to vary;
+/// what they share is the connector underneath.
 #[derive(Default)]
 pub struct LazyHttpClient(Option<HttpClient>);
 
 impl LazyHttpClient {
-    fn get_or_build(&mut self, config: ClientConfig) -> Result<HttpClient, ConfigError> {
-        match &self.0 {
-            Some(client) => Ok(client.clone()),
+    /// A client with the caller's limits, over the shared connector.
+    fn with_limits(
+        &mut self,
+        request_timeout: Duration,
+        maximum_response_bytes: usize,
+    ) -> Result<HttpClient, ConfigError> {
+        let shared = match &self.0 {
+            Some(client) => client,
             None => {
-                let client = HttpClient::new(config).map_err(|error| invalid(error.to_string()))?;
-                Ok(self.0.insert(client).clone())
+                let client = HttpClient::new(ClientConfig::default())
+                    .map_err(|error| invalid(error.to_string()))?;
+                self.0.insert(client)
             }
-        }
+        };
+        Ok(shared.with_limits(request_timeout, maximum_response_bytes))
     }
 }
 

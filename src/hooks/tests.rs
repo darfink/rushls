@@ -21,7 +21,9 @@ use crate::{
     outbound::{ClientConfig, Endpoint, HttpClient},
 };
 
-use super::{HookConfig, HooksConfig, Loss, Queue, Renderer, build, envelope::Envelope};
+use super::{
+    HookConfig, HookObserver, HooksConfig, Loss, Queue, Renderer, build, envelope::Envelope,
+};
 
 /// Records what the endpoint received, and decides what it answers with.
 #[derive(Clone, Default)]
@@ -100,13 +102,18 @@ fn envelope(stream: &str) -> Envelope {
 
 /// Collects what the node reported about its own delivery.
 #[derive(Clone, Default)]
-struct NodeLog(Arc<Mutex<Vec<NodeEvent>>>);
+struct NodeLog {
+    node: Arc<Mutex<Vec<NodeEvent>>>,
+    sessions: Arc<Mutex<Vec<SessionEvent>>>,
+}
 
 impl EventObserver for NodeLog {
-    fn observe(&self, _session: SessionId, _event: SessionEvent) {}
+    fn observe(&self, _session: SessionId, event: SessionEvent) {
+        self.sessions.lock().push(event);
+    }
 
     fn observe_node(&self, event: NodeEvent) {
-        self.0.lock().push(event);
+        self.node.lock().push(event);
     }
 }
 
@@ -238,6 +245,67 @@ async fn a_client_rejection_is_not_retried() {
 }
 
 #[tokio::test]
+async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_it() {
+    let recorder = Recorder::default();
+    let address = start(recorder.clone()).await;
+    let client = HttpClient::new(ClientConfig::default()).expect("a client builds");
+    let seen = NodeLog::default();
+    let (hooks, dispatchers) = build(
+        HooksConfig {
+            source: "urn:rushls:node:test".into(),
+            hooks: vec![hook(address, &lifecycle::Kind::ALL)],
+            drain_timeout: Duration::from_secs(2),
+            ..HooksConfig::default()
+        },
+        client,
+        Events::default(),
+    );
+    let observer = HookObserver::new(hooks, Arc::new(seen.clone()));
+    let (stop, stopped) = watch::channel(false);
+    let running = tokio::spawn(dispatchers.run(stopped));
+
+    // What a real publication emits, in the order a session emits it.
+    let session = SessionId(7.try_into().expect("a nonzero session id"));
+    observer.observe(
+        session,
+        SessionEvent::Accepted {
+            stream: StreamId::new("live/camera"),
+            principal: "camera".into(),
+        },
+    );
+    observer.observe(session, SessionEvent::Running);
+    observer.observe(
+        session,
+        SessionEvent::Ended {
+            end: SessionEnd::Ended,
+        },
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while recorder.bodies().len() < 3 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), running).await;
+
+    assert_eq!(
+        recorder.types(),
+        [
+            "rushls.session.started.v1",
+            "rushls.stream.available.v1",
+            "rushls.session.ended.v1"
+        ],
+        "one stream's events arrive in the order they happened"
+    );
+    assert_eq!(
+        seen.sessions.lock().len(),
+        3,
+        "the observer decorates rather than replaces: a node keeps the \
+         reporting it already had"
+    );
+}
+
+#[tokio::test]
 async fn a_dropped_event_is_reported_through_the_node_observer() {
     let recorder = Recorder::default();
     recorder
@@ -258,7 +326,7 @@ async fn a_dropped_event_is_reported_through_the_node_observer() {
 
     // Nothing here writes to stderr itself: the process owns its output, so an
     // embedder that redirects it redirects this too.
-    let reported = log.0.lock().clone();
+    let reported = log.node.lock().clone();
     let dropped = reported
         .iter()
         .find_map(|event| match event {

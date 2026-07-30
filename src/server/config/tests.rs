@@ -12,6 +12,7 @@ use crate::{
         PublishResource, StreamPolicy, TakeoverPolicy,
     },
     domain::StreamId,
+    observe::lifecycle::Kind,
     server::{AllowedOrigins, NodeConfig, ResolvedAppConfig},
 };
 
@@ -753,6 +754,91 @@ url = "http://auth-sidecar:8081/admit"
         assert!(
             resolve_toml(configuration)?.is_err(),
             "a provider table nobody reads is a typo, not a fallback:{configuration}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hooks_are_absent_until_an_endpoint_is_configured() -> Result<(), Box<dyn Error>> {
+    let resolved = resolve_toml("[hooks]\nsource = \"urn:rushls:node:studio\"\n")??;
+
+    assert!(
+        resolved.hooks.is_none(),
+        "a node delivering nothing should not even build an outbound client"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_configured_endpoint_resolves_to_a_subscription() -> Result<(), Box<dyn Error>> {
+    let resolved = resolve_toml(
+        r#"
+[hooks]
+source = "urn:rushls:node:studio"
+
+[hooks.endpoints.automation]
+url = "http://automation:9000/events"
+events = ["session.started", "session.ended"]
+maximum_attempts = 2
+"#,
+    )??;
+
+    let hooks = resolved.hooks.ok_or("hooks resolve")?;
+    assert_eq!(hooks.config.source, "urn:rushls:node:studio");
+    let hook = hooks.config.hooks.first().ok_or("one endpoint")?;
+    assert_eq!(&*hook.name, "automation");
+    assert_eq!(hook.maximum_attempts, 2);
+    assert_eq!(
+        hook.events,
+        [Kind::SessionStarted, Kind::SessionEnded]
+            .into_iter()
+            .collect(),
+        "a subscription is exactly what was asked for, never widened"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_endpoint_that_could_never_deliver_is_rejected() -> Result<(), Box<dyn Error>> {
+    let unknown_event = r#"
+[hooks.endpoints.automation]
+url = "http://automation:9000/events"
+events = ["session.exploded"]
+"#;
+    let no_events = r#"
+[hooks.endpoints.automation]
+url = "http://automation:9000/events"
+events = []
+"#;
+    let no_attempts = r#"
+[hooks.endpoints.automation]
+url = "http://automation:9000/events"
+events = ["session.ended"]
+maximum_attempts = 0
+"#;
+    let no_queue = r#"
+[hooks.endpoints.automation]
+url = "http://automation:9000/events"
+events = ["session.ended"]
+queue_capacity = 0
+"#;
+    let unusable_url = r#"
+[hooks.endpoints.automation]
+url = "automation:9000"
+events = ["session.ended"]
+"#;
+
+    for configuration in [
+        unknown_event,
+        no_events,
+        no_attempts,
+        no_queue,
+        unusable_url,
+    ] {
+        assert!(
+            resolve_toml(configuration)?.is_err(),
+            "expected a startup error for:{configuration}"
         );
     }
     Ok(())

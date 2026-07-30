@@ -2,9 +2,11 @@ use std::{error::Error, sync::Arc};
 
 use rushls::{
     domain::SessionId,
+    hooks::{self, HookObserver},
     observe::{EventObserver, Events, NodeEvent, SessionEvent},
-    server::{AppConfig, Node},
+    server::{AppConfig, Node, ResolvedHooks},
 };
+use tokio::sync::watch;
 
 struct StderrEvents;
 
@@ -71,13 +73,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let resolved = AppConfig::load()
         .and_then(AppConfig::resolve)
         .unwrap_or_else(|error| error.exit());
-    eprintln!("publisher authentication configured");
-    let node = Node::new(
-        resolved.node,
-        resolved.authenticator,
-        Events::new(Arc::new(StderrEvents)),
-    )?;
-    node.serve(shutdown_signal()).await?;
+
+    // The base observer is what hooks themselves report through, so a failing
+    // hook cannot produce events that re-enter it.
+    let base: Arc<dyn EventObserver> = Arc::new(StderrEvents);
+    let (observer, dispatchers) = match resolved.hooks {
+        Some(ResolvedHooks { config, client }) => {
+            let (hooks, dispatchers) = hooks::build(config, client, Events::new(Arc::clone(&base)));
+            (
+                Arc::new(HookObserver::new(hooks, base)) as Arc<dyn EventObserver>,
+                Some(dispatchers),
+            )
+        }
+        None => (base, None),
+    };
+
+    let node = Node::new(resolved.node, resolved.authenticator, Events::new(observer))?;
+
+    // Dispatchers outlive the node deliberately. `serve` returns once every
+    // session has ended, which is also when the last `session.ended` has been
+    // queued, so draining afterwards is what gives those events their chance.
+    let (stop, stopped) = watch::channel(false);
+    let delivering = dispatchers.map(|dispatchers| tokio::spawn(dispatchers.run(stopped)));
+
+    let served = node.serve(shutdown_signal()).await;
+
+    if let Some(delivering) = delivering {
+        let _ = stop.send(true);
+        let _ = delivering.await;
+    }
+    served?;
     Ok(())
 }
 

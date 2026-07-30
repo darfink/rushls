@@ -43,9 +43,10 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::{
+    domain::SessionId,
     observe::{
-        Events, NodeEvent,
-        lifecycle::{Event, Kind},
+        EventObserver, Events, NodeEvent, SessionEvent,
+        lifecycle::{Event, Kind, Projector},
     },
     outbound::{BearerToken, Endpoint, HttpClient},
 };
@@ -184,6 +185,50 @@ struct Shared {
     /// Wakes the dispatcher when work arrives.
     arrived: Notify,
     meters: HookMeters,
+}
+
+/// Feeds hooks from the session events a node already emits.
+///
+/// A decorator rather than a replacement: it forwards everything to the
+/// observer it wraps, so a node keeps whatever reporting it had. What it adds
+/// is the [`Projector`], which is the only thing that decides whether an
+/// internal event means anything externally.
+///
+/// The wrapped observer is also where hooks report their own failures, which is
+/// why `Hooks` is built with that one rather than with this. A node event
+/// produced by a failing hook must not re-enter the hook that produced it.
+#[derive(derive_more::Debug)]
+pub struct HookObserver {
+    projector: Projector,
+    hooks: Hooks,
+    #[debug(skip)]
+    inner: Arc<dyn EventObserver>,
+}
+
+impl HookObserver {
+    pub fn new(hooks: Hooks, inner: Arc<dyn EventObserver>) -> Self {
+        Self {
+            projector: Projector::new(),
+            hooks,
+            inner,
+        }
+    }
+}
+
+impl EventObserver for HookObserver {
+    fn observe(&self, session: SessionId, event: SessionEvent) {
+        // Projected before forwarding, because the projector holds per-session
+        // state that `Ended` retires: running it first keeps that bookkeeping
+        // independent of what the wrapped observer does with the event.
+        if let Some(projected) = self.projector.project(session, &event) {
+            self.hooks.deliver(&projected);
+        }
+        self.inner.observe(session, event);
+    }
+
+    fn observe_node(&self, event: NodeEvent) {
+        self.inner.observe_node(event);
+    }
 }
 
 /// The enqueue side, held by whatever observes session events.
