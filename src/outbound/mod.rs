@@ -12,6 +12,11 @@
 //! bearer token can never be replayed to another origin by a redirecting
 //! endpoint. Its `client-proxy` feature is off, so no environment variable can
 //! silently route these requests through a third party.
+//!
+//! Cleartext endpoints are permitted. Whether a hop is protected is not
+//! knowable from the URL — a service mesh or a private network may be doing it
+//! — so [`Endpoint::is_encrypted`] reports the scheme and leaves the judgement
+//! to the operator who chose the address.
 
 use std::time::Duration;
 
@@ -41,18 +46,25 @@ impl Endpoint {
         if !matches!(scheme, "http" | "https") {
             return Err(EndpointError::Scheme(value.to_owned()));
         }
-        let host = uri.host().ok_or(EndpointError::NoHost(value.to_owned()))?;
-        // Cleartext is fine to a sidecar sharing the pod or host, and is how
-        // most of these are deployed. Anywhere else it puts a bearer token on
-        // the wire, so it is refused rather than warned about.
-        if scheme == "http" && !is_loopback(host) {
-            return Err(EndpointError::Cleartext(value.to_owned()));
-        }
+        // Cleartext is permitted anywhere. A sidecar reached over a private
+        // network or a service mesh that terminates its own TLS is the ordinary
+        // deployment, and `http://auth-sidecar:8081` is not a loopback address
+        // — refusing it would reject the common case to catch the careless one.
+        uri.host().ok_or(EndpointError::NoHost(value.to_owned()))?;
         Ok(Self(uri))
     }
 
     pub fn uri(&self) -> &Uri {
         &self.0
+    }
+
+    /// Whether credentials sent here are protected in transit by this node.
+    ///
+    /// Cleartext may still be entirely appropriate, so this is a fact to report
+    /// rather than a verdict: what protects the hop may be a mesh or a private
+    /// network that this process cannot see.
+    pub fn is_encrypted(&self) -> bool {
+        self.0.scheme_str() == Some("https")
     }
 }
 
@@ -60,15 +72,6 @@ impl std::fmt::Display for Endpoint {
     fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(output, "{}", self.0)
     }
-}
-
-fn is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -79,8 +82,6 @@ pub enum EndpointError {
     Scheme(String),
     #[error("`{0}` names no host")]
     NoHost(String),
-    #[error("`{0}` would send credentials in cleartext; use https, or a loopback address")]
-    Cleartext(String),
 }
 
 /// A bearer credential, kept out of anything that prints.

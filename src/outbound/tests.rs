@@ -159,25 +159,23 @@ async fn an_unreachable_endpoint_fails_rather_than_hanging() {
 }
 
 #[test]
-fn cleartext_is_confined_to_loopback() {
-    for accepted in [
+fn cleartext_endpoints_are_accepted_and_reported_as_unencrypted() {
+    // `http://auth-sidecar:8081` is the ordinary in-cluster deployment, and
+    // whatever protects that hop — a mesh, a private network — is not visible
+    // from the URL. So the scheme is reported, not judged.
+    for cleartext in [
         "http://127.0.0.1:8081/admit",
-        "http://localhost:8081/admit",
-        "http://[::1]:8081/admit",
-        "https://auth.example.com/admit",
+        "http://auth-sidecar:8081/admit",
+        "http://auth.example.com/admit",
     ] {
-        assert!(
-            Endpoint::parse(accepted).is_ok(),
-            "{accepted} should be accepted"
-        );
+        let endpoint = Endpoint::parse(cleartext).expect("{cleartext} is a usable endpoint");
+        assert!(!endpoint.is_encrypted());
     }
 
-    assert_eq!(
-        Endpoint::parse("http://auth.example.com/admit"),
-        Err(EndpointError::Cleartext(
-            "http://auth.example.com/admit".into()
-        )),
-        "a bearer token must not reach a remote host in the clear"
+    assert!(
+        Endpoint::parse("https://auth.example.com/admit")
+            .expect("an https URL is accepted")
+            .is_encrypted()
     );
 }
 
