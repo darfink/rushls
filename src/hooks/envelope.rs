@@ -124,9 +124,13 @@ fn data(event: &Event) -> serde_json::Value {
             "session_id": session_id(started.session),
             "principal": started.principal,
         }),
+        // Stream-lifetime events carry no session: they are about the stream,
+        // which outlives whichever publisher happened to make it playable.
         Event::StreamAvailable(available) => serde_json::json!({
             "stream_id": available.stream.0.as_str(),
-            "session_id": session_id(available.session),
+        }),
+        Event::StreamUnavailable(unavailable) => serde_json::json!({
+            "stream_id": unavailable.stream.0.as_str(),
         }),
         Event::SessionEnded(ended) => serde_json::json!({
             "stream_id": ended.stream.0.as_str(),

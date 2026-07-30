@@ -1,9 +1,9 @@
 use std::{error::Error, sync::Arc};
 
 use rushls::{
-    domain::SessionId,
+    domain::{SessionId, StreamId},
     hooks::{self, HookObserver},
-    observe::{EventObserver, Events, NodeEvent, SessionEvent},
+    observe::{EventObserver, Events, NodeEvent, SessionEvent, StreamEvent},
     server::{AppConfig, Node, ResolvedHooks},
 };
 use tokio::sync::watch;
@@ -13,6 +13,13 @@ struct StderrEvents;
 impl EventObserver for StderrEvents {
     fn observe(&self, session: SessionId, event: SessionEvent) {
         eprintln!("session {session:?}: {event:?}");
+    }
+
+    fn observe_stream(&self, stream: StreamId, event: StreamEvent) {
+        match event {
+            StreamEvent::Available => eprintln!("stream {stream:?} is playable"),
+            StreamEvent::Retired => eprintln!("stream {stream:?} is no longer reachable"),
+        }
     }
 
     fn observe_node(&self, event: NodeEvent) {

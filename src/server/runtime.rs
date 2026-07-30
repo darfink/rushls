@@ -17,7 +17,7 @@ use crate::{
     hooks::Hooks,
     media::PassThroughNormalizerFactory,
     mux::{CmafMuxerConfig, PassThroughMuxerFactory},
-    observe::{Events, NodeEvent, ProcessMeters, Protocol},
+    observe::{Events, NodeEvent, ProcessMeters, Protocol, StreamEvent},
     session::{PendingPublishers, Registry, Services, SessionConfig, StopReason, run_session},
     source::transport::{
         rtmp::{RtmpConfig, RtmpPendingPublish},
@@ -313,6 +313,7 @@ impl Node {
             self.store.clone(),
             Arc::clone(&self.origin),
             self.config.maintenance_interval,
+            events.clone(),
             stop_rx,
         ));
 
@@ -556,6 +557,7 @@ async fn run_maintenance(
     store: StreamStore,
     origin: Arc<Origin>,
     interval: Duration,
+    events: Events,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
     let mut ticks = tokio::time::interval(interval);
@@ -569,7 +571,15 @@ async fn run_maintenance(
                 }
             }
             _ = ticks.tick() => {
-                store.maintain();
+                // The one place both edges of a stream's life are announced,
+                // because the store computes them together.
+                let reachability = store.maintain();
+                for stream in reachability.became_available {
+                    events.stream(stream, StreamEvent::Available);
+                }
+                for stream in reachability.retired {
+                    events.stream(stream, StreamEvent::Retired);
+                }
                 origin.prune();
             }
         }

@@ -14,7 +14,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -61,6 +61,12 @@ pub struct LiveStream {
     /// Exact invalidation epoch for every media-playlist-visible rendition
     /// snapshot change. Kept beside the catalog so a chunk does not rebuild it.
     media_revision: AtomicU64,
+    /// Whether this stream has already been reported playable.
+    ///
+    /// Latched per *stream* rather than per publication, which is the whole
+    /// point: a publisher reconnecting within the idle window resumes a stream
+    /// viewers never lost, and announcing it again would say something untrue.
+    announced: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -109,6 +115,7 @@ impl LiveStream {
             }),
             snapshot: ArcSwap::from_pointee(snapshot),
             media_revision: AtomicU64::new(0),
+            announced: AtomicBool::new(false),
         }
     }
 
@@ -118,6 +125,37 @@ impl LiveStream {
 
     pub fn media_revision(&self) -> u64 {
         self.media_revision.load(Ordering::Acquire)
+    }
+
+    /// Whether a viewer asking now would be served media.
+    ///
+    /// A resolved presentation is not enough: one exists from the moment a
+    /// publisher takes its lease, while the playlist it describes is still
+    /// empty. What a viewer waits for is media at a live edge, which is the
+    /// same thing delivery gates its first response on.
+    ///
+    /// Deliberately the most permissive reading — a part counts, not only a
+    /// completed segment — so that this never claims a stream is playable
+    /// later than it is. A node configured to withhold playlists until a
+    /// segment completes makes a viewer wait slightly longer than this says.
+    pub fn is_playable(&self) -> bool {
+        self.snapshot.load().renditions.iter().any(|rendition| {
+            let edge = &rendition.snapshot().live_edge;
+            edge.last_segment.is_some() || edge.last_part.is_some()
+        })
+    }
+
+    /// Claims the first-time transition to playable, latching it.
+    ///
+    /// Returns true exactly once per stream, for whoever should announce it.
+    pub fn claim_availability(&self) -> bool {
+        self.is_playable() && !self.announced.swap(true, Ordering::Relaxed)
+    }
+
+    /// Whether this stream was ever announced playable, so its retirement is
+    /// worth reporting. A stream that never served anything cannot stop.
+    pub fn was_announced(&self) -> bool {
+        self.announced.load(Ordering::Relaxed)
     }
 
     pub fn is_ended(&self) -> bool {

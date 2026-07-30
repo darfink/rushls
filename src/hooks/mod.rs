@@ -43,9 +43,9 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::{
-    domain::SessionId,
+    domain::{SessionId, StreamId},
     observe::{
-        EventObserver, Events, NodeEvent, SessionEvent,
+        EventObserver, Events, NodeEvent, SessionEvent, StreamEvent,
         lifecycle::{Event, Kind, Projector},
     },
     outbound::{BearerToken, Endpoint, HttpClient},
@@ -224,6 +224,12 @@ impl EventObserver for HookObserver {
             self.hooks.deliver(&projected);
         }
         self.inner.observe(session, event);
+    }
+
+    fn observe_stream(&self, stream: StreamId, event: StreamEvent) {
+        self.hooks
+            .deliver(&self.projector.project_stream(stream.clone(), event));
+        self.inner.observe_stream(stream, event);
     }
 
     fn observe_node(&self, event: NodeEvent) {

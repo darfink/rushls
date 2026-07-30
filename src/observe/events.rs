@@ -181,9 +181,36 @@ pub enum Protocol {
 pub trait EventObserver: Send + Sync {
     fn observe(&self, session: SessionId, event: SessionEvent);
 
+    /// A fact about a stream rather than about one of its publishers.
+    ///
+    /// Separate from [`Self::observe`] because a stream outlives any single
+    /// session: a publisher reconnecting within the idle window ends one
+    /// session and starts another while viewers keep playing throughout. An
+    /// observer that conflated the two would tell a consumer the broadcast
+    /// stopped every time an encoder hiccuped.
+    ///
+    /// Defaulted, like [`Self::observe_node`], so an observer that only cares
+    /// about sessions stays a one-method impl.
+    fn observe_stream(&self, _stream: StreamId, _event: StreamEvent) {}
+
     /// Defaulted so an observer that only cares about sessions stays a
     /// one-method impl.
     fn observe_node(&self, _event: NodeEvent) {}
+}
+
+/// What changed about a stream's own lifetime.
+///
+/// Deliberately two variants. Everything else worth reporting about a stream
+/// happens to a publisher, and belongs in [`SessionEvent`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamEvent {
+    /// The store has a presentation a viewer can play.
+    Available,
+    /// The reconnect window closed, so viewers can no longer reach it.
+    ///
+    /// Only reported for a stream that was playable: one retired without ever
+    /// serving anything never became unavailable, because it never was.
+    Retired,
 }
 
 /// The process-wide event destination.
@@ -203,6 +230,11 @@ impl Events {
             observer: Arc::clone(&self.0),
             session,
         }
+    }
+
+    /// Reports a fact about a stream, which outlives any one publisher.
+    pub fn stream(&self, stream: StreamId, event: StreamEvent) {
+        self.0.observe_stream(stream, event);
     }
 
     /// Reports a fact about the process, which has no session to scope to.

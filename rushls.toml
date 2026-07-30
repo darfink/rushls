@@ -228,10 +228,16 @@ maximum_response_bytes = "64KiB"
 # url = "http://automation:9000/rushls/events"
 # Required rather than defaulting to everything, so a consumer written today is
 # never sent an event type added after it. One or more of:
-#   "session.started"  a publisher was admitted
-#   "stream.available" the stream can be played
-#   "session.ended"    a publisher stopped, for any reason
-# events = ["session.started", "stream.available", "session.ended"]
+#   "session.started"    a publisher was admitted
+#   "stream.available"   the stream became playable
+#   "stream.unavailable" the reconnect window closed and viewers now 404
+#   "session.ended"      a publisher stopped, for any reason
+#
+# The two pairs describe different lifetimes and must not be confused. A
+# publisher disconnecting produces `session.ended` and nothing more, because a
+# reconnect within `inactive_stream_retention` resumes a stream viewers never
+# lost. `stream.unavailable` is the stream itself ending, once nobody came back.
+# events = ["session.started", "stream.available", "stream.unavailable", "session.ended"]
 # Events held for this endpoint before the oldest waiting one is dropped. The
 # oldest, never the newest: what survives stays in order and the most recent
 # state is what is kept.

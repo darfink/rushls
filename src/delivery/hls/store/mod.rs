@@ -234,17 +234,30 @@ impl StreamStore {
     /// and has no process-shutdown token. Writes still sweep before capacity
     /// checks so expired bytes cannot cause a false rejection.
     ///
-    /// Returns the number of logical streams whose reconnect budget expired.
-    pub fn maintain(&self) -> usize {
+    /// Reports what changed about which streams a viewer can reach.
+    ///
+    /// Transitions are returned rather than announced. The store stays
+    /// ignorant of the vocabulary this node promises anyone outside it, and
+    /// whoever runs maintenance decides what to do with the facts — which also
+    /// means both edges of a stream's life are computed in one place, by one
+    /// rule, and cannot drift apart.
+    pub fn maintain(&self) -> Maintenance {
         let _mutation = self.mutations.lock();
         let current = self.streams.load_full();
         let mut next = None;
-        let mut retired = 0;
+        let mut changed = Maintenance::default();
 
         for (stream, live) in current.iter() {
             live.sweep_expired();
+            if live.claim_availability() {
+                changed.became_available.push(stream.clone());
+            }
             if live.retire_if_idle_for(self.limits.idle_retention) {
-                retired += 1;
+                // Only a stream viewers could reach becomes unreachable. One
+                // that never served anything was never available to lose.
+                if live.was_announced() {
+                    changed.retired.push(stream.clone());
+                }
                 next.get_or_insert_with(|| (*current).clone())
                     .remove(stream);
             }
@@ -253,8 +266,20 @@ impl StreamStore {
         if let Some(next) = next {
             self.streams.store(Arc::new(next));
         }
-        retired
+        changed
     }
+}
+
+/// What one maintenance pass changed about stream reachability.
+///
+/// Both edges of a stream's life, so a caller announcing them cannot report one
+/// and forget the other.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Maintenance {
+    /// Streams a viewer can resolve for the first time.
+    pub became_available: Vec<StreamId>,
+    /// Streams whose reconnect window closed, and which were reachable before.
+    pub retired: Vec<StreamId>,
 }
 
 /// A publisher's write lease on one stream.

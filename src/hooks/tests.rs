@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use crate::{
     domain::{SessionId, StreamId},
     observe::{
-        EventObserver, Events, NodeEvent, SessionEnd, SessionEvent,
+        EventObserver, Events, NodeEvent, SessionEnd, SessionEvent, StreamEvent,
         lifecycle::{self, Event, Projector, SessionStarted},
     },
     outbound::{ClientConfig, Endpoint, HttpClient},
@@ -274,15 +274,19 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
         },
     );
     observer.observe(session, SessionEvent::Running);
+    // The store's answer, not the pipeline's: what a viewer can fetch is what
+    // "available" means, and it arrives on the stream-scoped path.
+    observer.observe_stream(StreamId::new("live/camera"), StreamEvent::Available);
     observer.observe(
         session,
         SessionEvent::Ended {
             end: SessionEnd::Ended,
         },
     );
+    observer.observe_stream(StreamId::new("live/camera"), StreamEvent::Retired);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while recorder.bodies().len() < 3 && tokio::time::Instant::now() < deadline {
+    while recorder.bodies().len() < 4 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let _ = stop.send(true);
@@ -293,9 +297,11 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
         [
             "rushls.session.started.v1",
             "rushls.stream.available.v1",
-            "rushls.session.ended.v1"
+            "rushls.session.ended.v1",
+            "rushls.stream.unavailable.v1",
         ],
-        "one stream's events arrive in the order they happened"
+        "both lifetimes arrive interleaved on one ordered stream: the \
+         publisher stops before the stream does"
     );
     assert_eq!(
         seen.sessions.lock().len(),
@@ -451,9 +457,10 @@ fn a_projected_session_reaches_the_hooks_it_subscribed_to() {
         kinds,
         [
             lifecycle::Kind::SessionStarted,
-            lifecycle::Kind::StreamAvailable,
             lifecycle::Kind::SessionEnded,
-        ]
+        ],
+        "a session's events describe the publisher only; what viewers can \
+         reach is the store's to report"
     );
 }
 

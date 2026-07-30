@@ -21,7 +21,9 @@ pub mod lifecycle;
 mod meters;
 
 pub use delivery::{OriginMeters, OriginSnapshot};
-pub use events::{EventObserver, EventSink, Events, NodeEvent, Protocol, SessionEnd, SessionEvent};
+pub use events::{
+    EventObserver, EventSink, Events, NodeEvent, Protocol, SessionEnd, SessionEvent, StreamEvent,
+};
 pub use meters::{
     DeliveryMeters, MediaMeters, MeterSnapshot, MuxMeters, ProcessMeters, ProcessSnapshot,
     SessionMeters, SourceMeters,

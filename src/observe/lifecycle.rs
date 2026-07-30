@@ -26,7 +26,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::domain::{SessionId, StreamId};
 
-use super::{SessionEnd, SessionEvent};
+use super::{SessionEnd, SessionEvent, StreamEvent};
 
 /// Which fact an [`Event`] reports.
 ///
@@ -40,6 +40,9 @@ pub enum Kind {
     /// The stream can be played.
     #[display("stream.available")]
     StreamAvailable,
+    /// The stream can no longer be played.
+    #[display("stream.unavailable")]
+    StreamUnavailable,
     /// A publisher stopped, for any reason.
     #[display("session.ended")]
     SessionEnded,
@@ -47,9 +50,10 @@ pub enum Kind {
 
 impl Kind {
     /// Every kind, so a subscription list can be validated against one place.
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::SessionStarted,
         Self::StreamAvailable,
+        Self::StreamUnavailable,
         Self::SessionEnded,
     ];
 }
@@ -115,16 +119,30 @@ pub struct SessionStarted {
 
 /// The stream became playable.
 ///
-/// Currently the instant the pipeline starts running, which is when a muxer and
-/// publisher exist and media begins reaching the store. A viewer's very first
-/// request may still block briefly for `playlist_readiness`; nothing here
-/// promises otherwise, and narrowing this to the first satisfying store write
-/// would not change what the event means.
+/// Reported when the store first holds a presentation a viewer can resolve,
+/// not when a publisher's pipeline starts running. Those differ, and the store
+/// is the one that decides what a viewer can actually fetch.
+///
+/// Names no session. A stream can be made playable by one publisher and kept
+/// playable across a reconnect by another, so attributing it to a session would
+/// be picking one arbitrarily; the preceding `session.started` for this stream
+/// is the publisher that did it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamAvailable {
     pub stream: StreamId,
-    /// The publisher that made it playable.
-    pub session: SessionId,
+}
+
+/// The stream stopped being playable.
+///
+/// The end of the *stream's* life, not a publisher's: it fires when the
+/// reconnect window closes and the store retires the stream, which is the
+/// moment viewers begin getting 404s. A publisher disconnecting produces
+/// `session.ended` and nothing more, because viewers keep playing.
+///
+/// Never emitted for a stream that was never playable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamUnavailable {
+    pub stream: StreamId,
 }
 
 /// A publisher stopped.
@@ -136,11 +154,12 @@ pub struct SessionEnded {
     pub outcome: Outcome,
     /// How long the publisher was admitted for.
     pub duration: Duration,
-    /// Whether this publisher ever made the stream playable.
+    /// Whether this publisher's pipeline ever started running.
     ///
-    /// Saves a consumer from correlating against an earlier
-    /// [`StreamAvailable`] to tell a three-hour broadcast ending from an
-    /// encoder that connected and immediately failed.
+    /// Tells a three-hour broadcast ending from an encoder that connected and
+    /// immediately failed, without correlating against other events. About
+    /// this publisher rather than about the stream: viewers may have been
+    /// playing throughout on media an earlier publisher left behind.
     pub was_available: bool,
     /// Human-readable detail, for a person reading a log.
     ///
@@ -155,6 +174,7 @@ pub struct SessionEnded {
 pub enum Event {
     SessionStarted(SessionStarted),
     StreamAvailable(StreamAvailable),
+    StreamUnavailable(StreamUnavailable),
     SessionEnded(SessionEnded),
 }
 
@@ -163,6 +183,7 @@ impl Event {
         match self {
             Self::SessionStarted(_) => Kind::SessionStarted,
             Self::StreamAvailable(_) => Kind::StreamAvailable,
+            Self::StreamUnavailable(_) => Kind::StreamUnavailable,
             Self::SessionEnded(_) => Kind::SessionEnded,
         }
     }
@@ -174,15 +195,20 @@ impl Event {
         match self {
             Self::SessionStarted(event) => &event.stream,
             Self::StreamAvailable(event) => &event.stream,
+            Self::StreamUnavailable(event) => &event.stream,
             Self::SessionEnded(event) => &event.stream,
         }
     }
 
-    pub fn session(&self) -> SessionId {
+    /// The publisher an event is about, for the events that have one.
+    ///
+    /// `None` for stream-lifetime events, which is the distinction this module
+    /// exists to keep.
+    pub fn session(&self) -> Option<SessionId> {
         match self {
-            Self::SessionStarted(event) => event.session,
-            Self::StreamAvailable(event) => event.session,
-            Self::SessionEnded(event) => event.session,
+            Self::SessionStarted(event) => Some(event.session),
+            Self::SessionEnded(event) => Some(event.session),
+            Self::StreamAvailable(_) | Self::StreamUnavailable(_) => None,
         }
     }
 }
@@ -206,12 +232,25 @@ struct Tracked {
     stream: StreamId,
     principal: String,
     started_at: Instant,
-    available: bool,
+    /// Whether this publisher's pipeline ever started running.
+    reached_running: bool,
 }
 
 impl Projector {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Projects a stream-lifetime fact, which belongs to no session.
+    ///
+    /// Trivial today, and here rather than at the call site so that every
+    /// internal-to-public translation stays in one file: what a consumer is
+    /// told is decided in this module or nowhere.
+    pub fn project_stream(&self, stream: StreamId, event: StreamEvent) -> Event {
+        match event {
+            StreamEvent::Available => Event::StreamAvailable(StreamAvailable { stream }),
+            StreamEvent::Retired => Event::StreamUnavailable(StreamUnavailable { stream }),
+        }
     }
 
     /// Projects one internal event, if it means anything externally.
@@ -234,7 +273,7 @@ impl Projector {
                         stream: stream.clone(),
                         principal: principal.clone(),
                         started_at: Instant::now(),
-                        available: false,
+                        reached_running: false,
                     },
                 );
                 Some(Event::SessionStarted(SessionStarted {
@@ -244,18 +283,13 @@ impl Projector {
                 }))
             }
             SessionEvent::Running => {
-                let mut live = self.live.lock();
-                let tracked = live.get_mut(&session)?;
-                // Latched: `Running` is entered once per session today, and a
-                // consumer that saw the stream come up must not be told again.
-                if tracked.available {
-                    return None;
-                }
-                tracked.available = true;
-                Some(Event::StreamAvailable(StreamAvailable {
-                    stream: tracked.stream.clone(),
-                    session,
-                }))
+                // Recorded but not reported. Whether *viewers* can play is the
+                // store's answer, not the pipeline's, and it is reported
+                // through [`Self::project_stream`]. All this remembers is
+                // whether this publisher got that far, which is what
+                // `session.ended` carries as `was_available`.
+                self.live.lock().get_mut(&session)?.reached_running = true;
+                None
             }
             SessionEvent::Ended { end } => self.finish(session, (*end).into(), None),
             SessionEvent::Failed { reason } => {
@@ -290,7 +324,7 @@ impl Projector {
             principal: tracked.principal,
             outcome,
             duration: Instant::now().saturating_duration_since(tracked.started_at),
-            was_available: tracked.available,
+            was_available: tracked.reached_running,
             diagnostic,
         }))
     }
@@ -309,12 +343,12 @@ mod tests {
     }
 
     #[test]
-    fn a_publisher_produces_a_start_an_availability_and_an_end() {
+    fn a_publisher_reports_only_its_own_lifetime() {
         let projector = Projector::new();
         let session = SessionId(nz::u64!(1));
 
         let started = projector.project(session, &accepted("live/camera"));
-        let available = projector.project(session, &SessionEvent::Running);
+        let running = projector.project(session, &SessionEvent::Running);
         let ended = projector.project(
             session,
             &SessionEvent::Ended {
@@ -323,7 +357,12 @@ mod tests {
         );
 
         assert!(matches!(started, Some(Event::SessionStarted(_))));
-        assert!(matches!(available, Some(Event::StreamAvailable(_))));
+        assert!(
+            running.is_none(),
+            "a running pipeline is not the same fact as a playable stream: \
+             what a viewer can fetch is the store's answer, and it arrives \
+             through `project_stream`"
+        );
         let Some(Event::SessionEnded(ended)) = ended else {
             panic!("a session that ran reports how it stopped");
         };
@@ -361,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reconnect_starts_a_new_session_without_repeating_availability() {
+    fn a_reconnect_reports_a_new_session_and_nothing_about_the_stream() {
         let projector = Projector::new();
         let (first, second) = (SessionId(nz::u64!(1)), SessionId(nz::u64!(2)));
 
@@ -374,18 +413,33 @@ mod tests {
             },
         );
 
-        // The stream stayed playable across the gap, so the second publisher
-        // reports its own session but the same stream never "became" available
-        // to a consumer that was already told it was.
         let restarted = projector.project(second, &accepted("live/camera"));
-        let available = projector.project(second, &SessionEvent::Running);
+        let running = projector.project(second, &SessionEvent::Running);
 
         assert!(matches!(restarted, Some(Event::SessionStarted(_))));
+        assert!(
+            running.is_none(),
+            "viewers never lost the stream, so nothing about the stream \
+             changed; only the publisher did"
+        );
+    }
+
+    #[test]
+    fn the_two_lifetimes_are_reported_by_different_paths() {
+        let projector = Projector::new();
+        let stream = StreamId::new("live/camera");
+
+        let available = projector.project_stream(stream.clone(), StreamEvent::Available);
+        let retired = projector.project_stream(stream.clone(), StreamEvent::Retired);
+
+        assert_eq!(available.kind(), Kind::StreamAvailable);
+        assert_eq!(retired.kind(), Kind::StreamUnavailable);
+        assert_eq!(available.stream(), &stream);
         assert_eq!(
-            available.map(|event| event.kind()),
-            Some(Kind::StreamAvailable),
-            "availability is latched per publisher; de-duplicating across a \
-             reconnect gap needs the store's retirement, which is not wired yet"
+            (available.session(), retired.session()),
+            (None, None),
+            "a stream can be made playable by one publisher and kept playable \
+             by the next, so naming one would be picking arbitrarily"
         );
     }
 
@@ -436,9 +490,11 @@ mod tests {
             assert_eq!(kind.to_string().parse(), Ok(kind));
         }
         assert_eq!(
-            "stream.unavailable".parse::<Kind>(),
-            Err(UnknownKind("stream.unavailable".into())),
-            "a name this node does not emit is refused rather than ignored"
+            "session.paused".parse::<Kind>(),
+            Err(UnknownKind("session.paused".into())),
+            "a name this node does not emit is refused rather than ignored, so \
+             a typo in a subscription is a startup error and not a hook that \
+             silently never fires"
         );
     }
 }

@@ -56,8 +56,4 @@ serialization and keep those bytes, which the immutable envelope already does
 for retries. mTLS is the alternative for deployments that prefer it.
 
 
-stream.unavailable isn't here. It belongs to the store retiring a stream after inactive_stream_retention, and there's no observer hook on that path. Consumers get session.ended (the publisher stopped) but nothing for "viewers now 404". Adding it later is purely additive since subscriptions are explicit.
-
-Availability is latched per publisher, not per stream. A reconnect emits stream.available again even though viewers never lost the stream. The test says so out loud. De-duplicating across the gap needs the same store hook as stream.unavailable — one piece of plumbing fixes both.
-
 protocol and remote_address aren't in session.started. Both are on PublishRequest but discarded before PublishGrant, so surfacing them is the session-model change your notes flagged, not a projection change

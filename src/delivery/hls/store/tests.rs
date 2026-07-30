@@ -1241,3 +1241,76 @@ fn a_part_is_held_to_its_target_at_both_ends() {
         "closing the segment leaves the short part final, and legal"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_reconnect_does_not_announce_a_stream_viewers_never_lost() {
+    let store = StreamStore::new(limits());
+    let first = lease(&store, &[(0, true)]);
+
+    // Leasing alone is not availability: nothing is fetchable until a
+    // presentation resolves, which is what a viewer actually needs.
+    assert_eq!(store.maintain(), Maintenance::default());
+    first
+        .write_encoded(initialization(0, 1), None)
+        .expect("the header is stored");
+    first
+        .write_encoded(chunk(0, 0, 0, 0, 1, 16), None)
+        .expect("the first part is stored");
+
+    assert_eq!(
+        store.maintain().became_available,
+        vec![stream()],
+        "the store decides what is playable, and says so once"
+    );
+    assert_eq!(
+        store.maintain(),
+        Maintenance::default(),
+        "a latched announcement is not repeated on every tick"
+    );
+
+    // The publisher goes away and comes back inside the reconnect window.
+    drop(first);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(store.maintain(), Maintenance::default());
+    let second = lease(&store, &[(0, true)]);
+    second
+        .write_encoded(initialization(0, 2), None)
+        .expect("the header is stored");
+    second
+        .write_encoded(chunk(0, 0, 0, 0, 1, 16), None)
+        .expect("the second publication is stored");
+
+    assert_eq!(
+        store.maintain(),
+        Maintenance::default(),
+        "viewers kept playing across the gap, so nothing about the stream \
+         changed; only the publisher did"
+    );
+
+    // Nobody comes back this time.
+    drop(second);
+    tokio::time::advance(limits().idle_retention + Duration::from_secs(1)).await;
+
+    assert_eq!(
+        store.maintain().retired,
+        vec![stream()],
+        "the reconnect window closing is the stream's own end, and the only \
+         point at which viewers begin getting 404s"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_never_served_anything_never_became_unavailable() {
+    let store = StreamStore::new(limits());
+    let lease = lease(&store, &[(0, true)]);
+
+    drop(lease);
+    tokio::time::advance(limits().idle_retention + Duration::from_secs(1)).await;
+
+    assert_eq!(
+        store.maintain(),
+        Maintenance::default(),
+        "a stream viewers could never reach cannot stop being reachable"
+    );
+    assert_eq!(store.len(), 0, "it is still retired, just not announced");
+}
