@@ -77,18 +77,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // The base observer is what hooks themselves report through, so a failing
     // hook cannot produce events that re-enter it.
     let base: Arc<dyn EventObserver> = Arc::new(StderrEvents);
-    let (observer, dispatchers) = match resolved.hooks {
+    let (observer, dispatchers, exported) = match resolved.hooks {
         Some(ResolvedHooks { config, client }) => {
             let (hooks, dispatchers) = hooks::build(config, client, Events::new(Arc::clone(&base)));
             (
-                Arc::new(HookObserver::new(hooks, base)) as Arc<dyn EventObserver>,
+                Arc::new(HookObserver::new(hooks.clone(), base)) as Arc<dyn EventObserver>,
                 Some(dispatchers),
+                Some(hooks),
             )
         }
-        None => (base, None),
+        None => (base, None, None),
     };
 
-    let node = Node::new(resolved.node, resolved.authenticator, Events::new(observer))?;
+    let mut node = Node::new(resolved.node, resolved.authenticator, Events::new(observer))?;
+    if let Some(hooks) = exported {
+        node = node.with_hooks(hooks);
+    }
 
     // Dispatchers outlive the node deliberately. `serve` returns once every
     // session has ended, which is also when the last `session.ended` has been

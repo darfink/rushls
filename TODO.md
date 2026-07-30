@@ -27,6 +27,7 @@
 - Test with non-paced source stream?
 - Invert so http exports types for HLS instead of vice versa?
 - Is a lot of work happening on one single thread?
+- Let shutdown signal disconnect but flush? IDK
 
 # MUST DOES
 

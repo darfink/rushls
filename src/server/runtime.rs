@@ -14,6 +14,7 @@ use crate::{
         StoreLimits, StorePublisherFactory, StreamStore,
         serve::{DeliveryConfig, Origin},
     },
+    hooks::Hooks,
     media::PassThroughNormalizerFactory,
     mux::{CmafMuxerConfig, PassThroughMuxerFactory},
     observe::{Events, NodeEvent, ProcessMeters, Protocol},
@@ -190,6 +191,16 @@ impl Node {
             origin,
             metrics,
         })
+    }
+
+    /// Exports delivery counters for the configured hooks.
+    ///
+    /// Separate from [`Self::new`] because hooks are assembled by whoever owns
+    /// the process's observer, which is also who decides whether there are any.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
+        self.metrics = self.metrics.with_hooks(hooks);
+        self
     }
 
     pub fn services(&self) -> &Services {

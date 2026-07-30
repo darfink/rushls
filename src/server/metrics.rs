@@ -1,9 +1,10 @@
-use std::fmt::Write;
+use std::{fmt::Write, sync::Arc};
 
 use subtle::ConstantTimeEq;
 
 use crate::{
     delivery::hls::StreamStore,
+    hooks::{HookSnapshot, Hooks},
     observe::{ProcessMeters, ProcessSnapshot},
     session::{Registry, SessionSnapshot},
 };
@@ -54,6 +55,8 @@ pub struct MetricsSnapshot {
     /// Streams still fetchable but waiting for a publisher to return.
     pub idle_streams: usize,
     pub streams: Vec<SessionSnapshot>,
+    /// Delivery counters per configured hook.
+    pub hooks: Vec<(Arc<str>, HookSnapshot)>,
 }
 
 /// A configured HTTP exporter backed by the node's live metrics reader.
@@ -91,6 +94,9 @@ pub struct MetricsReader {
     meters: ProcessMeters,
     sessions: Registry,
     store: StreamStore,
+    /// Absent unless hooks are configured, which is also when they have
+    /// anything to report.
+    hooks: Option<Hooks>,
     policy: ExportPolicy,
 }
 
@@ -105,8 +111,16 @@ impl MetricsReader {
             meters,
             sessions,
             store,
+            hooks: None,
             policy,
         }
+    }
+
+    /// Also exports delivery counters for the configured hooks.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
+        self.hooks = Some(hooks);
+        self
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -122,6 +136,14 @@ impl MetricsReader {
             } else {
                 Vec::new()
             },
+            // Always exported, unlike per-stream series: the number of hooks is
+            // what an operator configured, so this cannot grow unboundedly the
+            // way stream labels can.
+            hooks: self
+                .hooks
+                .as_ref()
+                .map(Hooks::snapshots)
+                .unwrap_or_default(),
         }
     }
 }
@@ -240,10 +262,69 @@ pub fn render(snapshot: &MetricsSnapshot) -> String {
         snapshot.idle_streams,
     );
 
+    if !snapshot.hooks.is_empty() {
+        render_hooks(&mut output, &snapshot.hooks);
+    }
     if !snapshot.streams.is_empty() {
         render_sessions(&mut output, &snapshot.streams);
     }
     output
+}
+
+/// One counter per hook, labelled by the name the operator configured.
+///
+/// Losses are kept apart rather than summed into one "failed" counter: an
+/// endpoint refusing an event, a queue overflowing, and a shutdown cutting a
+/// drain short call for three different responses from whoever is looking.
+fn render_hooks(output: &mut String, hooks: &[(Arc<str>, HookSnapshot)]) {
+    for (name, help, read) in [
+        (
+            "rushls_hook_deliveries_total",
+            "Lifecycle events accepted by a hook endpoint.",
+            (|snapshot: &HookSnapshot| snapshot.delivered) as fn(&HookSnapshot) -> u64,
+        ),
+        (
+            "rushls_hook_retries_total",
+            "Delivery attempts that failed and were retried.",
+            |snapshot| snapshot.retried,
+        ),
+        (
+            "rushls_hook_filtered_total",
+            "Events not delivered because the hook did not subscribe to them.",
+            |snapshot| snapshot.filtered,
+        ),
+        (
+            "rushls_hook_dropped_overflow_total",
+            "Events dropped because the hook's queue was full.",
+            |snapshot| snapshot.overflow,
+        ),
+        (
+            "rushls_hook_dropped_rejected_total",
+            "Events refused by the endpoint in a way retrying cannot fix.",
+            |snapshot| snapshot.rejected,
+        ),
+        (
+            "rushls_hook_dropped_exhausted_total",
+            "Events dropped after every delivery attempt failed.",
+            |snapshot| snapshot.exhausted,
+        ),
+        (
+            "rushls_hook_dropped_shutdown_total",
+            "Events still queued when the drain deadline passed.",
+            |snapshot| snapshot.shutdown,
+        ),
+    ] {
+        metadata(output, name, help, "counter");
+        for (hook, snapshot) in hooks {
+            writeln!(
+                output,
+                "{name}{{hook=\"{}\"}} {}",
+                escape_label(hook),
+                read(snapshot)
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
 }
 
 fn counter(output: &mut String, name: &str, help: &str, value: u64) {
@@ -570,6 +651,7 @@ mod tests {
             published_streams: 1,
             idle_streams: 4,
             streams: Vec::new(),
+            hooks: Vec::new(),
         });
 
         assert!(output.contains("# TYPE rushls_sessions_started_total counter\n"));
@@ -577,5 +659,56 @@ mod tests {
         assert!(output.contains("rushls_bytes_received_total 1024\n"));
         assert!(output.contains("# TYPE rushls_active_sessions gauge\n"));
         assert!(output.contains("rushls_active_sessions 2\n"));
+        assert!(
+            !output.contains("rushls_hook_"),
+            "a node with no hooks exports no hook series at all, rather than \
+             zeroes an operator would have to learn to ignore"
+        );
+    }
+
+    #[test]
+    fn every_way_a_hook_can_lose_an_event_is_exported_separately() {
+        let output = render(&MetricsSnapshot {
+            process: ProcessSnapshot::default(),
+            active_sessions: 0,
+            published_streams: 0,
+            idle_streams: 0,
+            streams: Vec::new(),
+            hooks: vec![
+                (
+                    Arc::from("automation"),
+                    HookSnapshot {
+                        delivered: 41,
+                        retried: 2,
+                        overflow: 3,
+                        rejected: 4,
+                        exhausted: 5,
+                        shutdown: 6,
+                        filtered: 7,
+                    },
+                ),
+                (Arc::from("audit"), HookSnapshot::default()),
+            ],
+        });
+
+        assert!(output.contains("# TYPE rushls_hook_deliveries_total counter\n"));
+        assert!(output.contains("rushls_hook_deliveries_total{hook=\"automation\"} 41\n"));
+        assert!(output.contains("rushls_hook_deliveries_total{hook=\"audit\"} 0\n"));
+        // Kept apart because an endpoint refusing an event, a queue overflowing,
+        // and a shutdown cutting a drain short call for different responses.
+        assert!(output.contains("rushls_hook_dropped_overflow_total{hook=\"automation\"} 3\n"));
+        assert!(output.contains("rushls_hook_dropped_rejected_total{hook=\"automation\"} 4\n"));
+        assert!(output.contains("rushls_hook_dropped_exhausted_total{hook=\"automation\"} 5\n"));
+        assert!(output.contains("rushls_hook_dropped_shutdown_total{hook=\"automation\"} 6\n"));
+        assert!(output.contains("rushls_hook_retries_total{hook=\"automation\"} 2\n"));
+        assert!(output.contains("rushls_hook_filtered_total{hook=\"automation\"} 7\n"));
+
+        assert_eq!(
+            output
+                .matches("# TYPE rushls_hook_deliveries_total")
+                .count(),
+            1,
+            "one HELP and TYPE per metric, with hooks as labels beneath it"
+        );
     }
 }
