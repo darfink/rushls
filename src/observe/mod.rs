@@ -17,6 +17,7 @@
 
 mod delivery;
 mod events;
+pub mod lifecycle;
 mod meters;
 
 pub use delivery::{OriginMeters, OriginSnapshot};
