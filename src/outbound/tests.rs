@@ -43,13 +43,32 @@ async fn teapot() -> impl IntoResponse {
     (StatusCode::IM_A_TEAPOT, "no coffee")
 }
 
+async fn busy() -> impl IntoResponse {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, "5")],
+        "slow down",
+    )
+}
+
+/// The HTTP-date form, which is legal and deliberately not supported.
+async fn dated() -> impl IntoResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "Wed, 21 Oct 2026 07:28:00 GMT")],
+        "later",
+    )
+}
+
 /// Starts a server on an ephemeral loopback port and returns its address.
 async fn start() -> SocketAddr {
     let router = Router::new()
         .route("/echo", post(echo))
         .route("/slow", post(slow))
         .route("/enormous", post(enormous))
-        .route("/teapot", post(teapot));
+        .route("/teapot", post(teapot))
+        .route("/busy", post(busy))
+        .route("/dated", post(dated));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("an ephemeral port is available");
@@ -193,6 +212,50 @@ fn an_endpoint_must_name_a_host_over_a_supported_scheme() {
         Endpoint::parse("https://"),
         Err(EndpointError::Malformed(_) | EndpointError::NoHost(_))
     ));
+}
+
+#[tokio::test]
+async fn a_retry_after_in_seconds_is_read_and_capped() {
+    let address = start().await;
+
+    let response = client(ClientConfig::default())
+        .post(&endpoint(address, "/busy"), JSON, None, Bytes::new())
+        .await
+        .expect("the endpoint answers");
+
+    assert_eq!(response.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.retry_after(Duration::from_secs(30)),
+        Some(Duration::from_secs(5))
+    );
+    assert_eq!(
+        response.retry_after(Duration::from_secs(2)),
+        Some(Duration::from_secs(2)),
+        "the endpoint asking to be left alone is also the one misbehaving, so \
+         the caller's cap still applies"
+    );
+}
+
+#[tokio::test]
+async fn an_absent_or_unparsable_retry_after_is_simply_absent() {
+    let address = start().await;
+    let client = client(ClientConfig::default());
+
+    let dated = client
+        .post(&endpoint(address, "/dated"), JSON, None, Bytes::new())
+        .await
+        .expect("the endpoint answers");
+    let plain = client
+        .post(&endpoint(address, "/teapot"), JSON, None, Bytes::new())
+        .await
+        .expect("the endpoint answers");
+
+    assert_eq!(
+        dated.retry_after(Duration::from_secs(30)),
+        None,
+        "the HTTP-date form falls back to the caller's own backoff"
+    );
+    assert_eq!(plain.retry_after(Duration::from_secs(30)), None);
 }
 
 #[test]

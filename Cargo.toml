@@ -41,6 +41,7 @@ serde_json = "1"
 http = "1"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "http1", "tls12", "logging"] }
+uuid = { version = "1.24.0", features = ["v7"] }
 
 [build-dependencies]
 cc = "1"

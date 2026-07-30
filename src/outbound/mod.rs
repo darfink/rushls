@@ -21,7 +21,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::{HeaderValue, Request, StatusCode, Uri, header};
+use http::{HeaderMap, HeaderValue, Request, StatusCode, Uri, header};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
@@ -125,13 +125,35 @@ impl Default for ClientConfig {
 
 /// What an endpoint answered.
 ///
-/// Deliberately just the status and the bytes: whether a status is success,
-/// worth retrying, or permanent is the caller's policy, and it differs between
-/// admission and hooks.
+/// Reported, not interpreted: whether a status is success, worth retrying, or
+/// permanent is the caller's policy, and it differs between admission and
+/// hooks. The one exception is [`Self::retry_after`], which parses a header
+/// rather than deciding anything with it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Response {
     pub status: StatusCode,
+    pub headers: HeaderMap,
     pub body: Bytes,
+}
+
+impl Response {
+    /// `Retry-After` in its delta-seconds form, capped by the caller.
+    ///
+    /// Only the seconds form. The HTTP-date alternative needs a parsed clock to
+    /// mean anything, and an endpoint that answers an event POST with an
+    /// absolute date is not a case worth carrying a date parser for; treating
+    /// it as absent falls back to the caller's own backoff, which is safe.
+    pub fn retry_after(&self, maximum: Duration) -> Option<Duration> {
+        let seconds: u64 = self
+            .headers
+            .get(header::RETRY_AFTER)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(Duration::from_secs(seconds).min(maximum))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -212,6 +234,7 @@ impl HttpClient {
             .await
             .map_err(|error| OutboundError::Unreachable(error.to_string()))?;
         let status = response.status();
+        let headers = response.headers().clone();
         let limit = self.config.maximum_response_bytes;
         // Bounded while it is read rather than checked afterwards: a
         // Content-Length is only a claim, and by the time an oversized body has
@@ -228,7 +251,11 @@ impl HttpClient {
             })?
             .to_bytes();
 
-        Ok(Response { status, body })
+        Ok(Response {
+            status,
+            headers,
+            body,
+        })
     }
 }
 

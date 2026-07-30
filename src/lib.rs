@@ -13,6 +13,7 @@
 //! segment     segmentation policy, boundary discovery, pre-roll
 //! media       validation, timeline calibration, normalization
 //! source      transports and demux, fused: a protocol implies its container
+//! hooks       lifecycle delivery to operator-configured endpoints
 //! admission   who may publish what
 //! observe     meters and lifecycle events
 //! outbound    requests to operator-configured services
@@ -43,6 +44,7 @@ pub mod admission;
 pub mod delivery;
 pub mod domain;
 mod ffmpeg;
+pub mod hooks;
 pub mod media;
 pub mod mux;
 pub mod observe;
