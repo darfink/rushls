@@ -4,8 +4,8 @@ use crate::{
         Payload, TickDuration, Timebase, TrackId, fixtures::TrackBuilder,
     },
     media::{
-        NormalizedSample, NormalizerFactory, PresentationPlan, StartedNormalizer, SubtitleSample,
-        TimelineCalibration, calibrate, fixtures::presentation,
+        NormalizeError, NormalizedSample, NormalizerFactory, PresentationPlan, StartedNormalizer,
+        SubtitleSample, TimelineCalibration, calibrate, fixtures::presentation,
     },
     source::Packet,
 };
@@ -101,6 +101,20 @@ fn primed_audio() -> DiscoveredTrack {
         .build()
 }
 
+fn millisecond_aac() -> DiscoveredTrack {
+    TrackBuilder::new(0, MediaKind::Audio)
+        .timebase(Timebase::new(nz::u32!(1), nz::u32!(1_000)))
+        .first_pts(Some(0))
+        .parameters(MediaParameters::Audio {
+            sample_rate: nz::u32!(44_100),
+            channels: nz::u16!(2),
+            frame_size: Some(nz::u32!(1_024)),
+            bit_depth: None,
+            timing: AudioTiming::default(),
+        })
+        .build()
+}
+
 #[test]
 fn audio_clock_preserves_exact_priming_despite_coarse_container_timestamps() {
     let (mut started, _, _) = start(vec![primed_audio()]);
@@ -169,6 +183,99 @@ fn audio_clock_rejects_a_real_timestamp_discontinuity() {
         .push(packet(0, Some(100), Some(100), Some(21)), &mut output)
         .expect_err("a 100 ms jump is not timestamp quantization");
     assert!(error.to_string().contains("discontinuity"));
+}
+
+#[test]
+fn a_shortened_terminal_audio_packet_becomes_trailing_trim() -> Result<(), NormalizeError> {
+    let (mut started, _, _) = start(vec![millisecond_aac()]);
+    let mut output = Vec::new();
+
+    started
+        .normalizer
+        .push(packet(0, Some(0), Some(0), Some(23)), &mut output)?;
+    started
+        .normalizer
+        .push(packet(0, Some(23), Some(23), Some(17)), &mut output)?;
+
+    assert_eq!(output.len(), 1, "the possible tail waits for end of input");
+    started.normalizer.finish(&mut output)?;
+    started.normalizer.finish(&mut output)?;
+
+    assert_eq!(output.len(), 2, "finishing twice releases the tail once");
+    assert!(matches!(
+        &output[1],
+        NormalizedSample::Audio(sample)
+            if sample.pts == 1_024
+                && sample.duration == 1_024
+                && sample.trim.trailing_samples == 274
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_shortened_audio_packet_with_a_successor_is_rejected() -> Result<(), NormalizeError> {
+    let (mut started, _, _) = start(vec![millisecond_aac()]);
+    let mut output = Vec::new();
+    started
+        .normalizer
+        .push(packet(0, Some(0), Some(0), Some(23)), &mut output)?;
+    started
+        .normalizer
+        .push(packet(0, Some(23), Some(23), Some(17)), &mut output)?;
+
+    let error = started
+        .normalizer
+        .push(packet(0, Some(40), Some(40), Some(23)), &mut output)
+        .expect_err("a non-terminal short frame is invalid");
+    assert!(
+        error
+            .to_string()
+            .contains("shortened audio packet was followed by more audio")
+    );
+
+    started.normalizer.finish(&mut output)?;
+    assert_eq!(output.len(), 1, "the invalid candidate is never emitted");
+    Ok(())
+}
+
+#[test]
+fn explicit_terminal_trim_must_agree_with_the_short_duration() -> Result<(), NormalizeError> {
+    let (mut agreeing, _, _) = start(vec![millisecond_aac()]);
+    let mut packet_with_trim = packet(0, Some(0), Some(0), Some(17));
+    packet_with_trim.audio_trim.trailing_samples = 280;
+    let mut output = Vec::new();
+    agreeing.normalizer.push(packet_with_trim, &mut output)?;
+    agreeing.normalizer.finish(&mut output)?;
+    assert!(matches!(
+        &output[0],
+        NormalizedSample::Audio(sample) if sample.trim.trailing_samples == 280
+    ));
+
+    let (mut conflicting, _, _) = start(vec![millisecond_aac()]);
+    let mut packet_with_trim = packet(0, Some(0), Some(0), Some(17));
+    packet_with_trim.audio_trim.trailing_samples = 100;
+    let error = conflicting
+        .normalizer
+        .push(packet_with_trim, &mut Vec::new())
+        .expect_err("contradictory trim is rejected");
+    assert!(error.to_string().contains("terminal audio trim disagrees"));
+    Ok(())
+}
+
+#[test]
+fn an_audio_packet_longer_than_its_fixed_frame_is_still_rejected() {
+    let (mut started, _, _) = start(vec![millisecond_aac()]);
+
+    let error = started
+        .normalizer
+        .push(packet(0, Some(0), Some(0), Some(30)), &mut Vec::new())
+        .expect_err("an oversized fixed audio frame is invalid");
+
+    assert!(
+        error
+            .to_string()
+            .contains("audio packet duration disagrees")
+    );
 }
 
 #[test]

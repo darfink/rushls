@@ -20,6 +20,10 @@ pub(super) struct AudioNormalizer {
     next_pts: Option<TickTimestamp>,
     first: bool,
     sample_rate: u32,
+    /// A shortened fixed-frame packet is valid only if no successor exists.
+    /// Holding that exceptional packet preserves strict mid-stream validation
+    /// without adding one access unit of latency to ordinary audio.
+    pending_terminal: Option<AudioSample>,
 }
 
 impl AudioNormalizer {
@@ -53,6 +57,7 @@ impl AudioNormalizer {
             next_pts: None,
             first: true,
             sample_rate: sample_rate.get(),
+            pending_terminal: None,
         })
     }
 
@@ -65,7 +70,13 @@ impl AudioNormalizer {
         packet: Packet,
         out: &mut dyn Appender<NormalizedSample>,
     ) -> Result<(), NormalizeError> {
-        let duration = self.duration(&packet)?;
+        if self.pending_terminal.take().is_some() {
+            return Err(processing(format!(
+                "{} shortened audio packet was followed by more audio",
+                self.track_id
+            )));
+        }
+        let (duration, inferred_trailing) = self.duration(&packet)?;
         let supplied_pts = packet
             .pts
             .map(|pts| project_timestamp(self.projection, pts, self.track_id, "audio PTS"))
@@ -106,15 +117,30 @@ impl AudioNormalizer {
             pts.checked_add_unsigned(duration)
                 .ok_or_else(|| processing(format!("{} audio clock overflows", self.track_id)))?,
         );
-        out.push(NormalizedSample::Audio(AudioSample {
+        let mut trim = packet.audio_trim;
+        if let Some(inferred) = inferred_trailing {
+            trim.trailing_samples = self.terminal_trim(trim.trailing_samples, inferred)?;
+        }
+        let sample = AudioSample {
             track_id: self.track_id,
             codec: self.codec,
             pts,
             duration,
-            trim: packet.audio_trim,
+            trim,
             payload: packet.payload,
-        }));
+        };
+        if inferred_trailing.is_some() {
+            self.pending_terminal = Some(sample);
+        } else {
+            out.push(NormalizedSample::Audio(sample));
+        }
         Ok(())
+    }
+
+    pub(super) fn finish(&mut self, out: &mut dyn Appender<NormalizedSample>) {
+        if let Some(sample) = self.pending_terminal.take() {
+            out.push(NormalizedSample::Audio(sample));
+        }
     }
 
     fn first_packet_padding(&self, packet: &Packet) -> Result<TickDuration, NormalizeError> {
@@ -133,7 +159,7 @@ impl AudioNormalizer {
         }))
     }
 
-    fn duration(&self, packet: &Packet) -> Result<TickDuration, NormalizeError> {
+    fn duration(&self, packet: &Packet) -> Result<(TickDuration, Option<u32>), NormalizeError> {
         if packet.duration.is_some_and(|duration| duration < 0) {
             return Err(processing(format!(
                 "{} audio duration is negative",
@@ -154,18 +180,46 @@ impl AudioNormalizer {
             .transpose()?;
         if let Some(frame_size) = self.frame_size {
             if let Some(supplied) = supplied {
-                self.ensure_duration_near(supplied, frame_size, "audio packet duration")?;
+                let difference = supplied.abs_diff(frame_size);
+                if difference > self.timestamp_tolerance {
+                    if supplied < frame_size {
+                        // The encoded access unit remains a complete codec
+                        // frame; the shorter container interval describes how
+                        // much of that frame belongs on the presentation tail.
+                        let trailing = u32::try_from(frame_size - supplied).map_err(|_| {
+                            processing(format!(
+                                "{} terminal audio trim exceeds its frame size",
+                                self.track_id
+                            ))
+                        })?;
+                        return Ok((frame_size, Some(trailing)));
+                    }
+                    self.ensure_duration_near(supplied, frame_size, "audio packet duration")?;
+                }
             }
             // Decoded samples are exact; a duration expressed in a coarse
             // container timebase is useful for validation but not for cadence.
-            return Ok(frame_size);
+            return Ok((frame_size, None));
         }
-        supplied.ok_or_else(|| {
+        supplied.map(|duration| (duration, None)).ok_or_else(|| {
             processing(format!(
                 "{} has neither a fixed audio frame size nor a packet duration",
                 self.track_id
             ))
         })
+    }
+
+    fn terminal_trim(&self, declared: u32, inferred: u32) -> Result<u32, NormalizeError> {
+        if declared == 0 {
+            return Ok(inferred);
+        }
+        if u64::from(declared).abs_diff(u64::from(inferred)) > self.timestamp_tolerance {
+            return Err(processing(format!(
+                "{} terminal audio trim disagrees with its packet duration",
+                self.track_id
+            )));
+        }
+        Ok(declared)
     }
 
     fn ensure_near(

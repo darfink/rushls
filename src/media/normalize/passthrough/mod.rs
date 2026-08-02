@@ -190,7 +190,11 @@ impl TrackNormalizer {
 
     fn finish(&mut self, out: &mut dyn Appender<NormalizedSample>) -> Result<(), NormalizeError> {
         match self {
-            Self::Audio(_) | Self::Subtitle(_) => Ok(()),
+            Self::Audio(track) => {
+                track.finish(out);
+                Ok(())
+            }
+            Self::Subtitle(_) => Ok(()),
             Self::Video(track) => track.finish(out),
         }
     }
