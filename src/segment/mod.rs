@@ -26,6 +26,9 @@ mod cadence;
 mod part;
 mod preroll;
 
+#[cfg(test)]
+pub mod fixtures;
+
 pub use cadence::CadenceObserver;
 pub use preroll::{Preroll, PrerollRequest, run as run_preroll};
 

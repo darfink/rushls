@@ -16,8 +16,8 @@ mod media;
 mod multivariant;
 
 pub use media::{
-    MediaPlaylistWriter, Part, PlaylistPresentationType, PreloadHint, PreloadHintType,
-    RenditionReport, Segment, ServerControl,
+    MediaPlaylistWriter, Part, PreloadHint, PreloadHintType, RenditionReport, Segment,
+    ServerControl,
 };
 pub use multivariant::{
     MultivariantPlaylistWriter, PlaylistMediaType, Rendition, Variant, VideoRange,

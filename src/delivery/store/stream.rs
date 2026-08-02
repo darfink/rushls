@@ -240,28 +240,6 @@ impl LiveStream {
         self.with_rendition(rendition_id, RenditionState::subscribe)
     }
 
-    /// Waits until one rendition advances past `revision` or ends.
-    ///
-    /// This is the store primitive for LL-HLS blocking reload. Sibling
-    /// renditions have independent watch channels, so one busy rendition does
-    /// not spuriously wake requests for another.
-    pub async fn wait_rendition_after(
-        &self,
-        rendition_id: RenditionId,
-        revision: u64,
-    ) -> Option<RenditionLiveEdge> {
-        let mut updates = self.subscribe_rendition(rendition_id)?;
-        loop {
-            let current = *updates.borrow_and_update();
-            if current.revision > revision || current.ended {
-                return Some(current);
-            }
-            if updates.changed().await.is_err() {
-                return Some(current);
-            }
-        }
-    }
-
     /// Ends a mutation: publishes what changed, then wakes whoever was waiting.
     ///
     /// Every mutating path finishes here rather than writing the sequence out

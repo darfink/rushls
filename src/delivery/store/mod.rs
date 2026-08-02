@@ -299,11 +299,6 @@ impl StreamLease {
         self.publication
     }
 
-    /// True once another publisher has taken the stream over.
-    pub fn is_revoked(&self) -> bool {
-        self.live.current_publication() != self.publication
-    }
-
     /// Publishes one event, returning `false` if takeover revoked this lease.
     ///
     /// Revoked media is discarded rather than appended, so an incumbent

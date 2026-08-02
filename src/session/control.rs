@@ -41,10 +41,6 @@ impl StopToken {
         *self.state.borrow()
     }
 
-    pub fn is_stopped(&self) -> bool {
-        self.reason().is_some()
-    }
-
     /// Resolves once a stop has been requested, and never otherwise.
     ///
     /// Safe to poll in a `select!` arm: it observes the current state before

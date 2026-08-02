@@ -644,7 +644,7 @@ where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
 {
-    http::serve_with_readiness(
+    http::serve(
         listener,
         application,
         config,

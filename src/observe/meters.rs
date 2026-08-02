@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -200,7 +200,6 @@ struct SessionCounters {
     media_lead_nanos: AtomicU64,
     pacing_delay_nanos: AtomicU64,
     publisher_backpressured: AtomicBool,
-    live_readers: AtomicUsize,
     source_seen: LivenessMark,
     media_seen: LivenessMark,
     publication_seen: LivenessMark,
@@ -244,7 +243,6 @@ impl SessionMeters {
                 media_lead_nanos: AtomicU64::new(0),
                 pacing_delay_nanos: AtomicU64::new(0),
                 publisher_backpressured: AtomicBool::new(false),
-                live_readers: AtomicUsize::new(0),
                 source_seen: LivenessMark::default(),
                 media_seen: LivenessMark::default(),
                 publication_seen: LivenessMark::default(),
@@ -323,18 +321,6 @@ impl SessionMeters {
         self.counters
             .publication_seen
             .idle_for(self.counters.started_at, now)
-    }
-
-    pub fn reader_attached(&self) {
-        self.counters.live_readers.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn reader_detached(&self) {
-        self.counters.live_readers.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    pub fn live_readers(&self) -> usize {
-        self.counters.live_readers.load(Ordering::Relaxed)
     }
 
     pub fn publisher_backpressured(&self) -> bool {

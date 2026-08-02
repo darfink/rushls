@@ -275,15 +275,6 @@ impl Registry {
             entry.stop.stop(reason);
         }
     }
-
-    /// Asks the session publishing `stream`, if any, to stop.
-    pub fn stop_stream(&self, stream: &StreamId, reason: StopReason) {
-        for entry in self.inner.sessions.read().values() {
-            if &entry.shared.stream == stream {
-                entry.stop.stop(reason);
-            }
-        }
-    }
 }
 
 /// A session's presence in the registry, withdrawn when dropped.

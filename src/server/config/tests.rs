@@ -67,7 +67,7 @@ async fn open_authentication_is_the_builtin_default() -> Result<(), Box<dyn Erro
 
 #[test]
 fn cli_overrides_environment_which_overrides_toml() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
+    let config = resolve_with(
         r#"
 [server]
 maximum_concurrent_publishers = 10
@@ -79,18 +79,9 @@ provider = "static"
 stream = "live/camera"
 key = "from-file"
 "#,
-    )?;
-    let config = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-            "--server-maximum-concurrent-publishers",
-            "30",
-        ]),
-        env([("RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHERS", "20")]),
-    )?
-    .resolve()?;
+        &["--server-maximum-concurrent-publishers", "30"],
+        &[("RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHERS", "20")],
+    )??;
 
     assert_eq!(config.node.maximum_sessions, 30);
     Ok(())
@@ -98,23 +89,14 @@ key = "from-file"
 
 #[test]
 fn the_removed_publishing_table_is_rejected() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
-        r#"
+    assert!(
+        load_toml(
+            r#"
 [publishing]
 key = "legacy"
 stream_id = "live/camera"
-"#,
-    )?;
-
-    assert!(
-        AppConfig::load_from(
-            os([
-                "rushls",
-                "--config",
-                file.path.to_str().ok_or("temporary path is not UTF-8")?,
-            ]),
-            std::iter::empty(),
-        )
+"#
+        )?
         .is_err()
     );
     Ok(())
@@ -122,8 +104,9 @@ stream_id = "live/camera"
 
 #[test]
 fn the_replaced_array_of_publishers_is_rejected() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
-        r#"
+    assert!(
+        load_toml(
+            r#"
 [auth]
 provider = "static"
 
@@ -131,18 +114,8 @@ provider = "static"
 name = "camera"
 stream = "live/camera"
 key = "key"
-"#,
-    )?;
-
-    assert!(
-        AppConfig::load_from(
-            os([
-                "rushls",
-                "--config",
-                file.path.to_str().ok_or("temporary path is not UTF-8")?,
-            ]),
-            std::iter::empty(),
-        )
+"#
+        )?
         .is_err()
     );
     Ok(())
@@ -150,7 +123,7 @@ key = "key"
 
 #[tokio::test]
 async fn static_publishers_select_named_or_builtin_policies() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
+    let config = resolve_toml(
         r#"
 [auth]
 provider = "static"
@@ -168,16 +141,7 @@ stream = "live/stage"
 key = "stage-key"
 policy = "protected"
 "#,
-    )?;
-    let config = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-        ]),
-        std::iter::empty(),
-    )?
-    .resolve()?;
+    )??;
 
     let camera = config
         .authenticator
@@ -200,7 +164,7 @@ policy = "protected"
 #[tokio::test]
 async fn open_authentication_accepts_any_credential_and_preserves_the_resource()
 -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
+    let config = resolve_toml(
         r#"
 [auth]
 provider = "open"
@@ -211,16 +175,7 @@ takeovers = "deny"
 [auth.open]
 policy = "restricted"
 "#,
-    )?;
-    let config = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-        ]),
-        std::iter::empty(),
-    )?
-    .resolve()?;
+    )??;
 
     let grant = config
         .authenticator
@@ -235,21 +190,12 @@ policy = "restricted"
 #[tokio::test]
 async fn open_authentication_uses_the_builtin_policy_without_a_provider_table()
 -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
+    let config = resolve_toml(
         r#"
 [auth]
 provider = "open"
 "#,
-    )?;
-    let config = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-        ]),
-        std::iter::empty(),
-    )?
-    .resolve()?;
+    )??;
 
     let grant = config
         .authenticator
@@ -292,25 +238,17 @@ stream = "live/camera"
 key = "key"
 "#,
     ] {
-        let file = TempConfig::new(configuration)?;
-        let result = AppConfig::load_from(
-            os([
-                "rushls",
-                "--config",
-                file.path.to_str().ok_or("temporary path is not UTF-8")?,
-            ]),
-            std::iter::empty(),
-        )?
-        .resolve();
-
-        assert!(matches!(result, Err(ConfigError::Invalid(_))));
+        assert!(matches!(
+            resolve_toml(configuration)?,
+            Err(ConfigError::Invalid(_))
+        ));
     }
     Ok(())
 }
 
 #[test]
 fn an_unknown_open_policy_is_rejected() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
+    let result = resolve_toml(
         r#"
 [auth]
 provider = "open"
@@ -319,15 +257,6 @@ provider = "open"
 policy = "missing"
 "#,
     )?;
-    let result = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-        ]),
-        std::iter::empty(),
-    )?
-    .resolve();
 
     assert!(matches!(result, Err(ConfigError::Invalid(_))));
     Ok(())
@@ -336,7 +265,7 @@ policy = "missing"
 #[tokio::test]
 async fn a_static_publishing_key_can_be_read_from_a_file() -> Result<(), Box<dyn Error>> {
     let secret = TempConfig::new("mounted-secret")?;
-    let file = TempConfig::new(&format!(
+    let config = resolve_toml(&format!(
         r#"
 [auth]
 provider = "static"
@@ -346,16 +275,7 @@ stream = "live/camera"
 key_file = "{}"
 "#,
         secret.path.display()
-    ))?;
-    let config = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-        ]),
-        std::iter::empty(),
-    )?
-    .resolve()?;
+    ))??;
 
     config
         .authenticator
@@ -383,22 +303,13 @@ stream = "live/stage"
 key = "same"
 "#,
     ] {
-        let file = TempConfig::new(&format!(
+        let result = resolve_toml(&format!(
             r#"
 [auth]
 provider = "static"
 {publishers}
 "#
         ))?;
-        let result = AppConfig::load_from(
-            os([
-                "rushls",
-                "--config",
-                file.path.to_str().ok_or("temporary path is not UTF-8")?,
-            ]),
-            std::iter::empty(),
-        )?
-        .resolve();
 
         assert!(matches!(result, Err(ConfigError::Invalid(_))));
     }
@@ -407,7 +318,7 @@ provider = "static"
 
 #[test]
 fn an_unknown_static_policy_is_rejected() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
+    let result = resolve_toml(
         r#"
 [auth]
 provider = "static"
@@ -418,15 +329,6 @@ key = "key"
 policy = "missing"
 "#,
     )?;
-    let result = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-        ]),
-        std::iter::empty(),
-    )?
-    .resolve();
 
     assert!(matches!(result, Err(ConfigError::Invalid(_))));
     Ok(())
@@ -442,7 +344,7 @@ fn a_malformed_cors_pattern_stops_startup() -> Result<(), Box<dyn Error>> {
         "https://foo.*.example.com",
         "player.example.com",
     ] {
-        let result = resolve_with_env([("RUSHLS_HTTP_CORS_ORIGINS", rejected)]);
+        let result = resolve_with_env(&[("RUSHLS_HTTP_CORS_ORIGINS", rejected)])?;
 
         assert!(
             matches!(result, Err(ConfigError::Invalid(_))),
@@ -454,10 +356,10 @@ fn a_malformed_cors_pattern_stops_startup() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn a_wildcard_cors_pattern_is_accepted() -> Result<(), Box<dyn Error>> {
-    let config = resolve_with_env([(
+    let config = resolve_with_env(&[(
         "RUSHLS_HTTP_CORS_ORIGINS",
         "https://*.example.com,https://**.video.example.com",
-    )])?;
+    )])??;
 
     let AllowedOrigins::Only(patterns) = &config.node.http.cors.allowed_origins else {
         panic!("an allowlist was configured");
@@ -468,7 +370,7 @@ fn a_wildcard_cors_pattern_is_accepted() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn credentialed_wildcard_cors_is_rejected() -> Result<(), Box<dyn Error>> {
-    let result = resolve_with_env([("RUSHLS_HTTP_CORS_ALLOW_CREDENTIALS", "true")]);
+    let result = resolve_with_env(&[("RUSHLS_HTTP_CORS_ALLOW_CREDENTIALS", "true")])?;
 
     assert!(matches!(result, Err(ConfigError::Invalid(_))));
     Ok(())
@@ -476,11 +378,11 @@ fn credentialed_wildcard_cors_is_rejected() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn metrics_endpoint_and_authentication_resolve_from_configuration() -> Result<(), Box<dyn Error>> {
-    let config = resolve_with_env([
+    let config = resolve_with_env(&[
         ("RUSHLS_METRICS_ENABLED", "true"),
         ("RUSHLS_METRICS_TOKEN", "scrape-secret"),
         ("RUSHLS_METRICS_PER_STREAM", "true"),
-    ])?;
+    ])??;
 
     assert!(config.node.metrics.enabled);
     assert!(config.node.metrics.token.is_some());
@@ -490,7 +392,7 @@ fn metrics_endpoint_and_authentication_resolve_from_configuration() -> Result<()
 
 #[test]
 fn an_empty_metrics_token_is_rejected() -> Result<(), Box<dyn Error>> {
-    let result = resolve_with_env([("RUSHLS_METRICS_TOKEN", "")]);
+    let result = resolve_with_env(&[("RUSHLS_METRICS_TOKEN", "")])?;
 
     assert!(matches!(result, Err(ConfigError::Invalid(_))));
     Ok(())
@@ -499,7 +401,7 @@ fn an_empty_metrics_token_is_rejected() -> Result<(), Box<dyn Error>> {
 #[test]
 fn existing_optional_secrets_accept_mounted_files() -> Result<(), Box<dyn Error>> {
     let secret = TempConfig::new("mounted-secret")?;
-    let file = TempConfig::new(&format!(
+    let config = resolve_toml(&format!(
         r#"
 {STATIC_AUTH}
 
@@ -511,16 +413,7 @@ token_file = "{}"
 "#,
         secret.path.display(),
         secret.path.display(),
-    ))?;
-    let config = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-        ]),
-        std::iter::empty(),
-    )?
-    .resolve()?;
+    ))??;
 
     assert!(config.node.srt.encryption.is_some());
     assert!(config.node.metrics.token.is_some());
@@ -530,7 +423,7 @@ token_file = "{}"
 #[test]
 fn an_inline_secret_and_its_file_are_mutually_exclusive() -> Result<(), Box<dyn Error>> {
     let secret = TempConfig::new("mounted-secret")?;
-    let file = TempConfig::new(&format!(
+    let result = resolve_toml(&format!(
         r#"
 {STATIC_AUTH}
 
@@ -540,39 +433,28 @@ token_file = "{}"
 "#,
         secret.path.display(),
     ))?;
-    let result = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-        ]),
-        std::iter::empty(),
-    )?
-    .resolve();
 
     assert!(matches!(result, Err(ConfigError::Invalid(_))));
     Ok(())
 }
 
 #[test]
-fn tls_requires_both_the_certificate_and_key() {
-    let file = TempConfig::new(STATIC_AUTH).expect("temporary config is written");
-    let result = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().expect("temporary path is UTF-8"),
-        ]),
-        env([("RUSHLS_HTTP_TLS_CERTIFICATE", "/tmp/certificate.pem")]),
-    );
+fn tls_requires_both_the_certificate_and_key() -> Result<(), Box<dyn Error>> {
+    let result = load_with(
+        STATIC_AUTH,
+        &[],
+        &[("RUSHLS_HTTP_TLS_CERTIFICATE", "/tmp/certificate.pem")],
+    )?;
 
     assert!(result.is_err());
+    Ok(())
 }
 
 #[test]
 fn unknown_toml_keys_are_rejected() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
-        r#"
+    assert!(
+        load_toml(
+            r#"
 [auth]
 provider = "static"
 
@@ -583,18 +465,8 @@ key = "key"
 [server]
 maximum_concurrent_publishers = 10
 maximum_concurrent_publisherz = 11
-"#,
-    )?;
-
-    assert!(
-        AppConfig::load_from(
-            os([
-                "rushls",
-                "--config",
-                file.path.to_str().ok_or("temporary path is not UTF-8")?,
-            ]),
-            std::iter::empty(),
-        )
+"#
+        )?
         .is_err()
     );
     Ok(())
@@ -602,8 +474,9 @@ maximum_concurrent_publisherz = 11
 
 #[test]
 fn low_level_pipeline_settings_are_not_part_of_the_public_schema() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
-        r#"
+    assert!(
+        load_toml(
+            r#"
 [auth]
 provider = "static"
 
@@ -613,18 +486,8 @@ key = "key"
 
 [ingest.rtmp.avformat]
 io_buffer_size = "64KiB"
-"#,
-    )?;
-
-    assert!(
-        AppConfig::load_from(
-            os([
-                "rushls",
-                "--config",
-                file.path.to_str().ok_or("temporary path is not UTF-8")?,
-            ]),
-            std::iter::empty(),
-        )
+"#
+        )?
         .is_err()
     );
     Ok(())
@@ -632,22 +495,12 @@ io_buffer_size = "64KiB"
 
 #[test]
 fn the_two_publisher_limits_are_configured_independently() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new(
-        r#"
+    const LIMITS: &str = r#"
 [server]
 maximum_concurrent_publishers = 40
 maximum_pending_publishers_per_listener = 7
-"#,
-    )?;
-    let config = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-        ]),
-        std::iter::empty(),
-    )?
-    .resolve()?;
+"#;
+    let config = resolve_toml(LIMITS)??;
 
     assert_eq!(config.node.maximum_sessions, 40);
     assert_eq!(config.node.maximum_pending_publishers_per_listener, 7);
@@ -655,17 +508,11 @@ maximum_pending_publishers_per_listener = 7
     // The admission budget deliberately need not exceed the session cap: it
     // covers a different population, and a slot is returned as soon as a
     // publisher authenticates rather than being held for the session.
-    let raised = AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-            "--server-maximum-pending-publishers-per-listener",
-            "9",
-        ]),
-        env([("RUSHLS_SERVER_MAXIMUM_PENDING_PUBLISHERS_PER_LISTENER", "8")]),
-    )?
-    .resolve()?;
+    let raised = resolve_with(
+        LIMITS,
+        &["--server-maximum-pending-publishers-per-listener", "9"],
+        &[("RUSHLS_SERVER_MAXIMUM_PENDING_PUBLISHERS_PER_LISTENER", "8")],
+    )??;
     assert_eq!(raised.node.maximum_pending_publishers_per_listener, 9);
     Ok(())
 }
@@ -844,40 +691,60 @@ events = ["session.ended"]
     Ok(())
 }
 
-/// Loads one TOML fragment, separating "could not parse" from "would not run".
+/// Writes one TOML fragment and loads it, with optional argument and
+/// environment overrides layered on top.
+///
+/// The nested result separates "the temporary file could not be written" — a
+/// broken test — from "the configuration was refused", which is what every
+/// caller here is actually asserting on. Loading stops short of [`resolve`],
+/// so a test about the *schema* cannot accidentally be satisfied by a later
+/// validation failure instead.
+///
+/// [`resolve`]: AppConfig::resolve
+fn load_with(
+    configuration: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Result<Result<AppConfig, ConfigError>, Box<dyn Error>> {
+    let file = TempConfig::new(configuration)?;
+    let mut args = os(["rushls", "--config"]).collect::<Vec<_>>();
+    args.push(file.path.clone().into_os_string());
+    args.extend(arguments.iter().copied().map(OsString::from));
+
+    Ok(AppConfig::load_from(
+        args,
+        environment
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into())),
+    ))
+}
+
+/// As [`load_with`], carried through to a resolved runtime configuration.
+fn resolve_with(
+    configuration: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Result<Result<ResolvedAppConfig, ConfigError>, Box<dyn Error>> {
+    Ok(load_with(configuration, arguments, environment)?.and_then(AppConfig::resolve))
+}
+
+/// Loads one TOML fragment on its own, for tests about the schema itself.
+fn load_toml(configuration: &str) -> Result<Result<AppConfig, ConfigError>, Box<dyn Error>> {
+    load_with(configuration, &[], &[])
+}
+
+/// Loads and resolves one TOML fragment on its own.
 fn resolve_toml(
     configuration: &str,
 ) -> Result<Result<ResolvedAppConfig, ConfigError>, Box<dyn Error>> {
-    let file = TempConfig::new(configuration)?;
-    Ok(AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path.to_str().ok_or("temporary path is not UTF-8")?,
-        ]),
-        std::iter::empty(),
-    )
-    .and_then(AppConfig::resolve))
+    resolve_with(configuration, &[], &[])
 }
 
-fn resolve_with_env<const N: usize>(
-    values: [(&str, &str); N],
-) -> Result<ResolvedAppConfig, ConfigError> {
-    let file = TempConfig::new(STATIC_AUTH).map_err(|source| ConfigError::Read {
-        path: PathBuf::from("<temporary auth config>"),
-        source,
-    })?;
-    AppConfig::load_from(
-        os([
-            "rushls",
-            "--config",
-            file.path
-                .to_str()
-                .ok_or_else(|| ConfigError::Invalid("temporary config path is not UTF-8".into()))?,
-        ]),
-        env(values),
-    )?
-    .resolve()
+/// Resolves environment overrides against a minimal authenticated node.
+fn resolve_with_env(
+    environment: &[(&str, &str)],
+) -> Result<Result<ResolvedAppConfig, ConfigError>, Box<dyn Error>> {
+    resolve_with(STATIC_AUTH, &[], environment)
 }
 
 fn request(credential: &str) -> PublishRequest {
@@ -898,12 +765,6 @@ fn request(credential: &str) -> PublishRequest {
 
 fn os<const N: usize>(values: [&str; N]) -> impl Iterator<Item = OsString> {
     values.into_iter().map(OsString::from)
-}
-
-fn env<const N: usize>(values: [(&str, &str); N]) -> impl Iterator<Item = (OsString, OsString)> {
-    values
-        .into_iter()
-        .map(|(key, value)| (key.into(), value.into()))
 }
 
 struct TempConfig {

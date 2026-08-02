@@ -10,7 +10,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::{TcpListener, TcpStream},
 };
 
 use crate::delivery::hls::{
@@ -26,10 +26,7 @@ use crate::{
 };
 
 use super::fixtures::application;
-use super::{
-    AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, Readiness, bind, serve,
-    serve_with_readiness,
-};
+use super::{AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, Readiness, serve};
 
 /// A raw HTTP/1.1 response, parsed just enough to assert on.
 struct Reply {
@@ -135,7 +132,7 @@ impl Harness {
     ) -> Self {
         let store = StreamStore::default();
         let origin = application(&store);
-        let listener = bind("127.0.0.1:0".parse().expect("a valid address"))
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("an ephemeral port is available");
         let address = listener.local_addr().expect("the listener is bound");
@@ -154,16 +151,9 @@ impl Harness {
             )),
             MetricsMode::Disabled => None,
         };
-        let served = tokio::spawn(serve_with_readiness(
-            listener,
-            origin,
-            config,
-            metrics,
-            readiness,
-            async {
-                let _ = signal.await;
-            },
-        ));
+        let served = tokio::spawn(serve(listener, origin, config, metrics, readiness, async {
+            let _ = signal.await;
+        }));
         Self {
             address,
             store,
@@ -712,7 +702,7 @@ mod end_to_end {
         },
     };
 
-    use super::{HttpConfig, bind, request, serve};
+    use super::{HttpConfig, Readiness, TcpListener, request, serve};
 
     struct FixturePublish {
         request: PublishRequest,
@@ -813,7 +803,7 @@ mod end_to_end {
         .await;
         assert_eq!(outcome, Ok(SessionOutcome::Ended));
 
-        let listener = bind("127.0.0.1:0".parse().expect("constant is valid"))
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("ephemeral HTTP listener binds");
         let address = listener.local_addr().expect("listener has an address");
@@ -822,6 +812,8 @@ mod end_to_end {
             listener,
             node.application(),
             HttpConfig::default(),
+            None,
+            Readiness::ready(),
             async {
                 let _ = stopped.await;
             },
@@ -1183,7 +1175,8 @@ mod tls {
         },
     };
 
-    use super::super::{HttpConfig, TlsSettings, bind, bind_tls, serve};
+    use super::super::{HttpConfig, Readiness, TlsSettings, bind_tls, serve};
+    use tokio::net::TcpListener;
 
     /// Accepts any certificate and remembers what it was handed.
     ///
@@ -1257,7 +1250,7 @@ mod tls {
         async fn start(settings: TlsSettings) -> Self {
             let store = StreamStore::default();
             let origin = application(&store);
-            let tcp = bind("127.0.0.1:0".parse().expect("a valid address"))
+            let tcp = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("an ephemeral port is available");
             let address = tcp.local_addr().expect("the listener is bound");
@@ -1266,9 +1259,16 @@ mod tls {
                 .expect("the certificate loads");
             let config = HttpConfig::default();
             let (shutdown, signal) = tokio::sync::oneshot::channel();
-            let served = tokio::spawn(serve(listener, origin, config, async {
-                let _ = signal.await;
-            }));
+            let served = tokio::spawn(serve(
+                listener,
+                origin,
+                config,
+                None,
+                Readiness::ready(),
+                async {
+                    let _ = signal.await;
+                },
+            ));
             Self {
                 address,
                 store,
@@ -1510,7 +1510,7 @@ mod tls {
             key: directory.join("absent.key"),
             ..TlsSettings::default()
         };
-        let tcp = bind("127.0.0.1:0".parse().expect("a valid address"))
+        let tcp = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("an ephemeral port is available");
         let (_, events) = NodeEventRecorder::install();

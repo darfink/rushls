@@ -39,14 +39,6 @@ impl Timebase {
         self.den
     }
 
-    pub fn rescale_ticks(self, value: TickTimestamp, dst: Timebase) -> TickTimestamp {
-        let num = i128::from(value)
-            .saturating_mul(i128::from(self.num.get()))
-            .saturating_mul(i128::from(dst.den.get()));
-        let den = i128::from(self.den.get()).saturating_mul(i128::from(dst.num.get()));
-        clamp_i128_to_i64(div_round_nearest(num, den))
-    }
-
     /// Requantizes a signed timestamp without hiding arithmetic overflow.
     ///
     /// Media timestamps may legitimately be negative for priming or reordered
@@ -121,12 +113,6 @@ impl Timebase {
             .saturating_mul(NANOS_PER_SECOND);
         let den = u128::from(self.den.get());
         Duration::from_nanos(clamp_u128_to_u64(div_round_nearest_unsigned(num, den)))
-    }
-
-    pub fn requantize_ratio_to(self, dst: Timebase) -> Option<Timebase> {
-        let num = self.num.checked_mul(dst.den)?;
-        let den = self.den.checked_mul(dst.num)?;
-        Some(Timebase::new(num, den))
     }
 }
 
@@ -245,25 +231,8 @@ fn greatest_common_divisor(mut left: u128, mut right: u128) -> u128 {
     left
 }
 
-fn clamp_i128_to_i64(value: i128) -> i64 {
-    value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
-}
-
 fn clamp_u128_to_u64(value: u128) -> u64 {
     value.min(u128::from(u64::MAX)) as u64
-}
-
-fn div_round_nearest(num: i128, den: i128) -> i128 {
-    debug_assert!(den != 0);
-    let quotient = num / den;
-    let remainder = num % den;
-    if remainder == 0 || remainder.abs().saturating_mul(2) < den.abs() {
-        quotient
-    } else if (num >= 0) == (den >= 0) {
-        quotient.saturating_add(1)
-    } else {
-        quotient.saturating_sub(1)
-    }
 }
 
 fn div_round_nearest_checked(num: i128, den: i128) -> Option<i128> {

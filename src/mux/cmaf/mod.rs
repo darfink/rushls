@@ -645,7 +645,7 @@ mod tests {
             },
         },
         observe::{EventObserver, Events, SessionEvent},
-        segment::{SegmentationPlan, TrackSegmentationPlan},
+        segment::{SegmentationPlan, fixtures::PlanBuilder},
         source::{
             DiscoveryLimits, InputLimits, PacketSource,
             avformat::{AvformatConfig, AvformatPacketSource, ReadInput},
@@ -714,6 +714,50 @@ mod tests {
         })
     }
 
+    /// The video schedule every test starts from: 16 384-tick segments cut
+    /// into two parts, on the ordinary grid.
+    ///
+    /// Returned unbuilt so a test can override the one field it is about.
+    fn video_plan(track_id: u32, timebase: Timebase) -> PlanBuilder {
+        PlanBuilder::new(track_id, timebase, nz::u64!(16_384)).part(nz::u32!(1), nz::u64!(8_192))
+    }
+
+    /// The audio equivalent: whole AAC frames, `frames` of them per segment,
+    /// `frames_per_part` to a part.
+    fn audio_plan(timebase: Timebase, frames: u64, frames_per_part: u32) -> PlanBuilder {
+        PlanBuilder::new(
+            0,
+            timebase,
+            NonZero::new(frames * AAC_FRAME_SAMPLES).expect("a segment spans whole frames"),
+        )
+        .part(
+            NonZero::new(frames_per_part).expect("a part spans whole frames"),
+            NonZero::new(u64::from(frames_per_part) * AAC_FRAME_SAMPLES).expect("nonzero"),
+        )
+    }
+
+    /// Plans these tracks and starts the default pass-through muxer over them.
+    ///
+    /// The pair is always taken together — a schedule exists to be muxed to —
+    /// and both failures are fixture bugs rather than anything under test, so
+    /// neither is worth restating at a dozen call sites.
+    fn started(
+        input: &crate::media::PresentationPlan,
+        plans: Vec<crate::segment::TrackSegmentationPlan>,
+        events: &crate::observe::EventSink,
+    ) -> crate::mux::StartedMuxer {
+        let segmentation =
+            SegmentationPlan::new(input, plans).expect("fixture segmentation validates");
+        PassThroughMuxerFactory::default()
+            .start(MuxerStartRequest {
+                presentation: input,
+                segmentation: &segmentation,
+                time_anchor: SystemTime::UNIX_EPOCH,
+                events,
+            })
+            .expect("the fixture CMAF output starts")
+    }
+
     fn start(
         policy: SegmentBoundaryPolicy,
         timebase: Timebase,
@@ -721,21 +765,8 @@ mod tests {
     ) -> Result<crate::mux::StartedMuxer, crate::mux::MuxError> {
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
             .expect("fixture presentation validates");
-        let segmentation = SegmentationPlan::new(
-            &input,
-            vec![TrackSegmentationPlan {
-                track_id: TrackId(0),
-                timebase,
-                presentation_origin_pts: 0,
-                segmentation_origin_pts: 0,
-                first_segment_boundary_pts: 16_384,
-                segment_duration: nz::u64!(16_384),
-                part_access_units: nz::u32!(1),
-                part_duration: nz::u64!(8_192),
-                boundary_tolerance: 0,
-            }],
-        )
-        .expect("fixture segmentation validates");
+        let segmentation = SegmentationPlan::new(&input, vec![video_plan(0, timebase).build()])
+            .expect("fixture segmentation validates");
         PassThroughMuxerFactory::new(CmafMuxerConfig {
             segment_boundary_policy: policy,
             ..CmafMuxerConfig::default()
@@ -768,31 +799,15 @@ mod tests {
             .build();
         let input = validate(&catalog(vec![audio]), &StreamPolicy::permissive())
             .expect("audio fixture validates");
-        let segment_duration = 8 * AAC_FRAME_SAMPLES;
-        let segmentation = SegmentationPlan::new(
+        started(
             &input,
-            vec![TrackSegmentationPlan {
-                track_id: TrackId(0),
-                timebase,
-                presentation_origin_pts: 0,
-                segmentation_origin_pts,
-                first_segment_boundary_pts: segmentation_origin_pts
-                    + i64::try_from(segment_duration).expect("fixture timing fits"),
-                segment_duration: NonZero::new(segment_duration).expect("nonzero"),
-                part_access_units: nz::u32!(2),
-                part_duration: NonZero::new(2 * AAC_FRAME_SAMPLES).expect("nonzero"),
-                boundary_tolerance: 0,
-            }],
+            vec![
+                audio_plan(timebase, 8, 2)
+                    .segmentation_origin(segmentation_origin_pts)
+                    .build(),
+            ],
+            events,
         )
-        .expect("audio segmentation validates");
-        PassThroughMuxerFactory::default()
-            .start(MuxerStartRequest {
-                presentation: &input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events,
-            })
-            .expect("audio CMAF output starts")
     }
 
     fn trimmed_audio_sample(pts: i64, trim: AudioTrim) -> NormalizedSample {
@@ -979,29 +994,15 @@ mod tests {
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(16_384));
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
             .expect("fixture presentation validates");
-        let segmentation = SegmentationPlan::new(
+        let mut started = started(
             &input,
-            vec![TrackSegmentationPlan {
-                track_id: TrackId(0),
-                timebase,
-                presentation_origin_pts: 0,
-                segmentation_origin_pts: 0,
-                first_segment_boundary_pts: i64::try_from(16 * FRAME).expect("fixture fits"),
-                segment_duration: NonZero::new(16 * FRAME).expect("nonzero"),
-                part_access_units: nz::u32!(1),
-                part_duration: NonZero::new(FRAME).expect("nonzero"),
-                boundary_tolerance: 0,
-            }],
-        )
-        .expect("fixture segmentation validates");
-        let mut started = PassThroughMuxerFactory::default()
-            .start(MuxerStartRequest {
-                presentation: &input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events: &sink,
-            })
-            .expect("reordered CMAF output starts");
+            vec![
+                PlanBuilder::new(0, timebase, NonZero::new(16 * FRAME).expect("nonzero"))
+                    .part(nz::u32!(1), NonZero::new(FRAME).expect("nonzero"))
+                    .build(),
+            ],
+            &sink,
+        );
         let frame = i64::try_from(FRAME).expect("fixture duration fits");
         let mut media = Vec::new();
 
@@ -1076,32 +1077,14 @@ mod tests {
             &StreamPolicy::permissive(),
         )
         .expect("two-video fixture validates");
-        let segmentation = SegmentationPlan::new(
+        let mut started = started(
             &input,
             [0, 1]
                 .into_iter()
-                .map(|track_id| TrackSegmentationPlan {
-                    track_id: TrackId(track_id),
-                    timebase,
-                    presentation_origin_pts: 0,
-                    segmentation_origin_pts: 0,
-                    first_segment_boundary_pts: 16_384,
-                    segment_duration: nz::u64!(16_384),
-                    part_access_units: nz::u32!(1),
-                    part_duration: nz::u64!(8_192),
-                    boundary_tolerance: 0,
-                })
+                .map(|track_id| video_plan(track_id, timebase).build())
                 .collect(),
-        )
-        .expect("two-track segmentation validates");
-        let mut started = PassThroughMuxerFactory::default()
-            .start(MuxerStartRequest {
-                presentation: &input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events: &sink,
-            })
-            .expect("two CMAF outputs start");
+            &sink,
+        );
         assert_eq!(started.presentation.renditions.len(), 2);
 
         let mut media = Vec::new();
@@ -1146,30 +1129,11 @@ mod tests {
             .build();
         let input = validate(&catalog(vec![audio]), &StreamPolicy::permissive())
             .expect("audio fixture validates");
-        let segmentation = SegmentationPlan::new(
+        let mut started = started(
             &input,
-            vec![TrackSegmentationPlan {
-                track_id: TrackId(0),
-                timebase,
-                presentation_origin_pts: 0,
-                segmentation_origin_pts: 0,
-                first_segment_boundary_pts: i64::try_from(segment_ticks)
-                    .expect("segment ticks fit"),
-                segment_duration: NonZero::new(segment_ticks).expect("nonzero"),
-                part_access_units: nz::u32!(4),
-                part_duration: NonZero::new(AAC_FRAME_SAMPLES * 4).expect("nonzero"),
-                boundary_tolerance: 0,
-            }],
-        )
-        .expect("audio segmentation validates");
-        let mut started = PassThroughMuxerFactory::default()
-            .start(MuxerStartRequest {
-                presentation: &input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events: &sink,
-            })
-            .expect("an audio CMAF output starts");
+            vec![audio_plan(timebase, frames_per_segment, 4).build()],
+            &sink,
+        );
 
         let mut media = Vec::new();
         // Three full segments: enough that a per-segment residue would have
@@ -1222,29 +1186,17 @@ mod tests {
             .build();
         let input = validate(&catalog(vec![audio]), &StreamPolicy::permissive())
             .expect("audio fixture validates");
-        let segmentation = SegmentationPlan::new(
+        let mut started = started(
             &input,
-            vec![TrackSegmentationPlan {
-                track_id: TrackId(0),
-                timebase,
-                presentation_origin_pts: 0,
-                segmentation_origin_pts: 0,
-                first_segment_boundary_pts: i64::try_from(segment_ticks).expect("ticks fit"),
-                segment_duration: NonZero::new(segment_ticks).expect("nonzero"),
-                part_access_units,
-                part_duration: part_target,
-                boundary_tolerance: access_units.iter().copied().max().unwrap_or(0),
-            }],
-        )
-        .expect("audio segmentation validates");
-        let mut started = PassThroughMuxerFactory::default()
-            .start(MuxerStartRequest {
-                presentation: &input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events: &sink,
-            })
-            .expect("an audio CMAF output starts");
+            vec![
+                PlanBuilder::new(0, timebase, NonZero::new(segment_ticks).expect("nonzero"))
+                    .part(part_access_units, part_target)
+                    // A jittery cadence needs room for its longest access unit.
+                    .boundary_tolerance(access_units.iter().copied().max().unwrap_or(0))
+                    .build(),
+            ],
+            &sink,
+        );
 
         let mut media = Vec::new();
         let mut pts = 0_i64;
@@ -1359,29 +1311,20 @@ mod tests {
             .build();
         let input = validate(&catalog(vec![audio]), &StreamPolicy::permissive())
             .expect("audio fixture validates");
-        let segmentation = SegmentationPlan::new(
+        let mut started = started(
             &input,
-            vec![TrackSegmentationPlan {
-                track_id: TrackId(0),
-                timebase,
-                presentation_origin_pts: 0,
-                segmentation_origin_pts: 0,
-                first_segment_boundary_pts: 1_900,
-                segment_duration: nz::u64!(1_500),
-                part_access_units: nz::u32!(1),
-                part_duration: nz::u64!(500),
-                boundary_tolerance: AAC_FRAME_SAMPLES,
-            }],
-        )
-        .expect("non-grid audio schedule validates");
-        let mut started = PassThroughMuxerFactory::default()
-            .start(MuxerStartRequest {
-                presentation: &input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events: &sink,
-            })
-            .expect("an audio CMAF output starts");
+            vec![
+                // Deliberately off the access-unit grid: 1_900 is not a
+                // multiple of the 1_500-tick period, which is what this test
+                // is about.
+                PlanBuilder::new(0, timebase, nz::u64!(1_500))
+                    .part(nz::u32!(1), nz::u64!(500))
+                    .first_boundary(1_900)
+                    .boundary_tolerance(AAC_FRAME_SAMPLES)
+                    .build(),
+            ],
+            &sink,
+        );
 
         let mut media = Vec::new();
         for frame in 0..=5 {
@@ -1616,29 +1559,11 @@ mod tests {
         let timebase = Timebase::hz90k();
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
             .expect("fixture presentation validates");
-        let segmentation = SegmentationPlan::new(
+        let mut started = started(
             &input,
-            vec![TrackSegmentationPlan {
-                track_id: TrackId(0),
-                timebase,
-                presentation_origin_pts: -1_980,
-                segmentation_origin_pts: 0,
-                first_segment_boundary_pts: 16_384,
-                segment_duration: nz::u64!(16_384),
-                part_access_units: nz::u32!(1),
-                part_duration: nz::u64!(8_192),
-                boundary_tolerance: 0,
-            }],
-        )
-        .expect("offset segmentation validates");
-        let mut started = PassThroughMuxerFactory::default()
-            .start(MuxerStartRequest {
-                presentation: &input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events: &sink,
-            })
-            .expect("offset CMAF output starts");
+            vec![video_plan(0, timebase).presentation_origin(-1_980).build()],
+            &sink,
+        );
         let mut media = Vec::new();
         for sample in [sample(0, true), sample(8_192, false)] {
             started
@@ -1692,42 +1617,16 @@ mod tests {
             .build();
         let input = validate(&catalog(vec![audio, video]), &StreamPolicy::permissive())
             .expect("audio and video fixture validates");
-        let segmentation = SegmentationPlan::new(
+        let mut started = started(
             &input,
             vec![
-                TrackSegmentationPlan {
-                    track_id: TrackId(0),
-                    timebase: audio_base,
-                    presentation_origin_pts: 0,
-                    segmentation_origin_pts: 0,
-                    first_segment_boundary_pts: 8 * AAC_FRAME_SAMPLES as i64,
-                    segment_duration: NonZero::new(8 * AAC_FRAME_SAMPLES).expect("nonzero"),
-                    part_access_units: nz::u32!(2),
-                    part_duration: NonZero::new(2 * AAC_FRAME_SAMPLES).expect("nonzero"),
-                    boundary_tolerance: 0,
-                },
-                TrackSegmentationPlan {
-                    track_id: TrackId(1),
-                    timebase: video_base,
-                    presentation_origin_pts: video_origin,
-                    segmentation_origin_pts: 0,
-                    first_segment_boundary_pts: 16_384,
-                    segment_duration: nz::u64!(16_384),
-                    part_access_units: nz::u32!(1),
-                    part_duration: nz::u64!(8_192),
-                    boundary_tolerance: 0,
-                },
+                audio_plan(audio_base, 8, 2).build(),
+                video_plan(1, video_base)
+                    .presentation_origin(video_origin)
+                    .build(),
             ],
-        )
-        .expect("two-kind segmentation validates");
-        let mut started = PassThroughMuxerFactory::default()
-            .start(MuxerStartRequest {
-                presentation: &input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events: &sink,
-            })
-            .expect("audio and video outputs start");
+            &sink,
+        );
 
         let mut media = Vec::new();
         for frame in 0..4_i64 {
@@ -1919,25 +1818,24 @@ mod tests {
                 let segment_duration = track
                     .timebase
                     .duration_to_ticks_ceil(Duration::from_secs(2));
-                TrackSegmentationPlan {
-                    track_id: track.id,
-                    timebase: track.timebase,
-                    presentation_origin_pts: normalized
+                PlanBuilder::new(
+                    track.id.0,
+                    track.timebase,
+                    NonZero::new(segment_duration).expect("two seconds is representable"),
+                )
+                .part(
+                    nz::u32!(1),
+                    NonZero::new(longest).expect("samples have duration"),
+                )
+                .presentation_origin(
+                    normalized
                         .timeline
                         .get(track.id)
                         .expect("normalized track has a timeline")
                         .origin_pts,
-                    segmentation_origin_pts: first.pts(),
-                    first_segment_boundary_pts: first
-                        .pts()
-                        .checked_add_unsigned(segment_duration)
-                        .expect("fixture segment boundary fits"),
-                    segment_duration: NonZero::new(segment_duration)
-                        .expect("two seconds is representable"),
-                    part_access_units: nz::u32!(1),
-                    part_duration: NonZero::new(longest).expect("samples have duration"),
-                    boundary_tolerance: 0,
-                }
+                )
+                .segmentation_origin(first.pts())
+                .build()
             })
             .collect();
         let segmentation = SegmentationPlan::new(&normalized.presentation, tracks)
@@ -2021,29 +1919,16 @@ mod tests {
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(16_384));
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
             .expect("fixture presentation validates");
-        let segmentation = SegmentationPlan::new(
+        let mut started = started(
             &input,
-            vec![TrackSegmentationPlan {
-                track_id: TrackId(0),
-                timebase,
-                presentation_origin_pts: 1_000,
-                segmentation_origin_pts: 1_000,
-                first_segment_boundary_pts: 17_384,
-                segment_duration: nz::u64!(16_384),
-                part_access_units: nz::u32!(1),
-                part_duration: nz::u64!(8_192),
-                boundary_tolerance: 0,
-            }],
-        )
-        .expect("fixture segmentation validates");
-        let mut started = PassThroughMuxerFactory::default()
-            .start(MuxerStartRequest {
-                presentation: &input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events: &sink,
-            })
-            .expect("CMAF output starts");
+            vec![
+                video_plan(0, timebase)
+                    .presentation_origin(1_000)
+                    .segmentation_origin(1_000)
+                    .build(),
+            ],
+            &sink,
+        );
         let mut media = Vec::new();
 
         started
@@ -2235,30 +2120,14 @@ mod tests {
         .expect("mixed fixture validates");
         let segmentation = SegmentationPlan::new(
             &subtitle_input,
-            vec![
-                TrackSegmentationPlan {
-                    track_id: TrackId(0),
-                    timebase: Timebase::hz90k(),
-                    presentation_origin_pts: 0,
-                    segmentation_origin_pts: 0,
-                    first_segment_boundary_pts: 180_000,
-                    segment_duration: nz::u64!(180_000),
-                    part_access_units: nz::u32!(1),
-                    part_duration: nz::u64!(90_000),
-                    boundary_tolerance: 0,
-                },
-                TrackSegmentationPlan {
-                    track_id: TrackId(1),
-                    timebase: Timebase::hz90k(),
-                    presentation_origin_pts: 0,
-                    segmentation_origin_pts: 0,
-                    first_segment_boundary_pts: 180_000,
-                    segment_duration: nz::u64!(180_000),
-                    part_access_units: nz::u32!(1),
-                    part_duration: nz::u64!(90_000),
-                    boundary_tolerance: 0,
-                },
-            ],
+            [0, 1]
+                .into_iter()
+                .map(|track_id| {
+                    PlanBuilder::new(track_id, Timebase::hz90k(), nz::u64!(180_000))
+                        .part(nz::u32!(1), nz::u64!(90_000))
+                        .build()
+                })
+                .collect(),
         )
         .expect("fixture segmentation validates");
         let started = PassThroughMuxerFactory::default()

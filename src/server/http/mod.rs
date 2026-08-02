@@ -28,12 +28,9 @@ pub mod fixtures;
 #[cfg(test)]
 mod tests;
 
-use std::{
-    net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 use axum::{
@@ -145,21 +142,8 @@ impl Readiness {
     }
 }
 
-/// Builds the router that serves one origin.
-pub fn router<P: Application>(application: Arc<P>, config: &HttpConfig) -> Router {
-    router_with_metrics(application, config, None)
-}
-
-/// Builds the origin router with an optional operator metrics surface.
-pub fn router_with_metrics<P: Application>(
-    application: Arc<P>,
-    config: &HttpConfig,
-    metrics: Option<MetricsEndpoint>,
-) -> Router {
-    router_with_readiness(application, config, metrics, Readiness::ready())
-}
-
-fn router_with_readiness<P: Application>(
+/// Builds the router that serves one origin, including the operator surface.
+fn router<P: Application>(
     application: Arc<P>,
     config: &HttpConfig,
     metrics: Option<MetricsEndpoint>,
@@ -192,44 +176,6 @@ pub async fn serve<L, P>(
     listener: L,
     application: Arc<P>,
     config: HttpConfig,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()>
-where
-    L: axum::serve::Listener,
-    L::Addr: std::fmt::Debug,
-    P: Application,
-{
-    axum::serve(listener, router(application, &config).into_make_service())
-        .with_graceful_shutdown(shutdown)
-        .await
-}
-
-/// Serves the origin and, when configured, Prometheus metrics on `/metrics`.
-pub async fn serve_with_metrics<L, P>(
-    listener: L,
-    application: Arc<P>,
-    config: HttpConfig,
-    metrics: MetricsEndpoint,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()>
-where
-    L: axum::serve::Listener,
-    L::Addr: std::fmt::Debug,
-    P: Application,
-{
-    axum::serve(
-        listener,
-        router_with_metrics(application, &config, Some(metrics)).into_make_service(),
-    )
-    .with_graceful_shutdown(shutdown)
-    .await
-}
-
-/// Serves the complete operator surface with runtime-controlled readiness.
-pub async fn serve_with_readiness<L, P>(
-    listener: L,
-    application: Arc<P>,
-    config: HttpConfig,
     metrics: Option<MetricsEndpoint>,
     readiness: Readiness,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -241,22 +187,17 @@ where
 {
     axum::serve(
         listener,
-        router_with_readiness(application, &config, metrics, readiness).into_make_service(),
+        router(application, &config, metrics, readiness).into_make_service(),
     )
     .with_graceful_shutdown(shutdown)
     .await
 }
 
-/// The address a bound listener is actually on.
-pub async fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
-    TcpListener::bind(address).await
-}
-
 /// Binds and terminates TLS, loading the certificate and starting its watch.
 ///
-/// Separate from [`bind`] rather than folded into it because binding can fail
-/// for reasons a certificate cannot, and an operator reading a startup failure
-/// deserves to know which of the two went wrong.
+/// Separate from binding the socket rather than folded into it because binding
+/// can fail for reasons a certificate cannot, and an operator reading a startup
+/// failure deserves to know which of the two went wrong.
 pub fn bind_tls(
     listener: TcpListener,
     settings: TlsSettings,

@@ -44,14 +44,6 @@ impl<'a> MediaPlaylistWriter<'a> {
         Ok(self)
     }
 
-    pub fn playlist_type(
-        &mut self,
-        presentation: PlaylistPresentationType,
-    ) -> ManifestWriteResult<&mut Self> {
-        writeln!(self.out, "#EXT-X-PLAYLIST-TYPE:{presentation}")?;
-        Ok(self)
-    }
-
     pub fn part_information(&mut self, target: Duration) -> ManifestWriteResult<&mut Self> {
         require_nonzero(target, "PART-TARGET")?;
         writeln!(
@@ -163,13 +155,6 @@ fn require_nonzero(duration: Duration, field: &'static str) -> ManifestWriteResu
         return Err(ManifestWriteError::ZeroDuration { field });
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
-#[display(rename_all = "SCREAMING-KEBAB-CASE")]
-pub enum PlaylistPresentationType {
-    Event,
-    Vod,
 }
 
 #[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
