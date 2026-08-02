@@ -171,10 +171,6 @@ impl LiveStream {
         self.snapshot.load().idle
     }
 
-    pub fn current_publication(&self) -> u64 {
-        self.state.read().publication
-    }
-
     pub fn retained_payload_bytes(&self) -> usize {
         self.state.read().retained_payload_bytes
     }

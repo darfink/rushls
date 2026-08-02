@@ -22,9 +22,6 @@ use super::{
 /// Ticks in one second of the 90 kHz video timebase these fixtures use.
 pub const VIDEO_SECOND: i64 = 90_000;
 
-/// Ticks in one second of the 48 kHz audio timebase these fixtures use.
-pub const AUDIO_SECOND: i64 = 48_000;
-
 /// Validates a track set that is expected to be admissible.
 pub fn presentation(tracks: Vec<DiscoveredTrack>) -> PresentationPlan {
     validate(&domain::catalog(tracks), &StreamPolicy::permissive())

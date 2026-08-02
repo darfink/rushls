@@ -201,11 +201,6 @@ impl RenditionBuilder {
     }
 }
 
-/// A 90 kHz video output whose key is stable across publications.
-pub fn video_rendition(packaging_rendition_id: u32) -> PackagedRendition {
-    RenditionBuilder::new(packaging_rendition_id, MediaKind::Video).build()
-}
-
 /// The default pass-through topology over `renditions`, anchored at the epoch.
 pub fn presentation(
     input: &PresentationPlan,
