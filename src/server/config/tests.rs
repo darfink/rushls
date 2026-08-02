@@ -799,3 +799,30 @@ impl Drop for TempConfig {
         let _ = fs::remove_file(&self.path);
     }
 }
+
+#[test]
+fn an_unknown_enumerated_value_names_the_alternatives() -> Result<(), Box<dyn Error>> {
+    // The point of these messages is that an operator who typos one does not
+    // have to go and read the reference file to find out what was allowed.
+    let provider = load_toml("[auth]\nprovider = \"opne\"\n")?
+        .err()
+        .ok_or("a misspelled provider is refused")?
+        .to_string();
+    assert!(provider.contains("static"), "{provider}");
+    assert!(provider.contains("open"), "{provider}");
+    assert!(
+        provider.contains("http"),
+        "the message lists every provider, including ones added after it was \
+         first written: {provider}"
+    );
+
+    let key_length = load_toml(&format!(
+        "{STATIC_AUTH}\n[ingest.srt]\nencryption_key_length = \"aes999\"\n"
+    ))?
+    .err()
+    .ok_or("an unknown key length is refused")?
+    .to_string();
+    assert!(key_length.contains("aes128"), "{key_length}");
+    assert!(key_length.contains("aes256"), "{key_length}");
+    Ok(())
+}

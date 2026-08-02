@@ -218,8 +218,8 @@ pub struct AuthAppConfig {
     #[conf(parameter, long, env, default_value = "open", serde(use_value_parser))]
     provider: AuthProviderValue,
     /// Named policy profiles selected by configured publishers.
-    #[conf(parameter, value_parser = PolicyProfiles::from_str)]
-    policies: Option<PolicyProfiles>,
+    #[conf(parameter, value_parser = TomlTable::<PolicyAppConfig>::from_str)]
+    policies: Option<TomlTable<PolicyAppConfig>>,
     #[conf(flatten, prefix = "static", serde(rename = "static"))]
     static_provider: Option<StaticAuthAppConfig>,
     #[conf(flatten, prefix = "open", serde(rename = "open"))]
@@ -236,7 +236,7 @@ impl AuthAppConfig {
     ) -> Result<Arc<dyn Authenticator>, ConfigError> {
         let mut profiles = self.policies.unwrap_or_default();
         profiles.0.entry("default".into()).or_default();
-        let policies = profiles.resolve()?;
+        let policies = resolve_policies(profiles)?;
 
         match self.provider {
             AuthProviderValue::Static => {
@@ -400,8 +400,8 @@ pub struct HooksAppConfig {
     #[conf(parameter, long, env, default_value = "64KiB", serde(use_value_parser))]
     maximum_response_bytes: ByteSize,
     /// Destinations, keyed by a name that identifies them in logs and metrics.
-    #[conf(parameter, value_parser = HookEndpoints::from_str)]
-    endpoints: Option<HookEndpoints>,
+    #[conf(parameter, value_parser = TomlTable::<HookEndpointAppConfig>::from_str)]
+    endpoints: Option<TomlTable<HookEndpointAppConfig>>,
 }
 
 impl HooksAppConfig {
@@ -438,11 +438,25 @@ impl HooksAppConfig {
     }
 }
 
-#[derive(Default, Deserialize)]
+/// A TOML table of entries keyed by the name an operator chose.
+///
+/// `conf` hands a table-valued parameter over as its own TOML text rather than
+/// as a parsed value, so each of these has to parse itself. Generic because the
+/// three that exist — hook endpoints, static publishers, policy profiles —
+/// differ in nothing but what they hold.
+#[derive(Debug, Deserialize)]
 #[serde(transparent)]
-struct HookEndpoints(BTreeMap<String, HookEndpointAppConfig>);
+struct TomlTable<T>(BTreeMap<String, T>);
 
-impl FromStr for HookEndpoints {
+// Hand-written rather than derived: an empty table is meaningful for every `T`,
+// and deriving would demand `T: Default` for no reason.
+impl<T> Default for TomlTable<T> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+impl<T: serde::de::DeserializeOwned> FromStr for TomlTable<T> {
     type Err = toml::de::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -577,8 +591,8 @@ pub struct OpenAuthAppConfig {
 #[conf(serde)]
 pub struct StaticAuthAppConfig {
     /// Statically authorized publishers, keyed by their stable principal name.
-    #[conf(parameter, value_parser = StaticPublishers::from_str)]
-    publishers: Option<StaticPublishers>,
+    #[conf(parameter, value_parser = TomlTable::<StaticPublisherAppConfig>::from_str)]
+    publishers: Option<TomlTable<StaticPublisherAppConfig>>,
 }
 
 impl StaticAuthAppConfig {
@@ -637,18 +651,6 @@ impl StaticAuthAppConfig {
     }
 }
 
-#[derive(Default, Deserialize)]
-#[serde(transparent)]
-struct StaticPublishers(BTreeMap<String, StaticPublisherAppConfig>);
-
-impl FromStr for StaticPublishers {
-    type Err = toml::de::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        toml::from_str(value)
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StaticPublisherAppConfig {
@@ -681,30 +683,20 @@ impl StaticPublisherAppConfig {
     }
 }
 
-#[derive(Default, Deserialize)]
-#[serde(transparent)]
-struct PolicyProfiles(BTreeMap<String, PolicyAppConfig>);
-
-impl PolicyProfiles {
-    fn resolve(self) -> Result<BTreeMap<String, StreamPolicy>, ConfigError> {
-        self.0
-            .into_iter()
-            .map(|(name, configured)| {
-                if name.is_empty() {
-                    return Err(invalid("auth policy name must not be empty"));
-                }
-                configured.resolve(&name).map(|policy| (name, policy))
-            })
-            .collect()
-    }
-}
-
-impl FromStr for PolicyProfiles {
-    type Err = toml::de::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        toml::from_str(value)
-    }
+/// Turns each configured profile into the policy publishers select by name.
+fn resolve_policies(
+    profiles: TomlTable<PolicyAppConfig>,
+) -> Result<BTreeMap<String, StreamPolicy>, ConfigError> {
+    profiles
+        .0
+        .into_iter()
+        .map(|(name, configured)| {
+            if name.is_empty() {
+                return Err(invalid("auth policy name must not be empty"));
+            }
+            configured.resolve(&name).map(|policy| (name, policy))
+        })
+        .collect()
 }
 
 #[derive(Default, Deserialize)]
@@ -1105,34 +1097,44 @@ impl fmt::Display for OriginsValue {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, derive_more::Display)]
+#[display(rename_all = "lowercase")]
 enum AuthProviderValue {
     Static,
     Open,
     Http,
 }
 
+impl AuthProviderValue {
+    const ALL: [Self; 3] = [Self::Static, Self::Open, Self::Http];
+}
+
 impl FromStr for AuthProviderValue {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "static" => Ok(Self::Static),
-            "open" => Ok(Self::Open),
-            "http" => Ok(Self::Http),
-            _ => Err("expected `static` or `open`".into()),
-        }
+        // Matched against the names `Display` produces, so the accepted set and
+        // the printed one cannot drift, and the diagnostic lists what is
+        // actually available rather than a fixed sentence someone has to
+        // remember to update. The previous one still said "static or open"
+        // long after `http` was added.
+        one_of(&Self::ALL, value, "auth provider")
     }
 }
 
-impl fmt::Display for AuthProviderValue {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Static => output.write_str("static"),
-            Self::Open => output.write_str("open"),
-            Self::Http => output.write_str("http"),
-        }
-    }
+/// Resolves a value against the spellings `Display` gives a fixed set of
+/// variants, reporting the whole set when nothing matches.
+fn one_of<T: Copy + fmt::Display>(all: &[T], value: &str, label: &str) -> Result<T, String> {
+    all.iter()
+        .find(|candidate| candidate.to_string() == value)
+        .copied()
+        .ok_or_else(|| {
+            let names: Vec<String> = all.iter().map(ToString::to_string).collect();
+            format!(
+                "unknown {label} `{value}`; expected one of: {}",
+                names.join(", ")
+            )
+        })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -1204,7 +1206,8 @@ impl fmt::Display for FrameRateValue {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, derive_more::Display)]
+#[display(rename_all = "lowercase")]
 enum SrtKeyLengthValue {
     Aes128,
     Aes192,
@@ -1215,22 +1218,11 @@ impl FromStr for SrtKeyLengthValue {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "aes128" => Ok(Self::Aes128),
-            "aes192" => Ok(Self::Aes192),
-            "aes256" => Ok(Self::Aes256),
-            _ => Err("expected one of: aes128, aes192, aes256".into()),
-        }
-    }
-}
-
-impl fmt::Display for SrtKeyLengthValue {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        output.write_str(match self {
-            Self::Aes128 => "aes128",
-            Self::Aes192 => "aes192",
-            Self::Aes256 => "aes256",
-        })
+        one_of(
+            &[Self::Aes128, Self::Aes192, Self::Aes256],
+            value,
+            "SRT key length",
+        )
     }
 }
 
@@ -1244,50 +1236,66 @@ impl From<SrtKeyLengthValue> for SrtKeyLength {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// The codecs an operator may admit.
+///
+/// Deliberately narrower than [`Codec`]: `MovText` is something the pipeline
+/// recognises on input rather than something anyone configures, and `Unknown`
+/// is not a name at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
+#[display(rename_all = "lowercase")]
 enum CodecValue {
     Aac,
     Av1,
-    #[serde(alias = "avc")]
     H264,
-    #[serde(alias = "h265")]
     Hevc,
     Opus,
-    #[serde(alias = "srt")]
     SubRip,
-    #[serde(alias = "vtt")]
     WebVtt,
+}
+
+impl CodecValue {
+    const ALL: [Self; 7] = [
+        Self::Aac,
+        Self::Av1,
+        Self::H264,
+        Self::Hevc,
+        Self::Opus,
+        Self::SubRip,
+        Self::WebVtt,
+    ];
+
+    /// The spellings accepted besides the canonical one `Display` produces.
+    ///
+    /// Only aliases, because the canonical names now have one home. They used
+    /// to have three — a `serde` attribute, a `FromStr` match and a `Display`
+    /// match — so a name could be accepted in a TOML file and refused on the
+    /// command line with neither place looking wrong.
+    const ALIASES: [(&'static str, Self); 4] = [
+        ("avc", Self::H264),
+        ("h265", Self::Hevc),
+        ("srt", Self::SubRip),
+        ("vtt", Self::WebVtt),
+    ];
 }
 
 impl FromStr for CodecValue {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().as_str() {
-            "aac" => Ok(Self::Aac),
-            "av1" => Ok(Self::Av1),
-            "h264" | "avc" => Ok(Self::H264),
-            "hevc" | "h265" => Ok(Self::Hevc),
-            "opus" => Ok(Self::Opus),
-            "subrip" | "srt" => Ok(Self::SubRip),
-            "webvtt" | "vtt" => Ok(Self::WebVtt),
-            _ => Err("unsupported codec name".into()),
+        let value = value.to_ascii_lowercase();
+        match Self::ALIASES.iter().find(|(alias, _)| *alias == value) {
+            Some((_, codec)) => Ok(*codec),
+            None => one_of(&Self::ALL, &value, "codec"),
         }
     }
 }
 
-impl fmt::Display for CodecValue {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        output.write_str(match self {
-            Self::Aac => "aac",
-            Self::Av1 => "av1",
-            Self::H264 => "h264",
-            Self::Hevc => "hevc",
-            Self::Opus => "opus",
-            Self::SubRip => "subrip",
-            Self::WebVtt => "webvtt",
-        })
+impl<'de> Deserialize<'de> for CodecValue {
+    /// Delegates to [`FromStr`] so a TOML file and a command line accept
+    /// exactly the same names.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
     }
 }
 

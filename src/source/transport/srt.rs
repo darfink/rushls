@@ -455,7 +455,9 @@ impl AvformatInput for SrtInput {
                     self.record_transport_loss(true);
                     return Err(AvformatInputError::End(InputState::Closed));
                 }
-                Err(error) if native::ended_cleanly(&self.socket) => {
+                // The detail is dropped deliberately: a peer that closed
+                // cleanly did not fail, whatever the receive call reported.
+                Err(_error) if native::ended_cleanly(&self.socket) => {
                     self.record_transport_loss(true);
                     return Err(AvformatInputError::End(InputState::Closed));
                 }
