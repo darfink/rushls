@@ -20,7 +20,7 @@ mod events;
 pub mod lifecycle;
 mod meters;
 
-pub use delivery::{OriginMeters, OriginSnapshot};
+pub use delivery::{HlsMeters, HlsSnapshot, OriginMeters, OriginSnapshot};
 pub use events::{
     EventObserver, EventSink, Events, NodeEvent, Protocol, SessionEnd, SessionEvent, StreamEvent,
 };

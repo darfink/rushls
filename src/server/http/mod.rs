@@ -1,11 +1,9 @@
 //! The HTTP surface viewers fetch from.
 //!
-//! Thin by construction. Every decision about what a request means, whether it
-//! must wait, and what bytes answer it belongs to
-//! [`delivery::hls::serve`](crate::delivery::hls::serve); this layer only
-//! translates between that vocabulary and HTTP's, and owns the concerns that
-//! genuinely are HTTP: methods, byte ranges, cache directives, and the
-//! listener's lifetime.
+//! Thin by construction. An [`Application`] decides what a request means,
+//! whether it must wait, and what bytes answer it. This layer only translates
+//! that result into HTTP and owns the concerns that genuinely belong to the
+//! transport: methods, byte ranges, headers, and the listener's lifetime.
 //!
 //! # Transport
 //!
@@ -22,8 +20,8 @@
 //! does not happen on the accept path.
 
 mod body;
+mod cache;
 mod cors;
-mod route;
 mod tls;
 
 #[cfg(test)]
@@ -44,21 +42,18 @@ use axum::{
 use tokio::net::TcpListener;
 
 use crate::{
-    delivery::hls::{
-        cache_control::CacheControl,
-        serve::{
-            Body as DeliveryBody, DeliveryError, DeliveryFailure, MediaBody, Origin,
-            Response as DeliveryResponse,
-        },
+    delivery::{
+        Body as DeliveryBody, DeliveryError, DeliveryFailure, MediaBody,
+        Response as DeliveryResponse, Reuse,
     },
     observe::{Events, ProcessMeters},
     server::metrics::MetricsEndpoint,
 };
 
+pub use cache::MediaCachePolicy;
 pub use cors::{AllowedOrigins, CorsConfig, OriginPattern, OriginPatternError, WildcardDepth};
 
 use body::{RangeOutcome, StoredMediaBody, parse_range};
-use route::route;
 
 pub use tls::{TlsError, TlsListener, TlsSettings};
 
@@ -74,6 +69,8 @@ pub struct HttpConfig {
     pub cors: CorsConfig,
     /// Absent serves cleartext, which is the right answer behind a proxy.
     pub tls: Option<TlsSettings>,
+    /// Reuse policy for protocol-neutral initialization and media paths.
+    pub media_cache: MediaCachePolicy,
 }
 
 impl HttpConfig {
@@ -83,37 +80,58 @@ impl HttpConfig {
     }
 }
 
-/// Per-request state: the origin, and the policy answering a request needs.
+/// The application one HTTP request target is delegated to.
+///
+/// Owned by the transport that consumes it; implementations are composed in
+/// runtime so lower layers never name the HTTP server.
+pub trait Application: Send + Sync + 'static {
+    fn serve<'a>(
+        &'a self,
+        path: &'a str,
+        query: Option<&'a str>,
+    ) -> impl Future<Output = Result<DeliveryResponse, DeliveryFailure>> + Send + 'a;
+}
+
+/// Per-request state: the application and HTTP-only policy.
 ///
 /// The CORS policy is behind an `Arc` because axum clones this for every
 /// request and an allowlist is a `Vec<String>`; the certificate paths are not
 /// here at all, for the same reason.
-#[derive(Clone)]
-struct Service {
-    origin: Arc<Origin>,
+struct HttpState<P> {
+    application: Arc<P>,
     cors: Arc<CorsConfig>,
     metrics: Option<MetricsEndpoint>,
 }
 
+impl<P> Clone for HttpState<P> {
+    fn clone(&self) -> Self {
+        Self {
+            application: Arc::clone(&self.application),
+            cors: Arc::clone(&self.cors),
+            metrics: self.metrics.clone(),
+        }
+    }
+}
+
 /// Builds the router that serves one origin.
-pub fn router(origin: Arc<Origin>, config: &HttpConfig) -> Router {
-    router_with_metrics(origin, config, None)
+pub fn router<P: Application>(application: Arc<P>, config: &HttpConfig) -> Router {
+    router_with_metrics(application, config, None)
 }
 
 /// Builds the origin router with an optional operator metrics surface.
-pub fn router_with_metrics(
-    origin: Arc<Origin>,
+pub fn router_with_metrics<P: Application>(
+    application: Arc<P>,
     config: &HttpConfig,
     metrics: Option<MetricsEndpoint>,
 ) -> Router {
     Router::new()
         // One catch-all rather than a route table: a stream identity may
-        // contain slashes, so path structure is resolved by the router module
-        // rather than by pattern matching.
-        .route("/{*path}", any(handle))
-        .fallback(any(handle))
-        .with_state(Service {
-            origin,
+        // contain slashes, so path structure is resolved by the application
+        // rather than by axum pattern matching.
+        .route("/{*path}", any(handle::<P>))
+        .fallback(any(handle::<P>))
+        .with_state(HttpState {
+            application,
             cors: Arc::new(config.cors.clone()),
             metrics,
         })
@@ -128,25 +146,26 @@ pub fn router_with_metrics(
 ///
 /// Generic over the listener so cleartext and TLS share one server and one
 /// shutdown path; only the bytes on the wire differ.
-pub async fn serve<L>(
+pub async fn serve<L, P>(
     listener: L,
-    origin: Arc<Origin>,
+    application: Arc<P>,
     config: HttpConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()>
 where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
+    P: Application,
 {
-    axum::serve(listener, router(origin, &config).into_make_service())
+    axum::serve(listener, router(application, &config).into_make_service())
         .with_graceful_shutdown(shutdown)
         .await
 }
 
 /// Serves the origin and, when configured, Prometheus metrics on `/metrics`.
-pub async fn serve_with_metrics<L>(
+pub async fn serve_with_metrics<L, P>(
     listener: L,
-    origin: Arc<Origin>,
+    application: Arc<P>,
     config: HttpConfig,
     metrics: MetricsEndpoint,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -154,10 +173,11 @@ pub async fn serve_with_metrics<L>(
 where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
+    P: Application,
 {
     axum::serve(
         listener,
-        router_with_metrics(origin, &config, Some(metrics)).into_make_service(),
+        router_with_metrics(application, &config, Some(metrics)).into_make_service(),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -182,8 +202,8 @@ pub fn bind_tls(
     TlsListener::new(listener, settings, meters, events)
 }
 
-async fn handle(
-    State(service): State<Service>,
+async fn handle<P: Application>(
+    State(service): State<HttpState<P>>,
     method: Method,
     OriginalUri(uri): OriginalUri,
     RawQuery(query): RawQuery,
@@ -215,13 +235,11 @@ async fn handle(
         return response;
     }
 
-    let routed = match route(uri.path(), query.as_deref()) {
-        Ok(routed) => routed,
-        Err(error) => {
-            return error_response(service.origin.unrouted(error), &service.cors, &headers);
-        }
-    };
-    let response = match service.origin.serve(&routed.stream, routed.request).await {
+    let response = match service
+        .application
+        .serve(uri.path(), query.as_deref())
+        .await
+    {
         Ok(response) => response,
         Err(failure) => return error_response(failure, &service.cors, &headers),
     };
@@ -317,7 +335,7 @@ fn into_http(
     accepts_gzip: bool,
 ) -> Result<Response, StatusCode> {
     let content_type = HeaderValue::from_static(response.content_type.name());
-    let cache = response.cache_control.into();
+    let cache = response.reuse.into();
     // Announced only where an encoding was actually available to choose. Saying
     // it on already-compressed media would split every cache entry downstream
     // for a resource that never varies — and those are the entries this origin
@@ -345,7 +363,7 @@ fn into_http(
     }
 
     match response.body {
-        DeliveryBody::Playlist(bytes) => Ok(with_vary(
+        DeliveryBody::Manifest(bytes) => Ok(with_vary(
             (
                 [
                     (header::CONTENT_TYPE, content_type),
@@ -432,14 +450,14 @@ fn media_response(
 /// becomes a revalidation. Truncating errs toward asking again sooner than
 /// policy allows rather than later, which is the safe direction for a live
 /// edge.
-impl From<CacheControl> for HeaderValue {
-    fn from(cache_control: CacheControl) -> Self {
-        let seconds = cache_control.max_age.as_secs();
+impl From<Reuse> for HeaderValue {
+    fn from(reuse: Reuse) -> Self {
+        let seconds = reuse.max_age.as_secs();
         if seconds == 0 {
             return Self::from_static(REVALIDATE);
         }
         let mut value = format!("public, max-age={seconds}");
-        if cache_control.immutable {
+        if reuse.immutable {
             value.push_str(", immutable");
         }
         Self::try_from(value).unwrap_or(Self::from_static(REVALIDATE))
@@ -463,7 +481,7 @@ fn error_response(failure: DeliveryFailure, cors: &CorsConfig, request: &HeaderM
     };
     let mut response = (status, failure.error.to_string()).into_response();
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, failure.cache_control.into());
+    headers.insert(header::CACHE_CONTROL, failure.reuse.into());
     if matches!(failure.error, DeliveryError::Unsatisfied) {
         // Tells a client to come back rather than to give up on the stream.
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));

@@ -17,7 +17,7 @@ use std::{
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 
-use crate::delivery::hls::serve::{MediaBody, MediaFrameIter};
+use crate::delivery::{MediaBody, MediaFrameIter};
 
 /// An HTTP body over the buffers media was stored in.
 pub struct StoredMediaBody {

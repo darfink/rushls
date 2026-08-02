@@ -10,8 +10,8 @@
 //! cacheable by whoever holds the snapshot and what makes every rule below
 //! testable without a running stream.
 //!
-//! Names come from [`uri`](crate::delivery::hls::uri), which is shared with the
-//! router that has to resolve what these playlists emit.
+//! Manifest names come from [`uri`](crate::delivery::hls::uri); its media names
+//! are derived from the protocol-neutral namespace the HTTP application routes.
 //!
 //! | Module | Owns |
 //! |---|---|

@@ -7,7 +7,7 @@ use crate::{
     mux::{FinishReason, PackagedMedia, PackagedPresentation, PackagingRenditionId},
 };
 
-use super::{StoreFull, StoreWriteError, StreamLease, StreamStore, gzip::gzip, uri};
+use super::{StoreFull, StoreWriteError, StreamLease, StreamStore, gzip::gzip};
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HlsError {
@@ -94,7 +94,7 @@ impl PublisherFactory for StorePublisherFactory {
         let text = presentation
             .renditions
             .iter()
-            .filter(|rendition| uri::is_text(rendition.config.segment_format))
+            .filter(|rendition| crate::delivery::uri::is_text(rendition.config.segment_format))
             .map(|rendition| rendition.packaging_rendition_id)
             .collect();
         Ok(Box::new(StorePublisher {

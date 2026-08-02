@@ -12,7 +12,11 @@ use crate::{
     admission::Authenticator,
     delivery::hls::{
         StoreLimits, StorePublisherFactory, StreamStore,
-        serve::{DeliveryConfig, Origin},
+        service::{Config as HlsConfig, Service as HlsService},
+    },
+    delivery::{
+        DeliveryError, DeliveryFailure, Origin, Response as DeliveryResponse, Reuse,
+        uri::{MediaResourcePath, parse_media_path},
     },
     hooks::Hooks,
     media::PassThroughNormalizerFactory,
@@ -26,7 +30,7 @@ use crate::{
 };
 
 use super::{
-    http::{self, HttpConfig, TlsError},
+    http::{self, Application, HttpConfig, MediaCachePolicy, TlsError},
     metrics::{MetricsConfig, MetricsEndpoint, MetricsReader},
 };
 
@@ -55,7 +59,7 @@ pub struct NodeConfig {
     pub session: SessionConfig,
     pub cmaf: CmafMuxerConfig,
     pub store: StoreLimits,
-    pub delivery: DeliveryConfig,
+    pub hls: HlsConfig,
     pub http: HttpConfig,
     pub metrics: MetricsConfig,
 }
@@ -74,7 +78,7 @@ impl Default for NodeConfig {
             session: SessionConfig::default(),
             cmaf: CmafMuxerConfig::default(),
             store: StoreLimits::default(),
-            delivery: DeliveryConfig::default(),
+            hls: HlsConfig::default(),
             http: HttpConfig::default(),
             metrics: MetricsConfig::default(),
         }
@@ -121,7 +125,97 @@ pub struct Node {
     services: Services,
     store: StreamStore,
     origin: Arc<Origin>,
+    hls: Arc<HlsService>,
+    application: Arc<ViewerApplication>,
     metrics: MetricsReader,
+}
+
+/// The protocols sharing one viewer-facing HTTP namespace.
+///
+/// Runtime is the composition root and therefore the only layer that names
+/// both the HTTP port and a manifest adapter. Shared media bypasses adapters;
+/// only manifest paths are delegated to HLS.
+pub(crate) struct ViewerApplication {
+    origin: Arc<Origin>,
+    hls: Arc<HlsService>,
+    media_cache: MediaCachePolicy,
+}
+
+impl ViewerApplication {
+    pub(crate) fn new(
+        origin: Arc<Origin>,
+        hls: Arc<HlsService>,
+        media_cache: MediaCachePolicy,
+    ) -> Self {
+        Self {
+            origin,
+            hls,
+            media_cache,
+        }
+    }
+
+    async fn serve_media(
+        &self,
+        named: MediaResourcePath,
+    ) -> Result<DeliveryResponse, DeliveryFailure> {
+        let target = self
+            .origin
+            .stream(&named.stream)
+            .and_then(|live| self.origin.rendition_for(&live, named.resource).ok())
+            .map(|rendition| Duration::from_secs(rendition.contract.target_duration.get()));
+        let result = async {
+            let live = self
+                .origin
+                .stream(&named.stream)
+                .ok_or(DeliveryError::UnknownStream)?;
+            let rendition = self.origin.rendition_for(&live, named.resource)?;
+            let object = self
+                .origin
+                .media(
+                    &named.stream,
+                    named.resource,
+                    self.hls.media_deadline(rendition.contract),
+                )
+                .await?;
+            let target = Duration::from_secs(object.contract.target_duration.get());
+            DeliveryResponse::media(
+                object.body,
+                object.gzip,
+                named.resource,
+                self.media_cache.reuse(target),
+            )
+        }
+        .await;
+
+        result.map_err(|error| DeliveryFailure {
+            error,
+            reuse: if matches!(
+                error,
+                DeliveryError::UnknownStream
+                    | DeliveryError::UnknownRendition
+                    | DeliveryError::UnknownResource
+            ) {
+                self.hls.missing_reuse(target, false)
+            } else {
+                Reuse::revalidate()
+            },
+        })
+    }
+}
+
+impl Application for ViewerApplication {
+    async fn serve<'a>(
+        &'a self,
+        path: &'a str,
+        query: Option<&'a str>,
+    ) -> Result<DeliveryResponse, DeliveryFailure> {
+        match parse_media_path(path) {
+            Ok(Some(named)) => self.serve_media(named).await,
+            // HLS owns manifest recognition, including the distinction
+            // between a malformed name and an absent resource.
+            Ok(None) | Err(_) => self.hls.serve_path(path, query).await,
+        }
+    }
 }
 
 impl Node {
@@ -181,7 +275,13 @@ impl Node {
             meters: meters.clone(),
             events,
         };
-        let origin = Arc::new(Origin::new(store.clone(), config.delivery.clone()));
+        let origin = Arc::new(Origin::new(store.clone()));
+        let hls = Arc::new(HlsService::new(Arc::clone(&origin), config.hls.clone()));
+        let application = Arc::new(ViewerApplication::new(
+            Arc::clone(&origin),
+            Arc::clone(&hls),
+            config.http.media_cache,
+        ));
         let metrics = MetricsReader::new(meters, sessions, store.clone(), config.metrics.export);
 
         Ok(Self {
@@ -189,6 +289,8 @@ impl Node {
             services,
             store,
             origin,
+            hls,
+            application,
             metrics,
         })
     }
@@ -213,6 +315,11 @@ impl Node {
 
     pub fn origin(&self) -> &Arc<Origin> {
         &self.origin
+    }
+
+    #[cfg(test)]
+    pub(crate) fn application(&self) -> Arc<ViewerApplication> {
+        Arc::clone(&self.application)
     }
 
     pub fn metrics(&self) -> &MetricsReader {
@@ -292,7 +399,7 @@ impl Node {
                 report_bound(&events, Protocol::Https, listener.local_addr());
                 tasks.spawn(run_http(
                     listener,
-                    Arc::clone(&self.origin),
+                    Arc::clone(&self.application),
                     self.config.http.clone(),
                     self.metrics_endpoint(),
                     stop_rx.clone(),
@@ -302,7 +409,7 @@ impl Node {
                 report_bound(&events, Protocol::Http, http_listener.local_addr());
                 tasks.spawn(run_http(
                     http_listener,
-                    Arc::clone(&self.origin),
+                    Arc::clone(&self.application),
                     self.config.http.clone(),
                     self.metrics_endpoint(),
                     stop_rx.clone(),
@@ -311,7 +418,7 @@ impl Node {
         }
         tasks.spawn(run_maintenance(
             self.store.clone(),
-            Arc::clone(&self.origin),
+            Arc::clone(&self.hls),
             self.config.maintenance_interval,
             events.clone(),
             stop_rx,
@@ -520,7 +627,7 @@ async fn run_rtmp(
 
 async fn run_http<L>(
     listener: L,
-    origin: Arc<Origin>,
+    application: Arc<ViewerApplication>,
     config: HttpConfig,
     metrics: Option<MetricsEndpoint>,
     stop: watch::Receiver<bool>,
@@ -531,9 +638,10 @@ where
 {
     match metrics {
         Some(metrics) => {
-            http::serve_with_metrics(listener, origin, config, metrics, wait_for_stop(stop)).await
+            http::serve_with_metrics(listener, application, config, metrics, wait_for_stop(stop))
+                .await
         }
-        None => http::serve(listener, origin, config, wait_for_stop(stop)).await,
+        None => http::serve(listener, application, config, wait_for_stop(stop)).await,
     }
     .map_err(RuntimeError::Http)
 }
@@ -555,7 +663,7 @@ fn report_bound(events: &Events, protocol: Protocol, address: std::io::Result<So
 
 async fn run_maintenance(
     store: StreamStore,
-    origin: Arc<Origin>,
+    origin: Arc<HlsService>,
     interval: Duration,
     events: Events,
     mut stop: watch::Receiver<bool>,
@@ -577,10 +685,10 @@ async fn run_maintenance(
                 for stream in reachability.became_available {
                     events.stream(stream, StreamEvent::Available);
                 }
+                origin.remove_streams(&reachability.retired);
                 for stream in reachability.retired {
                     events.stream(stream, StreamEvent::Retired);
                 }
-                origin.prune();
             }
         }
     }

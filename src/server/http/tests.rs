@@ -6,7 +6,7 @@
 //! with the right `Content-Range`, that a blocked request keeps its connection
 //! open, and that shutdown lets an in-flight blocking reload finish.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,7 +18,6 @@ use crate::delivery::hls::{
     fixtures::{
         PART_BYTES, chunk, initialization, lease, video, video_with_cadence, write, write_segment,
     },
-    serve::{DeliveryConfig, Origin},
 };
 use crate::{
     observe::ProcessMeters,
@@ -26,6 +25,7 @@ use crate::{
     session::Registry,
 };
 
+use super::fixtures::application;
 use super::{
     AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, bind, serve, serve_with_metrics,
 };
@@ -120,7 +120,7 @@ impl Harness {
 
     async fn start_config(config: HttpConfig, metrics: MetricsMode) -> Self {
         let store = StreamStore::default();
-        let origin = Arc::new(Origin::new(store.clone(), DeliveryConfig::default()));
+        let origin = application(&store);
         let listener = bind("127.0.0.1:0".parse().expect("a valid address"))
             .await
             .expect("an ephemeral port is available");
@@ -650,7 +650,7 @@ mod end_to_end {
             PublishRequest, PublishResource, StaticPublisher, StaticStreamAuthenticator,
             StreamPolicy,
         },
-        delivery::hls::serve::PlaylistReadiness,
+        delivery::hls::service::PlaylistReadiness,
         domain::{BoxFuture, StreamId},
         observe::{Events, SourceMeters},
         segment::SegmentationPolicy,
@@ -733,7 +733,7 @@ mod end_to_end {
             Duration::from_millis(180),
             Duration::from_millis(90),
         );
-        config.delivery.readiness = PlaylistReadiness::CompletedSegment;
+        config.hls.readiness = PlaylistReadiness::CompletedSegment;
         let session = config.session;
         let node = Node::new(
             config,
@@ -770,7 +770,7 @@ mod end_to_end {
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(serve(
             listener,
-            Arc::clone(node.origin()),
+            node.application(),
             HttpConfig::default(),
             async {
                 let _ = stopped.await;
@@ -1125,11 +1125,11 @@ mod tls {
         delivery::hls::{
             StreamStore,
             fixtures::{lease, video},
-            serve::{DeliveryConfig, Origin},
         },
         observe::{NodeEvent, ProcessMeters},
         server::http::fixtures::{
-            NodeEventRecorder, scratch, write_atomically, write_pair, write_projected_pair,
+            NodeEventRecorder, application, scratch, write_atomically, write_pair,
+            write_projected_pair,
         },
     };
 
@@ -1206,7 +1206,7 @@ mod tls {
     impl TlsHarness {
         async fn start(settings: TlsSettings) -> Self {
             let store = StreamStore::default();
-            let origin = Arc::new(Origin::new(store.clone(), DeliveryConfig::default()));
+            let origin = application(&store);
             let tcp = bind("127.0.0.1:0".parse().expect("a valid address"))
                 .await
                 .expect("an ephemeral port is available");

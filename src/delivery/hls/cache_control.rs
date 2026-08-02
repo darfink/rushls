@@ -13,7 +13,6 @@
 //! |-----------------------------------|--------------------|
 //! | Blocking playlist reload          | 6 target durations |
 //! | Plain playlist request            | ½ target duration  |
-//! | Media segment                     | 6 target durations |
 //! | Absent, named by a directive      | 4 target durations |
 //! | Absent otherwise                  | 1 target duration  |
 //!
@@ -24,9 +23,12 @@
 
 use std::time::Duration;
 
-use crate::delivery::hls::{DurationRule, TargetDurationMultiple};
+use crate::delivery::{
+    Reuse,
+    store::{DurationRule, TargetDurationMultiple},
+};
 
-/// All response-lifetime policy for HLS delivery.
+/// Response-lifetime policy for HLS manifests and absent resources.
 ///
 /// Consolidated so the relationships between the lifetimes stay visible: a
 /// deployment lengthening its blocking-reload lifetime past what its clients
@@ -42,16 +44,6 @@ pub struct CacheControlPolicy {
     pub blocking_playlist: DurationRule,
     /// A playlist answering a request for the live edge.
     pub playlist: DurationRule,
-    /// Media named by a durable identity.
-    ///
-    /// Deliberately *not* infinite, though the bytes behind one of these URIs
-    /// never change while the stream that produced them lives. A stream retired
-    /// for idleness and then republished under the same name starts issuing
-    /// segment and part identities from zero again, so a year-long lifetime
-    /// would let a cache answer the new stream with the old stream's media. Six
-    /// target durations is both what the specification recommends and shorter
-    /// than any retirement worth configuring.
-    pub media: DurationRule,
     /// A resource that does not exist, named by a request carrying a directive.
     pub blocking_missing: DurationRule,
     /// A resource that does not exist, or no longer does.
@@ -66,7 +58,6 @@ impl Default for CacheControlPolicy {
         Self {
             blocking_playlist: TargetDurationMultiple::new(6, nz::u32!(1)).into(),
             playlist: TargetDurationMultiple::new(1, nz::u32!(2)).into(),
-            media: TargetDurationMultiple::new(6, nz::u32!(1)).into(),
             blocking_missing: TargetDurationMultiple::new(4, nz::u32!(1)).into(),
             missing: TargetDurationMultiple::new(1, nz::u32!(1)).into(),
             // The specification's recommended target duration, and the closest
@@ -79,70 +70,27 @@ impl Default for CacheControlPolicy {
 
 impl CacheControlPolicy {
     /// How long a projected playlist may be reused.
-    pub fn playlist(&self, target: Option<Duration>, blocking: bool) -> CacheControl {
+    pub fn playlist(&self, target: Option<Duration>, blocking: bool) -> Reuse {
         let rule = if blocking {
             self.blocking_playlist
         } else {
             self.playlist
         };
-        CacheControl::reusable(rule.resolve(self.target(target)))
-    }
-
-    /// How long media named by a durable identity may be reused.
-    ///
-    /// Marked immutable: within the lifetime it is granted, these bytes cannot
-    /// change under their URL, so revalidating is pure round trip. That is a
-    /// claim about the window, not about eternity, which is what makes it safe
-    /// to pair with a bounded lifetime.
-    pub fn media(&self, target: Option<Duration>) -> CacheControl {
-        CacheControl {
-            immutable: true,
-            ..CacheControl::reusable(self.media.resolve(self.target(target)))
-        }
+        Reuse::reusable(rule.resolve(self.target(target)))
     }
 
     /// How long the absence of a resource may be remembered.
-    pub fn missing(&self, target: Option<Duration>, blocking: bool) -> CacheControl {
+    pub fn missing(&self, target: Option<Duration>, blocking: bool) -> Reuse {
         let rule = if blocking {
             self.blocking_missing
         } else {
             self.missing
         };
-        CacheControl::reusable(rule.resolve(self.target(target)))
+        Reuse::reusable(rule.resolve(self.target(target)))
     }
 
     fn target(&self, target: Option<Duration>) -> Duration {
         target.unwrap_or(self.assumed_target_duration)
-    }
-}
-
-/// How long one response may be reused, resolved against a target duration.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CacheControl {
-    /// Zero asks for revalidation before every reuse.
-    pub max_age: Duration,
-    /// Whether the bytes are guaranteed not to change under this URL for as
-    /// long as [`Self::max_age`] lasts.
-    pub immutable: bool,
-}
-
-impl CacheControl {
-    /// Reusable only after revalidating with the origin.
-    ///
-    /// The answer for anything momentary: a copy held for the round trip is
-    /// still useful, but nobody may serve it on their own authority.
-    pub const fn revalidate() -> Self {
-        Self {
-            max_age: Duration::ZERO,
-            immutable: false,
-        }
-    }
-
-    const fn reusable(max_age: Duration) -> Self {
-        Self {
-            max_age,
-            immutable: false,
-        }
     }
 }
 
@@ -164,7 +112,6 @@ mod tests {
             policy.playlist(TARGET, false).max_age,
             Duration::from_secs(3)
         );
-        assert_eq!(policy.media(TARGET).max_age, Duration::from_secs(36));
         assert_eq!(
             policy.missing(TARGET, true).max_age,
             Duration::from_secs(24)
@@ -174,32 +121,6 @@ mod tests {
             Duration::from_secs(6)
         );
         assert!(!policy.playlist(TARGET, true).immutable);
-    }
-
-    #[test]
-    fn media_is_immutable_only_for_the_window_it_is_granted() {
-        let media = CacheControlPolicy::default().media(TARGET);
-
-        assert!(media.immutable);
-        assert_eq!(
-            media.max_age,
-            Duration::from_secs(36),
-            "a republished stream reissues the identities this URL is built \
-             from, so the promise has to expire"
-        );
-    }
-
-    #[test]
-    fn a_flat_lifetime_ignores_the_target_it_would_have_scaled() {
-        let policy = CacheControlPolicy {
-            media: Duration::from_secs(31_536_000).into(),
-            ..CacheControlPolicy::default()
-        };
-
-        assert_eq!(
-            policy.media(TARGET).max_age,
-            Duration::from_secs(31_536_000)
-        );
     }
 
     #[test]
@@ -221,6 +142,6 @@ mod tests {
         let caching = CacheControlPolicy::default().playlist(Some(Duration::from_secs(1)), false);
 
         assert_eq!(caching.max_age.as_secs(), 0);
-        assert_eq!(CacheControl::revalidate().max_age.as_secs(), 0);
+        assert_eq!(Reuse::revalidate().max_age.as_secs(), 0);
     }
 }

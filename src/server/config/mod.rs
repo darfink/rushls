@@ -892,7 +892,7 @@ impl HlsAppConfig {
         node.session.segmentation =
             SegmentationPolicy::latency_first(self.segment_duration, self.part_duration);
         node.store.retention.minimum_playlist_segments = self.playlist_segments;
-        node.delivery.uri_base = UriBase::new(self.public_base_url.clone());
+        node.hls.uri_base = UriBase::new(self.public_base_url.clone());
         Ok(())
     }
 }
@@ -956,6 +956,7 @@ impl HttpAppConfig {
         let config = HttpConfig {
             cors: self.cors.resolve()?,
             tls: self.tls.as_ref().map(TlsAppConfig::resolve).transpose()?,
+            ..HttpConfig::default()
         };
         config.validate().map_err(invalid)?;
         Ok(config)

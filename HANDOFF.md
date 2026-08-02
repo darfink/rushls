@@ -58,19 +58,18 @@
   - `src/media/normalize/passthrough/{mod,audio,video,subtitle,tests}.rs`
 - Integration and regression coverage:
   - `src/session/{mod,tests}.rs`
-  - `src/delivery/hls/store/tests.rs`
+  - `src/delivery/store/tests.rs`
+  - `src/delivery/{origin,uri}.rs`
+  - `src/delivery/hls/{service,uri}.rs`
+  - `src/server/http/{mod,cache,tests}.rs`
   - `Cargo.toml` and `Cargo.lock`
-
-The CMAF and priming work is recorded in commits `0835c27` and `1178d41`.
-The normalization module split and WebVTT/SubRip packaging are currently
-working-tree changes. Preserve unrelated existing edits in `TODO.md`.
 
 ## Validation
 
-- `cargo test`: 329 passed, including real AVFormat → HTTP packaging.
+- `cargo test`: 471 passed, including real AVFormat → HTTP packaging.
 - `ffprobe`: validates fetched initialization plus CMAF media when installed.
 - `mediastreamvalidator`: validates the served HLS presentation when installed.
-- `cargo clippy --all-targets -- -D warnings`: passed.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
 - `git diff --check`: passed.
 
@@ -128,16 +127,27 @@ Built on top of the above. See `TODO.md` for what remains open.
   Presentation-wide `EXT-X-SERVER-CONTROL`, open-segment tags before the first
   `EXT-X-PART`, format-driven resource naming (`.m4s`/`.vtt`), and
   largest-playable-sum `BANDWIDTH` with a codec union.
-- `delivery::hls::serve` — resolution, blocking reload, deadlines, multi-frame
-  media bodies, and a render cache keyed on the catalog revision *and every
-  sibling's* edge revision, since rendition reports cross renditions.
-- `server::http` — axum over HTTP/1.1 and h2c, byte ranges spanning stored part
-  buffers, HEAD, CORS, graceful shutdown. TLS is left to a terminating proxy.
+- `delivery::{store,origin,body,response,uri}` — protocol-neutral retention,
+  end-aware waits, zero-copy media bodies, response vocabulary, and shared
+  init/segment/part paths.
+- `delivery::hls::service` — HLS-only manifest resolution, blocking reload
+  policy, projection deadlines, and a render cache keyed on the catalog
+  revision *and every sibling's* edge revision, since rendition reports cross
+  renditions.
+- `server::http` owns an `Application` port rather than naming HLS. Runtime
+  implements it by routing shared media directly to `delivery::Origin` and
+  manifest paths to the HLS service. Adding DASH therefore changes the
+  composition root, not the neutral core or HTTP transport.
+- `server::http` — axum over HTTP/1.1 and HTTP/2, byte ranges spanning stored
+  part buffers, HEAD, CORS, graceful shutdown, and optional reloadable TLS.
+- Store maintenance returns the exact retired stream identities; the same
+  runtime tick passes them to the HLS manifest cache instead of rescanning all
+  cached streams.
 
 ## Suggested next steps
 
-1. Implement and validate the SRT publishing adapter, reusing the byte-bounded
-   AVFormat bridge introduced for RTMP.
+1. Prove the new protocol boundary with a DASH manifest adapter that references
+   the existing shared CMAF media paths.
 2. Add a multi-stream authenticator or external stream-key lookup. The bundled
    fixed-stream authenticator is intentionally sufficient for one configured
    stream rather than pretending to be an account database.
