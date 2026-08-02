@@ -36,6 +36,22 @@ struct Reply {
 }
 
 impl Reply {
+    /// Every value sent for one field name, joined the way a comma-separated
+    /// list field means them.
+    ///
+    /// `Vary` arrives as more than one line here: the origin sets its own
+    /// content-negotiation field and the CORS middleware adds its own, which
+    /// HTTP treats as equivalent to one combined list.
+    fn joined(&self, name: &str) -> Option<String> {
+        let values: Vec<&str> = self
+            .headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        (!values.is_empty()).then(|| values.join(", "))
+    }
+
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -341,7 +357,7 @@ async fn a_playlist_is_gzipped_for_a_client_that_accepts_it() {
         "the media type describes the playlist, not the transfer encoding"
     );
     assert_eq!(
-        encoded.header("vary"),
+        encoded.joined("vary").as_deref(),
         Some("Accept-Encoding"),
         "a cache that stored this must not hand it to a client that cannot \
          decode it"
@@ -406,7 +422,7 @@ async fn already_compressed_media_is_neither_gzipped_nor_negotiated() {
     assert_eq!(reply.status, 200);
     assert_eq!(reply.header("content-encoding"), None);
     assert_eq!(
-        reply.header("vary"),
+        reply.joined("vary"),
         None,
         "announcing negotiation on a resource that never varies would split \
          every downstream cache entry for the six target durations this origin \
@@ -981,13 +997,15 @@ async fn a_preflight_is_answered_without_reaching_the_origin() {
     )
     .await;
 
-    // 204 rather than the 404 this unknown stream would otherwise produce:
-    // the browser asked what it may send, not for any media.
-    assert_eq!(reply.status, 204);
+    // Answered rather than producing the 404 this unknown stream would
+    // otherwise give: the browser asked what it may send, not for any media.
+    // Any 2xx satisfies a preflight; the middleware uses 200 where this origin
+    // used to send 204.
+    assert_eq!(reply.status, 200);
     assert_eq!(reply.header("access-control-allow-origin"), Some("*"));
     assert_eq!(
         reply.header("access-control-allow-methods"),
-        Some("GET, HEAD, OPTIONS")
+        Some("GET,HEAD,OPTIONS")
     );
     assert_eq!(reply.header("access-control-allow-headers"), Some("range"));
     assert!(reply.body.is_empty());
@@ -1024,7 +1042,10 @@ async fn an_allowlisted_origin_is_echoed_and_the_response_says_it_varies() {
     // Without Origin here, a CDN would hand this viewer's allowed origin to
     // every other viewer, and playback would break for all of them. A playlist
     // is also content-negotiated, so both fields have to be listed.
-    assert_eq!(allowed.header("vary"), Some("Accept-Encoding, Origin"));
+    assert_eq!(
+        allowed.joined("vary").as_deref(),
+        Some("Accept-Encoding, origin")
+    );
 
     let refused = request(
         harness.address,
@@ -1035,7 +1056,10 @@ async fn an_allowlisted_origin_is_echoed_and_the_response_says_it_varies() {
     .await;
     assert_eq!(refused.status, 200, "the media is not itself restricted");
     assert_eq!(refused.header("access-control-allow-origin"), None);
-    assert_eq!(refused.header("vary"), Some("Accept-Encoding, Origin"));
+    assert_eq!(
+        refused.joined("vary").as_deref(),
+        Some("Accept-Encoding, origin")
+    );
 
     harness.stop().await;
 }
@@ -1125,12 +1149,13 @@ async fn cors_probe(harness: &Harness, origin: &str) -> Option<String> {
     )
     .await;
     assert_eq!(reply.status, 200, "the media itself is never restricted");
-    // Accumulated onto whatever content negotiation already set — gzip adds
-    // `Accept-Encoding` — because replacing it would let a cache serve a
-    // compressed body to a client that never asked for one.
-    let vary = reply.header("vary").expect("an allowlisted policy varies");
+    // Carried alongside whatever content negotiation already set — gzip adds
+    // `Accept-Encoding` — rather than replacing it, which would let a cache
+    // serve a compressed body to a client that never asked for one.
+    let vary = reply.joined("vary").expect("an allowlisted policy varies");
     assert!(
-        vary.split(',').any(|field| field.trim() == "Origin"),
+        vary.split(',')
+            .any(|field| field.trim().eq_ignore_ascii_case("origin")),
         "a CDN must keep the answers apart, got `{vary}`"
     );
     reply

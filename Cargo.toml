@@ -43,12 +43,14 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "http1", "tls12", "logging"] }
 uuid = { version = "1.24.0", features = ["v7"] }
 base64 = "0.22"
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 rcgen = "0.14"
 tokio = { version = "1", features = ["test-util"] }
 

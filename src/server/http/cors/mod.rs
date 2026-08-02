@@ -15,12 +15,27 @@
 //! cannot use `*` at all: the Fetch specification requires a concrete origin
 //! whenever `Access-Control-Allow-Credentials` is set. A configuration that
 //! asks for both is a configuration that silently does not work.
+//!
+//! # What is ours and what is not
+//!
+//! The header mechanics are [`tower_http`]'s. What stays here is the part it
+//! has no opinion about: [`pattern`] decides which origins an allowlist entry
+//! stands for, and [`layer`] chooses the `Vary` for each mode.
+//!
+//! **That `Vary` choice is load-bearing, not decoration.** `tower-http` varies
+//! on `Origin` by default in every mode, including `*` — where the answer is a
+//! constant and varying on it would key a CDN's cache per viewer origin,
+//! storing one copy of every segment per site that embeds the player. So the
+//! wildcard mode clears it, and the allowlist mode sets it explicitly rather
+//! than inheriting it. A mode added later must make the same decision on
+//! purpose; the tests below are what catches it if one does not.
 
 mod pattern;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, header};
+use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
 pub use pattern::{OriginPattern, OriginPatternError, WildcardDepth};
 
@@ -31,9 +46,12 @@ use pattern::RequestOrigin;
 /// Not configurable because the list follows from what the origin serves: a
 /// player that cannot see `Content-Length` or `Content-Range` cannot tell a
 /// truncated transfer from a short resource.
-const EXPOSED: &str = "Content-Length, Content-Range, Date";
+const EXPOSED: [HeaderName; 3] = [header::CONTENT_LENGTH, header::CONTENT_RANGE, header::DATE];
 
 /// Everything this origin answers, preflight included.
+///
+/// Spelled as text because its other use is the `Allow` header on a 405, which
+/// is not a CORS concern at all.
 pub const ALLOWED_METHODS: &str = "GET, HEAD, OPTIONS";
 
 /// Who may read a response from this origin.
@@ -96,136 +114,51 @@ impl CorsConfig {
             _ => Ok(()),
         }
     }
-
-    /// What this policy answers a given request's `Origin` with, if anything.
-    fn allowance<'a>(&self, origin: Option<&'a str>) -> Option<Allowance<'a>> {
-        match &self.allowed_origins {
-            AllowedOrigins::Disabled => None,
-            AllowedOrigins::Any => Some(Allowance::Any),
-            AllowedOrigins::Only(allowed) => {
-                // The response varies by `Origin` whether or not this
-                // particular one matched: a cache must not reuse a miss for a
-                // request that would have hit.
-                let raw = origin?;
-                // Decomposed once here rather than by every pattern, and
-                // borrowed throughout, so a matched request allocates nothing
-                // until the header value itself is built.
-                let parsed = RequestOrigin::parse(raw)?;
-                allowed
-                    .iter()
-                    .any(|candidate| candidate.matches(&parsed))
-                    .then_some(Allowance::Echo(raw))
-            }
-        }
-    }
-
-    /// Whether a response's content depends on the request's `Origin`.
-    fn varies_by_origin(&self) -> bool {
-        matches!(self.allowed_origins, AllowedOrigins::Only(_))
-    }
 }
 
-enum Allowance<'a> {
-    Any,
-    /// Borrowed from the request's own header: the echoed value is by
-    /// definition the bytes that arrived.
-    Echo(&'a str),
-}
-
-/// Writes the access-control headers a normal response carries.
-pub fn apply(response: &mut axum::response::Response, config: &CorsConfig, request: &HeaderMap) {
-    let origin = request
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok());
-    let headers = response.headers_mut();
-
-    // Emitted even when the origin did not match, and even on a same-origin
-    // request that carried no `Origin` at all. A cache that stored this
-    // response must not serve it to a request from a different origin, and
-    // `Vary` is the only thing that says so.
-    if config.varies_by_origin() {
-        append_vary(headers, "Origin");
-    }
-
-    let Some(allowance) = config.allowance(origin) else {
-        return;
-    };
-    let allowed = match allowance {
-        Allowance::Any => HeaderValue::from_static("*"),
-        Allowance::Echo(origin) => match HeaderValue::from_str(origin) {
-            Ok(value) => value,
-            Err(_) => return,
-        },
-    };
-    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allowed);
-    // Without this a browser player cannot read Content-Length or
-    // Content-Range from a cross-origin response, which is what its buffer
-    // accounting runs on.
-    headers.insert(
-        header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_static(EXPOSED),
-    );
-    if config.allow_credentials {
-        headers.insert(
-            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-            HeaderValue::from_static("true"),
-        );
-    }
-}
-
-/// Answers a preflight, or declines to.
+/// Builds the middleware that answers for cross-origin access, or `None` when
+/// the policy is to answer nothing at all.
 ///
-/// `None` means this `OPTIONS` was not a preflight — no `Origin`, or an origin
-/// this policy does not allow — and the caller should treat it as an ordinary
-/// request rather than inventing an approval.
-pub fn preflight(config: &CorsConfig, request: &HeaderMap) -> Option<axum::response::Response> {
-    let origin = request
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())?;
-    // A bare OPTIONS is not a preflight, and answering it as an approved one
-    // would invent permission the browser never asked for.
-    request.get(header::ACCESS_CONTROL_REQUEST_METHOD)?;
-
-    let mut response = axum::response::Response::new(axum::body::Body::empty());
-    *response.status_mut() = StatusCode::NO_CONTENT;
-    let headers = response.headers_mut();
-    headers.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static(ALLOWED_METHODS),
-    );
-    // A preflight's answer depends on all three negotiation headers, so all
-    // three belong in `Vary` regardless of how origins are configured.
-    for name in [
-        "Origin",
-        "Access-Control-Request-Method",
-        "Access-Control-Request-Headers",
-    ] {
-        append_vary(headers, name);
-    }
-    // Echoed rather than enumerated: the origin has no header requirements of
-    // its own, and a player asking for `Range` on a preflight should not be
-    // refused because a fixed list did not anticipate it.
-    if let Some(requested) = request.get(header::ACCESS_CONTROL_REQUEST_HEADERS) {
-        headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, requested.clone());
-    }
-    if let Ok(value) = HeaderValue::try_from(config.max_age.as_secs().to_string()) {
-        headers.insert(header::ACCESS_CONTROL_MAX_AGE, value);
-    }
-
-    let allowance = config.allowance(Some(origin))?;
-    let allowed = match allowance {
-        Allowance::Any => HeaderValue::from_static("*"),
-        Allowance::Echo(origin) => HeaderValue::from_str(origin).ok()?,
+/// `None` rather than a layer that emits no headers, because "no CORS" and "an
+/// empty CORS policy" are different: a layer would still intercept `OPTIONS`.
+pub fn layer(config: &CorsConfig) -> Option<CorsLayer> {
+    let (origins, vary) = match &config.allowed_origins {
+        AllowedOrigins::Disabled => return None,
+        // A constant answer is the same for every caller, so there is nothing
+        // for a cache to key on — and keying on it would be actively harmful.
+        AllowedOrigins::Any => (AllowOrigin::any(), Vec::new()),
+        AllowedOrigins::Only(allowed) => {
+            // Parsed once per request and compared field by field; the grammar
+            // itself was checked at startup.
+            let allowed = Arc::new(allowed.clone());
+            let predicate = AllowOrigin::predicate(move |origin, _| {
+                origin
+                    .to_str()
+                    .ok()
+                    .and_then(RequestOrigin::parse)
+                    .is_some_and(|origin| {
+                        allowed.iter().any(|candidate| candidate.matches(&origin))
+                    })
+            });
+            // Emitted whether or not this particular origin matched: a cache
+            // must not reuse a miss for a request that would have hit.
+            (predicate, vec![header::ORIGIN])
+        }
     };
-    let headers = response.headers_mut();
-    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allowed);
-    if config.allow_credentials {
-        headers.insert(
-            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-            HeaderValue::from_static("true"),
-        );
-    }
-    Some(response)
+
+    Some(
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS])
+            // Echoed rather than enumerated: the origin has no header
+            // requirements of its own, and a player asking for `Range` should
+            // not be refused because a fixed list did not anticipate it.
+            .allow_headers(AllowHeaders::mirror_request())
+            .expose_headers(EXPOSED)
+            .allow_credentials(config.allow_credentials)
+            .max_age(config.max_age)
+            .vary(vary),
+    )
 }
 
 /// Adds one field name to `Vary` without dropping what is already there.
@@ -255,90 +188,141 @@ pub(super) fn append_vary(headers: &mut HeaderMap, name: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use axum::{Router, body::Body, http::Request, routing::any};
+    use tower::ServiceExt;
 
-    fn request(pairs: &[(&str, &str)]) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        for (name, value) in pairs {
-            headers.insert(
-                header::HeaderName::try_from(*name).expect("a valid header name"),
-                HeaderValue::try_from(*value).expect("a valid header value"),
-            );
-        }
-        headers
-    }
+    use super::*;
 
     fn pattern(value: &str) -> OriginPattern {
         OriginPattern::parse(value).expect("the pattern is valid")
     }
 
-    fn applied(config: &CorsConfig, request: &HeaderMap) -> HeaderMap {
-        let mut response = axum::response::Response::new(axum::body::Body::empty());
-        apply(&mut response, config, request);
-        response.headers().clone()
+    fn allowlist() -> CorsConfig {
+        CorsConfig {
+            allowed_origins: AllowedOrigins::Only(vec![pattern("https://player.example")]),
+            ..CorsConfig::default()
+        }
+    }
+
+    /// Sends one ordinary GET through the configured policy.
+    async fn get(config: &CorsConfig, origin: Option<&str>) -> HeaderMap {
+        let mut router = Router::new().route("/{*path}", any(|| async { "media" }));
+        if let Some(cors) = layer(config) {
+            router = router.layer(cors);
+        }
+        let mut request = Request::builder().uri("/live/camera/0/segment/1.m4s");
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        router
+            .oneshot(
+                request
+                    .body(Body::empty())
+                    .expect("the request is well formed"),
+            )
+            .await
+            .expect("the router answers")
+            .headers()
+            .clone()
     }
 
     fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         headers.get(name).and_then(|value| value.to_str().ok())
     }
 
-    #[test]
-    fn a_public_origin_allows_anyone_without_varying() {
-        let headers = applied(
-            &CorsConfig::default(),
-            &request(&[("origin", "https://player.example")]),
-        );
+    #[tokio::test]
+    async fn a_public_origin_allows_anyone_without_varying() {
+        let headers = get(&CorsConfig::default(), Some("https://player.example")).await;
 
         assert_eq!(header(&headers, "access-control-allow-origin"), Some("*"));
-        assert_eq!(
-            header(&headers, "access-control-expose-headers"),
-            Some(EXPOSED)
-        );
         // A constant answer is the same for every caller, so there is nothing
-        // for a cache to key on.
+        // for a cache to key on. Varying anyway would store one copy of every
+        // segment per site that embeds a player, which is the default
+        // configuration's busiest path.
         assert_eq!(header(&headers, "vary"), None);
     }
 
-    #[test]
-    fn an_allowlisted_origin_is_echoed_and_always_varies() {
-        let config = CorsConfig {
-            allowed_origins: AllowedOrigins::Only(vec![pattern("https://player.example")]),
-            ..CorsConfig::default()
-        };
+    #[tokio::test]
+    async fn an_allowlisted_origin_is_echoed_and_always_varies() {
+        let config = allowlist();
 
-        let allowed = applied(&config, &request(&[("origin", "https://player.example")]));
+        let allowed = get(&config, Some("https://player.example")).await;
         assert_eq!(
             header(&allowed, "access-control-allow-origin"),
             Some("https://player.example")
         );
-        assert_eq!(header(&allowed, "vary"), Some("Origin"));
+        assert_eq!(header(&allowed, "vary"), Some("origin"));
 
         // The refusal varies too. Were it not to, a CDN could store this
         // header-less response and replay it for the allowed origin, breaking
         // playback for a viewer whose request was perfectly acceptable.
-        let refused = applied(&config, &request(&[("origin", "https://elsewhere.test")]));
+        let refused = get(&config, Some("https://elsewhere.test")).await;
         assert_eq!(header(&refused, "access-control-allow-origin"), None);
-        assert_eq!(header(&refused, "vary"), Some("Origin"));
+        assert_eq!(header(&refused, "vary"), Some("origin"));
 
         // As does a request that named no origin at all.
-        let bare = applied(&config, &request(&[]));
-        assert_eq!(header(&bare, "vary"), Some("Origin"));
+        let bare = get(&config, None).await;
+        assert_eq!(header(&bare, "vary"), Some("origin"));
     }
 
-    #[test]
-    fn disabled_access_writes_nothing() {
+    #[tokio::test]
+    async fn the_allowlist_grammar_still_decides_what_matches() {
+        let config = CorsConfig {
+            allowed_origins: AllowedOrigins::Only(vec![pattern("https://*.example.com")]),
+            ..CorsConfig::default()
+        };
+
+        let subdomain = get(&config, Some("https://a.example.com")).await;
+        assert_eq!(
+            header(&subdomain, "access-control-allow-origin"),
+            Some("https://a.example.com")
+        );
+        // The `evil-example.com` bug, checked through the wiring rather than
+        // only against the matcher.
+        let lookalike = get(&config, Some("https://evil-example.com")).await;
+        assert_eq!(header(&lookalike, "access-control-allow-origin"), None);
+    }
+
+    #[tokio::test]
+    async fn an_unallowed_preflight_is_not_approved() {
+        let mut router = Router::new().route("/{*path}", any(|| async { "media" }));
+        router = router.layer(layer(&allowlist()).expect("an allowlist has a policy"));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/live/camera/index.m3u8")
+                    .method(Method::OPTIONS)
+                    .header(header::ORIGIN, "https://elsewhere.test")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .body(Body::empty())
+                    .expect("the request is well formed"),
+            )
+            .await
+            .expect("the router answers");
+
+        assert_eq!(
+            header(response.headers(), "access-control-allow-origin"),
+            None,
+            "asking permission is not being granted it"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_access_writes_nothing() {
         let config = CorsConfig {
             allowed_origins: AllowedOrigins::Disabled,
             ..CorsConfig::default()
         };
+        assert!(layer(&config).is_none(), "there is no middleware to apply");
 
-        let headers = applied(&config, &request(&[("origin", "https://player.example")]));
+        let headers = get(&config, Some("https://player.example")).await;
 
-        assert!(headers.is_empty());
+        assert_eq!(header(&headers, "access-control-allow-origin"), None);
+        assert_eq!(header(&headers, "vary"), None);
     }
 
-    #[test]
-    fn credentials_require_a_concrete_origin() {
+    #[tokio::test]
+    async fn credentials_require_a_concrete_origin() {
         let wildcard = CorsConfig {
             allow_credentials: true,
             ..CorsConfig::default()
@@ -346,87 +330,15 @@ mod tests {
         assert!(wildcard.validate().is_err());
 
         let allowlisted = CorsConfig {
-            allowed_origins: AllowedOrigins::Only(vec![pattern("https://player.example")]),
             allow_credentials: true,
-            ..CorsConfig::default()
+            ..allowlist()
         };
         assert!(allowlisted.validate().is_ok());
 
-        let headers = applied(
-            &allowlisted,
-            &request(&[("origin", "https://player.example")]),
-        );
+        let headers = get(&allowlisted, Some("https://player.example")).await;
         assert_eq!(
             header(&headers, "access-control-allow-credentials"),
             Some("true")
-        );
-    }
-
-    #[test]
-    fn a_preflight_is_answered_with_the_headers_it_asked_about() {
-        let response = preflight(
-            &CorsConfig::default(),
-            &request(&[
-                ("origin", "https://player.example"),
-                ("access-control-request-method", "GET"),
-                ("access-control-request-headers", "range"),
-            ]),
-        )
-        .expect("a preflight is answered");
-
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let headers = response.headers();
-        assert_eq!(header(headers, "access-control-allow-origin"), Some("*"));
-        assert_eq!(
-            header(headers, "access-control-allow-methods"),
-            Some(ALLOWED_METHODS)
-        );
-        assert_eq!(
-            header(headers, "access-control-allow-headers"),
-            Some("range")
-        );
-        assert_eq!(header(headers, "access-control-max-age"), Some("600"));
-        let vary = header(headers, "vary").expect("a preflight varies");
-        assert!(vary.contains("Origin"));
-        assert!(vary.contains("Access-Control-Request-Headers"));
-    }
-
-    #[test]
-    fn an_options_request_that_is_not_a_preflight_is_left_alone() {
-        // No `Access-Control-Request-Method`, so this is a plain OPTIONS and
-        // answering it as an approved preflight would be an invention.
-        assert!(
-            preflight(
-                &CorsConfig::default(),
-                &request(&[("origin", "https://player.example")])
-            )
-            .is_none()
-        );
-        assert!(
-            preflight(
-                &CorsConfig::default(),
-                &request(&[("access-control-request-method", "GET")])
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn an_unallowed_preflight_is_not_approved() {
-        let config = CorsConfig {
-            allowed_origins: AllowedOrigins::Only(vec![pattern("https://player.example")]),
-            ..CorsConfig::default()
-        };
-
-        assert!(
-            preflight(
-                &config,
-                &request(&[
-                    ("origin", "https://elsewhere.test"),
-                    ("access-control-request-method", "GET"),
-                ])
-            )
-            .is_none()
         );
     }
 

@@ -143,24 +143,43 @@ impl Readiness {
 }
 
 /// Builds the router that serves one origin, including the operator surface.
+///
+/// Cross-origin access is applied to the viewer surface alone. The health
+/// probes and `/metrics` are for the operator's own infrastructure, and giving
+/// them `Access-Control-Allow-Origin` would let any page a browser happens to
+/// load read them — which for an unauthenticated `/metrics` means publishing
+/// stream names to anyone who can get script into a viewer's browser.
 fn router<P: Application>(
     application: Arc<P>,
     config: &HttpConfig,
     metrics: Option<MetricsEndpoint>,
     readiness: Readiness,
 ) -> Router {
-    Router::new()
-        // One catch-all rather than a route table: a stream identity may
-        // contain slashes, so path structure is resolved by the application
-        // rather than by axum pattern matching.
+    // One catch-all rather than a route table: a stream identity may contain
+    // slashes, so path structure is resolved by the application rather than by
+    // axum pattern matching.
+    let mut viewer = Router::new()
         .route("/{*path}", any(handle::<P>))
-        .fallback(any(handle::<P>))
-        .with_state(HttpState {
-            application,
-            cors: Arc::new(config.cors.clone()),
-            metrics,
-            readiness,
-        })
+        .fallback(any(handle::<P>));
+    if let Some(cors) = cors::layer(&config.cors) {
+        viewer = viewer.layer(cors);
+    }
+
+    let mut operator = Router::new()
+        .route("/health/live", any(liveness))
+        .route("/health/ready", any(readiness_probe::<P>));
+    // Left to the catch-all when disabled, so `/metrics` is an ordinary
+    // unknown resource rather than a route that exists and refuses.
+    if metrics.is_some() {
+        operator = operator.route("/metrics", any(metrics_probe::<P>));
+    }
+
+    operator.merge(viewer).with_state(HttpState {
+        application,
+        cors: Arc::new(config.cors.clone()),
+        metrics,
+        readiness,
+    })
 }
 
 /// Serves until `shutdown` completes, then lets in-flight requests finish.
@@ -214,37 +233,16 @@ async fn handle<P: Application>(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    if uri.path() == "/health/live" {
-        return health_response(method, true);
-    }
-    if uri.path() == "/health/ready" {
-        return health_response(method, service.readiness.is_ready());
-    }
-
-    if uri.path() == "/metrics"
-        && let Some(metrics) = &service.metrics
-    {
-        return metrics_response(metrics, method, &headers);
-    }
-
-    // A preflight is answered by policy alone and never reaches the origin:
-    // the browser is asking what it may send, not for any media.
-    if method == Method::OPTIONS
-        && let Some(response) = cors::preflight(&service.cors, &headers)
-    {
-        return response;
-    }
-
     // HEAD is answered exactly like GET and then stripped of its body by the
     // server, so a client probing for size or existence sees the truth.
+    //
+    // A preflight never arrives here: the CORS layer answers `OPTIONS` itself.
     if !matches!(method, Method::GET | Method::HEAD) {
-        let mut response = (
+        return (
             StatusCode::METHOD_NOT_ALLOWED,
             [(header::ALLOW, cors::ALLOWED_METHODS)],
         )
             .into_response();
-        cors::apply(&mut response, &service.cors, &headers);
-        return response;
     }
 
     let response = match service
@@ -253,19 +251,40 @@ async fn handle<P: Application>(
         .await
     {
         Ok(response) => response,
-        Err(failure) => return error_response(failure, &service.cors, &headers),
+        Err(failure) => return error_response(failure),
     };
 
     let range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let mut response = match into_http(response, range.as_deref(), accepts_gzip(&headers)) {
+    match into_http(response, range.as_deref(), accepts_gzip(&headers)) {
         Ok(response) => response,
         Err(status) => status.into_response(),
-    };
-    cors::apply(&mut response, &service.cors, &headers);
-    response
+    }
+}
+
+async fn liveness(method: Method) -> Response {
+    health_response(method, true)
+}
+
+async fn readiness_probe<P: Application>(
+    State(service): State<HttpState<P>>,
+    method: Method,
+) -> Response {
+    health_response(method, service.readiness.is_ready())
+}
+
+async fn metrics_probe<P: Application>(
+    State(service): State<HttpState<P>>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    match &service.metrics {
+        // Unreachable: the route only exists when the endpoint does.
+        None => StatusCode::NOT_FOUND.into_response(),
+        Some(metrics) => metrics_response(metrics, method, &headers),
+    }
 }
 
 fn health_response(method: Method, healthy: bool) -> Response {
@@ -510,7 +529,7 @@ impl From<Reuse> for HeaderValue {
 /// directive naming an impossible position is the client's mistake (400), a
 /// deadline passing without the media arriving is the origin failing to keep up
 /// (503), and an unknown resource is neither.
-fn error_response(failure: DeliveryFailure, cors: &CorsConfig, request: &HeaderMap) -> Response {
+fn error_response(failure: DeliveryFailure) -> Response {
     let status = match failure.error {
         DeliveryError::UnknownStream
         | DeliveryError::UnknownRendition
@@ -526,8 +545,8 @@ fn error_response(failure: DeliveryFailure, cors: &CorsConfig, request: &HeaderM
         // Tells a client to come back rather than to give up on the stream.
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     }
-    // Errors carry the same policy as successes: a player that cannot read a
-    // 404 cross-origin sees a network failure instead, and retries forever.
-    cors::apply(&mut response, cors, request);
+    // Errors carry the same CORS policy as successes — a player that cannot
+    // read a 404 cross-origin sees a network failure instead, and retries
+    // forever — which the layer now applies to every response alike.
     response
 }
