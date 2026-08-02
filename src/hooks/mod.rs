@@ -46,6 +46,7 @@ use crate::{
     domain::{SessionId, StreamId},
     observe::{
         EventObserver, Events, NodeEvent, SessionEvent, StreamEvent,
+        counters::series,
         lifecycle::{Event, Kind, Projector},
     },
     outbound::{BearerToken, Endpoint, HttpClient},
@@ -104,23 +105,24 @@ impl Default for HooksConfig {
 }
 
 /// Why an event never reached its endpoint.
+///
+/// Spelled once, in [`Loss::as_str`]. `NodeEvent` carries the reason as a
+/// `&'static str` rather than as this type — `observe` sits below `hooks` and
+/// cannot name it — so the borrowed form is the one that has to exist, and
+/// `Display` forwards to it instead of repeating the five names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
+#[display("{}", self.as_str())]
 pub enum Loss {
     /// The dispatcher ingress channel was unavailable, so the new event could
     /// not reach the queue that implements the normal drop-oldest policy.
-    #[display("ingress")]
     Ingress,
     /// The queue was full, so the oldest waiting event made room.
-    #[display("overflow")]
     Overflow,
     /// The endpoint refused it in a way retrying cannot fix.
-    #[display("rejected")]
     Rejected,
     /// Every attempt failed.
-    #[display("exhausted")]
     Exhausted,
     /// Still queued when the drain deadline passed.
-    #[display("shutdown")]
     Shutdown,
 }
 
@@ -203,6 +205,60 @@ pub struct HookSnapshot {
     pub queue_depth: usize,
     pub queue_capacity: usize,
     pub in_flight: usize,
+}
+
+// Declared apart from the storage above because two of these are not measured
+// at all: the capacities are what an operator configured, and are filled in by
+// `Hooks::snapshots` from the config rather than read from a counter.
+//
+// The losses are kept apart rather than summed into one "failed" counter: an
+// endpoint refusing an event, a queue overflowing, and a shutdown cutting a
+// drain short call for three different responses from whoever is looking.
+series! {
+    HookSnapshot {
+        Counter("rushls_hook_deliveries_total",
+            "Lifecycle events accepted by a hook endpoint.")
+            = |snapshot: &HookSnapshot| snapshot.delivered,
+        Counter("rushls_hook_retries_total",
+            "Delivery attempts that failed and were retried.")
+            = |snapshot: &HookSnapshot| snapshot.retried,
+        Counter("rushls_hook_filtered_total",
+            "Events not delivered because the hook did not subscribe to them.")
+            = |snapshot: &HookSnapshot| snapshot.filtered,
+        Counter("rushls_hook_dropped_ingress_total",
+            "New events dropped because the nonblocking dispatcher ingress was unavailable.")
+            = |snapshot: &HookSnapshot| snapshot.ingress,
+        Counter("rushls_hook_dropped_overflow_total",
+            "Events dropped because the hook's queue was full.")
+            = |snapshot: &HookSnapshot| snapshot.overflow,
+        Counter("rushls_hook_dropped_rejected_total",
+            "Events refused by the endpoint in a way retrying cannot fix.")
+            = |snapshot: &HookSnapshot| snapshot.rejected,
+        Counter("rushls_hook_dropped_exhausted_total",
+            "Events dropped after every delivery attempt failed.")
+            = |snapshot: &HookSnapshot| snapshot.exhausted,
+        Counter("rushls_hook_dropped_shutdown_total",
+            "Queued events never attempted before the shutdown drain deadline.")
+            = |snapshot: &HookSnapshot| snapshot.shutdown,
+        Counter("rushls_hook_outcome_unknown_shutdown_total",
+            "Unresolved deliveries whose outcome became unknown at shutdown.")
+            = |snapshot: &HookSnapshot| snapshot.outcome_unknown_shutdown,
+        Gauge("rushls_hook_ingress_depth",
+            "Rendered lifecycle events waiting to enter a hook's ordering queue.")
+            = |snapshot: &HookSnapshot| snapshot.ingress_depth,
+        Gauge("rushls_hook_ingress_capacity",
+            "Maximum rendered lifecycle events held by a hook's nonblocking ingress.")
+            = |snapshot: &HookSnapshot| snapshot.ingress_capacity,
+        Gauge("rushls_hook_queue_depth",
+            "Lifecycle events waiting in a hook's per-stream ordering queue.")
+            = |snapshot: &HookSnapshot| snapshot.queue_depth,
+        Gauge("rushls_hook_queue_capacity",
+            "Maximum lifecycle events held by a hook's per-stream ordering queue.")
+            = |snapshot: &HookSnapshot| snapshot.queue_capacity,
+        Gauge("rushls_hook_in_flight",
+            "Per-stream hook deliveries currently active, including retry backoff.")
+            = |snapshot: &HookSnapshot| snapshot.in_flight,
+    }
 }
 
 /// One hook's queue, settings, and counters, shared with its dispatcher.

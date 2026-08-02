@@ -6,7 +6,8 @@ use crate::{
     delivery::hls::StreamStore,
     hooks::{HookSnapshot, Hooks},
     observe::{
-        HlsMeters, HlsSnapshot, OriginMeters, OriginSnapshot, ProcessMeters, ProcessSnapshot,
+        HlsMeters, HlsSnapshot, MeterSnapshot, MetricKind, OriginMeters, OriginSnapshot,
+        ProcessMeters, ProcessSnapshot, Series, counters::series,
     },
     session::{Registry, SessionSnapshot},
 };
@@ -160,167 +161,31 @@ impl MetricsReader {
     }
 }
 
+// The three readings that belong to the node itself rather than to any one
+// component's counters.
+series! {
+    MetricsSnapshot {
+        Gauge("rushls_active_sessions", "Publishing sessions currently active.")
+            = |snapshot: &MetricsSnapshot| snapshot.active_sessions,
+        Gauge("rushls_published_streams", "Streams with a publisher currently attached.")
+            = |snapshot: &MetricsSnapshot| snapshot.published_streams,
+        Gauge("rushls_idle_streams", "Retained streams waiting for a publisher to return.")
+            = |snapshot: &MetricsSnapshot| snapshot.idle_streams,
+    }
+}
+
 /// Serializes one atomic snapshot in Prometheus' text exposition format.
+///
+/// What each series is called and what it means lives beside the counter it
+/// reads, in `observe`. This decides only how to spell them on the wire, which
+/// is why adding a counter no longer means editing this function.
 pub fn render(snapshot: &MetricsSnapshot) -> String {
     let mut output = String::with_capacity(4_096 + snapshot.streams.len() * 2_048);
-    let process = snapshot.process;
 
-    counter(
-        &mut output,
-        "rushls_sessions_started_total",
-        "Publishing sessions started.",
-        process.sessions_started,
-    );
-    counter(
-        &mut output,
-        "rushls_sessions_completed_total",
-        "Publishing sessions completed successfully.",
-        process.sessions_completed,
-    );
-    counter(
-        &mut output,
-        "rushls_sessions_failed_total",
-        "Publishing sessions that failed.",
-        process.sessions_failed,
-    );
-    counter(
-        &mut output,
-        "rushls_sessions_replaced_total",
-        "Publishing sessions displaced by a takeover.",
-        process.sessions_replaced,
-    );
-    counter(
-        &mut output,
-        "rushls_publishers_rejected_total",
-        "Publishers rejected before a session started.",
-        process.publishers_rejected,
-    );
-    counter(
-        &mut output,
-        "rushls_codec_parameter_changes_total",
-        "Mid-stream codec parameter changes detected.",
-        process.codec_parameter_changes,
-    );
-    counter(
-        &mut output,
-        "rushls_unhealthy_terminations_total",
-        "Sessions stopped by health supervision.",
-        process.unhealthy_terminations,
-    );
-    counter(
-        &mut output,
-        "rushls_drain_failures_total",
-        "Sessions that failed while flushing their tail.",
-        process.drain_failures,
-    );
-    counter(
-        &mut output,
-        "rushls_bytes_received_total",
-        "Bytes received from publishers.",
-        process.bytes_received,
-    );
-    counter(
-        &mut output,
-        "rushls_packets_received_total",
-        "Packets received from publishers.",
-        process.packets_received,
-    );
-    counter(
-        &mut output,
-        "rushls_packets_lost_total",
-        "Publisher packets reported lost.",
-        process.packets_lost,
-    );
-    counter(
-        &mut output,
-        "rushls_parts_published_total",
-        "HLS parts made available to viewers.",
-        process.parts_published,
-    );
-    counter(
-        &mut output,
-        "rushls_segments_published_total",
-        "HLS segments made available to viewers.",
-        process.segments_published,
-    );
-    counter(
-        &mut output,
-        "rushls_tls_handshakes_completed_total",
-        "TLS handshakes completed.",
-        process.tls_handshakes_completed,
-    );
-    counter(
-        &mut output,
-        "rushls_tls_handshakes_failed_total",
-        "TLS handshakes that failed or timed out.",
-        process.tls_handshakes_failed,
-    );
-    counter(
-        &mut output,
-        "rushls_media_responses_served_total",
-        "Media responses served to viewers.",
-        snapshot.origin.media_served,
-    );
-    counter(
-        &mut output,
-        "rushls_bytes_served_total",
-        "Media bytes served to viewers.",
-        snapshot.origin.bytes_served,
-    );
-    counter(
-        &mut output,
-        "rushls_origin_requests_rejected_total",
-        "Origin requests rejected as invalid or unsatisfiable.",
-        snapshot.origin.requests_rejected,
-    );
-    counter(
-        &mut output,
-        "rushls_origin_requests_not_found_total",
-        "Origin requests for streams or resources that were not found.",
-        snapshot.origin.requests_not_found,
-    );
-    counter(
-        &mut output,
-        "rushls_hls_playlists_served_total",
-        "HLS playlist responses served to viewers.",
-        snapshot.hls.playlists_served,
-    );
-    counter(
-        &mut output,
-        "rushls_hls_playlists_rendered_total",
-        "HLS playlists projected instead of reused from the render cache.",
-        snapshot.hls.playlists_rendered,
-    );
-    counter(
-        &mut output,
-        "rushls_hls_blocking_reloads_total",
-        "HLS blocking playlist reloads started.",
-        snapshot.hls.blocking_reloads,
-    );
-    counter(
-        &mut output,
-        "rushls_hls_blocking_reloads_expired_total",
-        "HLS blocking playlist reloads that expired before media arrived.",
-        snapshot.hls.blocking_reloads_expired,
-    );
-    gauge(
-        &mut output,
-        "rushls_active_sessions",
-        "Publishing sessions currently active.",
-        snapshot.active_sessions,
-    );
-    gauge(
-        &mut output,
-        "rushls_published_streams",
-        "Streams with a publisher currently attached.",
-        snapshot.published_streams,
-    );
-    gauge(
-        &mut output,
-        "rushls_idle_streams",
-        "Retained streams waiting for a publisher to return.",
-        snapshot.idle_streams,
-    );
+    scalars(&mut output, ProcessSnapshot::SERIES, &snapshot.process);
+    scalars(&mut output, OriginSnapshot::SERIES, &snapshot.origin);
+    scalars(&mut output, HlsSnapshot::SERIES, &snapshot.hls);
+    scalars(&mut output, MetricsSnapshot::SERIES, snapshot);
 
     if !snapshot.hooks.is_empty() {
         render_hooks(&mut output, &snapshot.hooks);
@@ -331,304 +196,76 @@ pub fn render(snapshot: &MetricsSnapshot) -> String {
     output
 }
 
+/// One unlabelled reading per series, each under its own metadata.
+fn scalars<S>(output: &mut String, series: &[Series<S>], source: &S) {
+    for series in series {
+        metadata(output, series.name, series.help, series.kind);
+        writeln!(output, "{} {}", series.name, (series.read)(source))
+            .expect("writing to a String cannot fail");
+    }
+}
+
 /// One counter per hook, labelled by the name the operator configured.
-///
-/// Losses are kept apart rather than summed into one "failed" counter: an
-/// endpoint refusing an event, a queue overflowing, and a shutdown cutting a
-/// drain short call for three different responses from whoever is looking.
 fn render_hooks(output: &mut String, hooks: &[(Arc<str>, HookSnapshot)]) {
-    for (name, help, read) in [
-        (
-            "rushls_hook_deliveries_total",
-            "Lifecycle events accepted by a hook endpoint.",
-            (|snapshot: &HookSnapshot| snapshot.delivered) as fn(&HookSnapshot) -> u64,
-        ),
-        (
-            "rushls_hook_retries_total",
-            "Delivery attempts that failed and were retried.",
-            |snapshot| snapshot.retried,
-        ),
-        (
-            "rushls_hook_filtered_total",
-            "Events not delivered because the hook did not subscribe to them.",
-            |snapshot| snapshot.filtered,
-        ),
-        (
-            "rushls_hook_dropped_ingress_total",
-            "New events dropped because the nonblocking dispatcher ingress was unavailable.",
-            |snapshot| snapshot.ingress,
-        ),
-        (
-            "rushls_hook_dropped_overflow_total",
-            "Events dropped because the hook's queue was full.",
-            |snapshot| snapshot.overflow,
-        ),
-        (
-            "rushls_hook_dropped_rejected_total",
-            "Events refused by the endpoint in a way retrying cannot fix.",
-            |snapshot| snapshot.rejected,
-        ),
-        (
-            "rushls_hook_dropped_exhausted_total",
-            "Events dropped after every delivery attempt failed.",
-            |snapshot| snapshot.exhausted,
-        ),
-        (
-            "rushls_hook_dropped_shutdown_total",
-            "Queued events never attempted before the shutdown drain deadline.",
-            |snapshot| snapshot.shutdown,
-        ),
-        (
-            "rushls_hook_outcome_unknown_shutdown_total",
-            "Unresolved deliveries whose outcome became unknown at shutdown.",
-            |snapshot| snapshot.outcome_unknown_shutdown,
-        ),
-    ] {
-        metadata(output, name, help, "counter");
+    for series in HookSnapshot::SERIES {
+        metadata(output, series.name, series.help, series.kind);
         for (hook, snapshot) in hooks {
             writeln!(
                 output,
-                "{name}{{hook=\"{}\"}} {}",
+                "{}{{hook=\"{}\"}} {}",
+                series.name,
                 escape_label(hook),
-                read(snapshot)
-            )
-            .expect("writing to a String cannot fail");
-        }
-    }
-
-    for (name, help, read) in [
-        (
-            "rushls_hook_ingress_depth",
-            "Rendered lifecycle events waiting to enter a hook's ordering queue.",
-            (|snapshot: &HookSnapshot| snapshot.ingress_depth) as fn(&HookSnapshot) -> usize,
-        ),
-        (
-            "rushls_hook_ingress_capacity",
-            "Maximum rendered lifecycle events held by a hook's nonblocking ingress.",
-            |snapshot| snapshot.ingress_capacity,
-        ),
-        (
-            "rushls_hook_queue_depth",
-            "Lifecycle events waiting in a hook's per-stream ordering queue.",
-            |snapshot| snapshot.queue_depth,
-        ),
-        (
-            "rushls_hook_queue_capacity",
-            "Maximum lifecycle events held by a hook's per-stream ordering queue.",
-            |snapshot| snapshot.queue_capacity,
-        ),
-        (
-            "rushls_hook_in_flight",
-            "Per-stream hook deliveries currently active, including retry backoff.",
-            |snapshot| snapshot.in_flight,
-        ),
-    ] {
-        metadata(output, name, help, "gauge");
-        for (hook, snapshot) in hooks {
-            writeln!(
-                output,
-                "{name}{{hook=\"{}\"}} {}",
-                escape_label(hook),
-                read(snapshot)
+                (series.read)(snapshot)
             )
             .expect("writing to a String cannot fail");
         }
     }
 }
 
-fn counter(output: &mut String, name: &str, help: &str, value: u64) {
-    metadata(output, name, help, "counter");
-    writeln!(output, "{name} {value}").expect("writing to a String cannot fail");
-}
-
-fn gauge(output: &mut String, name: &str, help: &str, value: usize) {
-    metadata(output, name, help, "gauge");
-    writeln!(output, "{name} {value}").expect("writing to a String cannot fail");
-}
-
-fn metadata(output: &mut String, name: &str, help: &str, kind: &str) {
+fn metadata(output: &mut String, name: &str, help: &str, kind: MetricKind) {
     writeln!(output, "# HELP {name} {help}").expect("writing to a String cannot fail");
-    writeln!(output, "# TYPE {name} {kind}").expect("writing to a String cannot fail");
+    writeln!(output, "# TYPE {name} {}", kind.as_str()).expect("writing to a String cannot fail");
 }
 
+/// Per-stream series, each carrying the session's identity as labels.
+///
+/// Metadata for every series comes first and the readings follow, rather than
+/// interleaving them per session: `# HELP` and `# TYPE` may each appear only
+/// once for a metric, however many label sets it has.
 fn render_sessions(output: &mut String, sessions: &[SessionSnapshot]) {
-    for (name, help, kind) in [
-        (
-            "rushls_session_info",
-            "Identity and current lifecycle phase of an active session.",
-            "gauge",
-        ),
-        (
-            "rushls_session_bytes_received_total",
-            "Bytes received by an active session.",
-            "counter",
-        ),
-        (
-            "rushls_session_packets_received_total",
-            "Packets received by an active session.",
-            "counter",
-        ),
-        (
-            "rushls_session_packets_lost_total",
-            "Packets reported lost by an active session.",
-            "counter",
-        ),
-        (
-            "rushls_session_packets_normalized_total",
-            "Packets normalized by an active session.",
-            "counter",
-        ),
-        (
-            "rushls_session_samples_normalized_total",
-            "Samples emitted by normalization for an active session.",
-            "counter",
-        ),
-        (
-            "rushls_session_chunks_muxed_total",
-            "Media chunks muxed by an active session.",
-            "counter",
-        ),
-        (
-            "rushls_session_segments_muxed_total",
-            "Segments muxed by an active session.",
-            "counter",
-        ),
-        (
-            "rushls_session_parts_published_total",
-            "HLS parts published by an active session.",
-            "counter",
-        ),
-        (
-            "rushls_session_segments_published_total",
-            "HLS segments published by an active session.",
-            "counter",
-        ),
-        (
-            "rushls_session_peak_packets_per_batch",
-            "Largest packet batch observed by an active session.",
-            "gauge",
-        ),
-        (
-            "rushls_session_peak_samples_per_batch",
-            "Largest sample batch observed by an active session.",
-            "gauge",
-        ),
-        (
-            "rushls_session_media_lead_seconds",
-            "Current normalized-media lead for an active session.",
-            "gauge",
-        ),
-        (
-            "rushls_session_pacing_delay_seconds_total",
-            "Pacing delay accumulated by an active session.",
-            "counter",
-        ),
-        (
-            "rushls_session_publisher_backpressured",
-            "Whether an active publisher is currently backpressured.",
-            "gauge",
-        ),
-        (
-            "rushls_session_tracks",
-            "Discovered tracks in an active session by media kind.",
-            "gauge",
-        ),
-    ] {
-        metadata(output, name, help, kind);
+    metadata(
+        output,
+        SESSION_INFO,
+        "Identity and current lifecycle phase of an active session.",
+        MetricKind::Gauge,
+    );
+    for series in MeterSnapshot::SERIES {
+        metadata(output, series.name, series.help, series.kind);
     }
+    metadata(
+        output,
+        SESSION_TRACKS,
+        "Discovered tracks in an active session by media kind.",
+        MetricKind::Gauge,
+    );
 
     for session in sessions {
         let labels = session_labels(session);
         writeln!(
             output,
-            "rushls_session_info{{{labels},phase=\"{}\"}} 1",
+            "{SESSION_INFO}{{{labels},phase=\"{}\"}} 1",
             session.phase
         )
         .expect("writing to a String cannot fail");
-        session_metric(
-            output,
-            "rushls_session_bytes_received_total",
-            &labels,
-            session.meters.bytes_received,
-        );
-        session_metric(
-            output,
-            "rushls_session_packets_received_total",
-            &labels,
-            session.meters.packets_received,
-        );
-        session_metric(
-            output,
-            "rushls_session_packets_lost_total",
-            &labels,
-            session.meters.packets_lost,
-        );
-        session_metric(
-            output,
-            "rushls_session_packets_normalized_total",
-            &labels,
-            session.meters.packets_normalized,
-        );
-        session_metric(
-            output,
-            "rushls_session_samples_normalized_total",
-            &labels,
-            session.meters.samples_normalized,
-        );
-        session_metric(
-            output,
-            "rushls_session_chunks_muxed_total",
-            &labels,
-            session.meters.chunks_muxed,
-        );
-        session_metric(
-            output,
-            "rushls_session_segments_muxed_total",
-            &labels,
-            session.meters.segments_muxed,
-        );
-        session_metric(
-            output,
-            "rushls_session_parts_published_total",
-            &labels,
-            session.meters.parts_published,
-        );
-        session_metric(
-            output,
-            "rushls_session_segments_published_total",
-            &labels,
-            session.meters.segments_published,
-        );
-        session_metric(
-            output,
-            "rushls_session_peak_packets_per_batch",
-            &labels,
-            session.meters.peak_packets_per_batch,
-        );
-        session_metric(
-            output,
-            "rushls_session_peak_samples_per_batch",
-            &labels,
-            session.meters.peak_samples_per_batch,
-        );
-        session_float_metric(
-            output,
-            "rushls_session_media_lead_seconds",
-            &labels,
-            session.meters.media_lead.as_secs_f64(),
-        );
-        session_float_metric(
-            output,
-            "rushls_session_pacing_delay_seconds_total",
-            &labels,
-            session.meters.pacing_delay.as_secs_f64(),
-        );
-        session_metric(
-            output,
-            "rushls_session_publisher_backpressured",
-            &labels,
-            u64::from(session.meters.publisher_backpressured),
-        );
+        for series in MeterSnapshot::SERIES {
+            writeln!(
+                output,
+                "{}{{{labels}}} {}",
+                series.name,
+                (series.read)(&session.meters)
+            )
+            .expect("writing to a String cannot fail");
+        }
         for (kind, count) in [
             ("audio", session.tracks.audio),
             ("subtitle", session.tracks.subtitle),
@@ -636,12 +273,17 @@ fn render_sessions(output: &mut String, sessions: &[SessionSnapshot]) {
         ] {
             writeln!(
                 output,
-                "rushls_session_tracks{{{labels},kind=\"{kind}\"}} {count}"
+                "{SESSION_TRACKS}{{{labels},kind=\"{kind}\"}} {count}"
             )
             .expect("writing to a String cannot fail");
         }
     }
 }
+
+/// Carries a label set no snapshot field can produce, so it is spelled here
+/// rather than declared as a series.
+const SESSION_INFO: &str = "rushls_session_info";
+const SESSION_TRACKS: &str = "rushls_session_tracks";
 
 fn session_labels(session: &SessionSnapshot) -> String {
     format!(
@@ -657,14 +299,6 @@ fn escape_label(value: &str) -> String {
         .replace('\\', r"\\")
         .replace('\n', r"\n")
         .replace('"', r#"\""#)
-}
-
-fn session_metric(output: &mut String, name: &str, labels: &str, value: u64) {
-    writeln!(output, "{name}{{{labels}}} {value}").expect("writing to a String cannot fail");
-}
-
-fn session_float_metric(output: &mut String, name: &str, labels: &str, value: f64) {
-    writeln!(output, "{name}{{{labels}}} {value}").expect("writing to a String cannot fail");
 }
 
 #[cfg(test)]

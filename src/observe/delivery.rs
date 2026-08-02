@@ -14,25 +14,32 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use super::counters::counters;
+
 #[derive(Clone, Debug, Default)]
 pub struct OriginMeters {
     counters: Arc<OriginCounters>,
 }
 
-#[derive(Debug, Default)]
-struct OriginCounters {
-    media_served: AtomicU64,
-    bytes_served: AtomicU64,
-    requests_rejected: AtomicU64,
-    requests_not_found: AtomicU64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct OriginSnapshot {
-    pub media_served: u64,
-    pub bytes_served: u64,
-    pub requests_rejected: u64,
-    pub requests_not_found: u64,
+counters! {
+    OriginCounters => OriginSnapshot {
+        media_served: u64 = Counter(
+            "rushls_media_responses_served_total",
+            "Media responses served to viewers."
+        ),
+        bytes_served: u64 = Counter(
+            "rushls_bytes_served_total",
+            "Media bytes served to viewers."
+        ),
+        requests_rejected: u64 = Counter(
+            "rushls_origin_requests_rejected_total",
+            "Origin requests rejected as invalid or unsatisfiable."
+        ),
+        requests_not_found: u64 = Counter(
+            "rushls_origin_requests_not_found_total",
+            "Origin requests for streams or resources that were not found."
+        ),
+    }
 }
 
 impl OriginMeters {
@@ -50,12 +57,7 @@ impl OriginMeters {
     }
 
     pub fn snapshot(&self) -> OriginSnapshot {
-        OriginSnapshot {
-            media_served: read(&self.counters.media_served),
-            bytes_served: read(&self.counters.bytes_served),
-            requests_rejected: read(&self.counters.requests_rejected),
-            requests_not_found: read(&self.counters.requests_not_found),
-        }
+        self.counters.snapshot()
     }
 }
 
@@ -64,22 +66,27 @@ pub struct HlsMeters {
     counters: Arc<HlsCounters>,
 }
 
-#[derive(Debug, Default)]
-struct HlsCounters {
-    playlists_served: AtomicU64,
-    playlists_rendered: AtomicU64,
-    blocking_reloads: AtomicU64,
-    blocking_reloads_expired: AtomicU64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct HlsSnapshot {
-    pub playlists_served: u64,
-    /// Playlists actually projected, as opposed to reused from a cache.
-    pub playlists_rendered: u64,
-    pub blocking_reloads: u64,
-    /// Blocking reloads that hit their deadline without the media arriving.
-    pub blocking_reloads_expired: u64,
+counters! {
+    HlsCounters => HlsSnapshot {
+        playlists_served: u64 = Counter(
+            "rushls_hls_playlists_served_total",
+            "HLS playlist responses served to viewers."
+        ),
+        /// Playlists actually projected, as opposed to reused from a cache.
+        playlists_rendered: u64 = Counter(
+            "rushls_hls_playlists_rendered_total",
+            "HLS playlists projected instead of reused from the render cache."
+        ),
+        blocking_reloads: u64 = Counter(
+            "rushls_hls_blocking_reloads_total",
+            "HLS blocking playlist reloads started."
+        ),
+        /// Blocking reloads that hit their deadline without the media arriving.
+        blocking_reloads_expired: u64 = Counter(
+            "rushls_hls_blocking_reloads_expired_total",
+            "HLS blocking playlist reloads that expired before media arrived."
+        ),
+    }
 }
 
 impl HlsMeters {
@@ -99,21 +106,12 @@ impl HlsMeters {
     }
 
     pub fn snapshot(&self) -> HlsSnapshot {
-        HlsSnapshot {
-            playlists_served: read(&self.counters.playlists_served),
-            playlists_rendered: read(&self.counters.playlists_rendered),
-            blocking_reloads: read(&self.counters.blocking_reloads),
-            blocking_reloads_expired: read(&self.counters.blocking_reloads_expired),
-        }
+        self.counters.snapshot()
     }
 }
 
 fn add(counter: &AtomicU64, value: u64) {
     counter.fetch_add(value, Ordering::Relaxed);
-}
-
-fn read(counter: &AtomicU64) -> u64 {
-    counter.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

@@ -15,11 +15,13 @@
 //! through an event bus pays dispatch to reach a `fetch_add`; a lifecycle fact
 //! squeezed into a counter loses the structure that made it worth reporting.
 
+pub mod counters;
 mod delivery;
 mod events;
 pub mod lifecycle;
 mod meters;
 
+pub use counters::{MetricKind, Reading, Series};
 pub use delivery::{HlsMeters, HlsSnapshot, OriginMeters, OriginSnapshot};
 pub use events::{
     EventObserver, EventSink, Events, NodeEvent, Protocol, SessionEnd, SessionEvent, StreamEvent,

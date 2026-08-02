@@ -8,6 +8,8 @@ use std::{
 
 use tokio::time::Instant;
 
+use super::counters::{counters, series};
+
 /// Volume produced by the ingest front end.
 ///
 /// Signatures are batch-shaped on purpose: a source counts into local variables
@@ -55,45 +57,72 @@ pub struct ProcessMeters {
     counters: Arc<ProcessCounters>,
 }
 
-#[derive(Debug, Default)]
-struct ProcessCounters {
-    sessions_started: AtomicU64,
-    sessions_completed: AtomicU64,
-    sessions_failed: AtomicU64,
-    sessions_replaced: AtomicU64,
-    publishers_rejected: AtomicU64,
-    codec_parameter_changes: AtomicU64,
-    unhealthy_terminations: AtomicU64,
-    drain_failures: AtomicU64,
-    bytes_received: AtomicU64,
-    packets_received: AtomicU64,
-    packets_lost: AtomicU64,
-    parts_published: AtomicU64,
-    segments_published: AtomicU64,
-    tls_handshakes_completed: AtomicU64,
-    tls_handshakes_failed: AtomicU64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ProcessSnapshot {
-    pub sessions_started: u64,
-    pub sessions_completed: u64,
-    pub sessions_failed: u64,
-    pub sessions_replaced: u64,
-    pub publishers_rejected: u64,
-    pub codec_parameter_changes: u64,
-    pub unhealthy_terminations: u64,
-    pub drain_failures: u64,
-    pub bytes_received: u64,
-    pub packets_received: u64,
-    pub packets_lost: u64,
-    pub parts_published: u64,
-    pub segments_published: u64,
-    pub tls_handshakes_completed: u64,
-    /// Includes handshakes that simply timed out, which is what a port scan
-    /// looks like. A counter rather than an event precisely because the rate
-    /// is chosen by whoever is connecting.
-    pub tls_handshakes_failed: u64,
+counters! {
+    ProcessCounters => ProcessSnapshot {
+        sessions_started: u64 = Counter(
+            "rushls_sessions_started_total",
+            "Publishing sessions started."
+        ),
+        sessions_completed: u64 = Counter(
+            "rushls_sessions_completed_total",
+            "Publishing sessions completed successfully."
+        ),
+        sessions_failed: u64 = Counter(
+            "rushls_sessions_failed_total",
+            "Publishing sessions that failed."
+        ),
+        sessions_replaced: u64 = Counter(
+            "rushls_sessions_replaced_total",
+            "Publishing sessions displaced by a takeover."
+        ),
+        publishers_rejected: u64 = Counter(
+            "rushls_publishers_rejected_total",
+            "Publishers rejected before a session started."
+        ),
+        codec_parameter_changes: u64 = Counter(
+            "rushls_codec_parameter_changes_total",
+            "Mid-stream codec parameter changes detected."
+        ),
+        unhealthy_terminations: u64 = Counter(
+            "rushls_unhealthy_terminations_total",
+            "Sessions stopped by health supervision."
+        ),
+        drain_failures: u64 = Counter(
+            "rushls_drain_failures_total",
+            "Sessions that failed while flushing their tail."
+        ),
+        bytes_received: u64 = Counter(
+            "rushls_bytes_received_total",
+            "Bytes received from publishers."
+        ),
+        packets_received: u64 = Counter(
+            "rushls_packets_received_total",
+            "Packets received from publishers."
+        ),
+        packets_lost: u64 = Counter(
+            "rushls_packets_lost_total",
+            "Publisher packets reported lost."
+        ),
+        parts_published: u64 = Counter(
+            "rushls_parts_published_total",
+            "HLS parts made available to viewers."
+        ),
+        segments_published: u64 = Counter(
+            "rushls_segments_published_total",
+            "HLS segments made available to viewers."
+        ),
+        tls_handshakes_completed: u64 = Counter(
+            "rushls_tls_handshakes_completed_total",
+            "TLS handshakes completed."
+        ),
+        /// Includes handshakes that simply timed out, which is what a port scan
+        /// looks like. A counter rather than an event precisely because the rate
+        /// is chosen by whoever is connecting.
+        tls_handshakes_failed: u64 = Counter(
+            "rushls_tls_handshakes_failed_total",
+            "TLS handshakes that failed or timed out."
+        ),
+    }
 }
 
 impl ProcessMeters {
@@ -147,24 +176,7 @@ impl ProcessMeters {
     }
 
     pub fn snapshot(&self) -> ProcessSnapshot {
-        let counters = &self.counters;
-        ProcessSnapshot {
-            sessions_started: get(&counters.sessions_started),
-            sessions_completed: get(&counters.sessions_completed),
-            sessions_failed: get(&counters.sessions_failed),
-            sessions_replaced: get(&counters.sessions_replaced),
-            publishers_rejected: get(&counters.publishers_rejected),
-            codec_parameter_changes: get(&counters.codec_parameter_changes),
-            unhealthy_terminations: get(&counters.unhealthy_terminations),
-            drain_failures: get(&counters.drain_failures),
-            bytes_received: get(&counters.bytes_received),
-            packets_received: get(&counters.packets_received),
-            packets_lost: get(&counters.packets_lost),
-            parts_published: get(&counters.parts_published),
-            segments_published: get(&counters.segments_published),
-            tls_handshakes_completed: get(&counters.tls_handshakes_completed),
-            tls_handshakes_failed: get(&counters.tls_handshakes_failed),
-        }
+        self.counters.snapshot()
     }
 }
 
@@ -221,6 +233,57 @@ pub struct MeterSnapshot {
     pub media_lead: Duration,
     pub pacing_delay: Duration,
     pub publisher_backpressured: bool,
+}
+
+// Declared apart from the storage above because the storage is not a plain
+// bank of atomics: durations are held as nanoseconds and the peaks accumulate
+// with `fetch_max`. What is exported is uniform even though what is kept is
+// not.
+series! {
+    MeterSnapshot {
+        Counter("rushls_session_bytes_received_total",
+            "Bytes received by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.bytes_received,
+        Counter("rushls_session_packets_received_total",
+            "Packets received by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.packets_received,
+        Counter("rushls_session_packets_lost_total",
+            "Packets reported lost by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.packets_lost,
+        Counter("rushls_session_packets_normalized_total",
+            "Packets normalized by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.packets_normalized,
+        Counter("rushls_session_samples_normalized_total",
+            "Samples emitted by normalization for an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.samples_normalized,
+        Counter("rushls_session_chunks_muxed_total",
+            "Media chunks muxed by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.chunks_muxed,
+        Counter("rushls_session_segments_muxed_total",
+            "Segments muxed by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.segments_muxed,
+        Counter("rushls_session_parts_published_total",
+            "HLS parts published by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.parts_published,
+        Counter("rushls_session_segments_published_total",
+            "HLS segments published by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.segments_published,
+        Gauge("rushls_session_peak_packets_per_batch",
+            "Largest packet batch observed by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.peak_packets_per_batch,
+        Gauge("rushls_session_peak_samples_per_batch",
+            "Largest sample batch observed by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.peak_samples_per_batch,
+        Gauge("rushls_session_media_lead_seconds",
+            "Current normalized-media lead for an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.media_lead.as_secs_f64(),
+        Counter("rushls_session_pacing_delay_seconds_total",
+            "Pacing delay accumulated by an active session.")
+            = |snapshot: &MeterSnapshot| snapshot.pacing_delay.as_secs_f64(),
+        Gauge("rushls_session_publisher_backpressured",
+            "Whether an active publisher is currently backpressured.")
+            = |snapshot: &MeterSnapshot| snapshot.publisher_backpressured,
+    }
 }
 
 impl SessionMeters {
