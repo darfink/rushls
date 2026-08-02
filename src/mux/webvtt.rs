@@ -580,6 +580,7 @@ mod tests {
     use crate::{
         domain::{MediaKind, SubtitlePosition, WebVttCueMetadata, fixtures::TrackBuilder},
         media::SubtitleSample,
+        segment::fixtures::PlanBuilder,
     };
 
     const SECOND: u64 = 90_000;
@@ -592,18 +593,11 @@ mod tests {
     }
 
     fn plan(segment_seconds: u64) -> TrackSegmentationPlan {
-        let duration = segment_seconds * SECOND;
-        TrackSegmentationPlan {
-            track_id: TrackId(0),
-            timebase: Timebase::hz90k(),
-            presentation_origin_pts: 0,
-            segmentation_origin_pts: 0,
-            first_segment_boundary_pts: i64::try_from(duration).expect("fixture fits"),
-            segment_duration: std::num::NonZero::new(duration).expect("fixture is nonzero"),
-            part_access_units: nz::u32!(1),
-            part_duration: nz::u64!(90_000),
-            boundary_tolerance: 0,
-        }
+        let duration =
+            std::num::NonZero::new(segment_seconds * SECOND).expect("fixture segments are nonzero");
+        PlanBuilder::new(0, Timebase::hz90k(), duration)
+            .part(nz::u32!(1), nz::u64!(90_000))
+            .build()
     }
 
     fn sample(codec: Codec, start: i64, duration: u64, text: &[u8]) -> NormalizedSample {

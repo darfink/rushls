@@ -87,7 +87,7 @@ mod tests {
             fixtures::{AAC_EXTRADATA, AAC_FRAME, H264_EXTRADATA},
         },
         observe::Events,
-        segment::{SegmentationPlan, TrackSegmentationPlan},
+        segment::{SegmentationPlan, fixtures::PlanBuilder},
     };
 
     use super::*;
@@ -104,18 +104,12 @@ mod tests {
         let input = validate(&catalog(vec![video, subtitle]), &StreamPolicy::permissive())?;
         let segmentation = SegmentationPlan::new(
             &input,
-            [TrackId(0), TrackId(1)]
+            [0, 1]
                 .into_iter()
-                .map(|track_id| TrackSegmentationPlan {
-                    track_id,
-                    timebase: Timebase::hz90k(),
-                    presentation_origin_pts: 0,
-                    segmentation_origin_pts: 0,
-                    first_segment_boundary_pts: 180_000,
-                    segment_duration: nz::u64!(180_000),
-                    part_access_units: nz::u32!(1),
-                    part_duration: nz::u64!(90_000),
-                    boundary_tolerance: 0,
+                .map(|track_id| {
+                    PlanBuilder::new(track_id, Timebase::hz90k(), nz::u64!(180_000))
+                        .part(nz::u32!(1), nz::u64!(90_000))
+                        .build()
                 })
                 .collect(),
         )?;
@@ -165,28 +159,17 @@ mod tests {
         let segmentation = SegmentationPlan::new(
             &input,
             vec![
-                TrackSegmentationPlan {
-                    track_id: TrackId(0),
-                    timebase: audio_timebase,
-                    presentation_origin_pts: -1_056,
-                    segmentation_origin_pts: -1_056,
-                    first_segment_boundary_pts: 7_136,
-                    segment_duration: nz::u64!(8_192),
-                    part_access_units: nz::u32!(2),
-                    part_duration: nz::u64!(2_048),
-                    boundary_tolerance: 0,
-                },
-                TrackSegmentationPlan {
-                    track_id: TrackId(1),
-                    timebase: Timebase::hz90k(),
-                    presentation_origin_pts: -1_980,
-                    segmentation_origin_pts: 0,
-                    first_segment_boundary_pts: 180_000,
-                    segment_duration: nz::u64!(180_000),
-                    part_access_units: nz::u32!(1),
-                    part_duration: nz::u64!(90_000),
-                    boundary_tolerance: 0,
-                },
+                // Audio priming puts both origins before zero; the boundary
+                // still lands one segment after the segmentation origin.
+                PlanBuilder::new(0, audio_timebase, nz::u64!(8_192))
+                    .part(nz::u32!(2), nz::u64!(2_048))
+                    .presentation_origin(-1_056)
+                    .segmentation_origin(-1_056)
+                    .build(),
+                PlanBuilder::new(1, Timebase::hz90k(), nz::u64!(180_000))
+                    .part(nz::u32!(1), nz::u64!(90_000))
+                    .presentation_origin(-1_980)
+                    .build(),
             ],
         )?;
         let events = Events::default().scoped(SessionId(nz::u64!(2)));

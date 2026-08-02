@@ -310,17 +310,9 @@ mod tests {
     use super::*;
 
     fn planned_track(track_id: u32) -> TrackSegmentationPlan {
-        TrackSegmentationPlan {
-            track_id: TrackId(track_id),
-            timebase: Timebase::hz90k(),
-            presentation_origin_pts: 0,
-            segmentation_origin_pts: 0,
-            first_segment_boundary_pts: 180_000,
-            segment_duration: nz::u64!(180_000),
-            part_access_units: nz::u32!(6),
-            part_duration: nz::u64!(18_000),
-            boundary_tolerance: 0,
-        }
+        fixtures::PlanBuilder::new(track_id, Timebase::hz90k(), nz::u64!(180_000))
+            .part(nz::u32!(6), nz::u64!(18_000))
+            .build()
     }
 
     #[test]
