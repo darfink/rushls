@@ -1,13 +1,19 @@
-//! Track-local WebVTT segmentation and SubRip cue conversion.
+//! Track-local WebVTT segmentation.
+//!
+//! Reading the cues themselves belongs to [`cue`], which keeps every accepted
+//! input format's rules in one place; this module only decides where segment
+//! boundaries fall and renders the windows between them.
 
-use std::{collections::VecDeque, num::NonZero, str, sync::Arc};
+use std::{collections::VecDeque, num::NonZero, sync::Arc};
 
-mod subrip;
+mod cue;
+
+use cue::CueDialect;
 
 use crate::{
     domain::{
-        Appender, Codec, DiscoveredTrack, MediaKind, Payload, TickDuration, TickTimestamp,
-        Timebase, TimebaseProjection, TrackId, WebVttCueMetadata, duration_since,
+        Appender, DiscoveredTrack, MediaKind, Payload, TickDuration, TickTimestamp, Timebase,
+        TimebaseProjection, TrackId, duration_since,
     },
     media::{NormalizedSample, SubtitleSample},
     segment::TrackSegmentationPlan,
@@ -52,12 +58,12 @@ pub(super) fn build_track(
     if track.kind() != MediaKind::Subtitle {
         return Err(invalid("WebVTT output requires a subtitle track"));
     }
-    if !matches!(track.codec, Codec::WebVtt | Codec::SubRip) {
-        return Err(invalid(format!(
+    let dialect = CueDialect::for_codec(track.codec).ok_or_else(|| {
+        invalid(format!(
             "{} subtitle codec {:?} cannot be converted to WebVTT",
             track.id, track.codec
-        )));
-    }
+        ))
+    })?;
     if plan.track_id != track.id || plan.timebase != track.timebase {
         return Err(invalid(format!(
             "segmentation plan does not describe {}",
@@ -72,7 +78,7 @@ pub(super) fn build_track(
     }
 
     let rendition = packaged_rendition(rendition_id, track, &plan);
-    let packager = WebVttTrack::new(rendition_id, track, plan)?;
+    let packager = WebVttTrack::new(rendition_id, track, dialect, plan)?;
     Ok((rendition, Box::new(packager)))
 }
 
@@ -114,7 +120,7 @@ fn packaged_rendition(
 struct WebVttTrack {
     rendition_id: PackagingRenditionId,
     track_id: TrackId,
-    codec: Codec,
+    dialect: CueDialect,
     plan: TrackSegmentationPlan,
     origin: TickTimestamp,
     first_boundary: TickTimestamp,
@@ -131,6 +137,7 @@ impl WebVttTrack {
     fn new(
         rendition_id: PackagingRenditionId,
         track: &DiscoveredTrack,
+        dialect: CueDialect,
         plan: TrackSegmentationPlan,
     ) -> Result<Self, MuxError> {
         let origin = plan
@@ -148,7 +155,7 @@ impl WebVttTrack {
         Ok(Self {
             rendition_id,
             track_id: track.id,
-            codec: track.codec,
+            dialect,
             plan,
             origin,
             first_boundary,
@@ -173,15 +180,9 @@ impl WebVttTrack {
                 self.track_id, sample.track_id
             )));
         }
-        if sample.codec != self.codec {
+        if CueDialect::for_codec(sample.codec) != Some(self.dialect) {
             return Err(mux_error(format!(
                 "{} changed subtitle codec while muxing",
-                self.track_id
-            )));
-        }
-        if sample.position.is_some() {
-            return Err(mux_error(format!(
-                "{} carries pixel-positioned subtitle text that WebVTT cannot map without a canvas",
                 self.track_id
             )));
         }
@@ -254,31 +255,11 @@ impl WebVttTrack {
         // modifying the queue, keeping a failed push transactional.
         self.window_start(last_index)?;
 
-        let metadata = match self.codec {
-            Codec::WebVtt => validate_webvtt_metadata(sample.webvtt)?,
-            Codec::SubRip => {
-                if sample.webvtt != WebVttCueMetadata::default() {
-                    return Err(mux_error(format!(
-                        "{} SubRip cue carries WebVTT-only metadata",
-                        self.track_id
-                    )));
-                }
-                WebVttCueMetadata::default()
-            }
-            _ => {
-                return Err(mux_error(
-                    "unsupported subtitle codec reached WebVTT output",
-                ));
-            }
-        };
-        let text = match self.codec {
-            Codec::WebVtt => webvtt_text(sample.payload.as_bytes())?,
-            Codec::SubRip => subrip::convert(sample.payload.as_bytes())?,
-            _ => unreachable!("codec was checked above"),
-        };
-        let rendered_bytes = text
+        let content = self.dialect.read(&sample)?;
+        let rendered_bytes = content
+            .text
             .len()
-            .checked_add(metadata.retained_bytes())
+            .checked_add(content.metadata.retained_bytes())
             .ok_or_else(|| mux_error("rendered subtitle cue byte accounting overflowed"))?;
         if rendered_bytes > MAX_CUE_BYTES {
             return Err(mux_error(format!(
@@ -310,9 +291,9 @@ impl WebVttTrack {
             cue: Arc::new(Cue {
                 start_ms,
                 end_ms,
-                identifier: metadata.identifier,
-                settings: metadata.settings,
-                text,
+                identifier: content.metadata.identifier,
+                settings: content.metadata.settings,
+                text: content.text,
             }),
         })
     }
@@ -491,48 +472,6 @@ impl TrackPackager for WebVttTrack {
     }
 }
 
-fn validate_webvtt_metadata(metadata: WebVttCueMetadata) -> Result<WebVttCueMetadata, MuxError> {
-    if metadata
-        .identifier
-        .as_deref()
-        .is_some_and(|value| value.contains(['\0', '\r', '\n']) || value.contains("-->"))
-    {
-        return Err(mux_error("WebVTT cue identifier is not a single safe line"));
-    }
-    if let Some(settings) = metadata.settings.as_deref() {
-        if settings.contains(['\0', '\r', '\n']) || settings.contains("-->") {
-            return Err(mux_error("WebVTT cue settings are not a single safe line"));
-        }
-        if settings
-            .split_ascii_whitespace()
-            .any(|setting| setting.starts_with("region:"))
-        {
-            return Err(mux_error(
-                "WebVTT cue regions require a global REGION definition",
-            ));
-        }
-    }
-    Ok(metadata)
-}
-
-fn webvtt_text(bytes: &[u8]) -> Result<Arc<str>, MuxError> {
-    let text = str::from_utf8(bytes).map_err(|_| mux_error("WebVTT cue text is not UTF-8"))?;
-    if text.contains('\0') {
-        return Err(mux_error("WebVTT cue text contains a NUL byte"));
-    }
-    let normalized = normalize_newlines(text);
-    if normalized.is_empty() || normalized.contains("\n\n") {
-        return Err(mux_error(
-            "WebVTT cue text is empty or contains a blank line",
-        ));
-    }
-    Ok(Arc::from(normalized))
-}
-
-fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
-
 fn render_window(window: &Window) -> Vec<u8> {
     let mut body = String::new();
     for cue in &window.cues {
@@ -576,9 +515,11 @@ fn mux_error(message: impl Into<Box<str>>) -> MuxError {
 
 #[cfg(test)]
 mod tests {
+    use std::str;
+
     use super::*;
     use crate::{
-        domain::{MediaKind, SubtitlePosition, WebVttCueMetadata, fixtures::TrackBuilder},
+        domain::{Codec, MediaKind, SubtitlePosition, WebVttCueMetadata, fixtures::TrackBuilder},
         media::SubtitleSample,
         segment::fixtures::PlanBuilder,
     };
@@ -613,9 +554,12 @@ mod tests {
     }
 
     fn mux(codec: Codec, segment_seconds: u64) -> WebVttTrack {
+        let track = track(codec);
+        let dialect = CueDialect::for_codec(codec).expect("fixture codecs have a dialect");
         WebVttTrack::new(
             PackagingRenditionId(3),
-            &track(codec),
+            &track,
+            dialect,
             plan(segment_seconds),
         )
         .expect("fixture mux starts")
@@ -695,26 +639,6 @@ mod tests {
         }
         assert_eq!(packets.len(), 1);
         packets.pop().expect("one packet was recovered")
-    }
-
-    #[test]
-    fn webvtt_metadata_rejects_unsafe_lines_and_undefined_regions() {
-        for metadata in [
-            WebVttCueMetadata {
-                identifier: Some(Arc::from("bad\0identifier")),
-                settings: None,
-            },
-            WebVttCueMetadata {
-                identifier: None,
-                settings: Some(Arc::from("align:start\nposition:20%")),
-            },
-            WebVttCueMetadata {
-                identifier: None,
-                settings: Some(Arc::from("region:captions")),
-            },
-        ] {
-            assert!(validate_webvtt_metadata(metadata).is_err());
-        }
     }
 
     #[test]
