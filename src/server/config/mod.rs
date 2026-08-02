@@ -942,7 +942,7 @@ impl StorageAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct HttpAppConfig {
-    /// Address serving HLS and optional metrics.
+    /// Address serving HLS, health probes, and optional metrics.
     #[conf(parameter, long, env, default_value = "0.0.0.0:8080")]
     pub listen: SocketAddr,
     #[conf(flatten, prefix)]

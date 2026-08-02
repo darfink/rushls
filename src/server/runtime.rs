@@ -30,7 +30,7 @@ use crate::{
 };
 
 use super::{
-    http::{self, Application, HttpConfig, TlsError},
+    http::{self, Application, HttpConfig, Readiness, TlsError},
     metrics::{MetricsConfig, MetricsEndpoint, MetricsReader},
 };
 
@@ -274,7 +274,14 @@ impl Node {
             Arc::clone(&origin),
             Arc::clone(&hls),
         ));
-        let metrics = MetricsReader::new(meters, sessions, store.clone(), config.metrics.export);
+        let metrics = MetricsReader::new(
+            meters,
+            origin.meters().clone(),
+            hls.meters().clone(),
+            sessions,
+            store.clone(),
+            config.metrics.export,
+        );
 
         Ok(Self {
             config,
@@ -355,6 +362,7 @@ impl Node {
         report_bound(&events, Protocol::Srt, Ok(srt_listener.local_address()));
 
         let (stop_tx, stop_rx) = watch::channel(false);
+        let readiness = Readiness::default();
         let mut tasks = JoinSet::new();
         // One budget each: a transport being flooded with connections that
         // never authenticate should not stop the other from admitting anyone.
@@ -394,6 +402,7 @@ impl Node {
                     Arc::clone(&self.application),
                     self.config.http.clone(),
                     self.metrics_endpoint(),
+                    readiness.clone(),
                     stop_rx.clone(),
                 ));
             }
@@ -404,6 +413,7 @@ impl Node {
                     Arc::clone(&self.application),
                     self.config.http.clone(),
                     self.metrics_endpoint(),
+                    readiness.clone(),
                     stop_rx.clone(),
                 ));
             }
@@ -415,12 +425,17 @@ impl Node {
             events.clone(),
             stop_rx,
         ));
+        // All listeners and long-running tasks now exist. During shutdown this
+        // flips before their drain begins, so load balancers stop adding work.
+        readiness.mark_ready();
 
         tokio::pin!(shutdown);
         let (shutdown_requested, mut first_error) = tokio::select! {
             _ = &mut shutdown => (true, None),
             joined = tasks.join_next() => (false, joined.and_then(task_error)),
         };
+
+        readiness.mark_not_ready();
 
         if shutdown_requested {
             self.services.events.emit(NodeEvent::ShuttingDown);
@@ -622,19 +637,22 @@ async fn run_http<L>(
     application: Arc<ViewerApplication>,
     config: HttpConfig,
     metrics: Option<MetricsEndpoint>,
+    readiness: Readiness,
     stop: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError>
 where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
 {
-    match metrics {
-        Some(metrics) => {
-            http::serve_with_metrics(listener, application, config, metrics, wait_for_stop(stop))
-                .await
-        }
-        None => http::serve(listener, application, config, wait_for_stop(stop)).await,
-    }
+    http::serve_with_readiness(
+        listener,
+        application,
+        config,
+        metrics,
+        readiness,
+        wait_for_stop(stop),
+    )
+    .await
     .map_err(RuntimeError::Http)
 }
 

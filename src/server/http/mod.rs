@@ -28,7 +28,13 @@ pub mod fixtures;
 #[cfg(test)]
 mod tests;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use axum::{
     Router,
@@ -97,6 +103,7 @@ struct HttpState<P> {
     application: Arc<P>,
     cors: Arc<CorsConfig>,
     metrics: Option<MetricsEndpoint>,
+    readiness: Readiness,
 }
 
 impl<P> Clone for HttpState<P> {
@@ -105,7 +112,36 @@ impl<P> Clone for HttpState<P> {
             application: Arc::clone(&self.application),
             cors: Arc::clone(&self.cors),
             metrics: self.metrics.clone(),
+            readiness: self.readiness.clone(),
         }
+    }
+}
+
+/// Whether this node should receive new traffic.
+///
+/// Liveness needs no mutable state: successfully handling its request already
+/// proves that the HTTP task and runtime are responsive. Readiness differs
+/// during startup and graceful shutdown, so process wiring owns this latch.
+#[derive(Clone, Debug, Default)]
+pub struct Readiness(Arc<AtomicBool>);
+
+impl Readiness {
+    pub fn ready() -> Self {
+        let readiness = Self::default();
+        readiness.mark_ready();
+        readiness
+    }
+
+    pub fn mark_ready(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn mark_not_ready(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
@@ -120,6 +156,15 @@ pub fn router_with_metrics<P: Application>(
     config: &HttpConfig,
     metrics: Option<MetricsEndpoint>,
 ) -> Router {
+    router_with_readiness(application, config, metrics, Readiness::ready())
+}
+
+fn router_with_readiness<P: Application>(
+    application: Arc<P>,
+    config: &HttpConfig,
+    metrics: Option<MetricsEndpoint>,
+    readiness: Readiness,
+) -> Router {
     Router::new()
         // One catch-all rather than a route table: a stream identity may
         // contain slashes, so path structure is resolved by the application
@@ -130,6 +175,7 @@ pub fn router_with_metrics<P: Application>(
             application,
             cors: Arc::new(config.cors.clone()),
             metrics,
+            readiness,
         })
 }
 
@@ -179,6 +225,28 @@ where
     .await
 }
 
+/// Serves the complete operator surface with runtime-controlled readiness.
+pub async fn serve_with_readiness<L, P>(
+    listener: L,
+    application: Arc<P>,
+    config: HttpConfig,
+    metrics: Option<MetricsEndpoint>,
+    readiness: Readiness,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+    P: Application,
+{
+    axum::serve(
+        listener,
+        router_with_readiness(application, &config, metrics, readiness).into_make_service(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+}
+
 /// The address a bound listener is actually on.
 pub async fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
     TcpListener::bind(address).await
@@ -205,6 +273,13 @@ async fn handle<P: Application>(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    if uri.path() == "/health/live" {
+        return health_response(method, true);
+    }
+    if uri.path() == "/health/ready" {
+        return health_response(method, service.readiness.is_ready());
+    }
+
     if uri.path() == "/metrics"
         && let Some(metrics) = &service.metrics
     {
@@ -250,6 +325,34 @@ async fn handle<P: Application>(
     };
     cors::apply(&mut response, &service.cors, &headers);
     response
+}
+
+fn health_response(method: Method, healthy: bool) -> Response {
+    if !matches!(method, Method::GET | Method::HEAD) {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, HeaderValue::from_static("GET, HEAD"))],
+        )
+            .into_response();
+    }
+
+    let status = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        if healthy { "ok\n" } else { "not ready\n" },
+    )
+        .into_response()
 }
 
 fn metrics_response(metrics: &MetricsEndpoint, method: Method, headers: &HeaderMap) -> Response {

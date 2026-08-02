@@ -20,14 +20,15 @@ use crate::delivery::hls::{
     },
 };
 use crate::{
-    observe::ProcessMeters,
+    observe::{HlsMeters, OriginMeters, ProcessMeters},
     server::metrics::{ExportPolicy, MetricsEndpoint, MetricsReader, MetricsToken},
     session::Registry,
 };
 
 use super::fixtures::application;
 use super::{
-    AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, bind, serve, serve_with_metrics,
+    AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, Readiness, bind, serve,
+    serve_with_readiness,
 };
 
 /// A raw HTTP/1.1 response, parsed just enough to assert on.
@@ -119,6 +120,19 @@ impl Harness {
     }
 
     async fn start_config(config: HttpConfig, metrics: MetricsMode) -> Self {
+        Self::start_config_with_readiness(config, metrics, Readiness::ready()).await
+    }
+
+    async fn start_with_readiness(readiness: Readiness) -> Self {
+        Self::start_config_with_readiness(HttpConfig::default(), MetricsMode::Disabled, readiness)
+            .await
+    }
+
+    async fn start_config_with_readiness(
+        config: HttpConfig,
+        metrics: MetricsMode,
+        readiness: Readiness,
+    ) -> Self {
         let store = StreamStore::default();
         let origin = application(&store);
         let listener = bind("127.0.0.1:0".parse().expect("a valid address"))
@@ -126,31 +140,30 @@ impl Harness {
             .expect("an ephemeral port is available");
         let address = listener.local_addr().expect("the listener is bound");
         let (shutdown, signal) = tokio::sync::oneshot::channel();
-        let served = match metrics {
-            MetricsMode::Enabled(token) => {
-                let metrics = MetricsEndpoint::new(
-                    MetricsReader::new(
-                        ProcessMeters::default(),
-                        Registry::default(),
-                        store.clone(),
-                        ExportPolicy::default(),
-                    ),
-                    token,
-                );
-                tokio::spawn(serve_with_metrics(
-                    listener,
-                    origin,
-                    config,
-                    metrics,
-                    async {
-                        let _ = signal.await;
-                    },
-                ))
-            }
-            MetricsMode::Disabled => tokio::spawn(serve(listener, origin, config, async {
-                let _ = signal.await;
-            })),
+        let metrics = match metrics {
+            MetricsMode::Enabled(token) => Some(MetricsEndpoint::new(
+                MetricsReader::new(
+                    ProcessMeters::default(),
+                    OriginMeters::default(),
+                    HlsMeters::default(),
+                    Registry::default(),
+                    store.clone(),
+                    ExportPolicy::default(),
+                ),
+                token,
+            )),
+            MetricsMode::Disabled => None,
         };
+        let served = tokio::spawn(serve_with_readiness(
+            listener,
+            origin,
+            config,
+            metrics,
+            readiness,
+            async {
+                let _ = signal.await;
+            },
+        ));
         Self {
             address,
             store,
@@ -167,6 +180,43 @@ impl Harness {
             let _ = served.await;
         }
     }
+}
+
+#[tokio::test]
+async fn liveness_is_always_available_and_readiness_tracks_runtime_state() {
+    let readiness = Readiness::default();
+    let harness = Harness::start_with_readiness(readiness.clone()).await;
+
+    let live = request(harness.address, "GET", "/health/live", &[]).await;
+    assert_eq!(live.status, 200);
+    assert_eq!(live.body, b"ok\n");
+    assert_eq!(live.header("cache-control"), Some("no-store"));
+
+    let starting = request(harness.address, "GET", "/health/ready", &[]).await;
+    assert_eq!(starting.status, 503);
+    assert_eq!(starting.body, b"not ready\n");
+
+    readiness.mark_ready();
+    let ready = request(harness.address, "HEAD", "/health/ready", &[]).await;
+    assert_eq!(ready.status, 200);
+    assert!(ready.body.is_empty());
+
+    readiness.mark_not_ready();
+    let stopping = request(harness.address, "GET", "/health/ready", &[]).await;
+    assert_eq!(stopping.status, 503);
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn health_endpoints_reject_methods_that_cannot_be_probes() {
+    let harness = Harness::start().await;
+
+    let reply = request(harness.address, "POST", "/health/live", &[]).await;
+
+    assert_eq!(reply.status, 405);
+    assert_eq!(reply.header("allow"), Some("GET, HEAD"));
+    harness.stop().await;
 }
 
 #[tokio::test]

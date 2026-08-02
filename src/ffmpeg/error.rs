@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, c_char};
 
 use ffmpeg_sys_next as ffmpeg;
 
@@ -11,7 +11,8 @@ pub struct AvError {
 
 impl AvError {
     pub fn new(code: i32) -> Self {
-        let mut buffer = [0_i8; 128];
+        // `c_char` is unsigned on some targets, including Linux/AArch64.
+        let mut buffer = [c_char::default(); 128];
         // SAFETY: `buffer` is valid for its full length and FFmpeg always
         // writes a terminating NUL when the call succeeds.
         let result = unsafe { ffmpeg::av_strerror(code, buffer.as_mut_ptr(), buffer.len()) };

@@ -5,7 +5,9 @@ use subtle::ConstantTimeEq;
 use crate::{
     delivery::hls::StreamStore,
     hooks::{HookSnapshot, Hooks},
-    observe::{ProcessMeters, ProcessSnapshot},
+    observe::{
+        HlsMeters, HlsSnapshot, OriginMeters, OriginSnapshot, ProcessMeters, ProcessSnapshot,
+    },
     session::{Registry, SessionSnapshot},
 };
 
@@ -49,6 +51,8 @@ pub struct MetricsConfig {
 #[derive(Clone, Debug)]
 pub struct MetricsSnapshot {
     pub process: ProcessSnapshot,
+    pub origin: OriginSnapshot,
+    pub hls: HlsSnapshot,
     pub active_sessions: usize,
     /// Streams with a publisher attached.
     pub published_streams: usize,
@@ -92,6 +96,8 @@ impl MetricsEndpoint {
 #[derive(Clone, Debug)]
 pub struct MetricsReader {
     meters: ProcessMeters,
+    origin: OriginMeters,
+    hls: HlsMeters,
     sessions: Registry,
     store: StreamStore,
     /// Absent unless hooks are configured, which is also when they have
@@ -103,12 +109,16 @@ pub struct MetricsReader {
 impl MetricsReader {
     pub fn new(
         meters: ProcessMeters,
+        origin: OriginMeters,
+        hls: HlsMeters,
         sessions: Registry,
         store: StreamStore,
         policy: ExportPolicy,
     ) -> Self {
         Self {
             meters,
+            origin,
+            hls,
             sessions,
             store,
             hooks: None,
@@ -128,6 +138,8 @@ impl MetricsReader {
         let published = self.store.leased();
         MetricsSnapshot {
             process: self.meters.snapshot(),
+            origin: self.origin.snapshot(),
+            hls: self.hls.snapshot(),
             active_sessions: sessions.len(),
             published_streams: published,
             idle_streams: self.store.len() - published,
@@ -242,6 +254,54 @@ pub fn render(snapshot: &MetricsSnapshot) -> String {
         "rushls_tls_handshakes_failed_total",
         "TLS handshakes that failed or timed out.",
         process.tls_handshakes_failed,
+    );
+    counter(
+        &mut output,
+        "rushls_media_responses_served_total",
+        "Media responses served to viewers.",
+        snapshot.origin.media_served,
+    );
+    counter(
+        &mut output,
+        "rushls_bytes_served_total",
+        "Media bytes served to viewers.",
+        snapshot.origin.bytes_served,
+    );
+    counter(
+        &mut output,
+        "rushls_origin_requests_rejected_total",
+        "Origin requests rejected as invalid or unsatisfiable.",
+        snapshot.origin.requests_rejected,
+    );
+    counter(
+        &mut output,
+        "rushls_origin_requests_not_found_total",
+        "Origin requests for streams or resources that were not found.",
+        snapshot.origin.requests_not_found,
+    );
+    counter(
+        &mut output,
+        "rushls_hls_playlists_served_total",
+        "HLS playlist responses served to viewers.",
+        snapshot.hls.playlists_served,
+    );
+    counter(
+        &mut output,
+        "rushls_hls_playlists_rendered_total",
+        "HLS playlists projected instead of reused from the render cache.",
+        snapshot.hls.playlists_rendered,
+    );
+    counter(
+        &mut output,
+        "rushls_hls_blocking_reloads_total",
+        "HLS blocking playlist reloads started.",
+        snapshot.hls.blocking_reloads,
+    );
+    counter(
+        &mut output,
+        "rushls_hls_blocking_reloads_expired_total",
+        "HLS blocking playlist reloads that expired before media arrived.",
+        snapshot.hls.blocking_reloads_expired,
     );
     gauge(
         &mut output,
@@ -644,6 +704,8 @@ mod tests {
 
         let detailed = MetricsReader::new(
             meters.clone(),
+            OriginMeters::default(),
+            HlsMeters::default(),
             sessions.clone(),
             store.clone(),
             ExportPolicy { per_stream: true },
@@ -658,7 +720,15 @@ mod tests {
         drop(registration);
         drop(lease);
 
-        let terse = MetricsReader::new(meters, sessions, store, ExportPolicy::default()).snapshot();
+        let terse = MetricsReader::new(
+            meters,
+            OriginMeters::default(),
+            HlsMeters::default(),
+            sessions,
+            store,
+            ExportPolicy::default(),
+        )
+        .snapshot();
         assert_eq!(terse.active_sessions, 0);
         assert_eq!(
             (terse.published_streams, terse.idle_streams),
@@ -674,6 +744,8 @@ mod tests {
     fn endpoint_authentication_is_optional_and_exact() {
         let reader = MetricsReader::new(
             ProcessMeters::default(),
+            OriginMeters::default(),
+            HlsMeters::default(),
             Registry::default(),
             StreamStore::default(),
             ExportPolicy::default(),
@@ -696,6 +768,8 @@ mod tests {
                 bytes_received: 1_024,
                 ..ProcessSnapshot::default()
             },
+            origin: OriginSnapshot::default(),
+            hls: HlsSnapshot::default(),
             active_sessions: 2,
             published_streams: 1,
             idle_streams: 4,
@@ -716,9 +790,46 @@ mod tests {
     }
 
     #[test]
+    fn every_delivery_meter_is_exported() {
+        let origin = OriginMeters::default();
+        origin.media_served(2_048);
+        origin.request_rejected();
+        origin.request_not_found();
+        let hls = HlsMeters::default();
+        hls.playlist_served(true);
+        hls.playlist_served(false);
+        hls.blocking_reload_started();
+        hls.blocking_reload_expired();
+
+        let output = MetricsEndpoint::new(
+            MetricsReader::new(
+                ProcessMeters::default(),
+                origin,
+                hls,
+                Registry::default(),
+                StreamStore::default(),
+                ExportPolicy::default(),
+            ),
+            None,
+        )
+        .render();
+
+        assert!(output.contains("rushls_media_responses_served_total 1\n"));
+        assert!(output.contains("rushls_bytes_served_total 2048\n"));
+        assert!(output.contains("rushls_origin_requests_rejected_total 1\n"));
+        assert!(output.contains("rushls_origin_requests_not_found_total 1\n"));
+        assert!(output.contains("rushls_hls_playlists_served_total 2\n"));
+        assert!(output.contains("rushls_hls_playlists_rendered_total 1\n"));
+        assert!(output.contains("rushls_hls_blocking_reloads_total 1\n"));
+        assert!(output.contains("rushls_hls_blocking_reloads_expired_total 1\n"));
+    }
+
+    #[test]
     fn every_way_a_hook_can_lose_an_event_is_exported_separately() {
         let output = render(&MetricsSnapshot {
             process: ProcessSnapshot::default(),
+            origin: OriginSnapshot::default(),
+            hls: HlsSnapshot::default(),
             active_sessions: 0,
             published_streams: 0,
             idle_streams: 0,
