@@ -23,9 +23,12 @@ use crate::{
     mux::{CmafMuxerConfig, PassThroughMuxerFactory},
     observe::{Events, NodeEvent, ProcessMeters, Protocol, StreamEvent},
     session::{PendingPublishers, Registry, Services, SessionConfig, StopReason, run_session},
-    source::transport::{
-        rtmp::{RtmpConfig, RtmpPendingPublish},
-        srt::{SrtConfig, SrtListener},
+    source::{
+        PendingPublish, TransportError,
+        transport::{
+            rtmp::{RtmpConfig, RtmpPendingPublish},
+            srt::{SrtConfig, SrtListener, SrtPendingPublish},
+        },
     },
 };
 
@@ -366,15 +369,17 @@ impl Node {
         let mut tasks = JoinSet::new();
         // One budget each: a transport being flooded with connections that
         // never authenticate should not stop the other from admitting anyone.
-        tasks.spawn(run_rtmp(
-            rtmp_listener,
-            self.config.rtmp,
+        tasks.spawn(run_ingest(
+            RtmpListener {
+                tcp: rtmp_listener,
+                config: self.config.rtmp,
+            },
             self.services.clone(),
             self.config.session,
             PendingPublishers::new(self.config.maximum_pending_publishers_per_listener),
             stop_rx.clone(),
         ));
-        tasks.spawn(run_srt(
+        tasks.spawn(run_ingest(
             srt_listener,
             self.services.clone(),
             self.config.session,
@@ -462,94 +467,95 @@ impl Node {
     }
 }
 
-async fn run_srt(
-    mut listener: SrtListener,
-    services: Services,
-    session_config: SessionConfig,
-    pending_publishers: PendingPublishers,
-    mut stop: watch::Receiver<bool>,
-) -> Result<(), RuntimeError> {
-    let mut connections = JoinSet::new();
-    loop {
-        // Reserved before accepting, for the reason given in `run_rtmp`. SRT's
-        // own listener backlog bounds what waits ahead of `accept`; nothing
-        // bounded what came after it.
-        let slot = tokio::select! {
-            biased;
-
-            changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() {
-                    break;
-                }
-                continue;
-            }
-
-            completed = connections.join_next(), if !connections.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    services.events.emit(NodeEvent::ConnectionTaskPanicked {
-                        protocol: Protocol::Srt,
-                        reason: error.to_string(),
-                    });
-                }
-                continue;
-            }
-
-            slot = pending_publishers.reserve() => slot,
-        };
-
-        tokio::select! {
-            biased;
-
-            changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() {
-                    break;
-                }
-            }
-
-            accepted = listener.accept() => {
-                let Some(accepted) = accepted else {
-                    return Err(RuntimeError::SrtStopped);
-                };
-                let pending = match accepted {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        services.events.emit(NodeEvent::PublisherHandshakeFailed {
-                            protocol: Protocol::Srt,
-                            reason: error.to_string(),
-                        });
-                        continue;
-                    }
-                };
-                let services = services.clone();
-                connections.spawn(async move {
-                    if let Err(error) =
-                        run_session(Box::new(pending), &services, &session_config, slot).await
-                    {
-                        services.events.emit(NodeEvent::PublisherSessionFailed {
-                            protocol: Protocol::Srt,
-                            reason: error.to_string(),
-                        });
-                    }
-                });
-            }
-        }
-    }
-
-    drop(listener);
-    while let Some(completed) = connections.join_next().await {
-        if let Err(error) = completed {
-            services.events.emit(NodeEvent::ConnectionTaskPanicked {
-                protocol: Protocol::Srt,
-                reason: error.to_string(),
-            });
-        }
-    }
-    Ok(())
+/// What one `accept` produced.
+///
+/// Three outcomes rather than a `Result`, because "this peer went away" and
+/// "this listener is finished" are not the same event and only one of them
+/// stops the node.
+enum Accepted<C> {
+    Connection(C),
+    /// The peer never got as far as being a publisher. Reported and forgotten;
+    /// how often it happens is up to whoever is connecting.
+    Refused(String),
+    /// The listener itself can no longer accept, which fails the process.
+    Stopped(RuntimeError),
 }
 
-async fn run_rtmp(
-    listener: TcpListener,
+/// One ingest transport, reduced to what the accept loop needs to know.
+///
+/// The loop below is the same for every protocol — reserve, accept, spawn,
+/// drain — and the two implementations differ only in where the handshake
+/// happens. SRT completes its own inside `accept`; RTMP hands back a bare
+/// socket and negotiates on the connection's task, so a peer that stalls
+/// mid-handshake cannot hold up the next one. That distinction is the reason
+/// [`Self::handshake`] exists as a separate step rather than being folded into
+/// accepting.
+trait IngestListener: Send + 'static {
+    /// What `accept` yields: everything the connection's own task will need,
+    /// since it cannot borrow the listener.
+    type Connection: Send + 'static;
+
+    const PROTOCOL: Protocol;
+
+    fn accept(&mut self) -> impl Future<Output = Accepted<Self::Connection>> + Send;
+
+    /// Negotiates on the connection's own task.
+    fn handshake(
+        connection: Self::Connection,
+    ) -> impl Future<Output = Result<Box<dyn PendingPublish>, TransportError>> + Send;
+}
+
+impl IngestListener for SrtListener {
+    type Connection = SrtPendingPublish;
+
+    const PROTOCOL: Protocol = Protocol::Srt;
+
+    async fn accept(&mut self) -> Accepted<Self::Connection> {
+        match SrtListener::accept(self).await {
+            Some(Ok(pending)) => Accepted::Connection(pending),
+            Some(Err(error)) => Accepted::Refused(error.to_string()),
+            None => Accepted::Stopped(RuntimeError::SrtStopped),
+        }
+    }
+
+    /// Already negotiated: libSRT completes its handshake inside `accept`.
+    async fn handshake(
+        connection: Self::Connection,
+    ) -> Result<Box<dyn PendingPublish>, TransportError> {
+        Ok(Box::new(connection))
+    }
+}
+
+/// A bound TCP listener and the RTMP settings its handshakes negotiate under.
+struct RtmpListener {
+    tcp: TcpListener,
     config: RtmpConfig,
+}
+
+impl IngestListener for RtmpListener {
+    type Connection = (tokio::net::TcpStream, RtmpConfig);
+
+    const PROTOCOL: Protocol = Protocol::Rtmp;
+
+    async fn accept(&mut self) -> Accepted<Self::Connection> {
+        match self.tcp.accept().await {
+            Ok((stream, _)) => Accepted::Connection((stream, self.config)),
+            Err(error) => Accepted::Stopped(RuntimeError::Rtmp(error)),
+        }
+    }
+
+    async fn handshake(
+        (stream, config): Self::Connection,
+    ) -> Result<Box<dyn PendingPublish>, TransportError> {
+        RtmpPendingPublish::handshake_tcp(stream, config)
+            .await
+            .map(|pending| Box::new(pending) as Box<dyn PendingPublish>)
+    }
+}
+
+/// Accepts publishers until `stop`, then lets what is in flight finish.
+async fn run_ingest<L: IngestListener>(
+    mut listener: L,
     services: Services,
     session_config: SessionConfig,
     pending_publishers: PendingPublishers,
@@ -558,10 +564,10 @@ async fn run_rtmp(
     let mut connections = JoinSet::new();
     loop {
         // Capacity is reserved *before* accepting, so a surplus of connections
-        // waits in the kernel's backlog instead of becoming tasks that nothing
-        // has authenticated. Accepting and then closing would give an attacker
-        // cheap connection churn and give a well-behaved encoder nothing to
-        // retry against.
+        // waits in the listener's backlog instead of becoming tasks that
+        // nothing has authenticated. Accepting and then closing would give an
+        // attacker cheap connection churn and give a well-behaved encoder
+        // nothing to retry against.
         let slot = tokio::select! {
             biased;
 
@@ -573,12 +579,7 @@ async fn run_rtmp(
             }
 
             completed = connections.join_next(), if !connections.is_empty() => {
-                if let Some(Err(error)) = completed {
-                    services.events.emit(NodeEvent::ConnectionTaskPanicked {
-                        protocol: Protocol::Rtmp,
-                        reason: error.to_string(),
-                    });
-                }
+                report_panic::<L>(&services, completed);
                 continue;
             }
 
@@ -595,24 +596,34 @@ async fn run_rtmp(
             }
 
             accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(RuntimeError::Rtmp)?;
+                let connection = match accepted {
+                    Accepted::Connection(connection) => connection,
+                    Accepted::Refused(reason) => {
+                        services.events.emit(NodeEvent::PublisherHandshakeFailed {
+                            protocol: L::PROTOCOL,
+                            reason,
+                        });
+                        continue;
+                    }
+                    Accepted::Stopped(error) => return Err(error),
+                };
                 let services = services.clone();
                 connections.spawn(async move {
-                    let pending = match RtmpPendingPublish::handshake_tcp(stream, config).await {
+                    let pending = match L::handshake(connection).await {
                         Ok(pending) => pending,
                         Err(error) => {
                             services.events.emit(NodeEvent::PublisherHandshakeFailed {
-                            protocol: Protocol::Rtmp,
-                            reason: error.to_string(),
-                        });
+                                protocol: L::PROTOCOL,
+                                reason: error.to_string(),
+                            });
                             return;
                         }
                     };
                     if let Err(error) =
-                        run_session(Box::new(pending), &services, &session_config, slot).await
+                        run_session(pending, &services, &session_config, slot).await
                     {
                         services.events.emit(NodeEvent::PublisherSessionFailed {
-                            protocol: Protocol::Rtmp,
+                            protocol: L::PROTOCOL,
                             reason: error.to_string(),
                         });
                     }
@@ -621,15 +632,25 @@ async fn run_rtmp(
         }
     }
 
+    // Stops accepting before the drain rather than after it, so an encoder
+    // reconnecting into a node that is going away is refused immediately
+    // instead of being accepted onto a listener about to disappear.
+    drop(listener);
     while let Some(completed) = connections.join_next().await {
-        if let Err(error) = completed {
-            services.events.emit(NodeEvent::ConnectionTaskPanicked {
-                protocol: Protocol::Rtmp,
-                reason: error.to_string(),
-            });
-        }
+        report_panic::<L>(&services, Some(completed));
     }
     Ok(())
+}
+
+/// A connection task that panicked is always a defect: a session reports its
+/// own failures, so reaching this means one never got the chance.
+fn report_panic<L: IngestListener>(services: &Services, completed: Option<Result<(), JoinError>>) {
+    if let Some(Err(error)) = completed {
+        services.events.emit(NodeEvent::ConnectionTaskPanicked {
+            protocol: L::PROTOCOL,
+            reason: error.to_string(),
+        });
+    }
 }
 
 async fn run_http<L>(
