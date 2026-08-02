@@ -13,6 +13,7 @@
 //! |-----------------------------------|--------------------|
 //! | Blocking playlist reload          | 6 target durations |
 //! | Plain playlist request            | ½ target duration  |
+//! | Initialization, segment, or part   | 6 target durations |
 //! | Absent, named by a directive      | 4 target durations |
 //! | Absent otherwise                  | 1 target duration  |
 //!
@@ -28,7 +29,7 @@ use crate::delivery::{
     store::{DurationRule, TargetDurationMultiple},
 };
 
-/// Response-lifetime policy for HLS manifests and absent resources.
+/// Response-lifetime policy for HLS manifests, media, and absent resources.
 ///
 /// Consolidated so the relationships between the lifetimes stay visible: a
 /// deployment lengthening its blocking-reload lifetime past what its clients
@@ -44,6 +45,16 @@ pub struct CacheControlPolicy {
     pub blocking_playlist: DurationRule,
     /// A playlist answering a request for the live edge.
     pub playlist: DurationRule,
+    /// Media named by a durable identity.
+    ///
+    /// Deliberately *not* infinite, though the bytes behind one of these URIs
+    /// never change while the stream that produced them lives. A stream retired
+    /// for idleness and then republished under the same name starts issuing
+    /// segment and part identities from zero again, so a year-long lifetime
+    /// would let a cache answer the new stream with the old stream's media. Six
+    /// target durations is both what the specification recommends and shorter
+    /// than any retirement worth configuring.
+    pub media: DurationRule,
     /// A resource that does not exist, named by a request carrying a directive.
     pub blocking_missing: DurationRule,
     /// A resource that does not exist, or no longer does.
@@ -58,6 +69,7 @@ impl Default for CacheControlPolicy {
         Self {
             blocking_playlist: TargetDurationMultiple::new(6, nz::u32!(1)).into(),
             playlist: TargetDurationMultiple::new(1, nz::u32!(2)).into(),
+            media: TargetDurationMultiple::new(6, nz::u32!(1)).into(),
             blocking_missing: TargetDurationMultiple::new(4, nz::u32!(1)).into(),
             missing: TargetDurationMultiple::new(1, nz::u32!(1)).into(),
             // The specification's recommended target duration, and the closest
@@ -77,6 +89,12 @@ impl CacheControlPolicy {
             self.playlist
         };
         Reuse::reusable(rule.resolve(self.target(target)))
+    }
+
+    /// How long immutable media may be reused before a stream identity could
+    /// have been retired and issued again by a later publication.
+    pub fn media(&self, target: Option<Duration>) -> Reuse {
+        Reuse::immutable(self.media.resolve(self.target(target)))
     }
 
     /// How long the absence of a resource may be remembered.
@@ -112,6 +130,7 @@ mod tests {
             policy.playlist(TARGET, false).max_age,
             Duration::from_secs(3)
         );
+        assert_eq!(policy.media(TARGET).max_age, Duration::from_secs(36));
         assert_eq!(
             policy.missing(TARGET, true).max_age,
             Duration::from_secs(24)
@@ -121,6 +140,7 @@ mod tests {
             Duration::from_secs(6)
         );
         assert!(!policy.playlist(TARGET, true).immutable);
+        assert!(policy.media(TARGET).immutable);
     }
 
     #[test]
@@ -143,5 +163,18 @@ mod tests {
 
         assert_eq!(caching.max_age.as_secs(), 0);
         assert_eq!(Reuse::revalidate().max_age.as_secs(), 0);
+    }
+
+    #[test]
+    fn a_flat_media_lifetime_ignores_the_target_it_would_have_scaled() {
+        let policy = CacheControlPolicy {
+            media: Duration::from_secs(31_536_000).into(),
+            ..CacheControlPolicy::default()
+        };
+
+        assert_eq!(
+            policy.media(TARGET).max_age,
+            Duration::from_secs(31_536_000)
+        );
     }
 }

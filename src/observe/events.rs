@@ -133,6 +133,11 @@ pub enum NodeEvent {
     },
     /// Events still queued when the drain deadline passed.
     HookEventsAbandoned { hook: Arc<str>, dropped: usize },
+    /// Delivery was active when shutdown's drain deadline passed.
+    ///
+    /// Unlike a queued event, this may have reached the endpoint before the
+    /// request was cancelled, so its outcome is unknown rather than dropped.
+    HookDeliveryOutcomesUnknown { hook: Arc<str>, count: usize },
     /// An event could not be turned into bytes at all.
     ///
     /// A fault in this process rather than in delivery, so it names no hook:

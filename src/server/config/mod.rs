@@ -956,7 +956,6 @@ impl HttpAppConfig {
         let config = HttpConfig {
             cors: self.cors.resolve()?,
             tls: self.tls.as_ref().map(TlsAppConfig::resolve).transpose()?,
-            ..HttpConfig::default()
         };
         config.validate().map_err(invalid)?;
         Ok(config)

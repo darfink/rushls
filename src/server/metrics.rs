@@ -294,6 +294,11 @@ fn render_hooks(output: &mut String, hooks: &[(Arc<str>, HookSnapshot)]) {
             |snapshot| snapshot.filtered,
         ),
         (
+            "rushls_hook_dropped_ingress_total",
+            "New events dropped because the nonblocking dispatcher ingress was unavailable.",
+            |snapshot| snapshot.ingress,
+        ),
+        (
             "rushls_hook_dropped_overflow_total",
             "Events dropped because the hook's queue was full.",
             |snapshot| snapshot.overflow,
@@ -310,11 +315,55 @@ fn render_hooks(output: &mut String, hooks: &[(Arc<str>, HookSnapshot)]) {
         ),
         (
             "rushls_hook_dropped_shutdown_total",
-            "Events still queued when the drain deadline passed.",
+            "Queued events never attempted before the shutdown drain deadline.",
             |snapshot| snapshot.shutdown,
+        ),
+        (
+            "rushls_hook_outcome_unknown_shutdown_total",
+            "Unresolved deliveries whose outcome became unknown at shutdown.",
+            |snapshot| snapshot.outcome_unknown_shutdown,
         ),
     ] {
         metadata(output, name, help, "counter");
+        for (hook, snapshot) in hooks {
+            writeln!(
+                output,
+                "{name}{{hook=\"{}\"}} {}",
+                escape_label(hook),
+                read(snapshot)
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+
+    for (name, help, read) in [
+        (
+            "rushls_hook_ingress_depth",
+            "Rendered lifecycle events waiting to enter a hook's ordering queue.",
+            (|snapshot: &HookSnapshot| snapshot.ingress_depth) as fn(&HookSnapshot) -> usize,
+        ),
+        (
+            "rushls_hook_ingress_capacity",
+            "Maximum rendered lifecycle events held by a hook's nonblocking ingress.",
+            |snapshot| snapshot.ingress_capacity,
+        ),
+        (
+            "rushls_hook_queue_depth",
+            "Lifecycle events waiting in a hook's per-stream ordering queue.",
+            |snapshot| snapshot.queue_depth,
+        ),
+        (
+            "rushls_hook_queue_capacity",
+            "Maximum lifecycle events held by a hook's per-stream ordering queue.",
+            |snapshot| snapshot.queue_capacity,
+        ),
+        (
+            "rushls_hook_in_flight",
+            "Per-stream hook deliveries currently active, including retry backoff.",
+            |snapshot| snapshot.in_flight,
+        ),
+    ] {
+        metadata(output, name, help, "gauge");
         for (hook, snapshot) in hooks {
             writeln!(
                 output,
@@ -680,11 +729,18 @@ mod tests {
                     HookSnapshot {
                         delivered: 41,
                         retried: 2,
+                        ingress: 8,
                         overflow: 3,
                         rejected: 4,
                         exhausted: 5,
                         shutdown: 6,
+                        outcome_unknown_shutdown: 9,
                         filtered: 7,
+                        ingress_depth: 10,
+                        ingress_capacity: 11,
+                        queue_depth: 12,
+                        queue_capacity: 13,
+                        in_flight: 14,
                     },
                 ),
                 (Arc::from("audit"), HookSnapshot::default()),
@@ -700,8 +756,17 @@ mod tests {
         assert!(output.contains("rushls_hook_dropped_rejected_total{hook=\"automation\"} 4\n"));
         assert!(output.contains("rushls_hook_dropped_exhausted_total{hook=\"automation\"} 5\n"));
         assert!(output.contains("rushls_hook_dropped_shutdown_total{hook=\"automation\"} 6\n"));
+        assert!(output.contains("rushls_hook_dropped_ingress_total{hook=\"automation\"} 8\n"));
+        assert!(
+            output.contains("rushls_hook_outcome_unknown_shutdown_total{hook=\"automation\"} 9\n")
+        );
         assert!(output.contains("rushls_hook_retries_total{hook=\"automation\"} 2\n"));
         assert!(output.contains("rushls_hook_filtered_total{hook=\"automation\"} 7\n"));
+        assert!(output.contains("rushls_hook_ingress_depth{hook=\"automation\"} 10\n"));
+        assert!(output.contains("rushls_hook_ingress_capacity{hook=\"automation\"} 11\n"));
+        assert!(output.contains("rushls_hook_queue_depth{hook=\"automation\"} 12\n"));
+        assert!(output.contains("rushls_hook_queue_capacity{hook=\"automation\"} 13\n"));
+        assert!(output.contains("rushls_hook_in_flight{hook=\"automation\"} 14\n"));
 
         assert_eq!(
             output

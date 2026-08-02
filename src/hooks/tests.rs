@@ -1,5 +1,7 @@
 use std::{
     collections::BTreeSet,
+    error::Error,
+    future::pending,
     net::SocketAddr,
     sync::{
         Arc,
@@ -59,9 +61,30 @@ async fn receive(State(recorder): State<Recorder>, body: Bytes) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+async fn receive_without_answer(State(recorder): State<Recorder>, body: Bytes) -> StatusCode {
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("a hook body is always JSON");
+    recorder.received.lock().push(body);
+    pending().await
+}
+
 async fn start(recorder: Recorder) -> SocketAddr {
     let router = Router::new()
         .route("/events", post(receive))
+        .with_state(recorder);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("an ephemeral port is available");
+    let address = listener.local_addr().expect("the listener is bound");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    address
+}
+
+async fn start_hanging(recorder: Recorder) -> SocketAddr {
+    let router = Router::new()
+        .route("/events", post(receive_without_answer))
         .with_state(recorder);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -216,6 +239,78 @@ async fn a_retry_repeats_the_same_event_id() {
         "a redelivery is the same occurrence, so a consumer can deduplicate it"
     );
     assert_eq!(bodies[0]["time"], bodies[1]["time"]);
+}
+
+#[test]
+fn producer_ingress_is_bounded_and_never_waits_for_the_dispatcher() -> Result<(), Box<dyn Error>> {
+    let mut config = hook("127.0.0.1:1".parse()?, &[lifecycle::Kind::SessionStarted]);
+    config.queue_capacity = 1;
+    let client = HttpClient::new(ClientConfig::default())?;
+    let (hooks, _dispatchers) = build(
+        HooksConfig {
+            hooks: vec![config],
+            ..HooksConfig::default()
+        },
+        client,
+        Events::default(),
+    );
+
+    hooks.deliver(&started("live/first", 1));
+    hooks.deliver(&started("live/second", 2));
+
+    let snapshot = hooks.snapshots()[0].1;
+    assert_eq!(snapshot.ingress_depth, 1);
+    assert_eq!(snapshot.ingress, 1);
+    assert_eq!(snapshot.queue_depth, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_distinguishes_never_sent_from_unknown_outcomes() -> Result<(), Box<dyn Error>> {
+    let recorder = Recorder::default();
+    let address = start_hanging(recorder.clone()).await;
+    let mut config = hook(address, &[lifecycle::Kind::SessionStarted]);
+    config.maximum_in_flight = 1;
+    config.maximum_attempts = 1;
+    let reported = NodeLog::default();
+    let client = HttpClient::new(ClientConfig {
+        request_timeout: Duration::from_secs(5),
+        ..ClientConfig::default()
+    })?;
+    let (hooks, dispatchers) = build(
+        HooksConfig {
+            hooks: vec![config],
+            drain_timeout: Duration::from_millis(20),
+            ..HooksConfig::default()
+        },
+        client,
+        Events::new(Arc::new(reported.clone())),
+    );
+    let (stop, stopped) = watch::channel(false);
+    let running = tokio::spawn(dispatchers.run(stopped));
+
+    hooks.deliver(&started("live/camera", 1));
+    hooks.deliver(&started("live/camera", 2));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while recorder.bodies().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(recorder.bodies().len(), 1, "one request is in flight");
+
+    stop.send(true)?;
+    tokio::time::timeout(Duration::from_secs(2), running).await??;
+
+    let snapshot = hooks.snapshots()[0].1;
+    assert_eq!(snapshot.shutdown, 1, "the second event was never sent");
+    assert_eq!(
+        snapshot.outcome_unknown_shutdown, 1,
+        "the first request may have reached the endpoint"
+    );
+    assert!(reported.node.lock().iter().any(|event| matches!(
+        event,
+        NodeEvent::HookDeliveryOutcomesUnknown { count: 1, .. }
+    )));
+    Ok(())
 }
 
 #[tokio::test]
@@ -467,6 +562,7 @@ fn a_projected_session_reaches_the_hooks_it_subscribed_to() {
 #[test]
 fn losses_are_counted_apart_because_they_mean_different_things() {
     let names: BTreeSet<String> = [
+        Loss::Ingress,
         Loss::Overflow,
         Loss::Rejected,
         Loss::Exhausted,
@@ -476,5 +572,5 @@ fn losses_are_counted_apart_because_they_mean_different_things() {
     .map(ToString::to_string)
     .collect();
 
-    assert_eq!(names.len(), 4);
+    assert_eq!(names.len(), 5);
 }

@@ -234,13 +234,9 @@ impl StreamStore {
     /// and has no process-shutdown token. Writes still sweep before capacity
     /// checks so expired bytes cannot cause a false rejection.
     ///
-    /// Reports what changed about which streams a viewer can reach.
-    ///
-    /// Transitions are returned rather than announced. The store stays
-    /// ignorant of the vocabulary this node promises anyone outside it, and
-    /// whoever runs maintenance decides what to do with the facts — which also
-    /// means both edges of a stream's life are computed in one place, by one
-    /// rule, and cannot drift apart.
+    /// Reports streams whose reconnect window closed. Availability is claimed
+    /// on the successful media commit instead: polling it here could observe a
+    /// short publication only after its session had already ended.
     pub fn maintain(&self) -> Maintenance {
         let _mutation = self.mutations.lock();
         let current = self.streams.load_full();
@@ -249,9 +245,6 @@ impl StreamStore {
 
         for (stream, live) in current.iter() {
             live.sweep_expired();
-            if live.claim_availability() {
-                changed.became_available.push(stream.clone());
-            }
             if live.retire_if_idle_for(self.limits.idle_retention) {
                 // Only a stream viewers could reach becomes unreachable. One
                 // that never served anything was never available to lose.
@@ -271,13 +264,8 @@ impl StreamStore {
 }
 
 /// What one maintenance pass changed about stream reachability.
-///
-/// Both edges of a stream's life, so a caller announcing them cannot report one
-/// and forget the other.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Maintenance {
-    /// Streams a viewer can resolve for the first time.
-    pub became_available: Vec<StreamId>,
     /// Streams whose reconnect window closed, and which were reachable before.
     pub retired: Vec<StreamId>,
 }

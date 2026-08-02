@@ -1257,15 +1257,18 @@ async fn a_reconnect_does_not_announce_a_stream_viewers_never_lost() {
         .write_encoded(chunk(0, 0, 0, 0, 1, 16), None)
         .expect("the first part is stored");
 
-    assert_eq!(
-        store.maintain().became_available,
-        vec![stream()],
-        "the store decides what is playable, and says so once"
+    assert!(
+        first.live().claim_availability(),
+        "the first playable commit can claim the transition"
+    );
+    assert!(
+        !first.live().claim_availability(),
+        "a latched announcement is not repeated on later media"
     );
     assert_eq!(
         store.maintain(),
         Maintenance::default(),
-        "a latched announcement is not repeated on every tick"
+        "maintenance is responsible only for time-based retirement"
     );
 
     // The publisher goes away and comes back inside the reconnect window.

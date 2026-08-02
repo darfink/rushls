@@ -7,9 +7,10 @@
 //! Events for one stream arrive in the order they occurred, though a prefix may
 //! be missing; nothing is promised across streams.
 //!
-//! Events are lost by queue overflow, permanent rejection, exhausted retries,
-//! or the drain deadline at shutdown, each counted separately because they mean
-//! different things. Nothing survives a crash.
+//! Events are lost by exceptional ingress saturation, queue overflow, permanent
+//! rejection, exhausted retries, or the drain deadline at shutdown, each
+//! counted separately because they mean different things. Nothing survives a
+//! crash.
 //!
 //! **Hooks are not a substitute for reading state.** Anything correctness-
 //! critical has to reconcile. If that ever stops being acceptable the answer is
@@ -17,8 +18,8 @@
 //!
 //! # Why it cannot stall a publication
 //!
-//! [`Hooks::deliver`] only locks a queue, pushes, and returns — no awaiting, no
-//! network. It is called from
+//! [`Hooks::deliver`] renders once, performs only bounded `try_send` operations,
+//! and returns — no waiting, no queue scans, no network. It is called from
 //! [`EventObserver::observe`](crate::observe::EventObserver), which runs inline
 //! on the session's own task, so anything slower would pause segmentation or
 //! draining for whatever a remote endpoint felt like taking.
@@ -34,13 +35,12 @@ use std::{
     collections::BTreeSet,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
 use crate::{
     domain::{SessionId, StreamId},
@@ -64,6 +64,9 @@ pub struct HookConfig {
     /// Only these are delivered. Explicit rather than defaulting to everything,
     /// so a consumer written today cannot be sent an event type added later.
     pub events: BTreeSet<Kind>,
+    /// Capacity of both bounded stages. Ingress is normally empty; the
+    /// dispatcher-owned stage is the durable in-memory backlog that applies
+    /// drop-oldest while an endpoint is unhealthy.
     pub queue_capacity: usize,
     /// Distinct streams that may be in flight at once. One request per stream
     /// is the ordering rule, so this is also the concurrency.
@@ -103,6 +106,10 @@ impl Default for HooksConfig {
 /// Why an event never reached its endpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
 pub enum Loss {
+    /// The dispatcher ingress channel was unavailable, so the new event could
+    /// not reach the queue that implements the normal drop-oldest policy.
+    #[display("ingress")]
+    Ingress,
     /// The queue was full, so the oldest waiting event made room.
     #[display("overflow")]
     Overflow,
@@ -117,23 +124,29 @@ pub enum Loss {
     Shutdown,
 }
 
-/// Delivery counters for one hook.
+/// Delivery counters and current saturation for one hook.
 #[derive(Debug, Default)]
 pub struct HookMeters {
     delivered: AtomicU64,
     retried: AtomicU64,
+    ingress: AtomicU64,
     overflow: AtomicU64,
     rejected: AtomicU64,
     exhausted: AtomicU64,
     shutdown: AtomicU64,
+    outcome_unknown_shutdown: AtomicU64,
     /// Events for a kind this hook did not subscribe to are not losses.
     filtered: AtomicU64,
+    ingress_depth: AtomicUsize,
+    queue_depth: AtomicUsize,
+    in_flight: AtomicUsize,
 }
 
 impl Loss {
     /// Stable enough to appear in a log or a metric label.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Ingress => "ingress",
             Self::Overflow => "overflow",
             Self::Rejected => "rejected",
             Self::Exhausted => "exhausted",
@@ -145,6 +158,7 @@ impl Loss {
 impl HookMeters {
     fn record_loss(&self, loss: Loss) {
         match loss {
+            Loss::Ingress => &self.ingress,
             Loss::Overflow => &self.overflow,
             Loss::Rejected => &self.rejected,
             Loss::Exhausted => &self.exhausted,
@@ -157,11 +171,18 @@ impl HookMeters {
         HookSnapshot {
             delivered: self.delivered.load(Ordering::Relaxed),
             retried: self.retried.load(Ordering::Relaxed),
+            ingress: self.ingress.load(Ordering::Relaxed),
             overflow: self.overflow.load(Ordering::Relaxed),
             rejected: self.rejected.load(Ordering::Relaxed),
             exhausted: self.exhausted.load(Ordering::Relaxed),
             shutdown: self.shutdown.load(Ordering::Relaxed),
+            outcome_unknown_shutdown: self.outcome_unknown_shutdown.load(Ordering::Relaxed),
             filtered: self.filtered.load(Ordering::Relaxed),
+            ingress_depth: self.ingress_depth.load(Ordering::Relaxed),
+            ingress_capacity: 0,
+            queue_depth: self.queue_depth.load(Ordering::Relaxed),
+            queue_capacity: 0,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
         }
     }
 }
@@ -170,21 +191,33 @@ impl HookMeters {
 pub struct HookSnapshot {
     pub delivered: u64,
     pub retried: u64,
+    pub ingress: u64,
     pub overflow: u64,
     pub rejected: u64,
     pub exhausted: u64,
     pub shutdown: u64,
+    pub outcome_unknown_shutdown: u64,
     pub filtered: u64,
+    pub ingress_depth: usize,
+    pub ingress_capacity: usize,
+    pub queue_depth: usize,
+    pub queue_capacity: usize,
+    pub in_flight: usize,
 }
 
 /// One hook's queue, settings, and counters, shared with its dispatcher.
 #[derive(Debug)]
 struct Shared {
     config: HookConfig,
-    queue: Mutex<Queue>,
-    /// Wakes the dispatcher when work arrives.
-    arrived: Notify,
+    /// The producer only performs a bounded `try_send`; ordering and eviction
+    /// are owned exclusively by the dispatcher on the receiving side.
+    ingress: mpsc::Sender<Envelope>,
     meters: HookMeters,
+}
+
+struct Dispatcher {
+    shared: Arc<Shared>,
+    ingress: mpsc::Receiver<Envelope>,
 }
 
 /// Feeds hooks from the session events a node already emits.
@@ -256,9 +289,10 @@ pub struct Hooks {
 impl Hooks {
     /// Renders an event once and offers it to every subscribed hook.
     ///
-    /// Never blocks and never fails: a hook that cannot keep up drops its own
-    /// oldest event and counts it. Rendering happens once even with several
-    /// hooks, because the envelope is immutable and shared.
+    /// Never blocks and never fails: rendering happens once even with several
+    /// hooks, then each subscribed dispatcher receives the immutable envelope
+    /// through a bounded `try_send`. Its ordering queue drops the oldest event
+    /// when the endpoint cannot keep up.
     pub fn deliver(&self, event: &Event) {
         if self.hooks.is_empty() {
             return;
@@ -293,25 +327,33 @@ impl Hooks {
                 hook.meters.filtered.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            if hook.queue.lock().push(envelope.clone()) {
-                hook.meters.record_loss(Loss::Overflow);
+            // Incremented before publishing so a receiver cannot observe the
+            // item before the gauge does. A failed send rolls it back.
+            hook.meters.ingress_depth.fetch_add(1, Ordering::Relaxed);
+            if hook.ingress.try_send(envelope.clone()).is_err() {
+                hook.meters.ingress_depth.fetch_sub(1, Ordering::Relaxed);
+                hook.meters.record_loss(Loss::Ingress);
             }
-            hook.arrived.notify_one();
         }
     }
 
-    /// Counters for each configured hook, in configuration order.
+    /// Operational snapshot for each configured hook, in configuration order.
     pub fn snapshots(&self) -> Vec<(Arc<str>, HookSnapshot)> {
         self.hooks
             .iter()
-            .map(|hook| (Arc::clone(&hook.config.name), hook.meters.snapshot()))
+            .map(|hook| {
+                let mut snapshot = hook.meters.snapshot();
+                snapshot.ingress_capacity = hook.config.queue_capacity;
+                snapshot.queue_capacity = hook.config.queue_capacity;
+                (Arc::clone(&hook.config.name), snapshot)
+            })
             .collect()
     }
 }
 
 /// Everything needed to run the configured hooks.
 pub struct Dispatchers {
-    shared: Vec<Arc<Shared>>,
+    hooks: Vec<Dispatcher>,
     client: HttpClient,
     drain_timeout: Duration,
     events: Events,
@@ -322,17 +364,25 @@ pub struct Dispatchers {
 /// Split so the caller owns where the dispatchers run: they belong in the
 /// node's task set, alongside the listeners they outlive.
 pub fn build(config: HooksConfig, client: HttpClient, events: Events) -> (Hooks, Dispatchers) {
-    let shared: Vec<Arc<Shared>> = config
+    let dispatchers: Vec<Dispatcher> = config
         .hooks
         .into_iter()
         .map(|hook| {
-            Arc::new(Shared {
-                queue: Mutex::new(Queue::new(hook.queue_capacity)),
+            let (ingress, receiver) = mpsc::channel(hook.queue_capacity);
+            let shared = Arc::new(Shared {
+                ingress,
                 config: hook,
-                arrived: Notify::new(),
                 meters: HookMeters::default(),
-            })
+            });
+            Dispatcher {
+                shared,
+                ingress: receiver,
+            }
         })
+        .collect();
+    let shared: Vec<Arc<Shared>> = dispatchers
+        .iter()
+        .map(|dispatcher| Arc::clone(&dispatcher.shared))
         .collect();
 
     (
@@ -342,7 +392,7 @@ pub fn build(config: HooksConfig, client: HttpClient, events: Events) -> (Hooks,
             events: events.clone(),
         },
         Dispatchers {
-            shared,
+            hooks: dispatchers,
             client,
             drain_timeout: config.drain_timeout,
             events,

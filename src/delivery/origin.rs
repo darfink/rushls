@@ -60,15 +60,10 @@ pub struct Origin {
 
 impl Origin {
     pub fn new(store: StreamStore) -> Self {
-        Self::with_meters(store, OriginMeters::default())
-    }
-
-    pub fn with_meters(store: StreamStore, meters: OriginMeters) -> Self {
-        Self { store, meters }
-    }
-
-    pub fn store(&self) -> &StreamStore {
-        &self.store
+        Self {
+            store,
+            meters: OriginMeters::default(),
+        }
     }
 
     pub fn meters(&self) -> &OriginMeters {

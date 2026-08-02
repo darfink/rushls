@@ -149,6 +149,11 @@ impl LiveStream {
     ///
     /// Returns true exactly once per stream, for whoever should announce it.
     pub fn claim_availability(&self) -> bool {
+        // Media writes call this for the lifetime of the stream. Once the
+        // answer is known, avoid re-reading every rendition's live edge.
+        if self.announced.load(Ordering::Relaxed) {
+            return false;
+        }
         self.is_playable() && !self.announced.swap(true, Ordering::Relaxed)
     }
 

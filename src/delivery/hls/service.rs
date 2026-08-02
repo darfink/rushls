@@ -204,6 +204,11 @@ impl Service {
         blocking_reload_deadline(contract, self.config.timing)
     }
 
+    /// How long immutable media may be reused at this rendition's cadence.
+    pub fn media_reuse(&self, target: Option<Duration>) -> Reuse {
+        self.config.cache_control.media(target)
+    }
+
     /// How long an absent resource may be remembered by an HLS-facing cache.
     pub fn missing_reuse(&self, target: Option<Duration>, blocking: bool) -> Reuse {
         self.config.cache_control.missing(target, blocking)
@@ -1003,6 +1008,10 @@ mod cache_tests {
         let lease = lease(&store, vec![video(0)]);
         write(&lease, initialization(0, 1));
         write_segment(&lease, 0, 0, 0);
+        assert!(
+            lease.live().claim_availability(),
+            "the direct-store fixture stands in for the publisher's inline announcement"
+        );
         origin
             .serve(
                 &stream_id(),

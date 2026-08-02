@@ -53,6 +53,9 @@ impl EventObserver for StderrEvents {
             NodeEvent::HookEventsAbandoned { hook, dropped } => {
                 eprintln!("hook {hook}: abandoned {dropped} undelivered events at shutdown");
             }
+            NodeEvent::HookDeliveryOutcomesUnknown { hook, count } => {
+                eprintln!("hook {hook}: {count} deliveries had unknown outcomes at shutdown");
+            }
             NodeEvent::HookEventUnrenderable { reason } => {
                 eprintln!("a lifecycle event could not be rendered: {reason}");
             }

@@ -21,17 +21,13 @@ use crate::domain::SessionId;
 use crate::observe::{EventObserver, Events, NodeEvent, SessionEvent};
 use crate::server::runtime::ViewerApplication;
 
-use super::{MediaCachePolicy, tls::TlsSettings};
+use super::tls::TlsSettings;
 
 /// The production HLS/media composition used by HTTP integration tests.
 pub(crate) fn application(store: &StreamStore) -> Arc<ViewerApplication> {
     let origin = Arc::new(Origin::new(store.clone()));
     let hls = Arc::new(HlsService::new(Arc::clone(&origin), HlsConfig::default()));
-    Arc::new(ViewerApplication::new(
-        origin,
-        hls,
-        MediaCachePolicy::default(),
-    ))
+    Arc::new(ViewerApplication::new(origin, hls))
 }
 
 /// A self-signed pair written into `directory`, plus the certificate's DER.

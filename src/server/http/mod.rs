@@ -20,7 +20,6 @@
 //! does not happen on the accept path.
 
 mod body;
-mod cache;
 mod cors;
 mod tls;
 
@@ -50,7 +49,6 @@ use crate::{
     server::metrics::MetricsEndpoint,
 };
 
-pub use cache::MediaCachePolicy;
 pub use cors::{AllowedOrigins, CorsConfig, OriginPattern, OriginPatternError, WildcardDepth};
 
 use body::{RangeOutcome, StoredMediaBody, parse_range};
@@ -69,8 +67,6 @@ pub struct HttpConfig {
     pub cors: CorsConfig,
     /// Absent serves cleartext, which is the right answer behind a proxy.
     pub tls: Option<TlsSettings>,
-    /// Reuse policy for protocol-neutral initialization and media paths.
-    pub media_cache: MediaCachePolicy,
 }
 
 impl HttpConfig {

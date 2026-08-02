@@ -3,7 +3,10 @@
 use std::{sync::Arc, time::Duration};
 
 use http::StatusCode;
-use tokio::{sync::watch, task::JoinSet};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinSet,
+};
 
 use crate::{
     domain::StreamId,
@@ -11,7 +14,7 @@ use crate::{
     outbound::{HttpClient, OutboundError, Response},
 };
 
-use super::{CONTENT_TYPE, Dispatchers, Envelope, Loss, Shared};
+use super::{CONTENT_TYPE, Dispatcher, Dispatchers, Envelope, Loss, Queue, Shared};
 
 /// First wait between attempts, doubling from there.
 ///
@@ -24,9 +27,9 @@ impl Dispatchers {
     /// Runs every configured hook until `stop`, then drains what it can.
     pub async fn run(self, mut stop: watch::Receiver<bool>) {
         let mut hooks = JoinSet::new();
-        for shared in self.shared {
+        for dispatcher in self.hooks {
             hooks.spawn(run_hook(
-                shared,
+                dispatcher,
                 self.client.clone(),
                 self.drain_timeout,
                 self.events.clone(),
@@ -44,16 +47,22 @@ impl Dispatchers {
 }
 
 async fn run_hook(
-    shared: Arc<Shared>,
+    dispatcher: Dispatcher,
     client: HttpClient,
     drain_timeout: Duration,
     events: Events,
     mut stop: watch::Receiver<bool>,
 ) {
+    let Dispatcher {
+        shared,
+        mut ingress,
+    } = dispatcher;
+    let mut queue = Queue::new(shared.config.queue_capacity);
     let mut sending = JoinSet::new();
 
     loop {
-        start_available(&shared, &client, &events, &mut sending);
+        drain_ingress(&shared, &mut ingress, &mut queue);
+        start_available(&shared, &client, &events, &mut queue, &mut sending);
 
         tokio::select! {
             biased;
@@ -65,14 +74,47 @@ async fn run_hook(
             }
 
             Some(finished) = sending.join_next(), if !sending.is_empty() => {
-                release(&shared, finished.ok());
+                release(&shared, &mut queue, finished.ok());
             }
 
-            () = shared.arrived.notified() => {}
+            Some(envelope) = ingress.recv() => {
+                accept(&shared, &mut queue, envelope);
+            }
         }
     }
 
-    drain(shared, client, drain_timeout, events, sending).await;
+    drain(
+        shared,
+        ingress,
+        queue,
+        client,
+        drain_timeout,
+        events,
+        sending,
+    )
+    .await;
+}
+
+/// Moves all immediately available producer work into the dispatcher-owned
+/// ordering queue. Network progress is deliberately irrelevant here.
+fn drain_ingress(shared: &Shared, ingress: &mut mpsc::Receiver<Envelope>, queue: &mut Queue) {
+    while let Ok(envelope) = ingress.try_recv() {
+        accept(shared, queue, envelope);
+    }
+}
+
+fn accept(shared: &Shared, queue: &mut Queue, envelope: Envelope) {
+    shared
+        .meters
+        .ingress_depth
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if queue.push(envelope) {
+        shared.meters.record_loss(Loss::Overflow);
+    }
+    shared
+        .meters
+        .queue_depth
+        .store(queue.queued(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Starts requests for as many idle streams as the concurrency limit allows.
@@ -80,13 +122,11 @@ fn start_available(
     shared: &Arc<Shared>,
     client: &HttpClient,
     events: &Events,
+    queue: &mut Queue,
     sending: &mut JoinSet<StreamId>,
 ) {
     while sending.len() < shared.config.maximum_in_flight {
-        // Taken under the lock, sent outside it: reporting a failure emits a
-        // node event, and doing that while holding the queue would put an
-        // observer's work on the path of every other stream's delivery.
-        let Some(envelope) = shared.queue.lock().take_ready() else {
+        let Some(envelope) = queue.take_ready() else {
             break;
         };
         sending.spawn(send(
@@ -96,13 +136,25 @@ fn start_available(
             envelope,
         ));
     }
+    shared
+        .meters
+        .queue_depth
+        .store(queue.queued(), std::sync::atomic::Ordering::Relaxed);
+    shared
+        .meters
+        .in_flight
+        .store(sending.len(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Lets a stream's next event through once its predecessor has finished.
-fn release(shared: &Arc<Shared>, subject: Option<StreamId>) {
+fn release(shared: &Arc<Shared>, queue: &mut Queue, subject: Option<StreamId>) {
     if let Some(subject) = subject {
-        shared.queue.lock().finish(&subject);
+        queue.finish(&subject);
     }
+    shared
+        .meters
+        .in_flight
+        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Delivers one event, retrying until it lands or the attempts run out.
@@ -224,6 +276,8 @@ fn report(
 /// Finishes what is in flight, then what is queued, until the deadline.
 async fn drain(
     shared: Arc<Shared>,
+    mut ingress: mpsc::Receiver<Envelope>,
+    mut queue: Queue,
     client: HttpClient,
     timeout: Duration,
     events: Events,
@@ -233,21 +287,56 @@ async fn drain(
 
     let drained = tokio::time::timeout_at(deadline, async {
         loop {
-            start_available(&shared, &client, &events, &mut sending);
+            drain_ingress(&shared, &mut ingress, &mut queue);
+            start_available(&shared, &client, &events, &mut queue, &mut sending);
             let Some(finished) = sending.join_next().await else {
                 break;
             };
-            release(&shared, finished.ok());
+            release(&shared, &mut queue, finished.ok());
         }
     })
     .await;
 
     if drained.is_err() {
         sending.abort_all();
+        let mut unknown = 0;
+        // Reap after cancellation rather than counting `JoinSet::len`: a task
+        // may have completed at the deadline without yet being joined, in
+        // which case its delivered or loss counter is already definitive.
+        while let Some(finished) = sending.join_next().await {
+            if finished.is_err() {
+                unknown += 1;
+            }
+        }
+        shared
+            .meters
+            .outcome_unknown_shutdown
+            .fetch_add(unknown as u64, std::sync::atomic::Ordering::Relaxed);
+        if unknown > 0 {
+            events.emit(NodeEvent::HookDeliveryOutcomesUnknown {
+                hook: Arc::clone(&shared.config.name),
+                count: unknown,
+            });
+        }
     }
-    // Whatever is still queued is gone: it lives in memory only, and the
-    // process is on its way out.
-    let lost = shared.queue.lock().clear();
+    // Whatever is still waiting in either bounded stage is gone: it lives in
+    // memory only, and the process is on its way out.
+    let mut lost = queue.clear();
+    while ingress.try_recv().is_ok() {
+        shared
+            .meters
+            .ingress_depth
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        lost += 1;
+    }
+    shared
+        .meters
+        .queue_depth
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    shared
+        .meters
+        .in_flight
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     for _ in 0..lost {
         shared.meters.record_loss(Loss::Shutdown);
     }

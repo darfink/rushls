@@ -30,7 +30,7 @@ use crate::{
 };
 
 use super::{
-    http::{self, Application, HttpConfig, MediaCachePolicy, TlsError},
+    http::{self, Application, HttpConfig, TlsError},
     metrics::{MetricsConfig, MetricsEndpoint, MetricsReader},
 };
 
@@ -138,20 +138,11 @@ pub struct Node {
 pub(crate) struct ViewerApplication {
     origin: Arc<Origin>,
     hls: Arc<HlsService>,
-    media_cache: MediaCachePolicy,
 }
 
 impl ViewerApplication {
-    pub(crate) fn new(
-        origin: Arc<Origin>,
-        hls: Arc<HlsService>,
-        media_cache: MediaCachePolicy,
-    ) -> Self {
-        Self {
-            origin,
-            hls,
-            media_cache,
-        }
+    pub(crate) fn new(origin: Arc<Origin>, hls: Arc<HlsService>) -> Self {
+        Self { origin, hls }
     }
 
     async fn serve_media(
@@ -182,7 +173,7 @@ impl ViewerApplication {
                 object.body,
                 object.gzip,
                 named.resource,
-                self.media_cache.reuse(target),
+                self.hls.media_reuse(Some(target)),
             )
         }
         .await;
@@ -270,7 +261,9 @@ impl Node {
             authenticator,
             normalizers: Arc::new(PassThroughNormalizerFactory),
             muxers: Arc::new(PassThroughMuxerFactory::new(config.cmaf)),
-            publishers: Arc::new(StorePublisherFactory::new(store.clone())),
+            publishers: Arc::new(
+                StorePublisherFactory::new(store.clone()).with_events(events.clone()),
+            ),
             sessions: sessions.clone(),
             meters: meters.clone(),
             events,
@@ -280,7 +273,6 @@ impl Node {
         let application = Arc::new(ViewerApplication::new(
             Arc::clone(&origin),
             Arc::clone(&hls),
-            config.http.media_cache,
         ));
         let metrics = MetricsReader::new(meters, sessions, store.clone(), config.metrics.export);
 
@@ -679,12 +671,7 @@ async fn run_maintenance(
                 }
             }
             _ = ticks.tick() => {
-                // The one place both edges of a stream's life are announced,
-                // because the store computes them together.
                 let reachability = store.maintain();
-                for stream in reachability.became_available {
-                    events.stream(stream, StreamEvent::Available);
-                }
                 origin.remove_streams(&reachability.retired);
                 for stream in reachability.retired {
                     events.stream(stream, StreamEvent::Retired);

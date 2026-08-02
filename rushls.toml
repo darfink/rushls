@@ -240,7 +240,9 @@ maximum_response_bytes = "64KiB"
 # events = ["session.started", "stream.available", "stream.unavailable", "session.ended"]
 # Events held for this endpoint before the oldest waiting one is dropped. The
 # oldest, never the newest: what survives stays in order and the most recent
-# state is what is kept.
+# state is what is kept. A separate nonblocking ingress uses the same capacity
+# but is normally empty; filling it means the dispatcher itself was CPU-starved
+# or stopped, and drops the new event rather than delaying the media task.
 # queue_capacity = 1000
 # Distinct streams delivered at once. One request per stream is the ordering
 # rule, so this is also the concurrency.

@@ -97,9 +97,8 @@ impl Queue {
         }
     }
 
-    /// Gated until something reads it: a queue-depth gauge is the obvious
-    /// consumer, and there is no metrics surface for hooks yet.
-    #[cfg(test)]
+    /// Waiting events, excluding the one event each active stream may have in
+    /// flight. The dispatcher mirrors this into an atomic metrics gauge.
     pub fn queued(&self) -> usize {
         self.queued
     }

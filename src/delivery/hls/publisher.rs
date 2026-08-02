@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::{
     domain::{Payload, StreamId},
     mux::{FinishReason, PackagedMedia, PackagedPresentation, PackagingRenditionId},
+    observe::{Events, StreamEvent},
 };
 
 use super::{StoreFull, StoreWriteError, StreamLease, StreamStore, gzip::gzip};
@@ -71,11 +72,25 @@ pub trait PublisherFactory: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct StorePublisherFactory {
     store: StreamStore,
+    /// Present in a running node. Kept optional so this publisher remains
+    /// usable as a standalone delivery component with no observability sink.
+    events: Option<Events>,
 }
 
 impl StorePublisherFactory {
     pub fn new(store: StreamStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            events: None,
+        }
+    }
+
+    /// Announces availability on the media-writing task immediately after the
+    /// first playable commit, before that same task can end its session.
+    #[must_use]
+    pub fn with_events(mut self, events: Events) -> Self {
+        self.events = Some(events);
+        self
     }
 
     pub fn store(&self) -> &StreamStore {
@@ -100,6 +115,7 @@ impl PublisherFactory for StorePublisherFactory {
         Ok(Box::new(StorePublisher {
             lease: self.store.lease(stream.clone(), presentation)?,
             text,
+            events: self.events.clone(),
         }))
     }
 }
@@ -108,6 +124,7 @@ struct StorePublisher {
     lease: StreamLease,
     /// The renditions whose media is text, and so is worth compressing.
     text: HashSet<PackagingRenditionId>,
+    events: Option<Events>,
 }
 
 impl StorePublisher {
@@ -135,7 +152,17 @@ impl HlsPublisher for StorePublisher {
     fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
         let gzip = self.encoding(&media);
         match self.lease.write_encoded(media, gzip)? {
-            true => Ok(PublishOutcome::Published),
+            true => {
+                // The store commit has released its mutation lock by here.
+                // Emitting inline gives this transition causal order with the
+                // later `session.ended` emitted by the same session task.
+                if let Some(events) = &self.events
+                    && self.lease.live().claim_availability()
+                {
+                    events.stream(self.lease.stream().clone(), StreamEvent::Available);
+                }
+                Ok(PublishOutcome::Published)
+            }
             false => Ok(PublishOutcome::Superseded),
         }
     }
@@ -150,17 +177,33 @@ impl HlsPublisher for StorePublisher {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
+    use parking_lot::Mutex;
+
     use crate::{
-        domain::Payload,
+        domain::{Payload, SessionId},
         media::fixtures::video_presentation,
         mux::{
             InitializationSegment, PackagedChunk, PackagedMedia, PackagedPresentation,
             PackagingRenditionId, PackagingSegmentId,
             fixtures::{RenditionBuilder, presentation},
         },
+        observe::{EventObserver, SessionEvent},
     };
 
     use super::{super::StoreLimits, *};
+
+    #[derive(Clone, Default)]
+    struct StreamLog(Arc<Mutex<Vec<(StreamId, StreamEvent)>>>);
+
+    impl EventObserver for StreamLog {
+        fn observe(&self, _session: SessionId, _event: SessionEvent) {}
+
+        fn observe_stream(&self, stream: StreamId, event: StreamEvent) {
+            self.0.lock().push((stream, event));
+        }
+    }
 
     fn packaged_presentation() -> Arc<PackagedPresentation> {
         Arc::new(presentation(
@@ -198,6 +241,34 @@ mod tests {
             .write(initialization())
             .expect("initialization is published");
         publisher.write(chunk()).expect("chunk is published");
+    }
+
+    #[test]
+    fn first_playable_commit_announces_availability_inline() -> Result<(), Box<dyn Error>> {
+        let store = StreamStore::default();
+        let log = StreamLog::default();
+        let factory = StorePublisherFactory::new(store.clone())
+            .with_events(Events::new(Arc::new(log.clone())));
+        let stream = StreamId::new("live/camera");
+        let mut publisher = factory.start(&stream, packaged_presentation())?;
+
+        publisher.write(initialization())?;
+        assert!(log.0.lock().is_empty(), "a header alone is not playable");
+        publisher.write(chunk())?;
+
+        assert_eq!(
+            *log.0.lock(),
+            vec![(stream, StreamEvent::Available)],
+            "availability is emitted before the writing task can end its session"
+        );
+        assert!(
+            !store
+                .get(&StreamId::new("live/camera"))
+                .ok_or("stream is retained")?
+                .claim_availability(),
+            "the inline announcement owns the latch permanently"
+        );
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

@@ -33,8 +33,6 @@
 
 - Test reconnects/evictions?
 - Automated test on macos w/ mediastreamvalidator?
-- Support dynamic publishers
-- Invoke callback once playlist exists?
 
 # LATER
 
