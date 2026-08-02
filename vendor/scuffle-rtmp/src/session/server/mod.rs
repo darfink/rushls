@@ -59,6 +59,45 @@ fn write_initial_flow_control(
     Ok(())
 }
 
+fn validate_acknowledgement_window_size(
+    acknowledgement_window_size: u32,
+) -> Result<(), crate::error::RtmpError> {
+    if acknowledgement_window_size == 0 {
+        return Err(ServerSessionError::InvalidAcknowledgementWindowSize(
+            acknowledgement_window_size,
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn record_bytes_read(
+    sequence_number: &mut u32,
+    bytes_since_acknowledgement: &mut u32,
+    acknowledgement_window_size: u32,
+    bytes_read: u32,
+    output: &mut Vec<u8>,
+    writer: &ChunkWriter,
+) -> Result<(), crate::error::RtmpError> {
+    validate_acknowledgement_window_size(acknowledgement_window_size)?;
+    *sequence_number = sequence_number.wrapping_add(bytes_read);
+    let unacknowledged = u64::from(*bytes_since_acknowledgement) + u64::from(bytes_read);
+    let window = u64::from(acknowledgement_window_size);
+
+    if unacknowledged >= window {
+        tracing::debug!(sequence_number = %sequence_number, "sending acknowledgement");
+        ProtocolControlMessageAcknowledgement {
+            sequence_number: *sequence_number,
+        }
+        .write(output, writer)?;
+        *bytes_since_acknowledgement = (unacknowledged % window) as u32;
+    } else {
+        *bytes_since_acknowledgement = unacknowledged as u32;
+    }
+
+    Ok(())
+}
+
 /// A RTMP server session that is used to communicate with a client.
 ///
 /// This provides a high-level API to drive a RTMP session.
@@ -87,6 +126,8 @@ pub struct ServerSession<S, H> {
     /// The number of bytes read from the stream. Value wraps when reaching u32::MAX.
     /// This is used to know when to send acknoledgements.
     sequence_number: u32,
+    /// Bytes received since the last acknowledgement.
+    bytes_since_acknowledgement: u32,
     /// Buffer to read data into
     read_buf: BytesMut,
     /// Buffer to write data to
@@ -116,6 +157,7 @@ impl<S, H> ServerSession<S, H> {
             handler,
             acknowledgement_window_size: DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE,
             sequence_number: 0,
+            bytes_since_acknowledgement: 0,
             skip_read: false,
             chunk_reader: ChunkReader::default(),
             chunk_writer: ChunkWriter::default(),
@@ -275,28 +317,14 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
                 return Ok(false);
             }
 
-            // We have to send an acknowledgement every `self.acknowledgement_window_size` bytes.
-            // We also have to keep track of the total number of bytes read from the stream in `self.sequence_number`
-            // because it has to be sent as part of an acknowledgement message.
-
-            // This condition checks if we have read enough bytes to send the next acknowledgement.
-            // - `self.sequence_number % self.acknowledgement_window_size` calculates the number of bytes read since
-            //   the last acknowledgement.
-            // - `n` is the number of bytes read in this read operation.
-            // If the sum of the two is greater than or equal to the window size, we know that
-            // we just exceeded the window size and we need to send an acknowledgement again.
-            if (self.sequence_number % self.acknowledgement_window_size) + n >= self.acknowledgement_window_size {
-                tracing::debug!(sequence_number = %self.sequence_number, "sending acknowledgement");
-
-                // Send acknowledgement
-                ProtocolControlMessageAcknowledgement {
-                    sequence_number: self.sequence_number,
-                }
-                .write(&mut self.write_buf, &self.chunk_writer)?;
-            }
-
-            // Wrap back to 0 when we reach u32::MAX
-            self.sequence_number = self.sequence_number.wrapping_add(n);
+            record_bytes_read(
+                &mut self.sequence_number,
+                &mut self.bytes_since_acknowledgement,
+                self.acknowledgement_window_size,
+                n,
+                &mut self.write_buf,
+                &self.chunk_writer,
+            )?;
         }
 
         self.process_chunks().await?;
@@ -424,6 +452,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
     /// from the client.
     fn on_acknowledgement_window_size(&mut self, acknowledgement_window_size: u32) -> Result<(), crate::error::RtmpError> {
         tracing::debug!(acknowledgement_window_size = %acknowledgement_window_size, "received new acknowledgement window size");
+        validate_acknowledgement_window_size(acknowledgement_window_size)?;
         self.acknowledgement_window_size = acknowledgement_window_size;
         Ok(())
     }
@@ -600,5 +629,45 @@ mod tests {
         assert!(encoded.is_empty());
 
         Ok(())
+    }
+
+    #[test]
+    fn acknowledgement_includes_boundary_crossing_read() -> Result<(), Box<dyn std::error::Error>> {
+        let mut sequence_number = 7;
+        let mut unacknowledged = 7;
+        let mut encoded = Vec::new();
+        record_bytes_read(
+            &mut sequence_number,
+            &mut unacknowledged,
+            10,
+            5,
+            &mut encoded,
+            &ChunkWriter::default(),
+        )?;
+
+        assert_eq!(sequence_number, 12);
+        assert_eq!(unacknowledged, 2);
+        let mut encoded = BytesMut::from(encoded.as_slice());
+        let acknowledgement = ChunkReader::default()
+            .read_chunk(&mut encoded)?
+            .ok_or_else(|| io::Error::other("missing acknowledgement message"))?;
+        assert_eq!(
+            acknowledgement.message_header.msg_type_id,
+            MessageType::Acknowledgement
+        );
+        assert_eq!(acknowledgement.payload.as_ref(), 12_u32.to_be_bytes());
+        assert!(encoded.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn zero_acknowledgement_window_is_rejected() {
+        assert!(matches!(
+            validate_acknowledgement_window_size(0),
+            Err(crate::error::RtmpError::Session(
+                ServerSessionError::InvalidAcknowledgementWindowSize(0)
+            ))
+        ));
     }
 }

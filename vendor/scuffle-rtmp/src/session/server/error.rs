@@ -15,4 +15,7 @@ pub enum ServerSessionError {
     /// Invalid chunk size.
     #[error("invalid chunk size: {0}")]
     InvalidChunkSize(usize),
+    /// Invalid acknowledgement window size.
+    #[error("invalid acknowledgement window size: {0}")]
+    InvalidAcknowledgementWindowSize(u32),
 }

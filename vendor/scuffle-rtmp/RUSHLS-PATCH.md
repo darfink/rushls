@@ -12,6 +12,12 @@ RushLS records the last delta per chunk stream and distinguishes new messages
 from continuations using the reader's existing partial-message state. Timestamp
 addition also uses the RTMP clock's wrapping 32-bit arithmetic.
 
+The vendored server also advertises FFmpeg-compatible 2,500,000-byte
+acknowledgement and peer-bandwidth windows. Acknowledgements include the read
+that crosses the window boundary and retain a separate unacknowledged-byte
+counter so cadence remains correct when the 32-bit sequence number wraps. A
+zero acknowledgement window from a peer is rejected.
+
 Remove the `[patch.crates-io]` entry and this directory after an upstream
 release contains the equivalent fix.
 
