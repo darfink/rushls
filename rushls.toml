@@ -144,7 +144,9 @@ inactive_stream_retention = "30s"
 maximum_media_per_stream = "512MiB"
 
 [http]
-# Serves HLS, and `/metrics` when metrics are enabled.
+# Serves HLS, the always-on `/health/live` and `/health/ready` probes, and
+# `/metrics` when metrics are enabled. Readiness returns 503 during startup and
+# graceful shutdown; liveness remains 200 for as long as HTTP is responsive.
 listen = "0.0.0.0:8080"
 
 [http.cors]

@@ -1,0 +1,15 @@
+.git
+.gitignore
+target
+
+# Local/editor state should never invalidate an image build or enter its context.
+.DS_Store
+.idea
+.vscode
+*.swp
+
+# Repository notes and development-only helpers are not build inputs.
+AGENTS.md
+HANDOFF.md
+TODO.md
+tools
