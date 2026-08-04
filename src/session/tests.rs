@@ -80,10 +80,10 @@ struct FakeSource {
 }
 
 impl PacketSource for FakeSource {
-    fn discover<'a>(
-        &'a mut self,
+    fn discover(
+        &mut self,
         _limits: DiscoveryLimits,
-    ) -> BoxFuture<'a, Result<DiscoveryReport, SourceError>> {
+    ) -> BoxFuture<'_, Result<DiscoveryReport, SourceError>> {
         record(&self.log, "discover");
         let ending = self.ending;
         Box::pin(async move {
@@ -260,7 +260,7 @@ impl MediaNormalizer for FakeNormalizer {
             codec: Codec::H264,
             pts,
             dts: packet.dts.unwrap_or(pts),
-            duration: packet.duration.unwrap_or(SECOND) as u64,
+            duration: packet.duration.unwrap_or(SECOND).cast_unsigned(),
             random_access: packet.random_access,
             payload: packet.payload,
         });

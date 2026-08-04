@@ -64,26 +64,31 @@ impl TrackBuilder {
         })
     }
 
+    #[must_use]
     pub fn codec(mut self, codec: Codec) -> Self {
         self.0.codec = codec;
         self
     }
 
+    #[must_use]
     pub fn parameters(mut self, parameters: MediaParameters) -> Self {
         self.0.parameters = parameters;
         self
     }
 
+    #[must_use]
     pub fn timebase(mut self, timebase: Timebase) -> Self {
         self.0.timebase = timebase;
         self
     }
 
+    #[must_use]
     pub fn first_pts(mut self, first_pts: Option<TickTimestamp>) -> Self {
         self.0.first_pts = first_pts;
         self
     }
 
+    #[must_use]
     pub fn codec_extradata(mut self, codec_extradata: impl Into<Payload>) -> Self {
         self.0.codec_extradata = codec_extradata.into();
         self

@@ -145,10 +145,10 @@ pub trait PacketSource: Send {
     /// `limits` is advisory here — the caller also enforces
     /// [`DiscoveryLimits::maximum_wall_time`] from the outside, since an
     /// implementation that hangs cannot be trusted to time itself out.
-    fn discover<'a>(
-        &'a mut self,
+    fn discover(
+        &mut self,
         limits: DiscoveryLimits,
-    ) -> BoxFuture<'a, Result<DiscoveryReport, SourceError>>;
+    ) -> BoxFuture<'_, Result<DiscoveryReport, SourceError>>;
 
     /// Appends the next batch of packets to `out`.
     ///

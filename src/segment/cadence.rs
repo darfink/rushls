@@ -683,7 +683,7 @@ mod tests {
             observe_video(
                 &mut observer,
                 track_id,
-                6 * VIDEO_SECOND + VIDEO_FRAME as i64,
+                6 * VIDEO_SECOND + i64::try_from(VIDEO_FRAME).expect("fixture frame fits i64"),
                 false,
             );
         }
@@ -713,7 +713,11 @@ mod tests {
         observe_video(&mut observer, 0, 4 * VIDEO_SECOND, true);
         for frame in 0..=200 {
             observer
-                .observe(&audio_sample(1, frame * AUDIO_FRAME as i64, AUDIO_FRAME))
+                .observe(&audio_sample(
+                    1,
+                    frame * i64::try_from(AUDIO_FRAME).expect("fixture frame fits i64"),
+                    AUDIO_FRAME,
+                ))
                 .expect("audio is observable");
         }
 
@@ -726,7 +730,8 @@ mod tests {
         assert_eq!(audio.segment_duration.get() % AUDIO_FRAME, 0);
         assert_eq!(
             audio.first_segment_boundary_pts,
-            audio.segmentation_origin_pts + audio.segment_duration.get() as i64
+            audio.segmentation_origin_pts
+                + i64::try_from(audio.segment_duration.get()).expect("segment duration fits i64")
         );
         assert!(
             Duration::from_secs(4).abs_diff(

@@ -233,7 +233,7 @@ impl TrackSnapshot {
             ffmpeg::av_packet_get_side_data(
                 packet,
                 ffmpeg::AVPacketSideDataType::AV_PKT_DATA_PARAM_CHANGE,
-                &mut parameter_change_size,
+                &raw mut parameter_change_size,
             )
         };
         if !parameter_change.is_null() {
@@ -423,7 +423,7 @@ unsafe fn packet_configuration_matches(expected: &[u8], packet: *const ffmpeg::A
         ffmpeg::av_packet_get_side_data(
             packet,
             ffmpeg::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
-            &mut size,
+            &raw mut size,
         )
     };
     data.is_null() || unsafe { slice::from_raw_parts(data, size) == expected }

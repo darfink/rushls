@@ -582,13 +582,12 @@ impl LazyHttpClient {
         request_timeout: Duration,
         maximum_response_bytes: usize,
     ) -> Result<HttpClient, ConfigError> {
-        let shared = match &self.0 {
-            Some(client) => client,
-            None => {
-                let client = HttpClient::new(ClientConfig::default())
-                    .map_err(|error| invalid(error.to_string()))?;
-                self.0.insert(client)
-            }
+        let shared = if let Some(client) = &self.0 {
+            client
+        } else {
+            let client = HttpClient::new(ClientConfig::default())
+                .map_err(|error| invalid(error.to_string()))?;
+            self.0.insert(client)
         };
         Ok(shared.with_limits(request_timeout, maximum_response_bytes))
     }
@@ -1053,7 +1052,7 @@ impl HttpAppConfig {
     fn resolve(&self) -> Result<HttpConfig, ConfigError> {
         let config = HttpConfig {
             cors: self.cors.resolve()?,
-            tls: self.tls.as_ref().map(TlsAppConfig::resolve).transpose()?,
+            tls: self.tls.as_ref().map(TlsAppConfig::resolve),
         };
         config.validate().map_err(invalid)?;
         Ok(config)
@@ -1111,12 +1110,12 @@ pub struct TlsAppConfig {
 }
 
 impl TlsAppConfig {
-    fn resolve(&self) -> Result<TlsSettings, ConfigError> {
-        Ok(TlsSettings {
+    fn resolve(&self) -> TlsSettings {
+        TlsSettings {
             certificate: self.certificate.clone(),
             key: self.key.clone(),
             ..TlsSettings::default()
-        })
+        }
     }
 }
 
@@ -1173,15 +1172,16 @@ impl OriginsValue {
         match self {
             Self::Text(value) if value == "*" => Ok(AllowedOrigins::Any),
             Self::Text(value) if value.eq_ignore_ascii_case("off") => Ok(AllowedOrigins::Disabled),
-            Self::Text(value) => origins(
-                value
+            Self::Text(value) => {
+                let values: Vec<String> = value
                     .split(',')
                     .map(str::trim)
                     .filter(|origin| !origin.is_empty())
                     .map(str::to_owned)
-                    .collect(),
-            ),
-            Self::List(values) => origins(values.clone()),
+                    .collect();
+                origins(&values)
+            }
+            Self::List(values) => origins(values),
         }
     }
 }
@@ -1510,7 +1510,7 @@ fn nonzero_bytes(label: &str, value: ByteSize) -> Result<usize, ConfigError> {
     }
 }
 
-fn origins(values: Vec<String>) -> Result<AllowedOrigins, ConfigError> {
+fn origins(values: &[String]) -> Result<AllowedOrigins, ConfigError> {
     if values.is_empty() {
         return Err(invalid("a CORS origin allowlist must not be empty"));
     }

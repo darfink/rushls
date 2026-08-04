@@ -413,7 +413,8 @@ impl LivenessMark {
     /// unambiguously means never, without needing a second flag to say so.
     fn mark(&self, started_at: Instant) {
         let elapsed = Instant::now().saturating_duration_since(started_at);
-        let nanos = elapsed.as_nanos().min(u128::from(u64::MAX - 1)) as u64;
+        let nanos =
+            u64::try_from(elapsed.as_nanos().min(u128::from(u64::MAX - 1))).unwrap_or(u64::MAX);
         self.0.store(nanos + 1, Ordering::Relaxed);
     }
 
@@ -465,12 +466,12 @@ impl MediaMeters for SessionCounters {
         publisher_backpressured: bool,
     ) {
         self.media_lead_nanos.store(
-            media_lead.as_nanos().min(u128::from(u64::MAX)) as u64,
+            u64::try_from(media_lead.as_nanos().min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
         add(
             &self.pacing_delay_nanos,
-            pacing_delay.as_nanos().min(u128::from(u64::MAX)) as u64,
+            u64::try_from(pacing_delay.as_nanos().min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
         );
         self.publisher_backpressured
             .store(publisher_backpressured, Ordering::Relaxed);

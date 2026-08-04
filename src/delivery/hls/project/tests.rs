@@ -148,7 +148,12 @@ fn a_departed_discontinuity_survives_as_a_sequence_number() -> Result<(), Box<dy
     let second = lease(&store, vec![video(0)]);
     write(&second, initialization(0, 2));
     for id in 0..7 {
-        write_segment(&second, 0, id, id as i64 * 6);
+        write_segment(
+            &second,
+            0,
+            id,
+            i64::try_from(id).expect("fixture id fits i64") * 6,
+        );
     }
 
     let rendered = render(&second, 0, &policy())?;

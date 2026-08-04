@@ -48,6 +48,7 @@ impl PlanBuilder {
     }
 
     /// How a regular part is measured: a count, and the ceiling it implies.
+    #[must_use]
     pub fn part(mut self, access_units: NonZero<u32>, duration: NonZero<TickDuration>) -> Self {
         self.plan.part_access_units = access_units;
         self.plan.part_duration = duration;
@@ -55,18 +56,21 @@ impl PlanBuilder {
     }
 
     /// Where this track's PTS meets the publication's shared time anchor.
+    #[must_use]
     pub fn presentation_origin(mut self, pts: TickTimestamp) -> Self {
         self.plan.presentation_origin_pts = pts;
         self
     }
 
     /// The encoded access-unit start segment zero is accounted from.
+    #[must_use]
     pub fn segmentation_origin(mut self, pts: TickTimestamp) -> Self {
         self.plan.segmentation_origin_pts = pts;
         self
     }
 
     /// Pins the first boundary instead of taking one segment after the origin.
+    #[must_use]
     pub fn first_boundary(mut self, pts: TickTimestamp) -> Self {
         self.plan.first_segment_boundary_pts = pts;
         self.explicit_boundary = true;
@@ -74,6 +78,7 @@ impl PlanBuilder {
     }
 
     /// How late a usable access-unit start may be without failing the plan.
+    #[must_use]
     pub fn boundary_tolerance(mut self, ticks: TickDuration) -> Self {
         self.plan.boundary_tolerance = ticks;
         self

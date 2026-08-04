@@ -112,7 +112,7 @@ impl Authenticator for HttpAuthenticator {
                     Bytes::from(body),
                 )
                 .await
-                .map_err(unreachable)?;
+                .map_err(|error| unreachable(&error))?;
 
             match decision(&response)? {
                 Decision::Allow(allowed) => self.grant(allowed),
@@ -135,7 +135,7 @@ fn decision(response: &Response) -> Result<Decision, AdmissionError> {
         .map_err(|error| service(format!("the response was not a decision: {error}")))
 }
 
-fn unreachable(error: OutboundError) -> AdmissionError {
+fn unreachable(error: &OutboundError) -> AdmissionError {
     service(error.to_string())
 }
 

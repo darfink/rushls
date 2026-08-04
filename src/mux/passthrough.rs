@@ -148,7 +148,7 @@ mod tests {
                 channels: nz::u16!(1),
                 frame_size: Some(nz::u32!(1_024)),
                 bit_depth: None,
-                timing: Default::default(),
+                timing: crate::domain::AudioTiming::default(),
             })
             .build();
         let subtitle = TrackBuilder::new(1, MediaKind::Subtitle)
@@ -198,7 +198,7 @@ mod tests {
                 codec: Codec::SubRip,
                 pts: 0,
                 duration: 90_000,
-                webvtt: Default::default(),
+                webvtt: crate::domain::WebVttCueMetadata::default(),
                 position: None,
                 payload: Payload::from(b"later subtitle".as_slice()),
             }),

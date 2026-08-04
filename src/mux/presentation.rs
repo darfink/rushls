@@ -314,7 +314,22 @@ impl PackagedPresentation {
         if self.renditions.is_empty() {
             return Err(PackagedPresentationError::Empty);
         }
+        self.validate_renditions(input)?;
+        let memberships = self.validate_groups()?;
+        for rendition in self.renditions.iter() {
+            if memberships.get(&rendition.packaging_rendition_id) != Some(&1) {
+                return Err(PackagedPresentationError::InvalidGroupMembership {
+                    rendition_id: rendition.packaging_rendition_id,
+                });
+            }
+        }
+        self.validate_combinations()
+    }
 
+    fn validate_renditions(
+        &self,
+        input: &PresentationPlan,
+    ) -> Result<(), PackagedPresentationError> {
         let mut rendition_ids = HashSet::new();
         let mut rendition_keys = HashSet::new();
         for rendition in self.renditions.iter() {
@@ -349,7 +364,12 @@ impl PackagedPresentation {
                 }
             }
         }
+        Ok(())
+    }
 
+    fn validate_groups(
+        &self,
+    ) -> Result<HashMap<PackagingRenditionId, usize>, PackagedPresentationError> {
         let by_id: HashMap<_, _> = self
             .renditions
             .iter()
@@ -396,14 +416,10 @@ impl PackagedPresentation {
                 ));
             }
         }
-        for rendition in self.renditions.iter() {
-            if memberships.get(&rendition.packaging_rendition_id) != Some(&1) {
-                return Err(PackagedPresentationError::InvalidGroupMembership {
-                    rendition_id: rendition.packaging_rendition_id,
-                });
-            }
-        }
+        Ok(memberships)
+    }
 
+    fn validate_combinations(&self) -> Result<(), PackagedPresentationError> {
         let group_by_key: HashMap<RenditionGroupKey, &RenditionGroup> = self
             .groups
             .iter()

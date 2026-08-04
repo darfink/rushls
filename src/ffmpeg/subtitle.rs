@@ -57,7 +57,7 @@ pub unsafe fn read_subtitle_position(
         ffmpeg::av_packet_get_side_data(
             packet,
             ffmpeg::AVPacketSideDataType::AV_PKT_DATA_SUBTITLE_POSITION,
-            &mut size,
+            &raw mut size,
         )
     };
     if data.is_null() {
@@ -94,7 +94,7 @@ unsafe fn read_text_side_data(
 ) -> Result<Option<Arc<str>>, Box<str>> {
     let mut size = 0_usize;
     // SAFETY: guaranteed by the caller; FFmpeg owns the borrowed data.
-    let data = unsafe { ffmpeg::av_packet_get_side_data(packet, kind, &mut size) };
+    let data = unsafe { ffmpeg::av_packet_get_side_data(packet, kind, &raw mut size) };
     if data.is_null() {
         return Ok(None);
     }

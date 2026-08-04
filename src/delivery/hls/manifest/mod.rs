@@ -220,16 +220,12 @@ impl fmt::Display for DecimalSeconds {
             return write!(formatter, "{seconds}");
         }
 
-        let mut digits = 9;
+        let mut digits = 9_usize;
         while fraction.is_multiple_of(10) {
             fraction /= 10;
             digits -= 1;
         }
-        write!(
-            formatter,
-            "{seconds}.{fraction:0width$}",
-            width = digits as usize
-        )
+        write!(formatter, "{seconds}.{fraction:0digits$}")
     }
 }
 

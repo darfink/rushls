@@ -6,7 +6,7 @@
 //! with the right `Content-Range`, that a blocked request keeps its connection
 //! open, and that shutdown lets an in-flight blocking reload finish.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{fmt::Write as _, net::SocketAddr, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -69,7 +69,7 @@ async fn request(address: SocketAddr, method: &str, target: &str, extra: &[(&str
     let mut stream = TcpStream::connect(address).await.expect("the origin is up");
     let mut head = format!("{method} {target} HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n");
     for (name, value) in extra {
-        head.push_str(&format!("{name}: {value}\r\n"));
+        let _ = write!(head, "{name}: {value}\r\n");
     }
     head.push_str("\r\n");
     stream
@@ -695,6 +695,7 @@ mod end_to_end {
     use std::{
         fs,
         io::Cursor,
+        path::Path,
         process::Command,
         sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -858,7 +859,12 @@ mod end_to_end {
             .expect("media playlist names its initialization");
         let segment = media
             .lines()
-            .find(|line| !line.starts_with('#') && line.ends_with(".m4s"))
+            .find(|line| {
+                !line.starts_with('#')
+                    && Path::new(line)
+                        .extension()
+                        .is_some_and(|ext: &std::ffi::OsStr| ext.eq_ignore_ascii_case("m4s"))
+            })
             .expect("media playlist names a segment");
         let initialization = request(
             address,
@@ -920,20 +926,17 @@ mod end_to_end {
     fn push_flv_tag(output: &mut Vec<u8>, kind: u8, timestamp: u32, payload: &[u8]) {
         let length = u32::try_from(payload.len()).expect("test payload fits");
         output.push(kind);
-        output.extend_from_slice(&[
-            (length >> 16) as u8,
-            (length >> 8) as u8,
-            length as u8,
-            (timestamp >> 16) as u8,
-            (timestamp >> 8) as u8,
-            timestamp as u8,
-            (timestamp >> 24) as u8,
-            0,
-            0,
-            0,
-        ]);
+        output.extend_from_slice(&u24_be(length));
+        output.extend_from_slice(&u24_be(timestamp));
+        output.push(u8::try_from(timestamp >> 24).unwrap_or(0));
+        output.extend_from_slice(&[0, 0, 0]);
         output.extend_from_slice(payload);
         output.extend_from_slice(&(11 + length).to_be_bytes());
+    }
+
+    fn u24_be(value: u32) -> [u8; 3] {
+        let bytes = value.to_be_bytes();
+        [bytes[1], bytes[2], bytes[3]]
     }
 
     fn validate_with_ffprobe(initialization: &[u8], segment: &[u8]) {

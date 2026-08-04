@@ -135,7 +135,7 @@ impl PlaylistCache {
         let mut render = Some(render);
         self.get_or_render_stable(
             || Ok((key, ())),
-            |_| {
+            |()| {
                 render
                     .take()
                     .expect("an unchanging playlist key renders at most once")()
@@ -273,7 +273,7 @@ mod tests {
                     (),
                 ))
             },
-            |_| {
+            |()| {
                 let attempt = renders.get();
                 renders.set(attempt + 1);
                 if attempt == 0 {

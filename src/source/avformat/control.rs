@@ -83,19 +83,17 @@ impl Control {
     /// Called once before FFmpeg starts, so the non-atomic relationship between
     /// `origin` and the stored offset is never observed mid-change.
     pub fn set_deadline(&self, deadline: Option<Instant>) {
-        let nanos = deadline
-            .map(|deadline| {
-                // Saturating at one nanosecond keeps an already-elapsed
-                // deadline distinguishable from "no deadline", which zero means.
-                u64::try_from(
-                    deadline
-                        .saturating_duration_since(self.origin)
-                        .as_nanos()
-                        .max(1),
-                )
-                .unwrap_or(u64::MAX)
-            })
-            .unwrap_or(0);
+        let nanos = deadline.map_or(0, |deadline| {
+            // Saturating at one nanosecond keeps an already-elapsed
+            // deadline distinguishable from "no deadline", which zero means.
+            u64::try_from(
+                deadline
+                    .saturating_duration_since(self.origin)
+                    .as_nanos()
+                    .max(1),
+            )
+            .unwrap_or(u64::MAX)
+        });
         self.deadline_nanos.store(nanos, Ordering::Release);
     }
 
@@ -269,7 +267,11 @@ mod tests {
 
         // Already in the past. The stored offset saturates to one nanosecond
         // rather than zero, which is what keeps it distinct from "no deadline".
-        control.set_deadline(Some(Instant::now() - std::time::Duration::from_secs(1)));
+        control.set_deadline(Some(
+            Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        ));
         assert!(control.interrupted());
     }
 

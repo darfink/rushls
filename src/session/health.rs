@@ -111,7 +111,7 @@ pub fn evaluate(
 
     if publication_idle > deadline {
         HealthEvaluation::PublicationStalled {
-            overdue_by: publication_idle - deadline,
+            overdue_by: publication_idle.checked_sub(deadline).unwrap(),
         }
     } else {
         HealthEvaluation::Healthy

@@ -53,10 +53,7 @@ fn h264(config: Option<&[u8]>) -> Arc<str> {
         annex_b_sps_identity(config)
     };
     if let Some([profile, constraints, level]) = identity {
-        Arc::from(format!(
-            "avc1.{:02x}{:02x}{:02x}",
-            profile, constraints, level
-        ))
+        Arc::from(format!("avc1.{profile:02x}{constraints:02x}{level:02x}"))
     } else {
         Arc::from("avc1")
     }

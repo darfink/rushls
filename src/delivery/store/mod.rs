@@ -115,7 +115,7 @@ impl fmt::Debug for StreamStore {
         f.debug_struct("StreamStore")
             .field("streams", &self.len())
             .field("limits", &self.limits)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -153,29 +153,28 @@ impl StreamStore {
     pub fn lease(
         &self,
         stream: StreamId,
-        presentation: Arc<PackagedPresentation>,
+        presentation: &PackagedPresentation,
     ) -> Result<StreamLease, StoreFull> {
         let _mutation = self.mutations.lock();
         let current = self.streams.load_full();
-        let live = match current.get(&stream) {
-            Some(live) => Arc::clone(live),
-            None => {
-                if current.len() >= self.limits.maximum_streams {
-                    return Err(StoreFull {
-                        maximum: self.limits.maximum_streams,
-                    });
-                }
-                let live = Arc::new(LiveStream::new(self.limits.retention));
-                let mut next = (*current).clone();
-                next.insert(stream.clone(), Arc::clone(&live));
-                self.streams.store(Arc::new(next));
-                live
+        let live = if let Some(live) = current.get(&stream) {
+            Arc::clone(live)
+        } else {
+            if current.len() >= self.limits.maximum_streams {
+                return Err(StoreFull {
+                    maximum: self.limits.maximum_streams,
+                });
             }
+            let live = Arc::new(LiveStream::new(self.limits.retention));
+            let mut next = (*current).clone();
+            next.insert(stream.clone(), Arc::clone(&live));
+            self.streams.store(Arc::new(next));
+            live
         };
 
         // Serialized with structural removal, so the returned lease can never
         // point at a stream that was retired between lookup and attachment.
-        let (publication, renditions) = live.attach(&presentation);
+        let (publication, renditions) = live.attach(presentation);
         Ok(StreamLease {
             stream,
             live,
@@ -189,12 +188,12 @@ impl StreamStore {
     pub fn lease_without_presentation(&self, stream: StreamId) -> Result<StreamLease, StoreFull> {
         self.lease(
             stream,
-            Arc::new(PackagedPresentation {
+            &PackagedPresentation {
                 time_anchor: std::time::SystemTime::UNIX_EPOCH,
                 renditions: Arc::from([]),
                 groups: Arc::from([]),
                 combinations: Arc::from([]),
-            }),
+            },
         )
     }
 

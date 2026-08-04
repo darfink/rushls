@@ -112,8 +112,8 @@ fn nearest_whole_seconds(duration: Duration) -> NonZeroU64 {
 fn duration_from_nanos_saturating(nanos: u128) -> Duration {
     let nanos = nanos.min(Duration::MAX.as_nanos());
     Duration::new(
-        (nanos / 1_000_000_000) as u64,
-        (nanos % 1_000_000_000) as u32,
+        u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX),
+        u32::try_from(nanos % 1_000_000_000).unwrap_or(u32::MAX),
     )
 }
 

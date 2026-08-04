@@ -230,8 +230,7 @@ impl AudioNormalizer {
     ) -> Result<(), NormalizeError> {
         let distance = i128::from(actual)
             .checked_sub(i128::from(expected))
-            .map(i128::unsigned_abs)
-            .unwrap_or(u128::MAX);
+            .map_or(u128::MAX, i128::unsigned_abs);
         if distance > u128::from(self.timestamp_tolerance) {
             return Err(processing(format!(
                 "{} {field} discontinuity: expected {expected}, got {actual}",

@@ -105,10 +105,10 @@ impl AvformatPacketSource {
 }
 
 impl PacketSource for AvformatPacketSource {
-    fn discover<'a>(
-        &'a mut self,
+    fn discover(
+        &mut self,
         limits: DiscoveryLimits,
-    ) -> BoxFuture<'a, Result<DiscoveryReport, SourceError>> {
+    ) -> BoxFuture<'_, Result<DiscoveryReport, SourceError>> {
         Box::pin(async move {
             if let Some(discovery) = &self.discovery {
                 return Ok(discovery.clone());

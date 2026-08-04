@@ -173,7 +173,7 @@ impl WebVttTrack {
         })
     }
 
-    fn prepare_cue(&self, sample: SubtitleSample) -> Result<PreparedCue, MuxError> {
+    fn prepare_cue(&self, sample: &SubtitleSample) -> Result<PreparedCue, MuxError> {
         if sample.track_id != self.track_id {
             return Err(mux_error(format!(
                 "{} received a cue for {}",
@@ -221,6 +221,25 @@ impl WebVttTrack {
             )));
         }
 
+        let (first_index, last_index) = self.cue_segment_span(start, end)?;
+        // Verify every required window start before emitting initialization or
+        // modifying the queue, keeping a failed push transactional.
+        self.window_start(last_index)?;
+
+        Ok(PreparedCue {
+            start,
+            end,
+            first_index,
+            last_index,
+            cue: Arc::new(self.render_cue(sample, start)?),
+        })
+    }
+
+    fn cue_segment_span(
+        &self,
+        start: TickTimestamp,
+        end: TickTimestamp,
+    ) -> Result<(u64, u64), MuxError> {
         let first_index = self.segment_index(start)?;
         let last_index = self.segment_index(
             end.checked_sub(1)
@@ -251,11 +270,11 @@ impl WebVttTrack {
                 self.track_id
             )));
         }
-        // Verify every required window start before emitting initialization or
-        // modifying the queue, keeping a failed push transactional.
-        self.window_start(last_index)?;
+        Ok((first_index, last_index))
+    }
 
-        let content = self.dialect.read(&sample)?;
+    fn render_cue(&self, sample: &SubtitleSample, start: TickTimestamp) -> Result<Cue, MuxError> {
+        let content = self.dialect.read(sample)?;
         let rendered_bytes = content
             .text
             .len()
@@ -282,19 +301,12 @@ impl WebVttTrack {
         let end_ms = start_ms
             .checked_add(duration_ms)
             .ok_or_else(|| mux_error("WebVTT cue end overflowed"))?;
-
-        Ok(PreparedCue {
-            start,
-            end,
-            first_index,
-            last_index,
-            cue: Arc::new(Cue {
-                start_ms,
-                end_ms,
-                identifier: content.metadata.identifier,
-                settings: content.metadata.settings,
-                text: content.text,
-            }),
+        Ok(Cue {
+            start_ms,
+            end_ms,
+            identifier: content.metadata.identifier,
+            settings: content.metadata.settings,
+            text: content.text,
         })
     }
 
@@ -359,18 +371,18 @@ impl WebVttTrack {
             let duration = self
                 .window_duration(window.id)
                 .expect("queued WebVTT windows have valid timing");
-            self.emit(window, duration, out);
+            self.emit(&window, duration, out);
         }
     }
 
-    fn emit(&self, window: Window, duration: TickDuration, out: &mut dyn Appender<PackagedMedia>) {
+    fn emit(&self, window: &Window, duration: TickDuration, out: &mut dyn Appender<PackagedMedia>) {
         out.push(PackagedMedia::Segment(PackagedSegment {
             rendition_id: self.rendition_id,
             packaging_segment_id: PackagingSegmentId(window.id),
             media_start: window.start,
             duration,
             independent: true,
-            payload: Payload::from(render_window(&window)),
+            payload: Payload::from(render_window(window)),
         }));
     }
 
@@ -414,7 +426,7 @@ impl TrackPackager for WebVttTrack {
                 self.track_id
             )));
         };
-        let prepared = self.prepare_cue(sample)?;
+        let prepared = self.prepare_cue(&sample)?;
 
         self.initialize(out);
         self.ensure_through(prepared.last_index)?;
@@ -465,7 +477,7 @@ impl TrackPackager for WebVttTrack {
                 })
                 .filter(|duration| *duration > 0)
                 .ok_or_else(|| mux_error("final WebVTT segment duration overflowed"))?;
-            self.emit(window, duration, out);
+            self.emit(&window, duration, out);
         }
         self.windows.clear();
         Ok(())
@@ -592,10 +604,10 @@ mod tests {
 
         let mut mux = mux(codec, 2);
         let mut output = Vec::new();
-        let mut cue = match sample(codec, 0, SECOND, text) {
-            NormalizedSample::Subtitle(sample) => sample,
-            _ => unreachable!(),
+        let NormalizedSample::Subtitle(cue) = sample(codec, 0, SECOND, text) else {
+            unreachable!()
         };
+        let mut cue = cue;
         cue.webvtt = metadata;
         mux.push(NormalizedSample::Subtitle(cue), &mut output)
             .expect("cue is accepted");
@@ -651,10 +663,11 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::WebVtt, 2);
         let mut output = Vec::new();
-        let mut first = match sample(Codec::WebVtt, 0, 3 * SECOND, b"first") {
-            NormalizedSample::Subtitle(sample) => sample,
-            _ => unreachable!(),
+        let NormalizedSample::Subtitle(first) = sample(Codec::WebVtt, 0, 3 * SECOND, b"first")
+        else {
+            unreachable!()
         };
+        let mut first = first;
         first.webvtt = WebVttCueMetadata {
             identifier: Some(Arc::from("cue-one")),
             settings: Some(Arc::from("align:start")),
@@ -688,7 +701,12 @@ mod tests {
         let mut output = Vec::new();
         mux.push(sample(Codec::WebVtt, 0, 6 * SECOND, b"long"), &mut output)?;
         mux.push(
-            sample(Codec::WebVtt, 3 * SECOND as i64, SECOND, b"overlap"),
+            sample(
+                Codec::WebVtt,
+                3 * i64::try_from(SECOND).expect("second fits i64"),
+                SECOND,
+                b"overlap",
+            ),
             &mut output,
         )?;
         mux.finish(FinishReason::Final, &mut output)?;
@@ -711,7 +729,12 @@ mod tests {
         let mut output = Vec::new();
         mux.push(sample(Codec::WebVtt, 0, SECOND, b"first"), &mut output)?;
         mux.push(
-            sample(Codec::WebVtt, 6 * SECOND as i64, SECOND, b"later"),
+            sample(
+                Codec::WebVtt,
+                6 * i64::try_from(SECOND).expect("second fits i64"),
+                SECOND,
+                b"later",
+            ),
             &mut output,
         )?;
         mux.finish(FinishReason::Interrupted, &mut output)?;
@@ -720,7 +743,10 @@ mod tests {
         assert_eq!(segments.len(), 4);
         assert!(segments[1].payload.is_empty());
         assert!(segments[2].payload.is_empty());
-        assert_eq!(segments[3].media_start, 6 * SECOND as i64);
+        assert_eq!(
+            segments[3].media_start,
+            6 * i64::try_from(SECOND).expect("second fits i64")
+        );
         Ok(())
     }
 
@@ -739,10 +765,15 @@ mod tests {
             &mut output,
         )?;
         let output_before_error = output.len();
-        let mut positioned = match sample(Codec::SubRip, SECOND as i64, SECOND, b"placed") {
-            NormalizedSample::Subtitle(sample) => sample,
-            _ => unreachable!(),
+        let NormalizedSample::Subtitle(positioned) = sample(
+            Codec::SubRip,
+            i64::try_from(SECOND).expect("second fits i64"),
+            SECOND,
+            b"placed",
+        ) else {
+            unreachable!()
         };
+        let mut positioned = positioned;
         positioned.position = Some(SubtitlePosition {
             x1: 1,
             y1: 2,
@@ -794,7 +825,12 @@ mod tests {
         assert!(output.is_empty());
 
         mux.push(
-            sample(Codec::WebVtt, SECOND as i64, SECOND, b"valid"),
+            sample(
+                Codec::WebVtt,
+                i64::try_from(SECOND).expect("second fits i64"),
+                SECOND,
+                b"valid",
+            ),
             &mut output,
         )
         .expect("valid cue starts the muxer");

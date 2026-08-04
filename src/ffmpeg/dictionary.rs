@@ -15,7 +15,8 @@ impl Dictionary {
     pub fn set(&mut self, key: &CStr, value: &CStr) -> Result<(), AvError> {
         // SAFETY: FFmpeg copies both NUL-terminated strings into this owned
         // dictionary.
-        let result = unsafe { ffmpeg::av_dict_set(&mut self.0, key.as_ptr(), value.as_ptr(), 0) };
+        let result =
+            unsafe { ffmpeg::av_dict_set(&raw mut self.0, key.as_ptr(), value.as_ptr(), 0) };
         if result < 0 {
             return Err(AvError::new(result));
         }
@@ -23,7 +24,7 @@ impl Dictionary {
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut *mut ffmpeg::AVDictionary {
-        &mut self.0
+        &raw mut self.0
     }
 
     pub fn first_key(&self) -> Option<String> {
@@ -55,7 +56,7 @@ impl Dictionary {
 impl Drop for Dictionary {
     fn drop(&mut self) {
         // SAFETY: this wrapper uniquely owns the dictionary.
-        unsafe { ffmpeg::av_dict_free(&mut self.0) };
+        unsafe { ffmpeg::av_dict_free(&raw mut self.0) };
     }
 }
 

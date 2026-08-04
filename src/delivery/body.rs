@@ -80,6 +80,7 @@ impl MediaBody {
 
     /// Clips to an inclusive byte range, splitting refcounted frames where the
     /// range falls inside one.
+    #[must_use]
     pub fn range(&self, start: u64, end: u64) -> Self {
         let frames = match &self.frames {
             MediaFrames::Empty => Vec::new(),
@@ -102,9 +103,10 @@ fn clip_range<'a>(frames: impl Iterator<Item = &'a Payload>, start: u64, end: u6
         if frame_end > start && position <= end {
             let from = start.saturating_sub(position).min(length);
             let to = (end + 1 - position).min(length);
-            clipped.push(Payload::from_bytes(
-                frame.bytes().slice(from as usize..to as usize),
-            ));
+            // Frame payloads live in addressable memory, so these offsets fit.
+            let from = usize::try_from(from).unwrap_or(usize::MAX);
+            let to = usize::try_from(to).unwrap_or(usize::MAX);
+            clipped.push(Payload::from_bytes(frame.bytes().slice(from..to)));
         }
         position = frame_end;
     }

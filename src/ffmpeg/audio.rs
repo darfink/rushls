@@ -22,7 +22,7 @@ pub unsafe fn read_audio_trim(
         ffmpeg::av_packet_get_side_data(
             packet,
             ffmpeg::AVPacketSideDataType::AV_PKT_DATA_SKIP_SAMPLES,
-            &mut size,
+            &raw mut size,
         )
     };
     if data.is_null() {

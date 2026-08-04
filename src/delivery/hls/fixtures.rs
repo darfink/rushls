@@ -83,9 +83,12 @@ pub fn presentation(renditions: Vec<PackagedRendition>) -> Arc<PackagedPresentat
         .iter()
         .enumerate()
         .map(|(index, rendition)| {
-            TrackBuilder::new(index as u32, rendition.media.kind())
-                .timebase(timebase())
-                .build()
+            TrackBuilder::new(
+                u32::try_from(index).expect("fixture track count fits u32"),
+                rendition.media.kind(),
+            )
+            .timebase(timebase())
+            .build()
         })
         .collect();
     let input = validated(tracks);
@@ -93,7 +96,9 @@ pub fn presentation(renditions: Vec<PackagedRendition>) -> Arc<PackagedPresentat
         .into_iter()
         .enumerate()
         .map(|(index, mut rendition)| {
-            rendition.source_tracks = Arc::from([TrackId(index as u32)]);
+            rendition.source_tracks = Arc::from([TrackId(
+                u32::try_from(index).expect("fixture track count fits u32"),
+            )]);
             rendition
         })
         .collect();
@@ -102,7 +107,7 @@ pub fn presentation(renditions: Vec<PackagedRendition>) -> Arc<PackagedPresentat
 
 pub fn lease(store: &StreamStore, renditions: Vec<PackagedRendition>) -> StreamLease {
     store
-        .lease(stream_id(), presentation(renditions))
+        .lease(stream_id(), &presentation(renditions))
         .expect("the test publication fits")
 }
 
@@ -122,7 +127,11 @@ pub fn chunk(local: u32, segment: u64, index: u32, start: i64) -> PackagedMedia 
         media_start: start,
         duration: 1,
         independent: index == 0,
-        payload: Payload::from(vec![index as u8; PART_BYTES]),
+        payload: Payload::from(vec![
+            u8::try_from(index)
+                .expect("fixture chunk index fits u8");
+            PART_BYTES
+        ]),
     })
 }
 

@@ -87,10 +87,9 @@ impl NormalizerFactory for PassThroughNormalizerFactory {
 
 fn normalized_timebase(track: &DiscoveredTrack) -> Result<Timebase, NormalizeError> {
     match track.parameters {
-        MediaParameters::Video { .. } => Ok(Timebase::hz90k()),
         // HLS WebVTT maps LOCAL cue time onto the 90 kHz MPEG timestamp
         // timeline. Cue text is rounded to milliseconds only when rendered.
-        MediaParameters::Subtitle => Ok(Timebase::hz90k()),
+        MediaParameters::Video { .. } | MediaParameters::Subtitle => Ok(Timebase::hz90k()),
         MediaParameters::Audio { sample_rate, .. } => {
             if track.codec == Codec::Opus && sample_rate.get() != 48_000 {
                 return Err(invalid_plan(format!(

@@ -113,7 +113,7 @@ impl PublisherFactory for StorePublisherFactory {
             .map(|rendition| rendition.packaging_rendition_id)
             .collect();
         Ok(Box::new(StorePublisher {
-            lease: self.store.lease(stream.clone(), presentation)?,
+            lease: self.store.lease(stream.clone(), &presentation)?,
             text,
             events: self.events.clone(),
         }))
@@ -151,19 +151,18 @@ impl StorePublisher {
 impl HlsPublisher for StorePublisher {
     fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
         let gzip = self.encoding(&media);
-        match self.lease.write_encoded(media, gzip)? {
-            true => {
-                // The store commit has released its mutation lock by here.
-                // Emitting inline gives this transition causal order with the
-                // later `session.ended` emitted by the same session task.
-                if let Some(events) = &self.events
-                    && self.lease.live().claim_availability()
-                {
-                    events.stream(self.lease.stream().clone(), StreamEvent::Available);
-                }
-                Ok(PublishOutcome::Published)
+        if self.lease.write_encoded(media, gzip)? {
+            // The store commit has released its mutation lock by here.
+            // Emitting inline gives this transition causal order with the
+            // later `session.ended` emitted by the same session task.
+            if let Some(events) = &self.events
+                && self.lease.live().claim_availability()
+            {
+                events.stream(self.lease.stream().clone(), StreamEvent::Available);
             }
-            false => Ok(PublishOutcome::Superseded),
+            Ok(PublishOutcome::Published)
+        } else {
+            Ok(PublishOutcome::Superseded)
         }
     }
 

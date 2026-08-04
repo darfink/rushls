@@ -36,6 +36,6 @@ impl Drop for OwnedPacket {
     fn drop(&mut self) {
         let mut packet = self.0.as_ptr();
         // SAFETY: this wrapper uniquely owns the allocation.
-        unsafe { ffmpeg::av_packet_free(&mut packet) };
+        unsafe { ffmpeg::av_packet_free(&raw mut packet) };
     }
 }

@@ -270,11 +270,11 @@ pub fn open_listener(
         rushls_srt_listener_open(
             address.as_ptr().cast(),
             i32::try_from(address.len()).unwrap_or(i32::MAX),
-            &options,
+            &raw const options,
             backlog,
-            &mut handle,
-            &mut poll,
-            &mut local,
+            &raw mut handle,
+            &raw mut poll,
+            &raw mut local,
         )
     };
     if result != 0 {
@@ -310,7 +310,7 @@ pub fn accept(listener: &Socket) -> Result<Connection, NativeError> {
     let mut accepted = INVALID_SOCKET;
     let mut peer = Peer::empty();
     // SAFETY: output pointers are valid and libSRT initializes them on success.
-    if unsafe { rushls_srt_accept(listener, &mut accepted, &mut peer) } != 0 {
+    if unsafe { rushls_srt_accept(listener, &raw mut accepted, &raw mut peer) } != 0 {
         return Err(NativeError::last("accepting an SRT connection"));
     }
     let runtime = runtime()?;
@@ -393,10 +393,10 @@ pub fn test_connect(
         rushls_srt_test_connect(
             address.as_ptr().cast(),
             i32::try_from(address.len()).unwrap_or(i32::MAX),
-            &options,
+            &raw const options,
             stream_id.as_ptr().cast(),
             stream_id_length,
-            &mut connected,
+            &raw mut connected,
         )
     } != 0
     {

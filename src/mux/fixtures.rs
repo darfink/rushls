@@ -168,16 +168,19 @@ impl RenditionBuilder {
         builder
     }
 
+    #[must_use]
     pub fn key(mut self, key: &str) -> Self {
         self.0.key = RenditionKey::new(key);
         self
     }
 
+    #[must_use]
     pub fn source_tracks(mut self, tracks: &[u32]) -> Self {
         self.0.source_tracks = tracks.iter().copied().map(TrackId).collect();
         self
     }
 
+    #[must_use]
     pub fn config(mut self, config: RenditionConfig) -> Self {
         self.0.config = config;
         self
@@ -185,12 +188,14 @@ impl RenditionBuilder {
 
     /// Switches between chunked and segment-only packaging, keeping the
     /// rendition's timebase and segment target.
+    #[must_use]
     pub fn chunked(mut self, chunked: bool) -> Self {
         let chunk_target = self.0.config.chunk_target.or(NonZero::new(90_000));
         self.0.config.chunk_target = chunked.then_some(chunk_target).flatten();
         self
     }
 
+    #[must_use]
     pub fn is_default(mut self, is_default: bool) -> Self {
         self.0.is_default = is_default;
         self

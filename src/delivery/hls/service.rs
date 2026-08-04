@@ -220,11 +220,8 @@ impl Service {
         path: &str,
         query: Option<&str>,
     ) -> Result<Response, DeliveryFailure> {
-        let named = match parse_path(path) {
-            Ok(named) => named,
-            Err(_) => {
-                return Err(self.unrouted(DeliveryError::UnknownResource));
-            }
+        let Ok(named) = parse_path(path) else {
+            return Err(self.unrouted(DeliveryError::UnknownResource));
         };
         let blocking = match parse_directives(query) {
             Ok(blocking) => blocking,
@@ -382,7 +379,7 @@ impl Service {
         resource: Resource,
         blocking: Option<BlockingReload>,
     ) -> Result<Response, DeliveryError> {
-        let snapshot = self.rendition_for(live, resource)?;
+        let snapshot = Self::rendition_for(live, resource)?;
         let deadline = blocking_reload_deadline(snapshot.contract, self.config.timing);
 
         if let Some(blocking) = blocking {
@@ -390,7 +387,7 @@ impl Service {
             // media beyond its end is not an error and not something to wait
             // for; it is simply already answered.
             if !snapshot.live_edge.ended {
-                self.validate_blocking(&snapshot, blocking)?;
+                Self::validate_blocking(&snapshot, blocking)?;
                 self.meters.blocking_reload_started();
                 let _outcome = self
                     .origin
@@ -458,7 +455,6 @@ impl Service {
     /// segments away is a client bug that would otherwise consume a connection
     /// until the deadline expired.
     fn validate_blocking(
-        &self,
         snapshot: &RenditionSnapshot,
         blocking: BlockingReload,
     ) -> Result<(), DeliveryError> {
@@ -506,7 +502,6 @@ impl Service {
     /// worse than one: every format shares a single identifier space, so a
     /// cache would keep those bytes under a name no player should have fetched.
     fn rendition_for(
-        &self,
         live: &Arc<LiveStream>,
         resource: Resource,
     ) -> Result<Arc<RenditionSnapshot>, DeliveryError> {
@@ -528,13 +523,13 @@ fn parse_directives(query: Option<&str>) -> Result<Option<BlockingReload>, Deliv
                 msn =
                     Some(value.parse::<u64>().map_err(|_| {
                         DeliveryError::InvalidDirective("_HLS_msn must be a number")
-                    })?)
+                    })?);
             }
             "_HLS_part" => {
                 part =
                     Some(value.parse::<u32>().map_err(|_| {
                         DeliveryError::InvalidDirective("_HLS_part must be a number")
-                    })?)
+                    })?);
             }
             // Unknown directives are forward-compatible protocol extensions,
             // not malformed requests.

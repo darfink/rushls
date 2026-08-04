@@ -270,7 +270,7 @@ mod tests {
             "the earlier track anchors zero"
         );
         assert_eq!(
-            video_start - audio_start,
+            video_start.checked_sub(audio_start).unwrap(),
             Duration::from_secs(1),
             "the one-second gap between the tracks must survive rebasing"
         );

@@ -190,6 +190,7 @@ impl HttpClient {
     ///
     /// `connect_timeout` is fixed when the connector is built and so is not
     /// overridable here.
+    #[must_use]
     pub fn with_limits(&self, request_timeout: Duration, maximum_response_bytes: usize) -> Self {
         Self {
             inner: self.inner.clone(),

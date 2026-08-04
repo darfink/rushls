@@ -130,7 +130,7 @@ impl ResolvesServerCert for CertificateResolver {
 /// caught half-written is rejected here rather than at the next handshake.
 fn load(settings: &TlsSettings, provider: &CryptoProvider) -> Result<CertifiedKey, TlsError> {
     let chain = CertificateDer::pem_file_iter(&settings.certificate)
-        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+        .and_then(std::iter::Iterator::collect::<Result<Vec<_>, _>>)
         .map_err(|source| TlsError::Unreadable {
             path: settings.certificate.clone(),
             source,
@@ -242,17 +242,14 @@ impl axum::serve::Listener for TlsListener {
                     let deadline = self.settings.handshake_timeout;
                     let meters = self.meters.clone();
                     self.handshakes.spawn(async move {
-                        match timeout(deadline, acceptor.accept(stream)).await {
-                            Ok(Ok(stream)) => {
-                                meters.tls_handshake_completed();
-                                Some((stream, peer))
-                            }
+                        if let Ok(Ok(stream)) = timeout(deadline, acceptor.accept(stream)).await {
+                            meters.tls_handshake_completed();
+                            Some((stream, peer))
+                        } else {
                             // Neither outcome is reported as an event: the rate
                             // is whatever a remote peer chooses to make it.
-                            Ok(Err(_)) | Err(_) => {
-                                meters.tls_handshake_failed();
-                                None
-                            }
+                            meters.tls_handshake_failed();
+                            None
                         }
                     });
                 }

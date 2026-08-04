@@ -61,7 +61,7 @@ fn packaged_presentation(configs: &[(u32, bool)]) -> Arc<PackagedPresentation> {
 
 fn lease(store: &StreamStore, configs: &[(u32, bool)]) -> StreamLease {
     store
-        .lease(stream(), packaged_presentation(configs))
+        .lease(stream(), &packaged_presentation(configs))
         .expect("test publication fits")
 }
 
@@ -128,7 +128,11 @@ fn chunk(
         media_start: start,
         duration,
         independent: index == 0,
-        payload: Payload::from(vec![index as u8; bytes]),
+        payload: Payload::from(vec![
+            u8::try_from(index)
+                .expect("fixture chunk index fits u8");
+            bytes
+        ]),
     })
 }
 
@@ -148,7 +152,9 @@ fn direct(rendition: u32, segment: u64, start: i64, duration: u64, bytes: usize)
         media_start: start,
         duration,
         independent: true,
-        payload: Payload::from(vec![segment as u8; bytes]),
+        // Fill pattern is opaque to the store; only length matters for bitrate.
+        // Use the low byte so long-running tests can keep monotonic packaging ids.
+        payload: Payload::from(vec![segment.to_le_bytes()[0]; bytes]),
     })
 }
 
@@ -197,7 +203,16 @@ fn fractional_playlist_duration_policy_controls_the_visible_window() {
     configure(&lease, 0, false);
 
     for id in 0..3 {
-        write(&lease, direct(0, id, id as i64 * 6, 6, 1));
+        write(
+            &lease,
+            direct(
+                0,
+                id,
+                i64::try_from(id).expect("fixture id fits i64") * 6,
+                6,
+                1,
+            ),
+        );
     }
 
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
@@ -341,7 +356,7 @@ fn completing_a_chunked_segment_reuses_the_original_payloads() {
     // The rest of the segment carries no bytes, so the retained total and the
     // observed bitrate below still describe exactly the one tracked payload.
     for index in 1..6 {
-        write(&lease, chunk(0, 0, index, index as i64, 1, 0));
+        write(&lease, chunk(0, 0, index, i64::from(index), 1, 0));
     }
     assert!(
         !lease
@@ -433,7 +448,7 @@ fn webvtt_initialization_and_direct_segments_are_retained_as_authored() {
     ));
     let store = store();
     let lease = store
-        .lease(stream(), presentation)
+        .lease(stream(), &presentation)
         .expect("WebVTT publication fits");
     let header = b"WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n";
     let cue = b"00:00:00.000 --> 00:00:01.000\nHello\n\n";
@@ -560,7 +575,7 @@ fn reconnect_matches_exact_keys_even_when_local_ids_change() {
     let first = store
         .lease(
             stream(),
-            keyed_presentation(0, "camera/main", false, SystemTime::UNIX_EPOCH),
+            &keyed_presentation(0, "camera/main", false, SystemTime::UNIX_EPOCH),
         )
         .unwrap();
     write(&first, initialization(0, 1));
@@ -570,7 +585,7 @@ fn reconnect_matches_exact_keys_even_when_local_ids_change() {
     let second = store
         .lease(
             stream(),
-            keyed_presentation(9, "camera/main", false, second_anchor),
+            &keyed_presentation(9, "camera/main", false, second_anchor),
         )
         .unwrap();
     write(&second, initialization(9, 2));
@@ -598,7 +613,7 @@ fn changed_topology_retires_old_renditions_instead_of_fuzzy_matching() {
     let first = store
         .lease(
             stream(),
-            keyed_presentation(0, "camera/main", false, SystemTime::UNIX_EPOCH),
+            &keyed_presentation(0, "camera/main", false, SystemTime::UNIX_EPOCH),
         )
         .unwrap();
     write(&first, initialization(0, 1));
@@ -607,7 +622,7 @@ fn changed_topology_retires_old_renditions_instead_of_fuzzy_matching() {
     let second = store
         .lease(
             stream(),
-            keyed_presentation(0, "camera/replacement", false, SystemTime::UNIX_EPOCH),
+            &keyed_presentation(0, "camera/replacement", false, SystemTime::UNIX_EPOCH),
         )
         .unwrap();
     write(&second, initialization(0, 1));
@@ -635,7 +650,7 @@ fn changed_topology_retires_old_renditions_instead_of_fuzzy_matching() {
     let third = store
         .lease(
             stream(),
-            keyed_presentation(5, "camera/main", false, SystemTime::UNIX_EPOCH),
+            &keyed_presentation(5, "camera/main", false, SystemTime::UNIX_EPOCH),
         )
         .unwrap();
     let catalog = third.live().snapshot();
@@ -765,9 +780,9 @@ async fn part_tags_and_resources_have_distinct_retention_deadlines() {
     // advancing the live edge by a whole segment means publishing the parts
     // that actually compose one.
     for id in 1..=4 {
-        let start = 1 + (id as i64 - 1) * 6;
+        let start = 1 + (i64::try_from(id).expect("fixture id fits i64") - 1) * 6;
         for index in 0..6 {
-            write(&lease, chunk(0, id, index, start + index as i64, 1, 1));
+            write(&lease, chunk(0, id, index, start + i64::from(index), 1, 1));
         }
         write(&lease, completion(0, id, start, 6));
     }
@@ -789,7 +804,12 @@ fn part_tag_retention_never_exposes_only_a_parent_segment_suffix() {
     configure(&lease, 0, true);
 
     for id in 0..3 {
-        write_segment(&lease, 0, id, id as i64 * 6);
+        write_segment(
+            &lease,
+            0,
+            id,
+            i64::try_from(id).expect("fixture id fits i64") * 6,
+        );
     }
 
     // At 21 seconds the first parts of segment zero are individually older
@@ -826,7 +846,16 @@ async fn removed_segments_obey_their_availability_deadline() {
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
     for id in 0..7 {
-        write(&lease, direct(0, id, id as i64 * 6, 6, 1));
+        write(
+            &lease,
+            direct(
+                0,
+                id,
+                i64::try_from(id).expect("fixture id fits i64") * 6,
+                6,
+                1,
+            ),
+        );
         if id < 6 {
             tokio::time::advance(Duration::from_secs(6)).await;
         }
@@ -852,7 +881,10 @@ fn live_window_never_falls_below_three_target_durations() {
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
     for id in 0..19 {
-        write(&lease, direct(0, id, id as i64, 1, 1));
+        write(
+            &lease,
+            direct(0, id, i64::try_from(id).expect("fixture id fits i64"), 1, 1),
+        );
     }
 
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
@@ -873,7 +905,16 @@ async fn initializations_live_until_every_dependent_resource_expires() {
     write(&lease, direct(0, 0, 0, 6, 1));
     write(&lease, initialization(0, 2));
     for id in 1..7 {
-        write(&lease, direct(0, id, id as i64 * 6, 6, 1));
+        write(
+            &lease,
+            direct(
+                0,
+                id,
+                i64::try_from(id).expect("fixture id fits i64") * 6,
+                6,
+                1,
+            ),
+        );
     }
 
     assert_eq!(
@@ -941,7 +982,16 @@ fn segment_count_capacity_failure_is_atomic() {
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
     for id in 0..6 {
-        write(&lease, direct(0, id, id as i64 * 6, 6, 0));
+        write(
+            &lease,
+            direct(
+                0,
+                id,
+                i64::try_from(id).expect("fixture id fits i64") * 6,
+                6,
+                0,
+            ),
+        );
     }
 
     assert_eq!(
@@ -986,10 +1036,28 @@ fn peak_is_monotonic_and_average_uses_the_latest_media_hour() {
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
     for id in 0..600 {
-        write(&lease, direct(0, id, id as i64 * 6, 6, 12));
+        write(
+            &lease,
+            direct(
+                0,
+                id,
+                i64::try_from(id).expect("fixture id fits i64") * 6,
+                6,
+                12,
+            ),
+        );
     }
     for id in 600..1_200 {
-        write(&lease, direct(0, id, id as i64 * 6, 6, 6));
+        write(
+            &lease,
+            direct(
+                0,
+                id,
+                i64::try_from(id).expect("fixture id fits i64") * 6,
+                6,
+                6,
+            ),
+        );
     }
 
     let stats = lease.live().rendition(RenditionId(0)).unwrap().bitrate;
@@ -1098,7 +1166,12 @@ fn an_evicted_discontinuity_becomes_a_sequence_number_rather_than_nothing() {
     let second = lease(&store, &[(0, true)]);
     configure(&second, 0, true);
     for id in 0..7 {
-        write_segment(&second, 0, id, id as i64 * 6);
+        write_segment(
+            &second,
+            0,
+            id,
+            i64::try_from(id).expect("fixture id fits i64") * 6,
+        );
     }
 
     let snapshot = second.live().rendition(RenditionId(0)).unwrap();
@@ -1127,7 +1200,7 @@ fn a_reconnect_that_changes_cadence_gets_a_new_playlist_rather_than_new_terms() 
     let first = store
         .lease(
             stream(),
-            presentation_with(
+            &presentation_with(
                 0,
                 "camera/main",
                 config(timebase(), 6, None),
@@ -1141,7 +1214,7 @@ fn a_reconnect_that_changes_cadence_gets_a_new_playlist_rather_than_new_terms() 
     let _second = store
         .lease(
             stream(),
-            presentation_with(
+            &presentation_with(
                 0,
                 "camera/main",
                 config(timebase(), 10, None),
@@ -1205,7 +1278,7 @@ fn a_part_is_held_to_its_target_at_both_ends() {
     let lease = store
         .lease(
             stream(),
-            presentation_with(
+            &presentation_with(
                 0,
                 "camera/main",
                 config(millisecond, 6_000, Some(1_000)),

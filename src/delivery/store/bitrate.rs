@@ -105,12 +105,15 @@ fn bits_per_second(bits: u128, duration: Duration) -> u64 {
     if duration.is_zero() {
         return 0;
     }
-    bits.saturating_mul(1_000_000_000)
-        .checked_div(duration.as_nanos())
-        .unwrap_or(u128::from(u64::MAX))
-        .min(u128::from(u64::MAX)) as u64
+    u64::try_from(
+        bits.saturating_mul(1_000_000_000)
+            .checked_div(duration.as_nanos())
+            .unwrap_or(u128::from(u64::MAX))
+            .min(u128::from(u64::MAX)),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 fn duration_from_nanos(nanos: u128) -> Duration {
-    Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64)
+    Duration::from_nanos(u64::try_from(nanos.min(u128::from(u64::MAX))).unwrap_or(u64::MAX))
 }

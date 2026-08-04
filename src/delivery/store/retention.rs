@@ -159,9 +159,9 @@ impl Default for RetentionPolicy {
 
 fn duration_from_nanos_saturating(nanos: u128) -> Duration {
     let nanos = nanos.min(Duration::MAX.as_nanos());
-    let seconds = nanos / 1_000_000_000;
-    let subsecond_nanos = nanos % 1_000_000_000;
-    Duration::new(seconds as u64, subsecond_nanos as u32)
+    let seconds = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+    let subsecond_nanos = u32::try_from(nanos % 1_000_000_000).unwrap_or(u32::MAX);
+    Duration::new(seconds, subsecond_nanos)
 }
 
 #[cfg(test)]

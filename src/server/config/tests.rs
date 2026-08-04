@@ -496,11 +496,11 @@ io_buffer_size = "64KiB"
 
 #[test]
 fn the_two_publisher_limits_are_configured_independently() -> Result<(), Box<dyn Error>> {
-    const LIMITS: &str = r#"
+    const LIMITS: &str = r"
 [server]
 maximum_concurrent_publishers = 40
 maximum_pending_publishers_per_listener = 7
-"#;
+";
     let config = resolve_toml(LIMITS)??;
 
     assert_eq!(config.node.maximum_sessions, 40);

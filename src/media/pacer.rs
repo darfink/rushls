@@ -171,14 +171,11 @@ impl MediaPacer {
         let current = next_watermark
             .get()
             .expect("observing an advancing sample establishes a watermark");
-        let anchor = match self.anchor_media {
-            Some(anchor) => anchor,
-            None => {
-                self.anchor_media = Some(current);
-                self.anchor_wall = Instant::now();
-                self.watermark = next_watermark;
-                return Ok(());
-            }
+        let Some(anchor) = self.anchor_media else {
+            self.anchor_media = Some(current);
+            self.anchor_wall = Instant::now();
+            self.watermark = next_watermark;
+            return Ok(());
         };
 
         if let (
@@ -215,12 +212,12 @@ impl MediaPacer {
             }
             IngestTimingPolicy::PaceToRealtime { maximum_lead, .. } => {
                 let delay = lead.saturating_sub(maximum_lead);
-                if !delay.is_zero() {
+                if delay.is_zero() {
+                    self.meters.pacing_observation(lead, Duration::ZERO, false);
+                } else {
                     let mut wait = PacingWait::new(self.meters.as_ref(), lead);
                     tokio::time::sleep(delay).await;
                     wait.complete(maximum_lead);
-                } else {
-                    self.meters.pacing_observation(lead, Duration::ZERO, false);
                 }
                 self.watermark = next_watermark;
             }
@@ -328,7 +325,7 @@ mod tests {
         let ahead = sample(3);
 
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
             result = pacer.pace(&ahead) => {
                 panic!("the two-second pacing wait completed early: {result:?}");
             }

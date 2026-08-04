@@ -22,7 +22,7 @@ pub unsafe fn replace_extradata(
         .ok_or_else(|| Box::<str>::from("codec extradata size overflowed"))?;
     // FFmpeg permits `av_freep` on a null field and clears the pointer itself.
     unsafe {
-        ffmpeg::av_freep((&mut (*parameters).extradata as *mut *mut u8).cast::<c_void>());
+        ffmpeg::av_freep((&raw mut (*parameters).extradata).cast::<c_void>());
         (*parameters).extradata_size = 0;
     }
     if extradata.is_empty() {

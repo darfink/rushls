@@ -35,7 +35,7 @@ impl BitstreamFilter {
         time_base: ffmpeg::AVRational,
     ) -> Result<Self, SourceError> {
         let mut error = 0;
-        let context = unsafe { rushls_aac_adtstoasc_alloc(parameters, time_base, &mut error) };
+        let context = unsafe { rushls_aac_adtstoasc_alloc(parameters, time_base, &raw mut error) };
         NonNull::new(context).map(Self).ok_or_else(|| {
             SourceError::Demux(
                 format!(
@@ -59,7 +59,7 @@ impl BitstreamFilter {
 impl Drop for BitstreamFilter {
     fn drop(&mut self) {
         let mut context = self.0.as_ptr();
-        unsafe { rushls_bitstream_free(&mut context) };
+        unsafe { rushls_bitstream_free(&raw mut context) };
     }
 }
 
@@ -308,7 +308,7 @@ unsafe fn new_extradata(packet: *const ffmpeg::AVPacket) -> Option<Vec<u8>> {
         ffmpeg::av_packet_get_side_data(
             packet,
             ffmpeg::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
-            &mut size,
+            &raw mut size,
         )
     };
     if data.is_null() || size == 0 {

@@ -395,64 +395,7 @@ impl RenditionState {
                     return Err(StoreWriteError::InitializationDuringOpenSegment { rendition_id });
                 }
             }
-            PackagedMedia::Chunk(chunk) => {
-                let config = self.require_media_ready()?;
-                if config.chunk_target.is_none() {
-                    return Err(StoreWriteError::ChunksDisabled { rendition_id });
-                }
-                self.require_permitted_part(config.timebase.ticks_to_duration(chunk.duration))?;
-                match &self.open_segment {
-                    Some(open) if open.packaging_segment_id != chunk.packaging_segment_id => {
-                        return Err(StoreWriteError::DifferentSegmentAlreadyOpen {
-                            rendition_id,
-                            open: open.packaging_segment_id,
-                            found: chunk.packaging_segment_id,
-                        });
-                    }
-                    Some(open) => {
-                        let expected = u32::try_from(open.parts.len()).unwrap_or(u32::MAX);
-                        if chunk.chunk_index != expected {
-                            return Err(StoreWriteError::UnexpectedChunkIndex {
-                                rendition_id,
-                                expected,
-                                found: chunk.chunk_index,
-                            });
-                        }
-                        if open.media_start.checked_add_unsigned(open.duration)
-                            != Some(chunk.media_start)
-                        {
-                            return Err(StoreWriteError::SegmentTimingMismatch { rendition_id });
-                        }
-                        // A part's 85% floor only applies once something
-                        // follows it, so the arrival of a successor is the
-                        // first moment the predecessor can be judged — and the
-                        // last moment before it becomes unfixable.
-                        if let Some(previous) = open.parts.last() {
-                            self.require_permitted_non_final_part(
-                                config.timebase.ticks_to_duration(previous.duration),
-                            )?;
-                        }
-                        self.require_permitted_segment(
-                            config
-                                .timebase
-                                .ticks_to_duration(open.duration.saturating_add(chunk.duration)),
-                        )?;
-                    }
-                    None => {
-                        self.require_next_packaging_segment_id(chunk.packaging_segment_id)?;
-                        if chunk.chunk_index != 0 {
-                            return Err(StoreWriteError::UnexpectedChunkIndex {
-                                rendition_id,
-                                expected: 0,
-                                found: chunk.chunk_index,
-                            });
-                        }
-                        self.require_permitted_segment(
-                            config.timebase.ticks_to_duration(chunk.duration),
-                        )?;
-                    }
-                }
-            }
+            PackagedMedia::Chunk(chunk) => self.validate_chunk(chunk)?,
             PackagedMedia::Segment(segment) => {
                 let config = self.require_media_ready()?;
                 if self.open_segment.is_some() {
@@ -492,6 +435,62 @@ impl RenditionState {
             }
         }
         Ok(())
+    }
+
+    fn validate_chunk(&self, chunk: &PackagedChunk) -> Result<(), StoreWriteError> {
+        let rendition_id = self.rendition_id;
+        let config = self.require_media_ready()?;
+        if config.chunk_target.is_none() {
+            return Err(StoreWriteError::ChunksDisabled { rendition_id });
+        }
+        self.require_permitted_part(config.timebase.ticks_to_duration(chunk.duration))?;
+        match &self.open_segment {
+            Some(open) if open.packaging_segment_id != chunk.packaging_segment_id => {
+                Err(StoreWriteError::DifferentSegmentAlreadyOpen {
+                    rendition_id,
+                    open: open.packaging_segment_id,
+                    found: chunk.packaging_segment_id,
+                })
+            }
+            Some(open) => {
+                let expected = u32::try_from(open.parts.len()).unwrap_or(u32::MAX);
+                if chunk.chunk_index != expected {
+                    return Err(StoreWriteError::UnexpectedChunkIndex {
+                        rendition_id,
+                        expected,
+                        found: chunk.chunk_index,
+                    });
+                }
+                if open.media_start.checked_add_unsigned(open.duration) != Some(chunk.media_start) {
+                    return Err(StoreWriteError::SegmentTimingMismatch { rendition_id });
+                }
+                // A part's 85% floor only applies once something follows it, so
+                // the arrival of a successor is the first moment the
+                // predecessor can be judged — and the last moment before it
+                // becomes unfixable.
+                if let Some(previous) = open.parts.last() {
+                    self.require_permitted_non_final_part(
+                        config.timebase.ticks_to_duration(previous.duration),
+                    )?;
+                }
+                self.require_permitted_segment(
+                    config
+                        .timebase
+                        .ticks_to_duration(open.duration.saturating_add(chunk.duration)),
+                )
+            }
+            None => {
+                self.require_next_packaging_segment_id(chunk.packaging_segment_id)?;
+                if chunk.chunk_index != 0 {
+                    return Err(StoreWriteError::UnexpectedChunkIndex {
+                        rendition_id,
+                        expected: 0,
+                        found: chunk.chunk_index,
+                    });
+                }
+                self.require_permitted_segment(config.timebase.ticks_to_duration(chunk.duration))
+            }
+        }
     }
 
     fn require_config(&self) -> Result<RenditionConfig, StoreWriteError> {
@@ -585,13 +584,13 @@ impl RenditionState {
         match media {
             PackagedMedia::Initialization(segment) => self.set_initialization(segment, gzip),
             PackagedMedia::Chunk(chunk) => {
-                self.push_chunk(publication, chunk, gzip, now, retention)
+                self.push_chunk(publication, chunk, gzip, now, retention);
             }
             PackagedMedia::Segment(segment) => {
-                self.push_direct_segment(publication, segment, gzip, now, retention)
+                self.push_direct_segment(publication, segment, gzip, now, retention);
             }
             PackagedMedia::SegmentCompleted(completion) => {
-                self.complete_segment(completion, now, retention)
+                self.complete_segment(completion, now, retention);
             }
         }
     }
@@ -818,14 +817,11 @@ impl RenditionState {
             },
         );
 
-        let segment_target = self
-            .advertised_config
-            .map(|config| {
-                config
-                    .timebase
-                    .ticks_to_duration(config.segment_target.get())
-            })
-            .unwrap_or(Duration::MAX);
+        let segment_target = self.advertised_config.map_or(Duration::MAX, |config| {
+            config
+                .timebase
+                .ticks_to_duration(config.segment_target.get())
+        });
         let minimum_playlist_duration = retention.minimum_playlist_duration_for(segment_target);
         let mut playlist_duration = self.visible_playlist_duration();
         while self.visible_segments.len() > retention.minimum_playlist_segments {

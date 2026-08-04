@@ -232,7 +232,7 @@ fn greatest_common_divisor(mut left: u128, mut right: u128) -> u128 {
 }
 
 fn clamp_u128_to_u64(value: u128) -> u64 {
-    value.min(u128::from(u64::MAX)) as u64
+    u64::try_from(value.min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
 }
 
 fn div_round_nearest_checked(num: i128, den: i128) -> Option<i128> {

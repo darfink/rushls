@@ -330,7 +330,7 @@ impl EventObserver for HookObserver {
 #[derive(Clone, Debug)]
 pub struct Hooks {
     renderer: Renderer,
-    hooks: Arc<Vec<Arc<Shared>>>,
+    shared: Arc<Vec<Arc<Shared>>>,
     /// Where this module reports its own failures.
     ///
     /// Deliberately the same sink the rest of the process uses, so an embedder
@@ -350,18 +350,18 @@ impl Hooks {
     /// through a bounded `try_send`. Its ordering queue drops the oldest event
     /// when the endpoint cannot keep up.
     pub fn deliver(&self, event: &Event) {
-        if self.hooks.is_empty() {
+        if self.shared.is_empty() {
             return;
         }
         let kind = event.kind();
         // Rendered only if somebody wants it, so a node with a narrow
         // subscription pays nothing for the events nobody asked for.
         if !self
-            .hooks
+            .shared
             .iter()
             .any(|hook| hook.config.events.contains(&kind))
         {
-            for hook in self.hooks.iter() {
+            for hook in self.shared.iter() {
                 hook.meters.filtered.fetch_add(1, Ordering::Relaxed);
             }
             return;
@@ -378,7 +378,7 @@ impl Hooks {
             }
         };
 
-        for hook in self.hooks.iter() {
+        for hook in self.shared.iter() {
             if !hook.config.events.contains(&kind) {
                 hook.meters.filtered.fetch_add(1, Ordering::Relaxed);
                 continue;
@@ -395,7 +395,7 @@ impl Hooks {
 
     /// Operational snapshot for each configured hook, in configuration order.
     pub fn snapshots(&self) -> Vec<(Arc<str>, HookSnapshot)> {
-        self.hooks
+        self.shared
             .iter()
             .map(|hook| {
                 let mut snapshot = hook.meters.snapshot();
@@ -444,7 +444,7 @@ pub fn build(config: HooksConfig, client: HttpClient, events: Events) -> (Hooks,
     (
         Hooks {
             renderer: Renderer::new(config.source, config.schema_version),
-            hooks: Arc::new(shared.clone()),
+            shared: Arc::new(shared.clone()),
             events: events.clone(),
         },
         Dispatchers {

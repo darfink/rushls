@@ -190,7 +190,7 @@ impl LiveStream {
             .renditions
             .iter()
             .find(|rendition| rendition.rendition_id == rendition_id)
-            .map(|rendition| rendition.snapshot())
+            .map(super::catalog::RenditionCatalogEntry::snapshot)
     }
 
     /// Reads one rendition's retained state under the shared lock.
@@ -340,16 +340,15 @@ impl LiveStream {
                     && rendition.descriptor.compatible_with(descriptor)
                     && rendition.contract == contract
             });
-            let index = match existing {
-                Some(index) => index,
-                None => {
-                    let rendition_id = RenditionId(state.issued_renditions);
-                    state.issued_renditions = state.issued_renditions.saturating_add(1);
-                    state
-                        .renditions
-                        .push(RenditionState::new(rendition_id, descriptor.clone()));
-                    state.renditions.len() - 1
-                }
+            let index = if let Some(index) = existing {
+                index
+            } else {
+                let rendition_id = RenditionId(state.issued_renditions);
+                state.issued_renditions = state.issued_renditions.saturating_add(1);
+                state
+                    .renditions
+                    .push(RenditionState::new(rendition_id, descriptor.clone()));
+                state.renditions.len() - 1
             };
             let rendition = &mut state.renditions[index];
             rendition.descriptor = descriptor.clone();

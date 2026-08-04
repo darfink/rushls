@@ -265,14 +265,14 @@ async fn handle<P: Application>(
 }
 
 async fn liveness(method: Method) -> Response {
-    health_response(method, true)
+    health_response(&method, true)
 }
 
 async fn readiness_probe<P: Application>(
     State(service): State<HttpState<P>>,
     method: Method,
 ) -> Response {
-    health_response(method, service.readiness.is_ready())
+    health_response(&method, service.readiness.is_ready())
 }
 
 async fn metrics_probe<P: Application>(
@@ -283,12 +283,12 @@ async fn metrics_probe<P: Application>(
     match &service.metrics {
         // Unreachable: the route only exists when the endpoint does.
         None => StatusCode::NOT_FOUND.into_response(),
-        Some(metrics) => metrics_response(metrics, method, &headers),
+        Some(metrics) => metrics_response(metrics, &method, &headers),
     }
 }
 
-fn health_response(method: Method, healthy: bool) -> Response {
-    if !matches!(method, Method::GET | Method::HEAD) {
+fn health_response(method: &Method, healthy: bool) -> Response {
+    if !matches!(*method, Method::GET | Method::HEAD) {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
             [(header::ALLOW, HeaderValue::from_static("GET, HEAD"))],
@@ -315,8 +315,8 @@ fn health_response(method: Method, healthy: bool) -> Response {
         .into_response()
 }
 
-fn metrics_response(metrics: &MetricsEndpoint, method: Method, headers: &HeaderMap) -> Response {
-    if !matches!(method, Method::GET | Method::HEAD) {
+fn metrics_response(metrics: &MetricsEndpoint, method: &Method, headers: &HeaderMap) -> Response {
+    if !matches!(*method, Method::GET | Method::HEAD) {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
             [(header::ALLOW, HeaderValue::from_static("GET, HEAD"))],

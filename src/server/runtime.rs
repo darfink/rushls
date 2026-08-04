@@ -237,7 +237,7 @@ impl Node {
             .metrics
             .token
             .as_ref()
-            .is_some_and(|token| token.is_empty())
+            .is_some_and(super::metrics::MetricsToken::is_empty)
         {
             return Err(RuntimeError::InvalidConfiguration(
                 "metrics token must not be empty",
@@ -367,76 +367,22 @@ impl Node {
         let (stop_tx, stop_rx) = watch::channel(false);
         let readiness = Readiness::default();
         let mut tasks = JoinSet::new();
-        // One budget each: a transport being flooded with connections that
-        // never authenticate should not stop the other from admitting anyone.
-        tasks.spawn(run_ingest(
-            RtmpListener {
-                tcp: rtmp_listener,
-                config: self.config.rtmp,
-            },
-            self.services.clone(),
-            self.config.session,
-            PendingPublishers::new(self.config.maximum_pending_publishers_per_listener),
-            stop_rx.clone(),
-        ));
-        tasks.spawn(run_ingest(
+        self.spawn_listeners(
+            &mut tasks,
+            rtmp_listener,
             srt_listener,
-            self.services.clone(),
-            self.config.session,
-            PendingPublishers::new(self.config.maximum_pending_publishers_per_listener),
-            stop_rx.clone(),
-        ));
-        // The listener type differs but the server does not: both arms run the
-        // same router, the same graceful shutdown, and the same task.
-        //
-        // HTTPS is announced only once TLS is actually up. Announcing it
-        // alongside the other listeners would put "HTTPS listening on …" in
-        // the log immediately above the certificate error that stopped the
-        // process from ever serving.
-        match self.config.http.tls.clone() {
-            Some(settings) => {
-                let listener = http::bind_tls(
-                    http_listener,
-                    settings,
-                    self.services.meters.clone(),
-                    events.clone(),
-                )?;
-                report_bound(&events, Protocol::Https, listener.local_addr());
-                tasks.spawn(run_http(
-                    listener,
-                    Arc::clone(&self.application),
-                    self.config.http.clone(),
-                    self.metrics_endpoint(),
-                    readiness.clone(),
-                    stop_rx.clone(),
-                ));
-            }
-            None => {
-                report_bound(&events, Protocol::Http, http_listener.local_addr());
-                tasks.spawn(run_http(
-                    http_listener,
-                    Arc::clone(&self.application),
-                    self.config.http.clone(),
-                    self.metrics_endpoint(),
-                    readiness.clone(),
-                    stop_rx.clone(),
-                ));
-            }
-        }
-        tasks.spawn(run_maintenance(
-            self.store.clone(),
-            Arc::clone(&self.hls),
-            self.config.maintenance_interval,
-            events.clone(),
+            http_listener,
+            &events,
+            &readiness,
             stop_rx,
-        ));
+        )?;
         // All listeners and long-running tasks now exist. During shutdown this
         // flips before their drain begins, so load balancers stop adding work.
         readiness.mark_ready();
 
         tokio::pin!(shutdown);
         let (shutdown_requested, mut first_error) = tokio::select! {
-            _ = &mut shutdown => (true, None),
+            () = &mut shutdown => (true, None),
             joined = tasks.join_next() => (false, joined.and_then(task_error)),
         };
 
@@ -457,6 +403,82 @@ impl Node {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// One budget each: a transport flooded with unauthenticated connections
+    /// must not stop the other from admitting anyone.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_listeners(
+        &self,
+        tasks: &mut JoinSet<Result<(), RuntimeError>>,
+        rtmp_listener: TcpListener,
+        srt_listener: SrtListener,
+        http_listener: TcpListener,
+        events: &Events,
+        readiness: &Readiness,
+        stop_rx: watch::Receiver<bool>,
+    ) -> Result<(), RuntimeError> {
+        let maximum_pending = self.config.maximum_pending_publishers_per_listener;
+        let session_config = Arc::new(self.config.session);
+        tasks.spawn(run_ingest(
+            RtmpListener {
+                tcp: rtmp_listener,
+                config: self.config.rtmp,
+            },
+            self.services.clone(),
+            Arc::clone(&session_config),
+            PendingPublishers::new(maximum_pending),
+            stop_rx.clone(),
+        ));
+        tasks.spawn(run_ingest(
+            srt_listener,
+            self.services.clone(),
+            session_config,
+            PendingPublishers::new(maximum_pending),
+            stop_rx.clone(),
+        ));
+        // The listener type differs but the server does not: both arms run the
+        // same router, the same graceful shutdown, and the same task.
+        //
+        // HTTPS is announced only once TLS is actually up. Announcing it
+        // alongside the other listeners would put "HTTPS listening on …" in
+        // the log immediately above the certificate error that stopped the
+        // process from ever serving.
+        if let Some(settings) = self.config.http.tls.clone() {
+            let listener = http::bind_tls(
+                http_listener,
+                settings,
+                self.services.meters.clone(),
+                events.clone(),
+            )?;
+            report_bound(events, Protocol::Https, listener.local_addr());
+            tasks.spawn(run_http(
+                listener,
+                Arc::clone(&self.application),
+                self.config.http.clone(),
+                self.metrics_endpoint(),
+                readiness.clone(),
+                stop_rx.clone(),
+            ));
+        } else {
+            report_bound(events, Protocol::Http, http_listener.local_addr());
+            tasks.spawn(run_http(
+                http_listener,
+                Arc::clone(&self.application),
+                self.config.http.clone(),
+                self.metrics_endpoint(),
+                readiness.clone(),
+                stop_rx.clone(),
+            ));
+        }
+        tasks.spawn(run_maintenance(
+            self.store.clone(),
+            Arc::clone(&self.hls),
+            self.config.maintenance_interval,
+            events.clone(),
+            stop_rx,
+        ));
+        Ok(())
     }
 
     fn metrics_endpoint(&self) -> Option<MetricsEndpoint> {
@@ -557,7 +579,7 @@ impl IngestListener for RtmpListener {
 async fn run_ingest<L: IngestListener>(
     mut listener: L,
     services: Services,
-    session_config: SessionConfig,
+    session_config: Arc<SessionConfig>,
     pending_publishers: PendingPublishers,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
@@ -608,6 +630,7 @@ async fn run_ingest<L: IngestListener>(
                     Accepted::Stopped(error) => return Err(error),
                 };
                 let services = services.clone();
+                let session_config = Arc::clone(&session_config);
                 connections.spawn(async move {
                     let pending = match L::handshake(connection).await {
                         Ok(pending) => pending,
@@ -620,7 +643,7 @@ async fn run_ingest<L: IngestListener>(
                         }
                     };
                     if let Err(error) =
-                        run_session(pending, &services, &session_config, slot).await
+                        run_session(pending, &services, session_config.as_ref(), slot).await
                     {
                         services.events.emit(NodeEvent::PublisherSessionFailed {
                             protocol: L::PROTOCOL,

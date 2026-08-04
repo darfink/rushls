@@ -31,9 +31,11 @@ impl OutputAvio {
             .ok()
             .filter(|size| *size > 0)
             .ok_or_else(|| Box::<str>::from("invalid output AVIO buffer size"))?;
+        let buffer_len = usize::try_from(buffer_size)
+            .map_err(|_| Box::<str>::from("output AVIO buffer size exceeds address space"))?;
         // SAFETY: FFmpeg owns this allocation after `avio_alloc_context`
         // succeeds. The failure path releases it explicitly.
-        let buffer = unsafe { av::av_malloc(buffer_size as usize) }.cast::<u8>();
+        let buffer = unsafe { av::av_malloc(buffer_len) }.cast::<u8>();
         let Some(buffer) = NonNull::new(buffer) else {
             return Err("could not allocate output AVIO buffer".into());
         };
@@ -47,7 +49,7 @@ impl OutputAvio {
                 buffer.as_ptr(),
                 buffer_size,
                 1,
-                (&mut *opaque as *mut WriteBuffer).cast(),
+                (&raw mut *opaque).cast(),
                 None,
                 Some(write_packet),
                 None,
@@ -67,11 +69,11 @@ impl OutputAvio {
         self.context.as_ptr()
     }
 
-    fn take(&mut self) -> Result<Payload, Box<str>> {
+    fn take(&mut self) -> Payload {
         // SAFETY: the live context is uniquely borrowed and flushing invokes
         // the callback synchronously.
         unsafe { av::avio_flush(self.context.as_ptr()) };
-        Ok(Payload::from_bytes(self.opaque.bytes.split().freeze()))
+        Payload::from_bytes(self.opaque.bytes.split().freeze())
     }
 }
 
@@ -80,7 +82,7 @@ impl Drop for OutputAvio {
         let mut context = self.context.as_ptr();
         // SAFETY: this object uniquely owns the AVIO context and its internal
         // allocation.
-        unsafe { av::avio_context_free(&mut context) };
+        unsafe { av::avio_context_free(&raw mut context) };
     }
 }
 
@@ -126,7 +128,7 @@ impl FormatOutput {
         // SAFETY: FFmpeg allocates a new output context for the named muxer.
         let result = unsafe {
             av::avformat_alloc_output_context2(
-                &mut context,
+                &raw mut context,
                 ptr::null(),
                 c"mp4".as_ptr(),
                 ptr::null(),
@@ -148,7 +150,7 @@ impl FormatOutput {
         let stream = unsafe { av::avformat_new_stream(output.context.as_ptr(), ptr::null()) };
         let stream = NonNull::new(stream)
             .ok_or_else(|| Box::<str>::from("could not allocate an MP4 stream"))?;
-        output.configure_stream(stream, track)?;
+        Self::configure_stream(stream, track)?;
         // SAFETY: custom IO remains owned by `output`; the format context must
         // not attempt to open or close it.
         unsafe {
@@ -190,7 +192,6 @@ impl FormatOutput {
     }
 
     fn configure_stream(
-        &mut self,
         stream: NonNull<av::AVStream>,
         track: &DiscoveredTrack,
     ) -> Result<(), Box<str>> {
@@ -238,7 +239,7 @@ impl FormatOutput {
                     (*parameters).seek_preroll =
                         audio_timing_field(timing.seek_preroll_samples, "seek preroll")?;
                     av::av_channel_layout_default(
-                        &mut (*parameters).ch_layout,
+                        &raw mut (*parameters).ch_layout,
                         i32::from(channels.get()),
                     );
                 }
@@ -322,7 +323,7 @@ impl FormatOutput {
         if result < 0 {
             return Err(format!("flushing MP4 fragment: {}", AvError::new(result)).into());
         }
-        self.io.take()
+        Ok(self.io.take())
     }
 
     pub(super) fn finalize(&mut self) -> Result<(), Box<str>> {
@@ -333,7 +334,7 @@ impl FormatOutput {
         // SAFETY: the header was written successfully and the context is live.
         let result = unsafe { av::av_write_trailer(self.context.as_ptr()) };
         // Trailer indexes are not CMAF media objects; drain and discard them.
-        let _ = self.io.take()?;
+        let _ = self.io.take();
         if result < 0 {
             return Err(format!("finalizing MP4 output: {}", AvError::new(result)).into());
         }

@@ -137,7 +137,7 @@ impl RtmpPendingPublish {
             result
         });
 
-        let attempt = match tokio::time::timeout(config.maximum_publish_wait, async {
+        let attempt = if let Ok(result) = tokio::time::timeout(config.maximum_publish_wait, async {
             tokio::select! {
                 attempt = publish_rx => attempt.map_err(|_| {
                     TransportError::Handshake("RTMP connection ended before publishing".into())
@@ -147,13 +147,12 @@ impl RtmpPendingPublish {
         })
         .await
         {
-            Ok(result) => result?,
-            Err(_) => {
-                session.abort();
-                return Err(TransportError::Handshake(
-                    "RTMP publisher did not publish before the deadline".into(),
-                ));
-            }
+            result?
+        } else {
+            session.abort();
+            return Err(TransportError::Handshake(
+                "RTMP publisher did not publish before the deadline".into(),
+            ));
         };
 
         Ok(Self {
@@ -262,10 +261,10 @@ struct RtmpPacketSource {
 }
 
 impl PacketSource for RtmpPacketSource {
-    fn discover<'a>(
-        &'a mut self,
+    fn discover(
+        &mut self,
         limits: DiscoveryLimits,
-    ) -> BoxFuture<'a, Result<DiscoveryReport, SourceError>> {
+    ) -> BoxFuture<'_, Result<DiscoveryReport, SourceError>> {
         self.source.discover(limits)
     }
 
@@ -327,14 +326,16 @@ impl FlvHandler {
             return Err(ServerSessionError::PlayNotSupported);
         }
 
-        let payload_len = payload.len() as u32;
+        // Bounded above by `FLV_MAXIMUM_PAYLOAD_BYTES` (24-bit).
+        let payload_len = u32::try_from(payload.len()).expect("FLV payload fits u32");
+        let header_len = u32::try_from(FLV_TAG_HEADER_BYTES).expect("FLV header fits u32");
         let mut header = [0_u8; FLV_TAG_HEADER_BYTES];
         header[0] = tag_type;
         write_u24_be(&mut header[1..4], payload_len);
         write_u24_be(&mut header[4..7], timestamp & 0x00ff_ffff);
-        header[7] = (timestamp >> 24) as u8;
+        header[7] = u8::try_from(timestamp >> 24).unwrap_or(u8::MAX);
         // header[8..11] is FLV's always-zero StreamID.
-        let previous_tag_size = (FLV_TAG_HEADER_BYTES as u32 + payload_len).to_be_bytes();
+        let previous_tag_size = (header_len + payload_len).to_be_bytes();
 
         self.writer
             .send_group([
@@ -628,14 +629,20 @@ mod tests {
         assert_eq!(&bytes[..FLV_HEADER.len()], FLV_HEADER);
         let tag = &bytes[FLV_HEADER.len()..];
         assert_eq!(tag[0], 9);
-        assert_eq!(&tag[1..4], &[0, 0, payload.len() as u8]);
+        assert_eq!(
+            &tag[1..4],
+            &[
+                0,
+                0,
+                u8::try_from(payload.len()).expect("fixture payload fits u8")
+            ]
+        );
         assert_eq!(&tag[4..8], &[0x34, 0x56, 0x78, 0x12]);
         assert_eq!(&tag[8..11], &[0, 0, 0]);
         assert_eq!(&tag[11..11 + payload.len()], payload.as_ref());
-        assert_eq!(
-            &tag[11 + payload.len()..],
-            &(FLV_TAG_HEADER_BYTES as u32 + payload.len() as u32).to_be_bytes()
-        );
+        let previous_tag_size = u32::try_from(FLV_TAG_HEADER_BYTES).expect("header fits u32")
+            + u32::try_from(payload.len()).expect("fixture payload fits u32");
+        assert_eq!(&tag[11 + payload.len()..], &previous_tag_size.to_be_bytes());
     }
 
     #[tokio::test]

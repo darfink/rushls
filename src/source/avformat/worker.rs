@@ -93,7 +93,7 @@ pub fn spawn(
                 discovery_limits,
                 control,
                 discovery,
-                output,
+                &output,
             );
         })
         .map(|_| ())
@@ -109,11 +109,11 @@ fn run(
     discovery_limits: DiscoveryLimits,
     control: Arc<Control>,
     discovery: oneshot::Sender<Result<DiscoveryReport, SourceError>>,
-    output: mpsc::Sender<WorkerEvent>,
+    output: &mpsc::Sender<WorkerEvent>,
 ) {
     let (mut format, catalog) = match FormatInput::open(
         input,
-        Arc::clone(&control),
+        control,
         discovery_limits,
         config.io_buffer_size.get(),
     ) {

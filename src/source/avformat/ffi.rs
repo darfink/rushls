@@ -42,9 +42,11 @@ impl Avio {
             .ok()
             .filter(|size| *size > 0)
             .ok_or_else(|| SourceError::Open("invalid AVIO buffer size".into()))?;
+        let buffer_len = usize::try_from(buffer_size)
+            .map_err(|_| SourceError::Open("AVIO buffer size exceeds address space".into()))?;
         // SAFETY: FFmpeg owns this allocation after `avio_alloc_context`
         // succeeds. The failure path frees it below.
-        let buffer = unsafe { ffmpeg::av_malloc(buffer_size as usize) }.cast::<u8>();
+        let buffer = unsafe { ffmpeg::av_malloc(buffer_len) }.cast::<u8>();
         let Some(buffer) = NonNull::new(buffer) else {
             return Err(SourceError::Open(
                 "could not allocate the AVIO buffer".into(),
@@ -59,7 +61,7 @@ impl Avio {
                 buffer.as_ptr(),
                 buffer_size,
                 0,
-                (&mut *opaque as *mut ReadOpaque).cast(),
+                (&raw mut *opaque).cast(),
                 Some(read_packet),
                 None,
                 None,
@@ -88,7 +90,7 @@ impl Drop for Avio {
         let mut context = self.context.as_ptr();
         // SAFETY: this object uniquely owns the AVIO context. FFmpeg also
         // releases the possibly replaced internal buffer here.
-        unsafe { ffmpeg::avio_context_free(&mut context) };
+        unsafe { ffmpeg::avio_context_free(&raw mut context) };
     }
 }
 
@@ -189,14 +191,14 @@ impl FormatInput {
         // SAFETY: `opened` points to a configured input context. Custom IO
         // means neither a URL nor an explicit input format is required.
         let result = unsafe {
-            ffmpeg::avformat_open_input(&mut opened, ptr::null(), ptr::null(), ptr::null_mut())
+            ffmpeg::avformat_open_input(&raw mut opened, ptr::null(), ptr::null(), ptr::null_mut())
         };
         if result < 0 {
             if !opened.is_null() {
                 // SAFETY: FFmpeg left a live context in `opened`. This is the
                 // one failure the type below cannot cover, because ownership
                 // has not come back to us yet.
-                unsafe { ffmpeg::avformat_close_input(&mut opened) };
+                unsafe { ffmpeg::avformat_close_input(&raw mut opened) };
             }
             return Err(open_error("opening input", result, &control));
         }
@@ -279,7 +281,7 @@ impl Drop for FormatInput {
     fn drop(&mut self) {
         let mut context = self.context.as_ptr();
         // SAFETY: this object uniquely owns the open format context.
-        unsafe { ffmpeg::avformat_close_input(&mut context) };
+        unsafe { ffmpeg::avformat_close_input(&raw mut context) };
     }
 }
 
@@ -408,7 +410,7 @@ impl Drop for PacketPayload {
     fn drop(&mut self) {
         let mut buffer = self.buffer.as_ptr();
         // SAFETY: this owner uniquely owns its AVBuffer reference.
-        unsafe { ffmpeg::av_buffer_unref(&mut buffer) };
+        unsafe { ffmpeg::av_buffer_unref(&raw mut buffer) };
     }
 }
 
