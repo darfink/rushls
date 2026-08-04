@@ -23,8 +23,9 @@ use thiserror::Error;
 
 use crate::{
     admission::{
-        Authenticator, HttpAuthConfig, HttpAuthenticator, OpenStreamAuthenticator, Principal,
-        PublishGrant, StaticPublisher, StaticStreamAuthenticator, StreamPolicy, TakeoverPolicy,
+        Authenticator, HttpAuthConfig, HttpAuthenticator, IngestTimingPolicy,
+        OpenStreamAuthenticator, Principal, PublishGrant, StaticPublisher,
+        StaticStreamAuthenticator, StreamPolicy, TakeoverPolicy,
     },
     delivery::hls::uri::UriBase,
     domain::{Codec, FrameRate, StreamId},
@@ -46,6 +47,11 @@ pub struct ResolvedAppConfig {
     pub authenticator: Arc<dyn Authenticator>,
     /// `None` unless `[hooks.endpoints]` names at least one destination.
     pub hooks: Option<ResolvedHooks>,
+    /// Settings that are legal but probably not what was meant.
+    ///
+    /// Returned rather than printed: configuration is read before a `Node`
+    /// exists, so there is no observer yet, and the caller owns its output.
+    pub warnings: Vec<String>,
 }
 
 /// Hooks and the client they deliver with, which carries their own deadline.
@@ -172,9 +178,14 @@ impl AppConfig {
     pub fn resolve(self) -> Result<ResolvedAppConfig, ConfigError> {
         let defaults = NodeConfig::default();
         let mut client = LazyHttpClient::default();
-        let authenticator = self
-            .auth
-            .resolve(defaults.session.maximum_admission_time, &mut client)?;
+        let mut warnings = Vec::new();
+        let part_duration = self.hls.part_duration;
+        let authenticator = self.auth.resolve(
+            defaults.session.maximum_admission_time,
+            part_duration,
+            &mut client,
+            &mut warnings,
+        )?;
         let mut node = NodeConfig {
             maximum_sessions: self.server.maximum_concurrent_publishers,
             maximum_pending_publishers_per_listener: self
@@ -196,6 +207,7 @@ impl AppConfig {
             node,
             authenticator,
             hooks,
+            warnings,
         })
     }
 }
@@ -232,11 +244,14 @@ impl AuthAppConfig {
     fn resolve(
         self,
         admission_deadline: Duration,
+        part_duration: Duration,
         client: &mut LazyHttpClient,
+        warnings: &mut Vec<String>,
     ) -> Result<Arc<dyn Authenticator>, ConfigError> {
         let mut profiles = self.policies.unwrap_or_default();
         profiles.0.entry("default".into()).or_default();
         let policies = resolve_policies(profiles)?;
+        warn_about_tight_pacing(&policies, part_duration, warnings);
 
         match self.provider {
             AuthProviderValue::Static => {
@@ -699,10 +714,28 @@ fn resolve_policies(
         .collect()
 }
 
+/// What happens when a publisher's media runs ahead of wall clock.
+///
+/// Named for the condition rather than the mechanism, because that is the
+/// question an operator is answering: a file pushed at full speed and an
+/// encoder catching up after a stall both look like this, and only the
+/// operator knows which of the two their publishers are.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum FasterThanRealtimeValue {
+    /// Sleep the publisher until wall clock catches up.
+    Pace,
+    /// Refuse the publication instead.
+    Reject,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyAppConfig {
     takeovers: Option<TakeoversValue>,
+    faster_than_realtime: Option<FasterThanRealtimeValue>,
+    maximum_lead: Option<String>,
+    maximum_timestamp_jump: Option<String>,
     video_codecs: Option<Vec<CodecValue>>,
     audio_codecs: Option<Vec<CodecValue>>,
     subtitle_codecs: Option<Vec<CodecValue>>,
@@ -714,11 +747,84 @@ struct PolicyAppConfig {
 }
 
 impl PolicyAppConfig {
+    /// Builds the timing rule from one threshold and one choice of response.
+    ///
+    /// Both modes tolerate the same thing — media running ahead of wall clock
+    /// — so `maximum_lead` means one thing regardless of which is selected,
+    /// and only the consequence of exceeding it changes.
+    fn resolve_timing(
+        &self,
+        name: &str,
+        current: IngestTimingPolicy,
+    ) -> Result<IngestTimingPolicy, ConfigError> {
+        let inherited = match current {
+            IngestTimingPolicy::RequireRealtime { maximum_lead }
+            | IngestTimingPolicy::PaceToRealtime { maximum_lead, .. } => maximum_lead,
+        };
+        let maximum_lead = match &self.maximum_lead {
+            Some(value) => duration(name, "maximum_lead", value)?,
+            None => inherited,
+        };
+        if maximum_lead.is_zero() {
+            return Err(invalid(format!(
+                "auth policy `{name}`: maximum_lead must be nonzero; a \
+                 publisher cannot be required to never run ahead at all"
+            )));
+        }
+
+        let mode = self.faster_than_realtime.unwrap_or(match current {
+            IngestTimingPolicy::PaceToRealtime { .. } => FasterThanRealtimeValue::Pace,
+            IngestTimingPolicy::RequireRealtime { .. } => FasterThanRealtimeValue::Reject,
+        });
+
+        match mode {
+            FasterThanRealtimeValue::Reject => {
+                // A jump limit only makes sense where the response is to wait.
+                // Rejecting already catches a broken timeline through the lead
+                // itself, so this key would silently do nothing.
+                if self.maximum_timestamp_jump.is_some() {
+                    return Err(invalid(format!(
+                        "auth policy `{name}`: maximum_timestamp_jump applies \
+                         only to `faster_than_realtime = \"pace\"`, because \
+                         rejecting already catches a forward jump through \
+                         maximum_lead"
+                    )));
+                }
+                Ok(IngestTimingPolicy::RequireRealtime { maximum_lead })
+            }
+            FasterThanRealtimeValue::Pace => {
+                let inherited_jump = match current {
+                    IngestTimingPolicy::PaceToRealtime {
+                        maximum_timestamp_jump,
+                        ..
+                    } => maximum_timestamp_jump,
+                    IngestTimingPolicy::RequireRealtime { .. } => default_maximum_timestamp_jump(),
+                };
+                let maximum_timestamp_jump = match &self.maximum_timestamp_jump {
+                    Some(value) => duration(name, "maximum_timestamp_jump", value)?,
+                    None => inherited_jump,
+                };
+                if maximum_timestamp_jump <= maximum_lead {
+                    return Err(invalid(format!(
+                        "auth policy `{name}`: maximum_timestamp_jump must \
+                         exceed maximum_lead, or every tolerated lead would \
+                         also be a broken timeline"
+                    )));
+                }
+                Ok(IngestTimingPolicy::PaceToRealtime {
+                    maximum_lead,
+                    maximum_timestamp_jump,
+                })
+            }
+        }
+    }
+
     fn resolve(self, name: &str) -> Result<StreamPolicy, ConfigError> {
         let mut policy = StreamPolicy::permissive();
         if let Some(takeovers) = self.takeovers {
             policy.takeovers = takeovers.into();
         }
+        policy.ingest_timing = self.resolve_timing(name, policy.ingest_timing)?;
         if let Some(codecs) = self.video_codecs {
             policy.accepted_video_codecs = validate_codecs(
                 name,
@@ -1317,6 +1423,55 @@ fn env_value<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsSt
     env.iter()
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.as_os_str())
+}
+
+/// Flags a pacing threshold tight enough to throttle a well-behaved publisher.
+///
+/// The pacer works on individual samples, so an encoder that hands over a whole
+/// group of pictures at once is legitimately that far ahead the instant it does
+/// — through no fault of its own. A lead below the node's own part duration is
+/// therefore near-certainly too tight, and the symptom is not an error but
+/// backpressure and rising latency, which reads as a network problem.
+///
+/// Only for `pace`. Under `reject` a tight lead is the entire point: that is
+/// how an operator says a stream must be genuinely live.
+fn warn_about_tight_pacing(
+    policies: &BTreeMap<String, StreamPolicy>,
+    part_duration: Duration,
+    warnings: &mut Vec<String>,
+) {
+    for (name, policy) in policies {
+        if let IngestTimingPolicy::PaceToRealtime { maximum_lead, .. } = policy.ingest_timing
+            && maximum_lead < part_duration
+        {
+            warnings.push(format!(
+                "auth policy `{name}` paces at a maximum_lead of {maximum_lead:?}, \
+                 below the {part_duration:?} part duration; a publisher that \
+                 emits a group of pictures at a time will be slowed even when \
+                 it is running at realtime"
+            ));
+        }
+    }
+}
+
+/// Parses one policy duration, naming the field an operator mistyped.
+fn duration(policy: &str, field: &str, value: &str) -> Result<Duration, ConfigError> {
+    humantime::parse_duration(value)
+        .map_err(|error| invalid(format!("auth policy `{policy}`: {field} {error}")))
+}
+
+/// Used when a policy switches to pacing without naming a jump limit.
+///
+/// Read from the built-in permissive policy rather than written twice, so the
+/// default cannot drift from the one the library ships.
+fn default_maximum_timestamp_jump() -> Duration {
+    match StreamPolicy::permissive().ingest_timing {
+        IngestTimingPolicy::PaceToRealtime {
+            maximum_timestamp_jump,
+            ..
+        } => maximum_timestamp_jump,
+        IngestTimingPolicy::RequireRealtime { .. } => Duration::from_secs(10),
+    }
 }
 
 fn resolve_optional_text_secret(

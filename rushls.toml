@@ -55,6 +55,40 @@ maximum_subtitle_tracks = 8
 maximum_video_resolution = "7680x4320"
 maximum_video_frame_rate = "240"
 
+# What to do when a publisher sends media faster than wall clock: a file pushed
+# at full speed, or an encoder catching up after a stall.
+#
+#   "pace"    slow the publisher down until wall clock catches up
+#   "reject"  refuse the publication instead
+#
+# `pace` accepts a file as a live stream, which is what you want for testing and
+# for re-streaming recorded material. `reject` is for a stream that is only
+# meaningful if it is genuinely live, where silently pacing a replay would be
+# worse than refusing it.
+faster_than_realtime = "pace"
+
+# How far ahead of wall clock media may run before the above applies. It means
+# the same thing under both modes; only the response differs.
+#
+# This is slack, not a target. A live encoder tracking wall clock never reaches
+# it. What consumes it is burstiness: the pacer sees individual samples, so an
+# encoder that hands over a whole group of pictures at once is momentarily that
+# far ahead through no fault of its own. Set this comfortably above your
+# publishers' keyframe interval — the default covers a typical two-second GOP.
+#
+# Too low, and a well-behaved encoder is throttled; the symptom is backpressure
+# and rising latency rather than an error, which is easy to mistake for a
+# network problem. Too high under `pace`, and a file-push runs that far ahead
+# before anything slows it, since the lead is media buffered in the pipeline.
+maximum_lead = "2s"
+
+# `pace` only, and rejected outright under `reject`. A forward jump larger than
+# this is a broken timeline rather than something to sleep off, so the
+# publication fails instead of stalling for the length of the gap. Under
+# `reject` the lead check already catches such a jump, so the key would do
+# nothing and is refused rather than silently ignored.
+maximum_timestamp_jump = "10s"
+
 [auth.open]
 # Every admitted publisher has the `anonymous` principal. Omit this field to
 # select the built-in `default` policy.

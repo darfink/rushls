@@ -4,12 +4,13 @@ use std::{
     fs,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use crate::{
     admission::{
-        ClientInfo, IngestProtocol, PresentedCredential, Principal, PublishRequest,
-        PublishResource, StreamPolicy, TakeoverPolicy,
+        ClientInfo, IngestProtocol, IngestTimingPolicy, PresentedCredential, Principal,
+        PublishRequest, PublishResource, StreamPolicy, TakeoverPolicy,
     },
     domain::StreamId,
     observe::lifecycle::Kind,
@@ -824,5 +825,131 @@ fn an_unknown_enumerated_value_names_the_alternatives() -> Result<(), Box<dyn Er
     .to_string();
     assert!(key_length.contains("aes128"), "{key_length}");
     assert!(key_length.contains("aes256"), "{key_length}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_threshold_serves_both_timing_modes() -> Result<(), Box<dyn Error>> {
+    let paced = resolve_toml(
+        r#"
+[auth.policies.default]
+faster_than_realtime = "pace"
+maximum_lead = "4s"
+maximum_timestamp_jump = "30s"
+"#,
+    )??
+    .authenticator
+    .authenticate(&request("ignored"))
+    .await?;
+    assert_eq!(
+        paced.policy.ingest_timing,
+        IngestTimingPolicy::PaceToRealtime {
+            maximum_lead: Duration::from_secs(4),
+            maximum_timestamp_jump: Duration::from_secs(30),
+        }
+    );
+
+    let strict = resolve_toml(
+        r#"
+[auth.policies.default]
+faster_than_realtime = "reject"
+maximum_lead = "500ms"
+"#,
+    )??
+    .authenticator
+    .authenticate(&request("ignored"))
+    .await?;
+    assert_eq!(
+        strict.policy.ingest_timing,
+        IngestTimingPolicy::RequireRealtime {
+            maximum_lead: Duration::from_millis(500),
+        },
+        "the same key means the same thing under either mode; only the \
+         response to exceeding it changes"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_timing_setting_that_could_never_apply_is_rejected() -> Result<(), Box<dyn Error>> {
+    // Rejecting already catches a forward jump through the lead itself, so this
+    // key would silently do nothing.
+    let jump_without_pacing = r#"
+[auth.policies.default]
+faster_than_realtime = "reject"
+maximum_timestamp_jump = "30s"
+"#;
+    // Every tolerated lead would also be a broken timeline.
+    let jump_below_lead = r#"
+[auth.policies.default]
+maximum_lead = "10s"
+maximum_timestamp_jump = "5s"
+"#;
+    let no_lead_at_all = r#"
+[auth.policies.default]
+maximum_lead = "0s"
+"#;
+    let unparsable = r#"
+[auth.policies.default]
+maximum_lead = "soon"
+"#;
+    let misspelled = r#"
+[auth.policies.default]
+faster_then_realtime = "pace"
+"#;
+
+    for configuration in [
+        jump_without_pacing,
+        jump_below_lead,
+        no_lead_at_all,
+        unparsable,
+        misspelled,
+    ] {
+        assert!(
+            resolve_toml(configuration)?.is_err(),
+            "expected a startup error for:{configuration}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_lead_tighter_than_a_part_warns_without_refusing() -> Result<(), Box<dyn Error>> {
+    let resolved = resolve_toml(
+        r#"
+[hls]
+part_duration = "1s"
+
+[auth.policies.default]
+faster_than_realtime = "pace"
+maximum_lead = "200ms"
+"#,
+    )??;
+
+    assert_eq!(
+        resolved.warnings.len(),
+        1,
+        "pacing below the part duration throttles an encoder that is keeping \
+         up, and the symptom looks like a network problem: {:?}",
+        resolved.warnings
+    );
+    assert!(
+        resolved.warnings[0].contains("default"),
+        "it names the policy"
+    );
+
+    // The same lead under `reject` is not a mistake — it is how an operator
+    // says a stream must be genuinely live.
+    let strict = resolve_toml(
+        r#"
+[hls]
+part_duration = "1s"
+
+[auth.policies.default]
+faster_than_realtime = "reject"
+maximum_lead = "200ms"
+"#,
+    )??;
+    assert!(strict.warnings.is_empty());
     Ok(())
 }

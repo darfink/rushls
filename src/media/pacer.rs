@@ -213,12 +213,12 @@ impl MediaPacer {
                 }
                 self.watermark = next_watermark;
             }
-            IngestTimingPolicy::PaceToRealtime { initial_lead, .. } => {
-                let delay = lead.saturating_sub(initial_lead);
+            IngestTimingPolicy::PaceToRealtime { maximum_lead, .. } => {
+                let delay = lead.saturating_sub(maximum_lead);
                 if !delay.is_zero() {
                     let mut wait = PacingWait::new(self.meters.as_ref(), lead);
                     tokio::time::sleep(delay).await;
-                    wait.complete(initial_lead);
+                    wait.complete(maximum_lead);
                 } else {
                     self.meters.pacing_observation(lead, Duration::ZERO, false);
                 }
@@ -244,7 +244,7 @@ mod tests {
         let meters = SessionMeters::new(ProcessMeters::default());
         let mut pacer = MediaPacer::after_preroll(
             IngestTimingPolicy::PaceToRealtime {
-                initial_lead: Duration::from_secs(1),
+                maximum_lead: Duration::from_secs(1),
                 maximum_timestamp_jump: Duration::from_secs(10),
             },
             &timeline,
@@ -293,7 +293,7 @@ mod tests {
         let meters = SessionMeters::new(ProcessMeters::default());
         let mut pacer = MediaPacer::after_preroll(
             IngestTimingPolicy::PaceToRealtime {
-                initial_lead: Duration::ZERO,
+                maximum_lead: Duration::ZERO,
                 maximum_timestamp_jump: Duration::from_secs(1),
             },
             &timeline,
@@ -317,7 +317,7 @@ mod tests {
         let meters = SessionMeters::new(ProcessMeters::default());
         let mut pacer = MediaPacer::after_preroll(
             IngestTimingPolicy::PaceToRealtime {
-                initial_lead: Duration::from_secs(1),
+                maximum_lead: Duration::from_secs(1),
                 maximum_timestamp_jump: Duration::from_secs(10),
             },
             &timeline,

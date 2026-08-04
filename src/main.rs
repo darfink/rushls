@@ -83,6 +83,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let resolved = AppConfig::load()
         .and_then(AppConfig::resolve)
         .unwrap_or_else(|error| error.exit());
+    for warning in &resolved.warnings {
+        eprintln!("warning: {warning}");
+    }
 
     // The base observer is what hooks themselves report through, so a failing
     // hook cannot produce events that re-enter it.

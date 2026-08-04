@@ -109,8 +109,14 @@ pub enum IngestTimingPolicy {
     RequireRealtime { maximum_lead: Duration },
     /// Apply backpressure when normalized media gets ahead of wall clock.
     PaceToRealtime {
-        /// Lead allowed without delaying the publisher after pre-roll.
-        initial_lead: Duration,
+        /// Lead tolerated before the publisher is slept back to realtime.
+        ///
+        /// The same quantity [`Self::RequireRealtime`] rejects on, which is
+        /// why both spell it the same way: how far ahead media may run. Only
+        /// the answer to running further differs.
+        ///
+        /// Applies for the whole publication, not just its opening burst.
+        maximum_lead: Duration,
         /// Reject a forward discontinuity this large rather than sleeping for
         /// what is probably a broken timeline.
         maximum_timestamp_jump: Duration,
@@ -155,7 +161,7 @@ impl StreamPolicy {
         Self {
             takeovers: TakeoverPolicy::Allow,
             ingest_timing: IngestTimingPolicy::PaceToRealtime {
-                initial_lead: Duration::from_secs(2),
+                maximum_lead: Duration::from_secs(2),
                 maximum_timestamp_jump: Duration::from_secs(10),
             },
             accepted_video_codecs: vec![Codec::H264, Codec::Hevc, Codec::Av1],
