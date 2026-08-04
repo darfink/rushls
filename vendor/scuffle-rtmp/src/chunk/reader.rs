@@ -624,6 +624,99 @@ mod tests {
     }
 
     #[test]
+    fn type_three_new_message_advances_by_previous_delta() {
+        let mut wire = BytesMut::new();
+        // Type 0: absolute timestamp 100, three-byte audio message.
+        wire.extend_from_slice(&[
+            0x04, 0x00, 0x00, 0x64, 0x00, 0x00, 0x03, 0x08, 0x01, 0x00, 0x00, 0x00,
+        ]);
+        wire.extend_from_slice(b"aaa");
+        // Type 1: delta 21, same stream with a new three-byte payload.
+        wire.extend_from_slice(&[0x44, 0x00, 0x00, 0x15, 0x00, 0x00, 0x03, 0x08]);
+        wire.extend_from_slice(b"bbb");
+        // Type 3: a complete new message reusing the delta, length, and type.
+        wire.extend_from_slice(&[0xc4]);
+        wire.extend_from_slice(b"ccc");
+        let mut reader = ChunkReader::default();
+
+        let first = reader
+            .read_chunk(&mut wire)
+            .expect("first chunk is valid")
+            .expect("first message is complete");
+        let second = reader
+            .read_chunk(&mut wire)
+            .expect("second chunk is valid")
+            .expect("second message is complete");
+        let third = reader
+            .read_chunk(&mut wire)
+            .expect("third chunk is valid")
+            .expect("third message is complete");
+
+        assert_eq!(first.message_header.timestamp, 100);
+        assert_eq!(second.message_header.timestamp, 121);
+        assert_eq!(third.message_header.timestamp, 142);
+        assert_eq!(third.payload.as_ref(), b"ccc");
+        assert!(wire.is_empty());
+    }
+
+    #[test]
+    fn type_three_continuation_keeps_current_message_timestamp() {
+        let mut wire = BytesMut::new();
+        // The 130-byte message exceeds RTMP's initial 128-byte chunk size.
+        wire.extend_from_slice(&[
+            0x04, 0x00, 0x00, 0x64, 0x00, 0x00, 0x82, 0x08, 0x01, 0x00, 0x00, 0x00,
+        ]);
+        wire.extend_from_slice(&[b'a'; 128]);
+        wire.extend_from_slice(&[0xc4, b'b', b'b']);
+        let mut reader = ChunkReader::default();
+
+        let message = reader
+            .read_chunk(&mut wire)
+            .expect("continuation chunk is valid")
+            .expect("partial chunks form one complete message");
+
+        assert_eq!(message.message_header.timestamp, 100);
+        assert_eq!(message.payload.len(), 130);
+        assert!(wire.is_empty());
+    }
+
+    #[test]
+    fn compressed_message_timestamps_wrap_at_32_bits() {
+        let mut wire = BytesMut::new();
+        // Type 0: extended absolute timestamp just below the rollover point.
+        wire.extend_from_slice(&[
+            0x04, 0xff, 0xff, 0xff, 0x00, 0x00, 0x03, 0x08, 0x01, 0x00, 0x00, 0x00, 0xff, 0xff,
+            0xff, 0xf0,
+        ]);
+        wire.extend_from_slice(b"aaa");
+        // Type 1: delta 32 wraps the absolute timestamp to 16.
+        wire.extend_from_slice(&[0x44, 0x00, 0x00, 0x20, 0x00, 0x00, 0x03, 0x08]);
+        wire.extend_from_slice(b"bbb");
+        // Type 3: reuses delta 32 and advances to 48.
+        wire.extend_from_slice(&[0xc4]);
+        wire.extend_from_slice(b"ccc");
+        let mut reader = ChunkReader::default();
+
+        let first = reader
+            .read_chunk(&mut wire)
+            .expect("first chunk is valid")
+            .expect("first message is complete");
+        let second = reader
+            .read_chunk(&mut wire)
+            .expect("second chunk is valid")
+            .expect("second message is complete");
+        let third = reader
+            .read_chunk(&mut wire)
+            .expect("third chunk is valid")
+            .expect("third message is complete");
+
+        assert_eq!(first.message_header.timestamp, 0xffff_fff0);
+        assert_eq!(second.message_header.timestamp, 0x10);
+        assert_eq!(third.message_header.timestamp, 0x30);
+        assert!(wire.is_empty());
+    }
+
+    #[test]
     fn test_incomplete_header() {
         let mut buf = BytesMut::new();
         buf.extend_from_slice(&[0b00_000000]);

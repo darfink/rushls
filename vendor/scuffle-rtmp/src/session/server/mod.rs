@@ -1,11 +1,12 @@
 //! RTMP server session.
 
+use std::future::Future;
+use std::io;
 use std::time::Duration;
 
 use bytes::BytesMut;
 use scuffle_bytes_util::{BytesCursorExt, StringCow};
 use scuffle_context::ContextFutExt;
-use scuffle_future_ext::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::chunk::CHUNK_SIZE;
@@ -38,64 +39,28 @@ pub use handler::{SessionData, SessionHandler};
 // - https://github.com/FFmpeg/FFmpeg/blob/154c00514d889d27ae84a1001e00f9032fdc1c54/libavformat/rtmpproto.c#L2850
 const DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE: u32 = 2_500_000; // 2.5 MB
 
-fn write_initial_flow_control(
-    output: &mut Vec<u8>,
-    writer: &ChunkWriter,
-) -> Result<(), crate::error::RtmpError> {
-    // Flow-control windows are independent of RTMP chunk size. Advertising the
-    // 4 KiB chunk size here makes FFmpeg send an acknowledgement about every
-    // 2 KiB even though this receiver uses the conventional 2.5 MB window.
-    ProtocolControlMessageWindowAcknowledgementSize {
-        acknowledgement_window_size: DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE,
-    }
-    .write(output, writer)?;
-
-    ProtocolControlMessageSetPeerBandwidth {
-        acknowledgement_window_size: DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE,
-        limit_type: ProtocolControlMessageSetPeerBandwidthLimitType::Dynamic,
-    }
-    .write(output, writer)?;
-
-    Ok(())
+/// Network operation timeouts for an RTMP server session.
+///
+/// A value of `None` disables that timeout. The defaults preserve the
+/// timeouts used by scuffle-rtmp 0.2.3 before they were configurable.
+#[derive(Clone, Copy, Debug)]
+pub struct ServerSessionTimeouts {
+    /// Maximum time allowed for each handshake read.
+    pub handshake_read: Option<Duration>,
+    /// Maximum time allowed for each established-session read.
+    pub session_read: Option<Duration>,
+    /// Maximum time allowed for each socket write.
+    pub write: Option<Duration>,
 }
 
-fn validate_acknowledgement_window_size(
-    acknowledgement_window_size: u32,
-) -> Result<(), crate::error::RtmpError> {
-    if acknowledgement_window_size == 0 {
-        return Err(ServerSessionError::InvalidAcknowledgementWindowSize(
-            acknowledgement_window_size,
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn record_bytes_read(
-    sequence_number: &mut u32,
-    bytes_since_acknowledgement: &mut u32,
-    acknowledgement_window_size: u32,
-    bytes_read: u32,
-    output: &mut Vec<u8>,
-    writer: &ChunkWriter,
-) -> Result<(), crate::error::RtmpError> {
-    validate_acknowledgement_window_size(acknowledgement_window_size)?;
-    *sequence_number = sequence_number.wrapping_add(bytes_read);
-    let unacknowledged = u64::from(*bytes_since_acknowledgement) + u64::from(bytes_read);
-    let window = u64::from(acknowledgement_window_size);
-
-    if unacknowledged >= window {
-        tracing::debug!(sequence_number = %sequence_number, "sending acknowledgement");
-        ProtocolControlMessageAcknowledgement {
-            sequence_number: *sequence_number,
+impl Default for ServerSessionTimeouts {
+    fn default() -> Self {
+        Self {
+            handshake_read: Some(Duration::from_secs(2)),
+            session_read: Some(Duration::from_millis(2500)),
+            write: Some(Duration::from_secs(2)),
         }
-        .write(output, writer)?;
-        *bytes_since_acknowledgement = (unacknowledged % window) as u32;
-    } else {
-        *bytes_since_acknowledgement = unacknowledged as u32;
     }
-
-    Ok(())
 }
 
 /// A RTMP server session that is used to communicate with a client.
@@ -143,6 +108,8 @@ pub struct ServerSession<S, H> {
     chunk_writer: ChunkWriter,
     /// Is Publishing
     publishing_stream_ids: Vec<u32>,
+    /// Timeouts applied to network reads and writes.
+    timeouts: ServerSessionTimeouts,
 }
 
 impl<S, H> ServerSession<S, H> {
@@ -164,12 +131,19 @@ impl<S, H> ServerSession<S, H> {
             read_buf: BytesMut::new(),
             write_buf: Vec::new(),
             publishing_stream_ids: Vec::new(),
+            timeouts: ServerSessionTimeouts::default(),
         }
     }
 
     /// Set the context of the session.
     pub fn with_context(mut self, ctx: scuffle_context::Context) -> Self {
         self.ctx = Some(ctx);
+        self
+    }
+
+    /// Configure network operation timeouts for this session.
+    pub fn with_timeouts(mut self, timeouts: ServerSessionTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 }
@@ -236,12 +210,11 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
 
         let mut bytes_read = 0;
         while bytes_read < READ_SIZE {
-            let n = self
-                .io
-                .read_buf(&mut self.read_buf)
-                .with_timeout(Duration::from_secs(2))
-                .await
-                .map_err(ServerSessionError::Timeout)??;
+            let n = io_with_timeout(
+                self.timeouts.handshake_read,
+                self.io.read_buf(&mut self.read_buf),
+            )
+            .await?;
             bytes_read += n;
 
             self.sequence_number = self.sequence_number.wrapping_add(n.try_into().unwrap_or(u32::MAX));
@@ -306,25 +279,17 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
         } else {
             self.read_buf.reserve(CHUNK_SIZE);
 
-            let n = self
-                .io
-                .read_buf(&mut self.read_buf)
-                .with_timeout(Duration::from_millis(2500))
-                .await
-                .map_err(ServerSessionError::Timeout)?? as u32;
+            let n = io_with_timeout(
+                self.timeouts.session_read,
+                self.io.read_buf(&mut self.read_buf),
+            )
+            .await? as u32;
 
             if n == 0 {
                 return Ok(false);
             }
 
-            record_bytes_read(
-                &mut self.sequence_number,
-                &mut self.bytes_since_acknowledgement,
-                self.acknowledgement_window_size,
-                n,
-                &mut self.write_buf,
-                &self.chunk_writer,
-            )?;
+            self.record_bytes_read(n)?;
         }
 
         self.process_chunks().await?;
@@ -427,7 +392,17 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
                     .await?;
             }
             CommandType::Unknown(unknown_command) => {
-                self.handler.on_unknown_command(stream_id, unknown_command).await?;
+                // A `deleteStream` naming its stream rather than numbering it
+                // arrives here (see the reader). It is still an unpublish, so
+                // resolve it against what this connection publishes.
+                if unknown_command.command_name.as_str() == "deleteStream" {
+                    if let Some(&publishing) = self.publishing_stream_ids.first() {
+                        self.on_command_delete_stream(stream_id, command.transaction_id, publishing as f64)
+                            .await?;
+                    }
+                } else {
+                    self.handler.on_unknown_command(stream_id, unknown_command).await?;
+                }
             }
             // ignore everything else
             _ => {}
@@ -452,8 +427,35 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
     /// from the client.
     fn on_acknowledgement_window_size(&mut self, acknowledgement_window_size: u32) -> Result<(), crate::error::RtmpError> {
         tracing::debug!(acknowledgement_window_size = %acknowledgement_window_size, "received new acknowledgement window size");
-        validate_acknowledgement_window_size(acknowledgement_window_size)?;
+        if acknowledgement_window_size == 0 {
+            return Err(ServerSessionError::InvalidAcknowledgementWindowSize(
+                acknowledgement_window_size,
+            )
+            .into());
+        }
         self.acknowledgement_window_size = acknowledgement_window_size;
+        Ok(())
+    }
+
+    /// Record newly received bytes and emit an acknowledgement after crossing
+    /// the peer's configured window. The acknowledgement sequence includes the
+    /// bytes from the read that crossed the boundary.
+    fn record_bytes_read(&mut self, bytes_read: u32) -> Result<(), crate::error::RtmpError> {
+        self.sequence_number = self.sequence_number.wrapping_add(bytes_read);
+        let unacknowledged = u64::from(self.bytes_since_acknowledgement) + u64::from(bytes_read);
+        let window = u64::from(self.acknowledgement_window_size);
+
+        if unacknowledged >= window {
+            tracing::debug!(sequence_number = %self.sequence_number, "sending acknowledgement");
+            ProtocolControlMessageAcknowledgement {
+                sequence_number: self.sequence_number,
+            }
+            .write(&mut self.write_buf, &self.chunk_writer)?;
+            self.bytes_since_acknowledgement = (unacknowledged % window) as u32;
+        } else {
+            self.bytes_since_acknowledgement = unacknowledged as u32;
+        }
+
         Ok(())
     }
 
@@ -466,7 +468,16 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
         transaction_id: f64,
         connect: NetConnectionCommandConnect<'_>,
     ) -> Result<(), crate::error::RtmpError> {
-        write_initial_flow_control(&mut self.write_buf, &self.chunk_writer)?;
+        ProtocolControlMessageWindowAcknowledgementSize {
+            acknowledgement_window_size: DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE,
+        }
+        .write(&mut self.write_buf, &self.chunk_writer)?;
+
+        ProtocolControlMessageSetPeerBandwidth {
+            acknowledgement_window_size: DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE,
+            limit_type: ProtocolControlMessageSetPeerBandwidthLimitType::Dynamic,
+        }
+        .write(&mut self.write_buf, &self.chunk_writer)?;
 
         self.app_name = Some(connect.app.into_owned());
         self.caps_ex = connect.caps_ex;
@@ -477,7 +488,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
             command_type: CommandType::NetConnection(result),
             transaction_id,
         }
-        .write(&mut self.write_buf, &self.chunk_writer)?;
+        .write(&mut self.write_buf, &self.chunk_writer, 0)?;
 
         Ok(())
     }
@@ -496,7 +507,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
             command_type: CommandType::NetConnection(NetConnectionCommand::CreateStreamResult { stream_id: 1.0 }),
             transaction_id,
         }
-        .write(&mut self.write_buf, &self.chunk_writer)?;
+        .write(&mut self.write_buf, &self.chunk_writer, 0)?;
 
         Ok(())
     }
@@ -527,7 +538,8 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
             }),
             transaction_id,
         }
-        .write(&mut self.write_buf, &self.chunk_writer)?;
+        // A NetStream status belongs on the stream it describes, not on 0.
+        .write(&mut self.write_buf, &self.chunk_writer, stream_id)?;
 
         Ok(())
     }
@@ -562,18 +574,19 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
             }),
             transaction_id,
         }
-        .write(&mut self.write_buf, &self.chunk_writer)?;
+        // A NetStream status belongs on the stream it describes, not on 0.
+        .write(&mut self.write_buf, &self.chunk_writer, stream_id)?;
 
         Ok(())
     }
 
     async fn flush(&mut self) -> Result<(), crate::error::RtmpError> {
         if !self.write_buf.is_empty() {
-            self.io
-                .write_all(self.write_buf.as_ref())
-                .with_timeout(Duration::from_secs(2))
-                .await
-                .map_err(ServerSessionError::Timeout)??;
+            io_with_timeout(
+                self.timeouts.write,
+                self.io.write_all(self.write_buf.as_ref()),
+            )
+            .await?;
             self.write_buf.clear();
         }
 
@@ -584,90 +597,89 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin, H: SessionHandler>
 #[cfg(test)]
 #[cfg_attr(all(test, coverage_nightly), coverage(off))]
 mod tests {
-    use std::io;
+    use std::collections::HashMap;
 
     use bytes::BytesMut;
 
     use super::*;
+    use crate::chunk::reader::ChunkReader;
     use crate::messages::MessageType;
 
-    #[test]
-    fn initial_flow_control_uses_the_receive_window_not_the_chunk_size()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let mut encoded = Vec::new();
-        write_initial_flow_control(&mut encoded, &ChunkWriter::default())?;
+    struct Handler;
 
-        let mut encoded = BytesMut::from(encoded.as_slice());
+    impl SessionHandler for Handler {
+        async fn on_publish(&mut self, _stream_id: u32, _app_name: &str, _stream_name: &str) -> Result<(), ServerSessionError> {
+            Ok(())
+        }
+
+        async fn on_unpublish(&mut self, _stream_id: u32) -> Result<(), ServerSessionError> {
+            Ok(())
+        }
+
+        async fn on_data(&mut self, _stream_id: u32, _data: SessionData) -> Result<(), ServerSessionError> {
+            Ok(())
+        }
+    }
+
+    fn session() -> ServerSession<tokio::io::DuplexStream, Handler> {
+        let (server, _client) = tokio::io::duplex(64);
+        ServerSession::new(server, Handler)
+    }
+
+    #[tokio::test]
+    async fn connect_advertises_ffmpeg_acknowledgement_windows() {
+        let mut session = session();
+        session
+            .on_command_connect(0, 1.0, NetConnectionCommandConnect { app: "live".into(), caps_ex: None, others: HashMap::new() })
+            .await
+            .expect("connect response");
+
+        let mut wire = BytesMut::from(session.write_buf.as_slice());
         let mut reader = ChunkReader::default();
-        let window = reader
-            .read_chunk(&mut encoded)?
-            .ok_or_else(|| io::Error::other("missing acknowledgement-window message"))?;
-        assert_eq!(
-            window.message_header.msg_type_id,
-            MessageType::WindowAcknowledgementSize
-        );
-        assert_eq!(
-            window.payload.as_ref(),
-            DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE.to_be_bytes()
-        );
+        let window = reader.read_chunk(&mut wire).expect("read window chunk").expect("complete window chunk");
+        assert_eq!(window.message_header.msg_type_id, MessageType::WindowAcknowledgementSize);
+        assert_eq!(window.payload.as_ref(), DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE.to_be_bytes());
 
-        let bandwidth = reader
-            .read_chunk(&mut encoded)?
-            .ok_or_else(|| io::Error::other("missing peer-bandwidth message"))?;
-        assert_eq!(
-            bandwidth.message_header.msg_type_id,
-            MessageType::SetPeerBandwidth
-        );
-        assert_eq!(
-            &bandwidth.payload[..4],
-            &DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE.to_be_bytes()
-        );
-        assert_eq!(
-            bandwidth.payload[4],
-            ProtocolControlMessageSetPeerBandwidthLimitType::Dynamic as u8
-        );
-        assert!(encoded.is_empty());
-
-        Ok(())
+        let bandwidth = reader.read_chunk(&mut wire).expect("read bandwidth chunk").expect("complete bandwidth chunk");
+        assert_eq!(bandwidth.message_header.msg_type_id, MessageType::SetPeerBandwidth);
+        assert_eq!(bandwidth.payload.as_ref(), [DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE.to_be_bytes().as_slice(), &[2]].concat());
     }
 
     #[test]
-    fn acknowledgement_includes_boundary_crossing_read() -> Result<(), Box<dyn std::error::Error>> {
-        let mut sequence_number = 7;
-        let mut unacknowledged = 7;
-        let mut encoded = Vec::new();
-        record_bytes_read(
-            &mut sequence_number,
-            &mut unacknowledged,
-            10,
-            5,
-            &mut encoded,
-            &ChunkWriter::default(),
-        )?;
+    fn acknowledgement_includes_boundary_crossing_read() {
+        let mut session = session();
+        session.acknowledgement_window_size = 10;
+        session.sequence_number = 7;
+        session.bytes_since_acknowledgement = 7;
 
-        assert_eq!(sequence_number, 12);
-        assert_eq!(unacknowledged, 2);
-        let mut encoded = BytesMut::from(encoded.as_slice());
-        let acknowledgement = ChunkReader::default()
-            .read_chunk(&mut encoded)?
-            .ok_or_else(|| io::Error::other("missing acknowledgement message"))?;
-        assert_eq!(
-            acknowledgement.message_header.msg_type_id,
-            MessageType::Acknowledgement
-        );
+        session.record_bytes_read(5).expect("record bytes");
+
+        assert_eq!(session.sequence_number, 12);
+        assert_eq!(session.bytes_since_acknowledgement, 2);
+        let mut wire = BytesMut::from(session.write_buf.as_slice());
+        let acknowledgement =
+            ChunkReader::default().read_chunk(&mut wire).expect("read acknowledgement").expect("complete acknowledgement");
+        assert_eq!(acknowledgement.message_header.msg_type_id, MessageType::Acknowledgement);
         assert_eq!(acknowledgement.payload.as_ref(), 12_u32.to_be_bytes());
-        assert!(encoded.is_empty());
-
-        Ok(())
     }
 
     #[test]
     fn zero_acknowledgement_window_is_rejected() {
-        assert!(matches!(
-            validate_acknowledgement_window_size(0),
-            Err(crate::error::RtmpError::Session(
-                ServerSessionError::InvalidAcknowledgementWindowSize(0)
-            ))
-        ));
+        let mut session = session();
+        let error = session.on_acknowledgement_window_size(0).expect_err("zero window must fail");
+        assert!(matches!(error, crate::error::RtmpError::Session(ServerSessionError::InvalidAcknowledgementWindowSize(0))));
     }
+}
+
+async fn io_with_timeout<T>(
+    timeout: Option<Duration>,
+    future: impl Future<Output = io::Result<T>>,
+) -> Result<T, crate::error::RtmpError> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, future)
+            .await
+            .map_err(ServerSessionError::Timeout)?,
+        None => future.await,
+    }
+    .map_err(Into::into)
 }

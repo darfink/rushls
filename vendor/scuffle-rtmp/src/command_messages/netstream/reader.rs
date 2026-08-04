@@ -1,6 +1,7 @@
 //! Reading [`NetStreamCommand`].
 
 use bytes::Bytes;
+use scuffle_amf0::Amf0Value;
 use scuffle_amf0::decoder::Amf0Decoder;
 use scuffle_bytes_util::zero_copy::BytesBuf;
 
@@ -31,8 +32,17 @@ impl NetStreamCommand<'_> {
                 // skip command object
                 decoder.decode_null()?;
 
-                let stream_id = decoder.decode_number()?;
-                Ok(Some(Self::DeleteStream { stream_id }))
+                // Adobe types this argument as the numeric stream id, but
+                // GStreamer's rtmp2sink sends the stream *name* instead. Report
+                // the non-conforming form as unrecognized so the session can
+                // resolve it against the streams this connection publishes,
+                // rather than failing a connection whose media was fine.
+                match decoder.decode_all()?.first() {
+                    Some(Amf0Value::Number(stream_id)) => {
+                        Ok(Some(Self::DeleteStream { stream_id: *stream_id }))
+                    }
+                    _ => Ok(None),
+                }
             }
             "closeStream" => Ok(Some(Self::CloseStream)),
             "receiveAudio" => {

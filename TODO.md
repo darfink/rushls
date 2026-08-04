@@ -25,13 +25,15 @@
 - Maybe re-use/ffmpeg refcounter buffers with cmaf muxer?
 - Add h264 profile/level to accepted codecs logic?
 - Test with non-paced source stream?
-- Invert so http exports types for HLS instead of vice versa?
 - Is a lot of work happening on one single thread?
 - Let shutdown signal disconnect but flush? IDK
+- Store cached segments on disk?
+- Sometimes subtitle cue is layed over the other one - they collide?
+- Support MoQ ingest?
 
 # MUST DOES
 
-- Test reconnects/evictions?
+- Test evictions?
 - Automated test on macos w/ mediastreamvalidator?
 
 # LATER

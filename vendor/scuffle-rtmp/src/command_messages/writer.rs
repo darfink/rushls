@@ -35,17 +35,39 @@ impl Display for CommandResultLevel {
 }
 
 impl Command<'_> {
-    fn write_amf0_chunk(io: &mut impl io::Write, writer: &ChunkWriter, payload: Bytes) -> io::Result<()> {
+    fn write_amf0_chunk(
+        io: &mut impl io::Write,
+        writer: &ChunkWriter,
+        payload: Bytes,
+        message_stream_id: u32,
+    ) -> io::Result<()> {
         writer.write_chunk(
             io,
-            Chunk::new(CHUNK_STREAM_ID_COMMAND, 0, MessageType::CommandAMF0, 0, payload),
+            Chunk::new(
+                CHUNK_STREAM_ID_COMMAND,
+                0,
+                MessageType::CommandAMF0,
+                message_stream_id,
+                payload,
+            ),
         )
     }
 
     /// Writes a [`Command`] to the given writer.
     ///
+    /// `message_stream_id` selects the RTMP message stream the command is sent
+    /// on. NetConnection replies belong on stream 0, but a NetStream `onStatus`
+    /// must be sent on the stream it describes: clients such as GStreamer's
+    /// `rtmp2sink` match the reply to their publishing stream by this id and
+    /// will wait forever for a `NetStream.Publish.Start` that arrives on 0.
+    ///
     /// Skips unknown commands.
-    pub fn write(self, io: &mut impl io::Write, writer: &ChunkWriter) -> Result<(), RtmpError> {
+    pub fn write(
+        self,
+        io: &mut impl io::Write,
+        writer: &ChunkWriter,
+        message_stream_id: u32,
+    ) -> Result<(), RtmpError> {
         let mut buf = BytesMut::new();
         let mut buf_writer = (&mut buf).writer();
 
@@ -63,7 +85,7 @@ impl Command<'_> {
             CommandType::Unknown { .. } => {}
         }
 
-        Self::write_amf0_chunk(io, writer, buf.freeze())?;
+        Self::write_amf0_chunk(io, writer, buf.freeze(), message_stream_id)?;
 
         Ok(())
     }
@@ -104,7 +126,7 @@ mod tests {
             command_type: CommandType::NetStream(NetStreamCommand::CloseStream),
             transaction_id: 1.0,
         }
-        .write(&mut buf, &writer)
+        .write(&mut buf, &writer, 0)
         .unwrap_err();
 
         assert!(matches!(err, RtmpError::Command(CommandError::NoClientImplementation)));
