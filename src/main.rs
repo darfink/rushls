@@ -5,6 +5,7 @@ use rushls::{
     hooks::{self, HookObserver},
     observe::{EventObserver, Events, NodeEvent, SessionEvent, StreamEvent},
     server::{AppConfig, Node, ResolvedHooks},
+    version,
 };
 use tokio::sync::watch;
 
@@ -83,6 +84,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let resolved = AppConfig::load()
         .and_then(AppConfig::resolve)
         .unwrap_or_else(|error| error.exit());
+    eprintln!("rushls {}", version());
     for warning in &resolved.warnings {
         eprintln!("warning: {warning}");
     }

@@ -110,7 +110,7 @@ impl ConfigError {
 ///
 /// Values resolve in the order `defaults < TOML < environment < CLI`.
 #[derive(Conf)]
-#[conf(serde, name = "rushls", version, env_prefix = "RUSHLS_")]
+#[conf(serde, name = "rushls", version_fn = crate::version, env_prefix = "RUSHLS_")]
 pub struct AppConfig {
     /// TOML configuration file to load.
     #[conf(parameter, long, env = "CONFIG", serde(skip))]
