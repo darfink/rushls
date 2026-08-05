@@ -638,17 +638,14 @@ mod tests {
     use std::{
         io::Cursor,
         num::NonZero,
-        sync::Arc,
         time::{Duration, SystemTime},
     };
-
-    use parking_lot::Mutex;
 
     use crate::{
         admission::StreamPolicy,
         domain::{
-            AudioTiming, AudioTrim, FrameRate, MediaKind, MediaParameters, Payload, SessionId,
-            Timebase, TrackId,
+            AudioTiming, AudioTrim, FrameRate, MediaKind, MediaParameters, Payload, Timebase,
+            TrackId,
             fixtures::{TrackBuilder, catalog},
         },
         media::{
@@ -659,9 +656,10 @@ mod tests {
             InitializationSegment, MuxerStartRequest, PackagedMedia, SegmentBoundaryPolicy,
             fixtures::{
                 AAC_EXTRADATA, AAC_FRAME, AAC_FRAME_SAMPLES, H264_EXTRADATA, H264_IDR, H264_P,
+                RecordedEvents, discarded_events,
             },
         },
-        observe::{EventObserver, Events, SessionEvent},
+        observe::SessionEvent,
         segment::{SegmentationPlan, fixtures::PlanBuilder},
         source::{
             DiscoveryLimits, DiscoveryReport, InputLimits, Packet, PacketSource,
@@ -673,15 +671,6 @@ mod tests {
     use crate::mux::{MuxerFactory, PassThroughMuxerFactory};
 
     const FRAME: u64 = 8_192;
-
-    #[derive(Default)]
-    struct Recorder(Mutex<Vec<SessionEvent>>);
-
-    impl EventObserver for Recorder {
-        fn observe(&self, _session: SessionId, event: SessionEvent) {
-            self.0.lock().push(event);
-        }
-    }
 
     fn track(timebase: Timebase) -> crate::domain::DiscoveredTrack {
         TrackBuilder::new(0, MediaKind::Video)
@@ -906,10 +895,6 @@ mod tests {
         })
     }
 
-    fn event_sink() -> crate::observe::EventSink {
-        Events::default().scoped(SessionId(nz::u64!(1)))
-    }
-
     fn top_level_boxes(payload: &Payload) -> Vec<[u8; 4]> {
         let bytes = payload.as_bytes();
         let mut offset = 0;
@@ -989,7 +974,7 @@ mod tests {
 
     #[test]
     fn a_timestamp_gap_at_a_boundary_keeps_delivery_timing_contiguous() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let mut started = start(
             SegmentBoundaryPolicy::Strict,
             Timebase::new(nz::u32!(1), nz::u32!(16_384)),
@@ -1023,7 +1008,7 @@ mod tests {
 
     #[test]
     fn delay_moov_emits_initialization_then_first_chunk() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let mut started = start(
             SegmentBoundaryPolicy::Strict,
             Timebase::new(nz::u32!(1), nz::u32!(16_384)),
@@ -1078,7 +1063,7 @@ mod tests {
 
     #[test]
     fn reordered_video_parts_are_measured_on_the_decode_timeline() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(16_384));
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
             .expect("fixture presentation validates");
@@ -1120,7 +1105,7 @@ mod tests {
 
     #[test]
     fn strict_boundaries_complete_zero_based_segments() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let mut started = start(
             SegmentBoundaryPolicy::Strict,
             Timebase::new(nz::u32!(1), nz::u32!(16_384)),
@@ -1154,7 +1139,7 @@ mod tests {
 
     #[test]
     fn multiple_tracks_use_distinct_output_contexts_and_rendition_ids() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(16_384));
         let input = validate(
             &catalog(vec![track(timebase), {
@@ -1206,7 +1191,7 @@ mod tests {
     fn audio_segments_repeat_on_the_access_unit_grid() {
         // Exact AAC-aligned schedules should retain exact starts and durations;
         // the absolute-schedule test below covers the non-aligned case.
-        let sink = event_sink();
+        let sink = discarded_events();
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
         let frames_per_segment = 16_u64;
         let segment_ticks = AAC_FRAME_SAMPLES * frames_per_segment;
@@ -1266,7 +1251,7 @@ mod tests {
         part_target: NonZero<u64>,
         segment_ticks: u64,
     ) -> (Vec<u64>, u64) {
-        let sink = event_sink();
+        let sink = discarded_events();
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
         let audio = TrackBuilder::new(0, MediaKind::Audio)
             .timebase(timebase)
@@ -1391,7 +1376,7 @@ mod tests {
 
     #[test]
     fn audio_boundary_quantization_does_not_move_the_planned_grid() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
         let audio = TrackBuilder::new(0, MediaKind::Audio)
             .timebase(timebase)
@@ -1442,7 +1427,7 @@ mod tests {
 
     #[tokio::test]
     async fn audio_priming_is_muxed_but_excluded_from_chunk_timing() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let mut started = start_audio(
             AudioTiming {
                 initial_padding_samples: 1_024,
@@ -1519,7 +1504,7 @@ mod tests {
 
     #[test]
     fn audio_priming_spanning_access_units_keeps_packet_metadata_and_grid_timing() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let mut started = start_audio(
             AudioTiming {
                 initial_padding_samples: 2_112,
@@ -1571,7 +1556,7 @@ mod tests {
 
     #[test]
     fn trailing_audio_padding_is_excluded_from_final_delivery_timing() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let mut started = start_audio(
             AudioTiming {
                 trailing_padding_samples: 24,
@@ -1614,7 +1599,7 @@ mod tests {
 
     #[test]
     fn a_genuine_later_video_start_is_exposed_as_positive_media_start() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let timebase = Timebase::hz90k();
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
             .expect("fixture presentation validates");
@@ -1654,7 +1639,7 @@ mod tests {
         // publication, with different timebases and different start times. If a
         // per-track origin adjustment ever creeps back in, the two renditions
         // drift apart here and nowhere else.
-        let sink = event_sink();
+        let sink = discarded_events();
         let video_base = Timebase::new(nz::u32!(1), nz::u32!(16_384));
         let audio_base = Timebase::new(nz::u32!(1), nz::u32!(48_000));
         // The shared instant is half a second before video's first frame, so
@@ -1742,7 +1727,7 @@ mod tests {
 
     #[tokio::test]
     async fn emitted_initialization_and_chunks_are_demuxable() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let mut started = start(
             SegmentBoundaryPolicy::Strict,
             Timebase::new(nz::u32!(1), nz::u32!(16_384)),
@@ -1904,7 +1889,7 @@ mod tests {
             .collect();
         let segmentation = SegmentationPlan::new(&normalized.presentation, tracks)
             .expect("fixture segmentation is valid");
-        let sink = event_sink();
+        let sink = discarded_events();
         let mut mux = PassThroughMuxerFactory::default()
             .start(MuxerStartRequest {
                 presentation: &normalized.presentation,
@@ -1937,7 +1922,7 @@ mod tests {
 
     #[test]
     fn rebases_pts_and_preserves_negative_dts_at_the_shared_origin() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(16_384));
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
             .expect("fixture presentation validates");
@@ -1971,7 +1956,7 @@ mod tests {
 
     #[test]
     fn finish_flushes_final_and_interrupted_tails_but_not_superseded_tails() {
-        let sink = event_sink();
+        let sink = discarded_events();
         for reason in [
             crate::mux::FinishReason::Final,
             crate::mux::FinishReason::Interrupted,
@@ -2027,7 +2012,7 @@ mod tests {
 
     #[test]
     fn strict_mode_rejects_a_missed_random_access_boundary() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let mut started = start(
             SegmentBoundaryPolicy::Strict,
             Timebase::new(nz::u32!(1), nz::u32!(16_384)),
@@ -2047,9 +2032,7 @@ mod tests {
 
     #[test]
     fn extension_mode_warns_and_keeps_parts_flowing_until_a_keyframe() {
-        let recorder = Arc::new(Recorder::default());
-        let events = Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>);
-        let sink = events.scoped(SessionId(nz::u64!(2)));
+        let (sink, recorder) = RecordedEvents::sink();
         let mut started = start(
             SegmentBoundaryPolicy::ExtendToRandomAccess {
                 maximum_extension: Duration::from_secs(1),
@@ -2076,7 +2059,7 @@ mod tests {
             3
         );
         assert!(matches!(
-            recorder.0.lock().as_slice(),
+            recorder.events().as_slice(),
             [SessionEvent::SegmentationExtended {
                 track: TrackId(0),
                 ..
@@ -2086,7 +2069,7 @@ mod tests {
 
     #[test]
     fn an_exhausted_extension_budget_fails_instead_of_overrunning_the_target() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let mut started = start(
             SegmentBoundaryPolicy::ExtendToRandomAccess {
                 maximum_extension: Duration::from_millis(500),
@@ -2131,7 +2114,7 @@ mod tests {
 
     #[test]
     fn accepts_webvtt_and_rejects_negotiated_cmaf_timebase_changes() {
-        let sink = event_sink();
+        let sink = discarded_events();
         let subtitle_input = validate(
             &catalog(vec![
                 track(Timebase::hz90k()),

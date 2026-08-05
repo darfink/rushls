@@ -4,7 +4,7 @@
 //! input format's rules in one place; this module only decides where segment
 //! boundaries fall and renders the windows between them.
 
-use std::{collections::VecDeque, num::NonZero, sync::Arc};
+use std::{cmp::Ordering, collections::VecDeque, num::NonZero, sync::Arc};
 
 mod cue;
 
@@ -12,10 +12,11 @@ use cue::CueDialect;
 
 use crate::{
     domain::{
-        Appender, DiscoveredTrack, MediaKind, Payload, TickDuration, TickTimestamp, Timebase,
-        TimebaseProjection, TrackId, duration_since,
+        Appender, DiscoveredTrack, MediaInstant, MediaKind, Payload, TickDuration, TickTimestamp,
+        Timebase, TimebaseProjection, TrackId, duration_since,
     },
     media::{NormalizedSample, SubtitleSample},
+    observe::{EventSink, SessionEvent},
     segment::TrackSegmentationPlan,
 };
 
@@ -31,6 +32,9 @@ use super::{
 const MAX_CUE_BYTES: usize = 256 * 1024;
 const MAX_CUE_SEGMENTS: u64 = 64;
 const MAX_EMPTY_SEGMENTS_PER_CUE: u64 = 4_096;
+// The heartbeat advances by whatever a sibling's timestamp jumped, so a corrupt
+// or wildly out-of-range sample on *another* track lands here.
+const MAX_HEARTBEAT_SEGMENTS_PER_TICK: u64 = 4_096;
 
 const INITIALIZATION: &[u8] = b"WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n";
 
@@ -54,6 +58,7 @@ pub(super) fn build_track(
     rendition_id: PackagingRenditionId,
     track: &DiscoveredTrack,
     plan: TrackSegmentationPlan,
+    events: EventSink,
 ) -> Result<(PackagedRendition, Box<dyn TrackPackager>), MuxError> {
     if track.kind() != MediaKind::Subtitle {
         return Err(invalid("WebVTT output requires a subtitle track"));
@@ -78,7 +83,7 @@ pub(super) fn build_track(
     }
 
     let rendition = packaged_rendition(rendition_id, track, &plan);
-    let packager = WebVttTrack::new(rendition_id, track, dialect, plan)?;
+    let packager = WebVttTrack::new(rendition_id, track, dialect, plan, events)?;
     Ok((rendition, Box::new(packager)))
 }
 
@@ -122,6 +127,7 @@ struct WebVttTrack {
     track_id: TrackId,
     dialect: CueDialect,
     plan: TrackSegmentationPlan,
+    events: EventSink,
     origin: TickTimestamp,
     first_boundary: TickTimestamp,
     segment_ticks: TickDuration,
@@ -129,6 +135,12 @@ struct WebVttTrack {
     next_window_id: u64,
     last_cue_start: Option<TickTimestamp>,
     maximum_cue_end: Option<TickTimestamp>,
+    /// How far the presentation has advanced, as reported by sibling tracks.
+    ///
+    /// Only ever moves forward: siblings interleave, so a later sample can
+    /// carry an earlier instant, and windows that were already emitted cannot
+    /// be reopened.
+    clock: Option<MediaInstant>,
     initialized: bool,
     finished: bool,
 }
@@ -139,6 +151,7 @@ impl WebVttTrack {
         track: &DiscoveredTrack,
         dialect: CueDialect,
         plan: TrackSegmentationPlan,
+        events: EventSink,
     ) -> Result<Self, MuxError> {
         let origin = plan
             .segmentation_origin_pts
@@ -157,6 +170,7 @@ impl WebVttTrack {
             track_id: track.id,
             dialect,
             plan,
+            events,
             origin,
             first_boundary,
             segment_ticks: plan.segment_duration.get(),
@@ -168,9 +182,31 @@ impl WebVttTrack {
             next_window_id: 1,
             last_cue_start: None,
             maximum_cue_end: None,
+            clock: None,
             initialized: false,
             finished: false,
         })
+    }
+
+    /// Places one of this track's own timestamps on the presentation timeline.
+    ///
+    /// Internal timestamps are already rebased onto the shared presentation
+    /// origin, so the origin here is zero. Comparing instants rather than
+    /// rescaling a sibling's clock into this track's ticks is what keeps
+    /// sealing exact: requantizing would round segment boundaries, which is
+    /// precisely what segmentation depends on not happening.
+    fn instant(&self, ticks: TickTimestamp) -> MediaInstant {
+        MediaInstant::new(self.plan.timebase, ticks, 0)
+    }
+
+    /// The presentation instant one window's content runs out at.
+    fn window_end(&self, window: &Window) -> Result<MediaInstant, MuxError> {
+        let duration = self.window_duration(window.id)?;
+        window
+            .start
+            .checked_add_unsigned(duration)
+            .map(|end| self.instant(end))
+            .ok_or_else(|| mux_error("WebVTT window end overflowed"))
     }
 
     fn prepare_cue(&self, sample: &SubtitleSample) -> Result<PreparedCue, MuxError> {
@@ -360,12 +396,17 @@ impl WebVttTrack {
         Ok(())
     }
 
-    fn seal_before(&mut self, timestamp: TickTimestamp, out: &mut dyn Appender<PackagedMedia>) {
+    /// Emits every window whose content is entirely behind `now`.
+    ///
+    /// Only pops from the front, so callers must have materialized a window
+    /// that outlives `now` first — otherwise this drains the queue and strands
+    /// the invariant that an unfinished muxer always has a current window.
+    fn seal_before(&mut self, now: MediaInstant, out: &mut dyn Appender<PackagedMedia>) {
         while self.windows.front().is_some_and(|window| {
-            self.window_duration(window.id)
+            self.window_end(window)
                 .ok()
-                .and_then(|duration| window.start.checked_add_unsigned(duration))
-                .is_some_and(|end| end <= timestamp)
+                .and_then(|end| end.compare(now))
+                .is_some_and(|ordering| ordering != Ordering::Greater)
         }) {
             let window = self.windows.pop_front().expect("front was inspected above");
             let duration = self
@@ -373,6 +414,45 @@ impl WebVttTrack {
                 .expect("queued WebVTT windows have valid timing");
             self.emit(&window, duration, out);
         }
+    }
+
+    /// Materializes windows until one of them still has content ahead of `now`.
+    ///
+    /// Expressed as a walk rather than an index computed from `now` because the
+    /// two are not interchangeable: deriving an index would mean rescaling a
+    /// sibling's clock into this track's ticks, and a rounding error that
+    /// created one window too few would let [`Self::seal_before`] empty the
+    /// queue.
+    fn ensure_current_at(&mut self, now: MediaInstant) -> Result<(), MuxError> {
+        let mut created = 0u64;
+        while self
+            .windows
+            .back()
+            .map(|window| self.window_end(window))
+            .transpose()?
+            .is_none_or(|end| {
+                end.compare(now)
+                    .is_some_and(|ordering| ordering != Ordering::Greater)
+            })
+        {
+            if created >= MAX_HEARTBEAT_SEGMENTS_PER_TICK {
+                return Err(mux_error(format!(
+                    "{} presentation clock advanced past {MAX_HEARTBEAT_SEGMENTS_PER_TICK} subtitle segments in one step",
+                    self.track_id
+                )));
+            }
+            let next = self.next_window_id;
+            self.windows.push_back(Window {
+                id: next,
+                start: self.window_start(next)?,
+                cues: Vec::new(),
+            });
+            self.next_window_id = next
+                .checked_add(1)
+                .ok_or_else(|| mux_error("WebVTT segment ID overflowed"))?;
+            created += 1;
+        }
+        Ok(())
     }
 
     fn emit(&self, window: &Window, duration: TickDuration, out: &mut dyn Appender<PackagedMedia>) {
@@ -430,17 +510,57 @@ impl TrackPackager for WebVttTrack {
 
         self.initialize(out);
         self.ensure_through(prepared.last_index)?;
-        self.seal_before(prepared.start, out);
+        self.seal_before(self.instant(prepared.start), out);
+        let mut placed = false;
         for window in &mut self.windows {
             if window.id >= prepared.first_index && window.id <= prepared.last_index {
                 window.cues.push(Arc::clone(&prepared.cue));
+                placed = true;
             }
+        }
+        // The heartbeat seals on the presentation clock, so a cue can arrive
+        // after every window that could have carried it was already published.
+        // Dropping it is the only option left — the segments are out — but a
+        // publisher whose subtitles consistently run late should be visible.
+        if !placed {
+            self.events.emit(SessionEvent::SubtitleCueTooLate {
+                track: self.track_id,
+                late_by: self
+                    .clock
+                    .and_then(|now| now.elapsed_since(self.instant(prepared.end)))
+                    .unwrap_or_default(),
+            });
         }
         self.last_cue_start = Some(prepared.start);
         self.maximum_cue_end = Some(
             self.maximum_cue_end
                 .map_or(prepared.end, |end| end.max(prepared.end)),
         );
+        Ok(())
+    }
+
+    fn tick(
+        &mut self,
+        now: MediaInstant,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
+        if self.finished {
+            return Ok(());
+        }
+        if self
+            .clock
+            .is_some_and(|previous| now.compare(previous) != Some(Ordering::Greater))
+        {
+            return Ok(());
+        }
+        self.clock = Some(now);
+
+        self.ensure_current_at(now)?;
+        // Before any sealing, so the header precedes the first heartbeat
+        // segment. This is also what makes the rendition servable from the
+        // start of the presentation rather than from its first cue.
+        self.initialize(out);
+        self.seal_before(now, out);
         Ok(())
     }
 
@@ -533,6 +653,7 @@ mod tests {
     use crate::{
         domain::{Codec, MediaKind, SubtitlePosition, WebVttCueMetadata, fixtures::TrackBuilder},
         media::SubtitleSample,
+        mux::fixtures::{RecordedEvents, discarded_events},
         segment::fixtures::PlanBuilder,
     };
 
@@ -566,6 +687,10 @@ mod tests {
     }
 
     fn mux(codec: Codec, segment_seconds: u64) -> WebVttTrack {
+        mux_with_events(codec, segment_seconds, discarded_events())
+    }
+
+    fn mux_with_events(codec: Codec, segment_seconds: u64, events: EventSink) -> WebVttTrack {
         let track = track(codec);
         let dialect = CueDialect::for_codec(codec).expect("fixture codecs have a dialect");
         WebVttTrack::new(
@@ -573,8 +698,22 @@ mod tests {
             &track,
             dialect,
             plan(segment_seconds),
+            events,
         )
         .expect("fixture mux starts")
+    }
+
+    /// A sibling track's clock, `seconds` past the shared presentation origin.
+    ///
+    /// Deliberately not the 90 kHz output clock: the heartbeat has to work from
+    /// whatever timebase the track that carries it happens to use.
+    fn sibling(seconds: u64) -> MediaInstant {
+        let timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+        MediaInstant::new(
+            timebase,
+            i64::try_from(seconds * 48_000).expect("fixture instants fit i64"),
+            0,
+        )
     }
 
     fn segments(output: &[PackagedMedia]) -> Vec<&PackagedSegment> {
@@ -747,6 +886,151 @@ mod tests {
             segments[3].media_start,
             6 * i64::try_from(SECOND).expect("second fits i64")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_presentation_clock_alone_keeps_a_silent_track_on_cadence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux(Codec::WebVtt, 2);
+        let mut output = Vec::new();
+        // No cue is ever pushed: this is the sparse case that used to leave the
+        // playlist empty until someone spoke.
+        for second in 1..=7 {
+            mux.tick(sibling(second), &mut output)?;
+        }
+
+        assert!(matches!(
+            &output[0],
+            PackagedMedia::Initialization(initialization)
+                if initialization.payload.as_bytes() == INITIALIZATION
+        ));
+        let segments = segments(&output);
+        assert_eq!(segments.len(), 3);
+        for (index, segment) in segments.iter().enumerate() {
+            assert!(segment.payload.is_empty());
+            assert_eq!(segment.duration, 2 * SECOND);
+            assert_eq!(
+                segment.media_start,
+                i64::try_from(index as u64 * 2 * SECOND)?,
+                "heartbeat segments stay on the planned grid"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn one_large_clock_jump_emits_every_window_it_crossed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut mux = mux(Codec::WebVtt, 2);
+        let mut output = Vec::new();
+        mux.tick(sibling(7), &mut output)?;
+
+        let segments = segments(&output);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.packaging_segment_id)
+                .collect::<Vec<_>>(),
+            vec![
+                PackagingSegmentId(0),
+                PackagingSegmentId(1),
+                PackagingSegmentId(2)
+            ],
+            "no window may be skipped, or the timeline would gap"
+        );
+        // The queue must still hold the window covering the clock, or the next
+        // cue would find no current window at all.
+        mux.push(
+            sample(
+                Codec::WebVtt,
+                6 * i64::try_from(SECOND)?,
+                SECOND,
+                b"after the jump",
+            ),
+            &mut output,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_clock_that_goes_backwards_seals_nothing() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux(Codec::WebVtt, 2);
+        let mut output = Vec::new();
+        mux.tick(sibling(5), &mut output)?;
+        let sealed = segments(&output).len();
+        // Siblings interleave, so an earlier instant arriving later is ordinary.
+        mux.tick(sibling(3), &mut output)?;
+
+        assert_eq!(segments(&output).len(), sealed);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cue_the_heartbeat_already_sealed_past_is_reported_and_dropped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sink, recorder) = RecordedEvents::sink();
+        let mut mux = mux_with_events(Codec::WebVtt, 2, sink);
+        let mut output = Vec::new();
+        mux.tick(sibling(7), &mut output)?;
+        let sealed = segments(&output).len();
+
+        mux.push(
+            sample(Codec::WebVtt, 0, SECOND, b"far too late"),
+            &mut output,
+        )?;
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        assert!(matches!(
+            recorder.events().as_slice(),
+            [SessionEvent::SubtitleCueTooLate {
+                track: TrackId(0),
+                ..
+            }]
+        ));
+        for segment in segments(&output).iter().take(sealed) {
+            assert!(
+                segment.payload.is_empty(),
+                "a published segment cannot be revised to carry a late cue"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_cue_straddling_the_sealed_edge_still_reaches_its_open_windows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sink, recorder) = RecordedEvents::sink();
+        let mut mux = mux_with_events(Codec::WebVtt, 2, sink);
+        let mut output = Vec::new();
+        // Seals windows 0 and 1, leaving window 2 (4s..6s) open.
+        mux.tick(sibling(5), &mut output)?;
+        // Spans 3s..7s: its first window is gone, its later ones are not.
+        mux.push(
+            sample(
+                Codec::WebVtt,
+                3 * i64::try_from(SECOND)?,
+                4 * SECOND,
+                b"straddles",
+            ),
+            &mut output,
+        )?;
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        assert!(
+            recorder.events().is_empty(),
+            "a partially placed cue is not a dropped cue"
+        );
+        let segments = segments(&output);
+        let carried = segments
+            .iter()
+            .filter(|segment| {
+                str::from_utf8(segment.payload.as_bytes())
+                    .is_ok_and(|body| body.contains("straddles"))
+            })
+            .count();
+        assert!(carried > 0);
         Ok(())
     }
 

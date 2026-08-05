@@ -416,6 +416,7 @@ fn name(event: &SessionEvent) -> &'static str {
         SessionEvent::TimelineCalibrated { .. } => "timeline_calibrated",
         SessionEvent::SegmentationLocked { .. } => "segmentation_locked",
         SessionEvent::SegmentationExtended { .. } => "segmentation_extended",
+        SessionEvent::SubtitleCueTooLate { .. } => "subtitle_cue_too_late",
         SessionEvent::Running => "running",
         SessionEvent::TrackSetChanged => "track_set_changed",
         SessionEvent::CodecParametersChanged { .. } => "codec_parameters_changed",

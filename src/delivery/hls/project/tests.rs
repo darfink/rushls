@@ -230,6 +230,28 @@ fn siblings_are_reported_so_a_switching_client_knows_where_to_resume()
 }
 
 #[test]
+fn a_cueless_subtitle_rendition_is_still_reported_to_its_siblings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0), subtitle(1)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+    // Only what the cadence heartbeat produces: an empty segment, no cue.
+    write(&lease, initialization(1, 1));
+    write_direct(&lease, 1, 0, 0);
+
+    let rendered = render(&lease, 0, &policy())?;
+
+    assert!(
+        rendered.contains("#EXT-X-RENDITION-REPORT:URI=\"../1/subtitles.m3u8\",LAST-MSN=0\n"),
+        "a client toggling subtitles on needs somewhere to resume even before \
+         the first cue exists, and a part-less rendition reports no LAST-PART: \
+         {rendered}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_configured_base_makes_every_name_absolute() -> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0), audio(1)]);

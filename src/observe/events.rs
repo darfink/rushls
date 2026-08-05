@@ -39,6 +39,17 @@ pub enum SessionEvent {
         planned: Duration,
         actual: Duration,
     },
+    /// A subtitle cue arrived after every segment covering it was published.
+    ///
+    /// Sparse subtitle renditions are sealed on the presentation clock so their
+    /// playlist keeps pace with its siblings, which means a cue can miss its
+    /// window entirely. Nothing can carry it once that happens, so it is
+    /// dropped. Named per track and per cue because the interesting question is
+    /// which input runs late and by how much, which a counter cannot answer.
+    SubtitleCueTooLate {
+        track: TrackId,
+        late_by: Duration,
+    },
     Running,
     TrackSetChanged,
     CodecParametersChanged {
