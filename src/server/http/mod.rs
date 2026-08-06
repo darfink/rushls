@@ -406,7 +406,7 @@ fn into_http(
 
     if let Some(gzip) = encoded {
         let length = gzip.len();
-        let mut encoded = (
+        let encoded = (
             [
                 (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, cache),
@@ -415,24 +415,22 @@ fn into_http(
             gzip,
         )
             .into_response();
-        if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
-            encoded.headers_mut().insert(header::CONTENT_LENGTH, value);
-        }
-        return Ok(with_vary(encoded, varies));
+        return Ok(with_vary(with_content_length(encoded, length), varies));
     }
 
     match response.body {
-        DeliveryBody::Manifest(bytes) => Ok(with_vary(
-            (
+        DeliveryBody::Manifest(bytes) => {
+            let length = bytes.len();
+            let manifest = (
                 [
                     (header::CONTENT_TYPE, content_type),
                     (header::CACHE_CONTROL, cache),
                 ],
                 bytes,
             )
-                .into_response(),
-            varies,
-        )),
+                .into_response();
+            Ok(with_vary(with_content_length(manifest, length), varies))
+        }
         DeliveryBody::Media(media) => {
             let length = media.len();
             let Some(range) = range else {
@@ -463,6 +461,21 @@ fn into_http(
             }
         }
     }
+}
+
+/// Declares the length of a body that is already whole in memory.
+///
+/// Stated outright rather than left to the body's size hint, because a response
+/// that reaches the wire without one is framed as `Transfer-Encoding: chunked`.
+/// That is legal HTTP and irrelevant over HTTP/2, but clients that reissue
+/// requests on a kept-alive HTTP/1.1 connection mis-frame everything after the
+/// first chunked response — libavformat's HLS reader does exactly this by
+/// default, and reads the second playlist of a session as garbage.
+fn with_content_length(mut response: Response, length: usize) -> Response {
+    if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    response
 }
 
 /// Tells caches that this resource is negotiated, where it actually is.

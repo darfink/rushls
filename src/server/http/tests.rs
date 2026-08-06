@@ -106,6 +106,78 @@ async fn request(address: SocketAddr, method: &str, target: &str, extra: &[(&str
     }
 }
 
+/// Several requests down one kept-alive connection, framed only by
+/// `Content-Length`.
+///
+/// This is libavformat's HLS reader in miniature: it reissues each playlist
+/// request on the connection it already has, and frames every response by its
+/// declared length. A response that arrives without one is `Transfer-Encoding:
+/// chunked`, which this cannot frame — and neither could the real client, which
+/// read the *following* playlist as garbage and rejected it as invalid data.
+async fn over_one_connection(address: SocketAddr, targets: &[&str]) -> Vec<Reply> {
+    let mut stream = TcpStream::connect(address).await.expect("the origin is up");
+    let mut pending = Vec::new();
+    let mut replies = Vec::with_capacity(targets.len());
+    for target in targets {
+        let head =
+            format!("GET {target} HTTP/1.1\r\nHost: origin\r\nConnection: keep-alive\r\n\r\n");
+        stream
+            .write_all(head.as_bytes())
+            .await
+            .expect("the request is sent");
+        replies.push(read_declared(&mut stream, &mut pending).await);
+    }
+    replies
+}
+
+/// Reads exactly one length-delimited response, leaving any surplus for the
+/// next one.
+async fn read_declared(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Reply {
+    let split = loop {
+        if let Some(at) = pending.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at;
+        }
+        let mut chunk = [0_u8; 4096];
+        let read = stream.read(&mut chunk).await.expect("the response arrives");
+        assert!(read > 0, "the origin closed before sending headers");
+        pending.extend_from_slice(&chunk[..read]);
+    };
+
+    let head = String::from_utf8_lossy(&pending[..split]).to_string();
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("the status line parses");
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+        .collect();
+    let Some((_, declared)) = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+    else {
+        panic!("a response with no declared length cannot be framed on a reused connection: {head}")
+    };
+    let length: usize = declared.parse().expect("a declared length is a number");
+
+    let start = split + 4;
+    while pending.len() < start + length {
+        let mut chunk = [0_u8; 4096];
+        let read = stream.read(&mut chunk).await.expect("the body arrives");
+        assert!(read > 0, "the origin closed mid-body");
+        pending.extend_from_slice(&chunk[..read]);
+    }
+    let body = pending[start..start + length].to_vec();
+    pending.drain(..start + length);
+    Reply {
+        status,
+        headers,
+        body,
+    }
+}
+
 /// A running origin, its store, and the handle that stops it.
 struct Harness {
     address: SocketAddr,
@@ -327,6 +399,127 @@ fn ungzip(body: &[u8]) -> Vec<u8> {
         .read_to_end(&mut decoded)
         .expect("the origin emits a well-formed gzip member");
     decoded
+}
+
+/// Both playlist encodings must carry a length out of this layer, whichever
+/// transport later serializes them.
+///
+/// Asserted here rather than through the listener because HTTP/1.1 hides the
+/// bug: hyper derives a length from a fully buffered body's exact size hint, so
+/// a cleartext request looks correct either way. Over HTTP/2 — which is what
+/// this origin negotiates under TLS, and what the Low-Latency profile expects —
+/// framing is by `END_STREAM` and no length is synthesized. A proxy converting
+/// that back to HTTP/1.1 for an older client then has nothing to declare and
+/// must chunk, which is what broke libavformat's connection reuse in
+/// production. So the invariant is that *this* layer states the length, not
+/// that some transport happens to.
+#[test]
+fn a_playlist_leaves_this_layer_carrying_its_own_length() {
+    use bytes::Bytes;
+
+    use crate::delivery::{Response as DeliveryResponse, Reuse, uri::ContentType};
+
+    let playlist = Bytes::from_static(b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
+    let gzipped = Bytes::from_static(b"pretend this is a gzip member");
+    let response = || {
+        DeliveryResponse::manifest(
+            playlist.clone(),
+            gzipped.clone(),
+            ContentType::Manifest("application/vnd.apple.mpegurl"),
+            Reuse::revalidate(),
+        )
+    };
+
+    let identity = super::into_http(response(), None, false).expect("a playlist is representable");
+    assert_eq!(
+        identity
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .map(|value| value.to_str().expect("a length is ASCII").to_owned()),
+        Some(playlist.len().to_string()),
+        "an undeclared length becomes a chunked response, and a client reusing \
+         its connection mis-frames everything after it"
+    );
+
+    let encoded = super::into_http(response(), None, true).expect("a playlist is representable");
+    assert_eq!(
+        encoded
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .map(|value| value.to_str().expect("a length is ASCII").to_owned()),
+        Some(gzipped.len().to_string()),
+        "the declared length is the encoded bytes on the wire, not the playlist \
+         they decompress to"
+    );
+}
+
+#[tokio::test]
+async fn every_playlist_declares_its_length_so_a_reused_connection_stays_framed() {
+    let harness = Harness::start().await;
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+
+    // A client that keeps its connection reads the multivariant playlist, then
+    // the media playlist it names, then reloads it — all without reconnecting.
+    let replies = over_one_connection(
+        harness.address,
+        &[
+            "/live/camera/index.m3u8",
+            "/live/camera/0/video.m3u8",
+            "/live/camera/0/video.m3u8",
+        ],
+    )
+    .await;
+
+    for reply in &replies {
+        assert_eq!(reply.status, 200);
+        assert_eq!(
+            reply.header("content-length"),
+            Some(reply.body.len().to_string().as_str()),
+            "a declared length that disagreed with the body would desynchronize \
+             the connection just as surely as omitting it"
+        );
+        assert_eq!(
+            reply.header("transfer-encoding"),
+            None,
+            "a fully buffered playlist has no reason to be chunked"
+        );
+        assert!(
+            reply.body.starts_with(b"#EXTM3U"),
+            "a mis-framed response begins mid-playlist, which is what a client \
+             reports as invalid data: {:?}",
+            String::from_utf8_lossy(&reply.body[..reply.body.len().min(32)])
+        );
+    }
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_gzipped_playlist_also_declares_its_length() {
+    let harness = Harness::start().await;
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+
+    let encoded = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8",
+        &[("Accept-Encoding", "gzip")],
+    )
+    .await;
+
+    assert_eq!(encoded.header("content-encoding"), Some("gzip"));
+    assert_eq!(
+        encoded.header("content-length"),
+        Some(encoded.body.len().to_string().as_str()),
+        "the length describes the encoded bytes on the wire, not the playlist \
+         they decompress to"
+    );
+
+    harness.stop().await;
 }
 
 #[tokio::test]
