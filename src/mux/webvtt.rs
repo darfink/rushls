@@ -21,9 +21,10 @@ use crate::{
 };
 
 use super::{
-    FinishReason, InitializationSegment, MediaSegmentFormat, MuxError, PackagedMedia,
-    PackagedRendition, PackagedSegment, PackagingRenditionId, PackagingSegmentId, RenditionConfig,
-    RenditionKey, RenditionMedia, TrackPackager,
+    FinishReason, InitializationSegment, MediaSegmentFormat, MuxError, PackagedChunk,
+    PackagedMedia, PackagedRendition, PackagedSegment, PackagedSegmentCompletion,
+    PackagingRenditionId, PackagingSegmentId, RenditionConfig, RenditionKey, RenditionMedia,
+    TrackPackager,
 };
 
 // These cap synchronous work caused by one corrupt cue. They are deliberately
@@ -35,11 +36,19 @@ const MAX_EMPTY_SEGMENTS_PER_CUE: u64 = 4_096;
 // The heartbeat advances by whatever a sibling's timestamp jumped, so a corrupt
 // or wildly out-of-range sample on *another* track lands here.
 const MAX_HEARTBEAT_SEGMENTS_PER_TICK: u64 = 4_096;
+// A part index is a `u32`, and a segment whose part grid does not fit one is a
+// planning error rather than something to discover mid-publication.
+const MAX_PARTS_PER_SEGMENT: u64 = 4_096;
 
 const INITIALIZATION: &[u8] = b"WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n";
 
 #[derive(Clone, Debug)]
 struct Cue {
+    /// Presentation-relative span, kept alongside the rendered milliseconds so
+    /// a part can select the cues overlapping its own interval without
+    /// reparsing what was already formatted.
+    start: TickTimestamp,
+    end: TickTimestamp,
     start_ms: u64,
     end_ms: u64,
     identifier: Option<Arc<str>>,
@@ -52,6 +61,21 @@ struct Window {
     id: u64,
     start: TickTimestamp,
     cues: Vec<Arc<Cue>>,
+    /// How many of this window's parts have already been published.
+    ///
+    /// Always zero when parts are disabled. A published part cannot be revised,
+    /// so this is also the boundary a late cue is measured against.
+    sealed_parts: u32,
+}
+
+/// The part cadence a subtitle rendition publishes on, if any.
+///
+/// Parts are worth cutting only when they subdivide the segment: an equal
+/// target would advertise a part grid carrying exactly one part per segment,
+/// which is strictly more playlist for the same media. Decided in one place so
+/// the advertised `chunk_target` and the muxer's behaviour cannot disagree.
+fn part_target(plan: &TrackSegmentationPlan) -> Option<NonZero<TickDuration>> {
+    (plan.part_duration < plan.segment_duration).then_some(plan.part_duration)
 }
 
 pub(super) fn build_track(
@@ -110,7 +134,7 @@ fn packaged_rendition(
             // arrival. The first may be longer when subtitles begin before
             // their recurring cadence.
             maximum_segment_duration: first_segment_duration.max(plan.segment_duration),
-            chunk_target: None,
+            chunk_target: part_target(plan),
             segment_format: MediaSegmentFormat::WebVtt,
         },
         media: RenditionMedia::Subtitle,
@@ -131,6 +155,8 @@ struct WebVttTrack {
     origin: TickTimestamp,
     first_boundary: TickTimestamp,
     segment_ticks: TickDuration,
+    /// Part cadence, or `None` when this rendition publishes whole segments.
+    part_ticks: Option<TickDuration>,
     windows: VecDeque<Window>,
     next_window_id: u64,
     last_cue_start: Option<TickTimestamp>,
@@ -164,6 +190,20 @@ impl WebVttTrack {
         if first_boundary <= origin {
             return Err(invalid("WebVTT first segment boundary is invalid"));
         }
+        let part_ticks = part_target(&plan).map(NonZero::get);
+        if let Some(part_ticks) = part_ticks {
+            // The longest window is the first, which may run past the recurring
+            // cadence; checking it bounds every later one too.
+            let longest = duration_since(first_boundary, origin)
+                .unwrap_or(plan.segment_duration.get())
+                .max(plan.segment_duration.get());
+            if longest.div_ceil(part_ticks) > MAX_PARTS_PER_SEGMENT {
+                return Err(invalid(format!(
+                    "{} subtitle part cadence divides a segment into more than {MAX_PARTS_PER_SEGMENT} parts",
+                    track.id
+                )));
+            }
+        }
 
         Ok(Self {
             rendition_id,
@@ -174,10 +214,12 @@ impl WebVttTrack {
             origin,
             first_boundary,
             segment_ticks: plan.segment_duration.get(),
+            part_ticks,
             windows: VecDeque::from([Window {
                 id: 0,
                 start: origin,
                 cues: Vec::new(),
+                sealed_parts: 0,
             }]),
             next_window_id: 1,
             last_cue_start: None,
@@ -338,6 +380,10 @@ impl WebVttTrack {
             .checked_add(duration_ms)
             .ok_or_else(|| mux_error("WebVTT cue end overflowed"))?;
         Ok(Cue {
+            start,
+            end: start
+                .checked_add_unsigned(sample.duration)
+                .ok_or_else(|| mux_error("subtitle cue end overflowed while rendering"))?,
             start_ms,
             end_ms,
             identifier: content.metadata.identifier,
@@ -388,6 +434,7 @@ impl WebVttTrack {
                 id: next,
                 start: self.window_start(next)?,
                 cues: Vec::new(),
+                sealed_parts: 0,
             });
             self.next_window_id = next
                 .checked_add(1)
@@ -402,6 +449,10 @@ impl WebVttTrack {
     /// that outlives `now` first — otherwise this drains the queue and strands
     /// the invariant that an unfinished muxer always has a current window.
     fn seal_before(&mut self, now: MediaInstant, out: &mut dyn Appender<PackagedMedia>) {
+        if self.part_ticks.is_some() {
+            self.seal_parts_before(now, out);
+            return;
+        }
         while self.windows.front().is_some_and(|window| {
             self.window_end(window)
                 .ok()
@@ -414,6 +465,66 @@ impl WebVttTrack {
                 .expect("queued WebVTT windows have valid timing");
             self.emit(&window, duration, out);
         }
+    }
+
+    /// As [`Self::seal_before`], one part at a time.
+    ///
+    /// Works on an owned window so a part can be published and recorded in the
+    /// same step; a window with parts still open goes back on the front. The
+    /// queue cannot drain here for the same reason it cannot in whole-segment
+    /// mode: `ensure_current_at` has already materialized a window whose
+    /// content outlives `now`, and its final part therefore never seals.
+    fn seal_parts_before(&mut self, now: MediaInstant, out: &mut dyn Appender<PackagedMedia>) {
+        while let Some(mut window) = self.windows.pop_front() {
+            let Ok(total) = self.window_duration(window.id) else {
+                self.windows.push_front(window);
+                return;
+            };
+            let count = self.part_count(total);
+            while window.sealed_parts < count {
+                let Some((start, duration)) = self.part_span(&window, total, window.sealed_parts)
+                else {
+                    break;
+                };
+                let end = start.saturating_add_unsigned(duration);
+                if self
+                    .instant(end)
+                    .compare(now)
+                    .is_none_or(|ordering| ordering == Ordering::Greater)
+                {
+                    break;
+                }
+                self.emit_part(&window, window.sealed_parts, start, duration, out);
+                window.sealed_parts += 1;
+            }
+            if window.sealed_parts < count {
+                self.windows.push_front(window);
+                return;
+            }
+            self.complete(&window, total, out);
+        }
+    }
+
+    /// Publishes everything left of `window` up to `total`, then closes it.
+    ///
+    /// Used only on the drain path, where there is no clock left to wait for.
+    /// Remaining parts still follow the grid so none can exceed `PART-TARGET`;
+    /// only the last is short, which HLS allows.
+    fn seal_remaining_parts(
+        &self,
+        window: &mut Window,
+        total: TickDuration,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) {
+        let count = self.part_count(total);
+        while window.sealed_parts < count {
+            let Some((start, duration)) = self.part_span(window, total, window.sealed_parts) else {
+                break;
+            };
+            self.emit_part(window, window.sealed_parts, start, duration, out);
+            window.sealed_parts += 1;
+        }
+        self.complete(window, total, out);
     }
 
     /// Materializes windows until one of them still has content ahead of `now`.
@@ -446,6 +557,7 @@ impl WebVttTrack {
                 id: next,
                 start: self.window_start(next)?,
                 cues: Vec::new(),
+                sealed_parts: 0,
             });
             self.next_window_id = next
                 .checked_add(1)
@@ -456,14 +568,83 @@ impl WebVttTrack {
     }
 
     fn emit(&self, window: &Window, duration: TickDuration, out: &mut dyn Appender<PackagedMedia>) {
+        let end = window.start.saturating_add_unsigned(duration);
         out.push(PackagedMedia::Segment(PackagedSegment {
             rendition_id: self.rendition_id,
             packaging_segment_id: PackagingSegmentId(window.id),
             media_start: window.start,
             duration,
             independent: true,
-            payload: Payload::from(render_window(window)),
+            payload: Payload::from(render_range(window, window.start, end)),
         }));
+    }
+
+    /// Publishes one part, carrying every cue on screen during its interval.
+    ///
+    /// That overlap rule is what makes `independent` honest: a client joining
+    /// here is handed the captions it should already be displaying, not only
+    /// the ones that happen to begin inside this part. The cost is that a cue
+    /// spanning several parts is repeated in each, so the parent segment —
+    /// which delivery serves as the concatenation of its parts — carries the
+    /// same repetition players already absorb across overlapping segments.
+    fn emit_part(
+        &self,
+        window: &Window,
+        index: u32,
+        start: TickTimestamp,
+        duration: TickDuration,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) {
+        let end = start.saturating_add_unsigned(duration);
+        out.push(PackagedMedia::Chunk(PackagedChunk {
+            rendition_id: self.rendition_id,
+            packaging_segment_id: PackagingSegmentId(window.id),
+            chunk_index: index,
+            media_start: start,
+            duration,
+            independent: true,
+            payload: Payload::from(render_range(window, start, end)),
+        }));
+    }
+
+    fn complete(
+        &self,
+        window: &Window,
+        duration: TickDuration,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) {
+        out.push(PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
+            rendition_id: self.rendition_id,
+            packaging_segment_id: PackagingSegmentId(window.id),
+            media_start: window.start,
+            duration,
+        }));
+    }
+
+    /// Where one part of `window` begins and how long it runs.
+    ///
+    /// The last part of a window takes whatever remains, which HLS exempts from
+    /// the `PART-TARGET` floor precisely so a grid need not divide evenly.
+    fn part_span(
+        &self,
+        window: &Window,
+        total: TickDuration,
+        index: u32,
+    ) -> Option<(TickTimestamp, TickDuration)> {
+        let part_ticks = self.part_ticks?;
+        let offset = u64::from(index).checked_mul(part_ticks)?;
+        let duration = total.checked_sub(offset).filter(|left| *left > 0)?;
+        Some((
+            window.start.checked_add_unsigned(offset)?,
+            duration.min(part_ticks),
+        ))
+    }
+
+    fn part_count(&self, total: TickDuration) -> u32 {
+        self.part_ticks
+            .map(|ticks| total.div_ceil(ticks))
+            .and_then(|count| u32::try_from(count).ok())
+            .unwrap_or(0)
     }
 
     fn initialize(&mut self, out: &mut dyn Appender<PackagedMedia>) {
@@ -513,10 +694,19 @@ impl TrackPackager for WebVttTrack {
         self.seal_before(self.instant(prepared.start), out);
         let mut placed = false;
         for window in &mut self.windows {
-            if window.id >= prepared.first_index && window.id <= prepared.last_index {
-                window.cues.push(Arc::clone(&prepared.cue));
-                placed = true;
+            if window.id < prepared.first_index || window.id > prepared.last_index {
+                continue;
             }
+            // Storing the cue is not the same as publishing it: parts render by
+            // overlap at seal time, so a cue whose whole span lies in parts that
+            // already went out reaches nobody, even though its window is open.
+            let revisable = self
+                .part_ticks
+                .and_then(|ticks| u64::from(window.sealed_parts).checked_mul(ticks))
+                .and_then(|offset| window.start.checked_add_unsigned(offset))
+                .unwrap_or(window.start);
+            window.cues.push(Arc::clone(&prepared.cue));
+            placed |= prepared.end > revisable;
         }
         // The heartbeat seals on the presentation clock, so a cue can arrive
         // after every window that could have carried it was already published.
@@ -582,31 +772,58 @@ impl TrackPackager for WebVttTrack {
             return Ok(());
         };
 
-        while let Some(window) = self.windows.pop_front() {
-            if window.start >= end {
-                break;
-            }
-            let duration = end
+        while let Some(mut window) = self.windows.pop_front() {
+            let total = self
+                .window_duration(window.id)
+                .expect("queued WebVTT windows have valid timing");
+            // Cue content reaching into this window, if any. The heartbeat
+            // opens windows on the presentation clock, so a sparse track can
+            // leave one sitting entirely past the last cue. That is ordinary,
+            // not an error: such a window simply has no cued extent.
+            let cued = end
                 .checked_sub(window.start)
                 .and_then(|duration| u64::try_from(duration).ok())
-                .map(|duration| {
-                    duration.min(
-                        self.window_duration(window.id)
-                            .expect("queued WebVTT windows have valid timing"),
-                    )
-                })
-                .filter(|duration| *duration > 0)
-                .ok_or_else(|| mux_error("final WebVTT segment duration overflowed"))?;
-            self.emit(&window, duration, out);
+                .map_or(0, |duration| duration.min(total));
+            // Parts already published put a floor under the segment: a
+            // completion shorter than the media it closes would describe a
+            // segment delivery has already served more of.
+            let sealed = window
+                .sealed_parts
+                .checked_sub(1)
+                .and_then(|last| self.part_span(&window, total, last))
+                .map_or(0, |(start, duration)| {
+                    duration_since(start, window.start).unwrap_or(0) + duration
+                });
+            // Whichever reaches further wins: published parts are already out
+            // and must be closed over, while a window with neither cue content
+            // nor published parts has nothing to invent media for.
+            let duration = cued.max(sealed);
+            if duration == 0 {
+                break;
+            }
+            if self.part_ticks.is_some() {
+                self.seal_remaining_parts(&mut window, duration, out);
+            } else {
+                self.emit(&window, duration, out);
+            }
         }
         self.windows.clear();
         Ok(())
     }
 }
 
-fn render_window(window: &Window) -> Vec<u8> {
+/// Renders the cues on screen at any point in `[start, end)`.
+///
+/// Selecting by overlap rather than by start is what a WebVTT segment already
+/// promises — every cue intended to be displayed during the period — and
+/// applying the same rule to a part keeps that promise at part resolution.
+fn render_range(window: &Window, start: TickTimestamp, end: TickTimestamp) -> Vec<u8> {
     let mut body = String::new();
-    for cue in &window.cues {
+    for cue in window
+        .cues
+        .iter()
+        .filter(|cue| cue.start < end && cue.end > start)
+    {
         if let Some(identifier) = cue.identifier.as_deref()
             && !identifier.is_empty()
         {
@@ -666,11 +883,19 @@ mod tests {
             .build()
     }
 
+    /// Whole-segment publication: a part target equal to the segment means
+    /// there is no grid to subdivide, which is what `part_target` refuses.
     fn plan(segment_seconds: u64) -> TrackSegmentationPlan {
+        plan_with_parts(segment_seconds, segment_seconds)
+    }
+
+    fn plan_with_parts(segment_seconds: u64, part_seconds: u64) -> TrackSegmentationPlan {
         let duration =
             std::num::NonZero::new(segment_seconds * SECOND).expect("fixture segments are nonzero");
+        let part =
+            std::num::NonZero::new(part_seconds * SECOND).expect("fixture parts are nonzero");
         PlanBuilder::new(0, Timebase::hz90k(), duration)
-            .part(nz::u32!(1), nz::u64!(90_000))
+            .part(nz::u32!(1), part)
             .build()
     }
 
@@ -714,6 +939,48 @@ mod tests {
             i64::try_from(seconds * 48_000).expect("fixture instants fit i64"),
             0,
         )
+    }
+
+    fn mux_with_parts(codec: Codec, segment_seconds: u64, part_seconds: u64) -> WebVttTrack {
+        parts_mux(codec, segment_seconds, part_seconds, discarded_events())
+    }
+
+    fn parts_mux(
+        codec: Codec,
+        segment_seconds: u64,
+        part_seconds: u64,
+        events: EventSink,
+    ) -> WebVttTrack {
+        let track = track(codec);
+        let dialect = CueDialect::for_codec(codec).expect("fixture codecs have a dialect");
+        WebVttTrack::new(
+            PackagingRenditionId(3),
+            &track,
+            dialect,
+            plan_with_parts(segment_seconds, part_seconds),
+            events,
+        )
+        .expect("fixture mux starts")
+    }
+
+    fn parts(output: &[PackagedMedia]) -> Vec<&PackagedChunk> {
+        output
+            .iter()
+            .filter_map(|media| match media {
+                PackagedMedia::Chunk(chunk) => Some(chunk),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn completions(output: &[PackagedMedia]) -> Vec<&PackagedSegmentCompletion> {
+        output
+            .iter()
+            .filter_map(|media| match media {
+                PackagedMedia::SegmentCompleted(completion) => Some(completion),
+                _ => None,
+            })
+            .collect()
     }
 
     fn segments(output: &[PackagedMedia]) -> Vec<&PackagedSegment> {
@@ -1031,6 +1298,157 @@ mod tests {
             })
             .count();
         assert!(carried > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn every_part_carries_the_cues_on_screen_during_it() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux_with_parts(Codec::WebVtt, 2, 1);
+        let mut output = Vec::new();
+        // Spans the whole first window, so it is on screen during both parts.
+        mux.push(
+            sample(Codec::WebVtt, 0, 2 * SECOND, b"spanning"),
+            &mut output,
+        )?;
+        mux.tick(sibling(4), &mut output)?;
+
+        let parts = parts(&output);
+        assert!(parts.len() >= 2);
+        for part in parts.iter().take(2) {
+            let body = str::from_utf8(part.payload.as_bytes())?;
+            assert!(
+                body.contains("spanning"),
+                "a part that omitted an active cue would make INDEPENDENT=YES a \
+                 lie: a client joining there would see no caption"
+            );
+            assert!(part.independent);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn parts_tile_their_segment_exactly() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux_with_parts(Codec::WebVtt, 2, 1);
+        let mut output = Vec::new();
+        mux.tick(sibling(5), &mut output)?;
+
+        let completions = completions(&output);
+        assert!(!completions.is_empty());
+        for completion in &completions {
+            let covered: u64 = parts(&output)
+                .iter()
+                .filter(|part| part.packaging_segment_id == completion.packaging_segment_id)
+                .map(|part| part.duration)
+                .sum();
+            assert_eq!(
+                covered, completion.duration,
+                "a parent's duration is the sum of its parts, or delivery would \
+                 serve a segment whose bytes and timing disagree"
+            );
+            let first = parts(&output)
+                .into_iter()
+                .find(|part| part.packaging_segment_id == completion.packaging_segment_id)
+                .expect("a completed segment has parts");
+            assert_eq!(first.media_start, completion.media_start);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_silent_track_advances_on_the_part_grid() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux_with_parts(Codec::WebVtt, 2, 1);
+        let mut output = Vec::new();
+        for second in 1..=4 {
+            mux.tick(sibling(second), &mut output)?;
+        }
+
+        let parts = parts(&output);
+        assert_eq!(parts.len(), 4, "two segments of two one-second parts each");
+        for (index, part) in parts.iter().enumerate() {
+            assert!(part.payload.is_empty());
+            assert_eq!(part.duration, SECOND);
+            assert_eq!(part.chunk_index, u32::try_from(index % 2)?);
+        }
+        assert_eq!(completions(&output).len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_cue_landing_only_in_published_parts_is_reported_and_dropped()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sink, recorder) = RecordedEvents::sink();
+        let mut mux = parts_mux(Codec::WebVtt, 2, 1, sink);
+        let mut output = Vec::new();
+        // Seals part 0 of window 0 while leaving the window itself open.
+        mux.tick(sibling(1), &mut output)?;
+        assert_eq!(parts(&output).len(), 1);
+
+        // Confined to the part that already went out.
+        mux.push(
+            sample(Codec::WebVtt, 0, SECOND / 2, b"too late"),
+            &mut output,
+        )?;
+
+        assert!(
+            matches!(
+                recorder.events().as_slice(),
+                [SessionEvent::SubtitleCueTooLate { .. }]
+            ),
+            "an open window is not enough: the parts that could have carried \
+             this cue are already published"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn draining_an_untouched_window_publishes_only_the_media_it_has()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux_with_parts(Codec::WebVtt, 2, 1);
+        let mut output = Vec::new();
+        // Half a part's worth of cue, and no heartbeat: nothing has been sealed,
+        // so the drain must not claim a whole part of media exists.
+        mux.push(sample(Codec::WebVtt, 0, SECOND / 2, b"short"), &mut output)?;
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        let completion = completions(&output)
+            .first()
+            .copied()
+            .expect("a final drain completes its open segment");
+        assert_eq!(completion.duration, SECOND / 2);
+        let covered: u64 = parts(&output).iter().map(|part| part.duration).sum();
+        assert_eq!(covered, completion.duration);
+        Ok(())
+    }
+
+    #[test]
+    fn draining_after_the_heartbeat_outran_the_last_cue_still_closes_cleanly()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux_with_parts(Codec::WebVtt, 2, 1);
+        let mut output = Vec::new();
+        // Sparse captions: one early cue, then siblings carry the clock well
+        // past it, leaving a later window holding published parts but no cue
+        // content at all.
+        mux.push(sample(Codec::WebVtt, 0, SECOND / 2, b"early"), &mut output)?;
+        mux.tick(sibling(5), &mut output)?;
+        let published = parts(&output).len();
+        assert!(published > 2, "the heartbeat reached a later window");
+
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        let last = completions(&output)
+            .last()
+            .copied()
+            .expect("the drain completes the window the heartbeat opened");
+        let covered: u64 = parts(&output)
+            .iter()
+            .filter(|part| part.packaging_segment_id == last.packaging_segment_id)
+            .map(|part| part.duration)
+            .sum();
+        assert_eq!(
+            covered, last.duration,
+            "a window past the last cue still owes delivery exactly the media \
+             it already published"
+        );
         Ok(())
     }
 

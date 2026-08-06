@@ -77,6 +77,24 @@ pub fn subtitle(local: u32) -> PackagedRendition {
         .build()
 }
 
+/// A WebVTT rendition cut into parts, as a low-latency part plan produces.
+///
+/// Segment-only subtitles remain reachable — a plan whose part target equals
+/// its segment target has no grid to subdivide — so both shapes are fixtures
+/// rather than one replacing the other.
+pub fn subtitle_with_parts(local: u32) -> PackagedRendition {
+    RenditionBuilder::new(local, MediaKind::Subtitle)
+        .key(&format!("subtitle/{local}"))
+        .config(RenditionConfig {
+            timebase: timebase(),
+            segment_target: nz::u64!(6),
+            maximum_segment_duration: nz::u64!(6),
+            chunk_target: Some(nz::u64!(1)),
+            segment_format: MediaSegmentFormat::WebVtt,
+        })
+        .build()
+}
+
 /// Wraps renditions in a validated presentation, one source track each.
 pub fn presentation(renditions: Vec<PackagedRendition>) -> Arc<PackagedPresentation> {
     let tracks: Vec<_> = renditions

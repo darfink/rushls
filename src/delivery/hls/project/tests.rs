@@ -7,8 +7,8 @@ use crate::{
     delivery::hls::{
         RenditionSnapshot, StreamLease, StreamSnapshot, StreamStore,
         fixtures::{
-            audio, chunk, initialization, lease, stream_id, subtitle, video, write, write_direct,
-            write_segment,
+            audio, chunk, initialization, lease, stream_id, subtitle, subtitle_with_parts, video,
+            write, write_direct, write_segment,
         },
         project::{
             DeliveryTimingPolicy, PlaylistPolicy, ProgramDateTimePolicy, media::media_playlist,
@@ -304,6 +304,33 @@ fn a_webvtt_playlist_names_vtt_resources_and_advertises_no_parts()
         rendered.contains("PART-HOLD-BACK=3"),
         "but it still carries the presentation-wide server control, which its \
          chunked sibling requires"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_chunked_webvtt_playlist_advertises_vtt_parts() -> Result<(), Box<dyn std::error::Error>> {
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0), subtitle_with_parts(1)]);
+    write(&lease, initialization(1, 1));
+    write_segment(&lease, 1, 0, 0);
+    write(&lease, chunk(1, 1, 0, 6));
+
+    let rendered = render(&lease, 1, &policy())?;
+
+    assert!(
+        rendered.contains("#EXT-X-PART-INF:PART-TARGET=1\n"),
+        "a subtitle rendition that publishes parts declares its grid like any \
+         other: {rendered}"
+    );
+    assert!(
+        rendered.contains("#EXT-X-PART:DURATION=1,URI=\"part/1.vtt\""),
+        "a WebVTT part is a WebVTT resource, not an fMP4 one: {rendered}"
+    );
+    assert!(rendered.contains("#EXT-X-MAP:URI=\"init/1.vtt\"\n"));
+    assert!(
+        rendered.contains("#EXTINF:6,\nsegment/1.vtt\n"),
+        "the parent stays addressable as a whole segment: {rendered}"
     );
     Ok(())
 }

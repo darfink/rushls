@@ -128,7 +128,12 @@ mod tests {
         );
         let subtitle = &started.presentation.renditions[1];
         assert_eq!(subtitle.config.segment_format, MediaSegmentFormat::WebVtt);
-        assert_eq!(subtitle.config.chunk_target, None);
+        assert_eq!(
+            subtitle.config.chunk_target,
+            Some(nz::u64!(90_000)),
+            "a subtitle rendition publishes on the same part cadence its plan \
+             gives every other rendition, rather than opting out of parts"
+        );
         assert_eq!(subtitle.codecs.as_ref(), "wvtt");
         assert_eq!(subtitle.source_tracks.as_ref(), &[TrackId(1)]);
         Ok(())
@@ -293,9 +298,11 @@ mod tests {
             }
             _ => None,
         });
+        // Subtitles carry a part cadence here, so their first published object
+        // is a part rather than a whole segment.
         let subtitle_start = output.iter().find_map(|media| match media {
-            PackagedMedia::Segment(segment) if segment.rendition_id == PackagingRenditionId(1) => {
-                Some(segment.media_start)
+            PackagedMedia::Chunk(chunk) if chunk.rendition_id == PackagingRenditionId(1) => {
+                Some(chunk.media_start)
             }
             _ => None,
         });
