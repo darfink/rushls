@@ -461,13 +461,6 @@ impl LiveStream {
         if state.publication != publication {
             return Ok(false);
         }
-        // Capacity reclamation precedes validation. Each affected rendition
-        // publishes its cleanup immediately, so even a subsequently rejected
-        // event cannot leave the request-facing cache pointing at expired
-        // initialization state.
-        if state.sweep_expired(now) {
-            self.advance_media_revision();
-        }
 
         let existing = state
             .renditions
@@ -478,31 +471,52 @@ impl LiveStream {
                 rendition_id: media.rendition_id(),
             });
         };
+        // Capacity reclamation precedes validation. Only the rendition this
+        // write lands in is swept here: a full sweep is O(media retained by
+        // every rendition), while the maintenance tick already sweeps the
+        // rest. The affected rendition still publishes its cleanup
+        // immediately, so a subsequently rejected event cannot leave the
+        // request-facing cache pointing at expired initialization state.
+        if state.sweep_rendition(index, now) {
+            self.advance_media_revision();
+        }
         let additional = state.renditions[index].additional_bytes_for(&media)?;
         let adds_part = matches!(&media, PackagedMedia::Chunk(_));
         let adds_segment = matches!(
             &media,
             PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_)
         );
-        if adds_part && state.retained_parts() >= self.limits.maximum_parts {
-            return Err(StoreWriteError::PartCapacityExceeded {
-                maximum: self.limits.maximum_parts,
-            });
-        }
-        if adds_segment && state.retained_segments() >= self.limits.maximum_segments {
-            return Err(StoreWriteError::SegmentCapacityExceeded {
-                maximum: self.limits.maximum_segments,
-            });
-        }
-        if state
-            .retained_payload_bytes
-            .checked_add(additional)
-            .is_none_or(|total| total > self.limits.maximum_payload_bytes)
-        {
-            return Err(StoreWriteError::PayloadCapacityExceeded {
-                maximum: self.limits.maximum_payload_bytes,
-                additional,
-            });
+        let capacity = |state: &StreamState| {
+            if adds_part && state.retained_parts() >= self.limits.maximum_parts {
+                return Err(StoreWriteError::PartCapacityExceeded {
+                    maximum: self.limits.maximum_parts,
+                });
+            }
+            if adds_segment && state.retained_segments() >= self.limits.maximum_segments {
+                return Err(StoreWriteError::SegmentCapacityExceeded {
+                    maximum: self.limits.maximum_segments,
+                });
+            }
+            if state
+                .retained_payload_bytes
+                .checked_add(additional)
+                .is_none_or(|total| total > self.limits.maximum_payload_bytes)
+            {
+                return Err(StoreWriteError::PayloadCapacityExceeded {
+                    maximum: self.limits.maximum_payload_bytes,
+                    additional,
+                });
+            }
+            Ok(())
+        };
+        if let Err(rejected) = capacity(&state) {
+            // Expired media from *other* renditions can still stand in the
+            // way of a hard ceiling; reclaim everything before refusing.
+            if state.sweep_expired(now) {
+                self.advance_media_revision();
+                capacity(&state)?;
+            }
+            return Err(rejected);
         }
 
         let advertised_before = state.renditions[index].bitrate.snapshot().advertised();
@@ -585,6 +599,26 @@ impl StreamState {
         }
         self.prune_publication_anchors();
         self.recalculate_retained_bytes();
+        changed
+    }
+
+    /// Sweeps one rendition's expired resources, republishing its snapshot
+    /// when anything was reclaimed.
+    ///
+    /// The write path uses this instead of [`Self::sweep_expired`] so one
+    /// chunk costs work proportional to the rendition it lands in rather
+    /// than to everything the stream retains. The maintenance tick still
+    /// sweeps every rendition, and a refused capacity check falls back to a
+    /// full sweep before the write is rejected.
+    fn sweep_rendition(&mut self, index: usize, now: Instant) -> bool {
+        let before = self.renditions[index].retained_object_counts();
+        self.renditions[index].sweep_expired(now);
+        self.renditions[index].forget_unreachable_initializations();
+        let changed = self.renditions[index].retained_object_counts() != before;
+        if changed {
+            self.renditions[index].publish_snapshot();
+            self.recalculate_retained_bytes();
+        }
         changed
     }
 

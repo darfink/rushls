@@ -32,7 +32,9 @@ use super::{
     InitializationId, Msn, OpenSegment, PartCursor, PartId, PartIndex, PlaylistContract,
     PublishedSegments, RenditionBitrateStatistics, RenditionSnapshot, RenditionView,
     RetentionPolicy, SegmentBody, SegmentId, StoreWriteError, StoredInitialization, StoredPart,
-    StoredSegment, StoredSegmentKind, bitrate::BitrateTracker, media::segment_byte_len,
+    StoredSegment, StoredSegmentKind,
+    bitrate::BitrateTracker,
+    media::{segment_byte_len, segment_resource_bytes},
 };
 
 /// A committed live edge and the channel that should announce it.
@@ -169,6 +171,14 @@ pub struct RenditionState {
     part_resources: HashMap<PartId, PartResource>,
     /// At most one progressively published packaging segment per rendition.
     open_segment: Option<OpenSegment>,
+    /// Payload bytes this rendition currently retains, kept incrementally so
+    /// the write path never re-sums every retained resource.
+    ///
+    /// Charged when a payload is stored — initialization, part, or direct
+    /// segment — and released when one is reclaimed. A chunked segment's
+    /// bytes are already charged to the parts that compose it, so completing
+    /// it changes nothing.
+    retained_payload_bytes: usize,
     /// HLS numbering is independent from publisher-local packaging IDs and is
     /// never reset when a publisher reconnects.
     next_msn: u64,
@@ -232,6 +242,7 @@ impl RenditionState {
             part_order: VecDeque::new(),
             part_resources: HashMap::new(),
             open_segment: None,
+            retained_payload_bytes: 0,
             next_msn: 0,
             media_sequence: 0,
             discontinuity_sequence: 0,
@@ -603,6 +614,7 @@ impl RenditionState {
         if self.holds_current_initialization(&segment) {
             return;
         }
+        let payload_bytes = segment.payload.len();
         self.issued_initializations = self.issued_initializations.saturating_add(1);
         let id = InitializationId(self.issued_initializations);
         self.current_initialization = Some(id);
@@ -614,6 +626,7 @@ impl RenditionState {
             gzip,
         });
         self.initializations = initializations.into();
+        self.retained_payload_bytes = self.retained_payload_bytes.saturating_add(payload_bytes);
     }
 
     fn push_chunk(
@@ -625,6 +638,7 @@ impl RenditionState {
         retention: RetentionPolicy,
     ) {
         let config = self.require_config().expect("validated configuration");
+        let payload_bytes = chunk.payload.len();
         let initialization = self
             .current_initialization
             .expect("validated initialization");
@@ -684,6 +698,7 @@ impl RenditionState {
                 parent_retained: false,
             },
         );
+        self.retained_payload_bytes = self.retained_payload_bytes.saturating_add(payload_bytes);
         self.hide_old_parts(now, retention);
     }
 
@@ -805,6 +820,7 @@ impl RenditionState {
 
     fn insert_segment(&mut self, segment: StoredSegment, now: Instant, retention: RetentionPolicy) {
         let id = segment.id;
+        let payload_bytes = segment_resource_bytes(&segment);
         self.visible_segments.push_back(id);
         self.segment_resources.insert(
             id,
@@ -816,6 +832,7 @@ impl RenditionState {
                 expires_at: None,
             },
         );
+        self.retained_payload_bytes = self.retained_payload_bytes.saturating_add(payload_bytes);
 
         let segment_target = self.advertised_config.map_or(Duration::MAX, |config| {
             config
@@ -1016,13 +1033,20 @@ impl RenditionState {
                 && resource
                     .expires_at
                     .is_some_and(|expires_at| now >= expires_at);
-            if expired
-                && let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) =
+            if expired {
+                // A chunked segment's bytes belong to its parts and are
+                // released with them; only a contiguous segment holds bytes
+                // of its own.
+                self.retained_payload_bytes = self
+                    .retained_payload_bytes
+                    .saturating_sub(segment_resource_bytes(&resource.segment));
+                if let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) =
                     &resource.segment.kind
-            {
-                for part in parts.iter() {
-                    if let Some(part_resource) = part_resources.get_mut(&part.id) {
-                        part_resource.parent_retained = false;
+                {
+                    for part in parts.iter() {
+                        if let Some(part_resource) = part_resources.get_mut(&part.id) {
+                            part_resource.parent_retained = false;
+                        }
                     }
                 }
             }
@@ -1037,7 +1061,13 @@ impl RenditionState {
                         .is_some_and(|expires_at| now >= expires_at)
             });
             if remove {
-                self.part_resources.remove(id);
+                let resource = self
+                    .part_resources
+                    .remove(id)
+                    .expect("the part was inspected above");
+                self.retained_payload_bytes = self
+                    .retained_payload_bytes
+                    .saturating_sub(resource.part.payload.len());
             }
             !remove
         });
@@ -1070,27 +1100,7 @@ impl RenditionState {
     }
 
     pub fn retained_payload_bytes(&self) -> usize {
-        let initialization_bytes: usize = self
-            .initializations
-            .iter()
-            .map(|initialization| initialization.payload.len())
-            .sum();
-        let part_bytes: usize = self
-            .part_resources
-            .values()
-            .map(|resource| resource.part.payload.len())
-            .sum();
-        let direct_segment_bytes: usize = self
-            .segment_resources
-            .values()
-            .map(|resource| match &resource.segment.kind {
-                StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) => payload.len(),
-                StoredSegmentKind::Media(SegmentBody::Chunked(_)) | StoredSegmentKind::Gap => 0,
-            })
-            .sum();
-        initialization_bytes
-            .saturating_add(part_bytes)
-            .saturating_add(direct_segment_bytes)
+        self.retained_payload_bytes
     }
 
     pub fn forget_unreachable_initializations(&mut self) {
@@ -1105,6 +1115,12 @@ impl RenditionState {
         {
             return;
         }
+        let removed_bytes: usize = self
+            .initializations
+            .iter()
+            .filter(|held| !self.initialization_is_reachable(held.id))
+            .map(|held| held.payload.len())
+            .sum();
         let retained: Vec<_> = self
             .initializations
             .iter()
@@ -1112,6 +1128,7 @@ impl RenditionState {
             .cloned()
             .collect();
         self.initializations = retained.into();
+        self.retained_payload_bytes = self.retained_payload_bytes.saturating_sub(removed_bytes);
     }
 
     fn initialization_is_reachable(&self, id: InitializationId) -> bool {

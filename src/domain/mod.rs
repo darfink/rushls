@@ -25,7 +25,7 @@ pub use payload::Payload;
 pub use rfc6381::rfc6381;
 pub use time::{
     RationalTickAccumulator, TickDuration, TickOffset, TickTimestamp, Timebase, TimebaseProjection,
-    duration_since, offset_from,
+    duration_from_nanos_saturating, duration_since, offset_from,
 };
 pub use track::{
     AudioTiming, AudioTrim, Codec, DiscoveredTrack, FrameRate, MediaKind, MediaParameters,

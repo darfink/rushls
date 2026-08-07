@@ -235,6 +235,19 @@ fn clamp_u128_to_u64(value: u128) -> u64 {
     u64::try_from(value.min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
 }
 
+/// Builds a [`Duration`] from nanoseconds, saturating instead of overflowing.
+///
+/// Shared by the delivery store's policy math, where several independent
+/// rules scale durations (retention windows, part floors) and none of them
+/// may fail because a configured multiple produced a value larger than a
+/// [`Duration`] can represent.
+pub fn duration_from_nanos_saturating(nanos: u128) -> Duration {
+    let nanos = nanos.min(Duration::MAX.as_nanos());
+    let seconds = u64::try_from(nanos / NANOS_PER_SECOND).unwrap_or(u64::MAX);
+    let subsecond_nanos = u32::try_from(nanos % NANOS_PER_SECOND).unwrap_or(u32::MAX);
+    Duration::new(seconds, subsecond_nanos)
+}
+
 fn div_round_nearest_checked(num: i128, den: i128) -> Option<i128> {
     debug_assert!(den != 0);
     let quotient = num.checked_div(den)?;

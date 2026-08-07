@@ -1796,8 +1796,17 @@ mod tests {
         assert!(packets[0].random_access);
     }
 
-    #[tokio::test]
-    async fn mpeg_ts_normalizes_and_packages_as_demuxable_cmaf() {
+    /// The MPEG-TS fixture, demuxed and normalized.
+    ///
+    /// Shared by the normalization and packaging tests so the fixture is
+    /// probed and normalized exactly once per test.
+    struct MpegTsFixture {
+        presentation: crate::media::PresentationPlan,
+        timeline: crate::media::TimelineCalibration,
+        samples: Vec<NormalizedSample>,
+    }
+
+    async fn mpeg_ts_fixture() -> MpegTsFixture {
         let process = crate::observe::ProcessMeters::default();
         let session = crate::observe::SessionMeters::new(process);
         let mut source = AvformatPacketSource::new(
@@ -1841,21 +1850,38 @@ mod tests {
             .normalizer
             .finish(&mut samples)
             .expect("held video timing resolves at end of input");
+        MpegTsFixture {
+            presentation: normalized.presentation,
+            timeline: normalized.timeline,
+            samples,
+        }
+    }
+
+    #[tokio::test]
+    async fn mpeg_ts_normalizes_to_audio_and_video() {
+        let fixture = mpeg_ts_fixture().await;
         assert!(
-            samples
+            fixture
+                .samples
                 .iter()
                 .any(|sample| matches!(sample, NormalizedSample::Video(_)))
-                && samples
+                && fixture
+                    .samples
                     .iter()
                     .any(|sample| matches!(sample, NormalizedSample::Audio(_)))
         );
+    }
 
-        let tracks = normalized
+    #[tokio::test]
+    async fn normalized_mpeg_ts_packages_as_demuxable_cmaf() {
+        let fixture = mpeg_ts_fixture().await;
+        let tracks = fixture
             .presentation
             .tracks()
             .iter()
             .map(|track| {
-                let mut track_samples = samples
+                let mut track_samples = fixture
+                    .samples
                     .iter()
                     .filter(|sample| sample.track_id() == track.id);
                 let first = track_samples
@@ -1877,7 +1903,7 @@ mod tests {
                     NonZero::new(longest).expect("samples have duration"),
                 )
                 .presentation_origin(
-                    normalized
+                    fixture
                         .timeline
                         .get(track.id)
                         .expect("normalized track has a timeline")
@@ -1887,19 +1913,19 @@ mod tests {
                 .build()
             })
             .collect();
-        let segmentation = SegmentationPlan::new(&normalized.presentation, tracks)
+        let segmentation = SegmentationPlan::new(&fixture.presentation, tracks)
             .expect("fixture segmentation is valid");
         let sink = discarded_events();
         let mut mux = PassThroughMuxerFactory::default()
             .start(MuxerStartRequest {
-                presentation: &normalized.presentation,
+                presentation: &fixture.presentation,
                 segmentation: &segmentation,
                 time_anchor: SystemTime::UNIX_EPOCH,
                 events: &sink,
             })
             .expect("MPEG-TS presentation packages");
         let mut media = Vec::new();
-        for sample in samples {
+        for sample in fixture.samples {
             mux.muxer
                 .push(sample, &mut media)
                 .expect("normalized sample packages");

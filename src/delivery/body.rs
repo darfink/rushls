@@ -102,7 +102,13 @@ fn clip_range<'a>(frames: impl Iterator<Item = &'a Payload>, start: u64, end: u6
         let frame_end = position + length;
         if frame_end > start && position <= end {
             let from = start.saturating_sub(position).min(length);
-            let to = (end + 1 - position).min(length);
+            // `end + 1` is the exclusive bound; saturating keeps an
+            // end-of-representation range (`end == u64::MAX`) from wrapping
+            // around to zero.
+            let to = end.saturating_add(1).saturating_sub(position).min(length);
+            if from >= to {
+                continue;
+            }
             // Frame payloads live in addressable memory, so these offsets fit.
             let from = usize::try_from(from).unwrap_or(usize::MAX);
             let to = usize::try_from(to).unwrap_or(usize::MAX);

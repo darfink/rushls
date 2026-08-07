@@ -254,11 +254,12 @@ async fn handle<P: Application>(
         Err(failure) => return error_response(failure),
     };
 
+    // Borrowed straight from the request headers: the response is already
+    // resolved by here, so nothing else needs the header map mutably.
     let range = headers
         .get(header::RANGE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    match into_http(response, range.as_deref(), accepts_gzip(&headers)) {
+        .and_then(|value| value.to_str().ok());
+    match into_http(response, range, accepts_gzip(&headers)) {
         Ok(response) => response,
         Err(status) => status.into_response(),
     }

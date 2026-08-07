@@ -34,6 +34,15 @@ use crate::domain::RenditionId;
 
 use super::{StreamSnapshot, gzip::gzip, uri::PlaylistUris};
 
+/// Render attempts before a chasing epoch is served as-is instead.
+///
+/// A key that advances on every attempt means publications are landing
+/// between the two captures; each retry renders against a fresh snapshot.
+/// After this many, the loop stops chasing: the bytes just rendered describe
+/// one internally consistent snapshot, which is all a single render ever
+/// promised, so they are served uncached rather than withheld forever.
+const MAXIMUM_RENDER_ATTEMPTS: u32 = 8;
+
 /// Identifies exactly the inputs a rendered media playlist depends on.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PlaylistKey {
@@ -159,6 +168,7 @@ impl PlaylistCache {
         }
 
         let _rendering = self.rendering.lock();
+        let mut attempts = 0_u32;
         loop {
             let (key, inputs) = capture()?;
             // Whoever held the render lock may have filled this exact epoch.
@@ -166,11 +176,20 @@ impl PlaylistCache {
                 return Ok(cached);
             }
             let rendered = render(&inputs)?;
+            let bytes = Bytes::from(rendered.into_bytes());
             let (current, _) = capture()?;
             if current != key {
+                attempts += 1;
+                if attempts >= MAXIMUM_RENDER_ATTEMPTS {
+                    let gzip = gzip(&bytes);
+                    return Ok(Rendered {
+                        bytes,
+                        gzip,
+                        freshly_rendered: true,
+                    });
+                }
                 continue;
             }
-            let bytes = Bytes::from(rendered.into_bytes());
             // Compressed here, inside the section that already serialises
             // rendering, so a publication that wakes a thousand blocked viewers
             // costs one render and one compression rather than a thousand of

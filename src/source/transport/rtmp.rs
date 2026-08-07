@@ -6,7 +6,7 @@
 
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use scuffle_rtmp::{
     ServerSession,
     session::server::{ServerSessionError, SessionData, SessionHandler},
@@ -126,6 +126,7 @@ impl RtmpPendingPublish {
             writer,
             active_stream_id: None,
             maximum_tag_payload_bytes: config.maximum_tag_payload_bytes.get(),
+            framing: BytesMut::new(),
         };
         let mut session = tokio::spawn(async move {
             let result = ServerSession::new(io, handler).run().await;
@@ -301,11 +302,17 @@ struct FlvHandler {
     writer: AvformatByteChannelWriter,
     active_stream_id: Option<u32>,
     maximum_tag_payload_bytes: usize,
+    /// Scratch space for the FLV tag header and previous-tag-size footer.
+    ///
+    /// The frozen framing `Bytes` handed to the channel shares this buffer's
+    /// allocation, and the next message reuses whatever capacity remains, so
+    /// steady state costs no per-message allocation for framing.
+    framing: BytesMut,
 }
 
 impl FlvHandler {
     async fn write_tag(
-        &self,
+        &mut self,
         tag_type: u8,
         timestamp: u32,
         payload: Bytes,
@@ -337,12 +344,18 @@ impl FlvHandler {
         // header[8..11] is FLV's always-zero StreamID.
         let previous_tag_size = (header_len + payload_len).to_be_bytes();
 
+        // Both framing pieces are carved from one per-connection scratch
+        // buffer: each frozen `Bytes` shares its allocation with the next
+        // message's reuse, so steady state costs no allocation for framing.
+        self.framing.clear();
+        self.framing.extend_from_slice(&header);
+        let header = self.framing.split_to(self.framing.len()).freeze();
+        self.framing.clear();
+        self.framing.extend_from_slice(&previous_tag_size);
+        let previous_tag_size = self.framing.split_to(self.framing.len()).freeze();
+
         self.writer
-            .send_group([
-                Bytes::copy_from_slice(&header),
-                payload,
-                Bytes::copy_from_slice(&previous_tag_size),
-            ])
+            .send_group([header, payload, previous_tag_size])
             .await
             .map_err(|error| {
                 self.writer.fail(error.to_string());
@@ -569,6 +582,7 @@ mod tests {
                 writer,
                 active_stream_id: None,
                 maximum_tag_payload_bytes,
+                framing: BytesMut::new(),
             },
             attempt,
             input,

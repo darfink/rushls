@@ -556,9 +556,13 @@ fn rendition_for_stream(
 
 /// Whether a requested part is beyond HLS's Advance Part Limit.
 ///
-/// The limit is three seconds' worth of parts when PART-TARGET is below one
-/// second, otherwise three parts. Comparing durations directly preserves the
-/// draft's fractional result without inventing a rounding rule.
+/// Draft-pantos-hls-rfc8216bis-22, section 6.2.5.2, defines the limit as
+/// "three divided by the Part Target Duration if the Part Target Duration is
+/// less than one second, or three otherwise" — a part-count ceiling that
+/// stays fractional for sub-second targets. Comparing `advance × PART-TARGET`
+/// against three seconds is the same comparison without a fractional
+/// division, and the strict `>` matches the draft's "exceeds ... by the
+/// Advance Part Limit".
 fn advance_part_limit_exceeded(
     last: PartIndex,
     requested: PartIndex,

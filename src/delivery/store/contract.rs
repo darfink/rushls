@@ -15,6 +15,7 @@
 
 use std::{num::NonZeroU64, time::Duration};
 
+use crate::domain::duration_from_nanos_saturating;
 use crate::mux::{MediaSegmentFormat, RenditionConfig};
 
 /// The fraction of `PART-TARGET` a part must reach while it is not the last
@@ -28,10 +29,11 @@ pub struct PlaylistContract {
     pub target_duration: NonZeroU64,
     /// The exact bound every segment must respect, before rounding.
     ///
-    /// Retained separately from [`Self::target_duration`] because rounding is
-    /// lossy in the permissive direction: a 6.4 s segment rounds to a target of
-    /// 6, so validating against the rounded value alone would admit segments
-    /// half a second longer than the muxer ever promised to produce.
+    /// Retained separately from [`Self::target_duration`] so the muxer's
+    /// advertised budget and the rejection message stay exact. Validation
+    /// itself follows the protocol: the *segment's* duration is rounded to
+    /// the nearest whole second and compared to the target, exactly as
+    /// section 4.4.3.1 of draft-pantos-hls-rfc8216bis requires.
     pub maximum_segment_duration: Duration,
     /// The `PART-TARGET` value, absent for a rendition publishing whole
     /// segments.
@@ -60,7 +62,7 @@ impl PlaylistContract {
     }
 
     pub fn permits_segment(&self, duration: Duration) -> bool {
-        duration <= self.maximum_segment_duration
+        nearest_whole_seconds(duration) <= self.target_duration
     }
 
     /// Whether a part is short enough to be tagged at all.
@@ -95,10 +97,12 @@ impl PlaylistContract {
 
 /// Rounds to the nearest whole second, never below one.
 ///
-/// HLS compares each segment's *rounded* duration against the target, so the
-/// target has to be the rounding of the longest permitted segment for the
-/// comparison to hold for every shorter one. A sub-second cadence still needs a
-/// target of at least 1, which is the smallest value the tag can carry.
+/// The protocol version 6 semantics of `EXT-X-TARGETDURATION` make the tag
+/// "the maximum segment duration rounded to the nearest integer number of
+/// seconds" (draft-pantos-hls-rfc8216bis, section 4.4.3.1), and the same
+/// rounding is applied to each segment when it is judged against the target.
+/// A sub-second cadence still needs a target of at least 1, which is the
+/// smallest value the tag can carry.
 fn nearest_whole_seconds(duration: Duration) -> NonZeroU64 {
     let seconds = duration.as_secs();
     let rounded = if duration.subsec_nanos() >= 500_000_000 {
@@ -107,14 +111,6 @@ fn nearest_whole_seconds(duration: Duration) -> NonZeroU64 {
         seconds
     };
     NonZeroU64::new(rounded).unwrap_or(NonZeroU64::MIN)
-}
-
-fn duration_from_nanos_saturating(nanos: u128) -> Duration {
-    let nanos = nanos.min(Duration::MAX.as_nanos());
-    Duration::new(
-        u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX),
-        u32::try_from(nanos % 1_000_000_000).unwrap_or(u32::MAX),
-    )
 }
 
 #[cfg(test)]
@@ -142,7 +138,8 @@ mod tests {
         assert_eq!(contract.target_duration, nz::u64!(7));
         assert_eq!(contract.maximum_segment_duration, Duration::from_secs(7));
         assert!(contract.permits_segment(Duration::from_secs(7)));
-        assert!(!contract.permits_segment(Duration::from_millis(7_001)));
+        assert!(contract.permits_segment(Duration::from_millis(7_499)));
+        assert!(!contract.permits_segment(Duration::from_millis(7_500)));
     }
 
     #[test]
@@ -160,6 +157,21 @@ mod tests {
             PlaylistContract::derive(&config(9_000, None)).target_duration,
             nz::u64!(1),
             "a sub-second cadence still needs a representable target"
+        );
+    }
+
+    #[test]
+    fn segments_are_judged_by_their_rounded_duration_like_the_spec_requires() {
+        let contract = PlaylistContract::derive(&config(540_000, None));
+
+        assert_eq!(contract.target_duration, nz::u64!(6));
+        assert!(
+            contract.permits_segment(Duration::from_millis(6_499)),
+            "6.499 s rounds to 6, within a target of 6"
+        );
+        assert!(
+            !contract.permits_segment(Duration::from_millis(6_500)),
+            "6.5 s rounds to 7, beyond a target of 6"
         );
     }
 

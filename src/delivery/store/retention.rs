@@ -2,6 +2,8 @@ use std::{num::NonZeroU32, time::Duration};
 
 use tokio::time::Instant;
 
+use crate::domain::duration_from_nanos_saturating;
+
 const DEFAULT_VISIBLE_SEGMENTS: usize = 6;
 const DEFAULT_MAXIMUM_RETAINED_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_MAXIMUM_RETAINED_PARTS: usize = 16_384;
@@ -155,13 +157,6 @@ impl Default for RetentionPolicy {
             maximum_segments: DEFAULT_MAXIMUM_RETAINED_SEGMENTS,
         }
     }
-}
-
-fn duration_from_nanos_saturating(nanos: u128) -> Duration {
-    let nanos = nanos.min(Duration::MAX.as_nanos());
-    let seconds = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
-    let subsecond_nanos = u32::try_from(nanos % 1_000_000_000).unwrap_or(u32::MAX);
-    Duration::new(seconds, subsecond_nanos)
 }
 
 #[cfg(test)]

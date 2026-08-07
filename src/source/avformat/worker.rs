@@ -175,6 +175,15 @@ fn run(
 
         match converted {
             Ok(Some(packet)) => {
+                // Both waits below — `reserve` and `blocking_send` — are
+                // deliberately *not* interrupted by `Control::cancel`, which
+                // can only reach FFmpeg's next read. They unblock when the
+                // receiving half of the pipeline goes away: dropping
+                // `AvformatPacketSource` drops this channel's receiver, which
+                // fails a pending send, and the queued packets it drops
+                // release their permits, which wakes a pending reserve. Keep
+                // that teardown shape — cancellation must always be paired
+                // with dropping the source, never with merely cancelling it.
                 let permit = budget.reserve(packet.retained_payload_bytes());
                 if output
                     .blocking_send(WorkerEvent::Packet(QueuedPacket {

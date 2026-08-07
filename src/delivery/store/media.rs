@@ -144,6 +144,20 @@ impl PublishedSegments {
 ///
 /// A gap has none, and a chunked body's bytes are already charged to the parts
 /// that compose it, so this counts only what the segment itself holds.
+/// Distinct from [`segment_byte_len`], which describes the reassembled
+/// resource for bitrate accounting.
+pub fn segment_resource_bytes(segment: &StoredSegment) -> usize {
+    match &segment.kind {
+        StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) => payload.len(),
+        StoredSegmentKind::Media(SegmentBody::Chunked(_)) | StoredSegmentKind::Gap => 0,
+    }
+}
+
+/// The size of the media a completed segment carries, reassembled.
+///
+/// A chunked segment's size is the sum of its parts. Used where the bytes a
+/// viewer would receive matter (bitrate), never where retention is charged —
+/// see [`segment_resource_bytes`].
 pub fn segment_byte_len(segment: &StoredSegment) -> usize {
     match &segment.kind {
         StoredSegmentKind::Media(body) => body.len(),
