@@ -1738,4 +1738,17 @@ mod tls {
 
         assert!(bind_tls(tcp, settings, ProcessMeters::default(), events).is_err());
     }
+
+    #[test]
+    fn hostile_range_headers_never_panic() {
+        use crate::server::http::body::parse_range;
+
+        let mut state = 0xa55a_5aa5_1234_5678_u64;
+        for _ in 0..4_000 {
+            let header = crate::test_fuzz::string(&mut state, 48);
+            let length = crate::test_fuzz::next_random(&mut state) & 0x1_0000;
+            // Every outcome is legal: served, ignored, or unsatisfiable.
+            let _ = parse_range(&header, length);
+        }
+    }
 }

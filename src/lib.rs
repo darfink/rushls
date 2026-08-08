@@ -57,6 +57,9 @@ pub mod source;
 #[cfg(all(test, feature = "allocation-counting"))]
 pub mod test_alloc;
 
+#[cfg(test)]
+pub(crate) mod test_fuzz;
+
 /// Package version and the git commit this binary was built from.
 ///
 /// Set at compile time from `CARGO_PKG_VERSION` and `GIT_SHA` (see `build.rs`).

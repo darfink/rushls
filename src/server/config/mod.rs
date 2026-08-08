@@ -965,7 +965,7 @@ pub struct HlsAppConfig {
         long,
         env,
         default_value = "1s",
-se        value_parser = humantime::parse_duration,
+        value_parser = humantime::parse_duration,
         serde(use_value_parser)
     )]
     part_duration: Duration,

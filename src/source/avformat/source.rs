@@ -717,4 +717,56 @@ mod tests {
         .await
         .expect("the detached worker exits promptly");
     }
+
+    #[tokio::test]
+    async fn corrupted_containers_fail_cleanly_without_panicking_or_leaking() {
+        let valid = crate::source::avformat::fixtures::h264_adts_aac_mpeg_ts();
+        let mut seeds: Vec<Vec<u8>> = Vec::new();
+        // Truncations at awkward boundaries, including byte zero and the end.
+        for cut in [0_usize, 1, 7, 64, valid.len() / 2, valid.len() - 1] {
+            seeds.push(valid[..cut].to_vec());
+        }
+        // Bit flips in the header, mid-stream, and at the tail.
+        let mut corrupted = valid.clone();
+        for index in [0_usize, 5, 100, 1_000, valid.len() - 2] {
+            corrupted[index] ^= 0xff;
+            seeds.push(corrupted.clone());
+            corrupted[index] ^= 0xff;
+        }
+        // Pure garbage, emptiness, and the intact fixture as a control.
+        seeds.push(Vec::new());
+        seeds.push(vec![0xff; 512]);
+        seeds.push(valid);
+
+        for (seed_index, bytes) in seeds.into_iter().enumerate() {
+            let meters = SessionMeters::new(ProcessMeters::default());
+            let mut source = AvformatPacketSource::new(
+                Box::new(ReadInput::closed(Cursor::new(bytes))),
+                AvformatConfig::default(),
+                InputLimits::permissive(),
+                meters.source_view(),
+            )
+            .expect("configuration is valid");
+            // Discovery may refuse the input outright, which is a clean outcome.
+            if source.discover(discovery_limits()).await.is_err() {
+                continue;
+            }
+            let mut packets = Vec::new();
+            let mut terminal = false;
+            for _ in 0..32 {
+                match source.fill(&mut packets).await {
+                    Ok(state) if state.is_open() => {}
+                    Ok(_) | Err(_) => {
+                        terminal = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                terminal,
+                "corrupt seed {seed_index} reaches a terminal state rather \
+                 than producing media forever"
+            );
+        }
+    }
 }

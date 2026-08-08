@@ -847,6 +847,16 @@ playlist_window = "12s"
     Ok(())
 }
 
+#[test]
+fn hostile_playlist_windows_never_panic() {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    for _ in 0..4_000 {
+        let value = crate::test_fuzz::string(&mut state, 24);
+        // A window either parses into a rule or is refused; both are fine.
+        let _ = parse_playlist_window(&value);
+    }
+}
+
 struct TempConfig {
     path: PathBuf,
 }

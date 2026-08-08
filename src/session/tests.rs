@@ -7,10 +7,14 @@ use crate::{
         AdmissionError, Authenticator, ClientInfo, IngestProtocol, PresentedCredential, Principal,
         PublishGrant, PublishRequest, PublishResource, StreamPolicy, TakeoverPolicy,
     },
-    delivery::hls::{StorePublisherFactory, StreamStore},
+    delivery::hls::{
+        HlsError, HlsPublisher, PublishOutcome, PublisherFactory, StorePublisherFactory,
+        StreamStore,
+    },
+    delivery::store::StoreWriteError,
     domain::{
-        Appender, BoxFuture, Codec, MediaKind, Payload, SessionId, StreamId, Timebase, TrackCounts,
-        TrackId, fixtures::video_catalog,
+        Appender, BoxFuture, Codec, MediaKind, Payload, RenditionId, SessionId, StreamId, Timebase,
+        TrackCounts, TrackId, fixtures::video_catalog,
     },
     media::{
         MediaNormalizer, NormalizeError, NormalizedSample, NormalizerFactory, PresentationPlan,
@@ -18,8 +22,9 @@ use crate::{
     },
     mux::{
         FinishReason, InitializationSegment, MuxError, Muxer, MuxerFactory, MuxerStartRequest,
-        PackagedChunk, PackagedMedia, PackagedSegmentCompletion, PackagingRenditionId,
-        PackagingSegmentId, StartedMuxer, fixtures as mux_fixtures, fixtures::RenditionBuilder,
+        PackagedChunk, PackagedMedia, PackagedPresentation, PackagedSegmentCompletion,
+        PackagingRenditionId, PackagingSegmentId, StartedMuxer, fixtures as mux_fixtures,
+        fixtures::RenditionBuilder,
     },
     observe::{EventObserver, Events, ProcessMeters, SessionEnd, SessionEvent, SourceMeters},
     segment::{PrerollLimits, SegmentationPolicy},
@@ -31,9 +36,9 @@ use crate::{
 };
 
 use super::{
-    AtCapacity, HealthPolicy, PendingPermit, PendingPublishers, Registry, RegistryError, Services,
-    SessionConfig, SessionError, SessionOutcome, StopReason, SupervisionError, SupervisionPolicy,
-    run_session,
+    AtCapacity, ExecutionError, HealthPolicy, PendingPermit, PendingPublishers, Registry,
+    RegistryError, Services, SessionConfig, SessionError, SessionOutcome, StopReason,
+    SupervisionError, SupervisionPolicy, run_session,
 };
 
 const SECOND: i64 = 90_000;
@@ -50,6 +55,14 @@ struct Faults {
     /// The normalizer holds one sample back for reordering, releasing it only
     /// when it is finished.
     normalizer_reorders: bool,
+    /// The muxer's `push` fails once this many pushes have succeeded.
+    muxer_push_fails_after: Option<u32>,
+    /// The publisher's `write` fails once this many writes have succeeded.
+    publisher_fails_after: Option<u32>,
+    /// The muxer emits the second chunk of a segment with index 2 instead of 1.
+    muxer_skips_chunk_index: bool,
+    /// The source panics on the fill whose delivery count matches.
+    source_panics_after: Option<u32>,
 }
 
 fn record(log: &CallLog, call: &'static str) {
@@ -70,6 +83,10 @@ enum Ending {
     /// Never finishes probing, so the spine's discovery deadline is the only
     /// thing that can end the session.
     HangOnDiscovery,
+    /// Fails with a source error once this many batches were delivered.
+    FailAfter(u32),
+    /// Reports a clean end of input while still holding media back.
+    LyingEof,
 }
 
 struct FakeSource {
@@ -77,6 +94,8 @@ struct FakeSource {
     meters: Arc<dyn SourceMeters>,
     batches: VecDeque<Vec<Packet>>,
     ending: Ending,
+    panics_after: Option<u32>,
+    delivered: u32,
 }
 
 impl PacketSource for FakeSource {
@@ -102,6 +121,13 @@ impl PacketSource for FakeSource {
     ) -> BoxFuture<'a, Result<InputState, SourceError>> {
         record(&self.log, "fill");
         Box::pin(async move {
+            assert!(
+                self.panics_after != Some(self.delivered),
+                "injected source panic"
+            );
+            if matches!(self.ending, Ending::FailAfter(limit) if self.delivered >= limit) {
+                return Err(SourceError::Input("injected source failure".into()));
+            }
             if let Some(batch) = self.batches.pop_front() {
                 let bytes = batch.iter().map(|packet| packet.payload.len() as u64).sum();
                 let packets = batch.len() as u64;
@@ -109,19 +135,25 @@ impl PacketSource for FakeSource {
                     out.push(packet);
                 }
                 self.meters.source_progress(bytes, packets, 0);
-                return Ok(if self.batches.is_empty() {
+                self.delivered = self.delivered.saturating_add(1);
+                let state = if self.batches.is_empty() {
                     match self.ending {
-                        Ending::Eof => InputState::Closed,
+                        Ending::Eof | Ending::LyingEof => InputState::Closed,
                         Ending::Interrupted => InputState::Interrupted,
                         _ => InputState::Open,
                     }
+                } else if matches!(self.ending, Ending::LyingEof) {
+                    // A lying source reports end of input while still holding
+                    // batches; the pipeline must never be asked to read them.
+                    InputState::Closed
                 } else {
                     InputState::Open
-                });
+                };
+                return Ok(state);
             }
 
             match self.ending {
-                Ending::Eof | Ending::HangOnDiscovery => Ok(InputState::Closed),
+                Ending::Eof | Ending::HangOnDiscovery | Ending::LyingEof => Ok(InputState::Closed),
                 Ending::Interrupted => Ok(InputState::Interrupted),
                 Ending::Stall => std::future::pending().await,
                 Ending::CodecChange => {
@@ -130,6 +162,7 @@ impl PacketSource for FakeSource {
                         track_id: TrackId(0),
                     })
                 }
+                Ending::FailAfter(_) => Err(SourceError::Input("injected source failure".into())),
             }
         })
     }
@@ -140,6 +173,7 @@ struct FakePending {
     resource: &'static str,
     batches: Vec<Vec<Packet>>,
     ending: Ending,
+    panics_after: Option<u32>,
 }
 
 impl PendingPublish for FakePending {
@@ -173,6 +207,8 @@ impl PendingPublish for FakePending {
                     meters,
                     batches: self.batches.into(),
                     ending: self.ending,
+                    panics_after: self.panics_after,
+                    delivered: 0,
                 }),
                 grant,
             })
@@ -315,9 +351,10 @@ impl MuxerFactory for FakeMuxerFactory {
             muxer: Box::new(FakeMuxer {
                 initialized: false,
                 chunks: 0,
+                pushes: 0,
                 duration: 0,
                 finished: Arc::clone(&self.finished),
-                fails_to_finish: self.faults.muxer_finish_fails,
+                faults: self.faults,
             }),
             presentation: Arc::new(presentation),
         })
@@ -328,9 +365,10 @@ impl MuxerFactory for FakeMuxerFactory {
 struct FakeMuxer {
     initialized: bool,
     chunks: u32,
+    pushes: u32,
     duration: u64,
     finished: FinishLog,
-    fails_to_finish: bool,
+    faults: Faults,
 }
 
 impl Muxer for FakeMuxer {
@@ -343,6 +381,10 @@ impl Muxer for FakeMuxer {
         sample: NormalizedSample,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
+        if self.faults.muxer_push_fails_after == Some(self.pushes) {
+            return Err(MuxError::Mux("injected push failure".into()));
+        }
+        self.pushes = self.pushes.saturating_add(1);
         if !self.initialized {
             self.initialized = true;
             out.push(PackagedMedia::Initialization(InitializationSegment {
@@ -354,7 +396,10 @@ impl Muxer for FakeMuxer {
         out.push(PackagedMedia::Chunk(PackagedChunk {
             rendition_id: PackagingRenditionId(0),
             packaging_segment_id: PackagingSegmentId(0),
-            chunk_index: self.chunks,
+            // A skipping muxer emits index 2 where 1 belongs, which the store
+            // must refuse before the segment can be assembled around a hole.
+            chunk_index: self.chunks
+                + u32::from(self.faults.muxer_skips_chunk_index && self.chunks == 1),
             media_start: sample.pts(),
             duration: sample.duration(),
             independent: sample.random_access(),
@@ -371,7 +416,7 @@ impl Muxer for FakeMuxer {
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
         self.finished.lock().push(reason);
-        if self.fails_to_finish {
+        if self.faults.muxer_finish_fails {
             return Err(MuxError::Mux("container state is inconsistent".into()));
         }
         // A successor is about to publish; a one-frame trailing segment would
@@ -388,6 +433,51 @@ impl Muxer for FakeMuxer {
             }));
         }
         Ok(())
+    }
+}
+
+/// Wraps the real store publisher so a session can be handed a write failure.
+struct FaultyPublisherFactory {
+    inner: StorePublisherFactory,
+    faults: Faults,
+}
+
+impl PublisherFactory for FaultyPublisherFactory {
+    fn start(
+        &self,
+        stream: &StreamId,
+        presentation: Arc<PackagedPresentation>,
+    ) -> Result<Box<dyn HlsPublisher>, HlsError> {
+        let inner = self.inner.start(stream, presentation)?;
+        Ok(Box::new(FaultyPublisher {
+            inner,
+            writes: 0,
+            faults: self.faults,
+        }))
+    }
+}
+
+/// Delegates to the real publisher until the injected failure count is hit.
+struct FaultyPublisher {
+    inner: Box<dyn HlsPublisher>,
+    writes: u32,
+    faults: Faults,
+}
+
+impl HlsPublisher for FaultyPublisher {
+    fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
+        if self.faults.publisher_fails_after == Some(self.writes) {
+            return Err(HlsError::Store(StoreWriteError::PayloadCapacityExceeded {
+                maximum: 0,
+                additional: 1,
+            }));
+        }
+        self.writes = self.writes.saturating_add(1);
+        self.inner.write(media)
+    }
+
+    fn finish(&mut self, reason: FinishReason) -> Result<(), HlsError> {
+        self.inner.finish(reason)
     }
 }
 
@@ -494,6 +584,7 @@ struct Harness {
     store: StreamStore,
     meters: ProcessMeters,
     sessions: Registry,
+    panics_after: Option<u32>,
 }
 
 impl Harness {
@@ -520,7 +611,10 @@ impl Harness {
                 finished: Arc::clone(&finished),
                 faults,
             }),
-            publishers: Arc::new(StorePublisherFactory::new(store.clone())),
+            publishers: Arc::new(FaultyPublisherFactory {
+                inner: StorePublisherFactory::new(store.clone()),
+                faults,
+            }),
             sessions: sessions.clone(),
             meters: meters.clone(),
             events: Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>),
@@ -534,6 +628,7 @@ impl Harness {
             store,
             meters,
             sessions,
+            panics_after: faults.source_panics_after,
         }
     }
 
@@ -555,6 +650,7 @@ impl Harness {
             resource,
             batches: scripted_batches(),
             ending,
+            panics_after: self.panics_after,
         })
     }
 
@@ -1304,4 +1400,296 @@ async fn await_published(store: &StreamStore) -> Arc<crate::delivery::hls::LiveS
     })
     .await
     .expect("the session publishes")
+}
+
+#[tokio::test]
+async fn a_source_failure_after_media_was_published_fails_the_session_but_keeps_the_stream_resumable()
+ {
+    let harness = Harness::healthy();
+
+    let outcome = harness.run(Ending::FailAfter(1)).await;
+
+    assert!(matches!(
+        outcome,
+        Err(SessionError::Supervision(SupervisionError::Execution(
+            ExecutionError::Media(_)
+        )))
+    ));
+    assert_eq!(harness.meters.snapshot().sessions_failed, 1);
+    assert_eq!(harness.recorder.names().last(), Some(&"failed"));
+    // The pre-roll replay was published before the failing live-loop fill.
+    assert_eq!(harness.meters.snapshot().parts_published, 3);
+    assert_eq!(
+        harness.finish_reasons(),
+        [],
+        "a failed session skips the drain entirely"
+    );
+    assert!(
+        !harness.live().is_ended(),
+        "a failed publisher may reconnect within the idle window"
+    );
+    assert_eq!(harness.store.leased(), 0);
+}
+
+#[tokio::test]
+async fn a_source_that_lied_about_eof_is_never_read_again() {
+    let harness = Harness::healthy();
+
+    let outcome = harness
+        .run(Ending::LyingEof)
+        .await
+        .expect("a lying EOF still ends cleanly");
+
+    assert_eq!(outcome, SessionOutcome::Ended);
+    assert_eq!(
+        harness
+            .calls()
+            .into_iter()
+            .filter(|call| *call == "fill")
+            .count(),
+        1,
+        "the hidden batch is never read once the source reported end of input"
+    );
+    assert_eq!(harness.meters.snapshot().parts_published, 3);
+    assert_eq!(harness.meters.snapshot().segments_published, 1);
+}
+
+#[tokio::test]
+async fn a_muxer_failure_after_parts_were_published_keeps_those_parts_fetchable() {
+    let harness = Harness::faulty(Faults {
+        muxer_push_fails_after: Some(3),
+        ..Faults::default()
+    });
+
+    let outcome = harness.run(Ending::Eof).await;
+
+    assert!(matches!(
+        outcome,
+        Err(SessionError::Supervision(SupervisionError::Execution(
+            ExecutionError::Mux(_)
+        )))
+    ));
+    assert_eq!(harness.meters.snapshot().sessions_failed, 1);
+    assert_eq!(harness.meters.snapshot().parts_published, 3);
+    // The parts that made it out before the failure remain fetchable, and the
+    // open segment is left exactly as it was.
+    let rendition = harness
+        .live()
+        .rendition(RenditionId(0))
+        .expect("the rendition exists");
+    let open = rendition
+        .open_segment
+        .as_ref()
+        .expect("the open segment survives the failed push");
+    assert_eq!(open.parts.len(), 3);
+    assert!(!harness.live().is_ended());
+}
+
+#[tokio::test]
+async fn a_muxer_that_skips_a_chunk_index_is_refused_before_it_can_corrupt_the_segment() {
+    let harness = Harness::faulty(Faults {
+        muxer_skips_chunk_index: true,
+        ..Faults::default()
+    });
+
+    let outcome = harness.run(Ending::Eof).await;
+
+    assert!(matches!(
+        outcome,
+        Err(SessionError::Supervision(SupervisionError::Execution(
+            ExecutionError::Delivery(_)
+        )))
+    ));
+    assert_eq!(
+        harness.meters.snapshot().parts_published,
+        1,
+        "the mis-indexed chunk and everything after it is refused wholesale"
+    );
+    let rendition = harness
+        .live()
+        .rendition(RenditionId(0))
+        .expect("the rendition exists");
+    let open = rendition
+        .open_segment
+        .as_ref()
+        .expect("the open segment survives the refusal");
+    assert_eq!(open.parts.len(), 1);
+    assert!(!harness.live().is_ended());
+}
+
+#[tokio::test]
+async fn a_publisher_capacity_failure_fails_the_session_but_not_the_stream() {
+    let harness = Harness::faulty(Faults {
+        // The initialization and the first two chunks are written (writes
+        // zero, one, and two); the third chunk's write is refused.
+        publisher_fails_after: Some(3),
+        ..Faults::default()
+    });
+
+    let outcome = harness.run(Ending::Eof).await;
+
+    assert!(matches!(
+        outcome,
+        Err(SessionError::Supervision(SupervisionError::Execution(
+            ExecutionError::Delivery(_)
+        )))
+    ));
+    assert_eq!(harness.meters.snapshot().sessions_failed, 1);
+    assert_eq!(
+        harness.meters.snapshot().parts_published,
+        2,
+        "the writes before the failing one were delivered"
+    );
+    assert!(!harness.live().is_ended());
+    assert_eq!(harness.store.leased(), 0);
+}
+
+#[tokio::test]
+async fn a_panicking_source_unwinds_registry_and_lease() {
+    let harness = Harness::faulty(Faults {
+        source_panics_after: Some(1),
+        ..Faults::default()
+    });
+    let services = harness.services.clone();
+    let pending = harness.pending(Ending::Stall);
+
+    let session = tokio::spawn(async move {
+        run_session(pending, &services, &config(), PendingPermit::unlimited()).await
+    });
+    let joined = tokio::time::timeout(Duration::from_secs(5), session)
+        .await
+        .expect("the panicking session finishes unwinding")
+        .expect_err("the injected panic escapes the session task");
+
+    assert!(joined.is_panic(), "the panic is not caught by the pipeline");
+    assert!(
+        harness.sessions.is_empty(),
+        "unwinding removes the registry entry"
+    );
+    assert_eq!(harness.store.leased(), 0, "unwinding releases the lease");
+    assert!(
+        !harness.live().is_ended(),
+        "an unplanned crash leaves the stream resumable"
+    );
+    assert_eq!(harness.meters.snapshot().sessions_failed, 0);
+}
+
+#[tokio::test]
+async fn a_reconnect_storm_keeps_one_lease_and_one_durable_rendition() {
+    const STORM: u32 = 5;
+    let harness = Harness::healthy();
+
+    let mut incumbent: Option<tokio::task::JoinHandle<Result<SessionOutcome, SessionError>>> = None;
+    for cycle in 0..STORM {
+        let services = harness.services.clone();
+        let pending = harness.pending(Ending::Stall);
+        let session = tokio::spawn(async move {
+            run_session(pending, &services, &config(), PendingPermit::unlimited()).await
+        });
+        await_published(&harness.store).await;
+
+        if let Some(previous) = incumbent.take() {
+            let outcome = tokio::time::timeout(Duration::from_secs(5), previous)
+                .await
+                .expect("the displaced session stops")
+                .expect("the displaced session task succeeds")
+                .expect("displacement is not a failure");
+            assert_eq!(outcome, SessionOutcome::Replaced);
+            assert_eq!(
+                harness.meters.snapshot().sessions_replaced,
+                u64::from(cycle),
+                "each cycle displaces exactly the previous publisher"
+            );
+        }
+
+        let live = harness.live();
+        assert_eq!(
+            live.snapshot().renditions.len(),
+            1,
+            "the storm never forks the durable rendition"
+        );
+        assert_eq!(
+            harness.store.leased(),
+            1,
+            "a successor holds the lease continuously across the storm"
+        );
+        assert!(!live.is_ended(), "the stream never ends mid-storm");
+        incumbent = Some(session);
+    }
+
+    harness.sessions.stop_all(StopReason::Cancelled);
+    let final_outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        incumbent.expect("the storm has a survivor"),
+    )
+    .await
+    .expect("the survivor stops")
+    .expect("the survivor task succeeds")
+    .expect("cancellation is not a failure");
+    assert_eq!(final_outcome, SessionOutcome::Cancelled);
+    assert!(harness.live().is_ended());
+    assert_eq!(harness.store.leased(), 0);
+}
+
+#[tokio::test]
+async fn concurrent_takeovers_resolve_to_exactly_one_survivor() {
+    let harness = Harness::healthy();
+    let mut sessions = Vec::new();
+    for _ in 0..3 {
+        let services = harness.services.clone();
+        let pending = harness.pending(Ending::Stall);
+        sessions.push(tokio::spawn(async move {
+            run_session(pending, &services, &config(), PendingPermit::unlimited()).await
+        }));
+    }
+
+    // Registration is serialized by the registry lock, and each registration
+    // displaces the current incumbent, so however the three interleave,
+    // exactly one session survives. The losers are either displaced by a
+    // later registration or refused while an incumbent is still draining.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while harness.sessions.len() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exactly one session survives the scramble");
+    assert_eq!(harness.store.leased(), 1);
+
+    harness.sessions.stop_all(StopReason::Cancelled);
+    let mut outcomes = Vec::new();
+    for session in sessions {
+        outcomes.push(
+            tokio::time::timeout(Duration::from_secs(5), session)
+                .await
+                .expect("every session resolves")
+                .expect("no session task panics"),
+        );
+    }
+
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(SessionOutcome::Cancelled)))
+            .count(),
+        1,
+        "exactly one survivor is left to be cancelled"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    Ok(SessionOutcome::Replaced)
+                        | Err(SessionError::Registry(
+                            RegistryError::TakeoverInProgress { .. }
+                        ))
+                )
+            })
+            .count(),
+        2,
+        "the two losers were displaced or refused, never leaked"
+    );
+    assert_eq!(harness.store.leased(), 0);
 }

@@ -487,4 +487,14 @@ mod tests {
             assert_eq!(parse(pattern).to_string(), pattern);
         }
     }
+
+    #[test]
+    fn hostile_origin_patterns_never_panic() {
+        let mut state = 0x3c6e_f5a1_9b2d_8470_u64;
+        for _ in 0..4_000 {
+            let pattern = crate::test_fuzz::string(&mut state, 64);
+            // A pattern either parses or is refused; both answers are fine.
+            let _ = OriginPattern::parse(&pattern);
+        }
+    }
 }

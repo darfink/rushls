@@ -376,4 +376,15 @@ mod tests {
             Err(ResourcePathError::Unrecognized)
         );
     }
+
+    #[test]
+    fn hostile_paths_never_panic() {
+        let mut state = 0x8d5e_3d8b_2c1a_4f6f_u64;
+        for _ in 0..4_000 {
+            let path = crate::test_fuzz::string(&mut state, 64);
+            // Whatever the answer, the parser must answer: valid, invalid, or
+            // "not mine" — never a panic.
+            let _ = parse_media_path(&path);
+        }
+    }
 }

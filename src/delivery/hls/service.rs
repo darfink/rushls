@@ -1080,4 +1080,15 @@ mod cache_tests {
             "a cached playlist request only clones stable handles"
         );
     }
+
+    #[test]
+    fn hostile_reload_directives_never_panic() {
+        let mut state = 0x41c6_ce57_edcf_a8b4_u64;
+        for _ in 0..4_000 {
+            let query = crate::test_fuzz::string(&mut state, 48);
+            // Unknown directives are forward-compatible; malformed known ones
+            // are refused. Both answers are fine, a panic is not.
+            let _ = parse_directives(Some(&query));
+        }
+    }
 }
