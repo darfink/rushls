@@ -877,7 +877,13 @@ async fn removed_segments_obey_their_availability_deadline() {
 
 #[test]
 fn live_window_never_falls_below_three_target_durations() {
-    let store = store();
+    let mut limits = limits();
+    // The shipped default is a six-target window; this test pins the floor
+    // the spec makes mandatory, so the mechanism is what is being exercised
+    // rather than whichever default is current.
+    limits.retention.minimum_playlist_duration =
+        DurationRule::MultipleOfTarget(TargetDurationMultiple::integer(3));
+    let store = StreamStore::new(limits);
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
     for id in 0..19 {

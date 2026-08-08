@@ -12,12 +12,13 @@ use crate::{
         ClientInfo, IngestProtocol, IngestTimingPolicy, PresentedCredential, Principal,
         PublishRequest, PublishResource, StreamPolicy, TakeoverPolicy,
     },
+    delivery::store::{DurationRule, TargetDurationMultiple},
     domain::StreamId,
     observe::lifecycle::Kind,
     server::{AllowedOrigins, NodeConfig, ResolvedAppConfig},
 };
 
-use super::{AppConfig, ConfigError};
+use super::{AppConfig, ConfigError, decimal_fraction, parse_playlist_window};
 
 const STATIC_AUTH: &str = r#"
 [auth]
@@ -766,6 +767,84 @@ fn request(credential: &str) -> PublishRequest {
 
 fn os<const N: usize>(values: [&str; N]) -> impl Iterator<Item = OsString> {
     values.into_iter().map(OsString::from)
+}
+
+#[test]
+fn playlist_windows_parse_as_durations_or_target_multiples() -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        parse_playlist_window("6x")?,
+        DurationRule::MultipleOfTarget(TargetDurationMultiple::integer(6))
+    );
+    assert_eq!(
+        parse_playlist_window("1.5x")?,
+        DurationRule::MultipleOfTarget(TargetDurationMultiple::new(3, nz::u32!(2)))
+    );
+    assert_eq!(
+        parse_playlist_window("18s")?,
+        DurationRule::Fixed(Duration::from_secs(18))
+    );
+    assert!(parse_playlist_window("0x").is_err(), "zero is refused");
+    assert!(
+        parse_playlist_window("x").is_err(),
+        "bare suffix is refused"
+    );
+    assert!(
+        parse_playlist_window("1.2.3x").is_err(),
+        "one decimal point only"
+    );
+    assert!(parse_playlist_window("abc").is_err(), "garbage is refused");
+    Ok(())
+}
+
+#[test]
+fn decimal_fractions_reduce_exactly() -> Result<(), Box<dyn Error>> {
+    assert_eq!(decimal_fraction("6")?, (6, 1));
+    assert_eq!(decimal_fraction("1.5")?, (3, 2));
+    assert_eq!(decimal_fraction("0.5")?, (1, 2));
+    assert_eq!(
+        decimal_fraction("0.333333333")?,
+        (333_333_333, 1_000_000_000)
+    );
+    assert!(
+        decimal_fraction("0.3333333333").is_err(),
+        "ninth digit is the ceiling"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_playlist_window_becomes_both_retention_floors() -> Result<(), Box<dyn Error>> {
+    let config = resolve_toml(
+        r#"
+[hls]
+segment_duration = "6s"
+playlist_window = "18s"
+"#,
+    )??;
+
+    let retention = config.node.store.retention;
+    assert_eq!(retention.minimum_playlist_segments, 3);
+    assert_eq!(
+        retention.minimum_playlist_duration,
+        DurationRule::Fixed(Duration::from_secs(18))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_fixed_window_below_three_target_durations_is_refused() -> Result<(), Box<dyn Error>> {
+    assert!(
+        resolve_toml(
+            r#"
+[hls]
+segment_duration = "6s"
+playlist_window = "12s"
+"#,
+        )?
+        .is_err(),
+        "a live playlist must never drop below three times the target duration"
+    );
+    Ok(())
 }
 
 struct TempConfig {

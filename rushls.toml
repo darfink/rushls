@@ -166,8 +166,10 @@ public_base_url = ""
 segment_duration = "6s"
 part_duration = "1s"
 
-# Minimum completed segments retained in each live playlist.
-playlist_segments = 6
+# Minimum completed media retained in each live playlist: a fixed duration
+# ("18s") or a multiple of the segment duration ("6x"). Must be at least
+# three times the segment duration, which the spec requires of live playlists.
+playlist_window = "6x"
 
 [storage]
 # Includes active streams and recently inactive streams retained for reconnect.

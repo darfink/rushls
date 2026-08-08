@@ -28,6 +28,7 @@ use crate::{
         StaticStreamAuthenticator, StreamPolicy, TakeoverPolicy,
     },
     delivery::hls::uri::UriBase,
+    delivery::store::{DurationRule, TargetDurationMultiple},
     domain::{Codec, FrameRate, StreamId},
     hooks::{HookConfig, HooksConfig},
     observe::lifecycle::Kind,
@@ -964,13 +965,26 @@ pub struct HlsAppConfig {
         long,
         env,
         default_value = "1s",
-        value_parser = humantime::parse_duration,
+se        value_parser = humantime::parse_duration,
         serde(use_value_parser)
     )]
     part_duration: Duration,
-    /// Minimum completed segments shown in a live playlist.
-    #[conf(parameter, long, env, default_value = "6")]
-    playlist_segments: usize,
+    /// Minimum completed media retained in each live playlist.
+    ///
+    /// A fixed duration (`"18s"`) or a multiple of the segment duration
+    /// (`"6x"`), which adapts to `segment_duration`. The media playlist must
+    /// never drop below three times the target duration
+    /// (draft-pantos-hls-rfc8216bis-22, section 6.2.1), so a fixed window
+    /// shorter than that is refused.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "6x",
+        value_parser = parse_playlist_window,
+        serde(use_value_parser)
+    )]
+    playlist_window: DurationRule,
 }
 
 impl HlsAppConfig {
@@ -983,15 +997,96 @@ impl HlsAppConfig {
                 "HLS part duration must not exceed the segment duration",
             ));
         }
-        if self.playlist_segments == 0 {
-            return Err(invalid("HLS playlist must retain at least one segment"));
+        let window = self.playlist_window;
+        let window_duration = window.resolve(self.segment_duration);
+        if window_duration.is_zero() {
+            return Err(invalid("HLS playlist window must be nonzero"));
+        }
+        if let DurationRule::Fixed(fixed) = window
+            && fixed < self.segment_duration.saturating_mul(3)
+        {
+            return Err(invalid(
+                "HLS playlist window must be at least three times the segment duration",
+            ));
         }
         node.session.segmentation =
             SegmentationPolicy::latency_first(self.segment_duration, self.part_duration);
-        node.store.retention.minimum_playlist_segments = self.playlist_segments;
+        // The store keeps a tag-count floor beside the duration floor; the
+        // count is derived from the same window so the knob means one thing,
+        // whatever cadence a rendition actually locks.
+        let minimum_segments = window_duration
+            .as_nanos()
+            .div_ceil(self.segment_duration.as_nanos().max(1));
+        node.store.retention.minimum_playlist_segments =
+            usize::try_from(minimum_segments.max(1)).unwrap_or(usize::MAX);
+        node.store.retention.minimum_playlist_duration = window;
         node.hls.uri_base = UriBase::new(self.public_base_url.clone());
         Ok(())
     }
+}
+
+/// Parses a playlist window: a multiple of the segment duration (`"6x"`) or
+/// a fixed duration (`"18s"`).
+///
+/// The `x` suffix is the multiple form, so the two can never be confused
+/// with each other or with a bare count.
+fn parse_playlist_window(value: &str) -> Result<DurationRule, String> {
+    if let Some(multiple) = value.strip_suffix('x') {
+        let (numerator, denominator) = decimal_fraction(multiple)?;
+        if numerator == 0 {
+            return Err("a playlist window multiple must be nonzero".into());
+        }
+        let denominator = NonZeroU32::new(denominator)
+            .ok_or_else(|| "a playlist window multiple must be nonzero".to_owned())?;
+        return Ok(DurationRule::MultipleOfTarget(TargetDurationMultiple::new(
+            numerator,
+            denominator,
+        )));
+    }
+    humantime::parse_duration(value)
+        .map(DurationRule::Fixed)
+        .map_err(|error| format!("invalid playlist window: {error}"))
+}
+
+/// Parses a decimal into a reduced fraction, so `"1.5"` becomes `3/2`.
+///
+/// Bounded to nine fractional digits so the denominator always fits a `u32`.
+fn decimal_fraction(value: &str) -> Result<(u32, u32), String> {
+    let (whole, fraction) = value.split_once('.').map_or((value, ""), |parts| parts);
+    let fraction_digits = fraction.len();
+    if whole.is_empty()
+        || fraction_digits > 9
+        || whole.bytes().any(|byte| !byte.is_ascii_digit())
+        || fraction.bytes().any(|byte| !byte.is_ascii_digit())
+    {
+        return Err(format!("`{value}` is not a decimal number"));
+    }
+    let whole: u32 = whole
+        .parse()
+        .map_err(|_| format!("`{value}` is too large"))?;
+    let fraction: u32 = if fraction.is_empty() {
+        0
+    } else {
+        fraction
+            .parse()
+            .map_err(|_| format!("`{value}` is too large"))?
+    };
+    let denominator = 10_u32
+        .checked_pow(u32::try_from(fraction_digits).unwrap_or(u32::MAX))
+        .ok_or_else(|| format!("`{value}` is too large"))?;
+    let numerator = whole
+        .checked_mul(denominator)
+        .and_then(|scaled| scaled.checked_add(fraction))
+        .ok_or_else(|| format!("`{value}` is too large"))?;
+    let divisor = greatest_common_divisor(numerator, denominator);
+    Ok((numerator / divisor, denominator / divisor))
+}
+
+fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 #[derive(Conf)]

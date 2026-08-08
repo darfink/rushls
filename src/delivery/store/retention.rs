@@ -100,6 +100,11 @@ impl From<TargetDurationMultiple> for DurationRule {
 /// fractional target-duration multiples allow deployment-specific guidance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetentionPolicy {
+    /// Tag-count floor for the playlist window.
+    ///
+    /// The server configuration derives this from its single playlist-window
+    /// knob so the window means the same thing whatever a rendition's cadence
+    /// locks to; the duration floor below is the same window in seconds.
     pub minimum_playlist_segments: usize,
     pub minimum_playlist_duration: DurationRule,
     pub part_tag_retention: DurationRule,
@@ -148,7 +153,10 @@ impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
             minimum_playlist_segments: DEFAULT_VISIBLE_SEGMENTS,
-            minimum_playlist_duration: TargetDurationMultiple::integer(3).into(),
+            // Six segments, or six target durations, whichever keeps more:
+            // the default matches the shipped configuration's `6x` playlist
+            // window, and comfortably clears the spec's three-target floor.
+            minimum_playlist_duration: TargetDurationMultiple::integer(6).into(),
             part_tag_retention: TargetDurationMultiple::integer(3).into(),
             part_fetch_grace_period: TargetDurationMultiple::integer(3).into(),
             segment_fetch_grace_period: None,
