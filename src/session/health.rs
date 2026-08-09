@@ -72,11 +72,38 @@ pub fn evaluate(
     phase: Phase,
     expected_publication_interval: Duration,
     policy: HealthPolicy,
+    running_since: Instant,
 ) -> HealthEvaluation {
+    let deadline = expected_publication_interval
+        .saturating_mul(policy.stalled_publication_multiplier)
+        .max(policy.minimum_publication_stall_tolerance);
+
+    // How far past its cadence a session that has never published has run,
+    // measured from Running rather than session start: a long pre-roll is not
+    // the muxer being late, it is the cadence not existing yet. `None` while
+    // the deadline still has room.
+    let first_publication_overdue = || {
+        if phase.is_before_publication() || meters.publication_idle_for(now).is_some() {
+            return None;
+        }
+        now.saturating_duration_since(running_since)
+            .checked_sub(deadline)
+            .filter(|overdue| !overdue.is_zero())
+    };
+
     // Pacing is deliberate lack of source and publication progress. Checking
     // this first keeps ordinary stall alarms from diagnosing backpressure as a
     // dead publisher.
     if meters.publisher_backpressured() {
+        // Pacing does suppress the source and media alarms below, because a
+        // deliberate sleep stops the loop reading input. It must not suppress
+        // the first-publication deadline as well: pacing delays samples but
+        // still lets them through, so a muxer that swallowed every one of them
+        // for a whole cadence is broken rather than merely slow — and while
+        // the pacer sleeps this is the only check left that can see it.
+        if let Some(overdue_by) = first_publication_overdue() {
+            return HealthEvaluation::PublicationStalled { overdue_by };
+        }
         return HealthEvaluation::PacingPublisher;
     }
 
@@ -103,11 +130,15 @@ pub fn evaluate(
     }
 
     let Some(publication_idle) = meters.publication_idle_for(now) else {
-        return HealthEvaluation::WaitingForFirstPublication;
+        // A muxer that accepts every sample and emits nothing leaves source
+        // and media marking liveness forever, so waiting for a first
+        // publication has to be a deadline rather than a state the session can
+        // rest in indefinitely.
+        return match first_publication_overdue() {
+            Some(overdue_by) => HealthEvaluation::PublicationStalled { overdue_by },
+            None => HealthEvaluation::WaitingForFirstPublication,
+        };
     };
-    let deadline = expected_publication_interval
-        .saturating_mul(policy.stalled_publication_multiplier)
-        .max(policy.minimum_publication_stall_tolerance);
 
     if publication_idle > deadline {
         HealthEvaluation::PublicationStalled {
@@ -159,7 +190,8 @@ mod tests {
                 Instant::now(),
                 Phase::Discovering,
                 Duration::ZERO,
-                policy()
+                policy(),
+                Instant::now(),
             ),
             HealthEvaluation::SourceStalled {
                 stalled_for: Duration::from_secs(6),
@@ -182,7 +214,8 @@ mod tests {
                 Instant::now(),
                 Phase::Running,
                 Duration::ZERO,
-                policy()
+                policy(),
+                Instant::now(),
             ),
             HealthEvaluation::MediaStalled {
                 stalled_for: Duration::from_secs(7),
@@ -204,6 +237,7 @@ mod tests {
                 Phase::Segmenting,
                 Duration::from_millis(200),
                 policy(),
+                Instant::now(),
             ),
             HealthEvaluation::WaitingForMedia
         );
@@ -222,6 +256,7 @@ mod tests {
                 Phase::Running,
                 Duration::from_millis(200),
                 policy(),
+                Instant::now(),
             ),
             HealthEvaluation::Healthy
         );
@@ -243,6 +278,7 @@ mod tests {
                 media_stall_timeout: Duration::from_secs(60),
                 ..policy()
             },
+            Instant::now(),
         );
 
         // Two seconds idle against a 400ms deadline.
@@ -260,6 +296,27 @@ mod tests {
         let meters = meters();
         meters.source_view().source_progress(1_024, 4, 0);
         meters.media_view().media_progress(4, 4);
+        let running_since = Instant::now();
+
+        let evaluation = evaluate(
+            &meters,
+            Instant::now(),
+            Phase::Running,
+            Duration::from_millis(200),
+            policy(),
+            running_since,
+        );
+
+        assert_eq!(evaluation, HealthEvaluation::WaitingForFirstPublication);
+        assert!(!evaluation.is_stalled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_running_session_without_a_first_publication_is_stalled_once_its_cadence_elapses() {
+        let meters = meters();
+        meters.source_view().source_progress(1_024, 4, 0);
+        meters.media_view().media_progress(4, 4);
+        let running_since = Instant::now();
         advance(1).await;
 
         let evaluation = evaluate(
@@ -268,10 +325,129 @@ mod tests {
             Phase::Running,
             Duration::from_millis(200),
             policy(),
+            running_since,
+        );
+
+        // The deadline is 200ms × 2 = 400ms; a whole second without any
+        // publication is genuinely overdue.
+        assert_eq!(
+            evaluation,
+            HealthEvaluation::PublicationStalled {
+                overdue_by: Duration::from_millis(600),
+            }
+        );
+        assert!(evaluation.is_stalled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_preroll_does_not_count_against_the_first_publication_deadline() {
+        let meters = meters();
+        // Pre-roll ran its full budget before Running began; the publication
+        // deadline is anchored at Running, not at session start, so the two
+        // must not be confused.
+        advance(10).await;
+        meters.source_view().source_progress(1_024, 4, 0);
+        meters.media_view().media_progress(4, 4);
+        let running_since = Instant::now();
+
+        let evaluation = evaluate(
+            &meters,
+            Instant::now(),
+            Phase::Running,
+            Duration::from_millis(200),
+            policy(),
+            running_since,
         );
 
         assert_eq!(evaluation, HealthEvaluation::WaitingForFirstPublication);
         assert!(!evaluation.is_stalled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dead_source_is_blamed_on_the_source_even_before_a_first_publication() {
+        // Both the source and the first publication are overdue. The session
+        // ends either way, so what is under test is the diagnosis: the input
+        // going away is why nothing was published, and an operator told the
+        // muxer is at fault would go looking in the wrong place.
+        let meters = meters();
+        let running_since = Instant::now();
+        advance(6).await;
+
+        let evaluation = evaluate(
+            &meters,
+            Instant::now(),
+            Phase::Running,
+            Duration::from_millis(200),
+            policy(),
+            running_since,
+        );
+
+        assert_eq!(
+            evaluation,
+            HealthEvaluation::SourceStalled {
+                stalled_for: Duration::from_secs(6),
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backpressured_publisher_within_its_deadline_is_still_only_pacing() {
+        // Backpressure before the first publication is owed is ordinary
+        // startup, not a fault.
+        let meters = meters();
+        meters.source_view().source_progress(1_024, 4, 0);
+        meters.media_view().media_progress(4, 4);
+        meters
+            .media_view()
+            .pacing_observation(Duration::from_secs(10), Duration::ZERO, true);
+        let running_since = Instant::now();
+
+        let evaluation = evaluate(
+            &meters,
+            Instant::now(),
+            Phase::Running,
+            Duration::from_millis(200),
+            policy(),
+            running_since,
+        );
+
+        assert_eq!(evaluation, HealthEvaluation::PacingPublisher);
+        assert!(!evaluation.is_stalled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pacing_does_not_shield_a_muxer_that_has_never_published() {
+        // A sleeping pacer suppresses the source and media alarms, so if it
+        // suppressed this one too a swallowing muxer would have no check left
+        // that could ever see it. Pacing delays samples; it does not stop them
+        // reaching the muxer, so a whole cadence without output is a fault.
+        let meters = meters();
+        meters.source_view().source_progress(1_024, 4, 0);
+        meters.media_view().media_progress(4, 4);
+        meters.media_view().pacing_observation(
+            Duration::from_secs(10),
+            Duration::from_secs(8),
+            true,
+        );
+        let running_since = Instant::now();
+        advance(10).await;
+
+        let evaluation = evaluate(
+            &meters,
+            Instant::now(),
+            Phase::Running,
+            Duration::from_millis(200),
+            policy(),
+            running_since,
+        );
+
+        assert_eq!(
+            evaluation,
+            HealthEvaluation::PublicationStalled {
+                overdue_by: Duration::from_millis(9_600),
+            }
+        );
+        assert!(evaluation.is_stalled());
     }
 
     #[tokio::test(start_paused = true)]
@@ -291,6 +467,7 @@ mod tests {
             Phase::Running,
             Duration::from_millis(200),
             policy(),
+            Instant::now(),
         );
 
         assert_eq!(evaluation, HealthEvaluation::PacingPublisher);

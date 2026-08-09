@@ -36,8 +36,8 @@ use crate::{
 };
 
 use super::{
-    AtCapacity, ExecutionError, HealthPolicy, PendingPermit, PendingPublishers, Registry,
-    RegistryError, Services, SessionConfig, SessionError, SessionOutcome, StopReason,
+    AtCapacity, ExecutionError, HealthEvaluation, HealthPolicy, PendingPermit, PendingPublishers,
+    Registry, RegistryError, Services, SessionConfig, SessionError, SessionOutcome, StopReason,
     SupervisionError, SupervisionPolicy, run_session,
 };
 
@@ -49,6 +49,7 @@ type FinishLog = Arc<Mutex<Vec<FinishReason>>>;
 /// Ways a collaborator can misbehave, so the spine's response can be tested
 /// rather than reasoned about.
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct Faults {
     /// The muxer cannot close out its container.
     muxer_finish_fails: bool,
@@ -61,6 +62,9 @@ struct Faults {
     publisher_fails_after: Option<u32>,
     /// The muxer emits the second chunk of a segment with index 2 instead of 1.
     muxer_skips_chunk_index: bool,
+    /// The muxer accepts every sample but emits nothing, as a defective
+    /// packager would.
+    muxer_swallows_samples: bool,
     /// The source panics on the fill whose delivery count matches.
     source_panics_after: Option<u32>,
 }
@@ -87,6 +91,8 @@ enum Ending {
     FailAfter(u32),
     /// Reports a clean end of input while still holding media back.
     LyingEof,
+    /// Delivers one frozen-clock packet per fill, forever.
+    Endless,
 }
 
 struct FakeSource {
@@ -128,6 +134,38 @@ impl PacketSource for FakeSource {
             if matches!(self.ending, Ending::FailAfter(limit) if self.delivered >= limit) {
                 return Err(SourceError::Input("injected source failure".into()));
             }
+            if matches!(self.ending, Ending::Endless) {
+                if self.delivered == 0 {
+                    // The same first batch as the scripted fixture, so
+                    // pre-roll locks on it.
+                    let cycle = [
+                        packet(0, false),
+                        packet(SECOND, true),
+                        packet(2 * SECOND, false),
+                    ];
+                    let payload_bytes: u64 = cycle.iter().map(|p| p.payload.len() as u64).sum();
+                    for opening in cycle {
+                        out.push(opening);
+                    }
+                    self.meters.source_progress(payload_bytes, 3, 0);
+                } else {
+                    // One new packet per fill afterwards, on a realtime
+                    // cadence: the pacer lets one through per second, so
+                    // source and media stay fresh while the swallowing muxer
+                    // never publishes anything. A frozen clock would be caught
+                    // by the media-density limiter instead, which is a
+                    // different defence.
+                    let pts = i64::from(self.delivered)
+                        .saturating_add(2)
+                        .saturating_mul(SECOND);
+                    let next = packet(pts, false);
+                    let payload_bytes = next.payload.len() as u64;
+                    out.push(next);
+                    self.meters.source_progress(payload_bytes, 1, 0);
+                }
+                self.delivered = self.delivered.saturating_add(1);
+                return Ok(InputState::Open);
+            }
             if let Some(batch) = self.batches.pop_front() {
                 let bytes = batch.iter().map(|packet| packet.payload.len() as u64).sum();
                 let packets = batch.len() as u64;
@@ -163,6 +201,7 @@ impl PacketSource for FakeSource {
                     })
                 }
                 Ending::FailAfter(_) => Err(SourceError::Input("injected source failure".into())),
+                Ending::Endless => unreachable!("the endless branch returns above"),
             }
         })
     }
@@ -381,6 +420,9 @@ impl Muxer for FakeMuxer {
         sample: NormalizedSample,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
+        if self.faults.muxer_swallows_samples {
+            return Ok(());
+        }
         if self.faults.muxer_push_fails_after == Some(self.pushes) {
             return Err(MuxError::Mux("injected push failure".into()));
         }
@@ -1076,6 +1118,54 @@ async fn a_stalled_publisher_is_terminated_as_unhealthy() {
     ));
     assert_eq!(harness.meters.snapshot().unhealthy_terminations, 1);
     assert!(harness.recorder.names().contains(&"unhealthy"));
+    assert_eq!(harness.store.leased(), 0);
+}
+
+#[tokio::test]
+async fn a_session_that_never_publishes_is_terminated_instead_of_running_forever() {
+    // A defective muxer accepts every sample and emits nothing. Source and
+    // media keep marking liveness, so the session has no stall to trip —
+    // only the missing first publication can end it. The health check must
+    // escalate that on the muxer's promised cadence rather than wait forever.
+    let harness = Harness::faulty(Faults {
+        muxer_swallows_samples: true,
+        ..Faults::default()
+    });
+    let services = harness.services.clone();
+    let pending = harness.pending(Ending::Endless);
+    let config = SessionConfig {
+        supervision: SupervisionPolicy {
+            health: HealthPolicy {
+                // Long enough that only the publication deadline can fire:
+                // the source and media marks stay fresh by construction.
+                source_stall_timeout: Duration::from_secs(3_600),
+                media_stall_timeout: Duration::from_secs(3_600),
+                stalled_publication_multiplier: 3,
+                minimum_publication_stall_tolerance: Duration::ZERO,
+            },
+            health_interval: Duration::from_millis(10),
+        },
+        ..config()
+    };
+
+    // The muxer promises a one-second cadence, so the first publication is
+    // owed within three seconds of Running. Outliving that without one is a
+    // stall; anything else is a session parked forever.
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_session(pending, &services, &config, PendingPermit::unlimited()),
+    )
+    .await
+    .expect("the never-publishing session is terminated by supervision")
+    .expect_err("a session that never publishes is unhealthy");
+
+    assert!(matches!(
+        error,
+        SessionError::Supervision(SupervisionError::Unhealthy(
+            HealthEvaluation::PublicationStalled { .. }
+        ))
+    ));
+    assert_eq!(harness.meters.snapshot().unhealthy_terminations, 1);
     assert_eq!(harness.store.leased(), 0);
 }
 
