@@ -39,6 +39,12 @@ impl<'a> MultivariantPlaylistWriter<'a> {
         attributes.boolean("DEFAULT", rendition.default)?;
         attributes.boolean("AUTOSELECT", rendition.autoselect)?;
         attributes.optional_quoted("LANGUAGE", rendition.language)?;
+        // Required for CLOSED-CAPTIONS and meaningless for the types this
+        // writer otherwise emits, so it is carried as a plain option rather
+        // than being derived from the media type.
+        if let Some(instream_id) = rendition.instream_id {
+            attributes.plain("INSTREAM-ID", format_args!(r#""{instream_id}""#))?;
+        }
         attributes.optional("SAMPLE-RATE", rendition.sample_rate)?;
         if let Some(channels) = rendition.channels {
             // Quoted, but a number cannot carry a character the quoting rejects.
@@ -68,6 +74,20 @@ impl<'a> MultivariantPlaylistWriter<'a> {
         attributes.optional_quoted("VIDEO", variant.video_group_id)?;
         attributes.optional_quoted("AUDIO", variant.audio_group_id)?;
         attributes.optional_quoted("SUBTITLES", variant.subtitle_group_id)?;
+        // NONE is an enumerated string rather than a quoted one, and
+        // draft-pantos-hls-rfc8216bis-22 section 4.4.6.2 requires that every
+        // variant agree: captions present on one variant but not another is
+        // what triggers the playback inconsistencies the attribute exists to
+        // prevent. The projection decides the value once for that reason.
+        match variant.closed_captions {
+            Some(ClosedCaptions::Group(group_id)) => {
+                attributes.quoted("CLOSED-CAPTIONS", group_id)?;
+            }
+            Some(ClosedCaptions::None) => {
+                attributes.plain("CLOSED-CAPTIONS", "NONE")?;
+            }
+            None => {}
+        }
         attributes.end()?;
 
         // The URI is a line of its own rather than an attribute, so it is
@@ -84,6 +104,75 @@ pub enum PlaylistMediaType {
     Audio,
     Video,
     Subtitles,
+    ClosedCaptions,
+}
+
+/// What a variant advertises for `CLOSED-CAPTIONS`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClosedCaptions<'a> {
+    /// Names an `EXT-X-MEDIA` group carrying in-band caption services.
+    Group(&'a str),
+    /// States that no variant in this presentation carries captions.
+    None,
+}
+
+/// A caption channel carried inside the video segments.
+///
+/// Restricted to the values section 4.4.6.1 permits: the CEA-608 Line 21 data
+/// service channels, and the CEA-708 DTVCC service block numbers.
+///
+/// The service number is deliberately not a public field: it is only
+/// constructible through [`InstreamId::service`], which is what makes the range
+/// restriction an invariant of the type rather than a rule every caller has to
+/// remember.
+#[derive(Clone, Copy, Debug, Display, Eq, Ord, PartialEq, PartialOrd)]
+pub enum InstreamId {
+    #[display("CC1")]
+    Cc1,
+    #[display("CC2")]
+    Cc2,
+    #[display("CC3")]
+    Cc3,
+    #[display("CC4")]
+    Cc4,
+    #[display("SERVICE{}", _0.0)]
+    Service(ServiceNumber),
+}
+
+/// A CEA-708 DTVCC service block number known to be within 1..=63.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ServiceNumber(u8);
+
+impl ServiceNumber {
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl InstreamId {
+    /// The highest CEA-708 service block number section 4.4.6.1 permits.
+    pub const MAXIMUM_SERVICE: u8 = 63;
+
+    /// A DTVCC service channel, or `None` outside the permitted 1..=63.
+    pub fn service(number: u8) -> Option<Self> {
+        (1..=Self::MAXIMUM_SERVICE)
+            .contains(&number)
+            .then_some(Self::Service(ServiceNumber(number)))
+    }
+
+    /// The CEA-608 channel carried by a Line 21 field, counting from zero.
+    ///
+    /// Field 1 carries CC1 and CC2; field 2 carries CC3 and CC4. Only the first
+    /// channel of each field is reported, because distinguishing the second
+    /// requires decoding the control codes rather than observing that the field
+    /// carries data at all.
+    pub fn for_field(field: u8) -> Option<Self> {
+        match field {
+            0 => Some(Self::Cc1),
+            1 => Some(Self::Cc3),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
@@ -100,6 +189,8 @@ pub struct Rendition<'a> {
     pub group_id: &'a str,
     pub name: &'a str,
     pub language: Option<&'a str>,
+    /// Required when the type is `CLOSED-CAPTIONS`, absent otherwise.
+    pub instream_id: Option<InstreamId>,
     pub sample_rate: Option<NonZeroU32>,
     pub channels: Option<NonZeroU16>,
     pub default: bool,
@@ -118,6 +209,7 @@ pub struct Variant<'a> {
     pub video_group_id: Option<&'a str>,
     pub audio_group_id: Option<&'a str>,
     pub subtitle_group_id: Option<&'a str>,
+    pub closed_captions: Option<ClosedCaptions<'a>>,
     pub uri: &'a str,
 }
 
@@ -140,6 +232,7 @@ mod tests {
                     group_id: "audio",
                     name: "English",
                     language: Some("en"),
+                    instream_id: None,
                     sample_rate: Some(nz::u32!(48_000)),
                     channels: Some(nz::u16!(2)),
                     default: true,
@@ -158,6 +251,7 @@ mod tests {
                     video_group_id: None,
                     audio_group_id: Some("audio"),
                     subtitle_group_id: None,
+                    closed_captions: None,
                     uri: "video/1080p.m3u8",
                 })
             })?;
@@ -192,6 +286,7 @@ mod tests {
                     group_id: "audio",
                     name: "English\"\n#EXT-X-ENDLIST",
                     language: None,
+                    instream_id: None,
                     sample_rate: None,
                     channels: None,
                     default: false,
@@ -202,5 +297,97 @@ mod tests {
         );
         assert_eq!(rendered, "#EXTM3U\n");
         Ok(())
+    }
+
+    #[test]
+    fn renders_a_closed_caption_rendition_without_a_uri() -> Result<(), ManifestWriteError> {
+        let mut rendered = String::new();
+        let mut writer = MultivariantPlaylistWriter::new(&mut rendered)?;
+        writer
+            .rendition(Rendition {
+                media_type: PlaylistMediaType::ClosedCaptions,
+                group_id: "cc",
+                name: "English",
+                language: Some("en"),
+                instream_id: InstreamId::service(1),
+                sample_rate: None,
+                channels: None,
+                default: true,
+                autoselect: true,
+                // Section 4.4.6.1 forbids a URI on a closed-caption rendition:
+                // the media is in the video segments, not a playlist of its own.
+                uri: None,
+            })
+            .and_then(|writer| {
+                writer.variant(Variant {
+                    bandwidth: nz::u64!(3_000_000),
+                    average_bandwidth: None,
+                    codecs: Some("avc1.640028"),
+                    resolution: None,
+                    frame_rate: None,
+                    video_range: None,
+                    video_group_id: None,
+                    audio_group_id: None,
+                    subtitle_group_id: None,
+                    closed_captions: Some(ClosedCaptions::Group("cc")),
+                    uri: "video/1080p.m3u8",
+                })
+            })?;
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "#EXTM3U\n",
+                "#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID=\"cc\",NAME=\"English\",",
+                "DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"en\",INSTREAM-ID=\"SERVICE1\"\n",
+                "#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS=\"avc1.640028\",",
+                "CLOSED-CAPTIONS=\"cc\"\n",
+                "video/1080p.m3u8\n",
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn renders_an_unquoted_none_for_a_presentation_without_captions()
+    -> Result<(), ManifestWriteError> {
+        let mut rendered = String::new();
+        let mut writer = MultivariantPlaylistWriter::new(&mut rendered)?;
+        writer.variant(Variant {
+            bandwidth: nz::u64!(3_000_000),
+            average_bandwidth: None,
+            codecs: None,
+            resolution: None,
+            frame_rate: None,
+            video_range: None,
+            video_group_id: None,
+            audio_group_id: None,
+            subtitle_group_id: None,
+            closed_captions: Some(ClosedCaptions::None),
+            uri: "video/1080p.m3u8",
+        })?;
+
+        // NONE is an enumerated string; quoting it would name a group called
+        // "NONE" rather than asserting the absence of captions.
+        assert!(rendered.contains("CLOSED-CAPTIONS=NONE\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_service_number_outside_the_permitted_range_is_refused() {
+        assert_eq!(
+            InstreamId::service(1).map(|id| id.to_string()).as_deref(),
+            Some("SERVICE1")
+        );
+        assert_eq!(
+            InstreamId::service(63).map(|id| id.to_string()).as_deref(),
+            Some("SERVICE63")
+        );
+        assert_eq!(InstreamId::service(0), None);
+        assert_eq!(InstreamId::service(64), None);
+        // Field 1 carries CC1, field 2 carries CC3; anything else names nothing.
+        assert_eq!(InstreamId::for_field(0), Some(InstreamId::Cc1));
+        assert_eq!(InstreamId::for_field(1), Some(InstreamId::Cc3));
+        assert_eq!(InstreamId::for_field(2), None);
     }
 }

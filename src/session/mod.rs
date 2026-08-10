@@ -255,6 +255,13 @@ async fn pipeline(
         context.meters().media_view(),
         config.input,
         &timeline,
+        // Captions are declared from what the bitstream actually carries, so
+        // the language advertised comes from the video track that carries them
+        // rather than from a separate declaration that could disagree.
+        Some(media::CaptionVerifier::new(
+            presentation.tracks(),
+            video_language(&presentation),
+        )),
     );
 
     context.enter(Phase::Segmenting);
@@ -327,6 +334,21 @@ async fn pipeline(
         });
     }
     Ok(outcome)
+}
+
+/// The language a caption service should advertise.
+///
+/// In-band captions carry no language tag of their own — the SEI has no field
+/// for one — so the video track carrying them is the only evidence available.
+/// `LANGUAGE` is optional on `EXT-X-MEDIA`, so its absence withholds the
+/// attribute rather than the whole declaration.
+fn video_language(presentation: &media::PresentationPlan) -> Option<Arc<str>> {
+    presentation
+        .tracks()
+        .iter()
+        .find(|track| track.kind() == crate::domain::MediaKind::Video)
+        .and_then(|track| track.language.as_deref())
+        .map(Arc::from)
 }
 
 fn report(

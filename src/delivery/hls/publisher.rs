@@ -4,7 +4,10 @@ use thiserror::Error;
 
 use crate::{
     domain::{Payload, StreamId},
-    mux::{FinishReason, PackagedMedia, PackagedPresentation, PackagingRenditionId},
+    mux::{
+        ClosedCaptionService, FinishReason, PackagedMedia, PackagedPresentation,
+        PackagingRenditionId,
+    },
     observe::{Events, StreamEvent},
 };
 
@@ -39,6 +42,23 @@ pub enum PublishOutcome {
 /// Accepts packaged media on behalf of one stream and makes it fetchable.
 pub trait HlsPublisher: Send {
     fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError>;
+
+    /// Advertises the in-band caption services this publication carries.
+    ///
+    /// Separate from the presentation handed to
+    /// [`HlsPublisherFactory::publish`] because in-band captions cannot be
+    /// described before media flows: nothing in a track's declared parameters
+    /// says whether its access units carry caption SEI, so the answer only
+    /// exists once packets have been inspected.
+    ///
+    /// Reports whether this changed what viewers are told, so a caller driving
+    /// it from a per-packet observation can log a transition without tracking
+    /// what it last declared. The default does nothing, which keeps publishers
+    /// that do not model a topology from having to care.
+    fn declare_closed_captions(&mut self, services: Arc<[ClosedCaptionService]>) -> bool {
+        let _ = services;
+        false
+    }
 
     /// Closes out the publication.
     ///
@@ -164,6 +184,10 @@ impl HlsPublisher for StorePublisher {
         } else {
             Ok(PublishOutcome::Superseded)
         }
+    }
+
+    fn declare_closed_captions(&mut self, services: Arc<[ClosedCaptionService]>) -> bool {
+        self.lease.declare_closed_captions(services)
     }
 
     fn finish(&mut self, reason: FinishReason) -> Result<(), HlsError> {

@@ -12,7 +12,10 @@ use arc_swap::ArcSwap;
 
 use crate::{
     domain::{MediaKind, RenditionId},
-    mux::{PlayableCombination, RenditionConfig, RenditionGroupKey, RenditionKey, RenditionMedia},
+    mux::{
+        ClosedCaptionService, PlayableCombination, RenditionConfig, RenditionGroupKey,
+        RenditionKey, RenditionMedia,
+    },
 };
 
 use super::{PlaylistContract, RenditionBandwidth, RenditionSnapshot};
@@ -106,6 +109,11 @@ pub struct ResolvedPresentation {
     pub time_anchor: SystemTime,
     pub groups: Arc<[ResolvedRenditionGroup]>,
     pub combinations: Arc<[PlayableCombination]>,
+    /// In-band caption services carried by every video rendition.
+    ///
+    /// Needs no ID resolution: an in-band service names no rendition, so it
+    /// crosses this boundary unchanged.
+    pub closed_captions: Arc<[ClosedCaptionService]>,
 }
 
 /// Shared wall-clock origin for every rendition produced by one publication.

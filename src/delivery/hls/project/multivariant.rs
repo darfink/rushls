@@ -18,17 +18,30 @@ use std::{collections::BTreeSet, num::NonZeroU64};
 use crate::{
     delivery::hls::{
         RenditionCatalogEntry, StreamSnapshot,
-        manifest::{MultivariantPlaylistWriter, PlaylistMediaType, Rendition, Variant, VideoRange},
+        manifest::{
+            ClosedCaptions, InstreamId, MultivariantPlaylistWriter, PlaylistMediaType, Rendition,
+            Variant, VideoRange,
+        },
         uri::PlaylistUris,
     },
     domain::{MediaKind, RenditionId},
-    mux::{RenditionGroupKey, RenditionMedia, VideoRange as MuxVideoRange},
+    mux::{
+        CaptionChannel, ClosedCaptionService, RenditionGroupKey, RenditionMedia,
+        VideoRange as MuxVideoRange,
+    },
 };
 
 use super::{PlaylistPolicy, ProjectionError};
 
 /// Version 6 covers everything this projection emits.
 const VERSION: u8 = 6;
+
+/// The group name every in-band caption service is published under.
+///
+/// One group is enough because these services share a carriage: they all ride
+/// inside the same video segments, so no client ever needs to choose between
+/// groups to reach one of them.
+const CLOSED_CAPTION_GROUP: &str = "cc";
 
 /// Renders the multivariant playlist, or `None` if there is no topology yet.
 ///
@@ -76,6 +89,15 @@ pub fn multivariant_playlist(
         .filter_map(|combination| Playable::resolve(&combination.groups, &groups))
         .collect();
 
+    // Only services this projection can actually name reach the playlist: an
+    // unrepresentable channel would otherwise become a variant reference to a
+    // group that was never written.
+    let captions: Vec<(InstreamId, &ClosedCaptionService)> = presentation
+        .closed_captions
+        .iter()
+        .filter_map(|service| Some((instream_id(service.channel)?, service)))
+        .collect();
+
     // A group is "alternate" if some combination uses it without it being that
     // combination's primary; those are the ones that become EXT-X-MEDIA.
     let alternates: BTreeSet<&RenditionGroupKey> = playable
@@ -94,6 +116,7 @@ pub fn multivariant_playlist(
                 group_id: &group.key.0,
                 name: &entry.name,
                 language: entry.language.as_deref(),
+                instream_id: None,
                 sample_rate,
                 channels,
                 default: entry.is_default,
@@ -106,6 +129,32 @@ pub fn multivariant_playlist(
         }
     }
 
+    for (instream_id, service) in &captions {
+        writer.rendition(Rendition {
+            media_type: PlaylistMediaType::ClosedCaptions,
+            group_id: CLOSED_CAPTION_GROUP,
+            name: &service.name,
+            language: service.language.as_deref(),
+            instream_id: Some(*instream_id),
+            // Section 4.4.6.1 permits neither on a non-audio rendition.
+            sample_rate: None,
+            channels: None,
+            default: service.is_default,
+            autoselect: service.autoselect,
+            // The media is inside the video segments, so there is nothing to
+            // point at; section 4.4.6.2.1 forbids the attribute outright.
+            uri: None,
+        })?;
+    }
+
+    // Section 4.4.6.2 requires the same value on every variant, so it is
+    // decided once here rather than per variant. Absent — rather than NONE —
+    // when nothing was detected, because NONE is a positive assertion that no
+    // variant carries captions, and this origin only knows what it has
+    // observed so far.
+    let closed_captions =
+        (!captions.is_empty()).then_some(ClosedCaptions::Group(CLOSED_CAPTION_GROUP));
+
     let mut written = BTreeSet::new();
     for playable in &playable {
         for entry in &playable.primary.renditions {
@@ -114,7 +163,14 @@ pub fn multivariant_playlist(
             if !written.insert(entry.rendition_id) {
                 continue;
             }
-            write_variant(&mut writer, entry, &playable.alternates, policy, uris)?;
+            write_variant(
+                &mut writer,
+                entry,
+                &playable.alternates,
+                closed_captions,
+                policy,
+                uris,
+            )?;
         }
     }
 
@@ -152,6 +208,7 @@ fn write_variant(
     writer: &mut MultivariantPlaylistWriter<'_>,
     primary: &RenditionCatalogEntry,
     alternates: &[&ResolvedGroup<'_>],
+    closed_captions: Option<ClosedCaptions<'_>>,
     policy: &PlaylistPolicy,
     uris: &PlaylistUris,
 ) -> Result<(), ProjectionError> {
@@ -226,6 +283,7 @@ fn write_variant(
         video_group_id: group_id(MediaKind::Video),
         audio_group_id: group_id(MediaKind::Audio),
         subtitle_group_id: group_id(MediaKind::Subtitle),
+        closed_captions,
         uri: &uris.media_playlist(primary.rendition_id, primary.media.kind()),
     })?;
     Ok(())
@@ -315,6 +373,18 @@ fn media_type(kind: MediaKind) -> PlaylistMediaType {
         MediaKind::Audio => PlaylistMediaType::Audio,
         MediaKind::Video => PlaylistMediaType::Video,
         MediaKind::Subtitle => PlaylistMediaType::Subtitles,
+    }
+}
+
+/// Maps an observed in-band channel onto the value HLS names it by.
+///
+/// `None` for a channel section 4.4.6.1 cannot express, which keeps an
+/// out-of-range service out of the playlist instead of emitting an
+/// `INSTREAM-ID` a client must ignore.
+fn instream_id(channel: CaptionChannel) -> Option<InstreamId> {
+    match channel {
+        CaptionChannel::Cea608Field(field) => InstreamId::for_field(field),
+        CaptionChannel::Cea708Service(service) => InstreamId::service(service),
     }
 }
 

@@ -25,7 +25,7 @@ use tokio::{sync::watch, time::Instant};
 
 use crate::{
     domain::{Payload, RenditionId},
-    mux::{PackagedMedia, PackagedPresentation, PackagingRenditionId},
+    mux::{ClosedCaptionService, PackagedMedia, PackagedPresentation, PackagingRenditionId},
 };
 
 use super::{
@@ -48,6 +48,14 @@ enum Catalog {
     /// The snapshot is replaced. Its revisions are bumped by the mutation
     /// itself, which is the only place that knows which of the two moved.
     Republished,
+}
+
+/// Whether a mutation can affect an already-rendered media playlist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Media {
+    Changed,
+    /// Nothing a media playlist renders was touched, so cached ones stand.
+    Untouched,
 }
 
 /// Live media for one logical stream, shared by publishers and readers.
@@ -256,10 +264,29 @@ impl LiveStream {
         catalog: Catalog,
         edges: impl IntoIterator<Item = EdgeUpdate>,
     ) {
+        self.commit_with(state, catalog, Media::Changed, edges);
+    }
+
+    /// The same, for a mutation that provably touches no media playlist.
+    ///
+    /// Only the multivariant playlist reads the catalog revision alone; every
+    /// media playlist is keyed on the media revision as well. A change confined
+    /// to presentation-wide attributes therefore has nothing to invalidate
+    /// there, and bumping it would re-render every rendition's playlist to
+    /// produce identical bytes.
+    fn commit_with(
+        &self,
+        state: RwLockWriteGuard<'_, StreamState>,
+        catalog: Catalog,
+        media: Media,
+        edges: impl IntoIterator<Item = EdgeUpdate>,
+    ) {
         if catalog == Catalog::Republished {
             self.publish_catalog(&state);
         }
-        self.advance_media_revision();
+        if media == Media::Changed {
+            self.advance_media_revision();
+        }
         drop(state);
 
         notify_edges(edges);
@@ -388,6 +415,7 @@ impl LiveStream {
             time_anchor: presentation.time_anchor,
             groups: resolved_groups,
             combinations: Arc::clone(&presentation.combinations),
+            closed_captions: Arc::clone(&presentation.closed_captions),
         });
         state.prune_publication_anchors();
         state.recalculate_retained_bytes();
@@ -395,6 +423,43 @@ impl LiveStream {
         state.bump_media_catalog();
         self.commit(state, Catalog::Republished, edge_updates);
         (publication, mapping)
+    }
+
+    /// Replaces the in-band caption services advertised by the live topology.
+    ///
+    /// Separate from [`Self::attach`] because captions are established by
+    /// observing the bitstream, which necessarily happens after the
+    /// presentation is published. Bumping the catalog revision is what
+    /// re-renders the multivariant playlist. No media playlist mentions
+    /// captions, so the media revision is deliberately left alone rather than
+    /// invalidating every rendition's cached playlist to reproduce identical
+    /// bytes.
+    ///
+    /// Ignored when the lease is not the current publisher, matching every
+    /// other write path: a displaced publisher must not alter what viewers of
+    /// its successor are told.
+    pub fn declare_closed_captions(
+        &self,
+        publication: u64,
+        services: Arc<[ClosedCaptionService]>,
+    ) -> bool {
+        let mut state = self.state.write();
+        if state.publication != publication {
+            return false;
+        }
+        let Some(presentation) = &state.active_presentation else {
+            return false;
+        };
+        if presentation.closed_captions == services {
+            return false;
+        }
+        state.active_presentation = Some(ResolvedPresentation {
+            closed_captions: services,
+            ..presentation.clone()
+        });
+        state.bump_catalog();
+        self.commit_with(state, Catalog::Republished, Media::Untouched, []);
+        true
     }
 
     pub fn release(&self, publication: u64) {

@@ -6,11 +6,11 @@ use crate::{
     delivery::hls::{HlsError, HlsPublisher, PublishOutcome},
     domain::{Appender, BoxFuture},
     media::{
-        MediaDensityWindow, MediaError, MediaNormalizer, MediaPacer, NormalizedSample, PacingError,
-        SampleSource, TimelineCalibration,
+        CaptionReconciliation, CaptionVerifier, MediaDensityWindow, MediaError, MediaNormalizer,
+        MediaPacer, NormalizedSample, PacingError, SampleSource, TimelineCalibration,
     },
-    mux::{FinishReason, MuxError, Muxer, PackagedMedia},
-    observe::{DeliveryMeters, MediaMeters, MuxMeters},
+    mux::{CaptionChannel, ClosedCaptionService, FinishReason, MuxError, Muxer, PackagedMedia},
+    observe::{DeliveryMeters, EventSink, MediaMeters, MuxMeters, SessionEvent},
     source::{
         BatchUnit, BoundedBatch, BoundedPacketBatch, InputLimits, InputState, Packet, PacketSource,
     },
@@ -51,6 +51,15 @@ pub struct MediaHead {
     meters: Arc<dyn MediaMeters>,
     limits: InputLimits,
     density: MediaDensityWindow,
+    /// Watches video access units for in-band captions, when any track can be
+    /// inspected. Absent for a publication with nothing to scan.
+    captions: Option<CaptionVerifier>,
+    /// Caption services observed but not yet handed to the publisher.
+    ///
+    /// Queued rather than declared inline because this half of the pipeline
+    /// holds no publisher: the tail owns publication, so the transition is
+    /// carried across in the same batch that produced it.
+    declared_captions: Option<Arc<[ClosedCaptionService]>>,
     packets: Vec<Packet>,
     normalized: Vec<NormalizedSample>,
     drained: bool,
@@ -63,6 +72,7 @@ impl MediaHead {
         meters: Arc<dyn MediaMeters>,
         limits: InputLimits,
         timeline: &TimelineCalibration,
+        captions: Option<CaptionVerifier>,
     ) -> Self {
         Self {
             source,
@@ -70,10 +80,42 @@ impl MediaHead {
             meters,
             limits,
             density: MediaDensityWindow::new(limits, timeline),
+            captions,
+            declared_captions: None,
             packets: Vec::with_capacity(INITIAL_BATCH.min(limits.maximum_packets_per_batch)),
             normalized: Vec::with_capacity(INITIAL_BATCH.min(limits.maximum_samples_per_batch)),
             drained: false,
         }
+    }
+
+    /// Takes any caption declaration produced since this was last called.
+    pub fn take_caption_declaration(&mut self) -> Option<Arc<[ClosedCaptionService]>> {
+        self.declared_captions.take()
+    }
+
+    /// How the observed captions currently reconcile across video tracks.
+    pub fn caption_reconciliation(&self) -> Option<CaptionReconciliation> {
+        self.captions.as_ref().map(CaptionVerifier::reconciliation)
+    }
+
+    /// Video tracks carrying captions, over the number that should.
+    pub fn caption_carriage(&self) -> Option<(usize, usize)> {
+        self.captions.as_ref().map(CaptionVerifier::carriage)
+    }
+
+    /// The channels currently declared, for reporting.
+    pub fn caption_channels(&self) -> Vec<CaptionChannel> {
+        self.captions
+            .as_ref()
+            .map(CaptionVerifier::declared_channels)
+            .unwrap_or_default()
+    }
+
+    /// Malformed SEI messages ignored across every video track.
+    pub fn caption_malformed_sei(&self) -> u64 {
+        self.captions
+            .as_ref()
+            .map_or(0, CaptionVerifier::malformed_sei)
     }
 
     /// Releases access units the normalizer is still holding back.
@@ -122,6 +164,15 @@ impl SampleSource for MediaHead {
                 self.limits.maximum_samples_per_batch,
             );
             for packet in self.packets.drain(..) {
+                // Inspected before normalization, while the access unit is
+                // still exactly the bytes the publisher sent. Read-only: the
+                // packet continues into the pipeline untouched.
+                if let Some(captions) = &mut self.captions
+                    && let Some(services) =
+                        captions.inspect(packet.track_id, packet.payload.as_bytes())
+                {
+                    self.declared_captions = Some(services);
+                }
                 self.normalizer.push(packet, &mut samples)?;
             }
             if !state.is_open() {
@@ -188,6 +239,11 @@ impl MediaTail {
     fn write_one(&mut self, sample: NormalizedSample) -> Result<(), ExecutionError> {
         self.muxer.push(sample, &mut self.media)?;
         self.publish()
+    }
+
+    /// Advertises in-band caption services on the live publication.
+    fn declare_closed_captions(&mut self, services: Arc<[ClosedCaptionService]>) -> bool {
+        self.publisher.declare_closed_captions(services)
     }
 
     fn finish(&mut self, reason: FinishReason) -> Result<(), ExecutionError> {
@@ -272,6 +328,10 @@ pub struct LiveSession {
     input_state: InputState,
     replayed: bool,
     drained: bool,
+    /// The last caption state reported, so each transition is announced once.
+    reported_captions: Option<CaptionReconciliation>,
+    /// Malformed SEI already reported, so a rising count is announced once.
+    reported_malformed_sei: u64,
 }
 
 impl LiveSession {
@@ -292,6 +352,72 @@ impl LiveSession {
             input_state,
             replayed: false,
             drained: false,
+            reported_captions: None,
+            reported_malformed_sei: 0,
+        }
+    }
+
+    /// Applies any queued caption declaration and announces a state change.
+    ///
+    /// One place, so the replay branch and the steady-state loop cannot drift:
+    /// both have to declare before writing media, and pre-roll makes the replay
+    /// branch the only chance a short input ever gets.
+    fn publish_captions(&mut self, events: &EventSink) {
+        if let Some(services) = self.head.take_caption_declaration() {
+            self.tail.declare_closed_captions(services);
+        }
+        self.report_captions(events);
+    }
+
+    /// Announces a change in what the video tracks were observed to carry.
+    ///
+    /// Driven from the pump rather than the detector so the event is emitted
+    /// once per transition, not once per access unit that confirms it.
+    fn report_captions(&mut self, events: &EventSink) {
+        let Some(state) = self.head.caption_reconciliation() else {
+            return;
+        };
+        if self.reported_captions == Some(state) {
+            return;
+        }
+        self.reported_captions = Some(state);
+        let Some((carrying, video_tracks)) = self.head.caption_carriage() else {
+            return;
+        };
+        match state {
+            CaptionReconciliation::Consistent => {
+                events.emit(SessionEvent::ClosedCaptionsDetected {
+                    channels: self
+                        .head
+                        .caption_channels()
+                        .into_iter()
+                        .map(|channel| channel.to_string())
+                        .collect(),
+                });
+            }
+            CaptionReconciliation::PartialLadder => {
+                events.emit(SessionEvent::ClosedCaptionsPartial {
+                    carrying,
+                    video_tracks,
+                });
+            }
+            CaptionReconciliation::ChannelMismatch => {
+                events.emit(SessionEvent::ClosedCaptionsChannelMismatch);
+            }
+            // Nothing observed yet is the state every publication starts in,
+            // so it is not an event.
+            CaptionReconciliation::Absent => {}
+        }
+
+        // Reported alongside the state change rather than on its own schedule:
+        // malformed SEI matters because it means the caption picture may be
+        // incomplete, which is only actionable next to what was concluded.
+        let malformed = self.head.caption_malformed_sei();
+        if malformed > self.reported_malformed_sei {
+            self.reported_malformed_sei = malformed;
+            events.emit(SessionEvent::ClosedCaptionsMalformedSei {
+                messages: malformed,
+            });
         }
     }
 
@@ -300,9 +426,16 @@ impl LiveSession {
     /// Stepping a batch at a time is what lets supervision interleave stop
     /// checks and health evaluation without ever cancelling a partially
     /// processed read.
-    pub async fn pump(&mut self) -> Result<InputState, ExecutionError> {
+    pub async fn pump(&mut self, events: &EventSink) -> Result<InputState, ExecutionError> {
         if !self.replayed {
             self.replayed = true;
+            // Pre-roll drove the same `MediaHead`, so its access units have
+            // already been inspected and may have queued a declaration. It has
+            // to be applied *before* the buffered media is written: the first
+            // write is what wakes viewers blocked on the multivariant playlist,
+            // and for an input that ended during pre-roll there is no later
+            // pump to apply it at all.
+            self.publish_captions(events);
             self.tail.write_all(&mut self.samples)?;
             self.drained = !self.input_state.is_open();
             return Ok(self.input_state);
@@ -314,6 +447,12 @@ impl LiveSession {
         if self.samples.is_empty() {
             self.input_state = self.head.next_batch(&mut self.samples).await?;
         }
+
+        // Declared before the samples are written so the multivariant playlist
+        // gains the caption group no later than the media it describes. The
+        // transition is rare — once per publication in the ordinary case — so
+        // this costs a check per batch and nothing more.
+        self.publish_captions(events);
 
         // Leave each accepted sample queued until its delay has completed.
         // This makes pacing cancellation-safe: a supervision tick or stop can
@@ -421,6 +560,36 @@ mod tests {
         }
     }
 
+    /// What a publisher saw, in the order it saw it.
+    #[derive(Default)]
+    struct PublishLog {
+        /// Media objects written before any caption declaration arrived.
+        media_before_captions: usize,
+        declared: bool,
+    }
+
+    /// Records whether captions were declared before any media was published.
+    struct OrderedPublisher(Arc<parking_lot::Mutex<PublishLog>>);
+
+    impl HlsPublisher for OrderedPublisher {
+        fn write(&mut self, _media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
+            let mut log = self.0.lock();
+            if !log.declared {
+                log.media_before_captions += 1;
+            }
+            Ok(PublishOutcome::Published)
+        }
+
+        fn declare_closed_captions(&mut self, _services: Arc<[ClosedCaptionService]>) -> bool {
+            self.0.lock().declared = true;
+            true
+        }
+
+        fn finish(&mut self, _reason: FinishReason) -> Result<(), HlsError> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn a_revoked_write_does_not_advance_delivery_meters() {
         let process = ProcessMeters::default();
@@ -445,5 +614,112 @@ mod tests {
             .expect("revocation is not a publication error");
 
         assert_eq!(process.snapshot().parts_published, 0);
+    }
+
+    /// A source that is already exhausted, standing in for an input that ended
+    /// during pre-roll.
+    struct ExhaustedSource;
+
+    impl PacketSource for ExhaustedSource {
+        fn discover(
+            &mut self,
+            _limits: crate::source::DiscoveryLimits,
+        ) -> BoxFuture<'_, Result<crate::source::DiscoveryReport, crate::source::SourceError>>
+        {
+            unreachable!("discovery already happened")
+        }
+
+        fn fill<'a>(
+            &'a mut self,
+            _out: &'a mut dyn Appender<Packet>,
+        ) -> BoxFuture<'a, Result<InputState, crate::source::SourceError>> {
+            Box::pin(async { Ok(InputState::Closed) })
+        }
+    }
+
+    struct IdleNormalizer;
+
+    impl MediaNormalizer for IdleNormalizer {
+        fn push(
+            &mut self,
+            _packet: Packet,
+            _out: &mut dyn Appender<NormalizedSample>,
+        ) -> Result<(), crate::media::NormalizeError> {
+            Ok(())
+        }
+
+        fn finish(
+            &mut self,
+            _out: &mut dyn Appender<NormalizedSample>,
+        ) -> Result<(), crate::media::NormalizeError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn captions_seen_during_preroll_are_declared_before_any_media() {
+        // Pre-roll drives the same `MediaHead`, so a short captioned input can
+        // have its captions detected and its input closed before the live loop
+        // ever runs. The replay branch is then the only chance to declare them:
+        // if it publishes media first, viewers are woken with a captionless
+        // multivariant playlist, and if the input ended there is no later pump
+        // at all.
+        let session = SessionMeters::new(ProcessMeters::default());
+        let mut head = MediaHead::new(
+            Box::new(ExhaustedSource),
+            Box::new(IdleNormalizer),
+            session.media_view(),
+            InputLimits::permissive(),
+            &crate::media::fixtures::video_timeline(),
+            None,
+        );
+        head.declared_captions = Some(Arc::from([ClosedCaptionService {
+            channel: crate::mux::CaptionChannel::Cea708Service(1),
+            name: Arc::from("Service 1"),
+            language: None,
+            is_default: true,
+            autoselect: true,
+        }]));
+
+        let log = Arc::new(parking_lot::Mutex::new(PublishLog::default()));
+        let publisher = Box::new(OrderedPublisher(Arc::clone(&log)));
+        let tail = MediaTail::new(
+            Box::new(IdleMuxer),
+            publisher,
+            session.mux_view(),
+            session.delivery_view(),
+        );
+        let pacer = MediaPacer::after_preroll(
+            crate::admission::IngestTimingPolicy::RequireRealtime {
+                maximum_lead: std::time::Duration::from_secs(60),
+            },
+            &crate::media::fixtures::video_timeline(),
+            &[],
+            session.media_view(),
+        )
+        .expect("an empty pre-roll paces");
+
+        let mut live = LiveSession::new(
+            head,
+            tail,
+            pacer,
+            vec![crate::media::fixtures::video_sample_at(0)],
+            // The publisher already went away, which is the edge that loses the
+            // declaration entirely.
+            InputState::Closed,
+        );
+        let events =
+            crate::observe::Events::default().scoped(crate::domain::SessionId(nz::u64!(1)));
+        live.pump(&events).await.expect("the replay pump succeeds");
+
+        let log = log.lock();
+        assert!(
+            log.declared,
+            "captions detected during pre-roll must still be declared"
+        );
+        assert_eq!(
+            log.media_before_captions, 0,
+            "captions must be declared before the first media write"
+        );
     }
 }

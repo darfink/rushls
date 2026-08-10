@@ -88,7 +88,7 @@ pub async fn supervise(
                 }
             }
 
-            state = session.pump() => {
+            state = session.pump(context.events()) => {
                 match state? {
                     InputState::Open => {}
                     InputState::Closed => return Ok(SessionOutcome::Ended),

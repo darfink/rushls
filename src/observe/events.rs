@@ -50,6 +50,40 @@ pub enum SessionEvent {
         track: TrackId,
         late_by: Duration,
     },
+    /// In-band closed captions were detected and are now advertised.
+    ///
+    /// Carries the channels so an operator can tell a 608-only publisher from a
+    /// 708 one without inspecting the playlist, which is the distinction that
+    /// decides whether browser clients will surface the captions at all.
+    ClosedCaptionsDetected {
+        channels: Vec<String>,
+    },
+    /// Captions were seen on some video tracks but not all of them.
+    ///
+    /// Nothing is declared while this holds: HLS advertises captions once for
+    /// the presentation, so a client that switched to a rendition without them
+    /// would silently lose the captions mid-playback. Reported per publication
+    /// because it is a fault in what was published, not something this node can
+    /// correct.
+    ClosedCaptionsPartial {
+        carrying: usize,
+        video_tracks: usize,
+    },
+    /// Every video track carries captions, but not on the same channels.
+    ///
+    /// Nothing is declared: a channel missing from one rendition cannot be
+    /// promised for the presentation. Separate from
+    /// [`Self::ClosedCaptionsPartial`] because the remedy differs — the ladder
+    /// is captioned throughout, just not uniformly.
+    ClosedCaptionsChannelMismatch,
+    /// A publisher emitted SEI this node could not parse.
+    ///
+    /// Counted per publication rather than per message: a stream with broken
+    /// SEI usually has it in every access unit, and the interesting fact is
+    /// that captions may be under-reported, not how many times.
+    ClosedCaptionsMalformedSei {
+        messages: u64,
+    },
     Running,
     TrackSetChanged,
     CodecParametersChanged {

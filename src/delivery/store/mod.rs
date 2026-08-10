@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 
 use crate::{
     domain::{Payload, RenditionId, StreamId},
-    mux::{PackagedMedia, PackagedPresentation, PackagingRenditionId},
+    mux::{ClosedCaptionService, PackagedMedia, PackagedPresentation, PackagingRenditionId},
 };
 
 mod bitrate;
@@ -193,6 +193,7 @@ impl StreamStore {
                 renditions: Arc::from([]),
                 groups: Arc::from([]),
                 combinations: Arc::from([]),
+                closed_captions: Arc::from([]),
             },
         )
     }
@@ -324,6 +325,16 @@ impl StreamLease {
             });
         };
         self.live.write(self.publication, rendition_id, media, gzip)
+    }
+
+    /// Advertises the in-band caption services this publication carries.
+    ///
+    /// Returns whether the topology actually changed, so a caller can report a
+    /// transition without tracking what it previously declared. A revoked lease
+    /// cannot alter its successor's topology.
+    pub fn declare_closed_captions(&self, services: Arc<[ClosedCaptionService]>) -> bool {
+        self.live
+            .declare_closed_captions(self.publication, services)
     }
 
     /// Marks the stream complete so readers stop waiting for new media.

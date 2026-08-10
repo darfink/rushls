@@ -6,6 +6,7 @@
 //! catalog — so a seam would only let tests substitute something that is not
 //! the thing running in production.
 
+mod captions;
 mod density;
 mod normalize;
 mod pacer;
@@ -18,6 +19,7 @@ mod validate;
 #[cfg(test)]
 pub mod fixtures;
 
+pub use captions::{CaptionReconciliation, CaptionVerifier};
 pub use density::{MediaDensityError, MediaDensityWindow};
 pub use normalize::{
     MediaNormalizer, NormalizeError, NormalizerFactory, PassThroughNormalizerFactory,

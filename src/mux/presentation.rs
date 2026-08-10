@@ -171,6 +171,38 @@ pub struct PlayableCombination {
     pub groups: Arc<[RenditionGroupKey]>,
 }
 
+/// One caption service carried inside the video access units themselves.
+///
+/// Presentation-wide rather than a rendition, and deliberately so. An in-band
+/// caption service has no media of its own: the bytes ride in every video
+/// rendition's segments, so the service exists once for the presentation while
+/// each video rendition is expected to carry it. Modelling it as a rendition
+/// would give it a store entry, a URI, and a media playlist, none of which it
+/// can have.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClosedCaptionService {
+    /// Which in-band channel carries it, as the delivery layer names it.
+    pub channel: CaptionChannel,
+    pub name: Arc<str>,
+    pub language: Option<Arc<str>>,
+    pub is_default: bool,
+    pub autoselect: bool,
+}
+
+/// An in-band caption channel, independent of how a manifest spells it.
+///
+/// Kept in mux terms so the packaging contract does not depend on the delivery
+/// protocol's vocabulary; the HLS projection maps this onto `INSTREAM-ID`.
+#[derive(Clone, Copy, Debug, Display, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CaptionChannel {
+    /// A CEA-608 Line 21 field, counted from zero.
+    #[display("cea608-field{_0}")]
+    Cea608Field(u8),
+    /// A CEA-708 DTVCC service block number.
+    #[display("cea708-service{_0}")]
+    Cea708Service(u8),
+}
+
 /// Immutable description of every output produced by one muxer publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackagedPresentation {
@@ -179,6 +211,13 @@ pub struct PackagedPresentation {
     pub renditions: Arc<[PackagedRendition]>,
     pub groups: Arc<[RenditionGroup]>,
     pub combinations: Arc<[PlayableCombination]>,
+    /// In-band caption services every video rendition is expected to carry.
+    ///
+    /// Empty until something establishes them. A pass-through publication
+    /// starts empty and gains services once detection confirms the bitstream
+    /// actually carries them, which is why this is not derived from the input
+    /// track set.
+    pub closed_captions: Arc<[ClosedCaptionService]>,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -299,6 +338,9 @@ impl PackagedPresentation {
             renditions: renditions.into(),
             groups: groups.into(),
             combinations: combinations.into(),
+            // Captions are established after publication, by observing the
+            // bitstream rather than by describing it up front.
+            closed_captions: Arc::from([]),
         };
         value.validate(input)?;
         Ok(value)

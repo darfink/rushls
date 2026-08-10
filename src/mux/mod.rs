@@ -29,9 +29,9 @@ pub use passthrough::PassThroughMuxerFactory;
 pub use track::{TrackPackager, TrackRouter};
 
 pub use presentation::{
-    MuxerStartRequest, PackagedPresentation, PackagedPresentationError, PackagedRendition,
-    PackagingRenditionId, PlayableCombination, RenditionGroup, RenditionGroupKey, RenditionKey,
-    RenditionMedia, StartedMuxer, VideoRange,
+    CaptionChannel, ClosedCaptionService, MuxerStartRequest, PackagedPresentation,
+    PackagedPresentationError, PackagedRendition, PackagingRenditionId, PlayableCombination,
+    RenditionGroup, RenditionGroupKey, RenditionKey, RenditionMedia, StartedMuxer, VideoRange,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

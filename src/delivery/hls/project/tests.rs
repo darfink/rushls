@@ -17,6 +17,7 @@ use crate::{
         uri::{PlaylistUris, UriBase},
     },
     domain::RenditionId,
+    mux::{CaptionChannel, ClosedCaptionService},
 };
 
 fn policy() -> PlaylistPolicy {
@@ -433,6 +434,74 @@ fn a_multivariant_playlist_preserves_canonical_language_metadata()
         .ok_or_else(|| std::io::Error::other("an attached publication has a topology"))?;
 
     assert!(rendered.contains("LANGUAGE=\"fr-CA\""));
+    Ok(())
+}
+
+#[test]
+fn detected_captions_are_declared_once_and_referenced_by_every_variant()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0), audio(1)]);
+
+    // Before detection the presentation says nothing about captions, which is
+    // legal: the attribute is optional, and this origin only knows what it has
+    // observed.
+    let before = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?
+        .ok_or_else(|| std::io::Error::other("an attached publication has a topology"))?;
+    assert!(!before.contains("CLOSED-CAPTIONS"));
+
+    assert!(
+        lease.declare_closed_captions(Arc::from([ClosedCaptionService {
+            channel: CaptionChannel::Cea708Service(1),
+            name: Arc::from("Service 1"),
+            language: Some(Arc::from("en")),
+            is_default: true,
+            autoselect: true,
+        }]))
+    );
+
+    let after = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?
+        .ok_or_else(|| std::io::Error::other("an attached publication has a topology"))?;
+
+    assert!(after.contains(concat!(
+        "#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID=\"cc\",NAME=\"Service 1\",",
+        "DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"en\",INSTREAM-ID=\"SERVICE1\"\n"
+    )));
+    // Section 4.4.6.1 forbids a URI on a closed-caption rendition, so the tag
+    // must be the whole declaration.
+    assert!(!after.contains("INSTREAM-ID=\"SERVICE1\",URI"));
+
+    // Section 4.4.6.2 requires every variant to agree, so the count of
+    // references must match the count of variants rather than merely be
+    // nonzero.
+    let variants = after.matches("#EXT-X-STREAM-INF:").count();
+    assert_eq!(after.matches("CLOSED-CAPTIONS=\"cc\"").count(), variants);
+    Ok(())
+}
+
+#[test]
+fn a_caption_channel_hls_cannot_name_is_left_out_of_the_playlist()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0), audio(1)]);
+
+    // Service 64 is outside the 1..=63 the spec permits. Emitting it would
+    // leave a variant referencing a group that was never written.
+    assert!(
+        lease.declare_closed_captions(Arc::from([ClosedCaptionService {
+            channel: CaptionChannel::Cea708Service(64),
+            name: Arc::from("Service 64"),
+            language: None,
+            is_default: true,
+            autoselect: true,
+        }]))
+    );
+
+    let rendered = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?
+        .ok_or_else(|| std::io::Error::other("an attached publication has a topology"))?;
+
+    assert!(!rendered.contains("CLOSED-CAPTIONS"));
+    assert!(!rendered.contains("TYPE=CLOSED-CAPTIONS"));
     Ok(())
 }
 

@@ -7,6 +7,7 @@
 //! transport into the demuxer and yields a ready [`PacketSource`], so session
 //! orchestration cannot accidentally mismatch those implementation pieces.
 
+mod caption;
 mod limits;
 mod packet;
 mod publish;
@@ -14,6 +15,7 @@ mod publish;
 pub mod avformat;
 pub mod transport;
 
+pub use caption::{CaptionObservation, H264CaptionDetector};
 pub use limits::{
     BatchUnit, BoundedBatch, BoundedPacketBatch, DensityUnit, InputLimits, LimitError,
     PacketBatchStats,
