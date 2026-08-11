@@ -955,6 +955,10 @@ mod end_to_end {
     }
 
     fn publish(input: crate::source::InputLimits) -> Box<dyn PendingPublish> {
+        publish_bytes(input, repeated_aac_flv(20))
+    }
+
+    fn publish_bytes(input: crate::source::InputLimits, bytes: Vec<u8>) -> Box<dyn PendingPublish> {
         Box::new(FixturePublish {
             request: PublishRequest {
                 protocol: IngestProtocol::Rtmp,
@@ -969,13 +973,17 @@ mod end_to_end {
                     protocol_version: None,
                 },
             },
-            bytes: repeated_aac_flv(20),
+            bytes,
             config: AvformatConfig::default(),
             input,
         })
     }
 
     fn node() -> (Node, crate::session::SessionConfig) {
+        node_with_policy(StreamPolicy::permissive())
+    }
+
+    fn node_with_policy(policy: StreamPolicy) -> (Node, crate::session::SessionConfig) {
         let mut config = NodeConfig::default();
         // Eight AAC units per segment and four per part keep the fixture small
         // while giving pre-roll enough cadence evidence for both boundaries.
@@ -992,7 +1000,7 @@ mod end_to_end {
                 PublishGrant {
                     stream_id: StreamId::new("live/camera"),
                     principal: Principal("fixture".into()),
-                    policy: StreamPolicy::permissive(),
+                    policy,
                 },
             )])),
             Events::default(),
@@ -1097,6 +1105,159 @@ mod end_to_end {
             .expect("HTTP server stopped cleanly");
     }
 
+    #[tokio::test]
+    async fn flv_script_data_captions_become_a_webvtt_rendition() {
+        // Both names FFmpeg extracts through the same path must produce the
+        // same rendition, so the whole publication runs once for each.
+        for name in [b"onTextData".as_slice(), b"onCaption".as_slice()] {
+            let body = published_captions(name).await;
+            let publisher = String::from_utf8_lossy(name);
+            assert!(
+                body.contains("third caption"),
+                "{publisher} cue text survives:\n{body}"
+            );
+            // A cue may repeat across segments — delivery serves overlapping
+            // windows — but two different cues may never be on screen at once,
+            // which is what an unresolved open-ended cue would produce.
+            assert!(
+                !overlapping_cues(&body),
+                "{publisher} produced overlapping cues:\n{body}"
+            );
+        }
+    }
+
+    /// Publishes a captioned FLV and returns its whole WebVTT rendition.
+    async fn published_captions(name: &[u8]) -> String {
+        let mut policy = StreamPolicy::permissive();
+        policy
+            .accepted_subtitle_codecs
+            .push(crate::domain::Codec::Text);
+        let (node, session) = node_with_policy(policy);
+        let cues: [(u32, &[u8]); 3] = [
+            (40, b"first caption"),
+            (120, b"second caption"),
+            (200, b"third caption"),
+        ];
+        let outcome = run_session(
+            publish_bytes(session.input, captioned_aac_flv(20, name, &cues)),
+            node.services(),
+            &session,
+            PendingPermit::unlimited(),
+        )
+        .await;
+        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral HTTP listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve(
+            listener,
+            node.application(),
+            HttpConfig::default(),
+            None,
+            Readiness::ready(),
+            async {
+                let _ = stopped.await;
+            },
+        ));
+
+        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
+        assert_eq!(multivariant.status, 200);
+        let multivariant =
+            String::from_utf8(multivariant.body).expect("the multivariant playlist is text");
+        let subtitles = multivariant
+            .lines()
+            .filter(|line| line.contains("TYPE=SUBTITLES"))
+            .find_map(|line| {
+                line.split_once("URI=\"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .map(|(uri, _)| uri.to_owned())
+            })
+            .expect("captions are declared as a subtitle rendition");
+
+        let media = request(address, "GET", &format!("/live/camera/{subtitles}"), &[]).await;
+        assert_eq!(media.status, 200);
+        let media = String::from_utf8(media.body).expect("media playlist is text");
+
+        // The WEBVTT header is delivered once through EXT-X-MAP, so segment
+        // bodies carry cues alone.
+        let initialization = media
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("#EXT-X-MAP:URI=\"")
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+            .expect("the subtitle playlist names its initialization");
+        let header = fetch(address, &relative_to(&subtitles, initialization)).await;
+        assert!(header.starts_with("WEBVTT"), "initialization:\n{header}");
+
+        // Concatenated across the rendition: this cadence is far shorter than
+        // a cue, so no single segment holds the whole caption sequence.
+        let mut body = String::new();
+        for segment in media
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        {
+            body.push_str(&fetch(address, &relative_to(&subtitles, segment)).await);
+        }
+
+        let _ = shutdown.send(());
+        server
+            .await
+            .expect("HTTP task did not panic")
+            .expect("HTTP server stopped cleanly");
+        body
+    }
+
+    /// Fetches one rendition-relative path, requiring a 200.
+    async fn fetch(address: std::net::SocketAddr, path: &str) -> String {
+        let response = request(address, "GET", &format!("/live/camera/{path}"), &[]).await;
+        assert_eq!(response.status, 200, "GET {path}");
+        String::from_utf8(response.body).expect("WebVTT resources are text")
+    }
+
+    /// Resolves a URI named relative to its media playlist.
+    fn relative_to(playlist: &str, uri: &str) -> String {
+        match playlist.rsplit_once('/') {
+            Some((directory, _)) => format!("{directory}/{uri}"),
+            None => uri.to_owned(),
+        }
+    }
+
+    /// Whether two distinct cues are ever on screen at the same time.
+    ///
+    /// A cue repeated verbatim across segments is ordinary — delivery serves
+    /// overlapping windows — so identical spans are not an overlap. Two cues
+    /// with *different* spans that intersect are, because a player would show
+    /// both at once.
+    fn overlapping_cues(body: &str) -> bool {
+        let mut spans: Vec<(u64, u64)> = body
+            .lines()
+            .filter_map(|line| line.split_once(" --> "))
+            .filter_map(|(start, end)| Some((timestamp_ms(start)?, timestamp_ms(end.trim())?)))
+            .collect();
+        spans.sort_unstable();
+        spans.dedup();
+        spans
+            .windows(2)
+            .any(|pair| pair[1].0 < pair[0].1 || pair[0].1 <= pair[0].0)
+    }
+
+    /// `HH:MM:SS.mmm` as milliseconds.
+    fn timestamp_ms(value: &str) -> Option<u64> {
+        let (hours, rest) = value.trim().split_once(':')?;
+        let (minutes, rest) = rest.split_once(':')?;
+        let (seconds, milliseconds) = rest.split_once('.')?;
+        Some(
+            hours.parse::<u64>().ok()? * 3_600_000
+                + minutes.parse::<u64>().ok()? * 60_000
+                + seconds.parse::<u64>().ok()? * 1_000
+                + milliseconds.parse::<u64>().ok()?,
+        )
+    }
+
     fn repeated_aac_flv(frames: usize) -> Vec<u8> {
         use crate::mux::fixtures::{AAC_EXTRADATA, AAC_FRAME, AAC_FRAME_SAMPLES};
 
@@ -1125,6 +1286,59 @@ mod end_to_end {
         output.extend_from_slice(&[0, 0, 0]);
         output.extend_from_slice(payload);
         output.extend_from_slice(&(11 + length).to_be_bytes());
+    }
+
+    /// AAC audio interleaved with FLV script-data captions under `name`.
+    ///
+    /// `onTextData` and `onCaption` are the two names FFmpeg's FLV demuxer
+    /// extracts through the same path, so a fixture parameterized on the name
+    /// is what shows they produce the same rendition rather than asserting it.
+    fn captioned_aac_flv(frames: usize, name: &[u8], cues: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut flv = repeated_aac_flv(frames);
+        let mut tagged = flv.split_off(13);
+        let mut out = flv;
+
+        // Script tags are interleaved by timestamp, as a publisher sends them.
+        let mut emitted = 0;
+        let mut cursor = 0;
+        while cursor + 11 <= tagged.len() {
+            let size = usize::from(tagged[cursor + 1]) << 16
+                | usize::from(tagged[cursor + 2]) << 8
+                | usize::from(tagged[cursor + 3]);
+            let timestamp = u32::from(tagged[cursor + 4]) << 16
+                | u32::from(tagged[cursor + 5]) << 8
+                | u32::from(tagged[cursor + 6]);
+            while emitted < cues.len() && cues[emitted].0 <= timestamp {
+                push_flv_tag(&mut out, 18, cues[emitted].0, &script_data(name, cues[emitted].1));
+                emitted += 1;
+            }
+            let end = cursor + 11 + size + 4;
+            out.extend_from_slice(&tagged[cursor..end]);
+            cursor = end;
+        }
+        while emitted < cues.len() {
+            push_flv_tag(&mut out, 18, cues[emitted].0, &script_data(name, cues[emitted].1));
+            emitted += 1;
+        }
+        tagged.clear();
+        out
+    }
+
+    /// One AMF0 script-data body: the message name, then `{text: ...}`.
+    fn script_data(name: &[u8], text: &[u8]) -> Vec<u8> {
+        let mut payload = vec![0x02];
+        payload.extend_from_slice(&u16::try_from(name.len()).expect("name fits").to_be_bytes());
+        payload.extend_from_slice(name);
+        // ECMA array with one property, which is what encoders emit.
+        payload.push(0x08);
+        payload.extend_from_slice(&1_u32.to_be_bytes());
+        payload.extend_from_slice(&4_u16.to_be_bytes());
+        payload.extend_from_slice(b"text");
+        payload.push(0x02);
+        payload.extend_from_slice(&u16::try_from(text.len()).expect("text fits").to_be_bytes());
+        payload.extend_from_slice(text);
+        payload.extend_from_slice(&[0x00, 0x00, 0x09]);
+        payload
     }
 
     fn u24_be(value: u32) -> [u8; 3] {

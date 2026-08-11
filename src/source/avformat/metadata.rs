@@ -68,6 +68,38 @@ impl StreamCatalog {
         &self.report
     }
 
+    /// Whether the stream table grew only by subtitle streams.
+    ///
+    /// The streams discovery saw keep their indices — FFmpeg appends — so the
+    /// prefix must still be the same table, and every stream past it must be a
+    /// subtitle. Anything else means the presentation changed shape.
+    ///
+    /// # Safety
+    ///
+    /// `format` must be the open context used for discovery.
+    unsafe fn only_added_subtitles(
+        &self,
+        format: &ffmpeg::AVFormatContext,
+        streams: Option<usize>,
+    ) -> bool {
+        let Some(streams) = streams.filter(|streams| *streams > self.stream_count) else {
+            // Fewer streams than discovered, or a count that does not fit:
+            // neither is an addition.
+            return false;
+        };
+        if format.streams.is_null() {
+            return false;
+        }
+        (self.stream_count..streams).all(|index| {
+            // SAFETY: `streams` entries are valid for the live context.
+            let stream = unsafe { *format.streams.add(index) };
+            !stream.is_null()
+                // SAFETY: the stream belongs to the live format context.
+                && unsafe { (*(*stream).codecpar).codec_type }
+                    == ffmpeg::AVMediaType::AVMEDIA_TYPE_SUBTITLE
+        })
+    }
+
     /// Rejects a new stream or a changed codec configuration before its packet
     /// enters the Rust pipeline.
     ///
@@ -81,14 +113,33 @@ impl StreamCatalog {
     ) -> Result<Option<TrackId>, SourceError> {
         // SAFETY: guaranteed by the caller.
         let format = unsafe { &*context };
-        if usize::try_from(format.nb_streams).ok() != Some(self.stream_count) {
-            return Err(SourceError::TrackSetChanged);
+        let streams = usize::try_from(format.nb_streams).ok();
+        if streams != Some(self.stream_count) {
+            // A subtitle stream can appear after discovery through no fault of
+            // the publisher: FLV script-data captions only materialize a stream
+            // once the first cue arrives, which for a late captioner is after
+            // the probe window closed. Ending an otherwise healthy session over
+            // it would be worse than publishing without those captions, so the
+            // added stream is tolerated. Anything else appearing mid-stream
+            // stays fatal: a new audio or video track changes what the
+            // presentation *is*.
+            if !unsafe { self.only_added_subtitles(format, streams) } {
+                return Err(SourceError::TrackSetChanged);
+            }
         }
 
         // SAFETY: guaranteed by the caller.
         let packet = unsafe { &*packet };
         let index = usize::try_from(packet.stream_index)
             .map_err(|_| SourceError::Input("packet has a negative stream index".into()))?;
+        // Only the added stream's own packets are skipped. Dropping every
+        // packet that merely *follows* the addition would silence the tracks
+        // that were discovered, turning a tolerated caption track into a source
+        // that appears to have stopped — the very failure this branch exists to
+        // prevent, arriving through a different door.
+        if index >= self.stream_count {
+            return Ok(None);
+        }
         let snapshot = self
             .tracks
             .get(index)
@@ -322,6 +373,10 @@ fn codec(codec: ffmpeg::AVCodecID) -> Codec {
         ffmpeg::AVCodecID::AV_CODEC_ID_WEBVTT => Codec::WebVtt,
         ffmpeg::AVCodecID::AV_CODEC_ID_MOV_TEXT => Codec::MovText,
         ffmpeg::AVCodecID::AV_CODEC_ID_SUBRIP | ffmpeg::AVCodecID::AV_CODEC_ID_SRT => Codec::SubRip,
+        // What FLV script-data captions demux to. Both `onTextData` and
+        // `onCaption` reach this same stream: flvdec extracts the text
+        // property from either and reports it as raw UTF-8.
+        ffmpeg::AVCodecID::AV_CODEC_ID_TEXT => Codec::Text,
         other => Codec::Unknown(other as u32),
     }
 }

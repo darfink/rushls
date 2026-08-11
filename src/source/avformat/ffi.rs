@@ -27,6 +27,91 @@ struct ReadOpaque {
     control: Arc<Control>,
 }
 
+/// Silences one benign FFmpeg message without hiding anything else.
+///
+/// FLV script-data captions log "OnTextData packet is not implemented" once per
+/// cue even though flvdec extracts the cue text successfully, so a captioned
+/// stream would emit a line per cue for the life of the session. FFmpeg offers
+/// no per-context threshold for a demuxer — `log_level_offset` exists on
+/// `AVCodecContext`, not `AVFormatContext` — so the message is matched on its
+/// format string and dropped, and everything else reaches the default handler
+/// unchanged.
+///
+/// Installed once per process, on the first demuxer opened.
+fn install_log_filter() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        // SAFETY: FFmpeg stores the pointer and calls it for later logging;
+        // the callback below is a plain `extern "C"` function with no state.
+        unsafe { ffmpeg::av_log_set_callback(Some(filter_log)) };
+    });
+}
+
+/// The subject `avpriv_request_sample` is called with for a caption cue.
+const ONTEXTDATA_SUBJECT: &str = "OnTextData packet";
+
+/// The two sentences FFmpeg appends to every `avpriv_request_sample` notice.
+///
+/// Emitted as separate `av_log` calls that name no subject of their own, so
+/// they can only be attributed to whichever notice preceded them.
+const REQUEST_SAMPLE_TAIL: [&str; 2] = [
+    " is not implemented. Update your FFmpeg ",
+    "If you want to help, upload a sample ",
+];
+
+thread_local! {
+    /// Whether the notice currently being emitted is the one being dropped.
+    ///
+    /// `avpriv_request_sample` logs its subject and then its two fixed
+    /// sentences in immediate succession on the calling thread, so tracking
+    /// the subject is what lets the tail be dropped for *our* notice only. A
+    /// different unimplemented feature keeps its whole message, rather than
+    /// printing a subject whose explanation was swallowed.
+    static DROPPING_NOTICE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+unsafe extern "C" fn filter_log(
+    class: *mut c_void,
+    level: libc::c_int,
+    format: *const libc::c_char,
+    arguments: ffmpeg::va_list,
+) {
+    if !format.is_null() {
+        // `avpriv_request_sample` passes its subject through the format string,
+        // so matching here needs no argument formatting and cannot be confused
+        // by a publisher's own text.
+        // SAFETY: FFmpeg format strings are NUL-terminated literals.
+        let text = unsafe { std::ffi::CStr::from_ptr(format) }.to_bytes();
+        if starts_with(text, ONTEXTDATA_SUBJECT.as_bytes()) {
+            DROPPING_NOTICE.with(|dropping| dropping.set(true));
+            return;
+        }
+        let tail = REQUEST_SAMPLE_TAIL
+            .iter()
+            .position(|sentence| starts_with(text, sentence.as_bytes()));
+        let dropping = DROPPING_NOTICE.with(std::cell::Cell::get);
+        match tail {
+            Some(index) if dropping => {
+                // The invitation is the last line of the notice.
+                if index + 1 == REQUEST_SAMPLE_TAIL.len() {
+                    DROPPING_NOTICE.with(|dropping| dropping.set(false));
+                }
+                return;
+            }
+            // Any other message ends the notice being tracked, so a later
+            // unrelated tail cannot be attributed to it.
+            None => DROPPING_NOTICE.with(|dropping| dropping.set(false)),
+            Some(_) => {}
+        }
+    }
+    // SAFETY: the arguments are exactly those FFmpeg passed in.
+    unsafe { ffmpeg::av_log_default_callback(class, level, format, arguments) };
+}
+
+fn starts_with(text: &[u8], prefix: &[u8]) -> bool {
+    text.len() >= prefix.len() && &text[..prefix.len()] == prefix
+}
+
 struct Avio {
     context: NonNull<ffmpeg::AVIOContext>,
     _opaque: Box<ReadOpaque>,
@@ -165,6 +250,7 @@ impl FormatInput {
             }
             .into());
         }
+        install_log_filter();
         control.set_deadline(Some(Instant::now() + limits.maximum_wall_time));
         control.begin_probe(limits.maximum_probe_bytes);
         let io = Avio::new(input, Arc::clone(&control), io_buffer_size)?;

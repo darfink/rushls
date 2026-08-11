@@ -13,7 +13,7 @@ use crate::{
         PublishRequest, PublishResource, StreamPolicy, TakeoverPolicy,
     },
     delivery::store::{DurationRule, TargetDurationMultiple},
-    domain::StreamId,
+    domain::{Codec, StreamId},
     observe::lifecycle::Kind,
     server::{AllowedOrigins, NodeConfig, ResolvedAppConfig},
 };
@@ -1040,5 +1040,44 @@ maximum_lead = "200ms"
 "#,
     )??;
     assert!(strict.warnings.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_band_text_captions_are_enabled_per_policy() -> Result<(), Box<dyn Error>> {
+    let config = resolve_toml(
+        r#"
+[auth]
+provider = "static"
+
+[auth.policies.captioned]
+subtitle_codecs = ["text", "webvtt"]
+
+[auth.static.publishers.camera]
+stream = "live/camera"
+key = "camera-key"
+policy = "captioned"
+"#,
+    )??;
+
+    let grant = config
+        .authenticator
+        .authenticate(&request("camera-key"))
+        .await?;
+    assert_eq!(
+        grant.policy.accepted_subtitle_codecs,
+        vec![Codec::Text, Codec::WebVtt]
+    );
+
+    // A codec name is valid for one media kind only: in-band text is not
+    // something a video ladder can carry, and accepting it there would let a
+    // misplaced entry silently widen what a publisher may send.
+    let wrong_kind = resolve_toml(
+        r#"
+[auth.policies.default]
+video_codecs = ["text"]
+"#,
+    )?;
+    assert!(matches!(wrong_kind, Err(ConfigError::Invalid(_))));
     Ok(())
 }

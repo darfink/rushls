@@ -30,6 +30,20 @@ fn start(
     tracks: Vec<DiscoveredTrack>,
 ) -> (StartedNormalizer, PresentationPlan, TimelineCalibration) {
     let input = presentation(tracks);
+    started_from(input)
+}
+
+/// As [`start`], for a track set containing an opt-in subtitle codec.
+fn start_with_text(
+    tracks: Vec<DiscoveredTrack>,
+) -> (StartedNormalizer, PresentationPlan, TimelineCalibration) {
+    let input = crate::media::fixtures::presentation_with_text_subtitles(tracks);
+    started_from(input)
+}
+
+fn started_from(
+    input: PresentationPlan,
+) -> (StartedNormalizer, PresentationPlan, TimelineCalibration) {
     let timeline = calibrate(&input).expect("input timeline calibrates");
     let started = PassThroughNormalizerFactory
         .start(&input, &timeline)
@@ -570,6 +584,56 @@ fn subtitle_normalization_preserves_codec_specific_metadata() {
             payload: Payload::from(b"subtitle".as_slice().to_vec()),
         })]
     );
+}
+
+#[test]
+fn an_open_ended_cue_may_arrive_without_a_duration() {
+    // FLV script-data captions carry only the instant a cue becomes visible.
+    // Zero travels on to the muxer, which resolves the end from the successor.
+    let subtitle = TrackBuilder::new(0, MediaKind::Subtitle)
+        .codec(Codec::Text)
+        .timebase(Timebase::new(nz::u32!(1), nz::u32!(1_000)))
+        .build();
+    let video = TrackBuilder::new(1, MediaKind::Video).build();
+    let (mut started, _, _) = start_with_text(vec![subtitle, video]);
+    let mut output = Vec::new();
+
+    for duration in [None, Some(0)] {
+        output.clear();
+        started
+            .normalizer
+            .push(packet(0, Some(1_000), None, duration), &mut output)
+            .expect("an open-ended cue normalizes without a duration");
+
+        let [NormalizedSample::Subtitle(cue)] = output.as_slice() else {
+            panic!("expected one subtitle cue, got {output:?}");
+        };
+        assert_eq!(cue.pts, 90_000);
+        assert_eq!(cue.duration, 0);
+        assert_eq!(cue.codec, Codec::Text);
+    }
+}
+
+#[test]
+fn a_closed_subtitle_codec_still_requires_a_positive_duration() {
+    // Only the open-ended codecs may omit it: for these, a missing duration is
+    // a demuxer or publisher fault rather than the shape of the format.
+    for codec in [Codec::WebVtt, Codec::SubRip] {
+        let subtitle = TrackBuilder::new(0, MediaKind::Subtitle)
+            .codec(codec)
+            .timebase(Timebase::new(nz::u32!(1), nz::u32!(1_000)))
+            .build();
+        let video = TrackBuilder::new(1, MediaKind::Video).build();
+        let (mut started, _, _) = start(vec![subtitle, video]);
+        let mut output = Vec::new();
+
+        assert!(
+            started
+                .normalizer
+                .push(packet(0, Some(1_000), None, Some(0)), &mut output)
+                .is_err()
+        );
+    }
 }
 
 #[test]

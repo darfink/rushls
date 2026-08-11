@@ -297,6 +297,30 @@ mod tests {
     }
 
     #[test]
+    fn in_band_text_is_admitted_only_where_a_policy_asks_for_it() {
+        let tracks = catalog(vec![
+            track(0, MediaKind::Video, Codec::H264),
+            track(1, MediaKind::Subtitle, Codec::Text),
+        ]);
+
+        // Off by default: FLV script data carries whatever a publisher chose to
+        // put there, so surfacing it as a subtitle rendition is a decision an
+        // operator makes rather than something every stream gets.
+        assert_eq!(
+            validate(&tracks, &policy()),
+            Err(ValidationError::UnsupportedCodec {
+                track_id: TrackId(1),
+                codec: Codec::Text,
+            })
+        );
+
+        let mut enabled = policy();
+        enabled.accepted_subtitle_codecs.push(Codec::Text);
+        let plan = validate(&tracks, &enabled).expect("text subtitles are accepted when enabled");
+        assert_eq!(plan.counts().subtitle, 1);
+    }
+
+    #[test]
     fn mov_text_waits_for_its_dedicated_converter() {
         let tracks = catalog(vec![
             track(0, MediaKind::Video, Codec::H264),

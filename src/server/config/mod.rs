@@ -842,7 +842,7 @@ impl PolicyAppConfig {
                 name,
                 "subtitle codecs",
                 codecs,
-                &[Codec::WebVtt, Codec::SubRip],
+                &[Codec::WebVtt, Codec::SubRip, Codec::Text],
             )?;
         }
         if let Some(maximum) = self.maximum_video_tracks {
@@ -1451,17 +1451,19 @@ enum CodecValue {
     Hevc,
     Opus,
     SubRip,
+    Text,
     WebVtt,
 }
 
 impl CodecValue {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Aac,
         Self::Av1,
         Self::H264,
         Self::Hevc,
         Self::Opus,
         Self::SubRip,
+        Self::Text,
         Self::WebVtt,
     ];
 
@@ -1509,6 +1511,7 @@ impl From<CodecValue> for Codec {
             CodecValue::Hevc => Self::Hevc,
             CodecValue::Opus => Self::Opus,
             CodecValue::SubRip => Self::SubRip,
+            CodecValue::Text => Self::Text,
             CodecValue::WebVtt => Self::WebVtt,
         }
     }

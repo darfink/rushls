@@ -87,8 +87,26 @@ pub enum Codec {
     MovText,
     Opus,
     SubRip,
+    /// Bare UTF-8 cue text with no markup, as FLV script-data captions arrive.
+    ///
+    /// Carries no end time of its own: the transports that produce it stamp a
+    /// cue with the instant it becomes visible and say nothing about when it
+    /// stops, so a reader has to decide that. See [`Codec::is_open_ended`].
+    Text,
     WebVtt,
     Unknown(u32),
+}
+
+impl Codec {
+    /// Whether a cue of this codec arrives without a duration.
+    ///
+    /// FLV `onTextData`/`onCaption` messages are a point on the timeline: the
+    /// cue shows until something replaces it. Every other subtitle codec this
+    /// node accepts carries an explicit duration, so this is what tells the
+    /// normalizer that a zero duration is the format rather than a fault.
+    pub fn is_open_ended(self) -> bool {
+        matches!(self, Self::Text)
+    }
 }
 
 /// Exact declared video cadence in frames per second.
@@ -286,6 +304,17 @@ mod tests {
             TrackCatalog::new(vec![track(0, MediaKind::Video), track(0, MediaKind::Audio)]),
             Err(TrackCatalogError::DuplicateId(TrackId(0)))
         );
+    }
+
+    #[test]
+    fn only_in_band_text_cues_arrive_without_an_end_of_their_own() {
+        // The single answer to "may this cue omit its duration": the
+        // normalizer and the WebVTT segmenter both read it from here, so
+        // neither can develop its own idea of which codecs are open-ended.
+        assert!(Codec::Text.is_open_ended());
+        for codec in [Codec::WebVtt, Codec::SubRip, Codec::MovText, Codec::H264] {
+            assert!(!codec.is_open_ended(), "{codec:?} carries its own end");
+        }
     }
 
     #[test]

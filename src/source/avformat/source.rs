@@ -538,6 +538,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_caption_track_appearing_after_discovery_is_ignored_rather_than_fatal() {
+        use crate::mux::fixtures::{AAC_EXTRADATA, AAC_FRAME, AAC_FRAME_SAMPLES};
+
+        const FRAMES: u64 = 400;
+        const CAPTION_AFTER: u64 = 360;
+
+        /// Appends one FLV tag, with its trailing previous-tag-size field.
+        fn tag(output: &mut Vec<u8>, kind: u8, timestamp: u32, payload: &[u8]) {
+            let length = u32::try_from(payload.len()).expect("fixture payload fits");
+            output.push(kind);
+            output.extend_from_slice(&length.to_be_bytes()[1..]);
+            output.extend_from_slice(&timestamp.to_be_bytes()[1..]);
+            output.push(u8::try_from(timestamp >> 24).unwrap_or(0));
+            output.extend_from_slice(&[0, 0, 0]);
+            output.extend_from_slice(payload);
+            output.extend_from_slice(&(11 + length).to_be_bytes());
+        }
+
+        let mut flv = b"FLV\x01\x04\x00\x00\x00\x09\x00\x00\x00\x00".to_vec();
+        let mut sequence = vec![0xaf, 0];
+        sequence.extend_from_slice(AAC_EXTRADATA);
+        tag(&mut flv, 8, 0, &sequence);
+        // The caption lands well after the probe window closed, and audio keeps
+        // flowing behind it. The tail is what matters: a publication that goes
+        // silent the moment captions start is exactly the outcome this path
+        // exists to avoid, and it would look like a stalled source rather than
+        // a rejected track set.
+        let mut caption_written = false;
+        for frame in 0..FRAMES {
+            let timestamp = u32::try_from(frame * AAC_FRAME_SAMPLES * 1_000 / 48_000)
+                .expect("fixture timestamp fits");
+            if frame == CAPTION_AFTER {
+                let mut script = vec![0x02, 0x00, 0x0a];
+                script.extend_from_slice(b"onTextData");
+                script.extend_from_slice(&[0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x04]);
+                script.extend_from_slice(b"text");
+                script.extend_from_slice(&[0x02, 0x00, 0x04]);
+                script.extend_from_slice(b"late");
+                script.extend_from_slice(&[0x00, 0x00, 0x09]);
+                tag(&mut flv, 18, timestamp, &script);
+                caption_written = true;
+            }
+            let mut payload = vec![0xaf, 1];
+            payload.extend_from_slice(AAC_FRAME);
+            tag(&mut flv, 8, timestamp, &payload);
+        }
+        assert!(caption_written, "the fixture injects a caption tag");
+
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let mut source = AvformatPacketSource::new(
+            Box::new(ReadInput::closed(Cursor::new(flv))),
+            AvformatConfig::default(),
+            InputLimits::permissive(),
+            meters.source_view(),
+        )
+        .expect("fixture source opens");
+
+        let discovery = source
+            // A larger probe budget than the shared fixture: the point of this
+            // test is a cue arriving after FFmpeg stopped analyzing, which
+            // needs enough audio in front of it to get there.
+            .discover(DiscoveryLimits {
+                maximum_probe_bytes: 512 * 1024,
+                ..discovery_limits()
+            })
+            .await
+            .expect("the audio track is discovered");
+        assert_eq!(discovery.tracks.tracks().len(), 1);
+
+        let (packets, state) = drain(&mut source).await;
+        assert_eq!(state, InputState::Closed);
+        // Every packet belongs to the discovered audio track: the late caption
+        // stream is skipped rather than routed to a track nothing knows about.
+        assert!(
+            packets
+                .iter()
+                .all(|packet| packet.track_id == discovery.tracks.tracks()[0].id)
+        );
+        // And the audio behind the caption still arrives. Skipping the added
+        // stream must skip *its* packets, not every packet that follows it.
+        assert_eq!(
+            u64::try_from(packets.len()).expect("fixture packet count fits"),
+            FRAMES,
+            "audio after the first caption is still delivered"
+        );
+    }
+
+    #[tokio::test]
     async fn discovers_subrip_text_and_its_optional_position_side_data() {
         let meters = SessionMeters::new(ProcessMeters::default());
         let mut source = AvformatPacketSource::new(

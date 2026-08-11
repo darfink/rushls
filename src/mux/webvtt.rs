@@ -40,6 +40,18 @@ const MAX_HEARTBEAT_SEGMENTS_PER_TICK: u64 = 4_096;
 // planning error rather than something to discover mid-publication.
 const MAX_PARTS_PER_SEGMENT: u64 = 4_096;
 
+/// How long an open-ended cue may stay on screen without a successor.
+///
+/// Cues from FLV script data carry no end: they show until replaced. A cap is
+/// what stops the last cue of a stream, or one before a long silence, from
+/// being displayed forever. Wowza's equivalent default is ten seconds; three
+/// is used here because the seal-driven flush usually resolves a cue first,
+/// and a shorter cap bounds how long a stale cue can linger.
+///
+/// Expressed in the 90 kHz presentation clock every subtitle plan is
+/// normalized to, which [`build_track`] already enforces.
+const MAX_TEXT_CUE_DISPLAY: TickDuration = 3 * 90_000;
+
 const INITIALIZATION: &[u8] = b"WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n";
 
 #[derive(Clone, Debug)]
@@ -161,6 +173,12 @@ struct WebVttTrack {
     next_window_id: u64,
     last_cue_start: Option<TickTimestamp>,
     maximum_cue_end: Option<TickTimestamp>,
+    /// An open-ended cue waiting for something to decide its end.
+    ///
+    /// At most one: a cue is resolved the moment its successor arrives, so a
+    /// second can never be waiting behind it. Only ever occupied for a dialect
+    /// whose codec is open-ended.
+    pending: Option<SubtitleSample>,
     /// How far the presentation has advanced, as reported by sibling tracks.
     ///
     /// Only ever moves forward: siblings interleave, so a later sample can
@@ -224,6 +242,7 @@ impl WebVttTrack {
             next_window_id: 1,
             last_cue_start: None,
             maximum_cue_end: None,
+            pending: None,
             clock: None,
             initialized: false,
             finished: false,
@@ -658,36 +677,18 @@ impl WebVttTrack {
         }));
         self.initialized = true;
     }
-}
 
-struct PreparedCue {
-    start: TickTimestamp,
-    end: TickTimestamp,
-    first_index: u64,
-    last_index: u64,
-    cue: Arc<Cue>,
-}
-
-impl TrackPackager for WebVttTrack {
-    fn track_id(&self) -> TrackId {
-        self.track_id
-    }
-
-    fn push(
+    /// Places one cue whose span is known into every window that carries it.
+    ///
+    /// Separate from [`TrackPackager::push`] because an open-ended cue is
+    /// placed whenever its end becomes known, which is rarely the moment it
+    /// arrived.
+    fn place_cue(
         &mut self,
-        sample: NormalizedSample,
+        sample: &SubtitleSample,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
-        if self.finished {
-            return Err(mux_error("cannot push WebVTT media after finish"));
-        }
-        let NormalizedSample::Subtitle(sample) = sample else {
-            return Err(mux_error(format!(
-                "{} received a non-subtitle sample",
-                self.track_id
-            )));
-        };
-        let prepared = self.prepare_cue(&sample)?;
+        let prepared = self.prepare_cue(sample)?;
 
         self.initialize(out);
         self.ensure_through(prepared.last_index)?;
@@ -729,6 +730,138 @@ impl TrackPackager for WebVttTrack {
         Ok(())
     }
 
+    /// Ends the held cue and places it, if one is waiting.
+    ///
+    /// `successor` is the start of the cue replacing it, which is what an
+    /// open-ended cue means by its end. Absent at finish, where nothing
+    /// replaces it and the cap is all that remains. Either way the span is
+    /// bounded by [`MAX_TEXT_CUE_DISPLAY`], so a publisher that goes quiet
+    /// cannot leave a cue on screen indefinitely.
+    fn resolve_pending(
+        &mut self,
+        successor: Option<TickTimestamp>,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
+        let Some(mut cue) = self.pending.take() else {
+            return Ok(());
+        };
+        let capped = cue.pts.saturating_add_unsigned(MAX_TEXT_CUE_DISPLAY);
+        let end = successor.map_or(capped, |next| next.min(capped));
+        // A successor sharing its predecessor's timestamp would otherwise
+        // produce an empty span, which WebVTT cannot express as a visible cue.
+        // Dropping the predecessor is what "replaced immediately" means.
+        let Some(duration) = end.checked_sub(cue.pts).and_then(|span| {
+            TickDuration::try_from(span).ok().filter(|span| *span > 0)
+        }) else {
+            return Ok(());
+        };
+        cue.duration = duration;
+        self.place_cue(&cue, out)
+    }
+
+    /// Resolves a held cue that the clock is about to seal past.
+    ///
+    /// Once the windows carrying a cue are published it can only be dropped, so
+    /// a cue is committed at its cap as soon as the presentation clock reaches
+    /// the end of that span. Cues still inside their display window are left
+    /// held, so an ordinary successor can still shorten them.
+    fn flush_pending_before(
+        &mut self,
+        now: MediaInstant,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
+        let Some(cue) = self.pending.as_ref() else {
+            return Ok(());
+        };
+        let deadline = self.instant(cue.pts.saturating_add_unsigned(MAX_TEXT_CUE_DISPLAY));
+        if now
+            .compare(deadline)
+            .is_some_and(|ordering| ordering == Ordering::Less)
+        {
+            return Ok(());
+        }
+        self.resolve_pending(None, out)
+    }
+}
+
+struct PreparedCue {
+    start: TickTimestamp,
+    end: TickTimestamp,
+    first_index: u64,
+    last_index: u64,
+    cue: Arc<Cue>,
+}
+
+impl TrackPackager for WebVttTrack {
+    fn track_id(&self) -> TrackId {
+        self.track_id
+    }
+
+
+    fn push(
+        &mut self,
+        sample: NormalizedSample,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
+        if self.finished {
+            return Err(mux_error("cannot push WebVTT media after finish"));
+        }
+        let NormalizedSample::Subtitle(sample) = sample else {
+            return Err(mux_error(format!(
+                "{} received a non-subtitle sample",
+                self.track_id
+            )));
+        };
+        // Held only when the cue actually lacks an end. A codec that may omit
+        // one can still supply it, and a supplied span is the publisher's
+        // statement about its own cue: overriding it with a successor's start
+        // would discard information this node does not have a better source
+        // for. Keyed on the sample rather than the dialect so the muxer and the
+        // normalizer cannot disagree about which cues are open-ended.
+        if sample.codec.is_open_ended() && sample.duration == 0 {
+            // Checked before anything is resolved. A held cue is the immediate
+            // predecessor and has not reached `last_cue_start` yet, so leaving
+            // it out would let a rewound cue end its predecessor in the past —
+            // which resolves to an empty span and silently drops it instead of
+            // failing the publisher that rewound.
+            let previous = self
+                .pending
+                .as_ref()
+                .map(|held| held.pts)
+                .or(self.last_cue_start);
+            if previous.is_some_and(|previous| sample.pts < previous) {
+                return Err(mux_error(format!(
+                    "{} supplied decreasing subtitle PTS",
+                    self.track_id
+                )));
+            }
+            // Validated before it is held, so a malformed cue fails on the push
+            // that delivered it rather than at whatever unrelated moment later
+            // resolves it.
+            self.dialect.read(&sample)?;
+            // Timing is checked here for the same reason. `prepare_cue` runs
+            // only when the cue is placed, so without this a cue starting
+            // before the locked origin would fail on an unrelated later push —
+            // or, at finish, with nothing left to attribute it to.
+            if sample
+                .pts
+                .checked_sub(self.plan.presentation_origin_pts)
+                .is_none_or(|start| start < self.origin)
+            {
+                return Err(mux_error(format!(
+                    "{} cue starts before its locked segmentation origin",
+                    self.track_id
+                )));
+            }
+            // The arriving cue is what ends its predecessor: an open-ended cue
+            // shows until something replaces it.
+            self.resolve_pending(Some(sample.pts), out)?;
+            self.pending = Some(sample);
+            return Ok(());
+        }
+        self.place_cue(&sample, out)
+    }
+
     fn tick(
         &mut self,
         now: MediaInstant,
@@ -750,6 +883,11 @@ impl TrackPackager for WebVttTrack {
         // segment. This is also what makes the rendition servable from the
         // start of the presentation rather than from its first cue.
         self.initialize(out);
+        // A held cue whose window is about to seal has to be placed now: once
+        // the segments carrying it are out, it can only be dropped. Resolved
+        // before sealing rather than after, so it lands in the window it
+        // belongs to instead of arriving one step too late.
+        self.flush_pending_before(now, out)?;
         self.seal_before(now, out);
         Ok(())
     }
@@ -762,6 +900,13 @@ impl TrackPackager for WebVttTrack {
         if self.finished {
             return Ok(());
         }
+        // The last cue of a stream has no successor to end it, so the cap is
+        // what it gets. Before `finished` is set, since placing a cue is a
+        // normal push and refuses to run after finish.
+        if reason != FinishReason::Superseded {
+            self.resolve_pending(None, out)?;
+        }
+        self.pending = None;
         self.finished = true;
         if reason == FinishReason::Superseded {
             self.windows.clear();
@@ -1578,5 +1723,178 @@ mod tests {
             packet.payload.as_bytes(),
             b"<b>Hello &amp; <i>world</i></b>"
         );
+    }
+
+    /// The rendered body of every segment, concatenated.
+    fn rendered(output: &[PackagedMedia]) -> String {
+        segments(output)
+            .iter()
+            .map(|segment| String::from_utf8_lossy(segment.payload.as_bytes()).into_owned())
+            .collect()
+    }
+
+    /// An open-ended cue, as FLV script data delivers one: a start and no end.
+    fn text_cue(start: i64, text: &[u8]) -> NormalizedSample {
+        sample(Codec::Text, start, 0, text)
+    }
+
+    /// One second on the 90 kHz presentation clock, as a cue timestamp.
+    const SECOND_TICKS: i64 = 90_000;
+
+    #[test]
+    fn an_open_ended_cue_is_held_until_its_successor_supplies_an_end()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux(Codec::Text, 10);
+        let mut output = Vec::new();
+
+        // Nothing can be rendered from the first cue alone: its end is not yet
+        // known, and guessing one is what the successor exists to avoid.
+        mux.push(text_cue(0, b"first"), &mut output)?;
+        assert!(rendered(&output).is_empty());
+
+        mux.push(text_cue(SECOND_TICKS, b"second"), &mut output)?;
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        let body = rendered(&output);
+        // The first cue ends exactly where the second begins.
+        assert!(body.contains("00:00:00.000 --> 00:00:01.000\nfirst\n"));
+        // The last cue has no successor, so it gets the cap.
+        assert!(body.contains("00:00:01.000 --> 00:00:04.000\nsecond\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_gap_longer_than_the_cap_does_not_leave_a_cue_on_screen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux(Codec::Text, 30);
+        let mut output = Vec::new();
+
+        // Ten seconds of silence between cues. Ending the first where the
+        // second begins would hold it far past what a viewer would read as one
+        // caption, so the cap wins.
+        mux.push(text_cue(0, b"first"), &mut output)?;
+        mux.push(text_cue(10 * SECOND_TICKS, b"second"), &mut output)?;
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        let body = rendered(&output);
+        assert!(body.contains("00:00:00.000 --> 00:00:03.000\nfirst\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn consecutive_cues_never_overlap() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux(Codec::Text, 30);
+        let mut output = Vec::new();
+
+        // A second apart, well inside the cap. Overlapping spans would stack as
+        // two captions on screen at once, which is what resolving the end from
+        // the successor exists to prevent.
+        for index in 0..4 {
+            mux.push(text_cue(index * SECOND_TICKS, b"line"), &mut output)?;
+        }
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        let body = rendered(&output);
+        for (start, end) in [
+            ("00:00:00.000", "00:00:01.000"),
+            ("00:00:01.000", "00:00:02.000"),
+            ("00:00:02.000", "00:00:03.000"),
+        ] {
+            assert!(body.contains(&format!("{start} --> {end}")), "missing {start}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_cue_is_published_before_its_window_seals() -> Result<(), Box<dyn std::error::Error>> {
+        let (events, recorded) = RecordedEvents::sink();
+        let mut mux = mux_with_events(Codec::Text, 2, events);
+        let mut output = Vec::new();
+
+        // The cue arrives, then the presentation clock runs past its cap while
+        // no successor ever comes. Leaving it held would let the windows that
+        // could carry it seal and publish empty.
+        mux.push(text_cue(0, b"only"), &mut output)?;
+        mux.tick(sibling(6), &mut output)?;
+
+        let body = rendered(&output);
+        assert!(body.contains("00:00:00.000 --> 00:00:03.000\nonly\n"));
+        // Committed on time, so this is not the drop path.
+        assert!(recorded.events().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_cue_replaced_at_the_same_instant_is_dropped_rather_than_rendered_empty()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux(Codec::Text, 10);
+        let mut output = Vec::new();
+
+        // Two cues stamped identically: the first is replaced before it was
+        // ever visible, and a zero-length span is not a cue WebVTT can express.
+        mux.push(text_cue(0, b"replaced"), &mut output)?;
+        mux.push(text_cue(0, b"winner"), &mut output)?;
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        let body = rendered(&output);
+        assert!(!body.contains("replaced"));
+        assert!(body.contains("winner"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_superseded_publication_drops_its_held_cue() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux(Codec::Text, 10);
+        let mut output = Vec::new();
+
+        // A successor's media follows immediately, so inventing a trailing cue
+        // for the publication being replaced would collide with it.
+        mux.push(text_cue(0, b"held"), &mut output)?;
+        mux.finish(FinishReason::Superseded, &mut output)?;
+
+        assert!(rendered(&output).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn decreasing_text_cue_timestamps_are_still_refused() {
+        let mut mux = mux(Codec::Text, 10);
+        let mut output = Vec::new();
+
+        mux.push(text_cue(2 * SECOND_TICKS, b"first"), &mut output)
+            .expect("the first cue is accepted");
+        assert!(
+            mux.push(text_cue(SECOND_TICKS, b"rewound"), &mut output)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_malformed_text_cue_fails_on_arrival_rather_than_when_it_resolves() {
+        let mut mux = mux(Codec::Text, 10);
+        let mut output = Vec::new();
+
+        // Held cues are validated when they arrive, so the error names the
+        // push that caused it rather than an unrelated later one.
+        assert!(mux.push(text_cue(0, b"bad\0cue"), &mut output).is_err());
+    }
+
+    #[test]
+    fn a_text_cue_that_carries_its_own_end_is_placed_immediately()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux(Codec::Text, 10);
+        let mut output = Vec::new();
+
+        // Holding is for cues with no end. One that arrived with a duration has
+        // already said when it stops, and resolving it from a successor would
+        // silently replace the publisher's own span with a guess.
+        mux.push(
+            sample(Codec::Text, 0, u64::try_from(SECOND_TICKS)? / 2, b"timed"),
+            &mut output,
+        )?;
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        assert!(rendered(&output).contains("00:00:00.000 --> 00:00:00.500\ntimed\n"));
+        Ok(())
     }
 }

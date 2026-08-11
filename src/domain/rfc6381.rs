@@ -35,7 +35,9 @@ pub fn rfc6381(codec: Codec, config: Option<&[u8]>) -> Option<Arc<str>> {
         Codec::Opus => Some(Arc::from("opus")),
         Codec::WebVtt => Some(Arc::from("wvtt")),
         Codec::MovText => Some(Arc::from("tx3g")),
-        Codec::SubRip | Codec::Unknown(_) => None,
+        // Both are converted to WebVTT before publication, so the input codec
+        // never describes what a manifest advertises.
+        Codec::SubRip | Codec::Text | Codec::Unknown(_) => None,
     }
 }
 

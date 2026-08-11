@@ -31,6 +31,12 @@ pub(super) enum CueDialect {
     /// SubRip markup is converted cue by cue. FFmpeg has already removed the
     /// index and timing lines, leaving inline markup over packet timing.
     SubRip,
+    /// Bare UTF-8 with no markup, as FLV script-data captions arrive.
+    ///
+    /// Distinct from [`Self::PassThrough`] despite sharing its validation:
+    /// these cues carry no WebVTT metadata, and accepting any would mean a
+    /// converter had invented it.
+    Text,
 }
 
 impl CueDialect {
@@ -39,6 +45,7 @@ impl CueDialect {
         match codec {
             Codec::WebVtt => Some(Self::PassThrough),
             Codec::SubRip => Some(Self::SubRip),
+            Codec::Text => Some(Self::Text),
             _ => None,
         }
     }
@@ -73,6 +80,21 @@ impl CueDialect {
                 Ok(CueContent {
                     metadata: WebVttCueMetadata::default(),
                     text: subrip::convert(payload)?,
+                })
+            }
+            // Already the text a cue body carries, so the WebVTT reader is the
+            // whole conversion: it is the same UTF-8, blank-line and NUL check
+            // every dialect has to pass before it can be rendered.
+            Self::Text => {
+                if sample.webvtt != WebVttCueMetadata::default() {
+                    return Err(mux_error(format!(
+                        "{} text cue carries WebVTT-only metadata",
+                        sample.track_id
+                    )));
+                }
+                Ok(CueContent {
+                    metadata: WebVttCueMetadata::default(),
+                    text: webvtt_text(payload)?,
                 })
             }
         }
@@ -154,7 +176,42 @@ mod tests {
             CueDialect::for_codec(Codec::SubRip),
             Some(CueDialect::SubRip)
         );
+        assert_eq!(CueDialect::for_codec(Codec::Text), Some(CueDialect::Text));
         assert_eq!(CueDialect::for_codec(Codec::MovText), None);
+    }
+
+    #[test]
+    fn text_cues_convert_as_plain_utf8_and_refuse_webvtt_metadata()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // FLV script data carries the cue body and nothing else, so conversion
+        // is the shared WebVTT validation rather than a markup translation.
+        let content = CueDialect::Text.read(&sample(Codec::Text, "hej världen".as_bytes()))?;
+        assert_eq!(content.text.as_ref(), "hej världen");
+        assert_eq!(content.metadata, WebVttCueMetadata::default());
+
+        // A converter that accepted these would be inventing them: nothing in
+        // the wire format can carry a cue identifier or settings.
+        let mut carries_metadata = sample(Codec::Text, b"text");
+        carries_metadata.webvtt = WebVttCueMetadata {
+            identifier: Some(Arc::from("cue-one")),
+            settings: None,
+        };
+        assert!(CueDialect::Text.read(&carries_metadata).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_text_cue_is_held_to_the_same_payload_rules_as_webvtt() {
+        for payload in [
+            b"\xff\xfe invalid utf8".as_slice(),
+            b"has\0nul".as_slice(),
+            b"".as_slice(),
+            // A blank line ends a cue, so a body containing one would silently
+            // become two cues sharing a timing line.
+            b"first\n\nsecond".as_slice(),
+        ] {
+            assert!(CueDialect::Text.read(&sample(Codec::Text, payload)).is_err());
+        }
     }
 
     #[test]
@@ -195,7 +252,7 @@ mod tests {
 
     #[test]
     fn no_dialect_accepts_a_pixel_positioned_cue() {
-        for dialect in [CueDialect::PassThrough, CueDialect::SubRip] {
+        for dialect in [CueDialect::PassThrough, CueDialect::SubRip, CueDialect::Text] {
             let mut positioned = sample(Codec::SubRip, b"placed");
             positioned.position = Some(SubtitlePosition {
                 x1: 1,
