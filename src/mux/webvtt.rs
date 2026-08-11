@@ -8,7 +8,7 @@ use std::{cmp::Ordering, collections::VecDeque, num::NonZero, sync::Arc};
 
 mod cue;
 
-use cue::CueDialect;
+use cue::{CueAction, CueDialect};
 
 use crate::{
     domain::{
@@ -371,7 +371,15 @@ impl WebVttTrack {
     }
 
     fn render_cue(&self, sample: &SubtitleSample, start: TickTimestamp) -> Result<Cue, MuxError> {
-        let content = self.dialect.read(sample)?;
+        let CueAction::Show(content) = self.dialect.read(sample)? else {
+            // A clear never reaches rendering: `push` consumes it to end the
+            // held cue and holds nothing in its place, so there is no cue to
+            // render. Reaching here would mean that ordering was broken.
+            return Err(mux_error(format!(
+                "{} attempted to render a clear as a cue",
+                self.track_id
+            )));
+        };
         let rendered_bytes = content
             .text
             .len()
@@ -838,7 +846,7 @@ impl TrackPackager for WebVttTrack {
             // Validated before it is held, so a malformed cue fails on the push
             // that delivered it rather than at whatever unrelated moment later
             // resolves it.
-            self.dialect.read(&sample)?;
+            let action = self.dialect.read(&sample)?;
             // Timing is checked here for the same reason. `prepare_cue` runs
             // only when the cue is placed, so without this a cue starting
             // before the locked origin would fail on an unrelated later push —
@@ -856,6 +864,18 @@ impl TrackPackager for WebVttTrack {
             // The arriving cue is what ends its predecessor: an open-ended cue
             // shows until something replaces it.
             self.resolve_pending(Some(sample.pts), out)?;
+            if matches!(action, CueAction::Clear) {
+                // The clear has done its whole job by ending the held cue.
+                // Holding nothing in its place is what makes the display go
+                // empty, and it is why a clear publishes no cue of its own.
+                //
+                // `last_cue_start` is advanced so a later cue is still checked
+                // against the clear's position: the clear is a point on this
+                // track's timeline, and a cue arriving before it would be out
+                // of order even though nothing was displayed.
+                self.last_cue_start = Some(sample.pts);
+                return Ok(());
+            }
             self.pending = Some(sample);
             return Ok(());
         }
@@ -1760,6 +1780,97 @@ mod tests {
         assert!(body.contains("00:00:00.000 --> 00:00:01.000\nfirst\n"));
         // The last cue has no successor, so it gets the cap.
         assert!(body.contains("00:00:01.000 --> 00:00:04.000\nsecond\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_text_cue_ends_the_held_cue_and_publishes_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux(Codec::Text, 30);
+        let mut output = Vec::new();
+
+        mux.push(text_cue(0, b"first"), &mut output)?;
+        // The publisher's own clear, well inside the cap: without it the cue
+        // would run to `MAX_TEXT_CUE_DISPLAY` and the display would stay
+        // populated for two seconds longer than the publisher intended.
+        mux.push(text_cue(SECOND_TICKS, b""), &mut output)?;
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        let body = rendered(&output);
+        assert!(
+            body.contains("00:00:00.000 --> 00:00:01.000\nfirst\n"),
+            "the clear must end the held cue where it was sent: {body}"
+        );
+        // A clear is an instruction, not content: nothing is published for it,
+        // and in particular not a cue with an empty body, which would
+        // terminate the preceding cue in the rendered WebVTT.
+        assert_eq!(
+            body.matches("-->").count(),
+            1,
+            "a clear must not publish a cue of its own: {body}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_clear_lets_the_publisher_beat_the_display_cap()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The reason this exists. Without a clear the end of a cue is
+        // whichever comes first of its successor or this node's cap, so a
+        // publisher whose own clear policy is longer or shorter than the cap
+        // cannot express it. With one, the publisher decides.
+        let mut mux = mux(Codec::Text, 30);
+        let mut output = Vec::new();
+
+        mux.push(text_cue(0, b"held"), &mut output)?;
+        mux.push(text_cue(SECOND_TICKS / 2, b""), &mut output)?;
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        let body = rendered(&output);
+        assert!(
+            body.contains("00:00:00.000 --> 00:00:00.500\nheld\n"),
+            "clear at 500ms must end the cue at 500ms, not at the cap: {body}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_clear_with_nothing_held_is_harmless() -> Result<(), Box<dyn std::error::Error>> {
+        // A publisher may clear a display that is already empty — at startup,
+        // or after two clears in a row. Nothing is held, so nothing ends, and
+        // the stream stays valid.
+        let mut mux = mux(Codec::Text, 30);
+        let mut output = Vec::new();
+
+        mux.push(text_cue(0, b""), &mut output)?;
+        mux.push(text_cue(SECOND_TICKS, b""), &mut output)?;
+        mux.push(text_cue(2 * SECOND_TICKS, b"after"), &mut output)?;
+        mux.finish(FinishReason::Final, &mut output)?;
+
+        let body = rendered(&output);
+        assert!(
+            body.contains("00:00:02.000 --> 00:00:05.000\nafter\n"),
+            "a cue after redundant clears must still publish: {body}"
+        );
+        assert_eq!(body.matches("-->").count(), 1, "clears published cues: {body}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_cue_arriving_before_a_clear_is_still_out_of_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A clear is a point on the track's timeline even though it displays
+        // nothing, so it has to advance the ordering reference. Otherwise a
+        // publisher could rewind past it undetected.
+        let mut mux = mux(Codec::Text, 30);
+        let mut output = Vec::new();
+
+        mux.push(text_cue(2 * SECOND_TICKS, b""), &mut output)?;
+        assert!(
+            mux.push(text_cue(SECOND_TICKS, b"rewound"), &mut output)
+                .is_err(),
+            "a cue before the last clear must be rejected"
+        );
         Ok(())
     }
 

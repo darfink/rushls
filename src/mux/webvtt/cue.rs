@@ -23,6 +23,23 @@ pub(super) struct CueContent {
     pub text: Arc<str>,
 }
 
+/// What one demuxed cue asks the segmenter to do.
+///
+/// Every dialect but [`CueDialect::Text`] can only ever produce
+/// [`Self::Show`]: their cues carry an explicit end, so "stop displaying" is
+/// expressed by that end arriving rather than by a separate signal.
+pub(super) enum CueAction {
+    /// Display this content until something replaces it or its end arrives.
+    Show(CueContent),
+    /// End whatever is on screen, and display nothing in its place.
+    ///
+    /// Only open-ended dialects need this. A cue with no end shows until it is
+    /// replaced, so without an explicit clear the only way to stop displaying
+    /// one is to send another — which is why a transport that cannot express
+    /// "nothing" leaves the last caption of a pause on screen.
+    Clear,
+}
+
 /// Which cue format one WebVTT rendition is reading.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CueDialect {
@@ -54,7 +71,7 @@ impl CueDialect {
     ///
     /// Purely a function of the cue: nothing here observes segmentation state,
     /// so a rejection leaves the caller's queue untouched.
-    pub(super) fn read(self, sample: &SubtitleSample) -> Result<CueContent, MuxError> {
+    pub(super) fn read(self, sample: &SubtitleSample) -> Result<CueAction, MuxError> {
         // Rejected for every dialect rather than dropped: WebVTT has no canvas
         // to project a pixel rectangle onto, and discarding the placement would
         // silently change how the cue presents.
@@ -66,10 +83,10 @@ impl CueDialect {
         }
         let payload = sample.payload.as_bytes();
         match self {
-            Self::PassThrough => Ok(CueContent {
+            Self::PassThrough => Ok(CueAction::Show(CueContent {
                 metadata: validate_metadata(sample.webvtt.clone())?,
                 text: webvtt_text(payload)?,
-            }),
+            })),
             Self::SubRip => {
                 if sample.webvtt != WebVttCueMetadata::default() {
                     return Err(mux_error(format!(
@@ -77,10 +94,10 @@ impl CueDialect {
                         sample.track_id
                     )));
                 }
-                Ok(CueContent {
+                Ok(CueAction::Show(CueContent {
                     metadata: WebVttCueMetadata::default(),
                     text: subrip::convert(payload)?,
-                })
+                }))
             }
             // Already the text a cue body carries, so the WebVTT reader is the
             // whole conversion: it is the same UTF-8, blank-line and NUL check
@@ -92,10 +109,24 @@ impl CueDialect {
                         sample.track_id
                     )));
                 }
-                Ok(CueContent {
+                // An empty body is the one payload this dialect reads as an
+                // instruction rather than as content. FLV script data has no
+                // erase message, so a publisher that wants to stop displaying a
+                // caption can only send a cue that renders as nothing — and
+                // WebVTT cannot carry that, since a blank body terminates a
+                // cue. Reading it as a clear is what lets the publisher keep
+                // ownership of when its captions disappear.
+                //
+                // Every other empty-payload rule is unchanged: this is not a
+                // relaxation of the WebVTT validation below, which still
+                // rejects an empty body for the dialects that have a real end.
+                if payload.is_empty() {
+                    return Ok(CueAction::Clear);
+                }
+                Ok(CueAction::Show(CueContent {
                     metadata: WebVttCueMetadata::default(),
                     text: webvtt_text(payload)?,
-                })
+                }))
             }
         }
     }
@@ -166,6 +197,15 @@ mod tests {
         }
     }
 
+    /// The content of a cue that displays something, or a failure if the
+    /// dialect read it as a clear.
+    fn shown(action: CueAction) -> CueContent {
+        match action {
+            CueAction::Show(content) => content,
+            CueAction::Clear => panic!("expected a displayable cue, got a clear"),
+        }
+    }
+
     #[test]
     fn only_cue_formats_with_a_converter_have_a_dialect() {
         assert_eq!(
@@ -185,7 +225,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         // FLV script data carries the cue body and nothing else, so conversion
         // is the shared WebVTT validation rather than a markup translation.
-        let content = CueDialect::Text.read(&sample(Codec::Text, "hej världen".as_bytes()))?;
+        let content = shown(CueDialect::Text.read(&sample(Codec::Text, "hej världen".as_bytes()))?);
         assert_eq!(content.text.as_ref(), "hej världen");
         assert_eq!(content.metadata, WebVttCueMetadata::default());
 
@@ -205,12 +245,35 @@ mod tests {
         for payload in [
             b"\xff\xfe invalid utf8".as_slice(),
             b"has\0nul".as_slice(),
-            b"".as_slice(),
             // A blank line ends a cue, so a body containing one would silently
             // become two cues sharing a timing line.
             b"first\n\nsecond".as_slice(),
         ] {
             assert!(CueDialect::Text.read(&sample(Codec::Text, payload)).is_err());
+        }
+    }
+
+    #[test]
+    fn an_empty_text_cue_clears_the_display_rather_than_failing() {
+        // The one payload this dialect reads as an instruction. FLV script
+        // data has no erase message, so a publisher can only say "show
+        // nothing" with an empty body, and WebVTT cannot carry that as a cue.
+        assert!(matches!(
+            CueDialect::Text.read(&sample(Codec::Text, b"")),
+            Ok(CueAction::Clear)
+        ));
+    }
+
+    #[test]
+    fn an_empty_body_still_fails_the_dialects_that_carry_their_own_end() {
+        // Only open-ended cues need a clear signal. A format that states when
+        // its cue ends has no use for one, so an empty body there is a
+        // malformed cue rather than an instruction.
+        for (dialect, codec) in [
+            (CueDialect::PassThrough, Codec::WebVtt),
+            (CueDialect::SubRip, Codec::SubRip),
+        ] {
+            assert!(dialect.read(&sample(codec, b"")).is_err());
         }
     }
 
@@ -237,7 +300,7 @@ mod tests {
     #[test]
     fn subrip_markup_is_converted_and_its_webvtt_metadata_is_refused()
     -> Result<(), Box<dyn std::error::Error>> {
-        let content = CueDialect::SubRip.read(&sample(Codec::SubRip, b"<B>bold</B>"))?;
+        let content = shown(CueDialect::SubRip.read(&sample(Codec::SubRip, b"<B>bold</B>"))?);
         assert_eq!(content.text.as_ref(), "<b>bold</b>");
         assert_eq!(content.metadata, WebVttCueMetadata::default());
 

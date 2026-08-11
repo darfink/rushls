@@ -46,5 +46,25 @@ fn main() {
     println!("a53_present     = {}", observed.a53_present);
     println!("cea608_fields   = {:#04b}", observed.cea608_fields);
     println!("dtvcc_present   = {}", observed.dtvcc_present);
+    // The service numbers are the point of the probe: a 708 stream declares
+    // one INSTREAM-ID per service, so a wrong number here is a playlist that
+    // names a service no decoder will find.
+    let services: Vec<u8> = (1..=63)
+        .filter(|service| observed.cea708_services & (1 << u32::from(service - 1)) != 0)
+        .collect();
+    if services.is_empty() {
+        // Distinguished from "no DTVCC at all": a stream carrying only null
+        // padding sets dtvcc_present while naming nothing.
+        println!("cea708_services = none");
+    } else {
+        println!(
+            "cea708_services = {}",
+            services
+                .iter()
+                .map(|service| format!("SERVICE{service}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!("malformed_sei   = {}", detector.malformed_sei());
 }
