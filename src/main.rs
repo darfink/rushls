@@ -2,6 +2,7 @@ use std::{error::Error, sync::Arc};
 
 use rushls::{
     domain::{SessionId, StreamId},
+    ffmpeg_versions,
     hooks::{self, HookObserver},
     observe::{EventObserver, Events, NodeEvent, SessionEvent, StreamEvent},
     server::{AppConfig, Node, ResolvedHooks},
@@ -84,7 +85,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let resolved = AppConfig::load()
         .and_then(AppConfig::resolve)
         .unwrap_or_else(|error| error.exit());
-    eprintln!("rushls {}", version());
+    // Before anything is served. A publication admitted against an older
+    // FFmpeg would lose caption and multitrack ingest silently, so refusing to
+    // start is more honest than accepting publishers this build cannot package
+    // correctly. Reported alongside the banner so a support question about
+    // missing captions can be answered from the first line of the log.
+    let ffmpeg = ffmpeg_versions()?;
+    eprintln!("rushls {} ({ffmpeg})", version());
     for warning in &resolved.warnings {
         eprintln!("warning: {warning}");
     }

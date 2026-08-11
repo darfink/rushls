@@ -11,6 +11,7 @@ mod extradata;
 mod packet;
 mod rational;
 mod subtitle;
+mod version;
 
 pub use audio::{read_audio_trim, write_audio_trim};
 pub use dictionary::{Dictionary, value};
@@ -19,3 +20,4 @@ pub use extradata::replace_extradata;
 pub use packet::OwnedPacket;
 pub use rational::{RationalError, from_av_rational, to_av_rational};
 pub use subtitle::{read_subtitle_position, read_webvtt_metadata};
+pub use version::{LinkedVersions, VersionMismatch, linked_versions};

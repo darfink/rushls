@@ -36,7 +36,45 @@ RUN curl --fail --location --retry 5 --silent --show-error \
   && cmake --build /tmp/srt/build --parallel \
   && cmake --install /tmp/srt/build
 
-FROM rust:1.93-trixie AS builder
+# Debian Trixie ships FFmpeg 7.1, whose FLV demuxer only understands Enhanced
+# RTMP v1. GStreamer's eflvmux emits v2 multitrack packets for the rendition
+# ladder, support for which landed in FFmpeg 8. Pin the same parser generation
+# used by the host E2E tests instead of silently depending on the base image.
+FROM debian:trixie-slim AS ffmpeg
+
+ARG FFMPEG_VERSION=8.1.2
+ARG FFMPEG_COMMIT=38b88335f99e76ed89ff3c93f877fdefce736c13
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    git \
+    nasm \
+    pkg-config \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch "n${FFMPEG_VERSION}" \
+      https://github.com/FFmpeg/FFmpeg.git /src/ffmpeg \
+  && test "$(git -C /src/ffmpeg rev-parse HEAD)" = "${FFMPEG_COMMIT}" \
+  && grep -q 'MultitrackTypeOneTrack' /src/ffmpeg/libavformat/flvdec.c
+
+WORKDIR /src/ffmpeg
+
+RUN ./configure \
+    --prefix=/opt/ffmpeg \
+    --disable-avdevice \
+    --disable-avfilter \
+    --disable-autodetect \
+    --disable-debug \
+    --disable-doc \
+    --disable-programs \
+    --disable-static \
+    --enable-shared \
+  && make -j"$(nproc)" \
+  && make install
+
+FROM rust:1.93-slim-trixie AS builder
 
 WORKDIR /app
 
@@ -45,17 +83,16 @@ RUN apt-get update \
     build-essential \
     clang \
     libclang-dev \
-    libavcodec-dev \
-    libavformat-dev \
-    libavutil-dev \
     libssl-dev \
-    libswresample-dev \
-    libswscale-dev \
+    libzstd-dev \
     pkg-config \
+    zlib1g-dev \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=libsrt /opt/srt /opt/srt
-ENV PKG_CONFIG_PATH=/opt/srt/lib/pkgconfig
+COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
+ENV LD_LIBRARY_PATH=/opt/ffmpeg/lib \
+    PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig:/opt/srt/lib/pkgconfig
 
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
@@ -81,14 +118,14 @@ LABEL org.opencontainers.image.revision=$GIT_SHA
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
-    libavcodec61 \
-    libavformat61 \
-    libavutil59 \
     libssl3t64 \
     libstdc++6 \
-    libswresample5 \
-    libswscale8 \
+    libzstd1 \
+    zlib1g \
   && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
+ENV LD_LIBRARY_PATH=/opt/ffmpeg/lib
 
 # The builder copies the artifact out of its persistent Cargo target cache.
 COPY --from=builder /usr/local/bin/rushls /usr/local/bin/rushls
