@@ -22,8 +22,13 @@ pub struct HealthPolicy {
 impl Default for HealthPolicy {
     fn default() -> Self {
         Self {
-            source_stall_timeout: Duration::from_secs(5),
-            media_stall_timeout: Duration::from_secs(5),
+            // One segment at the default 6s cadence. The configuration layer
+            // resolves these from a multiple of the configured segment
+            // duration, so a deployment that retunes segmentation moves these
+            // with it; this value is what a caller constructing the policy
+            // directly gets.
+            source_stall_timeout: Duration::from_secs(6),
+            media_stall_timeout: Duration::from_secs(6),
             stalled_publication_multiplier: 3,
             minimum_publication_stall_tolerance: Duration::from_secs(1),
         }

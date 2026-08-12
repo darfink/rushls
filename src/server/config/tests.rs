@@ -822,6 +822,113 @@ handshake_read_timeout = "30s"
 }
 
 #[test]
+fn stall_deadlines_follow_the_segment_duration() -> Result<(), Box<dyn Error>> {
+    // The reason these are relative. An absolute value sized against a 6s
+    // segment becomes stall detection that fires before one segment can
+    // complete the moment segmentation is retuned.
+    let resolved = resolve_toml(
+        r#"
+[hls]
+segment_duration = "10s"
+part_duration = "1s"
+"#,
+    )?
+    .unwrap_or_else(|error| panic!("a longer segment duration must resolve: {error}"));
+
+    let health = resolved.node.session.supervision.health;
+    assert_eq!(health.source_stall_timeout, Duration::from_secs(10));
+    assert_eq!(health.media_stall_timeout, Duration::from_secs(10));
+    Ok(())
+}
+
+#[test]
+fn a_stall_deadline_may_be_pinned_to_an_absolute() -> Result<(), Box<dyn Error>> {
+    // A deployment with its own reasons keeps the fixed form available.
+    let resolved = resolve_toml(
+        r#"
+[ingest.health]
+source_stall = "20s"
+"#,
+    )?
+    .unwrap_or_else(|error| panic!("a fixed stall deadline must resolve: {error}"));
+
+    let health = resolved.node.session.supervision.health;
+    assert_eq!(health.source_stall_timeout, Duration::from_secs(20));
+    // The unset one still follows the cadence.
+    assert_eq!(health.media_stall_timeout, Duration::from_secs(6));
+    Ok(())
+}
+
+#[test]
+fn a_stall_deadline_shorter_than_its_sampling_is_refused() -> Result<(), Box<dyn Error>> {
+    // Sampling cannot observe a deadline shorter than its own period, so such
+    // a value is not the tighter detection it appears to be.
+    let Err(error) = resolve_toml(
+        r#"
+[ingest.health]
+source_stall = "500ms"
+health_interval = "1s"
+"#,
+    )?
+    else {
+        panic!("an unobservable stall deadline must be refused");
+    };
+
+    assert!(
+        error.to_string().contains("cannot be observed"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_srt_idle_deadline_inside_the_latency_window_is_refused() -> Result<(), Box<dyn Error>> {
+    // Firing inside the receiver's own reorder window would drop packets the
+    // transport is still legitimately waiting for.
+    let Err(error) = resolve_toml(
+        r#"
+[ingest.srt]
+latency = "2s"
+peer_idle_timeout = "1s"
+"#,
+    )?
+    else {
+        panic!("an idle deadline inside the latency window must be refused");
+    };
+
+    assert!(
+        error.to_string().contains("must exceed the receive latency"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn tls_admission_limits_are_configurable() -> Result<(), Box<dyn Error>> {
+    // The unauthenticated edge: the cost a peer can impose is the product of
+    // these two, so both have to be reachable.
+    let certificate = TempConfig::new("certificate")?;
+    let key = TempConfig::new("key")?;
+    let resolved = resolve_toml(&format!(
+        r#"
+[http.tls]
+certificate = "{}"
+key = "{}"
+handshake_timeout = "2s"
+maximum_pending_handshakes = 32
+"#,
+        certificate.path.display(),
+        key.path.display()
+    ))?
+    .unwrap_or_else(|error| panic!("TLS admission limits must resolve: {error}"));
+
+    let tls = resolved.node.http.tls.expect("TLS is configured");
+    assert_eq!(tls.handshake_timeout, Duration::from_secs(2));
+    assert_eq!(tls.maximum_pending_handshakes, 32);
+    Ok(())
+}
+
+#[test]
 fn a_session_read_below_a_keyframe_interval_is_refused() -> Result<(), Box<dyn Error>> {
     // Hardening that drops legitimate publishers is an outage, not a defence.
     let Err(error) = resolve_toml(

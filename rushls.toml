@@ -178,6 +178,37 @@ latency = "120ms"
 # passphrase_file = "/run/secrets/rushls-srt-passphrase"
 encryption_key_length = "aes256"
 
+# How long an SRT peer may send nothing before its session is dropped. This is
+# not the RTMP `peer_timeout`: SRT keeps its own keepalive, so this bounds a
+# protocol-level idle rather than a stalled socket read. It must exceed
+# `latency`, or it fires inside the receiver's own reorder window.
+peer_idle_timeout = "5s"
+
+[ingest.health]
+# When a session is judged to have stalled. Both accept a multiple of the
+# segment duration ("1x") or a fixed duration ("6s").
+#
+# The multiple is the default because these deadlines are only meaningful
+# against the output cadence: an absolute value sized for a 6s segment becomes
+# stall detection that fires before a single segment can complete once
+# segmentation is retuned.
+
+# The publisher has gone quiet.
+source_stall = "1x"
+# The publisher is still sending, but the media stops making sense.
+media_stall = "1x"
+
+# How far past its own output cadence a session may fall behind before its
+# publication is treated as stalled. Always relative: the quantity it bounds is
+# the cadence itself.
+publication_stall_multiplier = 3
+
+# How often liveness is judged. A sampling rate rather than a policy — near the
+# stall values above it makes detection jittery, and far below them it costs
+# work without detecting anything sooner. Rushls refuses a stall deadline
+# shorter than this, since sampling could not observe it.
+health_interval = "1s"
+
 [hls]
 # Empty produces relative playlist URLs, which is normally right behind a
 # reverse proxy or CDN. Set an absolute prefix only when playlists must point
@@ -239,6 +270,16 @@ max_age = "10min"
 # [http.tls]
 # certificate = "/etc/rushls/tls/fullchain.pem"
 # key = "/etc/rushls/tls/private-key.pem"
+#
+# The unauthenticated edge of the node. A TLS handshake is more expensive to
+# hold open than a plain socket, so a peer that completes TCP and then stalls
+# mid-handshake is the cheapest way to consume resources here.
+#
+# Size these together: the cost one peer can impose is the product of the two,
+# so tightening the timeout while leaving the concurrency ceiling alone buys
+# less than it appears to.
+# handshake_timeout = "5s"
+# maximum_pending_handshakes = 256
 
 [metrics]
 # Prometheus metrics are served at `/metrics` on the HTTP listener when enabled.

@@ -201,6 +201,11 @@ impl AppConfig {
         self.ingest.rtmp.apply(&mut node, &mut warnings)?;
         self.ingest.srt.apply(&mut node)?;
         self.hls.apply(&mut node)?;
+        // After HLS: the relative stall forms are sized by the segment
+        // duration, which `hls.apply` is what establishes.
+        self.ingest
+            .health
+            .apply(&mut node, self.hls.segment_duration())?;
         self.storage.apply(&mut node)?;
         node.http = self.http.resolve()?;
         node.metrics = self.metrics.resolve()?;
@@ -880,6 +885,120 @@ pub struct IngestAppConfig {
     pub rtmp: RtmpAppConfig,
     #[conf(flatten, prefix)]
     pub srt: SrtAppConfig,
+    #[conf(flatten, prefix)]
+    pub health: HealthAppConfig,
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct HealthAppConfig {
+    /// How long the input may deliver nothing before the session is failed.
+    ///
+    /// Expressed as a multiple of the segment duration (`"1x"`) or a fixed
+    /// duration (`"5s"`). The multiple form is the safer default: an absolute
+    /// value that is sensible against a 6s segment silently becomes
+    /// aggressive when segmentation is retuned, and stall detection that
+    /// fires before one segment can complete fails healthy publishers.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "1x",
+        value_parser = parse_stall_rule,
+        serde(use_value_parser)
+    )]
+    source_stall: DurationRule,
+    /// How long normalization may produce nothing while input still arrives.
+    ///
+    /// Distinct from `source_stall`: this is the publisher still sending while
+    /// the media stops making sense, which is a different fault from the
+    /// publisher going quiet.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "1x",
+        value_parser = parse_stall_rule,
+        serde(use_value_parser)
+    )]
+    media_stall: DurationRule,
+    /// How far past its own output cadence a session may fall behind.
+    ///
+    /// Always relative, because the quantity it bounds is the cadence itself.
+    #[conf(parameter, long, env, default_value = "3")]
+    publication_stall_multiplier: u32,
+    /// How often liveness is judged while a session runs.
+    ///
+    /// A sampling rate rather than a policy: near the stall values above it
+    /// makes detection jittery, and well below them it costs work for no
+    /// extra sensitivity.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "1s",
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    health_interval: Duration,
+}
+
+impl HealthAppConfig {
+    /// Resolve against the segment duration the relative forms are sized by.
+    fn apply(&self, node: &mut NodeConfig, segment_duration: Duration) -> Result<(), ConfigError> {
+        if self.publication_stall_multiplier == 0 {
+            return Err(invalid(
+                "ingest.health.publication_stall_multiplier must be at least one",
+            ));
+        }
+        if self.health_interval.is_zero() {
+            return Err(invalid("ingest.health.health_interval must be nonzero"));
+        }
+
+        let source_stall = self.source_stall.resolve(segment_duration);
+        let media_stall = self.media_stall.resolve(segment_duration);
+        for (name, value) in [("source_stall", source_stall), ("media_stall", media_stall)] {
+            if value.is_zero() {
+                return Err(invalid(format!("ingest.health.{name} must be nonzero")));
+            }
+            // Sampling cannot observe a deadline shorter than its own period,
+            // so such a value is not the tighter detection it looks like.
+            if value < self.health_interval {
+                return Err(invalid(format!(
+                    "ingest.health.{name} ({value:?}) is shorter than the health \
+                     interval ({:?}), so it cannot be observed",
+                    self.health_interval
+                )));
+            }
+        }
+
+        node.session.supervision.health.source_stall_timeout = source_stall;
+        node.session.supervision.health.media_stall_timeout = media_stall;
+        node.session.supervision.health.stalled_publication_multiplier =
+            self.publication_stall_multiplier;
+        node.session.supervision.health_interval = self.health_interval;
+        Ok(())
+    }
+}
+
+/// Parses a stall deadline: a multiple of the segment duration (`"1x"`) or a
+/// fixed duration (`"5s"`).
+fn parse_stall_rule(value: &str) -> Result<DurationRule, String> {
+    if let Some(multiple) = value.strip_suffix('x') {
+        let (numerator, denominator) = decimal_fraction(multiple)?;
+        if numerator == 0 {
+            return Err("a stall multiple must be greater than zero".to_owned());
+        }
+        let denominator = NonZeroU32::new(denominator)
+            .ok_or_else(|| "a stall multiple must be greater than zero".to_owned())?;
+        return Ok(DurationRule::MultipleOfTarget(TargetDurationMultiple::new(
+            numerator,
+            denominator,
+        )));
+    }
+    humantime::parse_duration(value)
+        .map(DurationRule::Fixed)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Conf)]
@@ -1048,6 +1167,21 @@ pub struct SrtAppConfig {
         serde(use_value_parser)
     )]
     latency: Duration,
+    /// How long an SRT peer may send nothing before its session is dropped.
+    ///
+    /// Deliberately not folded into the RTMP `peer_timeout`: SRT is
+    /// connectionless and keeps its own keepalive, so this bounds a
+    /// protocol-level idle rather than a stalled socket read. Sharing a knob
+    /// would imply the two move together, and they should not.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "5s",
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    peer_idle_timeout: Duration,
     /// Optional passphrase; absent accepts unencrypted SRT.
     #[conf(parameter, env, secret)]
     passphrase: Option<String>,
@@ -1070,12 +1204,21 @@ impl SrtAppConfig {
         if self.latency.is_zero() {
             return Err(invalid("SRT latency must be nonzero"));
         }
+        // An idle deadline inside the receiver's own latency window would fire
+        // on packets the transport is still legitimately waiting to reorder.
+        if self.peer_idle_timeout <= self.latency {
+            return Err(invalid(format!(
+                "SRT peer_idle_timeout ({:?}) must exceed the receive latency ({:?})",
+                self.peer_idle_timeout, self.latency
+            )));
+        }
         let passphrase = resolve_optional_text_secret(
             "SRT passphrase",
             self.passphrase.as_ref(),
             self.passphrase_file.as_ref(),
         )?;
         node.srt.latency = self.latency;
+        node.srt.peer_idle_timeout = self.peer_idle_timeout;
         node.srt.encryption = passphrase
             .as_ref()
             .map(|passphrase| {
@@ -1132,6 +1275,11 @@ pub struct HlsAppConfig {
 }
 
 impl HlsAppConfig {
+    /// The segment duration other sections size their relative values by.
+    fn segment_duration(&self) -> Duration {
+        self.segment_duration
+    }
+
     fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
         if self.segment_duration.is_zero() || self.part_duration.is_zero() {
             return Err(invalid("HLS segment and part durations must be nonzero"));
@@ -1291,7 +1439,7 @@ impl HttpAppConfig {
     fn resolve(&self) -> Result<HttpConfig, ConfigError> {
         let config = HttpConfig {
             cors: self.cors.resolve()?,
-            tls: self.tls.as_ref().map(TlsAppConfig::resolve),
+            tls: self.tls.as_ref().map(TlsAppConfig::resolve).transpose()?,
         };
         config.validate().map_err(invalid)?;
         Ok(config)
@@ -1346,15 +1494,46 @@ pub struct TlsAppConfig {
     /// PEM private key.
     #[conf(parameter, long, env)]
     key: PathBuf,
+    /// Bounds a connection that completes TCP and then stalls mid-handshake.
+    ///
+    /// This is the unauthenticated edge of the node, and a TLS handshake is
+    /// more expensive to hold open than a plain socket, so it is worth keeping
+    /// tight.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "5s",
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    handshake_timeout: Duration,
+    /// Handshakes admitted at once, which is what stops a flood from growing
+    /// the task set without bound.
+    ///
+    /// Sized together with `handshake_timeout`: the cost an unauthenticated
+    /// peer can impose is the product of the two, so tightening one while
+    /// leaving the other untouched buys less than it appears to.
+    #[conf(parameter, long, env, default_value = "256")]
+    maximum_pending_handshakes: usize,
 }
 
 impl TlsAppConfig {
-    fn resolve(&self) -> TlsSettings {
-        TlsSettings {
+    fn resolve(&self) -> Result<TlsSettings, ConfigError> {
+        if self.maximum_pending_handshakes == 0 {
+            return Err(ConfigError::Invalid(
+                "http.tls.maximum_pending_handshakes must be at least one, or no \
+                 TLS connection can be admitted"
+                    .to_owned(),
+            ));
+        }
+
+        Ok(TlsSettings {
             certificate: self.certificate.clone(),
             key: self.key.clone(),
-            ..TlsSettings::default()
-        }
+            handshake_timeout: self.handshake_timeout,
+            maximum_pending_handshakes: self.maximum_pending_handshakes,
+        })
     }
 }
 
