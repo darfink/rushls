@@ -33,14 +33,6 @@ fn start(
     started_from(input)
 }
 
-/// As [`start`], for a track set containing an opt-in subtitle codec.
-fn start_with_text(
-    tracks: Vec<DiscoveredTrack>,
-) -> (StartedNormalizer, PresentationPlan, TimelineCalibration) {
-    let input = crate::media::fixtures::presentation_with_text_subtitles(tracks);
-    started_from(input)
-}
-
 fn started_from(
     input: PresentationPlan,
 ) -> (StartedNormalizer, PresentationPlan, TimelineCalibration) {
@@ -595,7 +587,7 @@ fn an_open_ended_cue_may_arrive_without_a_duration() {
         .timebase(Timebase::new(nz::u32!(1), nz::u32!(1_000)))
         .build();
     let video = TrackBuilder::new(1, MediaKind::Video).build();
-    let (mut started, _, _) = start_with_text(vec![subtitle, video]);
+    let (mut started, _, _) = start(vec![subtitle, video]);
     let mut output = Vec::new();
 
     for duration in [None, Some(0)] {

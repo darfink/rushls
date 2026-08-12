@@ -9,7 +9,9 @@ use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 use bytes::{Bytes, BytesMut};
 use scuffle_rtmp::{
     ServerSession,
-    session::server::{ServerSessionError, SessionData, SessionHandler},
+    session::server::{
+        ServerSessionError, ServerSessionTimeouts, SessionData, SessionHandler,
+    },
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -45,6 +47,14 @@ const FLV_MAXIMUM_PAYLOAD_BYTES: usize = 0x00ff_ffff;
 pub struct RtmpConfig {
     /// Maximum time from accepting the socket until its first publish command.
     pub maximum_publish_wait: Duration,
+    /// Network operation timeouts for the session beneath this connection.
+    ///
+    /// Distinct from [`Self::maximum_publish_wait`], and both are needed: this
+    /// bounds how long a single socket operation may produce nothing, while
+    /// `maximum_publish_wait` bounds the whole pre-publish phase. A peer that
+    /// dribbles one byte per second defeats the first and is caught by the
+    /// second.
+    pub timeouts: ServerSessionTimeouts,
     /// Encoded FLV bytes allowed to wait for AVFormat.
     pub maximum_buffered_flv_bytes: NonZeroUsize,
     /// Application limit below the FLV format's fixed 24-bit tag-size ceiling.
@@ -57,6 +67,16 @@ impl Default for RtmpConfig {
     fn default() -> Self {
         Self {
             maximum_publish_wait: Duration::from_secs(10),
+            // Deliberately looser than scuffle-rtmp's 2s/2.5s defaults, which
+            // are tight enough to drop a legitimate publisher on a poor
+            // network between keyframes. The configuration layer resolves
+            // these from `peer_timeout`; this value is what a caller
+            // constructing the transport directly gets.
+            timeouts: ServerSessionTimeouts {
+                handshake_read: Some(Duration::from_secs(10)),
+                session_read: Some(Duration::from_secs(10)),
+                write: Some(Duration::from_secs(10)),
+            },
             maximum_buffered_flv_bytes: nz::usize!(16 * 1024 * 1024),
             maximum_tag_payload_bytes: nz::usize!(8 * 1024 * 1024),
             avformat: AvformatConfig::default(),
@@ -128,8 +148,12 @@ impl RtmpPendingPublish {
             maximum_tag_payload_bytes: config.maximum_tag_payload_bytes.get(),
             framing: BytesMut::new(),
         };
+        let timeouts = config.timeouts;
         let mut session = tokio::spawn(async move {
-            let result = ServerSession::new(io, handler).run().await;
+            let result = ServerSession::new(io, handler)
+                .with_timeouts(timeouts)
+                .run()
+                .await;
             match &result {
                 Ok(true) => supervisor.finish(InputState::Closed),
                 Ok(false) => supervisor.finish(InputState::Interrupted),

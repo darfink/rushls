@@ -1309,7 +1309,12 @@ mod end_to_end {
                 | u32::from(tagged[cursor + 5]) << 8
                 | u32::from(tagged[cursor + 6]);
             while emitted < cues.len() && cues[emitted].0 <= timestamp {
-                push_flv_tag(&mut out, 18, cues[emitted].0, &script_data(name, cues[emitted].1));
+                push_flv_tag(
+                    &mut out,
+                    18,
+                    cues[emitted].0,
+                    &script_data(name, cues[emitted].1),
+                );
                 emitted += 1;
             }
             let end = cursor + 11 + size + 4;
@@ -1317,7 +1322,12 @@ mod end_to_end {
             cursor = end;
         }
         while emitted < cues.len() {
-            push_flv_tag(&mut out, 18, cues[emitted].0, &script_data(name, cues[emitted].1));
+            push_flv_tag(
+                &mut out,
+                18,
+                cues[emitted].0,
+                &script_data(name, cues[emitted].1),
+            );
             emitted += 1;
         }
         tagged.clear();

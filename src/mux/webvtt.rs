@@ -758,9 +758,10 @@ impl WebVttTrack {
         // A successor sharing its predecessor's timestamp would otherwise
         // produce an empty span, which WebVTT cannot express as a visible cue.
         // Dropping the predecessor is what "replaced immediately" means.
-        let Some(duration) = end.checked_sub(cue.pts).and_then(|span| {
-            TickDuration::try_from(span).ok().filter(|span| *span > 0)
-        }) else {
+        let Some(duration) = end
+            .checked_sub(cue.pts)
+            .and_then(|span| TickDuration::try_from(span).ok().filter(|span| *span > 0))
+        else {
             return Ok(());
         };
         cue.duration = duration;
@@ -804,7 +805,6 @@ impl TrackPackager for WebVttTrack {
     fn track_id(&self) -> TrackId {
         self.track_id
     }
-
 
     fn push(
         &mut self,
@@ -1813,8 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn a_clear_lets_the_publisher_beat_the_display_cap()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn a_clear_lets_the_publisher_beat_the_display_cap() -> Result<(), Box<dyn std::error::Error>> {
         // The reason this exists. Without a clear the end of a cue is
         // whichever comes first of its successor or this node's cap, so a
         // publisher whose own clear policy is longer or shorter than the cap
@@ -1852,7 +1851,11 @@ mod tests {
             body.contains("00:00:02.000 --> 00:00:05.000\nafter\n"),
             "a cue after redundant clears must still publish: {body}"
         );
-        assert_eq!(body.matches("-->").count(), 1, "clears published cues: {body}");
+        assert_eq!(
+            body.matches("-->").count(),
+            1,
+            "clears published cues: {body}"
+        );
         Ok(())
     }
 
@@ -1911,7 +1914,10 @@ mod tests {
             ("00:00:01.000", "00:00:02.000"),
             ("00:00:02.000", "00:00:03.000"),
         ] {
-            assert!(body.contains(&format!("{start} --> {end}")), "missing {start}");
+            assert!(
+                body.contains(&format!("{start} --> {end}")),
+                "missing {start}"
+            );
         }
         Ok(())
     }

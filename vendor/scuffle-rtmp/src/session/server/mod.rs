@@ -43,7 +43,7 @@ const DEFAULT_ACKNOWLEDGEMENT_WINDOW_SIZE: u32 = 2_500_000; // 2.5 MB
 ///
 /// A value of `None` disables that timeout. The defaults preserve the
 /// timeouts used by scuffle-rtmp 0.2.3 before they were configurable.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ServerSessionTimeouts {
     /// Maximum time allowed for each handshake read.
     pub handshake_read: Option<Duration>,

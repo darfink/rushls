@@ -249,7 +249,11 @@ mod tests {
             // become two cues sharing a timing line.
             b"first\n\nsecond".as_slice(),
         ] {
-            assert!(CueDialect::Text.read(&sample(Codec::Text, payload)).is_err());
+            assert!(
+                CueDialect::Text
+                    .read(&sample(Codec::Text, payload))
+                    .is_err()
+            );
         }
     }
 
@@ -315,7 +319,11 @@ mod tests {
 
     #[test]
     fn no_dialect_accepts_a_pixel_positioned_cue() {
-        for dialect in [CueDialect::PassThrough, CueDialect::SubRip, CueDialect::Text] {
+        for dialect in [
+            CueDialect::PassThrough,
+            CueDialect::SubRip,
+            CueDialect::Text,
+        ] {
             let mut positioned = sample(Codec::SubRip, b"placed");
             positioned.position = Some(SubtitlePosition {
                 x1: 1,

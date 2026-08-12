@@ -28,17 +28,6 @@ pub fn presentation(tracks: Vec<DiscoveredTrack>) -> PresentationPlan {
         .expect("test presentation is valid")
 }
 
-/// As [`presentation`], with the opt-in subtitle codecs also accepted.
-///
-/// `Codec::Text` is deliberately absent from the permissive policy — an
-/// operator enables in-band text per stream — so a fixture that needs one has
-/// to say so rather than the default quietly widening.
-pub fn presentation_with_text_subtitles(tracks: Vec<DiscoveredTrack>) -> PresentationPlan {
-    let mut policy = StreamPolicy::permissive();
-    policy.accepted_subtitle_codecs.push(Codec::Text);
-    validate(&domain::catalog(tracks), &policy).expect("test presentation is valid")
-}
-
 /// The single-video-track presentation most pipeline tests are built on.
 pub fn video_presentation() -> PresentationPlan {
     presentation(vec![domain::track(0, MediaKind::Video)])

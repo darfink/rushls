@@ -735,6 +735,112 @@ fn load_toml(configuration: &str) -> Result<Result<AppConfig, ConfigError>, Box<
     load_with(configuration, &[], &[])
 }
 
+#[test]
+fn rtmp_phase_timeouts_inherit_the_peer_timeout() -> Result<(), Box<dyn Error>> {
+    // The point of the single knob: one value an operator can reason about,
+    // reaching every phase without naming them.
+    let resolved = resolve_toml(
+        r#"
+[ingest.rtmp]
+peer_timeout = "15s"
+"#,
+    )?
+    .unwrap_or_else(|error| panic!("peer_timeout alone must resolve: {error}"));
+
+    let timeouts = resolved.node.rtmp.timeouts;
+    assert_eq!(timeouts.handshake_read, Some(Duration::from_secs(15)));
+    assert_eq!(timeouts.session_read, Some(Duration::from_secs(15)));
+    assert_eq!(timeouts.write, Some(Duration::from_secs(15)));
+    Ok(())
+}
+
+#[test]
+fn a_named_phase_overrides_the_peer_timeout() -> Result<(), Box<dyn Error>> {
+    // Inheritance is per field, not all-or-nothing: naming one phase must not
+    // silently drop the others back to their built-in defaults.
+    let resolved = resolve_toml(
+        r#"
+[ingest.rtmp]
+peer_timeout = "15s"
+handshake_read_timeout = "3s"
+"#,
+    )?
+    .unwrap_or_else(|error| panic!("a partial override must resolve: {error}"));
+
+    let timeouts = resolved.node.rtmp.timeouts;
+    assert_eq!(timeouts.handshake_read, Some(Duration::from_secs(3)));
+    assert_eq!(timeouts.session_read, Some(Duration::from_secs(15)));
+    assert_eq!(timeouts.write, Some(Duration::from_secs(15)));
+    Ok(())
+}
+
+#[test]
+fn a_timeout_can_be_disabled_explicitly() -> Result<(), Box<dyn Error>> {
+    // "No timeout" has to be expressible, or an operator who wants it writes
+    // an absurd number instead — which reads as a mistake and behaves like one.
+    let resolved = resolve_toml(
+        r#"
+[ingest.rtmp]
+peer_timeout = "15s"
+write_timeout = "off"
+"#,
+    )?
+    .unwrap_or_else(|error| panic!("a disabled timeout must resolve: {error}"));
+
+    assert_eq!(resolved.node.rtmp.timeouts.write, None);
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("write_timeout is disabled")),
+        "disabling a timeout must be surfaced: {:?}",
+        resolved.warnings
+    );
+    Ok(())
+}
+
+#[test]
+fn the_unauthenticated_phase_may_not_be_the_patient_one() -> Result<(), Box<dyn Error>> {
+    // A handshake read outliving an established read inverts the intent, and
+    // is the shape a global multiplier would produce by accident.
+    let Err(error) = resolve_toml(
+        r#"
+[ingest.rtmp]
+peer_timeout = "10s"
+handshake_read_timeout = "30s"
+"#,
+    )?
+    else {
+        panic!("an inverted handshake timeout must be refused");
+    };
+
+    assert!(
+        error.to_string().contains("must not exceed"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_session_read_below_a_keyframe_interval_is_refused() -> Result<(), Box<dyn Error>> {
+    // Hardening that drops legitimate publishers is an outage, not a defence.
+    let Err(error) = resolve_toml(
+        r#"
+[ingest.rtmp]
+peer_timeout = "500ms"
+"#,
+    )?
+    else {
+        panic!("a sub-second session read must be refused");
+    };
+
+    assert!(
+        error.to_string().contains("below one second"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
 /// Loads and resolves one TOML fragment on its own.
 fn resolve_toml(
     configuration: &str,

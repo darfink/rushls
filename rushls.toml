@@ -43,7 +43,7 @@ takeovers = "allow"
 # container automatically for each ingest protocol.
 video_codecs = ["h264", "hevc", "av1"]
 audio_codecs = ["aac", "opus"]
-subtitle_codecs = ["webvtt", "subrip"]
+subtitle_codecs = ["webvtt", "subrip", "text"]
 
 # Multi-language and alternate tracks count separately.
 maximum_video_tracks = 8
@@ -142,6 +142,30 @@ policy = "default"
 [ingest.rtmp]
 # Use 127.0.0.1 when a local proxy is the only intended RTMP client.
 listen = "0.0.0.0:1935"
+
+# How long an RTMP peer may produce nothing before its session is closed.
+# This is the one timeout most deployments need: it reaches the handshake,
+# established-session reads, and writes together.
+peer_timeout = "10s"
+
+# Per-phase overrides, for deployments that need them. Anything left unset
+# inherits `peer_timeout`, so naming one phase does not disturb the others.
+#
+# The two phases are not equivalent and are worth tuning apart. A handshake
+# read covers an *unauthenticated* peer, which is the cheapest way for one to
+# hold a socket, so it may be tightened well below `peer_timeout`. A session
+# read covers an established publisher, where an over-tight value drops a
+# legitimate stream between keyframes and turns hardening into an outage.
+#
+# Rushls refuses a handshake timeout longer than the session timeout, and a
+# session timeout below one second.
+# handshake_read_timeout = "3s"
+# session_read_timeout = "30s"
+# write_timeout = "10s"
+
+# Any of these may be "off" to wait indefinitely. That is reasonable on a
+# trusted link and a liability on a public one, so rushls warns at startup
+# whenever a timeout is disabled.
 
 [ingest.srt]
 # `[::]` is the dual-stack wildcard used by the SRT listener.

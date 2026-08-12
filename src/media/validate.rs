@@ -303,9 +303,9 @@ mod tests {
             track(1, MediaKind::Subtitle, Codec::Text),
         ]);
 
-        // Off by default: FLV script data carries whatever a publisher chose to
-        // put there, so surfacing it as a subtitle rendition is a decision an
-        // operator makes rather than something every stream gets.
+        // The default policy admits `text` (FLV script data is a mainstream
+        // caption carriage), so this uses a narrower policy to prove the codec
+        // is still gated on admission rather than hard-coded.
         assert_eq!(
             validate(&tracks, &policy()),
             Err(ValidationError::UnsupportedCodec {

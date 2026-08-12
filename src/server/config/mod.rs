@@ -18,6 +18,7 @@ use std::{
 
 use bytesize::ByteSize;
 use conf::{Conf, find_parameter};
+use scuffle_rtmp::session::server::ServerSessionTimeouts;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -197,6 +198,7 @@ impl AppConfig {
             http_address: self.http.listen,
             ..NodeConfig::default()
         };
+        self.ingest.rtmp.apply(&mut node, &mut warnings)?;
         self.ingest.srt.apply(&mut node)?;
         self.hls.apply(&mut node)?;
         self.storage.apply(&mut node)?;
@@ -886,6 +888,148 @@ pub struct RtmpAppConfig {
     /// Address receiving RTMP publishers.
     #[conf(parameter, long, env, default_value = "0.0.0.0:1935")]
     pub listen: SocketAddr,
+    /// How long an RTMP peer may produce nothing before its session is closed.
+    ///
+    /// One value for connection liveness, which is what most operators want to
+    /// think about: a peer that connects and then stalls costs a socket until
+    /// something reclaims it. The per-phase settings below inherit this, and
+    /// each may be overridden on its own.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "10s",
+        value_parser = parse_optional_duration,
+        serde(use_value_parser)
+    )]
+    peer_timeout: OptionalDuration,
+    /// Maximum time allowed for each handshake read.
+    ///
+    /// This one is worth tightening below `peer_timeout`: the peer is
+    /// unauthenticated here, so a stalled handshake is the cheapest way to
+    /// hold a socket open.
+    #[conf(
+        parameter,
+        long,
+        env,
+        value_parser = parse_optional_duration,
+        serde(use_value_parser)
+    )]
+    handshake_read_timeout: Option<OptionalDuration>,
+    /// Maximum time allowed for each established-session read.
+    ///
+    /// Worth keeping generous: an established publisher on a poor network is
+    /// still a publisher, and this is where an over-tight timeout turns
+    /// hardening into an outage.
+    #[conf(
+        parameter,
+        long,
+        env,
+        value_parser = parse_optional_duration,
+        serde(use_value_parser)
+    )]
+    session_read_timeout: Option<OptionalDuration>,
+    /// Maximum time allowed for each socket write.
+    #[conf(
+        parameter,
+        long,
+        env,
+        value_parser = parse_optional_duration,
+        serde(use_value_parser)
+    )]
+    write_timeout: Option<OptionalDuration>,
+}
+
+impl RtmpAppConfig {
+    /// Resolve the per-phase timeouts, applying `peer_timeout` where a phase
+    /// names no value of its own.
+    fn timeouts(&self) -> ServerSessionTimeouts {
+        ServerSessionTimeouts {
+            handshake_read: self.handshake_read_timeout.unwrap_or(self.peer_timeout).0,
+            session_read: self.session_read_timeout.unwrap_or(self.peer_timeout).0,
+            write: self.write_timeout.unwrap_or(self.peer_timeout).0,
+        }
+    }
+
+    fn apply(
+        &self,
+        node: &mut NodeConfig,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), ConfigError> {
+        let timeouts = self.timeouts();
+
+        // A handshake read that outlives an established read inverts the
+        // intent: the unauthenticated phase would be the more patient one.
+        if let (Some(handshake), Some(session)) = (timeouts.handshake_read, timeouts.session_read)
+            && handshake > session
+        {
+            return Err(ConfigError::Invalid(format!(
+                "the RTMP handshake read timeout ({handshake:?}) must not exceed the \
+                 established-session read timeout ({session:?}): the unauthenticated \
+                 phase should be the stricter one"
+            )));
+        }
+
+        // A session read shorter than a keyframe interval drops publishers
+        // mid-GOP. Nothing here knows the publisher's cadence, so this only
+        // catches values too small to be deliberate.
+        if let Some(session) = timeouts.session_read
+            && session < Duration::from_secs(1)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "the RTMP established-session read timeout ({session:?}) is below one \
+                 second, which drops publishers between ordinary keyframes"
+            )));
+        }
+
+        node.rtmp.timeouts = timeouts;
+
+        // Disabling a timeout is legitimate on a trusted link and a liability
+        // on a public one, and nothing here can tell which this is. Say so
+        // rather than let an unbounded wait be invisible.
+        for (name, value) in [
+            ("handshake_read_timeout", timeouts.handshake_read),
+            ("session_read_timeout", timeouts.session_read),
+            ("write_timeout", timeouts.write),
+        ] {
+            if value.is_none() {
+                warnings.push(format!(
+                    "RTMP {name} is disabled: a peer that stops responding holds its \
+                     connection until it is closed from the other end"
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// A duration that may be explicitly disabled.
+///
+/// "No timeout" has to stay expressible: a trusted link on a controlled
+/// network is a legitimate reason to wait indefinitely, and without `"off"` an
+/// operator who wants that is pushed into writing an absurd number instead —
+/// which reads as a mistake and behaves like one if it is ever reached.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OptionalDuration(pub Option<Duration>);
+
+impl std::fmt::Display for OptionalDuration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(duration) => write!(formatter, "{}", humantime::format_duration(duration)),
+            None => formatter.write_str("off"),
+        }
+    }
+}
+
+fn parse_optional_duration(value: &str) -> Result<OptionalDuration, String> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(OptionalDuration(None));
+    }
+    humantime::parse_duration(trimmed)
+        .map(|duration| OptionalDuration(Some(duration)))
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Conf)]

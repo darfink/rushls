@@ -27,6 +27,18 @@ struct ReadOpaque {
     control: Arc<Control>,
 }
 
+/// The `va_list` parameter FFmpeg's log callback prototype uses.
+///
+/// `va_list` is already a pointer typedef on Apple targets, so the typedef is
+/// the parameter type. On SysV x86 it is an array typedef
+/// (`__va_list_tag[1]`), and a function parameter of array type decays to a
+/// pointer, so bindgen binds the prototype's parameter as that pointer; a
+/// callback written with the array typedef itself no longer matches.
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+type FfmpegLogVaList = *mut ffmpeg::__va_list_tag;
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86"))))]
+type FfmpegLogVaList = ffmpeg::va_list;
+
 /// Silences one benign FFmpeg message without hiding anything else.
 ///
 /// FLV script-data captions log "OnTextData packet is not implemented" once per
@@ -74,7 +86,7 @@ unsafe extern "C" fn filter_log(
     class: *mut c_void,
     level: libc::c_int,
     format: *const libc::c_char,
-    arguments: ffmpeg::va_list,
+    arguments: FfmpegLogVaList,
 ) {
     if !format.is_null() {
         // `avpriv_request_sample` passes its subject through the format string,

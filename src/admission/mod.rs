@@ -166,7 +166,7 @@ impl StreamPolicy {
             },
             accepted_video_codecs: vec![Codec::H264, Codec::Hevc, Codec::Av1],
             accepted_audio_codecs: vec![Codec::Aac, Codec::Opus],
-            accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::SubRip],
+            accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::SubRip, Codec::Text],
             maximum_audio_tracks: 8,
             maximum_subtitle_tracks: 8,
             maximum_video_tracks: 8,
