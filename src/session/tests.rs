@@ -472,6 +472,7 @@ impl Muxer for FakeMuxer {
                 packaging_segment_id: PackagingSegmentId(0),
                 media_start: 0,
                 duration: self.duration,
+                payload: None,
             }));
         }
         Ok(())
@@ -549,6 +550,7 @@ fn name(event: &SessionEvent) -> &'static str {
         SessionEvent::SegmentationLocked { .. } => "segmentation_locked",
         SessionEvent::SegmentationExtended { .. } => "segmentation_extended",
         SessionEvent::SubtitleCueTooLate { .. } => "subtitle_cue_too_late",
+        SessionEvent::SubtitleStateLongLived { .. } => "subtitle_state_long_lived",
         SessionEvent::ClosedCaptionsDetected { .. } => "closed_captions_detected",
         SessionEvent::ClosedCaptionsPartial { .. } => "closed_captions_partial",
         SessionEvent::ClosedCaptionsChannelMismatch => "closed_captions_channel_mismatch",

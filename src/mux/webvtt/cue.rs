@@ -18,6 +18,7 @@ use super::{MuxError, mux_error};
 mod subrip;
 
 /// One cue's WebVTT content, whatever dialect produced it.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CueContent {
     pub metadata: WebVttCueMetadata,
     pub text: Arc<str>,

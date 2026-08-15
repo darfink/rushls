@@ -175,6 +175,7 @@ pub fn write_segment(lease: &StreamLease, local: u32, segment: u64, start: i64) 
             packaging_segment_id: PackagingSegmentId(segment),
             media_start: start,
             duration: 6,
+            payload: None,
         }),
     );
 }

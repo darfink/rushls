@@ -8,7 +8,7 @@ use std::{cmp::Ordering, collections::VecDeque, num::NonZero, sync::Arc};
 
 mod cue;
 
-use cue::{CueAction, CueDialect};
+use cue::{CueAction, CueContent, CueDialect};
 
 use crate::{
     domain::{
@@ -40,17 +40,12 @@ const MAX_HEARTBEAT_SEGMENTS_PER_TICK: u64 = 4_096;
 // planning error rather than something to discover mid-publication.
 const MAX_PARTS_PER_SEGMENT: u64 = 4_096;
 
-/// How long an open-ended cue may stay on screen without a successor.
+/// An unchanged open-ended display state this old is worth reporting.
 ///
-/// Cues from FLV script data carry no end: they show until replaced. A cap is
-/// what stops the last cue of a stream, or one before a long silence, from
-/// being displayed forever. Wowza's equivalent default is ten seconds; three
-/// is used here because the seal-driven flush usually resolves a cue first,
-/// and a shorter cap bounds how long a stale cue can linger.
-///
-/// Expressed in the 90 kHz presentation clock every subtitle plan is
-/// normalized to, which [`build_track`] already enforces.
-const MAX_TEXT_CUE_DISPLAY: TickDuration = 3 * 90_000;
+/// This is deliberately not a presentation timeout. FLV text is replacement
+/// state, so only the publisher can distinguish a deliberately long caption
+/// from a lost clear. The muxer reports the condition once and keeps rendering.
+const LONG_LIVED_TEXT_STATE: TickDuration = 30 * 90_000;
 
 const INITIALIZATION: &[u8] = b"WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n";
 
@@ -61,11 +56,17 @@ struct Cue {
     /// reparsing what was already formatted.
     start: TickTimestamp,
     end: TickTimestamp,
-    start_ms: u64,
-    end_ms: u64,
     identifier: Option<Arc<str>>,
     settings: Option<Arc<str>>,
     text: Arc<str>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveCue {
+    sample: SubtitleSample,
+    start: TickTimestamp,
+    content: CueContent,
+    long_lived_reported: bool,
 }
 
 #[derive(Debug)]
@@ -173,12 +174,12 @@ struct WebVttTrack {
     next_window_id: u64,
     last_cue_start: Option<TickTimestamp>,
     maximum_cue_end: Option<TickTimestamp>,
-    /// An open-ended cue waiting for something to decide its end.
+    /// The publisher-owned display state for an open-ended text dialect.
     ///
-    /// At most one: a cue is resolved the moment its successor arrives, so a
-    /// second can never be waiting behind it. Only ever occupied for a dialect
-    /// whose codec is open-ended.
-    pending: Option<SubtitleSample>,
+    /// It is rendered provisionally at every seal boundary, then resolved into
+    /// canonical intervals when a replacement or clear arrives. Consequently a
+    /// part never waits for the future merely to know what is on screen now.
+    active: Option<ActiveCue>,
     /// How far the presentation has advanced, as reported by sibling tracks.
     ///
     /// Only ever moves forward: siblings interleave, so a later sample can
@@ -242,7 +243,7 @@ impl WebVttTrack {
             next_window_id: 1,
             last_cue_start: None,
             maximum_cue_end: None,
-            pending: None,
+            active: None,
             clock: None,
             initialized: false,
             finished: false,
@@ -391,28 +392,11 @@ impl WebVttTrack {
                 self.track_id
             )));
         }
-        let milliseconds = TimebaseProjection::new(
-            self.plan.timebase,
-            Timebase::new(nz::u32!(1), nz::u32!(1_000)),
-        );
-        let (start_ms, duration_ms) =
-            milliseconds
-                .interval(start, sample.duration)
-                .ok_or_else(|| {
-                    mux_error("subtitle cue cannot be represented in WebVTT milliseconds")
-                })?;
-        let start_ms = u64::try_from(start_ms)
-            .map_err(|_| mux_error("subtitle cue begins before the publication origin"))?;
-        let end_ms = start_ms
-            .checked_add(duration_ms)
-            .ok_or_else(|| mux_error("WebVTT cue end overflowed"))?;
         Ok(Cue {
             start,
             end: start
                 .checked_add_unsigned(sample.duration)
                 .ok_or_else(|| mux_error("subtitle cue end overflowed while rendering"))?,
-            start_ms,
-            end_ms,
             identifier: content.metadata.identifier,
             settings: content.metadata.settings,
             text: content.text,
@@ -602,7 +586,12 @@ impl WebVttTrack {
             media_start: window.start,
             duration,
             independent: true,
-            payload: Payload::from(render_range(window, window.start, end)),
+            payload: Payload::from(self.render_range(
+                window,
+                window.start,
+                end,
+                self.dialect == CueDialect::Text,
+            )),
         }));
     }
 
@@ -630,7 +619,7 @@ impl WebVttTrack {
             media_start: start,
             duration,
             independent: true,
-            payload: Payload::from(render_range(window, start, end)),
+            payload: Payload::from(self.render_range(window, start, end, true)),
         }));
     }
 
@@ -640,12 +629,76 @@ impl WebVttTrack {
         duration: TickDuration,
         out: &mut dyn Appender<PackagedMedia>,
     ) {
+        let end = window.start.saturating_add_unsigned(duration);
         out.push(PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
             rendition_id: self.rendition_id,
             packaging_segment_id: PackagingSegmentId(window.id),
             media_start: window.start,
             duration,
+            payload: Some(Payload::from(self.render_range(
+                window,
+                window.start,
+                end,
+                self.dialect == CueDialect::Text,
+            ))),
         }));
+    }
+
+    /// Renders the display state intersecting `[start, end)` as independent
+    /// WebVTT cue slices.
+    ///
+    /// Clipping every interval to the resource boundary makes adjacent parts
+    /// tile exactly. In particular, an unresolved active state can be emitted
+    /// now without inventing a future end that a later clear could not retract.
+    fn render_range(
+        &self,
+        window: &Window,
+        start: TickTimestamp,
+        end: TickTimestamp,
+        clip_resolved: bool,
+    ) -> Vec<u8> {
+        let milliseconds = TimebaseProjection::new(
+            self.plan.timebase,
+            Timebase::new(nz::u32!(1), nz::u32!(1_000)),
+        );
+        let mut body = String::new();
+        for cue in window
+            .cues
+            .iter()
+            .filter(|cue| cue.start < end && cue.end > start)
+        {
+            render_cue_slice(
+                &mut body,
+                milliseconds,
+                if clip_resolved {
+                    cue.start.max(start)
+                } else {
+                    cue.start
+                },
+                if clip_resolved {
+                    cue.end.min(end)
+                } else {
+                    cue.end
+                },
+                cue.identifier.as_deref(),
+                cue.settings.as_deref(),
+                &cue.text,
+            );
+        }
+        if let Some(active) = &self.active
+            && active.start < end
+        {
+            render_cue_slice(
+                &mut body,
+                milliseconds,
+                active.start.max(start),
+                end,
+                active.content.metadata.identifier.as_deref(),
+                active.content.metadata.settings.as_deref(),
+                &active.content.text,
+            );
+        }
+        body.into_bytes()
     }
 
     /// Where one part of `window` begins and how long it runs.
@@ -738,58 +791,83 @@ impl WebVttTrack {
         Ok(())
     }
 
-    /// Ends the held cue and places it, if one is waiting.
-    ///
-    /// `successor` is the start of the cue replacing it, which is what an
-    /// open-ended cue means by its end. Absent at finish, where nothing
-    /// replaces it and the cap is all that remains. Either way the span is
-    /// bounded by [`MAX_TEXT_CUE_DISPLAY`], so a publisher that goes quiet
-    /// cannot leave a cue on screen indefinitely.
-    fn resolve_pending(
+    /// Resolves the active replacement state at a presentation-relative end.
+    fn close_active_at(
         &mut self,
-        successor: Option<TickTimestamp>,
+        end: TickTimestamp,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
-        let Some(mut cue) = self.pending.take() else {
+        let Some(active) = self.active.take() else {
             return Ok(());
         };
-        let capped = cue.pts.saturating_add_unsigned(MAX_TEXT_CUE_DISPLAY);
-        let end = successor.map_or(capped, |next| next.min(capped));
-        // A successor sharing its predecessor's timestamp would otherwise
-        // produce an empty span, which WebVTT cannot express as a visible cue.
-        // Dropping the predecessor is what "replaced immediately" means.
         let Some(duration) = end
-            .checked_sub(cue.pts)
+            .checked_sub(active.start)
             .and_then(|span| TickDuration::try_from(span).ok().filter(|span| *span > 0))
         else {
             return Ok(());
         };
-        cue.duration = duration;
-        self.place_cue(&cue, out)
+        let mut sample = active.sample;
+        sample.duration = duration;
+        // Identical replacement messages advance input ordering without
+        // changing the active state's original start. Resolving that older
+        // start is not a timestamp rewind, so validate it against itself and
+        // restore the latest observed state-change position afterwards.
+        let latest_update = self.last_cue_start;
+        self.last_cue_start = Some(sample.pts);
+        let result = self.place_cue(&sample, out);
+        self.last_cue_start = latest_update.or(self.last_cue_start);
+        result
     }
 
-    /// Resolves a held cue that the clock is about to seal past.
-    ///
-    /// Once the windows carrying a cue are published it can only be dropped, so
-    /// a cue is committed at its cap as soon as the presentation clock reaches
-    /// the end of that span. Cues still inside their display window are left
-    /// held, so an ordinary successor can still shorten them.
-    fn flush_pending_before(
-        &mut self,
-        now: MediaInstant,
-        out: &mut dyn Appender<PackagedMedia>,
-    ) -> Result<(), MuxError> {
-        let Some(cue) = self.pending.as_ref() else {
-            return Ok(());
+    fn report_long_lived_state(&mut self, now: MediaInstant) {
+        let Some(active) = self.active.as_ref() else {
+            return;
         };
-        let deadline = self.instant(cue.pts.saturating_add_unsigned(MAX_TEXT_CUE_DISPLAY));
-        if now
-            .compare(deadline)
-            .is_some_and(|ordering| ordering == Ordering::Less)
-        {
-            return Ok(());
+        if active.long_lived_reported {
+            return;
         }
-        self.resolve_pending(None, out)
+        let start = active.start;
+        let Some(age) = now.elapsed_since(self.instant(start)) else {
+            return;
+        };
+        if age < self.plan.timebase.ticks_to_duration(LONG_LIVED_TEXT_STATE) {
+            return;
+        }
+        if let Some(active) = self.active.as_mut() {
+            active.long_lived_reported = true;
+        }
+        self.events.emit(SessionEvent::SubtitleStateLongLived {
+            track: self.track_id,
+            started_at: self
+                .plan
+                .timebase
+                .ticks_to_duration(u64::try_from(start.max(0)).unwrap_or(u64::MAX)),
+            age,
+        });
+    }
+
+    /// Report a replacement-state transition whose intended start is already
+    /// behind the first byte range that can still be changed. The state still
+    /// applies to future parts; already published parts are never revised.
+    fn report_late_transition(&self, start: TickTimestamp) {
+        let Some(window) = self.windows.front() else {
+            return;
+        };
+        let revisable = self
+            .part_ticks
+            .and_then(|ticks| u64::from(window.sealed_parts).checked_mul(ticks))
+            .and_then(|offset| window.start.checked_add_unsigned(offset))
+            .unwrap_or(window.start);
+        if start >= revisable {
+            return;
+        }
+        self.events.emit(SessionEvent::SubtitleCueTooLate {
+            track: self.track_id,
+            late_by: self
+                .clock
+                .and_then(|now| now.elapsed_since(self.instant(start)))
+                .unwrap_or_default(),
+        });
     }
 }
 
@@ -833,10 +911,12 @@ impl TrackPackager for WebVttTrack {
             // which resolves to an empty span and silently drops it instead of
             // failing the publisher that rewound.
             let previous = self
-                .pending
+                .active
                 .as_ref()
-                .map(|held| held.pts)
-                .or(self.last_cue_start);
+                .map(|active| active.sample.pts)
+                .into_iter()
+                .chain(self.last_cue_start)
+                .max();
             if previous.is_some_and(|previous| sample.pts < previous) {
                 return Err(mux_error(format!(
                     "{} supplied decreasing subtitle PTS",
@@ -861,10 +941,12 @@ impl TrackPackager for WebVttTrack {
                     self.track_id
                 )));
             }
-            // The arriving cue is what ends its predecessor: an open-ended cue
-            // shows until something replaces it.
-            self.resolve_pending(Some(sample.pts), out)?;
+            let start = sample
+                .pts
+                .checked_sub(self.plan.presentation_origin_pts)
+                .ok_or_else(|| mux_error("subtitle PTS rebasing overflowed"))?;
             if matches!(action, CueAction::Clear) {
+                self.close_active_at(start, out)?;
                 // The clear has done its whole job by ending the held cue.
                 // Holding nothing in its place is what makes the display go
                 // empty, and it is why a clear publishes no cue of its own.
@@ -876,7 +958,29 @@ impl TrackPackager for WebVttTrack {
                 self.last_cue_start = Some(sample.pts);
                 return Ok(());
             }
-            self.pending = Some(sample);
+            let CueAction::Show(content) = action else {
+                unreachable!("clear was handled above")
+            };
+            self.report_late_transition(start);
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|active| active.content == content)
+            {
+                // Replacement state did not change. Keeping the original start
+                // coalesces publisher restatements and, importantly, does not
+                // let them hide a missing clear from the long-lived warning.
+                self.last_cue_start = Some(sample.pts);
+                return Ok(());
+            }
+            self.close_active_at(start, out)?;
+            self.last_cue_start = Some(sample.pts);
+            self.active = Some(ActiveCue {
+                sample,
+                start,
+                content,
+                long_lived_reported: false,
+            });
             return Ok(());
         }
         self.place_cue(&sample, out)
@@ -903,11 +1007,7 @@ impl TrackPackager for WebVttTrack {
         // segment. This is also what makes the rendition servable from the
         // start of the presentation rather than from its first cue.
         self.initialize(out);
-        // A held cue whose window is about to seal has to be placed now: once
-        // the segments carrying it are out, it can only be dropped. Resolved
-        // before sealing rather than after, so it lands in the window it
-        // belongs to instead of arriving one step too late.
-        self.flush_pending_before(now, out)?;
+        self.report_long_lived_state(now);
         self.seal_before(now, out);
         Ok(())
     }
@@ -920,13 +1020,19 @@ impl TrackPackager for WebVttTrack {
         if self.finished {
             return Ok(());
         }
-        // The last cue of a stream has no successor to end it, so the cap is
-        // what it gets. Before `finished` is set, since placing a cue is a
-        // normal push and refuses to run after finish.
-        if reason != FinishReason::Superseded {
-            self.resolve_pending(None, out)?;
+        // The presentation end is the only honest end for an active replacement
+        // state. A timeout would override the publisher; the latest sibling
+        // clock instead closes exactly where the media itself stopped.
+        if reason != FinishReason::Superseded
+            && let (Some(active), Some(clock)) = (self.active.as_ref(), self.clock)
+            && let Some(elapsed) = clock.elapsed_since(self.instant(active.start))
+        {
+            let end = active
+                .start
+                .saturating_add_unsigned(self.plan.timebase.duration_to_ticks(elapsed));
+            self.close_active_at(end, out)?;
         }
-        self.pending = None;
+        self.active = None;
         self.finished = true;
         if reason == FinishReason::Superseded {
             self.windows.clear();
@@ -977,38 +1083,48 @@ impl TrackPackager for WebVttTrack {
     }
 }
 
-/// Renders the cues on screen at any point in `[start, end)`.
-///
-/// Selecting by overlap rather than by start is what a WebVTT segment already
-/// promises — every cue intended to be displayed during the period — and
-/// applying the same rule to a part keeps that promise at part resolution.
-fn render_range(window: &Window, start: TickTimestamp, end: TickTimestamp) -> Vec<u8> {
-    let mut body = String::new();
-    for cue in window
-        .cues
-        .iter()
-        .filter(|cue| cue.start < end && cue.end > start)
-    {
-        if let Some(identifier) = cue.identifier.as_deref()
-            && !identifier.is_empty()
-        {
-            body.push_str(identifier);
-            body.push('\n');
-        }
-        body.push_str(&format_timestamp(cue.start_ms));
-        body.push_str(" --> ");
-        body.push_str(&format_timestamp(cue.end_ms));
-        if let Some(settings) = cue.settings.as_deref()
-            && !settings.is_empty()
-        {
-            body.push(' ');
-            body.push_str(settings);
-        }
-        body.push('\n');
-        body.push_str(&cue.text);
-        body.push_str("\n\n");
+fn render_cue_slice(
+    body: &mut String,
+    milliseconds: TimebaseProjection,
+    start: TickTimestamp,
+    end: TickTimestamp,
+    identifier: Option<&str>,
+    settings: Option<&str>,
+    text: &str,
+) {
+    let Some(start_ms) = milliseconds
+        .timestamp(start)
+        .and_then(|value| u64::try_from(value).ok())
+    else {
+        return;
+    };
+    let Some(end_ms) = milliseconds
+        .timestamp(end)
+        .and_then(|value| u64::try_from(value).ok())
+    else {
+        return;
+    };
+    if end_ms <= start_ms {
+        return;
     }
-    body.into_bytes()
+    if let Some(identifier) = identifier
+        && !identifier.is_empty()
+    {
+        body.push_str(identifier);
+        body.push('\n');
+    }
+    body.push_str(&format_timestamp(start_ms));
+    body.push_str(" --> ");
+    body.push_str(&format_timestamp(end_ms));
+    if let Some(settings) = settings
+        && !settings.is_empty()
+    {
+        body.push(' ');
+        body.push_str(settings);
+    }
+    body.push('\n');
+    body.push_str(text);
+    body.push_str("\n\n");
 }
 
 fn format_timestamp(milliseconds: u64) -> String {
@@ -1488,6 +1604,106 @@ mod tests {
             );
             assert!(part.independent);
         }
+        let completion = completions(&output)
+            .first()
+            .and_then(|completion| completion.payload.as_ref())
+            .expect("WebVTT parent has a canonical standalone body");
+        let parent = str::from_utf8(completion.as_bytes())?;
+        assert_eq!(parent.matches("spanning").count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn an_open_text_state_tiles_every_part_until_clear() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux_with_parts(Codec::Text, 2, 1);
+        let mut output = Vec::new();
+        mux.push(text_cue(0, b"and then we had"), &mut output)?;
+        mux.tick(sibling(3), &mut output)?;
+
+        let parts = parts(&output);
+        assert!(parts.len() >= 2);
+        let first = str::from_utf8(parts[0].payload.as_bytes())?;
+        let second = str::from_utf8(parts[1].payload.as_bytes())?;
+        assert!(first.contains("00:00:00.000 --> 00:00:01.000\nand then we had"));
+        assert!(second.contains("00:00:01.000 --> 00:00:02.000\nand then we had"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_clear_inside_a_part_leaves_later_parts_empty() -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux_with_parts(Codec::Text, 2, 1);
+        let mut output = Vec::new();
+        mux.push(text_cue(0, b"visible"), &mut output)?;
+        mux.push(text_cue(SECOND_TICKS + SECOND_TICKS / 2, b""), &mut output)?;
+        mux.tick(sibling(4), &mut output)?;
+
+        let parts = parts(&output);
+        assert!(parts.len() >= 3);
+        assert!(str::from_utf8(parts[0].payload.as_bytes())?.contains("visible"));
+        let crossing = str::from_utf8(parts[1].payload.as_bytes())?;
+        assert!(crossing.contains("00:00:01.000 --> 00:00:01.500\nvisible"));
+        assert!(parts[2].payload.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_long_lived_text_state_is_reported_once_without_clearing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (events, recorded) = RecordedEvents::sink();
+        let mut mux = parts_mux(Codec::Text, 2, 1, events);
+        let mut output = Vec::new();
+        mux.push(text_cue(0, b"still active"), &mut output)?;
+        mux.tick(sibling(31), &mut output)?;
+        mux.tick(sibling(32), &mut output)?;
+
+        assert!(parts(&output).iter().any(|part| {
+            str::from_utf8(part.payload.as_bytes()).is_ok_and(|body| body.contains("still active"))
+        }));
+        assert!(matches!(
+            recorded.events().as_slice(),
+            [SessionEvent::SubtitleStateLongLived {
+                track: TrackId(0),
+                ..
+            }]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn identical_restatement_advances_transition_ordering() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut mux = mux(Codec::Text, 30);
+        let mut output = Vec::new();
+        mux.push(text_cue(0, b"same"), &mut output)?;
+        mux.push(text_cue(2 * SECOND_TICKS, b"same"), &mut output)?;
+
+        let error = mux
+            .push(text_cue(SECOND_TICKS, b""), &mut output)
+            .expect_err("clear before the latest state update must be rejected");
+        assert!(error.to_string().contains("decreasing subtitle PTS"));
+        Ok(())
+    }
+
+    #[test]
+    fn open_state_starting_behind_sealed_parts_is_reported_late()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (events, recorded) = RecordedEvents::sink();
+        let mut mux = parts_mux(Codec::Text, 2, 1, events);
+        let mut output = Vec::new();
+        mux.tick(sibling(2), &mut output)?;
+        mux.push(text_cue(0, b"late but active"), &mut output)?;
+        mux.tick(sibling(3), &mut output)?;
+
+        assert!(
+            recorded
+                .events()
+                .iter()
+                .any(|event| matches!(event, SessionEvent::SubtitleCueTooLate { .. }))
+        );
+        assert!(parts(&output).iter().any(|part| {
+            str::from_utf8(part.payload.as_bytes())
+                .is_ok_and(|body| body.contains("late but active"))
+        }));
         Ok(())
     }
 
@@ -1773,12 +1989,13 @@ mod tests {
         assert!(rendered(&output).is_empty());
 
         mux.push(text_cue(SECOND_TICKS, b"second"), &mut output)?;
+        mux.tick(sibling(4), &mut output)?;
         mux.finish(FinishReason::Final, &mut output)?;
 
         let body = rendered(&output);
         // The first cue ends exactly where the second begins.
         assert!(body.contains("00:00:00.000 --> 00:00:01.000\nfirst\n"));
-        // The last cue has no successor, so it gets the cap.
+        // The last cue closes where the presentation itself ends.
         assert!(body.contains("00:00:01.000 --> 00:00:04.000\nsecond\n"));
         Ok(())
     }
@@ -1790,9 +2007,7 @@ mod tests {
         let mut output = Vec::new();
 
         mux.push(text_cue(0, b"first"), &mut output)?;
-        // The publisher's own clear, well inside the cap: without it the cue
-        // would run to `MAX_TEXT_CUE_DISPLAY` and the display would stay
-        // populated for two seconds longer than the publisher intended.
+        // The publisher's own clear is the only normal display end.
         mux.push(text_cue(SECOND_TICKS, b""), &mut output)?;
         mux.finish(FinishReason::Final, &mut output)?;
 
@@ -1813,11 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn a_clear_lets_the_publisher_beat_the_display_cap() -> Result<(), Box<dyn std::error::Error>> {
-        // The reason this exists. Without a clear the end of a cue is
-        // whichever comes first of its successor or this node's cap, so a
-        // publisher whose own clear policy is longer or shorter than the cap
-        // cannot express it. With one, the publisher decides.
+    fn a_clear_ends_state_at_the_publishers_timestamp() -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::Text, 30);
         let mut output = Vec::new();
 
@@ -1844,6 +2055,7 @@ mod tests {
         mux.push(text_cue(0, b""), &mut output)?;
         mux.push(text_cue(SECOND_TICKS, b""), &mut output)?;
         mux.push(text_cue(2 * SECOND_TICKS, b"after"), &mut output)?;
+        mux.tick(sibling(5), &mut output)?;
         mux.finish(FinishReason::Final, &mut output)?;
 
         let body = rendered(&output);
@@ -1878,25 +2090,25 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_longer_than_the_cap_does_not_leave_a_cue_on_screen()
+    fn a_gap_without_a_clear_keeps_the_publishers_state_visible()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::Text, 30);
         let mut output = Vec::new();
 
-        // Ten seconds of silence between cues. Ending the first where the
-        // second begins would hold it far past what a viewer would read as one
-        // caption, so the cap wins.
+        // Ten seconds of silence between cues. RushLS cannot know whether that
+        // is deliberate, so the successor — not an inferred cap — ends it.
         mux.push(text_cue(0, b"first"), &mut output)?;
         mux.push(text_cue(10 * SECOND_TICKS, b"second"), &mut output)?;
+        mux.tick(sibling(13), &mut output)?;
         mux.finish(FinishReason::Final, &mut output)?;
 
         let body = rendered(&output);
-        assert!(body.contains("00:00:00.000 --> 00:00:03.000\nfirst\n"));
+        assert!(body.contains("00:00:00.000 --> 00:00:10.000\nfirst\n"));
         Ok(())
     }
 
     #[test]
-    fn consecutive_cues_never_overlap() -> Result<(), Box<dyn std::error::Error>> {
+    fn identical_replacements_are_coalesced() -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::Text, 30);
         let mut output = Vec::new();
 
@@ -1906,19 +2118,12 @@ mod tests {
         for index in 0..4 {
             mux.push(text_cue(index * SECOND_TICKS, b"line"), &mut output)?;
         }
+        mux.tick(sibling(4), &mut output)?;
         mux.finish(FinishReason::Final, &mut output)?;
 
         let body = rendered(&output);
-        for (start, end) in [
-            ("00:00:00.000", "00:00:01.000"),
-            ("00:00:01.000", "00:00:02.000"),
-            ("00:00:02.000", "00:00:03.000"),
-        ] {
-            assert!(
-                body.contains(&format!("{start} --> {end}")),
-                "missing {start}"
-            );
-        }
+        assert!(body.contains("00:00:00.000 --> 00:00:04.000\nline\n"));
+        assert_eq!(body.matches("line").count(), 1);
         Ok(())
     }
 
@@ -1928,14 +2133,13 @@ mod tests {
         let mut mux = mux_with_events(Codec::Text, 2, events);
         let mut output = Vec::new();
 
-        // The cue arrives, then the presentation clock runs past its cap while
-        // no successor ever comes. Leaving it held would let the windows that
-        // could carry it seal and publish empty.
+        // The cue arrives, then the presentation clock advances without a
+        // successor. Every sealed window must still carry the active state.
         mux.push(text_cue(0, b"only"), &mut output)?;
         mux.tick(sibling(6), &mut output)?;
 
         let body = rendered(&output);
-        assert!(body.contains("00:00:00.000 --> 00:00:03.000\nonly\n"));
+        assert!(body.contains("00:00:00.000 --> 00:00:02.000\nonly\n"));
         // Committed on time, so this is not the drop path.
         assert!(recorded.events().is_empty());
         Ok(())
@@ -1951,6 +2155,7 @@ mod tests {
         // ever visible, and a zero-length span is not a cue WebVTT can express.
         mux.push(text_cue(0, b"replaced"), &mut output)?;
         mux.push(text_cue(0, b"winner"), &mut output)?;
+        mux.tick(sibling(3), &mut output)?;
         mux.finish(FinishReason::Final, &mut output)?;
 
         let body = rendered(&output);

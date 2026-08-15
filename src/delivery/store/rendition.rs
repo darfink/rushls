@@ -601,7 +601,7 @@ impl RenditionState {
                 self.push_direct_segment(publication, segment, gzip, now, retention);
             }
             PackagedMedia::SegmentCompleted(completion) => {
-                self.complete_segment(completion, now, retention);
+                self.complete_segment(completion, gzip, now, retention);
             }
         }
     }
@@ -705,6 +705,7 @@ impl RenditionState {
     fn complete_segment(
         &mut self,
         completion: PackagedSegmentCompletion,
+        gzip: Option<Payload>,
         now: Instant,
         retention: RetentionPolicy,
     ) {
@@ -716,6 +717,7 @@ impl RenditionState {
                 resource.parent_retained = true;
             }
         }
+        let standalone = completion.payload;
         let segment = StoredSegment {
             id: open.id,
             msn: open.msn,
@@ -728,10 +730,11 @@ impl RenditionState {
             // Decided when the segment opened; completing it only preserves
             // the answer its already-published parts were tagged under.
             discontinuity_before: open.discontinuity_before,
-            kind: StoredSegmentKind::Media(SegmentBody::Chunked(Arc::clone(&parts))),
-            // Served from the parts that composed it, so there is no single
-            // buffer anyone encoded.
-            gzip: None,
+            kind: StoredSegmentKind::Media(match standalone {
+                Some(payload) => SegmentBody::Contiguous(payload),
+                None => SegmentBody::Chunked(Arc::clone(&parts)),
+            }),
+            gzip,
         };
         self.commit_segment(
             segment,

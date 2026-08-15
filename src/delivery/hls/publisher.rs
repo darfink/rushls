@@ -151,9 +151,8 @@ impl StorePublisher {
     /// The encoding delivery will serve this media under, if any.
     ///
     /// Computed on the way in, where the bytes are already in hand and the work
-    /// happens once per object. A completed segment carries no payload of its
-    /// own — it is served from the parts already published — so there is
-    /// nothing here to encode.
+    /// happens once per object. Most completed segments carry no payload of
+    /// their own; a text completion may provide a canonical parent body.
     fn encoding(&self, media: &PackagedMedia) -> Option<Payload> {
         if !self.text.contains(&media.rendition_id()) {
             return None;
@@ -162,7 +161,7 @@ impl StorePublisher {
             PackagedMedia::Initialization(segment) => &segment.payload,
             PackagedMedia::Chunk(chunk) => &chunk.payload,
             PackagedMedia::Segment(segment) => &segment.payload,
-            PackagedMedia::SegmentCompleted(_) => return None,
+            PackagedMedia::SegmentCompleted(completion) => completion.payload.as_ref()?,
         };
         Some(Payload::from_bytes(gzip(payload.bytes())))
     }

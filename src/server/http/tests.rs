@@ -823,6 +823,7 @@ async fn an_unsatisfiable_wait_ends_in_503_with_a_retry_hint() {
             packaging_segment_id: crate::mux::PackagingSegmentId(0),
             media_start: 0,
             duration: 1,
+            payload: None,
         }),
     );
 

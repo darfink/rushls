@@ -254,6 +254,7 @@ impl CmafTrack {
                 packaging_segment_id: PackagingSegmentId(self.segment.id),
                 media_start: self.segment.start,
                 duration: self.segment.filled,
+                payload: None,
             }));
             self.segment.advance(&self.plan)?;
         } else if self.segment.part_access_units >= self.plan.part_access_units.get()
@@ -532,6 +533,7 @@ impl TrackPackager for CmafTrack {
                     packaging_segment_id: PackagingSegmentId(self.segment.id),
                     media_start: self.segment.start,
                     duration: self.segment.filled,
+                    payload: None,
                 }));
             }
         }

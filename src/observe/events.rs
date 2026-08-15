@@ -50,6 +50,17 @@ pub enum SessionEvent {
         track: TrackId,
         late_by: Duration,
     },
+    /// One unchanged subtitle display state remained active unusually long.
+    ///
+    /// This is diagnostic only: an open-ended caption is publisher-owned and
+    /// remains visible until an explicit replacement or clear. Reporting once
+    /// per state generation makes a lost clear observable without introducing
+    /// a second, consumer-side presentation timeout.
+    SubtitleStateLongLived {
+        track: TrackId,
+        started_at: Duration,
+        age: Duration,
+    },
     /// In-band closed captions were detected and are now advertised.
     ///
     /// Carries the channels so an operator can tell a 608-only publisher from a

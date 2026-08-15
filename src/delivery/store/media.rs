@@ -147,10 +147,11 @@ impl PublishedSegments {
 /// Distinct from [`segment_byte_len`], which describes the reassembled
 /// resource for bitrate accounting.
 pub fn segment_resource_bytes(segment: &StoredSegment) -> usize {
-    match &segment.kind {
+    let payload = match &segment.kind {
         StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) => payload.len(),
         StoredSegmentKind::Media(SegmentBody::Chunked(_)) | StoredSegmentKind::Gap => 0,
-    }
+    };
+    payload.saturating_add(segment.gzip.as_ref().map_or(0, Payload::len))
 }
 
 /// The size of the media a completed segment carries, reassembled.

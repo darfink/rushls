@@ -107,13 +107,19 @@ pub struct PackagedSegment {
     pub payload: Payload,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackagedSegmentCompletion {
     pub rendition_id: PackagingRenditionId,
     /// Identifies the open packaging segment being completed.
     pub packaging_segment_id: PackagingSegmentId,
     pub media_start: TickTimestamp,
     pub duration: TickDuration,
+    /// Optional standalone representation of the completed parent segment.
+    ///
+    /// Binary formats normally reconstruct the parent from the chunks already
+    /// published. Text formats may need a canonical body instead: concatenating
+    /// independently decodable WebVTT parts repeats overlapping cues.
+    pub payload: Option<Payload>,
 }
 
 impl PackagedMedia {
