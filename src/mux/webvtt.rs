@@ -646,18 +646,11 @@ impl WebVttTrack {
         duration: TickDuration,
         out: &mut dyn Appender<PackagedMedia>,
     ) {
-        let end = window.start.saturating_add_unsigned(duration);
         out.push(PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
             rendition_id: self.rendition_id,
             packaging_segment_id: PackagingSegmentId(window.id),
             media_start: window.start,
             duration,
-            payload: Some(Payload::from(self.render_range(
-                window,
-                window.start,
-                end,
-                self.dialect == CueDialect::Text,
-            ))),
         }));
     }
 
@@ -1638,12 +1631,6 @@ mod tests {
             );
             assert!(part.independent);
         }
-        let completion = completions(&output)
-            .first()
-            .and_then(|completion| completion.payload.as_ref())
-            .expect("WebVTT parent has a canonical standalone body");
-        let parent = str::from_utf8(completion.as_bytes())?;
-        assert_eq!(parent.matches("spanning").count(), 1);
         Ok(())
     }
 

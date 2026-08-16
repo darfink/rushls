@@ -337,6 +337,37 @@ fn a_chunked_webvtt_playlist_advertises_vtt_parts() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn completed_webvtt_parts_remain_tagged_through_the_retention_frontier()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0), subtitle_with_parts(1)]);
+    write(&lease, initialization(1, 1));
+    for segment in 0..4 {
+        write_segment(&lease, 1, segment, i64::try_from(segment)? * 6);
+    }
+
+    let retained = render(&lease, 1, &policy())?;
+    assert!(
+        retained.contains("#EXT-X-PART:DURATION=1,URI=\"part/1.vtt\""),
+        "the oldest subtitle parent's parts remain tagged at exactly three \
+         target durations from the live edge: {retained}"
+    );
+
+    write(&lease, chunk(1, 4, 0, 24));
+    let advanced = render(&lease, 1, &policy())?;
+    assert!(
+        !advanced.contains("URI=\"part/1.vtt\""),
+        "the oldest subtitle parent's parts leave together only after crossing \
+         the retention frontier: {advanced}"
+    );
+    assert!(
+        advanced.contains("URI=\"part/7.vtt\""),
+        "newer completed subtitle parts remain advertised: {advanced}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_gap_is_tagged_rather_than_omitted() -> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let first = lease(&store, vec![video(0)]);

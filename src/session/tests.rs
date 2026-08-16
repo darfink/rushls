@@ -472,7 +472,6 @@ impl Muxer for FakeMuxer {
                 packaging_segment_id: PackagingSegmentId(0),
                 media_start: 0,
                 duration: self.duration,
-                payload: None,
             }));
         }
         Ok(())

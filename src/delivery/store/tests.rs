@@ -142,23 +142,6 @@ fn completion(rendition: u32, segment: u64, start: i64, duration: u64) -> Packag
         packaging_segment_id: PackagingSegmentId(segment),
         media_start: start,
         duration,
-        payload: None,
-    })
-}
-
-fn standalone_completion(
-    rendition: u32,
-    segment: u64,
-    start: i64,
-    duration: u64,
-    payload: Payload,
-) -> PackagedMedia {
-    PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
-        rendition_id: PackagingRenditionId(rendition),
-        packaging_segment_id: PackagingSegmentId(segment),
-        media_start: start,
-        duration,
-        payload: Some(payload),
     })
 }
 
@@ -403,46 +386,6 @@ fn completing_a_chunked_segment_reuses_the_original_payloads() {
             average_bits_per_second: Some(5),
             observed_segments: 1,
         }
-    );
-}
-
-#[test]
-fn standalone_completion_retains_parent_gzip_and_independent_parts() {
-    let store = store();
-    let lease = lease(&store, &[(0, true)]);
-    configure(&lease, 0, true);
-    for index in 0..6 {
-        write(&lease, chunk(0, 0, index, i64::from(index), 1, 1));
-    }
-
-    let parent = Payload::from(b"canonical-vtt".to_vec());
-    let gzip = Payload::from(b"compressed".to_vec());
-    assert_eq!(
-        lease.write_encoded(
-            standalone_completion(0, 0, 0, 6, parent.clone()),
-            Some(gzip.clone()),
-        ),
-        Ok(true)
-    );
-
-    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
-    let segment = &snapshot.segments[0];
-    assert!(matches!(
-        &segment.kind,
-        StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) if payload == &parent
-    ));
-    assert_eq!(segment.gzip.as_ref(), Some(&gzip));
-    assert!(snapshot.segments.parts(segment).is_empty());
-    for id in 1..=6 {
-        assert!(
-            lease.live().part(RenditionId(0), PartId(id)).is_some(),
-            "part {id} remains independently fetchable"
-        );
-    }
-    // Initialization + six parts + parent + gzip are all retained resources.
-    assert_eq!(
-        lease.live().retained_payload_bytes(),
-        1 + 6 + parent.len() + gzip.len()
     );
 }
 

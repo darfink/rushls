@@ -216,7 +216,8 @@ mod tests {
     use crate::{
         delivery::{
             hls::fixtures::{
-                PART_BYTES, chunk, initialization, lease, stream_id, video, write, write_segment,
+                PART_BYTES, chunk, initialization, lease, stream_id, subtitle_with_parts, video,
+                write, write_segment,
             },
             store::{Msn, SegmentId},
         },
@@ -257,6 +258,30 @@ mod tests {
                 .await,
             Err(DeliveryError::UnknownResource)
         );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_webvtt_parent_is_the_ordered_composition_of_its_parts() -> Result<(), DeliveryError>
+    {
+        let store = StreamStore::default();
+        let origin = Origin::new(store.clone());
+        let lease = lease(&store, vec![video(0), subtitle_with_parts(1)]);
+        write(&lease, initialization(1, 1));
+        write_segment(&lease, 1, 0, 0);
+
+        let object = origin
+            .media(
+                &stream_id(),
+                MediaResource::Segment(RenditionId(1), SegmentId(1), MediaSegmentFormat::WebVtt),
+                Duration::ZERO,
+            )
+            .await?;
+        let parent: Vec<u8> = object.body.into_frames().flatten().collect();
+        let expected: Vec<u8> = (0_u8..6)
+            .flat_map(|index| std::iter::repeat_n(index, PART_BYTES))
+            .collect();
+        assert_eq!(parent, expected);
         Ok(())
     }
 
