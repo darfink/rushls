@@ -271,7 +271,11 @@ impl WebVttTrack {
             .ok_or_else(|| mux_error("WebVTT window end overflowed"))
     }
 
-    fn prepare_cue(&self, sample: &SubtitleSample) -> Result<PreparedCue, MuxError> {
+    fn prepare_cue(
+        &self,
+        sample: &SubtitleSample,
+        resolving_state: bool,
+    ) -> Result<PreparedCue, MuxError> {
         if sample.track_id != self.track_id {
             return Err(mux_error(format!(
                 "{} received a cue for {}",
@@ -319,7 +323,7 @@ impl WebVttTrack {
             )));
         }
 
-        let (first_index, last_index) = self.cue_segment_span(start, end)?;
+        let (first_index, last_index) = self.cue_segment_span(start, end, resolving_state)?;
         // Verify every required window start before emitting initialization or
         // modifying the queue, keeping a failed push transactional.
         self.window_start(last_index)?;
@@ -337,6 +341,7 @@ impl WebVttTrack {
         &self,
         start: TickTimestamp,
         end: TickTimestamp,
+        resolving_state: bool,
     ) -> Result<(u64, u64), MuxError> {
         let first_index = self.segment_index(start)?;
         let last_index = self.segment_index(
@@ -350,7 +355,19 @@ impl WebVttTrack {
             .checked_sub(first_index)
             .and_then(|distance| distance.checked_add(1))
             .ok_or_else(|| mux_error("subtitle cue segment span overflowed"))?;
-        if span > MAX_CUE_SEGMENTS {
+        let last_materialized_window = self
+            .windows
+            .back()
+            .expect("unfinished WebVTT muxer always has a current window")
+            .id;
+        let windows_to_create = last_index.saturating_sub(last_materialized_window);
+        if resolving_state && windows_to_create > MAX_CUE_SEGMENTS {
+            return Err(mux_error(format!(
+                "{} subtitle state resolution requires more than {MAX_CUE_SEGMENTS} unmaterialized segments",
+                self.track_id
+            )));
+        }
+        if !resolving_state && span > MAX_CUE_SEGMENTS {
             return Err(mux_error(format!(
                 "{} subtitle cue overlaps {span} segments, above the {MAX_CUE_SEGMENTS}-segment safety limit",
                 self.track_id
@@ -748,8 +765,9 @@ impl WebVttTrack {
         &mut self,
         sample: &SubtitleSample,
         out: &mut dyn Appender<PackagedMedia>,
+        resolving_state: bool,
     ) -> Result<(), MuxError> {
-        let prepared = self.prepare_cue(sample)?;
+        let prepared = self.prepare_cue(sample, resolving_state)?;
 
         self.initialize(out);
         self.ensure_through(prepared.last_index)?;
@@ -774,7 +792,7 @@ impl WebVttTrack {
         // after every window that could have carried it was already published.
         // Dropping it is the only option left — the segments are out — but a
         // publisher whose subtitles consistently run late should be visible.
-        if !placed {
+        if !placed && !resolving_state {
             self.events.emit(SessionEvent::SubtitleCueTooLate {
                 track: self.track_id,
                 late_by: self
@@ -808,13 +826,11 @@ impl WebVttTrack {
         };
         let mut sample = active.sample;
         sample.duration = duration;
-        // Identical replacement messages advance input ordering without
-        // changing the active state's original start. Resolving that older
-        // start is not a timestamp rewind, so validate it against itself and
-        // restore the latest observed state-change position afterwards.
+        // A state's historical span was already rendered provisionally. Only
+        // still-open windows need the canonical resolved cue now.
         let latest_update = self.last_cue_start;
         self.last_cue_start = Some(sample.pts);
-        let result = self.place_cue(&sample, out);
+        let result = self.place_cue(&sample, out, true);
         self.last_cue_start = latest_update.or(self.last_cue_start);
         result
     }
@@ -946,6 +962,9 @@ impl TrackPackager for WebVttTrack {
                 .checked_sub(self.plan.presentation_origin_pts)
                 .ok_or_else(|| mux_error("subtitle PTS rebasing overflowed"))?;
             if matches!(action, CueAction::Clear) {
+                if self.active.is_some() {
+                    self.report_late_transition(start);
+                }
                 self.close_active_at(start, out)?;
                 // The clear has done its whole job by ending the held cue.
                 // Holding nothing in its place is what makes the display go
@@ -983,7 +1002,7 @@ impl TrackPackager for WebVttTrack {
             });
             return Ok(());
         }
-        self.place_cue(&sample, out)
+        self.place_cue(&sample, out, false)
     }
 
     fn tick(
@@ -1410,6 +1429,21 @@ mod tests {
     }
 
     #[test]
+    fn a_finite_cue_still_cannot_materialize_too_many_segments() {
+        let mut mux = mux(Codec::WebVtt, 2);
+        let mut output = Vec::new();
+        let duration = (MAX_CUE_SEGMENTS + 1) * 2 * SECOND;
+
+        let error = mux
+            .push(
+                sample(Codec::WebVtt, 0, duration, b"corrupt duration"),
+                &mut output,
+            )
+            .expect_err("a finite cue spanning too many segments must remain bounded");
+        assert!(error.to_string().contains("64-segment safety limit"));
+    }
+
+    #[test]
     fn sparse_cues_emit_empty_windows_without_inventing_cue_text()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::WebVtt, 2);
@@ -1647,6 +1681,26 @@ mod tests {
     }
 
     #[test]
+    fn a_late_clear_of_active_state_is_reported() -> Result<(), Box<dyn std::error::Error>> {
+        let (events, recorded) = RecordedEvents::sink();
+        let mut mux = parts_mux(Codec::Text, 2, 1, events);
+        let mut output = Vec::new();
+
+        mux.push(text_cue(0, b"visible"), &mut output)?;
+        mux.tick(sibling(2), &mut output)?;
+        mux.push(text_cue(SECOND_TICKS, b""), &mut output)?;
+
+        assert!(matches!(
+            recorded.events().as_slice(),
+            [SessionEvent::SubtitleCueTooLate {
+                track: TrackId(0),
+                ..
+            }]
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn a_long_lived_text_state_is_reported_once_without_clearing()
     -> Result<(), Box<dyn std::error::Error>> {
         let (events, recorded) = RecordedEvents::sink();
@@ -1666,6 +1720,59 @@ mod tests {
                 ..
             }]
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_long_lived_text_state_resolves_without_hitting_the_finite_cue_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const SILENCE_SECONDS: u64 = 18 * 60 + 40;
+
+        let (events, recorded) = RecordedEvents::sink();
+        let mut mux = parts_mux(Codec::Text, 2, 1, events);
+        let mut output = Vec::new();
+
+        // This is the production failure shape: an invisible non-empty state
+        // stayed active from presentation zero until speech began 560 segments
+        // later. It must remain observable without making that replacement
+        // fatal merely because the historical state was long-lived.
+        mux.push(text_cue(0, "\u{200b}".as_bytes()), &mut output)?;
+        mux.tick(sibling(SILENCE_SECONDS), &mut output)?;
+        mux.push(
+            text_cue(
+                i64::try_from(SILENCE_SECONDS)? * SECOND_TICKS,
+                b"speech after long silence",
+            ),
+            &mut output,
+        )?;
+        mux.tick(sibling(SILENCE_SECONDS + 1), &mut output)?;
+
+        assert!(parts(&output).iter().any(|part| {
+            str::from_utf8(part.payload.as_bytes())
+                .is_ok_and(|body| body.contains("speech after long silence"))
+        }));
+        assert!(matches!(
+            recorded.events().as_slice(),
+            [SessionEvent::SubtitleStateLongLived {
+                track: TrackId(0),
+                ..
+            }]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resolving_state_cannot_materialize_too_many_future_windows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut mux = mux(Codec::Text, 2);
+        let mut output = Vec::new();
+        let future = i64::try_from((MAX_CUE_SEGMENTS + 2) * 2 * SECOND)?;
+
+        mux.push(text_cue(0, b"active"), &mut output)?;
+        let error = mux
+            .push(text_cue(future, b"future"), &mut output)
+            .expect_err("a future transition must retain a bounded work budget");
+        assert!(error.to_string().contains("64 unmaterialized segments"));
         Ok(())
     }
 
