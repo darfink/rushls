@@ -378,9 +378,10 @@ async fn a_playlist_is_served_with_its_media_type_and_half_a_target_duration() {
     );
     assert_eq!(
         reply.header("cache-control"),
-        Some("public, max-age=3"),
+        Some("public, max-age=3, no-transform"),
         "a plain reload names the live edge, so it may be reused for half of \
-         the fixture's six-second target duration"
+         the fixture's six-second target duration, and the text it holds has \
+         two codings an intermediary must not convert between"
     );
     assert_eq!(reply.header("access-control-allow-origin"), Some("*"));
     let body = String::from_utf8(reply.body).expect("a playlist is text");
@@ -430,7 +431,8 @@ fn a_playlist_leaves_this_layer_carrying_its_own_length() {
         )
     };
 
-    let identity = super::into_http(response(), None, false).expect("a playlist is representable");
+    let identity =
+        super::into_http(response(), None, false, None).expect("a playlist is representable");
     assert_eq!(
         identity
             .headers()
@@ -441,7 +443,8 @@ fn a_playlist_leaves_this_layer_carrying_its_own_length() {
          its connection mis-frames everything after it"
     );
 
-    let encoded = super::into_http(response(), None, true).expect("a playlist is representable");
+    let encoded =
+        super::into_http(response(), None, true, None).expect("a playlist is representable");
     assert_eq!(
         encoded
             .headers()
@@ -451,6 +454,265 @@ fn a_playlist_leaves_this_layer_carrying_its_own_length() {
         "the declared length is the encoded bytes on the wire, not the playlist \
          they decompress to"
     );
+}
+
+/// The two encodings of one playlist must not validate as the same entity.
+///
+/// A shared cache holding a gzip copy and asked for identity may answer from
+/// what it has when nothing distinguishes the two. Observed in production
+/// behind a CDN that recomputed the range against its compressed copy and then
+/// decompressed the body, producing `Content-Range: bytes 0-370/371` above 852
+/// bytes of playlist. A client reusing an HTTP/1.1 connection reads the excess
+/// as the next response's headers.
+#[test]
+fn each_playlist_encoding_validates_as_a_different_entity() {
+    use bytes::Bytes;
+
+    use crate::delivery::{Response as DeliveryResponse, Reuse, uri::ContentType};
+
+    let playlist = Bytes::from_static(b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
+    let gzipped = crate::delivery::hls::gzip::gzip(&playlist);
+    let response = || {
+        DeliveryResponse::manifest(
+            playlist.clone(),
+            gzipped.clone(),
+            ContentType::Manifest("application/vnd.apple.mpegurl"),
+            Reuse::revalidate(),
+        )
+    };
+    let etag = |response: &axum::response::Response| {
+        response
+            .headers()
+            .get(axum::http::header::ETAG)
+            .map(|value| value.to_str().expect("an entity tag is ASCII").to_owned())
+    };
+
+    let identity =
+        super::into_http(response(), None, false, None).expect("a playlist is representable");
+    let encoded =
+        super::into_http(response(), None, true, None).expect("a playlist is representable");
+
+    let (identity, encoded) = (etag(&identity), etag(&encoded));
+    assert!(identity.is_some(), "a playlist carries a validator");
+    assert_ne!(
+        identity, encoded,
+        "a cache that cannot tell the encodings apart may answer a request for \
+         one with the other"
+    );
+    assert!(
+        encoded.is_some_and(|tag| tag.ends_with("-gz\"")),
+        "the encoded representation is the one marked, so the identity tag \
+         stays stable for clients that never negotiate"
+    );
+}
+
+/// A viewer holding current bytes is told so rather than sent them again.
+///
+/// A playlist is reusable for half a target duration, so this is the common
+/// case for the whole of a session, not an edge case.
+#[tokio::test]
+async fn an_unchanged_playlist_revalidates_without_its_body() {
+    let harness = Harness::start().await;
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+
+    let first = request(harness.address, "GET", "/live/camera/0/video.m3u8", &[]).await;
+    let tag = first
+        .header("etag")
+        .expect("a playlist carries a validator");
+
+    let revalidated = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8",
+        &[("If-None-Match", tag)],
+    )
+    .await;
+
+    assert_eq!(revalidated.status, 304);
+    assert!(revalidated.body.is_empty());
+    assert_eq!(revalidated.header("etag"), Some(tag));
+    assert_eq!(
+        revalidated.header("content-length"),
+        None,
+        "a 304 is framed by its status, and a length here is what an \
+         intermediary turns into a body that was never sent"
+    );
+
+    // A weak validator names the same representation for caching purposes.
+    let weak = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8",
+        &[("If-None-Match", &format!("W/{tag}"))],
+    )
+    .await;
+    assert_eq!(weak.status, 304);
+
+    let stale = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8",
+        &[("If-None-Match", "\"00000000-0\"")],
+    )
+    .await;
+    assert_eq!(
+        stale.status, 200,
+        "a validator naming other bytes is answered with the current ones"
+    );
+    assert_eq!(stale.body, first.body);
+
+    harness.stop().await;
+}
+
+/// Revalidation is per-representation, or it hands over the wrong bytes.
+///
+/// The identity tag presented on a gzip-accepting request describes a
+/// different representation, so answering 304 would leave the client using
+/// uncompressed bytes it believes are current under a compressed entity — the
+/// same conflation that produced the mismatched lengths behind the CDN.
+#[tokio::test]
+async fn revalidating_one_encoding_never_answers_for_the_other() {
+    let harness = Harness::start().await;
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+
+    let identity = request(harness.address, "GET", "/live/camera/0/video.m3u8", &[]).await;
+    let encoded = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8",
+        &[("Accept-Encoding", "gzip")],
+    )
+    .await;
+
+    let (identity_tag, encoded_tag) = (
+        identity.header("etag").expect("a validator"),
+        encoded.header("etag").expect("a validator"),
+    );
+
+    let crossed = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8",
+        &[("Accept-Encoding", "gzip"), ("If-None-Match", identity_tag)],
+    )
+    .await;
+    assert_eq!(
+        crossed.status, 200,
+        "the identity validator does not describe the encoded representation"
+    );
+    assert_eq!(crossed.header("content-encoding"), Some("gzip"));
+
+    let matched = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8",
+        &[("Accept-Encoding", "gzip"), ("If-None-Match", encoded_tag)],
+    )
+    .await;
+    assert_eq!(matched.status, 304);
+
+    harness.stop().await;
+}
+
+/// A playlist is not range-addressable, and says so.
+///
+/// The manifest branch already ignores `Range` and answers 200. Stating
+/// `Accept-Ranges: none` denies an intermediary the premise for synthesizing a
+/// 206 it was never offered, and `no-transform` asks it not to convert between
+/// the codings in the first place.
+#[test]
+fn a_playlist_refuses_ranges_and_asks_not_to_be_transformed() {
+    use bytes::Bytes;
+
+    use crate::delivery::{Response as DeliveryResponse, Reuse, uri::ContentType};
+
+    let playlist = Bytes::from_static(b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n");
+    let gzipped = crate::delivery::hls::gzip::gzip(&playlist);
+    let response = || {
+        DeliveryResponse::manifest(
+            playlist.clone(),
+            gzipped.clone(),
+            ContentType::Manifest("application/vnd.apple.mpegurl"),
+            Reuse::reusable(std::time::Duration::from_secs(3)),
+        )
+    };
+
+    for accepts_gzip in [false, true] {
+        // The range is offered exactly as libavformat sends it.
+        let reply = super::into_http(response(), Some("bytes=0-"), accepts_gzip, None)
+            .expect("a playlist is representable");
+
+        assert_eq!(
+            reply.status(),
+            axum::http::StatusCode::OK,
+            "a whole playlist is a valid answer to a range request, and the \
+             only one this origin gives"
+        );
+        assert_eq!(
+            reply
+                .headers()
+                .get(axum::http::header::ACCEPT_RANGES)
+                .and_then(|value| value.to_str().ok()),
+            Some("none")
+        );
+        assert_eq!(
+            reply.headers().get(axum::http::header::CONTENT_RANGE),
+            None,
+            "no partial response is ever offered for a playlist"
+        );
+        assert!(
+            reply
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("no-transform")),
+            "an intermediary must not convert between the two codings"
+        );
+        assert_eq!(
+            reply.headers().get(axum::http::header::CONTENT_ENCODING),
+            None,
+            "a range request is answered in identity, so its offsets and the \
+             bytes on the wire describe the same representation"
+        );
+    }
+}
+
+/// Media keeps the range support a player depends on.
+///
+/// The playlist changes above must not leak onto segments: a byte-range
+/// playlist addresses parts of a segment by offset, and refusing those would
+/// break the profile outright.
+#[tokio::test]
+async fn media_still_advertises_and_serves_ranges() {
+    let harness = Harness::start().await;
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+
+    let whole = request(harness.address, "GET", "/live/camera/0/segment/1.m4s", &[]).await;
+    let partial = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/segment/1.m4s",
+        &[("Range", "bytes=0-9")],
+    )
+    .await;
+
+    assert_eq!(whole.header("accept-ranges"), Some("bytes"));
+    assert_eq!(partial.status, 206);
+    assert_eq!(partial.body.len(), 10);
+    assert!(
+        whole
+            .header("cache-control")
+            .is_some_and(|value| !value.contains("no-transform")),
+        "media has one representation, so there is no transformation to refuse"
+    );
+
+    harness.stop().await;
 }
 
 #[tokio::test]
@@ -795,7 +1057,7 @@ async fn a_blocking_reload_holds_the_connection_until_its_part_arrives() {
     assert_eq!(reply.status, 200);
     assert_eq!(
         reply.header("cache-control"),
-        Some("public, max-age=36"),
+        Some("public, max-age=36, no-transform"),
         "the directive is part of the URL, so these bytes answer one exact \
          playlist state and can never become the wrong answer to it"
     );

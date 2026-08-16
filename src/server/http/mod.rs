@@ -259,7 +259,10 @@ async fn handle<P: Application>(
     let range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
-    match into_http(response, range, accepts_gzip(&headers)) {
+    let conditional = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok());
+    match into_http(response, range, accepts_gzip(&headers), conditional) {
         Ok(response) => response,
         Err(status) => status.into_response(),
     }
@@ -393,17 +396,47 @@ fn into_http(
     response: DeliveryResponse,
     range: Option<&str>,
     accepts_gzip: bool,
+    if_none_match: Option<&str>,
 ) -> Result<Response, StatusCode> {
     let content_type = HeaderValue::from_static(response.content_type.name());
-    let cache = response.reuse.into();
     // Announced only where an encoding was actually available to choose. Saying
     // it on already-compressed media would split every cache entry downstream
     // for a resource that never varies — and those are the entries this origin
     // asks caches to hold for six target durations.
     let varies = response.gzip.is_some();
+    // Transformation is only a hazard for a resource that has two encodings to
+    // be converted between, so the request not to transform is stated exactly
+    // there.
+    let cache = cache_control(response.reuse, varies);
+    // Derived before the gzip representation is consumed below, because both
+    // tags are read out of the same member's trailer.
+    let identity_tag = response
+        .gzip
+        .as_ref()
+        .and_then(|gzip| entity_tag(gzip, false));
+    let encoded_tag = response
+        .gzip
+        .as_ref()
+        .and_then(|gzip| entity_tag(gzip, true));
     // A range names bytes of the identity representation, so the two cannot be
     // combined: a range of a gzip stream describes a different resource.
     let encoded = response.gzip.filter(|_| accepts_gzip && range.is_none());
+
+    // Which representation this request selected is what the validator has to
+    // describe, so the comparison happens after negotiation rather than before.
+    let selected_tag = if encoded.is_some() {
+        encoded_tag.clone()
+    } else {
+        identity_tag.clone()
+    };
+    // Evaluated ahead of `Range`, which is the order RFC 9110 § 13.2.1 sets:
+    // a client holding current bytes is told so, whether or not it also asked
+    // for part of them.
+    if let Some(tag) = selected_tag.as_ref()
+        && if_none_match.is_some_and(|header| matches_etag(header, tag))
+    {
+        return Ok(not_modified(tag.clone(), cache, varies));
+    }
 
     if let Some(gzip) = encoded {
         let length = gzip.len();
@@ -412,11 +445,15 @@ fn into_http(
                 (header::CONTENT_TYPE, content_type),
                 (header::CACHE_CONTROL, cache),
                 (header::CONTENT_ENCODING, HeaderValue::from_static("gzip")),
+                (header::ACCEPT_RANGES, HeaderValue::from_static("none")),
             ],
             gzip,
         )
             .into_response();
-        return Ok(with_vary(with_content_length(encoded, length), varies));
+        return Ok(with_vary(
+            with_etag(with_content_length(encoded, length), encoded_tag),
+            varies,
+        ));
     }
 
     match response.body {
@@ -426,35 +463,55 @@ fn into_http(
                 [
                     (header::CONTENT_TYPE, content_type),
                     (header::CACHE_CONTROL, cache),
+                    // A playlist is rewritten in place at the live edge and is
+                    // small enough that no client has reason to fetch part of
+                    // one. Saying so outright, rather than ignoring `Range`
+                    // silently as this branch does, denies an intermediary the
+                    // premise it needs to invent a partial response.
+                    (header::ACCEPT_RANGES, HeaderValue::from_static("none")),
                 ],
                 bytes,
             )
                 .into_response();
-            Ok(with_vary(with_content_length(manifest, length), varies))
+            Ok(with_vary(
+                with_etag(with_content_length(manifest, length), identity_tag),
+                varies,
+            ))
         }
         DeliveryBody::Media(media) => {
             let length = media.len();
             let Some(range) = range else {
                 return Ok(with_vary(
-                    media_response(media, content_type, cache, None, length),
+                    with_etag(
+                        media_response(media, content_type, cache, None, length),
+                        identity_tag,
+                    ),
                     varies,
                 ));
             };
             match parse_range(range, length) {
                 RangeOutcome::Ignore => Ok(with_vary(
-                    media_response(media, content_type, cache, None, length),
+                    with_etag(
+                        media_response(media, content_type, cache, None, length),
+                        identity_tag,
+                    ),
                     varies,
                 )),
                 RangeOutcome::Unsatisfiable => Err(StatusCode::RANGE_NOT_SATISFIABLE),
                 RangeOutcome::Satisfiable(range) => {
                     let clipped = media.range(range.start, range.end);
                     Ok(with_vary(
-                        media_response(
-                            clipped,
-                            content_type,
-                            cache,
-                            Some((range.start, range.end)),
-                            length,
+                        with_etag(
+                            media_response(
+                                clipped,
+                                content_type,
+                                cache,
+                                Some((range.start, range.end)),
+                                length,
+                            ),
+                            // The same representation, so the same validator: a
+                            // range does not name a resource of its own.
+                            identity_tag,
                         ),
                         varies,
                     ))
@@ -462,6 +519,103 @@ fn into_http(
             }
         }
     }
+}
+
+/// A strong entity tag, taken from the gzip member this origin already built.
+///
+/// RFC 9110 § 8.8.3 requires two representations of one resource to carry
+/// different entity tags, and a shared cache that cannot tell them apart is
+/// free to answer a request for one with the other — which is the whole of the
+/// failure this guards against, since an identity request answered from a gzip
+/// entry is how a playlist arrives with a length that describes different
+/// bytes than the body does.
+///
+/// The value costs nothing to produce. A gzip member ends with a CRC32 of the
+/// uncompressed bytes followed by their length (RFC 1952 § 2.3.1), so the
+/// validator for the identity representation has already been computed inside
+/// the render cache's critical section. Hashing the playlist again per request
+/// would put work on the request path that this origin deliberately keeps off
+/// it.
+fn entity_tag(gzip: &bytes::Bytes, encoded: bool) -> Option<HeaderValue> {
+    let trailer = gzip.get(gzip.len().checked_sub(8)?..)?;
+    let crc = u32::from_le_bytes(trailer[..4].try_into().ok()?);
+    // Truncated to 32 bits by the format itself, which is why the tag pairs it
+    // with the CRC rather than trusting either alone.
+    let size = u32::from_le_bytes(trailer[4..].try_into().ok()?);
+    // The suffix is what keeps the two encodings distinguishable; without it
+    // both representations would validate as the same entity.
+    let suffix = if encoded { "-gz" } else { "" };
+    HeaderValue::from_str(&format!("\"{crc:08x}-{size:x}{suffix}\"")).ok()
+}
+
+/// Attaches a validator, where one could be derived.
+fn with_etag(mut response: Response, tag: Option<HeaderValue>) -> Response {
+    if let Some(tag) = tag {
+        response.headers_mut().insert(header::ETAG, tag);
+    }
+    response
+}
+
+/// Answers a client whose copy is still current.
+///
+/// Worth having on this origin specifically: a playlist is reusable for half a
+/// target duration, so a viewer revalidates it every few seconds for the whole
+/// session, and the bytes are identical across the overwhelming majority of
+/// those reloads. Carries no body and no `Content-Length` — a 304 is framed by
+/// its status, and a length here is the kind of thing an intermediary converts
+/// into a body that is not there.
+fn not_modified(tag: HeaderValue, cache: HeaderValue, varies: bool) -> Response {
+    let mut response = StatusCode::NOT_MODIFIED.into_response();
+    // `into_response` gives an empty body a zero length; a 304 must carry
+    // neither.
+    let headers = response.headers_mut();
+    headers.remove(header::CONTENT_LENGTH);
+    headers.insert(header::ETAG, tag);
+    headers.insert(header::CACHE_CONTROL, cache);
+    with_vary(response, varies)
+}
+
+/// Weak comparison of an `If-None-Match` list against one entity tag.
+///
+/// Weak rather than strong because that is what RFC 9110 § 13.1.2 specifies for
+/// this field: the question is whether the representations are equivalent for
+/// caching, not whether they are byte-identical. In practice it means a cache
+/// that stored `"abc"` and revalidates with `W/"abc"` is answered correctly.
+fn matches_etag(header: &str, tag: &HeaderValue) -> bool {
+    let Ok(tag) = tag.to_str() else {
+        return false;
+    };
+    let opaque = |value: &str| {
+        value
+            .trim()
+            .strip_prefix("W/")
+            .unwrap_or_else(|| value.trim())
+            .to_owned()
+    };
+    let current = opaque(tag);
+    header
+        .split(',')
+        // `*` matches whenever a representation exists at all, which by the
+        // time a response has been produced it does.
+        .any(|candidate| candidate.trim() == "*" || opaque(candidate) == current)
+}
+
+/// Resolves a lifetime into the header, asking negotiated text be left alone.
+///
+/// `no-transform` is the standards-defined way (RFC 9111 § 5.2.2.6) to tell an
+/// intermediary not to convert between content codings. It is stated only for
+/// resources that have more than one coding, because it is meaningless — and
+/// on media, misleading — anywhere else.
+fn cache_control(reuse: Reuse, negotiated: bool) -> HeaderValue {
+    let value: HeaderValue = reuse.into();
+    if !negotiated {
+        return value;
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|directives| HeaderValue::try_from(format!("{directives}, no-transform")).ok())
+        .unwrap_or(value)
 }
 
 /// Declares the length of a body that is already whole in memory.
