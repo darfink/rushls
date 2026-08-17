@@ -1351,6 +1351,28 @@ mod tests {
     }
 
     #[test]
+    fn a_balanced_aac_cadence_emits_no_one_frame_final_part() {
+        // The 94th frame closes a segment balanced as 24 + 24 + 24 + 21.
+        let (parts, part_target) = packaged_parts(
+            &[AAC_FRAME_SAMPLES; 94],
+            nz::u32!(24),
+            nz::u64!(24 * AAC_FRAME_SAMPLES),
+            93 * AAC_FRAME_SAMPLES,
+        );
+
+        assert_eq!(part_target, 24 * AAC_FRAME_SAMPLES);
+        assert_eq!(
+            parts,
+            vec![
+                24 * AAC_FRAME_SAMPLES,
+                24 * AAC_FRAME_SAMPLES,
+                24 * AAC_FRAME_SAMPLES,
+                21 * AAC_FRAME_SAMPLES,
+            ]
+        );
+    }
+
+    #[test]
     fn part_counting_restarts_at_every_segment_boundary() {
         // Five units to a segment against a four-unit part: each segment ends
         // with a short part, and the next segment's first part must be a full

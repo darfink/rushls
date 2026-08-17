@@ -22,6 +22,13 @@
 //! For every codec that matters the two are equal (AAC frames are 1024 samples;
 //! constant-frame-rate video is constant), so regular parts land exactly on
 //! target.
+//!
+//! # Balanced remainders
+//!
+//! Final parts may legally fall below the 85% floor, but very short parts are a
+//! poor interoperability bet. When a nearby access-unit count avoids one, it is
+//! preferred without making short remainders invalid. For example, 93 AAC
+//! frames use `24 + 24 + 24 + 21` instead of `23 + 23 + 23 + 23 + 1`.
 
 use std::num::NonZero;
 
@@ -35,6 +42,14 @@ use super::CadenceError;
 /// individual access units, is deliberately conservative: a part sums `n` of
 /// them, so averaging can only narrow the spread this admits.
 const MINIMUM_CADENCE_CONSISTENCY_PERCENT: u128 = 85;
+
+/// Preferred minimum final-part fraction of `PART-TARGET`.
+///
+/// Final parts may be shorter; this only ranks nearby valid grids.
+const PREFERRED_FINAL_PART_PERCENT: u128 = 85;
+
+/// Search radius around the nearest access-unit count.
+const REMAINDER_SEARCH_RADIUS: u32 = 1;
 
 /// The observed spread of one track's presentable access-unit durations.
 ///
@@ -66,6 +81,11 @@ impl AccessUnitCadence {
             u128::from(shortest) * 100
                 >= u128::from(self.longest) * MINIMUM_CADENCE_CONSISTENCY_PERCENT
         })
+    }
+
+    /// Whether the final-part remainder can be predicted from the segment grid.
+    fn is_constant(self) -> bool {
+        self.shortest == Some(self.longest)
     }
 }
 
@@ -112,6 +132,7 @@ pub fn select_part_cadence(
         .unwrap_or(1);
     let count = nearest.clamp(1, (segment / longest).max(1));
     let count = u32::try_from(count).unwrap_or(u32::MAX);
+    let count = balance_final_part(count, access_units, longest.get(), segment);
     let access_units = NonZero::new(count).unwrap_or(nz::u32!(1));
     let duration = u64::from(access_units.get())
         .checked_mul(longest.get())
@@ -121,6 +142,44 @@ pub fn select_part_cadence(
         access_units,
         duration,
     })
+}
+
+/// Prefers an adjacent count with no short final-part remainder.
+///
+/// Variable or non-integral grids keep `nearest` because their remainder is not
+/// predictable in advance.
+fn balance_final_part(
+    nearest: u32,
+    access_units: AccessUnitCadence,
+    longest: TickDuration,
+    segment: TickDuration,
+) -> u32 {
+    if !access_units.is_constant() || !segment.is_multiple_of(longest) {
+        return nearest;
+    }
+    let units_per_segment = segment / longest;
+    if units_per_segment == 0 {
+        return nearest;
+    }
+
+    // Prefer no remainder, or one large enough to resemble a regular part.
+    let leaves_usable_remainder = |count: u32| {
+        let remainder = units_per_segment % TickDuration::from(count);
+        remainder == 0
+            || u128::from(remainder) * 100 >= u128::from(count) * PREFERRED_FINAL_PART_PERCENT
+    };
+
+    if leaves_usable_remainder(nearest) {
+        return nearest;
+    }
+
+    let maximum = u32::try_from(units_per_segment).unwrap_or(u32::MAX).max(1);
+    // Keep the achieved part duration as close as possible to the request.
+    (nearest.saturating_sub(REMAINDER_SEARCH_RADIUS).max(1)
+        ..=nearest.saturating_add(REMAINDER_SEARCH_RADIUS).min(maximum))
+        .filter(|candidate| leaves_usable_remainder(*candidate))
+        .min_by_key(|candidate| candidate.abs_diff(nearest))
+        .unwrap_or(nearest)
 }
 
 #[cfg(test)]
@@ -149,6 +208,20 @@ mod tests {
         )
     }
 
+    fn select_audio(
+        durations: &[TickDuration],
+        desired: TickDuration,
+        segment: TickDuration,
+    ) -> Result<PartCadence, CadenceError> {
+        select_part_cadence(
+            TrackId(0),
+            MediaKind::Audio,
+            cadence(durations),
+            desired,
+            segment,
+        )
+    }
+
     #[test]
     fn selects_six_frames_for_2997_fps_near_200ms() {
         assert_eq!(
@@ -161,12 +234,85 @@ mod tests {
     }
 
     #[test]
-    fn selects_nine_aac_access_units_near_200ms() {
+    fn selects_ten_aac_access_units_near_200ms() {
+        // Nine-frame parts leave one frame; ten-frame parts divide exactly.
         assert_eq!(
             select(&[1_024; 100], 9_600, 102_400),
             Ok(PartCadence {
-                access_units: nz::u32!(9),
-                duration: nz::u64!(9_216),
+                access_units: nz::u32!(10),
+                duration: nz::u64!(10_240),
+            })
+        );
+    }
+
+    #[test]
+    fn a_one_frame_final_part_is_widened_away() {
+        // Move one frame from the target to avoid a one-frame remainder.
+        assert_eq!(
+            select_audio(&[1_024; 93], 23_552, 95_232),
+            Ok(PartCadence {
+                access_units: nz::u32!(24),
+                duration: nz::u64!(24_576),
+            })
+        );
+    }
+
+    #[test]
+    fn an_exact_division_is_left_alone() {
+        // An exact nearest grid needs no adjustment.
+        assert_eq!(
+            select_audio(&[1_024; 96], 24_576, 98_304),
+            Ok(PartCadence {
+                access_units: nz::u32!(24),
+                duration: nz::u64!(24_576),
+            })
+        );
+    }
+
+    #[test]
+    fn a_final_part_already_at_the_floor_is_left_alone() {
+        // A 19-of-20 remainder already exceeds the preferred floor.
+        assert_eq!(
+            select_audio(&[1_000; 119], 20_000, 119_000),
+            Ok(PartCadence {
+                access_units: nz::u32!(20),
+                duration: nz::u64!(20_000),
+            })
+        );
+    }
+
+    #[test]
+    fn a_short_final_part_remains_legal_when_nothing_nearby_is_better() {
+        // Short final parts remain valid when adjacent grids do not improve it.
+        assert_eq!(
+            select_audio(&[1_024; 21], 5_120, 21_504),
+            Ok(PartCadence {
+                access_units: nz::u32!(5),
+                duration: nz::u64!(5_120),
+            })
+        );
+    }
+
+    #[test]
+    fn a_variable_cadence_keeps_the_nearest_count() {
+        // A variable cadence has no predictable remainder to balance.
+        assert_eq!(
+            select(&[100, 110, 100, 110, 100, 110], 410, 630),
+            Ok(PartCadence {
+                access_units: nz::u32!(4),
+                duration: nz::u64!(440),
+            })
+        );
+    }
+
+    #[test]
+    fn a_non_integral_segment_grid_keeps_the_nearest_count() {
+        // A non-integral grid may yield different unit counts across segments.
+        assert_eq!(
+            select_audio(&[20; 9], 60, 170),
+            Ok(PartCadence {
+                access_units: nz::u32!(3),
+                duration: nz::u64!(60),
             })
         );
     }
