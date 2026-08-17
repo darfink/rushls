@@ -9,9 +9,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 use bytes::{Bytes, BytesMut};
 use scuffle_rtmp::{
     ServerSession,
-    session::server::{
-        ServerSessionError, ServerSessionTimeouts, SessionData, SessionHandler,
-    },
+    session::server::{ServerSessionError, ServerSessionTimeouts, SessionData, SessionHandler},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},

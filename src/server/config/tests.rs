@@ -40,7 +40,7 @@ async fn the_reference_file_resolves_to_the_runtime_defaults() -> Result<(), Box
         ]),
         std::iter::empty(),
     )?
-    .resolve()?;
+    .resolve_from(std::iter::empty())?;
 
     assert_eq!(config.node, NodeConfig::default());
     let grant = config
@@ -55,7 +55,8 @@ async fn the_reference_file_resolves_to_the_runtime_defaults() -> Result<(), Box
 
 #[tokio::test]
 async fn open_authentication_is_the_builtin_default() -> Result<(), Box<dyn Error>> {
-    let config = AppConfig::load_from(os(["rushls"]), std::iter::empty())?.resolve()?;
+    let config = AppConfig::load_from(os(["rushls"]), std::iter::empty())?
+        .resolve_from(std::iter::empty())?;
     let grant = config
         .authenticator
         .authenticate(&request("ignored"))
@@ -86,6 +87,31 @@ key = "from-file"
     )??;
 
     assert_eq!(config.node.maximum_sessions, 30);
+    Ok(())
+}
+
+#[test]
+fn unknown_rushls_environment_variables_warn_instead_of_failing() -> Result<(), Box<dyn Error>> {
+    let env = [
+        // A recognized override and a variable outside the namespace stay quiet.
+        ("RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHERS", "20"),
+        ("PAGER", "less"),
+        // Two misspellings are named, in a stable order.
+        ("RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHER", "20"),
+        ("RUSHLS_TLS_CERTIFICATE", "/tmp/certificate.pem"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (OsString::from(key), OsString::from(value)));
+    let resolved = AppConfig::load_and_resolve_from(os(["rushls"]), env)?;
+
+    assert_eq!(resolved.node.maximum_sessions, 20);
+    assert_eq!(
+        resolved.warnings.as_slice(),
+        [
+            "unrecognized environment variable RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHER is ignored",
+            "unrecognized environment variable RUSHLS_TLS_CERTIFICATE is ignored",
+        ]
+    );
     Ok(())
 }
 
@@ -727,7 +753,12 @@ fn resolve_with(
     arguments: &[&str],
     environment: &[(&str, &str)],
 ) -> Result<Result<ResolvedAppConfig, ConfigError>, Box<dyn Error>> {
-    Ok(load_with(configuration, arguments, environment)?.and_then(AppConfig::resolve))
+    let env: Vec<(OsString, OsString)> = environment
+        .iter()
+        .map(|(key, value)| ((*key).into(), (*value).into()))
+        .collect();
+    Ok(load_with(configuration, arguments, environment)?
+        .and_then(|config| config.resolve_from(env)))
 }
 
 /// Loads one TOML fragment on its own, for tests about the schema itself.
@@ -897,7 +928,9 @@ peer_idle_timeout = "1s"
     };
 
     assert!(
-        error.to_string().contains("must exceed the receive latency"),
+        error
+            .to_string()
+            .contains("must exceed the receive latency"),
         "unexpected error: {error}"
     );
     Ok(())

@@ -17,7 +17,7 @@ use std::{
 };
 
 use bytesize::ByteSize;
-use conf::{Conf, find_parameter};
+use conf::{Conf, find_parameter, introspection::ProgramOptionMeta};
 use scuffle_rtmp::session::server::ServerSessionTimeouts;
 use serde::Deserialize;
 use thiserror::Error;
@@ -142,6 +142,21 @@ impl AppConfig {
         Self::load_from(std::env::args_os(), std::env::vars_os())
     }
 
+    /// Loads and resolves process arguments, environment, and an optional TOML
+    /// document from one consistent source snapshot.
+    pub fn load_and_resolve() -> Result<ResolvedAppConfig, ConfigError> {
+        Self::load_and_resolve_from(std::env::args_os(), std::env::vars_os())
+    }
+
+    /// As [`Self::load_and_resolve`], over explicit source snapshots.
+    pub fn load_and_resolve_from(
+        args: impl IntoIterator<Item = OsString>,
+        env: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Result<ResolvedAppConfig, ConfigError> {
+        let env: Vec<(OsString, OsString)> = env.into_iter().collect();
+        Self::load_from(args, env.iter().cloned())?.resolve_from(env)
+    }
+
     /// Loads from explicit source snapshots, keeping configuration tests free
     /// from process-global environment mutation.
     pub fn load_from(
@@ -176,11 +191,24 @@ impl AppConfig {
     }
 
     /// Applies supported operator choices to independently evolving runtime
-    /// defaults.
+    /// defaults, over the process environment.
     pub fn resolve(self) -> Result<ResolvedAppConfig, ConfigError> {
+        self.resolve_from(std::env::vars_os())
+    }
+
+    /// As [`Self::resolve`], over an explicit environment snapshot.
+    ///
+    /// Mirrors [`Self::load_from`]: the environment is inspected here so a
+    /// configuration test exercises the same inputs the loader used, rather
+    /// than whatever happens to be set in the test runner's shell.
+    pub fn resolve_from(
+        self,
+        env: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Result<ResolvedAppConfig, ConfigError> {
         let defaults = NodeConfig::default();
         let mut client = LazyHttpClient::default();
         let mut warnings = Vec::new();
+        warnings.extend(Self::unrecognized_environment(env));
         let part_duration = self.hls.part_duration;
         let authenticator = self.auth.resolve(
             defaults.session.maximum_admission_time,
@@ -217,6 +245,29 @@ impl AppConfig {
             hooks,
             warnings,
         })
+    }
+
+    /// `RUSHLS_`-prefixed environment variables that no option reads.
+    ///
+    /// An override that misses its name by a typo falls back to the compiled
+    /// default silently, so the misspelling is named at startup rather than
+    /// left to be discovered in the behavior it never controlled.
+    fn unrecognized_environment(
+        env: impl IntoIterator<Item = (OsString, OsString)>,
+    ) -> Vec<String> {
+        let known: BTreeSet<String> = Self::program_options()
+            .filter_map(|option| option.env_form().map(ToString::to_string))
+            .collect();
+        let mut unrecognized: Vec<String> = env
+            .into_iter()
+            .filter_map(|(key, _)| key.into_string().ok())
+            .filter(|key| key.starts_with("RUSHLS_") && !known.contains(key))
+            .map(|key| format!("unrecognized environment variable {key} is ignored"))
+            .collect();
+        // Environment iteration order is unspecified; startup warnings should
+        // read the same way run to run.
+        unrecognized.sort();
+        unrecognized
     }
 }
 
@@ -974,8 +1025,10 @@ impl HealthAppConfig {
 
         node.session.supervision.health.source_stall_timeout = source_stall;
         node.session.supervision.health.media_stall_timeout = media_stall;
-        node.session.supervision.health.stalled_publication_multiplier =
-            self.publication_stall_multiplier;
+        node.session
+            .supervision
+            .health
+            .stalled_publication_multiplier = self.publication_stall_multiplier;
         node.session.supervision.health_interval = self.health_interval;
         Ok(())
     }
@@ -1070,11 +1123,7 @@ impl RtmpAppConfig {
         }
     }
 
-    fn apply(
-        &self,
-        node: &mut NodeConfig,
-        warnings: &mut Vec<String>,
-    ) -> Result<(), ConfigError> {
+    fn apply(&self, node: &mut NodeConfig, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
         let timeouts = self.timeouts();
 
         // A handshake read that outlives an established read inverts the

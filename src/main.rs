@@ -82,9 +82,7 @@ impl EventObserver for StderrEvents {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let resolved = AppConfig::load()
-        .and_then(AppConfig::resolve)
-        .unwrap_or_else(|error| error.exit());
+    let resolved = AppConfig::load_and_resolve().unwrap_or_else(|error| error.exit());
     // Before anything is served. A publication admitted against an older
     // FFmpeg would lose caption and multitrack ingest silently, so refusing to
     // start is more honest than accepting publishers this build cannot package
