@@ -95,13 +95,11 @@ impl ConfigError {
     pub fn exit(self) -> ! {
         match self {
             Self::Sources(error) => error.exit(),
-            // The one place in the library that writes to stderr itself, and
-            // deliberately: configuration is read before a `Node` exists, so
-            // there is no observer to report through and nothing downstream
-            // that could route this anywhere. Everything after start-up goes
-            // through `Events`.
+            // Configuration is resolved before a `Node` exists, so this cannot
+            // use the observer. The binary initializes tracing before loading
+            // configuration, which keeps this startup diagnostic timestamped.
             error => {
-                eprintln!("error: {error}");
+                tracing::error!(error = %error, "configuration error");
                 std::process::exit(2);
             }
         }

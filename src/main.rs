@@ -4,46 +4,162 @@ use rushls::{
     domain::{SessionId, StreamId},
     ffmpeg_versions,
     hooks::{self, HookObserver},
-    observe::{EventObserver, Events, NodeEvent, SessionEvent, StreamEvent},
+    observe::{EventObserver, Events, NodeEvent, SessionEnd, SessionEvent, StreamEvent},
     server::{AppConfig, Node, ResolvedHooks},
     version,
 };
 use tokio::sync::watch;
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::{EnvFilter, fmt};
 
-struct StderrEvents;
+struct TracingEvents;
 
-impl EventObserver for StderrEvents {
+impl EventObserver for TracingEvents {
+    // Keeping this exhaustive mapping together makes every operator-facing
+    // session event and its severity easy to review in one place.
+    #[allow(clippy::too_many_lines)]
     fn observe(&self, session: SessionId, event: SessionEvent) {
-        eprintln!("session {session:?}: {event:?}");
+        match event {
+            SessionEvent::Accepted { stream, principal } => {
+                info!(session = %session, stream = %stream, principal = %principal, "accepted");
+            }
+            SessionEvent::Displaced { stream } => {
+                info!(session = %session, stream = %stream, "displaced");
+            }
+            SessionEvent::TracksDiscovered { counts } => {
+                info!(
+                    session = %session,
+                    audio = counts.audio,
+                    subtitle = counts.subtitle,
+                    video = counts.video,
+                    "tracks discovered"
+                );
+            }
+            SessionEvent::TimelineCalibrated { authority } => {
+                info!(session = %session, authority = %authority, "timeline calibrated");
+            }
+            SessionEvent::SegmentationLocked { segment, part } => {
+                info!(session = %session, segment = ?segment, part = ?part, "segmentation locked");
+            }
+            SessionEvent::SegmentationExtended {
+                track,
+                planned,
+                actual,
+            } => {
+                debug!(
+                    session = %session,
+                    track = %track,
+                    planned = ?planned,
+                    actual = ?actual,
+                    "segmentation extended"
+                );
+            }
+            SessionEvent::SubtitleCueTooLate { track, late_by } => {
+                warn!(
+                    session = %session,
+                    track = %track,
+                    late_by = ?late_by,
+                    "subtitle cue too late"
+                );
+            }
+            SessionEvent::SubtitleStateLongLived {
+                track,
+                started_at,
+                age,
+            } => {
+                debug!(
+                    session = %session,
+                    track = %track,
+                    started_at = ?started_at,
+                    age = ?age,
+                    "subtitle state long lived"
+                );
+            }
+            SessionEvent::ClosedCaptionsDetected { channels } => {
+                info!(session = %session, channels = ?channels, "closed captions detected");
+            }
+            SessionEvent::ClosedCaptionsPartial {
+                carrying,
+                video_tracks,
+            } => {
+                warn!(
+                    session = %session,
+                    carrying,
+                    video_tracks,
+                    "closed captions missing from some video tracks"
+                );
+            }
+            SessionEvent::ClosedCaptionsChannelMismatch => {
+                warn!(session = %session, "closed caption channels differ across video tracks");
+            }
+            SessionEvent::ClosedCaptionsMalformedSei { messages } => {
+                warn!(session = %session, messages, "closed captions SEI malformed");
+            }
+            SessionEvent::Running => {
+                info!(session = %session, "running");
+            }
+            SessionEvent::TrackSetChanged => {
+                warn!(session = %session, "track set changed");
+            }
+            SessionEvent::CodecParametersChanged { track } => {
+                warn!(session = %session, track = %track, "codec parameters changed");
+            }
+            SessionEvent::Unhealthy { reason } => {
+                warn!(session = %session, reason = %reason, "unhealthy");
+            }
+            SessionEvent::Draining => {
+                info!(session = %session, "draining");
+            }
+            SessionEvent::DrainFailed { reason } => {
+                warn!(session = %session, reason = %reason, "drain failed");
+            }
+            SessionEvent::Ended { end } => match end {
+                SessionEnd::Unhealthy | SessionEnd::Failed => {
+                    warn!(session = %session, end = %end, "ended");
+                }
+                SessionEnd::Ended
+                | SessionEnd::Interrupted
+                | SessionEnd::Replaced
+                | SessionEnd::Cancelled => {
+                    info!(session = %session, end = %end, "ended");
+                }
+            },
+            SessionEvent::Failed { reason } => {
+                warn!(session = %session, reason = %reason, "failed");
+            }
+        }
     }
 
     fn observe_stream(&self, stream: StreamId, event: StreamEvent) {
         match event {
-            StreamEvent::Available => eprintln!("stream {stream:?} is playable"),
-            StreamEvent::Retired => eprintln!("stream {stream:?} is no longer reachable"),
+            StreamEvent::Available => info!(stream = %stream, "playable"),
+            StreamEvent::Retired => info!(stream = %stream, "no longer reachable"),
         }
     }
 
     fn observe_node(&self, event: NodeEvent) {
         match event {
             NodeEvent::ShuttingDown => {
-                eprintln!("shutting down");
+                info!("shutting down");
             }
             NodeEvent::ListenerBound { protocol, address } => {
-                eprintln!("{protocol} listening on {address}");
+                info!(protocol = %protocol, %address, "listening");
             }
             NodeEvent::CertificateLoaded { certificate } => {
-                eprintln!("serving the certificate at {}", certificate.display());
+                info!(certificate = %certificate.display(), "serving certificate");
             }
             NodeEvent::CertificateRejected {
                 certificate,
                 reason,
-            } => eprintln!(
-                "keeping the previous certificate; {} was rejected: {reason}",
-                certificate.display()
-            ),
+            } => {
+                warn!(
+                    certificate = %certificate.display(),
+                    reason = %reason,
+                    "keeping previous certificate; rotation rejected"
+                );
+            }
             NodeEvent::CertificateWatchLost { reason } => {
-                eprintln!("certificate rotations will no longer be noticed: {reason}");
+                warn!(reason = %reason, "certificate rotations will no longer be noticed");
             }
             NodeEvent::HookEventDropped {
                 hook,
@@ -51,37 +167,66 @@ impl EventObserver for StderrEvents {
                 kind,
                 reason,
                 detail,
-            } => eprintln!("hook {hook}: dropped {kind} {event}, {reason} ({detail})"),
+            } => {
+                warn!(
+                    hook = %hook,
+                    event = %event,
+                    kind = %kind,
+                    reason,
+                    detail = %detail,
+                    "hook event dropped"
+                );
+            }
             NodeEvent::HookEventsAbandoned { hook, dropped } => {
-                eprintln!("hook {hook}: abandoned {dropped} undelivered events at shutdown");
+                warn!(hook = %hook, dropped, "hook abandoned undelivered events at shutdown");
             }
             NodeEvent::HookDeliveryOutcomesUnknown { hook, count } => {
-                eprintln!("hook {hook}: {count} deliveries had unknown outcomes at shutdown");
+                warn!(
+                    hook = %hook,
+                    count,
+                    "hook deliveries had unknown outcomes at shutdown"
+                );
             }
             NodeEvent::HookEventUnrenderable { reason } => {
-                eprintln!("a lifecycle event could not be rendered: {reason}");
+                error!(reason = %reason, "lifecycle event could not be rendered");
             }
             NodeEvent::PublisherHandshakeFailed { protocol, reason } => {
-                eprintln!("{protocol} handshake rejected: {reason}");
+                warn!(protocol = %protocol, reason = %reason, "handshake rejected");
             }
             NodeEvent::PublisherSessionFailed { protocol, reason } => {
-                eprintln!("{protocol} publishing session failed: {reason}");
+                warn!(protocol = %protocol, reason = %reason, "publishing session failed");
             }
             NodeEvent::ConnectionTaskPanicked { protocol, reason } => {
-                eprintln!("{protocol} connection task panicked: {reason}");
+                error!(protocol = %protocol, reason = %reason, "connection task panicked");
             }
             NodeEvent::ListenerAddressUnavailable { protocol, reason } => {
-                eprintln!("{protocol} listener bound but has no local address: {reason}");
+                error!(
+                    protocol = %protocol,
+                    reason = %reason,
+                    "listener bound but has no local address"
+                );
             }
             NodeEvent::ListenerAcceptFailed { protocol, reason } => {
-                eprintln!("{protocol} listener could not accept: {reason}");
+                error!(protocol = %protocol, reason = %reason, "listener could not accept");
             }
         }
     }
 }
 
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_timer(fmt::time::UtcTime::rfc_3339())
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Initialize before configuration so startup failures also carry timestamps.
+    init_tracing();
     let resolved = AppConfig::load_and_resolve().unwrap_or_else(|error| error.exit());
     // Before anything is served. A publication admitted against an older
     // FFmpeg would lose caption and multitrack ingest silently, so refusing to
@@ -89,14 +234,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // correctly. Reported alongside the banner so a support question about
     // missing captions can be answered from the first line of the log.
     let ffmpeg = ffmpeg_versions()?;
-    eprintln!("rushls {} ({ffmpeg})", version());
+    info!(version = %version(), ffmpeg = %ffmpeg, "rushls started");
     for warning in &resolved.warnings {
-        eprintln!("warning: {warning}");
+        warn!(warning = %warning, "configuration warning");
     }
 
     // The base observer is what hooks themselves report through, so a failing
     // hook cannot produce events that re-enter it.
-    let base: Arc<dyn EventObserver> = Arc::new(StderrEvents);
+    let base: Arc<dyn EventObserver> = Arc::new(TracingEvents);
     let (observer, dispatchers, exported) = match resolved.hooks {
         Some(ResolvedHooks { config, client }) => {
             let (hooks, dispatchers) = hooks::build(config, client, Events::new(Arc::clone(&base)));
