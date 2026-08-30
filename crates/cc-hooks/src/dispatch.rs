@@ -1,6 +1,9 @@
-//! Draining one hook's queue, one request per stream at a time.
+//! Draining one hook's queue, one request per subject at a time.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
 use http::StatusCode;
 use tokio::{
@@ -8,13 +11,11 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::{
-    domain::StreamId,
-    observe::{Events, NodeEvent},
-    outbound::{HttpClient, OutboundError, Response},
-};
+use cc_outbound::{HttpClient, OutboundError, Response};
 
-use super::{CONTENT_TYPE, Dispatcher, Dispatchers, Envelope, Loss, Queue, Shared};
+use crate::{
+    CONTENT_TYPE, Dispatcher, Dispatchers, Envelope, HookObserver, Loss, Occurrence, Queue, Shared,
+};
 
 /// First wait between attempts, doubling from there.
 ///
@@ -23,7 +24,11 @@ use super::{CONTENT_TYPE, Dispatcher, Dispatchers, Envelope, Loss, Queue, Shared
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const MAXIMUM_BACKOFF: Duration = Duration::from_secs(30);
 
-impl Dispatchers {
+/// One hook's envelope type, which two type parameters would otherwise repeat.
+type Item<E> = Envelope<<E as Occurrence>::Subject, <E as Occurrence>::Kind>;
+type Pending<E> = Queue<<E as Occurrence>::Subject, <E as Occurrence>::Kind>;
+
+impl<E: Occurrence> Dispatchers<E> {
     /// Runs every configured hook until `stop`, then drains what it can.
     pub async fn run(self, mut stop: watch::Receiver<bool>) {
         let mut hooks = JoinSet::new();
@@ -32,7 +37,7 @@ impl Dispatchers {
                 dispatcher,
                 self.client.clone(),
                 self.drain_timeout,
-                self.events.clone(),
+                Arc::clone(&self.observer),
                 stop.clone(),
             ));
         }
@@ -46,40 +51,40 @@ impl Dispatchers {
     }
 }
 
-async fn run_hook(
-    dispatcher: Dispatcher,
+async fn run_hook<E: Occurrence>(
+    dispatcher: Dispatcher<E>,
     client: HttpClient,
     drain_timeout: Duration,
-    events: Events,
+    observer: Arc<dyn HookObserver<E::Kind>>,
     mut stop: watch::Receiver<bool>,
 ) {
     let Dispatcher {
         shared,
         mut ingress,
     } = dispatcher;
-    let mut queue = Queue::new(shared.config.queue_capacity);
+    let mut queue = Pending::<E>::new(shared.config.queue_capacity);
     let mut sending = JoinSet::new();
 
     loop {
         drain_ingress(&shared, &mut ingress, &mut queue);
-        start_available(&shared, &client, &events, &mut queue, &mut sending);
+        start_available(&shared, &client, &observer, &mut queue, &mut sending);
 
         tokio::select! {
-            biased;
+          biased;
 
-            changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() {
-                    break;
-                }
+          changed = stop.changed() => {
+            if changed.is_err() || *stop.borrow() {
+              break;
             }
+          }
 
-            Some(finished) = sending.join_next(), if !sending.is_empty() => {
-                release(&shared, &mut queue, finished.ok());
-            }
+          Some(finished) = sending.join_next(), if !sending.is_empty() => {
+            release(&shared, &mut queue, finished.ok());
+          }
 
-            Some(envelope) = ingress.recv() => {
-                accept(&shared, &mut queue, envelope);
-            }
+          Some(envelope) = ingress.recv() => {
+            accept(&shared, &mut queue, envelope);
+          }
         }
     }
 
@@ -89,7 +94,7 @@ async fn run_hook(
         queue,
         client,
         drain_timeout,
-        events,
+        observer,
         sending,
     )
     .await;
@@ -97,33 +102,34 @@ async fn run_hook(
 
 /// Moves all immediately available producer work into the dispatcher-owned
 /// ordering queue. Network progress is deliberately irrelevant here.
-fn drain_ingress(shared: &Shared, ingress: &mut mpsc::Receiver<Envelope>, queue: &mut Queue) {
+fn drain_ingress<E: Occurrence>(
+    shared: &Shared<E>,
+    ingress: &mut mpsc::Receiver<Item<E>>,
+    queue: &mut Pending<E>,
+) {
     while let Ok(envelope) = ingress.try_recv() {
         accept(shared, queue, envelope);
     }
 }
 
-fn accept(shared: &Shared, queue: &mut Queue, envelope: Envelope) {
-    shared
-        .meters
-        .ingress_depth
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+fn accept<E: Occurrence>(shared: &Shared<E>, queue: &mut Pending<E>, envelope: Item<E>) {
+    shared.meters.ingress_depth.fetch_sub(1, Ordering::Relaxed);
     if queue.push(envelope) {
         shared.meters.record_loss(Loss::Overflow);
     }
     shared
         .meters
         .queue_depth
-        .store(queue.queued(), std::sync::atomic::Ordering::Relaxed);
+        .store(queue.queued(), Ordering::Relaxed);
 }
 
-/// Starts requests for as many idle streams as the concurrency limit allows.
-fn start_available(
-    shared: &Arc<Shared>,
+/// Starts requests for as many idle subjects as the concurrency limit allows.
+fn start_available<E: Occurrence>(
+    shared: &Arc<Shared<E>>,
     client: &HttpClient,
-    events: &Events,
-    queue: &mut Queue,
-    sending: &mut JoinSet<StreamId>,
+    observer: &Arc<dyn HookObserver<E::Kind>>,
+    queue: &mut Pending<E>,
+    sending: &mut JoinSet<E::Subject>,
 ) {
     while sending.len() < shared.config.maximum_in_flight {
         let Some(envelope) = queue.take_ready() else {
@@ -132,45 +138,46 @@ fn start_available(
         sending.spawn(send(
             Arc::clone(shared),
             client.clone(),
-            events.clone(),
+            Arc::clone(observer),
             envelope,
         ));
     }
     shared
         .meters
         .queue_depth
-        .store(queue.queued(), std::sync::atomic::Ordering::Relaxed);
+        .store(queue.queued(), Ordering::Relaxed);
     shared
         .meters
         .in_flight
-        .store(sending.len(), std::sync::atomic::Ordering::Relaxed);
+        .store(sending.len(), Ordering::Relaxed);
 }
 
-/// Lets a stream's next event through once its predecessor has finished.
-fn release(shared: &Arc<Shared>, queue: &mut Queue, subject: Option<StreamId>) {
+/// Lets a subject's next event through once its predecessor has finished.
+fn release<E: Occurrence>(
+    shared: &Arc<Shared<E>>,
+    queue: &mut Pending<E>,
+    subject: Option<E::Subject>,
+) {
     if let Some(subject) = subject {
         queue.finish(&subject);
     }
-    shared
-        .meters
-        .in_flight
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    shared.meters.in_flight.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Delivers one event, retrying until it lands or the attempts run out.
 ///
-/// Retries happen here rather than by re-queuing, so the stream's slot stays
+/// Retries happen here rather than by re-queuing, so the subject's slot stays
 /// held for the whole thing. That is deliberate: releasing it between attempts
 /// would let the next event overtake the one being retried, which is exactly
-/// the reordering the per-stream rule exists to prevent. The cost is that one
-/// unreachable endpoint stalls that stream for up to
+/// the reordering the per-subject rule exists to prevent. The cost is that one
+/// unreachable endpoint stalls that subject for up to
 /// `maximum_attempts` × backoff.
-async fn send(
-    shared: Arc<Shared>,
+async fn send<E: Occurrence>(
+    shared: Arc<Shared<E>>,
     client: HttpClient,
-    events: Events,
-    envelope: Envelope,
-) -> StreamId {
+    observer: Arc<dyn HookObserver<E::Kind>>,
+    envelope: Item<E>,
+) -> E::Subject {
     let mut backoff = INITIAL_BACKOFF;
 
     for attempt in 1..=shared.config.maximum_attempts {
@@ -185,28 +192,22 @@ async fn send(
 
         match verdict(&result) {
             Verdict::Delivered => {
-                shared
-                    .meters
-                    .delivered
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                shared.meters.delivered.fetch_add(1, Ordering::Relaxed);
                 return envelope.subject;
             }
             Verdict::Rejected => {
-                report(&shared, &events, &envelope, Loss::Rejected, &result);
+                report(&shared, &observer, &envelope, Loss::Rejected, &result);
                 return envelope.subject;
             }
             Verdict::Retry if attempt == shared.config.maximum_attempts => {
-                report(&shared, &events, &envelope, Loss::Exhausted, &result);
+                report(&shared, &observer, &envelope, Loss::Exhausted, &result);
                 return envelope.subject;
             }
             Verdict::Retry => {
-                shared
-                    .meters
-                    .retried
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // An endpoint asking to be left alone knows better than the
-                // backoff curve does, so its answer wins — but only up to the
-                // cap, since it is also the party currently misbehaving.
+                shared.meters.retried.fetch_add(1, Ordering::Relaxed);
+                // An endpoint asking to be left alone knows better than the backoff
+                // curve does, so its answer wins — but only up to the cap, since it is
+                // also the party currently misbehaving.
                 let wait = result
                     .as_ref()
                     .ok()
@@ -233,15 +234,15 @@ fn verdict(result: &Result<Response, OutboundError>) -> Verdict {
     match result {
         Ok(response) if response.status.is_success() => Verdict::Delivered,
         Ok(response) => match response.status {
-            // Transient by definition, plus the two the specifications reserve
-            // for "ask again": a request timeout and too-early.
+            // Transient by definition, plus the two the specifications reserve for
+            // "ask again": a request timeout and too-early.
             StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_EARLY | StatusCode::TOO_MANY_REQUESTS => {
                 Verdict::Retry
             }
             status if status.is_server_error() => Verdict::Retry,
             // Any other 4xx is the consumer saying the request itself is wrong.
-            // Retrying would move a poison event to the front of this stream's
-            // queue for the whole backoff, delaying everything behind it.
+            // Retrying would move a poison event to the front of this subject's queue
+            // for the whole backoff, delaying everything behind it.
             _ => Verdict::Rejected,
         },
         Err(
@@ -253,42 +254,42 @@ fn verdict(result: &Result<Response, OutboundError>) -> Verdict {
     }
 }
 
-fn report(
-    shared: &Arc<Shared>,
-    events: &Events,
-    envelope: &Envelope,
+fn report<E: Occurrence>(
+    shared: &Arc<Shared<E>>,
+    observer: &Arc<dyn HookObserver<E::Kind>>,
+    envelope: &Item<E>,
     loss: Loss,
     result: &Result<Response, OutboundError>,
 ) {
     shared.meters.record_loss(loss);
-    events.emit(NodeEvent::HookEventDropped {
-        hook: Arc::clone(&shared.config.name),
-        event: envelope.id.clone(),
-        kind: envelope.kind,
-        reason: loss.as_str(),
-        detail: match result {
+    observer.event_dropped(
+        &shared.config.name,
+        &envelope.id,
+        envelope.kind,
+        loss,
+        &match result {
             Ok(response) => format!("HTTP {}", response.status),
             Err(error) => error.to_string(),
         },
-    });
+    );
 }
 
 /// Finishes what is in flight, then what is queued, until the deadline.
-async fn drain(
-    shared: Arc<Shared>,
-    mut ingress: mpsc::Receiver<Envelope>,
-    mut queue: Queue,
+async fn drain<E: Occurrence>(
+    shared: Arc<Shared<E>>,
+    mut ingress: mpsc::Receiver<Item<E>>,
+    mut queue: Pending<E>,
     client: HttpClient,
     timeout: Duration,
-    events: Events,
-    mut sending: JoinSet<StreamId>,
+    observer: Arc<dyn HookObserver<E::Kind>>,
+    mut sending: JoinSet<E::Subject>,
 ) {
     let deadline = tokio::time::Instant::now() + timeout;
 
     let drained = tokio::time::timeout_at(deadline, async {
         loop {
             drain_ingress(&shared, &mut ingress, &mut queue);
-            start_available(&shared, &client, &events, &mut queue, &mut sending);
+            start_available(&shared, &client, &observer, &mut queue, &mut sending);
             let Some(finished) = sending.join_next().await else {
                 break;
             };
@@ -300,9 +301,9 @@ async fn drain(
     if drained.is_err() {
         sending.abort_all();
         let mut unknown = 0;
-        // Reap after cancellation rather than counting `JoinSet::len`: a task
-        // may have completed at the deadline without yet being joined, in
-        // which case its delivered or loss counter is already definitive.
+        // Reap after cancellation rather than counting `JoinSet::len`: a task may
+        // have completed at the deadline without yet being joined, in which case
+        // its delivered or loss counter is already definitive.
         while let Some(finished) = sending.join_next().await {
             if finished.is_err() {
                 unknown += 1;
@@ -311,39 +312,24 @@ async fn drain(
         shared
             .meters
             .outcome_unknown_shutdown
-            .fetch_add(unknown as u64, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(unknown as u64, Ordering::Relaxed);
         if unknown > 0 {
-            events.emit(NodeEvent::HookDeliveryOutcomesUnknown {
-                hook: Arc::clone(&shared.config.name),
-                count: unknown,
-            });
+            observer.delivery_outcomes_unknown(&shared.config.name, unknown);
         }
     }
     // Whatever is still waiting in either bounded stage is gone: it lives in
     // memory only, and the process is on its way out.
     let mut lost = queue.clear();
     while ingress.try_recv().is_ok() {
-        shared
-            .meters
-            .ingress_depth
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        shared.meters.ingress_depth.fetch_sub(1, Ordering::Relaxed);
         lost += 1;
     }
-    shared
-        .meters
-        .queue_depth
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-    shared
-        .meters
-        .in_flight
-        .store(0, std::sync::atomic::Ordering::Relaxed);
+    shared.meters.queue_depth.store(0, Ordering::Relaxed);
+    shared.meters.in_flight.store(0, Ordering::Relaxed);
     for _ in 0..lost {
         shared.meters.record_loss(Loss::Shutdown);
     }
     if lost > 0 {
-        events.emit(NodeEvent::HookEventsAbandoned {
-            hook: Arc::clone(&shared.config.name),
-            dropped: lost,
-        });
+        observer.events_abandoned(&shared.config.name, lost);
     }
 }

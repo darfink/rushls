@@ -1,14 +1,12 @@
-use std::{
-    collections::BTreeSet,
-    error::Error,
-    future::pending,
-    net::SocketAddr,
-    sync::{
-        Arc,
-        atomic::{AtomicU16, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+//! What this node promises consumers, as distinct from how delivery works.
+//!
+//! Ordering, overflow, retry, and the drain are `cc-hooks`' contract and are
+//! tested there against a vocabulary belonging to no application. What is left
+//! here is the part a fork of this node would have to keep: the event names on
+//! the wire, the shape of each payload, and the fact that projecting a real
+//! publication produces them in the right order.
+
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{Router, body::Bytes, extract::State, http::StatusCode, routing::post};
 use parking_lot::Mutex;
@@ -23,17 +21,15 @@ use crate::{
     outbound::{ClientConfig, Endpoint, HttpClient},
 };
 
-use super::{
-    HookConfig, HookObserver, HooksConfig, Loss, Queue, Renderer, build, envelope::Envelope,
-};
+use super::{HookConfig, HookObserver, HooksConfig, build};
 
-/// Records what the endpoint received, and decides what it answers with.
+/// Records what the endpoint received.
 #[derive(Clone, Default)]
 struct Recorder {
     received: Arc<Mutex<Vec<serde_json::Value>>>,
-    /// Answered until `failures` requests have been served.
-    failing_status: Arc<AtomicU16>,
-    failures: Arc<AtomicUsize>,
+    /// Answered with this status until `failures` requests have been served.
+    failing_status: Arc<std::sync::atomic::AtomicU16>,
+    failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Recorder {
@@ -50,6 +46,8 @@ impl Recorder {
 }
 
 async fn receive(State(recorder): State<Recorder>, body: Bytes) -> StatusCode {
+    use std::sync::atomic::Ordering;
+
     let body: serde_json::Value =
         serde_json::from_slice(&body).expect("a hook body is always JSON");
     recorder.received.lock().push(body);
@@ -61,37 +59,16 @@ async fn receive(State(recorder): State<Recorder>, body: Bytes) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn receive_without_answer(State(recorder): State<Recorder>, body: Bytes) -> StatusCode {
-    let body: serde_json::Value =
-        serde_json::from_slice(&body).expect("a hook body is always JSON");
-    recorder.received.lock().push(body);
-    pending().await
-}
-
 async fn start(recorder: Recorder) -> SocketAddr {
-    let router = Router::new()
+    let app = Router::new()
         .route("/events", post(receive))
         .with_state(recorder);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("an ephemeral port is available");
-    let address = listener.local_addr().expect("the listener is bound");
+        .expect("a loopback port is available");
+    let address = listener.local_addr().expect("the listener has an address");
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    address
-}
-
-async fn start_hanging(recorder: Recorder) -> SocketAddr {
-    let router = Router::new()
-        .route("/events", post(receive_without_answer))
-        .with_state(recorder);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("an ephemeral port is available");
-    let address = listener.local_addr().expect("the listener is bound");
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        let _ = axum::serve(listener, app).await;
     });
     address
 }
@@ -115,12 +92,6 @@ fn started(stream: &str, session: u64) -> Event {
         session: SessionId(session.try_into().expect("a nonzero session id")),
         principal: "studio-camera".into(),
     })
-}
-
-fn envelope(stream: &str) -> Envelope {
-    Renderer::new("urn:rushls:node:test", 1)
-        .render(&started(stream, 1))
-        .expect("an event renders")
 }
 
 /// Collects what the node reported about its own delivery.
@@ -159,10 +130,9 @@ async fn deliver_reporting(
     .expect("a client builds");
     let (producer, dispatchers) = build(
         HooksConfig {
-            source: "urn:rushls:node:test".into(),
             hooks: vec![hooks],
             drain_timeout: Duration::from_secs(2),
-            ..HooksConfig::default()
+            ..HooksConfig::new("urn:rushls:node:test")
         },
         client,
         reported,
@@ -216,130 +186,6 @@ async fn an_event_arrives_as_a_cloudevent_naming_its_stream() {
 }
 
 #[tokio::test]
-async fn a_retry_repeats_the_same_event_id() {
-    let recorder = Recorder::default();
-    recorder
-        .failing_status
-        .store(StatusCode::SERVICE_UNAVAILABLE.as_u16(), Ordering::Relaxed);
-    recorder.failures.store(1, Ordering::Relaxed);
-    let address = start(recorder.clone()).await;
-
-    deliver(
-        hook(address, &[lifecycle::Kind::SessionStarted]),
-        &[started("live/camera", 1)],
-        2,
-        &recorder,
-    )
-    .await;
-
-    let bodies = recorder.bodies();
-    assert_eq!(bodies.len(), 2, "the 503 was retried");
-    assert_eq!(
-        bodies[0]["id"], bodies[1]["id"],
-        "a redelivery is the same occurrence, so a consumer can deduplicate it"
-    );
-    assert_eq!(bodies[0]["time"], bodies[1]["time"]);
-}
-
-#[test]
-fn producer_ingress_is_bounded_and_never_waits_for_the_dispatcher() -> Result<(), Box<dyn Error>> {
-    let mut config = hook("127.0.0.1:1".parse()?, &[lifecycle::Kind::SessionStarted]);
-    config.queue_capacity = 1;
-    let client = HttpClient::new(ClientConfig::default())?;
-    let (hooks, _dispatchers) = build(
-        HooksConfig {
-            hooks: vec![config],
-            ..HooksConfig::default()
-        },
-        client,
-        Events::default(),
-    );
-
-    hooks.deliver(&started("live/first", 1));
-    hooks.deliver(&started("live/second", 2));
-
-    let snapshot = hooks.snapshots()[0].1;
-    assert_eq!(snapshot.ingress_depth, 1);
-    assert_eq!(snapshot.ingress, 1);
-    assert_eq!(snapshot.queue_depth, 0);
-    Ok(())
-}
-
-#[tokio::test]
-async fn shutdown_distinguishes_never_sent_from_unknown_outcomes() -> Result<(), Box<dyn Error>> {
-    let recorder = Recorder::default();
-    let address = start_hanging(recorder.clone()).await;
-    let mut config = hook(address, &[lifecycle::Kind::SessionStarted]);
-    config.maximum_in_flight = 1;
-    config.maximum_attempts = 1;
-    let reported = NodeLog::default();
-    let client = HttpClient::new(ClientConfig {
-        request_timeout: Duration::from_secs(5),
-        ..ClientConfig::default()
-    })?;
-    let (hooks, dispatchers) = build(
-        HooksConfig {
-            hooks: vec![config],
-            drain_timeout: Duration::from_millis(20),
-            ..HooksConfig::default()
-        },
-        client,
-        Events::new(Arc::new(reported.clone())),
-    );
-    let (stop, stopped) = watch::channel(false);
-    let running = tokio::spawn(dispatchers.run(stopped));
-
-    hooks.deliver(&started("live/camera", 1));
-    hooks.deliver(&started("live/camera", 2));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while recorder.bodies().is_empty() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert_eq!(recorder.bodies().len(), 1, "one request is in flight");
-
-    stop.send(true)?;
-    tokio::time::timeout(Duration::from_secs(2), running).await??;
-
-    let snapshot = hooks.snapshots()[0].1;
-    assert_eq!(snapshot.shutdown, 1, "the second event was never sent");
-    assert_eq!(
-        snapshot.outcome_unknown_shutdown, 1,
-        "the first request may have reached the endpoint"
-    );
-    assert!(reported.node.lock().iter().any(|event| matches!(
-        event,
-        NodeEvent::HookDeliveryOutcomesUnknown { count: 1, .. }
-    )));
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_client_rejection_is_not_retried() {
-    let recorder = Recorder::default();
-    recorder
-        .failing_status
-        .store(StatusCode::BAD_REQUEST.as_u16(), Ordering::Relaxed);
-    recorder.failures.store(10, Ordering::Relaxed);
-    let address = start(recorder.clone()).await;
-
-    deliver(
-        hook(address, &[lifecycle::Kind::SessionStarted]),
-        &[started("live/camera", 1)],
-        1,
-        &recorder,
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    assert_eq!(
-        recorder.bodies().len(),
-        1,
-        "a 400 means the consumer rejected the payload; retrying would only \
-         hold up everything queued behind it for this stream"
-    );
-}
-
-#[tokio::test]
 async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_it() {
     let recorder = Recorder::default();
     let address = start(recorder.clone()).await;
@@ -347,10 +193,9 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
     let seen = NodeLog::default();
     let (hooks, dispatchers) = build(
         HooksConfig {
-            source: "urn:rushls:node:test".into(),
             hooks: vec![hook(address, &lifecycle::Kind::ALL)],
             drain_timeout: Duration::from_secs(2),
-            ..HooksConfig::default()
+            ..HooksConfig::new("urn:rushls:node:test")
         },
         client,
         Events::default(),
@@ -395,19 +240,19 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
             "rushls.session.ended.v1",
             "rushls.stream.unavailable.v1",
         ],
-        "both lifetimes arrive interleaved on one ordered stream: the \
-         publisher stops before the stream does"
+        "both lifetimes arrive interleaved on one ordered stream: the +         publisher stops before the stream does"
     );
     assert_eq!(
         seen.sessions.lock().len(),
         3,
-        "the observer decorates rather than replaces: a node keeps the \
-         reporting it already had"
+        "the observer decorates rather than replaces: a node keeps the +         reporting it already had"
     );
 }
 
 #[tokio::test]
 async fn a_dropped_event_is_reported_through_the_node_observer() {
+    use std::sync::atomic::Ordering;
+
     let recorder = Recorder::default();
     recorder
         .failing_status
@@ -426,7 +271,8 @@ async fn a_dropped_event_is_reported_through_the_node_observer() {
     .await;
 
     // Nothing here writes to stderr itself: the process owns its output, so an
-    // embedder that redirects it redirects this too.
+    // embedder that redirects it redirects this too. This is also what keeps
+    // the shared crate free of any opinion about how a node reports.
     let reported = log.node.lock().clone();
     let dropped = reported
         .iter()
@@ -474,57 +320,6 @@ async fn only_subscribed_events_are_delivered() {
 }
 
 #[test]
-fn one_stream_has_one_request_in_flight_at_a_time() {
-    let mut queue = Queue::new(16);
-    let camera = StreamId::new("live/camera");
-    queue.push(envelope("live/camera"));
-    queue.push(envelope("live/stage"));
-    queue.push(envelope("live/camera"));
-
-    let first = queue.take_ready().expect("a stream is ready");
-    let second = queue.take_ready().expect("another stream is ready");
-
-    assert_eq!(first.subject, camera);
-    assert_eq!(
-        second.subject,
-        StreamId::new("live/stage"),
-        "a second stream goes concurrently; only one *per stream* is held back"
-    );
-    assert!(
-        queue.take_ready().is_none(),
-        "the camera's next event waits for the one ahead of it: out-of-order \
-         delivery is what would tell a consumer a live stream had ended"
-    );
-
-    queue.finish(&camera);
-    assert_eq!(
-        queue.take_ready().map(|envelope| envelope.subject),
-        Some(camera)
-    );
-}
-
-#[test]
-fn overflow_drops_the_oldest_so_survivors_stay_in_order() {
-    let mut queue = Queue::new(2);
-
-    assert!(!queue.push(envelope("live/a")));
-    assert!(!queue.push(envelope("live/b")));
-    let evicted = queue.push(envelope("live/c"));
-
-    assert!(evicted, "the third event put the queue over capacity");
-    assert_eq!(queue.queued(), 2);
-    let remaining: Vec<StreamId> = std::iter::from_fn(|| queue.take_ready())
-        .map(|envelope| envelope.subject)
-        .collect();
-    assert_eq!(
-        remaining,
-        [StreamId::new("live/b"), StreamId::new("live/c")],
-        "the newest state is what a consumer needs; dropping it would freeze \
-         their view at whatever was oldest"
-    );
-}
-
-#[test]
 fn a_projected_session_reaches_the_hooks_it_subscribed_to() {
     // The two halves fit together: the projector decides what is public, and
     // hooks decide who hears it.
@@ -554,23 +349,6 @@ fn a_projected_session_reaches_the_hooks_it_subscribed_to() {
             lifecycle::Kind::SessionStarted,
             lifecycle::Kind::SessionEnded,
         ],
-        "a session's events describe the publisher only; what viewers can \
-         reach is the store's to report"
+        "a session's events describe the publisher only; what viewers can +         reach is the store's to report"
     );
-}
-
-#[test]
-fn losses_are_counted_apart_because_they_mean_different_things() {
-    let names: BTreeSet<String> = [
-        Loss::Ingress,
-        Loss::Overflow,
-        Loss::Rejected,
-        Loss::Exhausted,
-        Loss::Shutdown,
-    ]
-    .iter()
-    .map(ToString::to_string)
-    .collect();
-
-    assert_eq!(names.len(), 5);
 }

@@ -172,6 +172,11 @@ macro_rules! counters {
 /// The half of [`counters!`] for a snapshot whose storage is not a plain bank
 /// of atomics — durations held as nanoseconds, capacities that come from
 /// configuration rather than from measurement.
+///
+/// A snapshot owned by another crate takes the second form, which names the
+/// const instead of hanging one off the type: the orphan rule forbids an
+/// inherent `impl` on a foreign type, and a shared crate has no business
+/// knowing what this application calls its metrics.
 macro_rules! series {
     (
         $snapshot:ty {
@@ -193,6 +198,27 @@ macro_rules! series {
                 },)+
             ];
         }
+    };
+
+    (
+        $(#[$meta:meta])*
+        $visibility:vis $series:ident: $snapshot:ty {
+            $(
+                $kind:ident($name:literal, $help:literal) = $read:expr
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $visibility const $series: &[$crate::observe::counters::Series<$snapshot>] = &[
+            $($crate::observe::counters::Series {
+                name: $name,
+                help: $help,
+                kind: $crate::observe::counters::MetricKind::$kind,
+                read: |snapshot: &$snapshot| {
+                    $crate::observe::counters::Reading::from($read(snapshot))
+                },
+            },)+
+        ];
     };
 }
 

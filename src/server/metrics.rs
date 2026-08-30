@@ -4,7 +4,7 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     delivery::hls::StreamStore,
-    hooks::{HookSnapshot, Hooks},
+    hooks::{HOOK_SERIES, HookSnapshot, Hooks},
     observe::{
         HlsMeters, HlsSnapshot, MeterSnapshot, MetricKind, OriginMeters, OriginSnapshot,
         ProcessMeters, ProcessSnapshot, Series, counters::series,
@@ -207,7 +207,7 @@ fn scalars<S>(output: &mut String, series: &[Series<S>], source: &S) {
 
 /// One counter per hook, labelled by the name the operator configured.
 fn render_hooks(output: &mut String, hooks: &[(Arc<str>, HookSnapshot)]) {
-    for series in HookSnapshot::SERIES {
+    for series in HOOK_SERIES {
         metadata(output, series.name, series.help, series.kind);
         for (hook, snapshot) in hooks {
             writeln!(

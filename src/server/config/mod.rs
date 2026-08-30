@@ -492,10 +492,9 @@ impl HooksAppConfig {
 
         Ok(Some(ResolvedHooks {
             config: HooksConfig {
-                source: self.source,
                 drain_timeout: self.drain_timeout,
                 hooks,
-                ..HooksConfig::default()
+                ..HooksConfig::new(self.source)
             },
             // A hook may wait far longer than admission may, which is why the
             // limits are per-request rather than baked into a shared client.

@@ -290,6 +290,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cc-hooks"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "cc-outbound",
+ "derive_more",
+ "http",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "cc-outbound"
 version = "0.1.0"
 dependencies = [
@@ -1524,6 +1542,7 @@ dependencies = [
  "bytes",
  "bytesize",
  "cc",
+ "cc-hooks",
  "cc-outbound",
  "cc-rtmp",
  "cc-tls",
