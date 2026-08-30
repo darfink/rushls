@@ -305,6 +305,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cc-tls"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "axum",
+ "notify",
+ "notify-debouncer-full",
+ "rcgen",
+ "rustls",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "cexpr"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1501,6 +1516,7 @@ dependencies = [
  "bytesize",
  "cc",
  "cc-outbound",
+ "cc-tls",
  "conf",
  "derive_more",
  "ffmpeg-sys-next",

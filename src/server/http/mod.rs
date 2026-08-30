@@ -223,7 +223,11 @@ pub fn bind_tls(
     meters: ProcessMeters,
     events: Events,
 ) -> Result<TlsListener, TlsError> {
-    TlsListener::new(listener, settings, meters, events)
+    TlsListener::new(
+        listener,
+        settings,
+        std::sync::Arc::new(tls::NodeTlsObserver::new(meters, events)),
+    )
 }
 
 async fn handle<P: Application>(
