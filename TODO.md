@@ -1,3 +1,8 @@
+- Configurable part hold back - e.g. 500ms parts but 2s part hold back?
+- Stream retention always at least as long as playlist window?
+- JWT for signed streams
+- Stuck shutdown
+- Support DVR
 - Warn instead of prevent non-HLS compliant settings?
 - Input tracks may in theory have PTS belonging to different epochs
 - What's the status of B-frames?

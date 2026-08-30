@@ -7,6 +7,7 @@ edition = "2024"
 allocation-counting = []
 
 [dependencies]
+cc-outbound.workspace = true
 arc-swap = "1"
 derive_more = { version = "2", features = ["debug", "deref", "display"] }
 bytes = "1.12.1"
@@ -57,12 +58,6 @@ tower = { version = "0.5", features = ["util"] }
 rcgen = "0.14"
 tokio = { version = "1", features = ["test-util"] }
 
-[patch.crates-io]
-# 0.2.3 does not advance timestamps for new messages using type-3 chunk
-# headers and conflates chunk size with the RTMP flow-control window. Keep the
-# patch local until Scuffle publishes the upstream fixes.
-scuffle-rtmp = { path = "vendor/scuffle-rtmp" }
-
 [lints.clippy]
 pedantic = { priority = -1, level = "deny" }
 similar_names = "allow"
@@ -70,3 +65,54 @@ must_use_candidate = "allow"
 doc_markdown = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["."]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "UNLICENSED"
+publish = false
+
+# Shared across both applications. Anything listed here is a version both apps
+# agree on; a crate needing something different keeps it in its own manifest
+# rather than forcing the other to move.
+[workspace.dependencies]
+# Internal
+cc-outbound = { path = "crates/cc-outbound" }
+bytes = "1"
+derive_more = { version = "2", features = ["debug", "deref", "display"] }
+http = "1"
+http-body-util = "0.1"
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "ring",
+  "native-tokio",
+  "http1",
+  "tls12",
+  "logging",
+] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+thiserror = "2"
+tokio = { version = "1", features = [
+  "macros",
+  "rt-multi-thread",
+  "net",
+  "io-util",
+  "sync",
+  "time",
+  "signal",
+] }
+[profile.release]
+lto = "thin"
+
+# `[patch]` is only honoured at the workspace root, so this moved up from
+# `.` when the workspace was formed.
+#
+# 0.2.3 does not advance timestamps for new messages using type-3 chunk headers
+# and conflates chunk size with the RTMP flow-control window. Keep the patch
+# local until Scuffle publishes the upstream fixes.
+[patch.crates-io]
+scuffle-rtmp = { path = "vendor/scuffle-rtmp" }
