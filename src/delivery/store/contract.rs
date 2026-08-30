@@ -195,7 +195,7 @@ mod tests {
 
         assert!(!contract.is_chunked());
         assert_eq!(contract.minimum_non_final_part_duration(), None);
-        assert!(contract.permits_part(Duration::from_secs(600)));
+        assert!(contract.permits_part(Duration::from_mins(10)));
         assert!(contract.permits_non_final_part(Duration::ZERO));
     }
 }

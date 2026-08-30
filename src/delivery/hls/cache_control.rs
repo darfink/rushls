@@ -168,13 +168,10 @@ mod tests {
     #[test]
     fn a_flat_media_lifetime_ignores_the_target_it_would_have_scaled() {
         let policy = CacheControlPolicy {
-            media: Duration::from_secs(31_536_000).into(),
+            media: Duration::from_hours(8_760).into(),
             ..CacheControlPolicy::default()
         };
 
-        assert_eq!(
-            policy.media(TARGET).max_age,
-            Duration::from_secs(31_536_000)
-        );
+        assert_eq!(policy.media(TARGET).max_age, Duration::from_hours(8_760));
     }
 }

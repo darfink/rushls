@@ -691,7 +691,7 @@ mod tests {
         );
         let pacer = MediaPacer::after_preroll(
             crate::admission::IngestTimingPolicy::RequireRealtime {
-                maximum_lead: std::time::Duration::from_secs(60),
+                maximum_lead: std::time::Duration::from_mins(1),
             },
             &crate::media::fixtures::video_timeline(),
             &[],

@@ -8,6 +8,7 @@ allocation-counting = []
 
 [dependencies]
 cc-outbound.workspace = true
+cc-rtmp.workspace = true
 cc-tls = { workspace = true, features = ["axum"] }
 arc-swap = "1"
 derive_more = { version = "2", features = ["debug", "deref", "display"] }
@@ -25,7 +26,6 @@ parking_lot = "0.12"
 # `ring` rather than the default `aws-lc-rs`: the latter wants cmake and nasm,
 # and this build already carries as much C toolchain dependency as it should.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-scuffle-rtmp = "0.2.3"
 serde = { version = "1", features = ["derive"] }
 socket2 = "0.6"
 subtle = "2"
@@ -84,7 +84,11 @@ publish = false
 [workspace.dependencies]
 # Internal
 cc-outbound = { path = "crates/cc-outbound" }
+cc-rtmp = { path = "crates/cc-rtmp" }
 cc-tls = { path = "crates/cc-tls" }
+rml_rtmp = { path = "vendor/rml_rtmp" }
+
+# External
 arc-swap = "1"
 bytes = "1"
 derive_more = { version = "2", features = ["debug", "deref", "display"] }
@@ -100,12 +104,16 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 notify = "8"
 notify-debouncer-full = "0.7"
+rml_amf0 = "0.3"
+# `ring` rather than `aws-lc-rs`: the latter wants cmake and NASM, which both
+# applications independently chose to avoid in their build images.
 rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "std",
   "tls12",
   "logging",
 ] }
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = [
   "macros",
@@ -123,12 +131,3 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 ] }
 [profile.release]
 lto = "thin"
-
-# `[patch]` is only honoured at the workspace root, so this moved up from
-# `.` when the workspace was formed.
-#
-# 0.2.3 does not advance timestamps for new messages using type-3 chunk headers
-# and conflates chunk size with the RTMP flow-control window. Keep the patch
-# local until Scuffle publishes the upstream fixes.
-[patch.crates-io]
-scuffle-rtmp = { path = "vendor/scuffle-rtmp" }

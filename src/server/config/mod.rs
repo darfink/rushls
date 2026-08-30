@@ -17,8 +17,8 @@ use std::{
 };
 
 use bytesize::ByteSize;
+use cc_rtmp::{EnhancedValidationMode, ServerSessionTimeouts};
 use conf::{Conf, find_parameter, introspection::ProgramOptionMeta};
-use scuffle_rtmp::session::server::ServerSessionTimeouts;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -1058,6 +1058,9 @@ pub struct RtmpAppConfig {
     /// Address receiving RTMP publishers.
     #[conf(parameter, long, env, default_value = "0.0.0.0:1935")]
     pub listen: SocketAddr,
+    /// Enhanced RTMP validation policy (`strict` or `passthrough`).
+    #[conf(parameter, long, env, default_value = "strict")]
+    enhanced_validation: EnhancedValidationMode,
     /// How long an RTMP peer may produce nothing before its session is closed.
     ///
     /// One value for connection liveness, which is what most operators want to
@@ -1149,6 +1152,7 @@ impl RtmpAppConfig {
         }
 
         node.rtmp.timeouts = timeouts;
+        node.rtmp.enhanced_validation = self.enhanced_validation;
 
         // Disabling a timeout is legitimate on a trusted link and a liability
         // on a public one, and nothing here can tell which this is. Say so

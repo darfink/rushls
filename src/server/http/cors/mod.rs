@@ -90,7 +90,7 @@ impl Default for CorsConfig {
             // Ten minutes: Chrome's ceiling is two hours, but a shorter window
             // keeps a policy change from lingering in browsers for a whole
             // afternoon, and preflights are rare on this origin anyway.
-            max_age: Duration::from_secs(600),
+            max_age: Duration::from_mins(10),
         }
     }
 }

@@ -7,12 +7,14 @@
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use bytes::{Bytes, BytesMut};
-use scuffle_rtmp::{
-    ServerSession,
-    session::server::{ServerSessionError, ServerSessionTimeouts, SessionData, SessionHandler},
+use cc_rtmp::{
+    EnhancedCapabilities, EnhancedValidationMode, ServerSessionTimeouts, ValidatedMedia,
+    ValidatedMetadata,
+    handshake::{Handshake, HandshakeProcessResult, PeerType},
+    sessions::{ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::oneshot,
     task::JoinHandle,
@@ -53,6 +55,8 @@ pub struct RtmpConfig {
     /// dribbles one byte per second defeats the first and is caught by the
     /// second.
     pub timeouts: ServerSessionTimeouts,
+    /// Enhanced FLV structural validation policy.
+    pub enhanced_validation: EnhancedValidationMode,
     /// Encoded FLV bytes allowed to wait for AVFormat.
     pub maximum_buffered_flv_bytes: NonZeroUsize,
     /// Application limit below the FLV format's fixed 24-bit tag-size ceiling.
@@ -65,7 +69,7 @@ impl Default for RtmpConfig {
     fn default() -> Self {
         Self {
             maximum_publish_wait: Duration::from_secs(10),
-            // Deliberately looser than scuffle-rtmp's 2s/2.5s defaults, which
+            // Deliberately looser than the former listener's 2s/2.5s defaults, which
             // are tight enough to drop a legitimate publisher on a poor
             // network between keyframes. The configuration layer resolves
             // these from `peer_timeout`; this value is what a caller
@@ -75,6 +79,7 @@ impl Default for RtmpConfig {
                 session_read: Some(Duration::from_secs(10)),
                 write: Some(Duration::from_secs(10)),
             },
+            enhanced_validation: EnhancedValidationMode::Strict,
             maximum_buffered_flv_bytes: nz::usize!(16 * 1024 * 1024),
             maximum_tag_payload_bytes: nz::usize!(8 * 1024 * 1024),
             avformat: AvformatConfig::default(),
@@ -117,7 +122,7 @@ pub struct RtmpPendingPublish {
     decision: oneshot::Sender<PublishDecision>,
     input: AvformatByteChannel,
     config: RtmpConfig,
-    session: JoinHandle<Result<bool, scuffle_rtmp::error::RtmpError>>,
+    session: JoinHandle<SessionResult>,
 }
 
 impl RtmpPendingPublish {
@@ -146,12 +151,8 @@ impl RtmpPendingPublish {
             maximum_tag_payload_bytes: config.maximum_tag_payload_bytes.get(),
             framing: BytesMut::new(),
         };
-        let timeouts = config.timeouts;
         let mut session = tokio::spawn(async move {
-            let result = ServerSession::new(io, handler)
-                .with_timeouts(timeouts)
-                .run()
-                .await;
+            let result = run_server_session(io, handler, config).await;
             match &result {
                 Ok(true) => supervisor.finish(InputState::Closed),
                 Ok(false) => supervisor.finish(InputState::Interrupted),
@@ -269,10 +270,6 @@ impl PendingPublish for RtmpPendingPublish {
                 TransportError::Reject("RTMP connection ended before rejection completed".into())
             })?;
             session.abort();
-
-            // scuffle-rtmp currently exposes no handler API for a typed
-            // NetStream.Publish rejection. Returning a handler error closes the
-            // connection, which is safe but less informative to the encoder.
             Ok(())
         })
     }
@@ -280,7 +277,7 @@ impl PendingPublish for RtmpPendingPublish {
 
 struct RtmpPacketSource {
     source: AvformatPacketSource,
-    session: Option<JoinHandle<Result<bool, scuffle_rtmp::error::RtmpError>>>,
+    session: Option<JoinHandle<SessionResult>>,
 }
 
 impl PacketSource for RtmpPacketSource {
@@ -318,6 +315,14 @@ enum PublishDecision {
     Reject(PublishRejection, oneshot::Sender<()>),
 }
 
+enum PublishOutcome {
+    Accepted,
+    Rejected {
+        rejection: PublishRejection,
+        completion: oneshot::Sender<()>,
+    },
+}
+
 struct FlvHandler {
     remote_address: SocketAddr,
     publish: Option<oneshot::Sender<PublishAttempt>>,
@@ -338,7 +343,7 @@ impl FlvHandler {
         tag_type: u8,
         timestamp: u32,
         payload: Bytes,
-    ) -> Result<(), ServerSessionError> {
+    ) -> Result<(), Box<str>> {
         if payload.len() > self.maximum_tag_payload_bytes
             || payload.len() > FLV_MAXIMUM_PAYLOAD_BYTES
         {
@@ -350,9 +355,7 @@ impl FlvHandler {
                 )
                 .into_boxed_str(),
             );
-            // SessionHandler has no user-defined error variant. The detailed
-            // cause is retained on the byte input before the RTMP session ends.
-            return Err(ServerSessionError::PlayNotSupported);
+            return Err("RTMP media payload exceeds configured FLV tag limit".into());
         }
 
         // Bounded above by `FLV_MAXIMUM_PAYLOAD_BYTES` (24-bit).
@@ -381,25 +384,23 @@ impl FlvHandler {
             .await
             .map_err(|error| {
                 self.writer.fail(error.to_string());
-                ServerSessionError::PlayNotSupported
+                error.to_string().into_boxed_str()
             })
     }
-}
 
-impl SessionHandler for FlvHandler {
     async fn on_publish(
         &mut self,
         stream_id: u32,
         app_name: &str,
         stream_name: &str,
-    ) -> Result<(), ServerSessionError> {
+    ) -> Result<PublishOutcome, Box<str>> {
         if self.active_stream_id.is_some() || app_name.is_empty() || stream_name.is_empty() {
-            return Err(ServerSessionError::PlayNotSupported);
+            return Err("invalid or duplicate RTMP publish request".into());
         }
         let publish = self
             .publish
             .take()
-            .ok_or(ServerSessionError::PlayNotSupported)?;
+            .ok_or_else(|| Box::<str>::from("RTMP connection attempted a second publication"))?;
         let (decision_tx, decision_rx) = oneshot::channel();
         let request = PublishRequest {
             protocol: IngestProtocol::Rtmp,
@@ -411,8 +412,6 @@ impl SessionHandler for FlvHandler {
             client: ClientInfo {
                 remote_address: self.remote_address,
                 encoder: None,
-                // Scuffle's handler callback does not expose connect metadata
-                // or the negotiated Enhanced RTMP capability set.
                 protocol_version: None,
             },
         };
@@ -421,11 +420,11 @@ impl SessionHandler for FlvHandler {
                 request,
                 decision: decision_tx,
             })
-            .map_err(|_| ServerSessionError::PlayNotSupported)?;
+            .map_err(|_| Box::<str>::from("publication admission receiver closed"))?;
 
         match decision_rx
             .await
-            .map_err(|_| ServerSessionError::PlayNotSupported)?
+            .map_err(|_| Box::<str>::from("publication admission decision was dropped"))?
         {
             PublishDecision::Accept(completion) => {
                 let result = self
@@ -437,44 +436,397 @@ impl SessionHandler for FlvHandler {
                     Ok(()) => {
                         self.active_stream_id = Some(stream_id);
                         let _ = completion.send(Ok(()));
-                        Ok(())
+                        Ok(PublishOutcome::Accepted)
                     }
                     Err(error) => {
                         self.writer.fail(error.clone());
                         let _ = completion.send(Err(error));
-                        Err(ServerSessionError::PlayNotSupported)
+                        Err("could not enqueue FLV header".into())
                     }
                 }
             }
-            PublishDecision::Reject(_rejection, completion) => {
-                let _ = completion.send(());
-                Err(ServerSessionError::PlayNotSupported)
-            }
+            PublishDecision::Reject(rejection, completion) => Ok(PublishOutcome::Rejected {
+                rejection,
+                completion,
+            }),
         }
     }
 
-    async fn on_unpublish(&mut self, stream_id: u32) -> Result<(), ServerSessionError> {
+    fn on_unpublish(&mut self, stream_id: u32) -> Result<(), Box<str>> {
         if self.active_stream_id != Some(stream_id) {
-            return Err(ServerSessionError::PlayNotSupported);
+            return Err("RTMP unpublish did not match the active stream".into());
         }
         self.active_stream_id = None;
         self.writer.finish(InputState::Closed);
         Ok(())
     }
 
-    async fn on_data(
-        &mut self,
-        stream_id: u32,
-        data: SessionData,
-    ) -> Result<(), ServerSessionError> {
+    async fn on_data(&mut self, stream_id: u32, data: SessionData) -> Result<(), Box<str>> {
         if self.active_stream_id != Some(stream_id) {
-            return Err(ServerSessionError::PlayNotSupported);
+            return Err("RTMP media arrived outside the active publication".into());
         }
         match data {
             SessionData::Audio { timestamp, data } => self.write_tag(8, timestamp, data).await,
             SessionData::Video { timestamp, data } => self.write_tag(9, timestamp, data).await,
             SessionData::Amf0 { timestamp, data } => self.write_tag(18, timestamp, data).await,
         }
+    }
+}
+
+enum SessionData {
+    Audio { timestamp: u32, data: Bytes },
+    Video { timestamp: u32, data: Bytes },
+    Amf0 { timestamp: u32, data: Bytes },
+}
+
+type SessionResult = Result<bool, Box<str>>;
+
+async fn run_server_session<S>(
+    mut io: S,
+    mut handler: FlvHandler,
+    config: RtmpConfig,
+) -> SessionResult
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut read_buffer = vec![0_u8; 16 * 1024];
+    let mut handshake = Handshake::new(PeerType::Server);
+    let carry = loop {
+        let read = timed_read(
+            &mut io,
+            &mut read_buffer,
+            config.timeouts.handshake_read,
+            "RTMP handshake read",
+        )
+        .await?;
+        if read == 0 {
+            return Err("RTMP peer closed during handshake".into());
+        }
+        match handshake
+            .process_bytes(&read_buffer[..read])
+            .map_err(|error| format!("RTMP handshake failed: {error:?}").into_boxed_str())?
+        {
+            HandshakeProcessResult::InProgress { response_bytes } => {
+                timed_write(&mut io, &response_bytes, config.timeouts.write).await?;
+            }
+            HandshakeProcessResult::Completed {
+                response_bytes,
+                remaining_bytes,
+            } => {
+                timed_write(&mut io, &response_bytes, config.timeouts.write).await?;
+                break remaining_bytes;
+            }
+        }
+    };
+
+    let mut session_config = ServerSessionConfig::new();
+    session_config.window_ack_size = 2_500_000;
+    session_config.chunk_deserializer.maximum_message_size = config.maximum_tag_payload_bytes.get();
+    session_config.chunk_deserializer.maximum_buffered_bytes =
+        config.maximum_buffered_flv_bytes.get();
+    let (mut session, initial) = ServerSession::new(session_config)
+        .map_err(|error| format!("could not create RTMP session: {error}").into_boxed_str())?;
+    debug_assert!(initial.is_empty(), "server must not write before connect");
+
+    if !carry.is_empty() {
+        let results = session
+            .handle_input(&carry)
+            .map_err(|error| format!("invalid RTMP input: {error}").into_boxed_str())?;
+        if !process_session_results(&mut io, &mut session, &mut handler, config, results).await? {
+            return Ok(false);
+        }
+    }
+
+    loop {
+        let read = timed_read(
+            &mut io,
+            &mut read_buffer,
+            config.timeouts.session_read,
+            "RTMP session read",
+        )
+        .await?;
+        if read == 0 {
+            return Ok(true);
+        }
+        let results = session
+            .handle_input(&read_buffer[..read])
+            .map_err(|error| format!("invalid RTMP input: {error}").into_boxed_str())?;
+        if !process_session_results(&mut io, &mut session, &mut handler, config, results).await? {
+            return Ok(false);
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Keep the protocol event taxonomy visible in one dispatcher.
+async fn process_session_results<S>(
+    io: &mut S,
+    session: &mut ServerSession,
+    handler: &mut FlvHandler,
+    config: RtmpConfig,
+    results: Vec<ServerSessionResult>,
+) -> Result<bool, Box<str>>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut pending = results;
+    loop {
+        let mut follow_up = Vec::new();
+        for result in pending {
+            match result {
+                ServerSessionResult::OutboundResponse(packet) => {
+                    timed_write(io, &packet.bytes, config.timeouts.write).await?;
+                }
+                ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                ServerSessionResult::RaisedEvent(event) => match event {
+                    ServerSessionEvent::ConnectionRequested {
+                        request_id,
+                        additional_properties,
+                        ..
+                    } => {
+                        EnhancedCapabilities::parse(
+                            &additional_properties,
+                            config.enhanced_validation,
+                        )
+                        .map_err(String::into_boxed_str)?;
+                        follow_up.extend(
+                            session
+                                .accept_request_with_properties(
+                                    request_id,
+                                    enhanced_server_capabilities(),
+                                )
+                                .map_err(|error| error.to_string().into_boxed_str())?,
+                        );
+                    }
+                    ServerSessionEvent::PublishStreamRequested {
+                        request_id,
+                        app_name,
+                        stream_key,
+                        stream_id,
+                        ..
+                    } => {
+                        match handler
+                            .on_publish(stream_id, &app_name, &stream_key)
+                            .await?
+                        {
+                            PublishOutcome::Accepted => {
+                                follow_up.extend(
+                                    session
+                                        .accept_request(request_id)
+                                        .map_err(|error| error.to_string().into_boxed_str())?,
+                                );
+                            }
+                            PublishOutcome::Rejected {
+                                rejection,
+                                completion,
+                            } => {
+                                let (code, description) = publish_rejection_status(rejection);
+                                follow_up.extend(
+                                    session
+                                        .reject_request(request_id, code, description)
+                                        .map_err(|error| error.to_string().into_boxed_str())?,
+                                );
+                                write_server_results(io, config.timeouts.write, follow_up).await?;
+                                let _ = completion.send(());
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    ServerSessionEvent::AudioDataReceived {
+                        data, timestamp, ..
+                    } => {
+                        let media = ValidatedMedia::parse_audio(data, config.enhanced_validation)
+                            .map_err(|error| error.to_string().into_boxed_str())?;
+                        let stream_id = handler.active_stream_id.ok_or_else(|| {
+                            Box::<str>::from("audio arrived before publish acceptance")
+                        })?;
+                        handler
+                            .on_data(
+                                stream_id,
+                                SessionData::Audio {
+                                    timestamp: timestamp.value,
+                                    data: media.raw,
+                                },
+                            )
+                            .await?;
+                    }
+                    ServerSessionEvent::VideoDataReceived {
+                        data, timestamp, ..
+                    } => {
+                        let media = ValidatedMedia::parse_video(data, config.enhanced_validation)
+                            .map_err(|error| error.to_string().into_boxed_str())?;
+                        let stream_id = handler.active_stream_id.ok_or_else(|| {
+                            Box::<str>::from("video arrived before publish acceptance")
+                        })?;
+                        handler
+                            .on_data(
+                                stream_id,
+                                SessionData::Video {
+                                    timestamp: timestamp.value,
+                                    data: media.raw,
+                                },
+                            )
+                            .await?;
+                    }
+                    ServerSessionEvent::StreamMetadataChanged {
+                        raw_metadata,
+                        raw_payload,
+                        timestamp,
+                        ..
+                    } => {
+                        let metadata = ValidatedMetadata::parse(
+                            raw_payload,
+                            raw_metadata,
+                            config.enhanced_validation,
+                        )
+                        .map_err(|error| error.to_string().into_boxed_str())?;
+                        let stream_id = handler.active_stream_id.ok_or_else(|| {
+                            Box::<str>::from("metadata arrived before publish acceptance")
+                        })?;
+                        handler
+                            .on_data(
+                                stream_id,
+                                SessionData::Amf0 {
+                                    timestamp: timestamp.value,
+                                    data: metadata.raw,
+                                },
+                            )
+                            .await?;
+                    }
+                    ServerSessionEvent::PublishStreamFinished { .. } => {
+                        if let Some(stream_id) = handler.active_stream_id {
+                            handler.on_unpublish(stream_id)?;
+                        }
+                        return Ok(false);
+                    }
+                    ServerSessionEvent::PlayStreamRequested { request_id, .. } => {
+                        follow_up.extend(
+                            session
+                                .reject_request(
+                                    request_id,
+                                    "NetStream.Play.Failed",
+                                    "this endpoint only accepts publishers",
+                                )
+                                .map_err(|error| error.to_string().into_boxed_str())?,
+                        );
+                    }
+                    _ => {}
+                },
+            }
+        }
+        if follow_up.is_empty() {
+            return Ok(true);
+        }
+        pending = follow_up;
+    }
+}
+
+fn publish_rejection_status(rejection: PublishRejection) -> (&'static str, &'static str) {
+    match rejection {
+        PublishRejection::Unauthorized => (
+            "NetStream.Publish.Denied",
+            "publisher authentication failed",
+        ),
+        PublishRejection::Forbidden => (
+            "NetStream.Publish.Denied",
+            "publisher is not allowed to publish this stream",
+        ),
+        PublishRejection::AlreadyPublished => (
+            "NetStream.Publish.BadName",
+            "stream is already being published",
+        ),
+        PublishRejection::ServiceUnavailable => (
+            "NetStream.Publish.Failed",
+            "publication service is unavailable",
+        ),
+    }
+}
+
+fn enhanced_server_capabilities() -> std::collections::HashMap<String, cc_rtmp::rml_amf0::Amf0Value>
+{
+    use cc_rtmp::rml_amf0::Amf0Value;
+    let video = ["avc1", "hvc1", "av01"];
+    let audio = ["mp4a", "Opus"];
+    let info_map = |values: &[&str]| {
+        Amf0Value::Object(
+            values
+                .iter()
+                .map(|value| ((*value).to_owned(), Amf0Value::Number(1.0)))
+                .collect(),
+        )
+    };
+    std::collections::HashMap::from([
+        (
+            "fourCcList".to_owned(),
+            Amf0Value::StrictArray(
+                video
+                    .into_iter()
+                    .chain(audio)
+                    .map(|value| Amf0Value::Utf8String(value.to_owned()))
+                    .collect(),
+            ),
+        ),
+        ("videoFourCcInfoMap".to_owned(), info_map(&video)),
+        ("audioFourCcInfoMap".to_owned(), info_map(&audio)),
+        ("capsEx".to_owned(), Amf0Value::Number(14.0)),
+    ])
+}
+
+async fn write_server_results<S>(
+    io: &mut S,
+    timeout: Option<Duration>,
+    results: Vec<ServerSessionResult>,
+) -> Result<(), Box<str>>
+where
+    S: AsyncWrite + Unpin,
+{
+    for result in results {
+        if let ServerSessionResult::OutboundResponse(packet) = result {
+            timed_write(io, &packet.bytes, timeout).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn timed_read<S>(
+    io: &mut S,
+    buffer: &mut [u8],
+    timeout: Option<Duration>,
+    operation: &'static str,
+) -> Result<usize, Box<str>>
+where
+    S: AsyncRead + Unpin,
+{
+    match timeout {
+        Some(duration) => tokio::time::timeout(duration, io.read(buffer))
+            .await
+            .map_err(|_| format!("{operation} timed out").into_boxed_str())?
+            .map_err(|error| format!("{operation} failed: {error}").into_boxed_str()),
+        None => io
+            .read(buffer)
+            .await
+            .map_err(|error| format!("{operation} failed: {error}").into_boxed_str()),
+    }
+}
+
+async fn timed_write<S>(io: &mut S, bytes: &[u8], timeout: Option<Duration>) -> Result<(), Box<str>>
+where
+    S: AsyncWrite + Unpin,
+{
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let write = async {
+        io.write_all(bytes).await?;
+        io.flush().await
+    };
+    match timeout {
+        Some(duration) => tokio::time::timeout(duration, write)
+            .await
+            .map_err(|_| Box::<str>::from("RTMP write timed out"))?
+            .map_err(|error| format!("RTMP write failed: {error}").into_boxed_str()),
+        None => write
+            .await
+            .map_err(|error| format!("RTMP write failed: {error}").into_boxed_str()),
     }
 }
 
@@ -491,7 +843,7 @@ fn invalid_request(message: &'static str) -> TransportError {
 }
 
 fn session_handshake_error(
-    result: Result<Result<bool, scuffle_rtmp::error::RtmpError>, tokio::task::JoinError>,
+    result: Result<SessionResult, tokio::task::JoinError>,
 ) -> TransportError {
     let message = match result {
         Ok(Ok(_)) => "RTMP connection ended before publishing".into(),
@@ -506,7 +858,7 @@ mod tests {
     use std::io::Cursor;
 
     use bytes::BytesMut;
-    use scuffle_rtmp::chunk::reader::ChunkReader;
+    use cc_rtmp::chunk_io::ChunkDeserializer;
 
     use crate::{
         domain::Codec,
@@ -531,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn scuffle_advances_a_new_type_three_message_by_the_previous_delta() {
+    fn shared_core_advances_a_new_type_three_message_by_the_previous_delta() {
         let mut wire = BytesMut::new();
         // Type 0: absolute timestamp 100, three-byte audio message.
         wire.extend_from_slice(&[
@@ -544,30 +896,29 @@ mod tests {
         // Type 3: a complete new message reusing the delta, length, and type.
         wire.extend_from_slice(&[0xc4]);
         wire.extend_from_slice(b"ccc");
-        let mut reader = ChunkReader::default();
+        let mut reader = ChunkDeserializer::new();
 
         let first = reader
-            .read_chunk(&mut wire)
+            .get_next_message(&wire)
             .expect("first chunk is valid")
             .expect("first message is complete");
         let second = reader
-            .read_chunk(&mut wire)
+            .get_next_message(&[])
             .expect("second chunk is valid")
             .expect("second message is complete");
         let third = reader
-            .read_chunk(&mut wire)
+            .get_next_message(&[])
             .expect("third chunk is valid")
             .expect("third message is complete");
 
-        assert_eq!(first.message_header.timestamp, 100);
-        assert_eq!(second.message_header.timestamp, 121);
-        assert_eq!(third.message_header.timestamp, 142);
-        assert_eq!(third.payload.as_ref(), b"ccc");
-        assert!(wire.is_empty());
+        assert_eq!(first.timestamp.value, 100);
+        assert_eq!(second.timestamp.value, 121);
+        assert_eq!(third.timestamp.value, 142);
+        assert_eq!(third.data.as_ref(), b"ccc");
     }
 
     #[test]
-    fn scuffle_keeps_a_type_three_continuation_on_the_same_timestamp() {
+    fn shared_core_keeps_a_type_three_continuation_on_the_same_timestamp() {
         let mut wire = BytesMut::new();
         // The 130-byte message exceeds RTMP's initial 128-byte chunk size.
         wire.extend_from_slice(&[
@@ -575,16 +926,15 @@ mod tests {
         ]);
         wire.extend_from_slice(&[b'a'; 128]);
         wire.extend_from_slice(&[0xc4, b'b', b'b']);
-        let mut reader = ChunkReader::default();
+        let mut reader = ChunkDeserializer::new();
 
         let message = reader
-            .read_chunk(&mut wire)
+            .get_next_message(&wire)
             .expect("continuation chunk is valid")
             .expect("partial chunks form one complete message");
 
-        assert_eq!(message.message_header.timestamp, 100);
-        assert_eq!(message.payload.len(), 130);
-        assert!(wire.is_empty());
+        assert_eq!(message.timestamp.value, 100);
+        assert_eq!(message.data.len(), 130);
     }
 
     fn handler(
@@ -659,7 +1009,7 @@ mod tests {
             )
             .await
             .expect("tag was queued");
-        handler.on_unpublish(7).await.expect("clean unpublish");
+        handler.on_unpublish(7).expect("clean unpublish");
 
         let bytes = drain(&mut input).expect("channel ended cleanly");
         assert_eq!(&bytes[..FLV_HEADER.len()], FLV_HEADER);
@@ -790,7 +1140,7 @@ mod tests {
                 .await
                 .expect("AAC frame is framed");
         }
-        handler.on_unpublish(3).await.expect("clean unpublish");
+        handler.on_unpublish(3).expect("clean unpublish");
 
         let meters = SessionMeters::new(ProcessMeters::default());
         let mut source = AvformatPacketSource::new(

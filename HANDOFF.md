@@ -25,9 +25,10 @@
   - subtitle timing projected to 90 kHz for future `X-TIMESTAMP-MAP` rendering.
 - Normalization was split by responsibility: pipeline samples, presented
   timing, contracts, and per-kind pass-through implementations are separate.
-- Enhanced RTMP ingest through `scuffle-rtmp`. Admission pauses the publish
-  command, accepted audio/video/AMF0 messages are framed as a byte-bounded FLV
-  stream, and the existing AVFormat source performs discovery and demuxing.
+- Enhanced RTMP v2 r2 ingest through the shared `cc-rtmp` core. Admission
+  pauses the publish command, typed-and-validated audio/video and lossless AMF
+  payloads are framed as a byte-bounded FLV stream, and the existing AVFormat
+  source performs discovery and demuxing.
 - Production process assembly through `server::Node`: RTMP admission, AVFormat,
   normalization, CMAF/WebVTT packaging, HLS storage, HTTP delivery, metrics,
   graceful shutdown, and one maintenance task for store and playlist caches.

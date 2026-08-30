@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn a_packed_version_reads_as_its_three_components() {
         // FFmpeg packs the version as (major << 16) | (minor << 8) | micro.
-        let version = LibraryVersion((62 << 16) | (12 << 8) | 102);
+        let version = LibraryVersion((62 << 16) | (12 << 8) | 0x66);
         assert_eq!(
             (version.major(), version.minor(), version.micro()),
             (62, 12, 102)
@@ -172,7 +172,7 @@ mod tests {
         // it reaches them through `Debug` because `main` returns it.
         let mismatch = VersionMismatch {
             library: "libavformat",
-            found: LibraryVersion((61 << 16) | (7 << 8) | 100),
+            found: LibraryVersion((61 << 16) | (7 << 8) | 0x64),
             required: REQUIRED_AVFORMAT_MAJOR,
         };
         let rendered = format!("{mismatch:?}");

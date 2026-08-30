@@ -74,9 +74,9 @@ RUN ./configure \
   && make -j"$(nproc)" \
   && make install
 
-FROM rust:1.93-slim-trixie AS builder
+FROM rust:1.97-slim-trixie AS builder
 
-WORKDIR /app
+WORKDIR /workspace
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -94,20 +94,21 @@ COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
 ENV LD_LIBRARY_PATH=/opt/ffmpeg/lib \
     PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig:/opt/srt/lib/pkgconfig
 
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY src ./src
-# Cargo.toml patches scuffle-rtmp to this audited local copy.
-COPY vendor/scuffle-rtmp ./vendor/scuffle-rtmp
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY vendor ./vendor
+COPY apps ./apps
 
 # `.dockerignore` omits `.git`, so bake the commit in from the host:
-#   docker build --build-arg GIT_SHA="$(git rev-parse --short=12 HEAD)" .
+#   docker build -f Dockerfile \
+#     --build-arg GIT_SHA="$(git rev-parse --short=12 HEAD)" .
 ARG GIT_SHA=
 ENV GIT_SHA=$GIT_SHA
 
 ARG TARGETPLATFORM
 RUN --mount=type=cache,id=rushls-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=rushls-target-${TARGETPLATFORM},target=/app/target,sharing=locked \
-    cargo build --release --locked \
+    --mount=type=cache,id=rushls-target-${TARGETPLATFORM},target=/workspace/target,sharing=locked \
+    cargo build --release --locked -p rushls \
   && install -Dm755 target/release/rushls /usr/local/bin/rushls
 
 FROM debian:trixie-slim AS runtime

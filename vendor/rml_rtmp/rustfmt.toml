@@ -1,0 +1,5 @@
+# CROWDCAST: keep upstream's formatting (rustfmt defaults, 4-space indent) so
+# the diff against the published crate stays limited to real changes. The
+# workspace root uses 2-space indent, which would otherwise reformat every file
+# here and bury the CROWDCAST edits in noise.
+edition = "2015"

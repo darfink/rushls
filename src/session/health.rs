@@ -279,8 +279,8 @@ mod tests {
             Phase::Running,
             Duration::from_millis(200),
             HealthPolicy {
-                source_stall_timeout: Duration::from_secs(60),
-                media_stall_timeout: Duration::from_secs(60),
+                source_stall_timeout: Duration::from_mins(1),
+                media_stall_timeout: Duration::from_mins(1),
                 ..policy()
             },
             Instant::now(),

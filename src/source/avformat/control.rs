@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn an_elapsed_deadline_interrupts_and_a_future_one_does_not() {
         let control = Control::new();
-        control.set_deadline(Some(Instant::now() + std::time::Duration::from_secs(3_600)));
+        control.set_deadline(Some(Instant::now() + std::time::Duration::from_hours(1)));
         assert!(!control.interrupted());
 
         // Already in the past. The stored offset saturates to one nanosecond

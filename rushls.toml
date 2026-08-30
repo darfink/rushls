@@ -142,6 +142,9 @@ policy = "default"
 [ingest.rtmp]
 # Use 127.0.0.1 when a local proxy is the only intended RTMP client.
 listen = "0.0.0.0:1935"
+# Reject malformed Enhanced FLV structures. Set to "passthrough" only for
+# diagnostics or compatibility with a known non-conforming publisher.
+enhanced_validation = "strict"
 
 # How long an RTMP peer may produce nothing before its session is closed.
 # This is the one timeout most deployments need: it reaches the handshake,

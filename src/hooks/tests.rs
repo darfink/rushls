@@ -457,7 +457,7 @@ async fn only_subscribed_events_are_delivered() {
         session: SessionId(nz::u64!(1)),
         principal: "studio-camera".into(),
         outcome: lifecycle::Outcome::Ended,
-        duration: Duration::from_secs(180),
+        duration: Duration::from_mins(3),
         was_available: true,
         diagnostic: None,
     });

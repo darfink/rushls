@@ -613,12 +613,12 @@ fn config() -> SessionConfig {
         // Long enough that liveness never fires unless a test asks it to.
         supervision: SupervisionPolicy {
             health: HealthPolicy {
-                source_stall_timeout: Duration::from_secs(3_600),
-                media_stall_timeout: Duration::from_secs(3_600),
+                source_stall_timeout: Duration::from_hours(1),
+                media_stall_timeout: Duration::from_hours(1),
                 stalled_publication_multiplier: 1_000,
-                minimum_publication_stall_tolerance: Duration::from_secs(3_600),
+                minimum_publication_stall_tolerance: Duration::from_hours(1),
             },
-            health_interval: Duration::from_secs(3_600),
+            health_interval: Duration::from_hours(1),
         },
     }
 }
@@ -1143,8 +1143,8 @@ async fn a_session_that_never_publishes_is_terminated_instead_of_running_forever
             health: HealthPolicy {
                 // Long enough that only the publication deadline can fire:
                 // the source and media marks stay fresh by construction.
-                source_stall_timeout: Duration::from_secs(3_600),
-                media_stall_timeout: Duration::from_secs(3_600),
+                source_stall_timeout: Duration::from_hours(1),
+                media_stall_timeout: Duration::from_hours(1),
                 stalled_publication_multiplier: 3,
                 minimum_publication_stall_tolerance: Duration::ZERO,
             },
