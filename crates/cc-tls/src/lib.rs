@@ -287,7 +287,7 @@ impl<O: TlsObserver> TlsListener<O> {
 /// Lets an `axum` server accept from this listener.
 ///
 /// Behind a feature because the reload machinery has nothing to do with axum -
-/// the RTMP proxy uses [`TlsListener::accept_tls`] directly and should not
+/// the Routmp uses [`TlsListener::accept_tls`] directly and should not
 /// compile a web framework to get certificate rotation.
 #[cfg(feature = "axum")]
 impl<O: TlsObserver> axum::serve::Listener for TlsListener<O> {

@@ -765,10 +765,7 @@ fn task_error(joined: Result<Result<(), RuntimeError>, JoinError>) -> Option<Run
 #[cfg(test)]
 mod tests {
     use crate::{
-        admission::{
-            Principal, PublishGrant, StaticPublisher, StaticStreamAuthenticator, StreamPolicy,
-        },
-        domain::StreamId,
+        admission::{OpenStreamAuthenticator, StreamPolicy},
         observe::{EventObserver, Events, NodeEvent, SessionEvent},
         server::metrics::MetricsToken,
     };
@@ -782,14 +779,7 @@ mod tests {
     fn node_with_events(config: NodeConfig, events: Events) -> Result<Node, RuntimeError> {
         Node::new(
             config,
-            Arc::new(StaticStreamAuthenticator::new(vec![StaticPublisher::new(
-                "secret",
-                PublishGrant {
-                    stream_id: StreamId::new("live/camera"),
-                    principal: Principal("publisher".into()),
-                    policy: StreamPolicy::permissive(),
-                },
-            )])),
+            Arc::new(OpenStreamAuthenticator::new(StreamPolicy::permissive())),
             events,
         )
     }

@@ -9,9 +9,6 @@
 # CLI names use dashes:
 #   --http-listen 127.0.0.1:8080
 #
-# The static-provider publishing key shown below is only a placeholder. Replace
-# it before enabling that provider, or use `key_file` with a secret mount.
-
 [server]
 # Maximum publishers that may be connected and actively publishing at once.
 maximum_concurrent_publishers = 256
@@ -29,11 +26,6 @@ maximum_concurrent_publishers = 256
 maximum_pending_publishers_per_listener = 64
 
 [auth]
-# The default `open` provider accepts every publisher without checking a key
-# and exposes the requested app/stream unchanged. Select `static` when the
-# ingest listener is reachable from an untrusted network.
-provider = "open"
-
 # Every publisher selects a named policy. The `default` policy exists with
 # built-in values even when this section is omitted; it is written out here
 # because this file is the complete configuration reference.
@@ -89,28 +81,11 @@ maximum_lead = "2s"
 # nothing and is refused rather than silently ignored.
 maximum_timestamp_jump = "10s"
 
-[auth.open]
-# Every admitted publisher has the `anonymous` principal. Omit this field to
-# select the built-in `default` policy.
-policy = "default"
-
-# Alternative authenticated static-provider configuration. This table and
-# `[auth.open]` are mutually exclusive.
+# By default, authentication is open: every publisher is accepted with the
+# requested resource and the `default` policy. Add `[auth.http]` to ask an
+# external service instead.
 #
-# [auth.static.publishers.configured-publisher]
-# The final table key is the stable identity used for logs, metrics, and future
-# lifecycle hooks.
-# stream = "live/camera"
-# Configure exactly one of `key` and `key_file`. A key file is read exactly,
-# including whitespace, so mounted secrets have unambiguous credentials.
-# key = "replace-with-a-publishing-key"
-# key_file = "/run/secrets/rushls-publish-key"
-# Omit this field to select `default`.
-# policy = "default"
-
-# Alternative external-provider configuration, mutually exclusive with the two
-# tables above. Each publisher is admitted by asking a service you run, which
-# answers with an identity and the name of a policy defined above:
+# The service answers with an identity and the name of a policy defined above:
 #
 #   {"decision": "allow", "stream_id": "events/main", "principal": "account-42"}
 #   {"decision": "deny",  "reason": "subscription_inactive"}

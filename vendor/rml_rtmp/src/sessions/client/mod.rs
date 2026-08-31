@@ -221,7 +221,7 @@ impl ClientSession {
     /// Same as `request_connection`, but merges `extra_properties` into the
     /// `connect` command object.
     ///
-    /// CROWDCAST: added for the RTMP proxy. A proxy must forward the publisher's
+    /// CROWDCAST: added for the Routmp. A proxy must forward the publisher's
     /// Enhanced RTMP capability advertisement (`fourCcList`, `capsEx`,
     /// `videoFourCcInfoMap`, `audioFourCcInfoMap`) to the backend ingester.
     /// Without it an OBS 30+ publisher that negotiated HEVC or AV1 silently
@@ -511,7 +511,7 @@ impl ClientSession {
 
     /// Publishes `onMetaData` from raw AMF0 properties, exactly as received.
     ///
-    /// CROWDCAST: added for the RTMP proxy. `publish_metadata` rebuilds the
+    /// CROWDCAST: added for the Routmp. `publish_metadata` rebuilds the
     /// object from the typed `StreamMetadata`, which silently drops every key
     /// this crate does not model - including Enhanced RTMP and vendor hints. A
     /// proxy must relay metadata unchanged, so this variant passes the

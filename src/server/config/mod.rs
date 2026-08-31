@@ -25,12 +25,11 @@ use thiserror::Error;
 use crate::{
     admission::{
         Authenticator, HttpAuthConfig, HttpAuthenticator, IngestTimingPolicy,
-        OpenStreamAuthenticator, Principal, PublishGrant, StaticPublisher,
-        StaticStreamAuthenticator, StreamPolicy, TakeoverPolicy,
+        OpenStreamAuthenticator, StreamPolicy, TakeoverPolicy,
     },
     delivery::hls::uri::UriBase,
     delivery::store::{DurationRule, TargetDurationMultiple},
-    domain::{Codec, FrameRate, StreamId},
+    domain::{Codec, FrameRate},
     hooks::{HookConfig, HooksConfig},
     observe::lifecycle::Kind,
     outbound::{BearerToken, ClientConfig, Endpoint, HttpClient},
@@ -283,16 +282,11 @@ pub struct ServerAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct AuthAppConfig {
-    /// Authentication implementation used for publisher admission.
-    #[conf(parameter, long, env, default_value = "open", serde(use_value_parser))]
-    provider: AuthProviderValue,
     /// Named policy profiles selected by configured publishers.
     #[conf(parameter, value_parser = TomlTable::<PolicyAppConfig>::from_str)]
     policies: Option<TomlTable<PolicyAppConfig>>,
-    #[conf(flatten, prefix = "static", serde(rename = "static"))]
-    static_provider: Option<StaticAuthAppConfig>,
-    #[conf(flatten, prefix = "open", serde(rename = "open"))]
-    open: Option<OpenAuthAppConfig>,
+    /// Optional external admission service. When omitted, admission is open
+    /// and the requested resource uses the `default` policy.
     #[conf(flatten, prefix = "http", serde(rename = "http"))]
     http: Option<HttpAuthAppConfig>,
 }
@@ -310,53 +304,16 @@ impl AuthAppConfig {
         let policies = resolve_policies(profiles)?;
         warn_about_tight_pacing(&policies, part_duration, warnings);
 
-        match self.provider {
-            AuthProviderValue::Static => {
-                unselected(self.open.is_some(), "static", "open")?;
-                unselected(self.http.is_some(), "static", "http")?;
-                self.static_provider
-                    .ok_or_else(|| {
-                        invalid("auth provider `static` requires `[auth.static.publishers]`")
-                    })?
-                    .resolve(&policies)
-                    .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
-            }
-            AuthProviderValue::Open => {
-                unselected(self.static_provider.is_some(), "open", "static")?;
-                unselected(self.http.is_some(), "open", "http")?;
-                let policy_name = self
-                    .open
-                    .and_then(|provider| provider.policy)
-                    .unwrap_or_else(|| "default".into());
-                let policy = policies.get(&policy_name).ok_or_else(|| {
-                    invalid(format!(
-                        "open auth provider selects unknown policy `{policy_name}`"
-                    ))
-                })?;
-                Ok(Arc::new(OpenStreamAuthenticator::new(policy.clone())))
-            }
-            AuthProviderValue::Http => {
-                unselected(self.static_provider.is_some(), "http", "static")?;
-                unselected(self.open.is_some(), "http", "open")?;
-                self.http
-                    .ok_or_else(|| invalid("auth provider `http` requires `[auth.http]`"))?
-                    .resolve(policies, admission_deadline, client)
-                    .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
-            }
+        if let Some(http) = self.http {
+            http.resolve(policies, admission_deadline, client)
+                .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
+        } else {
+            let policy = policies
+                .get("default")
+                .expect("the default policy is inserted above");
+            Ok(Arc::new(OpenStreamAuthenticator::new(policy.clone())))
         }
     }
-}
-
-/// Refuses a provider table that is configured but not selected.
-///
-/// A table nobody reads is a typo, and reporting it is free.
-fn unselected(present: bool, selected: &str, other: &str) -> Result<(), ConfigError> {
-    if present {
-        return Err(invalid(format!(
-            "auth provider `{selected}` cannot be combined with `[auth.{other}]`"
-        )));
-    }
-    Ok(())
 }
 
 #[derive(Conf)]
@@ -646,110 +603,6 @@ impl LazyHttpClient {
             self.0.insert(client)
         };
         Ok(shared.with_limits(request_timeout, maximum_response_bytes))
-    }
-}
-
-#[derive(Conf)]
-#[conf(serde)]
-pub struct OpenAuthAppConfig {
-    /// Named policy applied to every unauthenticated publisher.
-    #[conf(parameter, long, env)]
-    policy: Option<String>,
-}
-
-#[derive(Conf)]
-#[conf(serde)]
-pub struct StaticAuthAppConfig {
-    /// Statically authorized publishers, keyed by their stable principal name.
-    #[conf(parameter, value_parser = TomlTable::<StaticPublisherAppConfig>::from_str)]
-    publishers: Option<TomlTable<StaticPublisherAppConfig>>,
-}
-
-impl StaticAuthAppConfig {
-    fn resolve(
-        self,
-        policies: &BTreeMap<String, StreamPolicy>,
-    ) -> Result<StaticStreamAuthenticator, ConfigError> {
-        let configured_publishers = self.publishers.unwrap_or_default().0;
-        if configured_publishers.is_empty() {
-            return Err(invalid(
-                "auth provider `static` requires at least one publisher",
-            ));
-        }
-
-        let mut credentials: Vec<Vec<u8>> = Vec::with_capacity(configured_publishers.len());
-        let mut publishers = Vec::with_capacity(configured_publishers.len());
-        for (name, configured) in configured_publishers {
-            if name.is_empty() {
-                return Err(invalid("static publisher name must not be empty"));
-            }
-            if configured.stream.is_empty() {
-                return Err(invalid(format!(
-                    "static publisher `{name}` has an empty stream"
-                )));
-            }
-
-            let credential = configured.resolve_key(&name)?;
-            if credential.is_empty() {
-                return Err(invalid(format!(
-                    "static publisher `{name}` has an empty key"
-                )));
-            }
-            if credentials.iter().any(|existing| existing == &credential) {
-                return Err(invalid(
-                    "the same static publishing key is configured more than once",
-                ));
-            }
-            credentials.push(credential.clone());
-
-            let policy_name = configured.policy.as_deref().unwrap_or("default");
-            let policy = policies.get(policy_name).ok_or_else(|| {
-                invalid(format!(
-                    "static publisher `{name}` selects unknown policy `{policy_name}`"
-                ))
-            })?;
-            publishers.push(StaticPublisher::new(
-                credential,
-                PublishGrant {
-                    stream_id: StreamId::new(configured.stream),
-                    principal: Principal(name),
-                    policy: policy.clone(),
-                },
-            ));
-        }
-        Ok(StaticStreamAuthenticator::new(publishers))
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StaticPublisherAppConfig {
-    /// Authoritative stream populated by this publisher.
-    stream: String,
-    /// Inline publishing key. Prefer `key_file` in managed deployments.
-    key: Option<String>,
-    /// File containing the publishing key.
-    key_file: Option<PathBuf>,
-    /// Named policy profile; omitted selects `default`.
-    policy: Option<String>,
-}
-
-impl StaticPublisherAppConfig {
-    fn resolve_key(&self, name: &str) -> Result<Vec<u8>, ConfigError> {
-        match (&self.key, &self.key_file) {
-            (Some(_), Some(_)) => Err(invalid(format!(
-                "static publisher `{name}` must configure only one of `key` and `key_file`"
-            ))),
-            (None, None) => Err(invalid(format!(
-                "static publisher `{name}` must configure one of `key` and `key_file`"
-            ))),
-            (Some(key), None) => Ok(key.as_bytes().to_vec()),
-            (None, Some(path)) => fs::read(path).map_err(|source| ConfigError::SecretRead {
-                secret: format!("static publisher `{name}` key"),
-                path: path.clone(),
-                source,
-            }),
-        }
     }
 }
 
@@ -1668,31 +1521,6 @@ impl fmt::Display for OriginsValue {
             Self::Text(value) => output.write_str(value),
             Self::List(values) => output.write_str(&values.join(",")),
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, derive_more::Display)]
-#[display(rename_all = "lowercase")]
-enum AuthProviderValue {
-    Static,
-    Open,
-    Http,
-}
-
-impl AuthProviderValue {
-    const ALL: [Self; 3] = [Self::Static, Self::Open, Self::Http];
-}
-
-impl FromStr for AuthProviderValue {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        // Matched against the names `Display` produces, so the accepted set and
-        // the printed one cannot drift, and the diagnostic lists what is
-        // actually available rather than a fixed sentence someone has to
-        // remember to update. The previous one still said "static or open"
-        // long after `http` was added.
-        one_of(&Self::ALL, value, "auth provider")
     }
 }
 

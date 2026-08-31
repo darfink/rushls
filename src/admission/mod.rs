@@ -18,11 +18,9 @@ use crate::domain::{BoxFuture, Codec, FrameRate, StreamId};
 
 mod http;
 mod open;
-mod static_stream;
 
 pub use http::{HttpAuthConfig, HttpAuthenticator};
 pub use open::OpenStreamAuthenticator;
-pub use static_stream::{StaticPublisher, StaticStreamAuthenticator};
 
 #[cfg(test)]
 mod fixtures;

@@ -1,6 +1,6 @@
 //! Requests this node makes to services an administrator configured.
 //!
-//! The implementation moved to `cc-outbound` so the RTMP proxy shares it: both
+//! The implementation moved to `cc-outbound` so the Routmp shares it: both
 //! call operator-supplied endpoints and need the same properties - a pooled
 //! connection, bounded time, a bounded response, and a bearer credential.
 //!

@@ -1,6 +1,6 @@
 //! TLS termination with certificates that rotate underneath a running origin.
 //!
-//! The implementation moved to `cc-tls` so the RTMP proxy shares it. What stays
+//! The implementation moved to `cc-tls` so the Routmp shares it. What stays
 //! here is the adapter from that crate's [`TlsObserver`] to this node's
 //! reporting: the shared crate has no opinion about how an application counts
 //! or logs, and neither application should have to adopt the other's.

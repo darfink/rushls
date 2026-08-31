@@ -37,7 +37,9 @@ pub mod time {
 }
 
 pub use enhanced::{EnhancedCapabilities, EnhancedValidationMode};
-pub use media::{MediaInterpretation, ParsedAudio, ParsedVideo, ValidatedMedia};
+pub use media::{
+    MediaClassification, MediaInterpretation, ParsedAudio, ParsedVideo, ValidatedMedia,
+};
 pub use metadata::{MetadataCodec, ParsedMetadata, TrackMetadata, ValidatedMetadata};
 pub use rml_amf0;
 

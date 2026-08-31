@@ -1158,12 +1158,11 @@ mod end_to_end {
 
     use crate::{
         admission::{
-            ClientInfo, IngestProtocol, PresentedCredential, Principal, PublishGrant,
-            PublishRequest, PublishResource, StaticPublisher, StaticStreamAuthenticator,
-            StreamPolicy,
+            ClientInfo, IngestProtocol, OpenStreamAuthenticator, PresentedCredential, PublishGrant,
+            PublishRequest, PublishResource, StreamPolicy,
         },
         delivery::hls::service::PlaylistReadiness,
-        domain::{BoxFuture, StreamId},
+        domain::BoxFuture,
         observe::{Events, SourceMeters},
         segment::SegmentationPolicy,
         server::{Node, NodeConfig},
@@ -1226,7 +1225,7 @@ mod end_to_end {
                 protocol: IngestProtocol::Rtmp,
                 resource: PublishResource {
                     namespace: Some("live".into()),
-                    name: "presented-key".into(),
+                    name: "camera".into(),
                 },
                 credential: PresentedCredential::new("secret"),
                 client: ClientInfo {
@@ -1257,14 +1256,7 @@ mod end_to_end {
         let session = config.session;
         let node = Node::new(
             config,
-            Arc::new(StaticStreamAuthenticator::new(vec![StaticPublisher::new(
-                "secret",
-                PublishGrant {
-                    stream_id: StreamId::new("live/camera"),
-                    principal: Principal("fixture".into()),
-                    policy,
-                },
-            )])),
+            Arc::new(OpenStreamAuthenticator::new(policy)),
             Events::default(),
         )
         .expect("node configuration is valid");

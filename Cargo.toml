@@ -8,6 +8,7 @@ allocation-counting = []
 
 [dependencies]
 cc-hooks.workspace = true
+cc-metrics.workspace = true
 cc-outbound.workspace = true
 cc-rtmp.workspace = true
 cc-tls = { workspace = true, features = ["axum"] }
@@ -29,7 +30,6 @@ parking_lot = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 socket2 = "0.6"
-subtle = "2"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 toml = "1"
@@ -88,6 +88,7 @@ cc-outbound = { path = "crates/cc-outbound" }
 cc-hooks = { path = "crates/cc-hooks" }
 cc-rtmp = { path = "crates/cc-rtmp" }
 cc-tls = { path = "crates/cc-tls" }
+cc-metrics = { path = "crates/cc-metrics" }
 rml_rtmp = { path = "vendor/rml_rtmp" }
 
 # External

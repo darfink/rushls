@@ -20,14 +20,7 @@ use crate::{
 
 use super::{AppConfig, ConfigError, decimal_fraction, parse_playlist_window};
 
-const STATIC_AUTH: &str = r#"
-[auth]
-provider = "static"
-
-[auth.static.publishers.configured-publisher]
-stream = "live/camera"
-key = "key"
-"#;
+const BASE_CONFIG: &str = "";
 
 #[tokio::test]
 async fn the_reference_file_resolves_to_the_runtime_defaults() -> Result<(), Box<dyn Error>> {
@@ -71,17 +64,10 @@ async fn open_authentication_is_the_builtin_default() -> Result<(), Box<dyn Erro
 #[test]
 fn cli_overrides_environment_which_overrides_toml() -> Result<(), Box<dyn Error>> {
     let config = resolve_with(
-        r#"
+        r"
 [server]
 maximum_concurrent_publishers = 10
-
-[auth]
-provider = "static"
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "from-file"
-"#,
+",
         &["--server-maximum-concurrent-publishers", "30"],
         &[("RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHERS", "20")],
     )??;
@@ -131,61 +117,9 @@ stream_id = "live/camera"
 }
 
 #[test]
-fn the_replaced_array_of_publishers_is_rejected() -> Result<(), Box<dyn Error>> {
-    assert!(
-        load_toml(
-            r#"
-[auth]
-provider = "static"
-
-[[auth.static.publishers]]
-name = "camera"
-stream = "live/camera"
-key = "key"
-"#
-        )?
-        .is_err()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn static_publishers_select_named_or_builtin_policies() -> Result<(), Box<dyn Error>> {
-    let config = resolve_toml(
-        r#"
-[auth]
-provider = "static"
-
-[auth.policies.protected]
-takeovers = "deny"
-maximum_video_tracks = 1
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "camera-key"
-
-[auth.static.publishers.stage]
-stream = "live/stage"
-key = "stage-key"
-policy = "protected"
-"#,
-    )??;
-
-    let camera = config
-        .authenticator
-        .authenticate(&request("camera-key"))
-        .await?;
-    assert_eq!(camera.stream_id, StreamId::new("live/camera"));
-    assert_eq!(camera.policy, StreamPolicy::permissive());
-
-    let stage = config
-        .authenticator
-        .authenticate(&request("stage-key"))
-        .await?;
-    assert_eq!(stage.stream_id, StreamId::new("live/stage"));
-    assert_eq!(stage.principal, Principal("stage".into()));
-    assert_eq!(stage.policy.takeovers, TakeoverPolicy::Deny);
-    assert_eq!(stage.policy.maximum_video_tracks, 1);
+fn static_authentication_is_removed() -> Result<(), Box<dyn Error>> {
+    assert!(load_toml("[auth]\nprovider = \"static\"\n")?.is_err());
+    assert!(load_toml("[auth.static.publishers.camera]\nkey = \"key\"\n")?.is_err());
     Ok(())
 }
 
@@ -194,14 +128,8 @@ async fn open_authentication_accepts_any_credential_and_preserves_the_resource()
 -> Result<(), Box<dyn Error>> {
     let config = resolve_toml(
         r#"
-[auth]
-provider = "open"
-
-[auth.policies.restricted]
+[auth.policies.default]
 takeovers = "deny"
-
-[auth.open]
-policy = "restricted"
 "#,
     )??;
 
@@ -216,149 +144,15 @@ policy = "restricted"
 }
 
 #[tokio::test]
-async fn open_authentication_uses_the_builtin_policy_without_a_provider_table()
+async fn open_authentication_uses_the_builtin_policy_when_http_is_omitted()
 -> Result<(), Box<dyn Error>> {
-    let config = resolve_toml(
-        r#"
-[auth]
-provider = "open"
-"#,
-    )??;
+    let config = resolve_toml("")??;
 
     let grant = config
         .authenticator
         .authenticate(&request("ignored"))
         .await?;
     assert_eq!(grant.policy, StreamPolicy::permissive());
-    Ok(())
-}
-
-#[test]
-fn configured_but_unselected_auth_providers_are_rejected() -> Result<(), Box<dyn Error>> {
-    for configuration in [
-        r#"
-[auth]
-provider = "static"
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "key"
-
-[auth.open]
-policy = "default"
-"#,
-        r#"
-[auth]
-provider = "static"
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "key"
-
-[auth.open]
-"#,
-        r#"
-[auth]
-provider = "open"
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "key"
-"#,
-    ] {
-        assert!(matches!(
-            resolve_toml(configuration)?,
-            Err(ConfigError::Invalid(_))
-        ));
-    }
-    Ok(())
-}
-
-#[test]
-fn an_unknown_open_policy_is_rejected() -> Result<(), Box<dyn Error>> {
-    let result = resolve_toml(
-        r#"
-[auth]
-provider = "open"
-
-[auth.open]
-policy = "missing"
-"#,
-    )?;
-
-    assert!(matches!(result, Err(ConfigError::Invalid(_))));
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_static_publishing_key_can_be_read_from_a_file() -> Result<(), Box<dyn Error>> {
-    let secret = TempConfig::new("mounted-secret")?;
-    let config = resolve_toml(&format!(
-        r#"
-[auth]
-provider = "static"
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key_file = "{}"
-"#,
-        secret.path.display()
-    ))??;
-
-    config
-        .authenticator
-        .authenticate(&request("mounted-secret"))
-        .await?;
-    Ok(())
-}
-
-#[test]
-fn static_authentication_rejects_ambiguous_or_duplicate_keys() -> Result<(), Box<dyn Error>> {
-    for publishers in [
-        r#"
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "same"
-key_file = "/run/secrets/camera"
-"#,
-        r#"
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "same"
-
-[auth.static.publishers.stage]
-stream = "live/stage"
-key = "same"
-"#,
-    ] {
-        let result = resolve_toml(&format!(
-            r#"
-[auth]
-provider = "static"
-{publishers}
-"#
-        ))?;
-
-        assert!(matches!(result, Err(ConfigError::Invalid(_))));
-    }
-    Ok(())
-}
-
-#[test]
-fn an_unknown_static_policy_is_rejected() -> Result<(), Box<dyn Error>> {
-    let result = resolve_toml(
-        r#"
-[auth]
-provider = "static"
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "key"
-policy = "missing"
-"#,
-    )?;
-
-    assert!(matches!(result, Err(ConfigError::Invalid(_))));
     Ok(())
 }
 
@@ -431,7 +225,7 @@ fn existing_optional_secrets_accept_mounted_files() -> Result<(), Box<dyn Error>
     let secret = TempConfig::new("mounted-secret")?;
     let config = resolve_toml(&format!(
         r#"
-{STATIC_AUTH}
+{BASE_CONFIG}
 
 [ingest.srt]
 passphrase_file = "{}"
@@ -453,7 +247,7 @@ fn an_inline_secret_and_its_file_are_mutually_exclusive() -> Result<(), Box<dyn 
     let secret = TempConfig::new("mounted-secret")?;
     let result = resolve_toml(&format!(
         r#"
-{STATIC_AUTH}
+{BASE_CONFIG}
 
 [metrics]
 token = "inline"
@@ -469,7 +263,7 @@ token_file = "{}"
 #[test]
 fn tls_requires_both_the_certificate_and_key() -> Result<(), Box<dyn Error>> {
     let result = load_with(
-        STATIC_AUTH,
+        BASE_CONFIG,
         &[],
         &[("RUSHLS_HTTP_TLS_CERTIFICATE", "/tmp/certificate.pem")],
     )?;
@@ -482,18 +276,11 @@ fn tls_requires_both_the_certificate_and_key() -> Result<(), Box<dyn Error>> {
 fn unknown_toml_keys_are_rejected() -> Result<(), Box<dyn Error>> {
     assert!(
         load_toml(
-            r#"
-[auth]
-provider = "static"
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "key"
-
+            r"
 [server]
 maximum_concurrent_publishers = 10
 maximum_concurrent_publisherz = 11
-"#
+"
         )?
         .is_err()
     );
@@ -505,13 +292,6 @@ fn low_level_pipeline_settings_are_not_part_of_the_public_schema() -> Result<(),
     assert!(
         load_toml(
             r#"
-[auth]
-provider = "static"
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "key"
-
 [ingest.rtmp.avformat]
 io_buffer_size = "64KiB"
 "#
@@ -546,91 +326,52 @@ maximum_pending_publishers_per_listener = 7
 }
 
 #[test]
-fn the_http_auth_provider_resolves_and_guards_its_own_settings() -> Result<(), Box<dyn Error>> {
+fn configured_http_auth_resolves_and_guards_its_own_settings() -> Result<(), Box<dyn Error>> {
     let valid = r#"
-[auth]
-provider = "http"
-
 [auth.http]
 url = "http://auth-sidecar:8081/v1/publish/admit"
 "#;
     assert!(
         resolve_toml(valid)?.is_ok(),
-        "a minimal http provider works"
+        "a minimal http auth table works"
     );
 
     // The internal admission deadline is 10s. A longer request timeout never
     // takes effect: the session gives up first and blames a stage rather than
     // the service that did not answer.
     let outlives_admission = r#"
-[auth]
-provider = "http"
-
 [auth.http]
 url = "http://auth-sidecar:8081/admit"
 request_timeout = "30s"
 "#;
     // A response may only name a policy this node actually has.
     let unknown_default = r#"
-[auth]
-provider = "http"
-
 [auth.http]
 url = "http://auth-sidecar:8081/admit"
 default_policy = "nonexistent"
-"#;
+    "#;
     let unusable_url = r#"
-[auth]
-provider = "http"
-
 [auth.http]
 url = "not-a-url"
 "#;
-    let missing_table = r#"
-[auth]
-provider = "http"
-"#;
-    for configuration in [
-        outlives_admission,
-        unknown_default,
-        unusable_url,
-        missing_table,
-    ] {
+    for configuration in [outlives_admission, unknown_default, unusable_url] {
         assert!(
             resolve_toml(configuration)?.is_err(),
             "expected a startup error for:{configuration}"
         );
     }
+    assert!(resolve_toml("[auth]\n")?.is_ok());
     Ok(())
 }
 
 #[test]
-fn an_http_provider_cannot_be_combined_with_another() -> Result<(), Box<dyn Error>> {
-    let with_static = r#"
-[auth]
-provider = "http"
-
-[auth.http]
-url = "http://auth-sidecar:8081/admit"
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "key"
-"#;
-    let unselected_http = r#"
-[auth]
-provider = "open"
-
+fn http_auth_is_selected_by_the_optional_table() -> Result<(), Box<dyn Error>> {
+    let configuration = r#"
 [auth.http]
 url = "http://auth-sidecar:8081/admit"
 "#;
-
-    for configuration in [with_static, unselected_http] {
-        assert!(
-            resolve_toml(configuration)?.is_err(),
-            "a provider table nobody reads is a typo, not a fallback:{configuration}"
-        );
-    }
+    assert!(resolve_toml(configuration)?.is_ok());
+    assert!(resolve_toml("[auth.open]\n")?.is_err());
     Ok(())
 }
 
@@ -988,11 +729,11 @@ fn resolve_toml(
     resolve_with(configuration, &[], &[])
 }
 
-/// Resolves environment overrides against a minimal authenticated node.
+/// Resolves environment overrides against a minimal node.
 fn resolve_with_env(
     environment: &[(&str, &str)],
 ) -> Result<Result<ResolvedAppConfig, ConfigError>, Box<dyn Error>> {
-    resolve_with(STATIC_AUTH, &[], environment)
+    resolve_with(BASE_CONFIG, &[], environment)
 }
 
 fn request(credential: &str) -> PublishRequest {
@@ -1140,20 +881,8 @@ impl Drop for TempConfig {
 fn an_unknown_enumerated_value_names_the_alternatives() -> Result<(), Box<dyn Error>> {
     // The point of these messages is that an operator who typos one does not
     // have to go and read the reference file to find out what was allowed.
-    let provider = load_toml("[auth]\nprovider = \"opne\"\n")?
-        .err()
-        .ok_or("a misspelled provider is refused")?
-        .to_string();
-    assert!(provider.contains("static"), "{provider}");
-    assert!(provider.contains("open"), "{provider}");
-    assert!(
-        provider.contains("http"),
-        "the message lists every provider, including ones added after it was \
-         first written: {provider}"
-    );
-
     let key_length = load_toml(&format!(
-        "{STATIC_AUTH}\n[ingest.srt]\nencryption_key_length = \"aes999\"\n"
+        "{BASE_CONFIG}\n[ingest.srt]\nencryption_key_length = \"aes999\"\n"
     ))?
     .err()
     .ok_or("an unknown key length is refused")?
@@ -1294,15 +1023,8 @@ async fn in_band_text_captions_are_enabled_per_policy() -> Result<(), Box<dyn Er
     let config = resolve_toml(
         r#"
 [auth]
-provider = "static"
-
-[auth.policies.captioned]
+[auth.policies.default]
 subtitle_codecs = ["text", "webvtt"]
-
-[auth.static.publishers.camera]
-stream = "live/camera"
-key = "camera-key"
-policy = "captioned"
 "#,
     )??;
 

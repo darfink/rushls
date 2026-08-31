@@ -1,6 +1,6 @@
 use std::{fmt::Write, sync::Arc};
 
-use subtle::ConstantTimeEq;
+use cc_metrics::escape_label;
 
 use crate::{
     delivery::hls::StreamStore,
@@ -12,24 +12,7 @@ use crate::{
     session::{Registry, SessionSnapshot},
 };
 
-#[derive(Clone, Eq, PartialEq, derive_more::Debug)]
-#[debug("MetricsToken([REDACTED])")]
-pub struct MetricsToken(Vec<u8>);
-
-impl MetricsToken {
-    pub fn new(value: impl Into<Vec<u8>>) -> Self {
-        Self(value.into())
-    }
-
-    /// Whether this token could never be presented as a bearer credential.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    fn matches(&self, presented: &[u8]) -> bool {
-        self.0.as_slice().ct_eq(presented).into()
-    }
-}
+pub use cc_metrics::MetricsToken;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ExportPolicy {
@@ -292,13 +275,6 @@ fn session_labels(session: &SessionSnapshot) -> String {
         escape_label(session.stream.as_str()),
         escape_label(&session.principal.0)
     )
-}
-
-fn escape_label(value: &str) -> String {
-    value
-        .replace('\\', r"\\")
-        .replace('\n', r"\n")
-        .replace('"', r#"\""#)
 }
 
 #[cfg(test)]

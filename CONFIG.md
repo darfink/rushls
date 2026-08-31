@@ -78,9 +78,9 @@ Worst offenders, worst first:
   input arrives" boundary — meaningless to an operator, who has one concept:
   *the stream is dead*. `health_interval` is the supervisor's sampling period;
   `publication_stall_multiplier` is `stalled_publication_multiplier`.
-- **Auth mirrors trait dispatch.** Three mutually-exclusive tables
-  (`[auth.open]` / `[auth.static]` / `[auth.http]`) with "can't combine these"
-  refusals are `Arc<dyn Authenticator>` implementations projected outward.
+- **Auth keeps the safe default visible.** Omitting `[auth.http]` selects the
+  built-in open authenticator; adding that table selects the external HTTP
+  authenticator. The implementation remains an `Arc<dyn Authenticator>`.
 - **Hooks leak the dispatcher.** `queue_capacity`, `maximum_in_flight`,
   `maximum_attempts`, `maximum_response_bytes` are the delivery queue's
   internals.
@@ -379,4 +379,3 @@ Turn this into the implementation spec: finalize the section layout and the two
 shipped files, write the interpolation grammar precisely, complete the
 field-by-field `→ NodeConfig` mapping, and settle open decision #1 in writing.
 That spec is what the `AppConfig` / `resolve()` rewrite implements.
-

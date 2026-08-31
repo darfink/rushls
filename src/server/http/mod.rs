@@ -41,6 +41,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
+use cc_metrics::bearer_token;
 use tokio::net::TcpListener;
 
 use crate::{
@@ -355,11 +356,6 @@ fn metrics_response(metrics: &MetricsEndpoint, method: &Method, headers: &Header
         metrics.render(),
     )
         .into_response()
-}
-
-fn bearer_token(value: &str) -> Option<&str> {
-    let (scheme, token) = value.split_once(' ')?;
-    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
 /// Whether the client is prepared to accept gzip.
