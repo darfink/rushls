@@ -215,11 +215,15 @@ impl EventObserver for TracingEvents {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let timestamp_format = time::format_description::parse_owned::<2>(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z",
+    )
+    .expect("the log timestamp format is valid");
     fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_target(false)
-        .with_timer(fmt::time::UtcTime::rfc_3339())
+        .with_timer(fmt::time::UtcTime::new(timestamp_format))
         .init();
 }
 
