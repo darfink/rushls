@@ -40,7 +40,9 @@ pub use enhanced::{EnhancedCapabilities, EnhancedValidationMode};
 pub use media::{
     MediaClassification, MediaInterpretation, ParsedAudio, ParsedVideo, ValidatedMedia,
 };
-pub use metadata::{MetadataCodec, ParsedMetadata, TrackMetadata, ValidatedMetadata};
+pub use metadata::{
+    EncoderSummary, MetadataCodec, ParsedMetadata, TrackMetadata, ValidatedMetadata,
+};
 pub use rml_amf0;
 
 /// Socket-operation timeouts used by async adapters built around the sans-I/O

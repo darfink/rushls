@@ -39,6 +39,116 @@ pub enum MetadataCodec {
     FourCc([u8; 4]),
 }
 
+/// The encoder-declared shape of a publication, read from the default-track
+/// `onMetaData` properties.
+///
+/// Every field is optional: `onMetaData` is advisory, encoders disagree about
+/// which properties they send, and some omit the message entirely. Callers must
+/// treat a missing field as "unknown" rather than as a fault.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EncoderSummary {
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Declared framerate. This is what the encoder intends to send, not what
+    /// it actually delivered; measured rates must come from frame counters.
+    pub framerate: Option<f64>,
+}
+
+impl EncoderSummary {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl ParsedMetadata {
+    /// Summarize the default track's encoder properties for observability.
+    pub fn encoder_summary(&self) -> EncoderSummary {
+        EncoderSummary {
+            video_codec: self.codec_name("videocodecid", TrackKind::Video),
+            audio_codec: self.codec_name("audiocodecid", TrackKind::Audio),
+            width: self.dimension("width"),
+            height: self.dimension("height"),
+            framerate: self
+                .bounded_positive_number("framerate", MAX_DECLARED_FRAMERATE)
+                .map(|value| (value * 1_000.0).round() / 1_000.0),
+        }
+    }
+
+    fn codec_name(&self, field: &str, kind: TrackKind) -> Option<String> {
+        match self.properties.get(field)? {
+            Amf0Value::Number(value) => codec_label(*value, kind),
+            // Enhanced RTMP encoders may send the FourCC as a string directly.
+            // Only retain a known value: metadata becomes a Prometheus label,
+            // so arbitrary publisher-controlled strings would create unbounded
+            // series churn when onMetaData is resent.
+            Amf0Value::Utf8String(value) => {
+                let bytes: [u8; 4] = value.trim().as_bytes().try_into().ok()?;
+                known_fourcc(bytes, kind).then(|| String::from_utf8_lossy(&bytes).into_owned())
+            }
+            _ => None,
+        }
+    }
+
+    fn dimension(&self, field: &str) -> Option<u32> {
+        let value = self.positive_number(field)?;
+        // Guard against absurd declarations; a real frame dimension fits well
+        // inside u16 and a fractional or bogus one must not become a label.
+        (value.fract() == 0.0 && value <= f64::from(u16::MAX)).then_some(value as u32)
+    }
+
+    fn positive_number(&self, field: &str) -> Option<f64> {
+        match self.properties.get(field)? {
+            Amf0Value::Number(value) if value.is_finite() && *value > 0.0 => Some(*value),
+            _ => None,
+        }
+    }
+
+    fn bounded_positive_number(&self, field: &str, maximum: f64) -> Option<f64> {
+        self.positive_number(field)
+            .filter(|value| *value <= maximum)
+    }
+}
+
+/// Map an `onMetaData` codec id to a display label.
+///
+/// Enhanced RTMP encodes the id as a big-endian FourCC; legacy FLV uses a small
+/// integer. The two ranges do not overlap, so the byte pattern decides.
+fn codec_label(value: f64, kind: TrackKind) -> Option<String> {
+    if !value.is_finite() || value.fract() != 0.0 || !(0.0..=f64::from(u32::MAX)).contains(&value) {
+        return None;
+    }
+    let id = value as u32;
+    let bytes = id.to_be_bytes();
+    if bytes.iter().all(u8::is_ascii_graphic) {
+        return Some(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    let label = match kind {
+        TrackKind::Video => match id {
+            2 => "h263",
+            3 => "screen",
+            4 => "vp6",
+            5 => "vp6a",
+            6 => "screen2",
+            7 => "avc1",
+            12 => "hvc1",
+            13 => "av01",
+            _ => return None,
+        },
+        TrackKind::Audio => match id {
+            0 => "pcm",
+            1 => "adpcm",
+            2 => "mp3",
+            4..=6 => "nellymoser",
+            10 => "mp4a",
+            11 => "speex",
+            _ => return None,
+        },
+    };
+    Some(label.to_owned())
+}
+
 #[derive(Debug, Error)]
 #[error("malformed Enhanced RTMP metadata: {reason}")]
 pub struct MetadataValidationError {
@@ -70,6 +180,17 @@ impl ValidatedMetadata {
 enum TrackKind {
     Audio,
     Video,
+}
+
+const MAX_DECLARED_FRAMERATE: f64 = 1_000.0;
+const AUDIO_FOURCCS: [[u8; 4]; 6] = [*b"ac-3", *b"ec-3", *b"Opus", *b".mp3", *b"fLaC", *b"mp4a"];
+const VIDEO_FOURCCS: [[u8; 4]; 6] = [*b"vp08", *b"vp09", *b"av01", *b"avc1", *b"hvc1", *b"vvc1"];
+
+fn known_fourcc(value: [u8; 4], kind: TrackKind) -> bool {
+    match kind {
+        TrackKind::Audio => AUDIO_FOURCCS.contains(&value),
+        TrackKind::Video => VIDEO_FOURCCS.contains(&value),
+    }
 }
 
 fn parse_metadata(properties: HashMap<String, Amf0Value>) -> Result<ParsedMetadata, String> {
@@ -149,15 +270,7 @@ fn parse_codec(
     if !bytes.iter().all(u8::is_ascii_graphic) {
         return Ok(MetadataCodec::Legacy(*value));
     }
-    let known = match kind {
-        TrackKind::Audio => {
-            [*b"ac-3", *b"ec-3", *b"Opus", *b".mp3", *b"fLaC", *b"mp4a"].contains(&bytes)
-        }
-        TrackKind::Video => {
-            [*b"vp08", *b"vp09", *b"av01", *b"avc1", *b"hvc1", *b"vvc1"].contains(&bytes)
-        }
-    };
-    if !known {
+    if !known_fourcc(bytes, kind) {
         return Err(format!(
             "{field}[{track_id}] has unknown FourCC {:?}",
             String::from_utf8_lossy(&bytes)
@@ -239,5 +352,44 @@ mod tests {
             metadata.interpretation,
             MediaInterpretation::Opaque { .. }
         ));
+    }
+
+    #[test]
+    fn encoder_summary_only_exposes_bounded_canonical_labels() {
+        let metadata = ParsedMetadata {
+            properties: HashMap::from([
+                ("videocodecid".into(), Amf0Value::Utf8String("avc1".into())),
+                ("audiocodecid".into(), Amf0Value::Utf8String("mp4a".into())),
+                ("width".into(), Amf0Value::Number(1920.0)),
+                ("height".into(), Amf0Value::Number(1080.0)),
+                ("framerate".into(), Amf0Value::Number(29.970_029)),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            metadata.encoder_summary(),
+            EncoderSummary {
+                video_codec: Some("avc1".into()),
+                audio_codec: Some("mp4a".into()),
+                width: Some(1920),
+                height: Some(1080),
+                framerate: Some(29.97),
+            }
+        );
+
+        let hostile = ParsedMetadata {
+            properties: HashMap::from([
+                (
+                    "videocodecid".into(),
+                    Amf0Value::Utf8String("attacker-controlled-codec".into()),
+                ),
+                ("audiocodecid".into(), Amf0Value::Utf8String("nope".into())),
+                ("width".into(), Amf0Value::Number(1920.5)),
+                ("height".into(), Amf0Value::Number(1_000_000.0)),
+                ("framerate".into(), Amf0Value::Number(1_001.0)),
+            ]),
+            ..Default::default()
+        };
+        assert!(hostile.encoder_summary().is_empty());
     }
 }
