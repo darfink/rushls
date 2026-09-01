@@ -20,6 +20,7 @@ use rml_amf0::Amf0Value;
 use sessions::StreamMetadata;
 use std::collections::HashMap;
 use std::mem;
+use std::sync::Arc;
 use std::time::SystemTime;
 use time::RtmpTimestamp;
 
@@ -50,7 +51,7 @@ pub struct ServerSession {
     start_time: SystemTime,
     serializer: ChunkSerializer,
     deserializer: ChunkDeserializer,
-    connected_app_name: Option<String>,
+    connected_app_name: Option<Arc<str>>,
     outstanding_requests: HashMap<u32, OutstandingRequest>,
     next_request_number: u32,
     current_state: SessionState,
@@ -593,7 +594,7 @@ impl ServerSession {
             _ => return Err(ServerSessionError::NoAppNameForConnectionRequest),
         };
 
-        let app_name = match properties.remove("app") {
+        let app_name: Arc<str> = match properties.remove("app") {
             Some(value) => match value {
                 Amf0Value::Utf8String(mut app) => {
                     if app.ends_with("/") {
@@ -605,7 +606,8 @@ impl ServerSession {
                 _ => return Err(ServerSessionError::NoAppNameForConnectionRequest),
             },
             None => return Err(ServerSessionError::NoAppNameForConnectionRequest),
-        };
+        }
+        .into();
 
         self.object_encoding = match properties.remove("objectEncoding") {
             Some(value) => match value {
@@ -821,8 +823,8 @@ impl ServerSession {
             }
         };
 
-        let stream_key = match arguments.remove(0) {
-            Amf0Value::Utf8String(stream_key) => stream_key,
+        let stream_key: Arc<str> = match arguments.remove(0) {
+            Amf0Value::Utf8String(stream_key) => stream_key.into(),
             _ => {
                 let packet = self.create_error_packet(
                     "NetStream.Publish.Start",
@@ -927,8 +929,8 @@ impl ServerSession {
             }
         };
 
-        let stream_key = match arguments.remove(0) {
-            Amf0Value::Utf8String(stream_key) => stream_key,
+        let stream_key: Arc<str> = match arguments.remove(0) {
+            Amf0Value::Utf8String(stream_key) => stream_key.into(),
             _ => {
                 let packet = self.create_error_packet(
                     "NetStream.Play.Start",
@@ -1024,8 +1026,44 @@ impl ServerSession {
             Amf0Value::Utf8String(ref value) if value == "@setDataFrame" => {
                 self.handle_amf0_data_set_data_frame(data, stream_id, timestamp, raw_payload)
             }
-            _ => Ok(Vec::new()),
+            _ => self.handle_amf0_stream_data(stream_id, timestamp, raw_payload),
         }
+    }
+
+    fn handle_amf0_stream_data(
+        &self,
+        stream_id: u32,
+        timestamp: RtmpTimestamp,
+        raw_payload: Bytes,
+    ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+        if self.connected_app_name.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let app_name = match self.connected_app_name {
+            Some(ref name) => name.clone(),
+            None => return Ok(Vec::new()),
+        };
+
+        let publish_stream_key = match self.active_streams.get(&stream_id) {
+            Some(ref stream) => match stream.current_state {
+                StreamState::Publishing {
+                    ref stream_key,
+                    mode: _,
+                } => stream_key.clone(),
+                _ => return Ok(Vec::new()),
+            },
+            None => return Ok(Vec::new()),
+        };
+
+        let event = ServerSessionEvent::StreamDataReceived {
+            stream_key: publish_stream_key,
+            app_name,
+            raw_payload,
+            timestamp,
+        };
+
+        Ok(vec![ServerSessionResult::RaisedEvent(event)])
     }
 
     fn handle_amf0_data_set_data_frame(
@@ -1242,7 +1280,7 @@ impl ServerSession {
 
     fn accept_connection_request(
         &mut self,
-        app_name: String,
+        app_name: Arc<str>,
         transaction_id: f64,
         response_properties: HashMap<String, Amf0Value>,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
@@ -1256,7 +1294,7 @@ impl ServerSession {
         );
         command_object_properties.insert("capabilities".to_string(), Amf0Value::Number(31.0));
 
-        let description = "Successfully connected on app: ".to_string() + &app_name;
+        let description = format!("Successfully connected on app: {app_name}");
         let mut additional_properties = create_status_object(
             "status",
             "NetConnection.Connect.Success",
@@ -1286,7 +1324,7 @@ impl ServerSession {
     fn accept_publish_request(
         &mut self,
         stream_id: u32,
-        stream_key: String,
+        stream_key: Arc<str>,
         mode: PublishMode,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
         match self.active_streams.get_mut(&stream_id) {
@@ -1347,7 +1385,7 @@ impl ServerSession {
     fn accept_play_request(
         &mut self,
         stream_id: u32,
-        stream_key: String,
+        stream_key: Arc<str>,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
         match self.active_streams.get_mut(&stream_id) {
             Some(active_stream) => {

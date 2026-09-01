@@ -2,6 +2,7 @@ use super::PublishMode;
 use bytes::Bytes;
 use rml_amf0::Amf0Value;
 use sessions::StreamMetadata;
+use std::sync::Arc;
 use time::RtmpTimestamp;
 
 /// Represents where RTMP playback should start from
@@ -27,7 +28,7 @@ pub enum ServerSessionEvent {
     /// The client is requesting a connection on the specified RTMP application name
     ConnectionRequested {
         request_id: u32,
-        app_name: String,
+        app_name: Arc<str>,
         /// CROWDCAST: the remaining `connect` command object properties.
         ///
         /// The session consumes `app` and `objectEncoding` itself and previously
@@ -41,29 +42,29 @@ pub enum ServerSessionEvent {
     /// The client is requesting a stream key be released for use.
     ReleaseStreamRequested {
         request_id: u32,
-        app_name: String,
-        stream_key: String,
+        app_name: Arc<str>,
+        stream_key: Arc<str>,
     },
 
     /// The client is requesting the ability to publish on the specified stream key,
     PublishStreamRequested {
         request_id: u32,
-        app_name: String,
-        stream_key: String,
+        app_name: Arc<str>,
+        stream_key: Arc<str>,
         mode: PublishMode,
         stream_id: u32,
     },
 
     /// The client is finished publishing on the specified stream key
     PublishStreamFinished {
-        app_name: String,
-        stream_key: String,
+        app_name: Arc<str>,
+        stream_key: Arc<str>,
     },
 
     /// The client is changing metadata properties of the stream being published
     StreamMetadataChanged {
-        app_name: String,
-        stream_key: String,
+        app_name: Arc<str>,
+        stream_key: Arc<str>,
         metadata: StreamMetadata,
         /// CROWDCAST: the unparsed `onMetaData` AMF0 properties as the publisher
         /// sent them.
@@ -78,18 +79,30 @@ pub enum ServerSessionEvent {
         timestamp: RtmpTimestamp,
     },
 
+    /// A non-metadata AMF0 script-data message was received from the publisher.
+    ///
+    /// The raw encoded payload is carried so relays can preserve events such as
+    /// `onCaption` without decoding and re-encoding their application-specific
+    /// fields.
+    StreamDataReceived {
+        app_name: Arc<str>,
+        stream_key: Arc<str>,
+        raw_payload: Bytes,
+        timestamp: RtmpTimestamp,
+    },
+
     /// Audio data was received from the client
     AudioDataReceived {
-        app_name: String,
-        stream_key: String,
+        app_name: Arc<str>,
+        stream_key: Arc<str>,
         data: Bytes,
         timestamp: RtmpTimestamp,
     },
 
     /// Video data received from the client
     VideoDataReceived {
-        app_name: String,
-        stream_key: String,
+        app_name: Arc<str>,
+        stream_key: Arc<str>,
         data: Bytes,
         timestamp: RtmpTimestamp,
     },
@@ -105,8 +118,8 @@ pub enum ServerSessionEvent {
     /// The client is requesting playback of the specified stream
     PlayStreamRequested {
         request_id: u32,
-        app_name: String,
-        stream_key: String,
+        app_name: Arc<str>,
+        stream_key: Arc<str>,
         start_at: PlayStartValue,
         duration: Option<u32>,
         reset: bool,
@@ -115,8 +128,8 @@ pub enum ServerSessionEvent {
 
     /// The client is finished with playback of the specified stream
     PlayStreamFinished {
-        app_name: String,
-        stream_key: String,
+        app_name: Arc<str>,
+        stream_key: Arc<str>,
     },
 
     /// The client has sent an acknowledgement that they have received the specified number of bytes

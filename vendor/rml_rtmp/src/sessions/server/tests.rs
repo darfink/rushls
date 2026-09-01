@@ -59,7 +59,7 @@ fn can_accept_connection_request() {
             ref app_name,
             request_id,
             ..
-        } if app_name == "some_app" => request_id,
+        } if app_name.as_ref() == "some_app" => request_id,
         _ => panic!("First event was not as expected: {:?}", events[0]),
     };
 
@@ -149,7 +149,7 @@ fn connect_request_strips_trailing_slash() {
     assert_eq!(events.len(), 1, "Unexpected number of events returned");
     match events[0] {
         ServerSessionEvent::ConnectionRequested { ref app_name, .. } => {
-            assert_eq!(app_name, "some_app", "Unexpected app name")
+            assert_eq!(app_name.as_ref(), "some_app", "Unexpected app name")
         }
         _ => panic!("First event was not as expected: {:?}", events[0]),
     };
@@ -222,7 +222,7 @@ fn accepted_connection_responds_with_same_object_encoding_value_as_connection_re
             ref app_name,
             request_id,
             ..
-        } if app_name == "some_app" => request_id,
+        } if app_name.as_ref() == "some_app" => request_id,
         _ => panic!("First event was not as expected: {:?}", events[0]),
     };
 
@@ -378,7 +378,9 @@ fn can_accept_live_publishing_to_requested_stream_key() {
             request_id: returned_request_id,
             mode: PublishMode::Live,
             ..
-        } if app_name == "some_app" && stream_key == "stream_key" => returned_request_id,
+        } if app_name.as_ref() == "some_app" && stream_key.as_ref() == "stream_key" => {
+            returned_request_id
+        }
 
         _ => panic!("Unexpected first event found: {:?}", events[0]),
     };
@@ -484,9 +486,14 @@ fn can_receive_and_raise_event_for_metadata_from_obs() {
             raw_metadata,
             ..
         } => {
-            assert_eq!(app_name, TEST_APP_NAME, "Unexpected metadata app name");
             assert_eq!(
-                stream_key, TEST_STREAM_KEY,
+                app_name.as_ref(),
+                TEST_APP_NAME,
+                "Unexpected metadata app name"
+            );
+            assert_eq!(
+                stream_key.as_ref(),
+                TEST_STREAM_KEY,
                 "Unexpected metadata stream key"
             );
             // CROWDCAST: the unparsed properties must survive intact, including
@@ -584,8 +591,12 @@ fn can_receive_audio_data_on_published_stream() {
             data,
             timestamp,
         } => {
-            assert_eq!(app_name, TEST_APP_NAME, "Unexpected app name");
-            assert_eq!(stream_key, TEST_STREAM_KEY, "Unexpected stream key");
+            assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
+            assert_eq!(
+                stream_key.as_ref(),
+                TEST_STREAM_KEY,
+                "Unexpected stream key"
+            );
             assert_eq!(timestamp, RtmpTimestamp::new(1234), "Unexepcted timestamp");
             assert_eq!(&data[..], &[1_u8, 2_u8, 3_u8], "Unexpected data");
         }
@@ -631,8 +642,12 @@ fn can_receive_video_data_on_published_stream() {
             data,
             timestamp,
         } => {
-            assert_eq!(app_name, TEST_APP_NAME, "Unexpected app name");
-            assert_eq!(stream_key, TEST_STREAM_KEY, "Unexpected stream key");
+            assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
+            assert_eq!(
+                stream_key.as_ref(),
+                TEST_STREAM_KEY,
+                "Unexpected stream key"
+            );
             assert_eq!(timestamp, RtmpTimestamp::new(1234), "Unexpected timestamp");
             assert_eq!(&data[..], &[1_u8, 2_u8, 3_u8], "Unexpected data");
         }
@@ -680,8 +695,12 @@ fn publish_finished_event_raised_when_delete_stream_invoked_on_publishing_stream
             app_name,
             stream_key,
         } => {
-            assert_eq!(app_name, TEST_APP_NAME, "Unexpected app name");
-            assert_eq!(stream_key, TEST_STREAM_KEY, "Unexpected stream key");
+            assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
+            assert_eq!(
+                stream_key.as_ref(),
+                TEST_STREAM_KEY,
+                "Unexpected stream key"
+            );
         }
 
         event => panic!(
@@ -725,7 +744,7 @@ fn gstreamer_string_delete_stream_id_finishes_publishing() {
     assert!(matches!(
         events.as_slice(),
         [ServerSessionEvent::PublishStreamFinished { app_name, stream_key }]
-            if app_name == TEST_APP_NAME && stream_key == TEST_STREAM_KEY
+            if app_name.as_ref() == TEST_APP_NAME && stream_key.as_ref() == TEST_STREAM_KEY
     ));
 }
 
@@ -768,8 +787,12 @@ fn publish_finished_event_raised_when_close_stream_invoked_on_publishing_stream(
             app_name,
             stream_key,
         } => {
-            assert_eq!(app_name, TEST_APP_NAME, "Unexpected app name");
-            assert_eq!(stream_key, TEST_STREAM_KEY, "Unexpected stream key");
+            assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
+            assert_eq!(
+                stream_key.as_ref(),
+                TEST_STREAM_KEY,
+                "Unexpected stream key"
+            );
         }
 
         event => panic!(
@@ -826,8 +849,12 @@ fn can_request_publishing_on_closed_stream() {
             mode: PublishMode::Live,
             ..
         } => {
-            assert_eq!(app_name, &TEST_APP_NAME, "Unexpected app name");
-            assert_eq!(stream_key, &TEST_STREAM_KEY, "Unexpected stream key");
+            assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
+            assert_eq!(
+                stream_key.as_ref(),
+                TEST_STREAM_KEY,
+                "Unexpected stream key"
+            );
         }
 
         _ => panic!("Unexpected first event found: {:?}", events[0]),
@@ -870,8 +897,12 @@ fn can_accept_play_command_with_no_optional_parameters_to_requested_stream_key()
             request_id,
             stream_id: sid,
         } => {
-            assert_eq!(app_name, TEST_APP_NAME, "Unexpected app name");
-            assert_eq!(stream_key, TEST_STREAM_KEY, "Unexpected stream key");
+            assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
+            assert_eq!(
+                stream_key.as_ref(),
+                TEST_STREAM_KEY,
+                "Unexpected stream key"
+            );
             assert_eq!(
                 start_at,
                 PlayStartValue::LiveOrRecorded,
@@ -1012,8 +1043,12 @@ fn can_accept_play_command_with_all_optional_parameters_to_requested_stream_key(
             request_id,
             stream_id: sid,
         } => {
-            assert_eq!(app_name, TEST_APP_NAME, "Unexpected app name");
-            assert_eq!(stream_key, TEST_STREAM_KEY, "Unexpected stream key");
+            assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
+            assert_eq!(
+                stream_key.as_ref(),
+                TEST_STREAM_KEY,
+                "Unexpected stream key"
+            );
             assert_eq!(
                 start_at,
                 PlayStartValue::StartTimeInSeconds(5),
@@ -1072,8 +1107,12 @@ fn play_finished_event_when_close_stream_invoked() {
             app_name,
             stream_key,
         } => {
-            assert_eq!(app_name, TEST_APP_NAME, "Unexpected app name");
-            assert_eq!(stream_key, TEST_STREAM_KEY, "Unexpected stream key");
+            assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
+            assert_eq!(
+                stream_key.as_ref(),
+                TEST_STREAM_KEY,
+                "Unexpected stream key"
+            );
         }
 
         event => panic!(
@@ -1123,8 +1162,12 @@ fn play_finished_event_when_delete_stream_invoked_on_playing_stream() {
             app_name,
             stream_key,
         } => {
-            assert_eq!(app_name, TEST_APP_NAME, "Unexpected app name");
-            assert_eq!(stream_key, TEST_STREAM_KEY, "Unexpected stream key");
+            assert_eq!(app_name.as_ref(), TEST_APP_NAME, "Unexpected app name");
+            assert_eq!(
+                stream_key.as_ref(),
+                TEST_STREAM_KEY,
+                "Unexpected stream key"
+            );
         }
 
         event => panic!(
@@ -1807,7 +1850,7 @@ fn perform_connection(
             ref app_name,
             request_id,
             ..
-        } if app_name == "some_app" => request_id,
+        } if app_name.as_ref() == "some_app" => request_id,
         _ => panic!("First event was not as expected: {:?}", events[0]),
     };
 
@@ -1924,7 +1967,9 @@ fn start_publishing(
             request_id: returned_request_id,
             mode: PublishMode::Live,
             ..
-        } if app_name == "some_app" && stream_key == "stream_key" => returned_request_id,
+        } if app_name.as_ref() == "some_app" && stream_key.as_ref() == "stream_key" => {
+            returned_request_id
+        }
 
         _ => panic!("Unexpected first event found: {:?}", events[0]),
     };
