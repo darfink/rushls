@@ -692,6 +692,24 @@ where
                             )
                             .await?;
                     }
+                    ServerSessionEvent::StreamDataReceived {
+                        raw_payload,
+                        timestamp,
+                        ..
+                    } => {
+                        let stream_id = handler.active_stream_id.ok_or_else(|| {
+                            Box::<str>::from("script data arrived before publish acceptance")
+                        })?;
+                        handler
+                            .on_data(
+                                stream_id,
+                                SessionData::Amf0 {
+                                    timestamp: timestamp.value,
+                                    data: raw_payload,
+                                },
+                            )
+                            .await?;
+                    }
                     ServerSessionEvent::PublishStreamFinished { .. } => {
                         if let Some(stream_id) = handler.active_stream_id {
                             handler.on_unpublish(stream_id)?;
@@ -1029,6 +1047,40 @@ mod tests {
         let previous_tag_size = u32::try_from(FLV_TAG_HEADER_BYTES).expect("header fits u32")
             + u32::try_from(payload.len()).expect("fixture payload fits u32");
         assert_eq!(&tag[11 + payload.len()..], &previous_tag_size.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn stream_data_events_preserve_script_payloads_as_flv_tags() {
+        let (mut handler, _attempt, mut input) = handler(nz::usize!(1024), 512);
+        handler.active_stream_id = Some(7);
+        let payload = Bytes::from_static(
+            b"\x02\x00\x09onCaption\x08\x00\x00\x00\x01\x00\x04text\x02\x00\x05hello\x00\x00\x09",
+        );
+        let event = ServerSessionEvent::StreamDataReceived {
+            app_name: "live".into(),
+            stream_key: "camera-key".into(),
+            raw_payload: payload.clone(),
+            timestamp: cc_rtmp::time::RtmpTimestamp::new(1_234),
+        };
+        let (mut session, _initial) =
+            ServerSession::new(ServerSessionConfig::new()).expect("session config is valid");
+        let mut sink = tokio::io::sink();
+
+        process_session_results(
+            &mut sink,
+            &mut session,
+            &mut handler,
+            RtmpConfig::default(),
+            vec![ServerSessionResult::RaisedEvent(event)],
+        )
+        .await
+        .expect("script data event is relayed");
+        handler.on_unpublish(7).expect("clean unpublish");
+
+        let bytes = drain(&mut input).expect("channel ended cleanly");
+        assert_eq!(bytes[0], 18, "script data uses an FLV data tag");
+        assert_eq!(&bytes[4..8], &[0, 4, 210, 0]);
+        assert_eq!(&bytes[11..11 + payload.len()], payload.as_ref());
     }
 
     #[tokio::test]
