@@ -41,7 +41,8 @@ pub use media::{
     MediaClassification, MediaInterpretation, ParsedAudio, ParsedVideo, ValidatedMedia,
 };
 pub use metadata::{
-    EncoderSummary, MetadataCodec, ParsedMetadata, TrackMetadata, ValidatedMetadata,
+    EncoderSummary, MAX_ENCODER_RAW_LEN, MetadataCodec, ParsedMetadata, TrackMetadata,
+    ValidatedMetadata, normalize_encoder_vendor,
 };
 pub use rml_amf0;
 

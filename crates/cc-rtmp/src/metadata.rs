@@ -54,6 +54,10 @@ pub struct EncoderSummary {
     /// Declared framerate. This is what the encoder intends to send, not what
     /// it actually delivered; measured rates must come from frame counters.
     pub framerate: Option<f64>,
+    /// Normalized RTMP client vendor derived from `onMetaData.encoder`
+    /// (e.g. `obs-studio 30.1.0` -> `obs`). Bounded allowlist;
+    /// unrecognized non-empty values become `other`, missing/empty stays `None`.
+    pub encoder_vendor: Option<String>,
 }
 
 impl EncoderSummary {
@@ -73,6 +77,7 @@ impl ParsedMetadata {
             framerate: self
                 .bounded_positive_number("framerate", MAX_DECLARED_FRAMERATE)
                 .map(|value| (value * 1_000.0).round() / 1_000.0),
+            encoder_vendor: self.encoder_vendor(),
         }
     }
 
@@ -108,6 +113,39 @@ impl ParsedMetadata {
     fn bounded_positive_number(&self, field: &str, maximum: f64) -> Option<f64> {
         self.positive_number(field)
             .filter(|value| *value <= maximum)
+    }
+
+    /// Raw `encoder` string from `onMetaData`, trimmed and bounded for logs.
+    ///
+    /// Returns `None` when the field is missing, non-string, or empty after
+    /// trimming. Callers needing the Prometheus-safe value want
+    /// [`ParsedMetadata::encoder_vendor`] instead.
+    pub fn encoder_raw(&self) -> Option<String> {
+        match self.properties.get("encoder")? {
+            Amf0Value::Utf8String(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                let mut owned = trimmed.to_owned();
+                if owned.len() > MAX_ENCODER_RAW_LEN {
+                    owned.truncate(MAX_ENCODER_RAW_LEN);
+                }
+                Some(owned)
+            }
+            _ => None,
+        }
+    }
+
+    /// Normalized client vendor for Prometheus grouping.
+    ///
+    /// `None` means missing/empty (no usable signal, e.g. GStreamer flvmux
+    /// which often omits `encoder`). `Some("other")` means present but
+    /// not in the allowlist — log the raw value and grow the table.
+    pub fn encoder_vendor(&self) -> Option<String> {
+        self.encoder_raw()
+            .as_deref()
+            .and_then(normalize_encoder_vendor)
     }
 }
 
@@ -183,8 +221,137 @@ enum TrackKind {
 }
 
 const MAX_DECLARED_FRAMERATE: f64 = 1_000.0;
+/// Upper bound for the logged `encoder` raw string.
+///
+/// Logs carry full fidelity for version drill-down (e.g. OBS 30.1.0 vs 30.0.0)
+/// while staying bounded; Prometheus only ever sees the normalized vendor.
+pub const MAX_ENCODER_RAW_LEN: usize = 96;
 const AUDIO_FOURCCS: [[u8; 4]; 6] = [*b"ac-3", *b"ec-3", *b"Opus", *b".mp3", *b"fLaC", *b"mp4a"];
 const VIDEO_FOURCCS: [[u8; 4]; 6] = [*b"vp08", *b"vp09", *b"av01", *b"avc1", *b"hvc1", *b"vvc1"];
+
+/// Map a free-form `onMetaData.encoder` string to a bounded vendor label.
+///
+/// Row shape is `(vendor, prefix_terms, substring_terms)`: a row matches when
+/// the lowercased string starts with any prefix or contains any substring.
+/// Ordered most-specific first. Returns `None` for missing/empty input so
+/// callers can distinguish "no signal" from `Some("other")` (present but
+/// unrecognized long tail).
+///
+/// Keep this table conservative: only unambiguous tokens become vendors.
+/// Generic words like `cube` or `bond` alone stay `other` to avoid false
+/// positives; the raw string is always in logs for follow-up.
+///
+/// To add a vendor, add one row — no new branching.
+const ENCODER_VENDOR_TABLE: &[(&str, &[&str], &[&str])] = &[
+    ("streamlabs", &[], &["streamlabs", "slobs"]),
+    ("obs", &[], &["obs-studio", "obs-output", "libobs"]),
+    (
+        "ffmpeg",
+        &["lavf", "lavc"],
+        &["ffmpeg", "libavformat", "libav", "avconv"],
+    ),
+    ("gstreamer", &[], &["gstreamer", "flvmux", "gst-launch"]),
+    ("fmle", &["fmle/", "fme/"], &["flash media live", "adobe"]),
+    ("wirecast", &[], &["wirecast", "telestream"]),
+    ("vmix", &[], &["vmix", "v-mix"]),
+    ("xsplit", &[], &["xsplit"]),
+    ("ecamm", &[], &["ecamm"]),
+    ("mimolive", &[], &["mimolive", "mimo live", "boinx"]),
+    ("manycam", &[], &["manycam"]),
+    ("prism_live", &[], &["prism live", "naver prism"]),
+    ("tiktok", &[], &["tiktok"]),
+    ("switcher", &[], &["switcher studio", "switcherstudio"]),
+    ("larix", &[], &["larix"]),
+    ("haishinkit", &[], &["haishinkit", "haishin"]),
+    (
+        "rootencoder",
+        &[],
+        &["rootencoder", "rtmp-rtsp-stream-client"],
+    ),
+    ("nanostream", &[], &["nanocosmos", "nanostream"]),
+    ("teradek", &[], &["teradek", "vidiu", "t-rax"]),
+    ("liveu", &[], &["liveu", "live-u", "lu600"]),
+    ("haivision", &[], &["haivision", "makito", "kulabyte"]),
+    ("elemental", &[], &["elemental"]),
+    (
+        "wowza",
+        &[],
+        &["wowza", "gocoder", "go coder", "clearcaster"],
+    ),
+    (
+        "blackmagic",
+        &[],
+        &["blackmagic", "atem", "decklink", "web presenter"],
+    ),
+    ("newtek", &[], &["newtek", "tricaster", "3play"]),
+    ("epiphan", &[], &["epiphan", "pearl", "webcaster"]),
+    ("matrox", &[], &["matrox", "monarch"]),
+    ("aja", &[], &["aja", "helo"]),
+    ("osprey", &[], &["osprey", "talon"]),
+    ("kiloview", &[], &["kiloview"]),
+    ("magewell", &[], &["magewell", "ultra stream"]),
+    ("cerevo", &[], &["cerevo", "liveshell", "livewedge"]),
+    ("roland", &[], &["roland", "vr-4hd", "v-60hd", "v-02hd"]),
+    ("yololiv", &[], &["yolobox", "yololiv"]),
+    ("atomos", &[], &["atomos", "ninja", "shogun"]),
+    ("videon", &[], &["videon", "edgecaster", "streamsync"]),
+    ("boxcast", &[], &["boxcast", "boxcaster"]),
+    ("resi", &[], &["resi"]),
+    ("slingstudio", &[], &["slingstudio", "sling studio"]),
+    ("vidblaster", &[], &["vidblaster", "vid blaster"]),
+    ("touchstream", &[], &["touchstream", "touch stream"]),
+    ("broadcastme", &[], &["broadcastme", "broadcast me"]),
+    ("vlc", &[], &["vlc"]),
+    (
+        "camera",
+        &[],
+        &[
+            "ptzoptics",
+            "mevo",
+            "gopro",
+            "dji",
+            "panasonic",
+            "sony",
+            "canon",
+            "jvc",
+        ],
+    ),
+    (
+        "gateway",
+        &["srs"],
+        &[
+            "datarhei",
+            "restreamer",
+            "mediamtx",
+            "nginx",
+            "mistserver",
+            "ovenmediaengine",
+            "ant media",
+            "red5",
+            "zixi",
+            "mosaicoon",
+            "/srs",
+            " srs",
+        ],
+    ),
+    ("flash", &[], &["flash player"]),
+];
+
+pub fn normalize_encoder_vendor(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    for (vendor, prefixes, substrings) in ENCODER_VENDOR_TABLE {
+        if prefixes.iter().any(|p| lower.starts_with(p))
+            || substrings.iter().any(|s| lower.contains(s))
+        {
+            return Some((*vendor).to_owned());
+        }
+    }
+    Some("other".to_owned())
+}
 
 fn known_fourcc(value: [u8; 4], kind: TrackKind) -> bool {
     match kind {
@@ -374,6 +541,7 @@ mod tests {
                 width: Some(1920),
                 height: Some(1080),
                 framerate: Some(29.97),
+                encoder_vendor: None,
             }
         );
 
@@ -391,5 +559,57 @@ mod tests {
             ..Default::default()
         };
         assert!(hostile.encoder_summary().is_empty());
+    }
+
+    #[test]
+    fn encoder_vendor_normalizes_to_a_bounded_allowlist() {
+        for (raw, expected) in [
+            ("obs-studio 30.1.0", Some("obs")),
+            ("obs-output module (libobs 26.1.0)", Some("obs")),
+            ("Lavf58.76.100", Some("ffmpeg")),
+            ("Lavf61.7.100", Some("ffmpeg")),
+            ("FMLE/3.0", Some("fmle")),
+            ("Wirecast/16.0", Some("wirecast")),
+            ("vMix 27", Some("vmix")),
+            ("XSplitBroadcaster", Some("xsplit")),
+            ("Larix Broadcaster", Some("larix")),
+            ("Teradek Cube", Some("teradek")),
+            ("LiveU Solo", Some("liveu")),
+            ("Haivision Makito", Some("haivision")),
+            ("Elemental Live", Some("elemental")),
+            ("Wowza GoCoder", Some("wowza")),
+            ("ATEM Mini Pro", Some("blackmagic")),
+            ("TriCaster", Some("newtek")),
+            ("GStreamer flvmux", Some("gstreamer")),
+            ("HaishinKit", Some("haishinkit")),
+            ("RootEncoder", Some("rootencoder")),
+            ("SomeFutureEncoder 9.9", Some("other")),
+        ] {
+            assert_eq!(
+                normalize_encoder_vendor(raw).as_deref(),
+                expected,
+                "raw {raw:?}"
+            );
+        }
+        assert_eq!(normalize_encoder_vendor(""), None);
+        assert_eq!(normalize_encoder_vendor("   "), None);
+    }
+
+    #[test]
+    fn encoder_summary_carries_vendor_without_allowing_raw_through() {
+        let metadata = ParsedMetadata {
+            properties: HashMap::from([(
+                "encoder".into(),
+                Amf0Value::Utf8String("obs-studio 30.1.0".into()),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            metadata.encoder_summary().encoder_vendor.as_deref(),
+            Some("obs")
+        );
+        assert_eq!(metadata.encoder_raw().as_deref(), Some("obs-studio 30.1.0"));
+        let missing = ParsedMetadata::default();
+        assert_eq!(missing.encoder_vendor(), None);
     }
 }
