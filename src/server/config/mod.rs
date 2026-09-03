@@ -231,7 +231,9 @@ impl AppConfig {
         self.ingest
             .health
             .apply(&mut node, self.hls.segment_duration())?;
-        self.storage.apply(&mut node)?;
+        // Same reason as health: the reconnect window is validated against the
+        // segment duration, which only `hls.apply` establishes.
+        self.storage.apply(&mut node, self.hls.segment_duration())?;
         node.http = self.http.resolve()?;
         node.metrics = self.metrics.resolve()?;
         let hooks = self.hooks.resolve(&mut client)?;
@@ -1291,6 +1293,11 @@ pub struct StorageAppConfig {
     #[conf(parameter, long, env, default_value = "1024")]
     maximum_streams: usize,
     /// Time an inactive stream remains available for a publisher to reconnect.
+    ///
+    /// At least three times the segment duration. A viewer holds playable
+    /// media when its publisher goes away — `HOLD-BACK` at the live edge,
+    /// more after seeking back — and a shorter window retires the stream
+    /// while that media is still being played.
     #[conf(
         parameter,
         long,
@@ -1312,9 +1319,26 @@ pub struct StorageAppConfig {
 }
 
 impl StorageAppConfig {
-    fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
+    /// Resolve against the segment duration the reconnect floor is sized by.
+    fn apply(&self, node: &mut NodeConfig, segment_duration: Duration) -> Result<(), ConfigError> {
         if self.maximum_streams == 0 {
             return Err(invalid("storage must allow at least one stream"));
+        }
+        // A viewer is handed content the playlist already advertised: a
+        // standard player sits HOLD-BACK behind the live edge, and a scrubbing
+        // one may be anywhere in the window. Retiring the stream sooner than
+        // the shortest of those promises cuts off playback of media that was
+        // promised as fetchable, so a reconnect window below the protocol's
+        // own three-target floor is refused rather than silently raised.
+        let reconnect_floor = segment_duration.saturating_mul(3);
+        if self.inactive_stream_retention < reconnect_floor {
+            return Err(invalid(format!(
+                "storage inactive_stream_retention ({:?}) must be at least three times the \
+                 segment duration ({reconnect_floor:?}): a viewer at the live edge still \
+                 holds HOLD-BACK worth of playable media when its publisher goes away, and \
+                 a shorter reconnect window retires the stream out from under it",
+                self.inactive_stream_retention
+            )));
         }
         node.store.maximum_streams = self.maximum_streams;
         node.store.idle_retention = self.inactive_stream_retention;

@@ -835,6 +835,58 @@ playlist_window = "12s"
 }
 
 #[test]
+fn a_reconnect_window_below_the_hold_back_is_refused() -> Result<(), Box<dyn Error>> {
+    assert!(
+        resolve_toml(
+            r#"
+[hls]
+segment_duration = "6s"
+
+[storage]
+inactive_stream_retention = "5s"
+"#,
+        )?
+        .is_err(),
+        "retiring a stream after 5s strands a viewer holding 18s of HOLD-BACK"
+    );
+    assert!(
+        resolve_toml(
+            r#"
+[storage]
+inactive_stream_retention = "0s"
+"#,
+        )?
+        .is_err(),
+        "a zero reconnect window retires every idle stream on the next tick"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_reconnect_window_is_measured_against_the_configured_segment_duration()
+-> Result<(), Box<dyn Error>> {
+    // The floor tracks the cadence rather than a constant: five seconds clears
+    // three one-second segments, having been refused against six-second ones.
+    let config = resolve_toml(
+        r#"
+[hls]
+segment_duration = "1s"
+part_duration = "1s"
+
+[storage]
+inactive_stream_retention = "5s"
+"#,
+    )??;
+
+    assert_eq!(
+        config.node.store.idle_retention,
+        Duration::from_secs(5),
+        "a legal reconnect window is stored as written, never raised"
+    );
+    Ok(())
+}
+
+#[test]
 fn hostile_playlist_windows_never_panic() {
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
     for _ in 0..4_000 {
