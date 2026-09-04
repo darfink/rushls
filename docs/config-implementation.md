@@ -24,14 +24,14 @@ plus five subsystem changes".
 
 ## Ingest timing
 
-**A rate multiplier in the pacer.** `speed = "3x"` has no representation
-today. The pacer compares media-elapsed against wall-elapsed one to one, so
-every multiple other than 1x is new arithmetic.
+**A rate multiplier in the pacer.** `ceiling.pace = "3x"` has no
+representation today. The pacer compares media-elapsed against wall-elapsed
+one to one, so every multiple other than 1x is new arithmetic.
 
-**`burst` is not the current lead tolerance.** The existing `maximum_lead` is a
-standing allowance a publisher may sit inside indefinitely. A burst is
-consumable and refills at `speed`. Better semantics, but genuinely different
-behaviour rather than a rename.
+**`ceiling.burst` is not the current lead tolerance.** The existing
+`maximum_lead` is a standing allowance a publisher may sit inside
+indefinitely. A burst is consumable and refills at `ceiling.pace`. Better
+semantics, but genuinely different behaviour rather than a rename.
 
 **The timestamp-jump guard must detach from pacing.** It currently lives inside
 one arm of the timing policy, so with no rate ceiling — the compiled default —

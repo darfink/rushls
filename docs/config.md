@@ -72,9 +72,12 @@ list is configured; header trust is not how playlist URLs or auth are derived.
 ## `[accept]`
 
 `[accept]` is admission: everything about whether a publisher is let in and on what
-terms. The top level holds admission controls (`speed`, `burst`, `takeover`,
-covered under Publish speed below); the nested `[accept.video]`, `[accept.audio]`,
-and `[accept.subtitles]` tables hold predicates.
+terms. The top level holds admission controls (`ceiling`, `stall`, `floor`,
+`takeover`, covered under Publish speed below); the nested `[accept.video]`,
+`[accept.audio]`, and `[accept.subtitles]` tables hold predicates. It is the
+per-publisher deal, and the only table whose rules may act on a live session —
+throttle it, drop it, replace it. Sizing the box itself is `[capacity]`, which
+only ever refuses new work.
 
 Every field under those nested tables is a **predicate over a candidate** —
 the set of values admitted. There are exactly three constructors:
@@ -120,10 +123,10 @@ Accepting it in one position but not the other would be the worst of both.
 String comparison is never used, because `"8kHz" > "48kHz"` lexicographically.
 
 Frame rates are compared as **exact rationals**, never floating point. `29.97`
-and `30000/1001` are the same rate and both are accepted, neither rounded
-before comparison. `frame_rate = 30` therefore does not admit 29.97 — the
-predicate doing what it says — and the range form is how a deployment accepts
-both.
+and `"30000/1001"` are the same rate and both are accepted, neither rounded
+before comparison. The quotient form is a string; a bare `30000/1001` is not
+valid TOML. `frame_rate = 30` therefore does not admit 29.97 — the predicate
+doing what it says — and the range form is how a deployment accepts both.
 
 Resolution is **two-dimensional**. A named size is a bounding box, not a point
 on a scale: `{ max = "4k" }` means the frame fits inside 3840x2160, with axes
@@ -160,19 +163,47 @@ belong on the auth service, which already knows the account and the stream.
 
 ## Publish speed
 
-`speed` is a **ceiling**, expressed as a multiple of realtime, plus `burst` for
-how far ahead of that rate a publisher may get.
+`ceiling`, `stall`, and `floor` are the three pacing bounds, kept side by
+side so their kinship reads at a glance. `ceiling` throttles, `stall` and
+`floor` disconnect — that difference in enforcement is why ceiling and floor
+stay two objects rather than one list. All three are per-publisher contracts,
+so the auth overlay may narrow any of them per account.
 
 ```toml
-speed = "1x"     # at most realtime
-burst = "10s"    # with a ten-second head start
+ceiling = { pace = "1x", burst = "10s" }     # at most realtime, ten-second head start
+stall   = "12s"                                # nothing usable for 12s: dropped
+# floor  = { pace = "0.5x", window = "30s" }  # below half realtime across 30s: dropped
 ```
 
-Exceeding it **waits**. Transport backpressure is the entire enforcement: a
-publisher cannot dump unbounded media into the process, and a file pushed at
-100x still plays, slowed to live. There is no disconnect-on-too-fast setting,
-because refusing turns an encoder catch-up or a large group-of-pictures into an
-outage.
+Exceeding the ceiling **waits**. Transport backpressure is the entire
+enforcement: a publisher cannot dump unbounded media into the process, and a
+file pushed at 100x still plays, slowed to live. There is no
+disconnect-on-too-fast setting today, because refusing turns an encoder
+catch-up or a large group-of-pictures into an outage. If one ever lands it
+belongs here as a third bound — same `{ pace, window }` shape, disconnect
+above — metered on pace *offered* before the ceiling throttles it, since the
+ceiling masks the signal downstream. Reserved name: `cutoff`.
+
+`floor` is `{ pace, window }`: the minimum media-time progress against
+wall-time, averaged over the window. Where `stall` asks did anything usable
+arrive, `floor` asks did enough of it arrive — a publisher averaging below
+`pace` across any `window` is disconnected. Omitted means no floor, which is
+the compiled default. The first window is startup grace, and discontinuities
+neither credit nor reset progress; only discontinuity-corrected media-time
+counts.
+
+`stall` is **"nothing usable arrived for this long"** — no packets, or packets
+that do not become media. It is explicitly *not* lag against wall clock, and
+it stays idle-based on purpose: it is the fast dead-versus-alive signal, and
+it resets on every usable arrival with no false-positive mode. A stable 0.98x
+publisher trips no idle timer, and only trips a floor whose `pace` the
+operator set above it. The two are different failure modes on different
+timescales — seconds of silence versus tens of seconds of slowness — which is
+why they stay two knobs rather than one list. `stall` lives here and not
+under `[hls]` because it measures the publisher, not the playlist: when it
+fires the origin drops the session and the outputs render the consequence
+(a stale, then ended playlist). A future output table inherits the same
+signal rather than growing its own timer.
 
 `takeover` decides what a second publisher for the same stream means. At `false`,
 the default, the newcomer is refused while the current publisher holds the name.
@@ -180,10 +211,10 @@ At `true`, the newcomer replaces it: the old session is closed and viewers see
 a discontinuity at the join. The default is refusal because silent replacement
 turns an encoder reconnect or a leaked credential into a hijack with no signal.
 
-`speed`, `burst`, and `takeover` deliberately do **not** take the predicate
-constructors above. Those answer "which values are in the admit set"; a refill
-rate is not a value to test membership against. "Exactly 1x" is not something
-a real encoder can be asked for.
+`ceiling`, `stall`, `floor`, and `takeover` deliberately do **not** take the
+predicate constructors above. Those answer "which values are in the admit
+set"; a refill rate is not a value to test membership against. "Exactly 1x"
+is not something a real encoder can be asked for.
 
 The one argument against throttle-only that survives: pacing a pre-recorded
 file makes it succeed *as live*. For an auction or a match that is the failure
@@ -216,13 +247,6 @@ memory" has no fixed byte meaning at a variable bitrate, so it would be a
 second, weaker way of writing `retain` — and the number an operator needs for
 capacity planning is the one that multiplies by `streams`.
 
-`stall` is **"nothing usable arrived for this long"** — no packets, or packets
-that do not become media. It is explicitly *not* lag against wall clock. A
-behind-ness measure was proposed and rejected: a publisher at 0.98x realtime
-accumulates drift forever and would be disconnected on a timer while sending
-perfectly good media. Idle-based detection resets on every arrival and has no
-false-positive mode.
-
 ## Storage tiers
 
 ```
@@ -243,6 +267,10 @@ than left to arithmetic.
 rather than silently falling back to memory-only.
 
 ## Concurrency budgets
+
+Together with the storage tiers above, this is the `[capacity]` table: how big
+a box. Everything here sizes the node and refuses new work when full; nothing
+here touches a live session — that is `[accept]`'s job.
 
 `publishers` and `streams` are separate because they answer different
 questions. A publisher is an ingest session — transport, muxing, CPU. A stream
@@ -283,6 +311,13 @@ bounded by a constant". Exposing both invites the pairing that the derived form
 prevents: a generous session timeout accidentally applied to unauthenticated
 peers.
 
+Three idle-adjacent knobs, three different signals. `[rtmp] timeout` is socket
+silence — any bytes reset it — and stays per-protocol because only RTMP needs
+its own transport guard. `stall` is usable-media silence, protocol-agnostic.
+`floor` is usable-media rate. Collapse any two and one failure mode loses its
+tuning: a dead socket wants seconds, a degraded encoder wants tens of seconds
+with a pace attached.
+
 ## Shutdown
 
 `shutdown` bounds how long a restart waits before abandoning work in progress.
@@ -295,7 +330,7 @@ usually sized against an orchestrator's own grace period. Set it below that
 period, or a scheduler sends a hard kill mid-drain and the graceful path buys
 nothing.
 
-It sits at the top level rather than under `[limits]` because it is not a
+It sits at the top level rather than under `[capacity]` because it is not a
 capacity bound. Everything in that table sizes a box — how many of something,
 how much memory. This is process lifecycle, and it belongs beside `name` as a
 property of the node itself.
@@ -463,7 +498,7 @@ One HTTP service, asked once per publisher:
 ```
 
 No policy names. The optional `accept` overlay uses the same field names as the
-TOML, which is what lets a control plane express per-account limits without a
+TOML, which is what lets a control plane express per-account terms without a
 configuration change — the single largest functional gain in this design.
 
 The request is a POST with a JSON body carrying four fields: `protocol` (`rtmp`
@@ -601,7 +636,7 @@ rewriting the file. Interpolation runs on file values before overrides apply, so
 
 The file is read at startup. New certificates and rotated JWKS keys take effect
 without a restart; anything else requires one. There is deliberately no reload
-signal for `accept`, `limits`, or `hls`: retuning cadence or capacity under a
+signal for `accept`, `capacity`, or `hls`: retuning cadence or capacity under a
 live edge is a restart, sized by `shutdown`. `rushls check` validates the file,
 its directories, and its secret paths without booting.
 
@@ -615,12 +650,12 @@ is lifted.
 - `[metrics]` omitted — nothing is exported.
 - `[record]` omitted — no local copies are written.
 - `[http.tls]` omitted — no HTTPS listener.
-- `[limits]` omitted — no stream count cap, though the compiled per-stream byte
+- `[capacity]` omitted — no stream count cap, though the compiled per-stream byte
   backstop remains.
 
 - `[http] listen = "off"` — no cleartext listener. Both listeners off refuses to
   boot.
-- `speed = "off"` — no publish rate ceiling. This is the compiled default.
+- `ceiling` omitted — no publish rate ceiling. This is the compiled default.
 - `stall`, `[rtmp] timeout`, and every numeric `[accept]` predicate accept `"off"` to
   mean no cap. Omitting a predicate already admits everything; `codecs = "off"` is
   refused rather than given a second spelling for omission.
@@ -645,7 +680,7 @@ origin.
 
 Legal but probably unintended, warned rather than refused: an ingest listener
 on a non-loopback address combined with open auth, an uncapped stream count,
-`memory_per_stream = "off"`, or `speed = "off"`. A disabled RTMP timeout on a
+`memory_per_stream = "off"`, or an omitted `ceiling`. A disabled RTMP timeout on a
 public bind is a second warning.
 
 Hard refusals are kept for the genuinely unbootable. Rules that bounce an

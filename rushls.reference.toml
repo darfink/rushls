@@ -73,15 +73,16 @@ url = "http://auth.example.internal/v1/publish/admit"
 # tier = "premium"
 
 [accept]
-speed    = "1x"                          # ceiling, as a multiple of realtime; "off" = no cap
-burst    = "10s"                         # how far ahead of that rate a publisher may get
-takeover = false                         # true lets a new publisher replace the current one; the old session is closed
+ceiling  = { pace = "1x", burst = "10s" }     # throttle: at most realtime, with a ten-second head start; omit for no cap
+# floor    = { pace = "0.5x", window = "30s" }  # disconnect: below half realtime across any 30s window; omit for no floor
+stall    = "12s"                                # disconnect: nothing usable arrived for this long; "off" = no idle cap
+takeover = false                                # true lets a new publisher replace the current one; the old session is closed
 
 [accept.video]
 codecs     = ["h264", "hevc", "av1"]     # omit for every codec this origin can mux
 # codecs   = { preset = "common" }       # frozen set; omitting codecs also admits ones added later
 resolution = { max = "4k" }              # fits a 3840x2160 box, either orientation
-frame_rate = { min = 24, max = 60 }      # or [24, 25, 30] for film and PAL only
+frame_rate = { min = 24, max = 60 }      # or [23.976, 25, "30000/1001", 30]: decimals and quotients mix, both exact
 tracks     = { max = 8 }
 
 [accept.audio]
@@ -99,10 +100,9 @@ segment  = "6s"                          # target length of each media file
 part     = "1s"                          # low-latency update interval; shorter than segment
 retain   = "1m"                          # how long media stays fetchable, live and after a drop
 # playlist = "1m"                        # advertised live window; default min("1m", retain)
-stall    = "12s"                         # drop the publisher when nothing usable arrives
 # retain is clipped by memory_per_stream. At 5 Mbps, 256MiB holds about 7m.
 
-[limits]
+[capacity]
 publishers        = 64                   # concurrent ingest sessions
 streams           = 256                  # live, plus those still held by retain; when full, a new stream is refused
 memory_per_stream = "256MiB"             # bytes; worst-case RAM is about streams x this

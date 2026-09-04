@@ -115,12 +115,12 @@ impl ParsedMetadata {
             .filter(|value| *value <= maximum)
     }
 
-    /// Raw `encoder` string from `onMetaData`, trimmed and bounded for logs.
+    /// Full `encoder` string from `onMetaData`, trimmed and bounded for logs.
     ///
     /// Returns `None` when the field is missing, non-string, or empty after
     /// trimming. Callers needing the Prometheus-safe value want
     /// [`ParsedMetadata::encoder_vendor`] instead.
-    pub fn encoder_raw(&self) -> Option<String> {
+    pub fn encoder(&self) -> Option<String> {
         match self.properties.get("encoder")? {
             Amf0Value::Utf8String(value) => {
                 let trimmed = value.trim();
@@ -128,8 +128,8 @@ impl ParsedMetadata {
                     return None;
                 }
                 let mut owned = trimmed.to_owned();
-                if owned.len() > MAX_ENCODER_RAW_LEN {
-                    owned.truncate(MAX_ENCODER_RAW_LEN);
+                if owned.len() > MAX_ENCODER_LEN {
+                    owned.truncate(MAX_ENCODER_LEN);
                 }
                 Some(owned)
             }
@@ -143,9 +143,7 @@ impl ParsedMetadata {
     /// which often omits `encoder`). `Some("other")` means present but
     /// not in the allowlist — log the raw value and grow the table.
     pub fn encoder_vendor(&self) -> Option<String> {
-        self.encoder_raw()
-            .as_deref()
-            .and_then(normalize_encoder_vendor)
+        self.encoder().as_deref().and_then(normalize_encoder_vendor)
     }
 }
 
@@ -225,7 +223,7 @@ const MAX_DECLARED_FRAMERATE: f64 = 1_000.0;
 ///
 /// Logs carry full fidelity for version drill-down (e.g. OBS 30.1.0 vs 30.0.0)
 /// while staying bounded; Prometheus only ever sees the normalized vendor.
-pub const MAX_ENCODER_RAW_LEN: usize = 96;
+pub const MAX_ENCODER_LEN: usize = 96;
 const AUDIO_FOURCCS: [[u8; 4]; 6] = [*b"ac-3", *b"ec-3", *b"Opus", *b".mp3", *b"fLaC", *b"mp4a"];
 const VIDEO_FOURCCS: [[u8; 4]; 6] = [*b"vp08", *b"vp09", *b"av01", *b"avc1", *b"hvc1", *b"vvc1"];
 
@@ -608,7 +606,7 @@ mod tests {
             metadata.encoder_summary().encoder_vendor.as_deref(),
             Some("obs")
         );
-        assert_eq!(metadata.encoder_raw().as_deref(), Some("obs-studio 30.1.0"));
+        assert_eq!(metadata.encoder().as_deref(), Some("obs-studio 30.1.0"));
         let missing = ParsedMetadata::default();
         assert_eq!(missing.encoder_vendor(), None);
     }
