@@ -302,29 +302,27 @@ io_buffer_size = "64KiB"
 }
 
 #[test]
-fn the_two_publisher_limits_are_configured_independently() -> Result<(), Box<dyn Error>> {
-    const LIMITS: &str = r"
+fn the_admission_budget_derives_from_the_publisher_budget() -> Result<(), Box<dyn Error>> {
+    // A pending admission is a precursor to an ingest session, so the
+    // publisher budget is its parent. The stream budget deliberately is not: a
+    // node holding many retained streams has no reason to accept more
+    // unauthenticated sockets.
+    let config = resolve_toml(
+        r"
 [server]
 maximum_concurrent_publishers = 40
-maximum_pending_publishers_per_listener = 7
-";
-    let config = resolve_toml(LIMITS)??;
+",
+    )??;
 
     assert_eq!(config.node.maximum_sessions, 40);
-    assert_eq!(config.node.maximum_pending_publishers_per_listener, 7);
-
-    // The admission budget deliberately need not exceed the session cap: it
-    // covers a different population, and a slot is returned as soon as a
-    // publisher authenticates rather than being held for the session.
-    let raised = resolve_with(
-        LIMITS,
-        &["--server-maximum-pending-publishers-per-listener", "9"],
-        &[("RUSHLS_SERVER_MAXIMUM_PENDING_PUBLISHERS_PER_LISTENER", "8")],
-    )??;
-    assert_eq!(raised.node.maximum_pending_publishers_per_listener, 9);
+    assert_eq!(
+        config.node.maximum_pending_publishers_per_listener(),
+        40,
+        "counted per listener, so the process-wide ceiling is this times the \
+         number of ingest transports"
+    );
     Ok(())
 }
-
 #[test]
 fn configured_http_auth_resolves_and_guards_its_own_settings() -> Result<(), Box<dyn Error>> {
     let valid = r#"
@@ -377,7 +375,7 @@ url = "http://auth-sidecar:8081/admit"
 
 #[test]
 fn hooks_are_absent_until_an_endpoint_is_configured() -> Result<(), Box<dyn Error>> {
-    let resolved = resolve_toml("[hooks]\nsource = \"urn:rushls:node:studio\"\n")??;
+    let resolved = resolve_toml("[server]\nname = \"studio\"\n")??;
 
     assert!(
         resolved.hooks.is_none(),
@@ -390,8 +388,8 @@ fn hooks_are_absent_until_an_endpoint_is_configured() -> Result<(), Box<dyn Erro
 fn a_configured_endpoint_resolves_to_a_subscription() -> Result<(), Box<dyn Error>> {
     let resolved = resolve_toml(
         r#"
-[hooks]
-source = "urn:rushls:node:studio"
+[server]
+name = "studio"
 
 [hooks.endpoints.automation]
 url = "http://automation:9000/events"
@@ -401,7 +399,11 @@ maximum_attempts = 2
     )??;
 
     let hooks = resolved.hooks.ok_or("hooks resolve")?;
-    assert_eq!(hooks.config.source, "urn:rushls:node:studio");
+    assert_eq!(
+        hooks.config.source, "studio",
+        "the node name is the producer identity: one field, not a second \
+         spelling of the same node"
+    );
     let hook = hooks.config.hooks.first().ok_or("one endpoint")?;
     assert_eq!(&*hook.name, "automation");
     assert_eq!(hook.maximum_attempts, 2);

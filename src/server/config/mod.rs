@@ -212,14 +212,16 @@ impl AppConfig {
         )?;
         let mut node = NodeConfig {
             maximum_sessions: self.server.maximum_concurrent_publishers,
-            maximum_pending_publishers_per_listener: self
-                .server
-                .maximum_pending_publishers_per_listener,
+            shutdown: self.server.shutdown,
             rtmp_address: self.ingest.rtmp.listen,
             srt_address: self.ingest.srt.listen,
             http_address: Some(self.http.listen),
             ..NodeConfig::default()
         };
+        if let Some(name) = self.server.name.as_deref().map(str::trim).filter(|name| !name.is_empty())
+        {
+            node.name = std::sync::Arc::from(name);
+        }
         self.ingest.rtmp.apply(&mut node, &mut warnings)?;
         self.ingest.srt.apply(&mut node)?;
         self.hls.apply(&mut node)?;
@@ -233,7 +235,7 @@ impl AppConfig {
         self.storage.apply(&mut node)?;
         node.http = self.http.resolve()?;
         node.metrics = self.metrics.resolve()?;
-        let hooks = self.hooks.resolve(&mut client)?;
+        let hooks = self.hooks.resolve(&node, &mut client)?;
 
         Ok(ResolvedAppConfig {
             node,
@@ -270,12 +272,31 @@ impl AppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct ServerAppConfig {
+    /// Identifies this node in logs, metrics, and hook events.
+    ///
+    /// Defaults to the hostname. Several nodes may share one deliberately, in
+    /// which case consumers of hook events see a single logical producer.
+    #[conf(parameter, long, env)]
+    pub name: Option<String>,
+    /// How long a restart waits for parked viewer requests and queued hook
+    /// events before exiting anyway.
+    ///
+    /// Keep it below the grace period the scheduler allows, or a hard kill
+    /// arrives mid-drain and the graceful path buys nothing. Deliberately has
+    /// no "off": waiting indefinitely would mean staying alive to serve
+    /// retained media, a wait bounded by `retain` that no scheduler grants.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "10s",
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    pub shutdown: Duration,
     /// Maximum publishers that may be active at the same time.
     #[conf(parameter, long, env, default_value = "256")]
     pub maximum_concurrent_publishers: usize,
-    /// Maximum publishers each ingest listener may be authenticating at once.
-    #[conf(parameter, long, env, default_value = "64")]
-    pub maximum_pending_publishers_per_listener: usize,
 }
 
 #[derive(Conf)]
@@ -394,23 +415,6 @@ impl HttpAuthAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct HooksAppConfig {
-    /// CloudEvents `source`, identifying this deployment to consumers.
-    ///
-    /// With the per-event id it identifies an occurrence, so it must be stable
-    /// across restarts. Nodes may share one, in which case consumers see a
-    /// single logical producer.
-    #[conf(parameter, long, env, default_value = "urn:rushls:node")]
-    source: String,
-    /// How long a shutdown waits for queued events before abandoning them.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "5s",
-        value_parser = humantime::parse_duration,
-        serde(use_value_parser)
-    )]
-    drain_timeout: Duration,
     /// Deadline for one delivery attempt, connection included.
     #[conf(
         parameter,
@@ -430,7 +434,11 @@ pub struct HooksAppConfig {
 }
 
 impl HooksAppConfig {
-    fn resolve(self, client: &mut LazyHttpClient) -> Result<Option<ResolvedHooks>, ConfigError> {
+    fn resolve(
+        self,
+        node: &NodeConfig,
+        client: &mut LazyHttpClient,
+    ) -> Result<Option<ResolvedHooks>, ConfigError> {
         let endpoints = self.endpoints.unwrap_or_default();
         if endpoints.0.is_empty() {
             // Nothing configured, so nothing is built — including the outbound
@@ -445,9 +453,12 @@ impl HooksAppConfig {
 
         Ok(Some(ResolvedHooks {
             config: HooksConfig {
-                drain_timeout: self.drain_timeout,
+                // Both drains answer one operator question and share one
+                // budget; the producer identity is the node name rather than
+                // a second spelling of the same thing.
+                drain_timeout: node.shutdown,
                 hooks,
-                ..HooksConfig::new(self.source)
+                ..HooksConfig::new(node.name.to_string())
             },
             // A hook may wait far longer than admission may, which is why the
             // limits are per-request rather than baked into a shared client.

@@ -40,6 +40,20 @@ use super::{
 /// Process-level configuration for one self-contained origin.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeConfig {
+    /// Identifies this node in its own logs and metrics, and as the producer
+    /// of hook events.
+    ///
+    /// Defaults to the hostname, which is right for a single origin and wrong
+    /// the moment several sit behind one load balancer and their metric series
+    /// become indistinguishable. Several nodes may share one deliberately, in
+    /// which case consumers see a single logical producer.
+    pub name: Arc<str>,
+    /// How long a restart waits for parked viewer requests and queued hook
+    /// events before exiting anyway.
+    ///
+    /// One budget covering both drains, because it answers one operator
+    /// question and is sized against an orchestrator's own grace period.
+    pub shutdown: Duration,
     pub rtmp_address: SocketAddr,
     pub srt_address: SocketAddr,
     /// Cleartext viewer listener. `None` serves HTTPS only.
@@ -51,18 +65,6 @@ pub struct NodeConfig {
     pub https_address: Option<SocketAddr>,
     pub maintenance_interval: Duration,
     pub maximum_sessions: usize,
-    /// Connections one ingest listener may be admitting at once.
-    ///
-    /// Counted per listener rather than process-wide so that a flood on one
-    /// transport cannot deny admission on the other; the process ceiling is
-    /// this value times the number of ingest listeners. Separate from
-    /// [`Self::maximum_sessions`], which bounds publishers that already
-    /// authenticated: a node at its session capacity keeps its full admission
-    /// headroom, and still rejects the surplus in the source protocol.
-    ///
-    /// A permit is held across authentication, so this is also what bounds
-    /// concurrent requests to an external authentication provider.
-    pub maximum_pending_publishers_per_listener: usize,
     pub rtmp: RtmpConfig,
     pub srt: SrtConfig,
     pub session: SessionConfig,
@@ -73,16 +75,36 @@ pub struct NodeConfig {
     pub metrics: MetricsConfig,
 }
 
+impl NodeConfig {
+    /// Connections one ingest listener may be admitting at once.
+    ///
+    /// Derived from the publisher budget rather than configured. A pending
+    /// admission is a precursor to an ingest session, so `publishers` is its
+    /// parent: a node holding many *retained* streams has no reason to accept
+    /// more unauthenticated sockets, which is why the stream budget is not.
+    ///
+    /// Counted per listener so a flood on one transport cannot deny admission
+    /// on the other, which means the process-wide ceiling is this times the
+    /// number of ingest listeners.
+    ///
+    /// A permit is held across authentication, so this also bounds concurrent
+    /// requests to an external admission service.
+    pub fn maximum_pending_publishers_per_listener(&self) -> usize {
+        self.maximum_sessions.max(1)
+    }
+}
+
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
+            name: node_name(),
+            shutdown: Duration::from_secs(10),
             rtmp_address: "0.0.0.0:1935".parse().expect("constant address is valid"),
             srt_address: "[::]:9000".parse().expect("constant address is valid"),
             http_address: Some("0.0.0.0:8080".parse().expect("constant address is valid")),
             https_address: None,
             maintenance_interval: Duration::from_secs(1),
             maximum_sessions: 256,
-            maximum_pending_publishers_per_listener: 64,
             rtmp: RtmpConfig::default(),
             srt: SrtConfig::default(),
             session: SessionConfig::default(),
@@ -228,11 +250,6 @@ impl Node {
         if config.maximum_sessions == 0 {
             return Err(RuntimeError::InvalidConfiguration(
                 "maximum sessions must be nonzero",
-            ));
-        }
-        if config.maximum_pending_publishers_per_listener == 0 {
-            return Err(RuntimeError::InvalidConfiguration(
-                "maximum pending publishers must be nonzero",
             ));
         }
         if config.maintenance_interval.is_zero() {
@@ -443,7 +460,7 @@ impl Node {
         readiness: &Readiness,
         stop_rx: watch::Receiver<bool>,
     ) -> Result<(), RuntimeError> {
-        let maximum_pending = self.config.maximum_pending_publishers_per_listener;
+        let maximum_pending = self.config.maximum_pending_publishers_per_listener();
         let session_config = Arc::new(self.config.session);
         tasks.spawn(run_ingest(
             RtmpListener {
@@ -485,6 +502,7 @@ impl Node {
                 shared_metrics.clone(),
                 readiness.clone(),
                 stop_rx.clone(),
+                self.config.shutdown,
             ));
         }
 
@@ -515,6 +533,7 @@ impl Node {
                 shared_metrics,
                 readiness.clone(),
                 stop_rx.clone(),
+                self.config.shutdown,
             ));
         }
 
@@ -527,6 +546,7 @@ impl Node {
                 self.metrics_endpoint(),
                 readiness.clone(),
                 stop_rx.clone(),
+                self.config.shutdown,
             ));
         }
 
@@ -546,6 +566,18 @@ impl Node {
             .listen
             .map(|_| MetricsEndpoint::new(self.metrics.clone(), self.config.metrics.token.clone()))
     }
+}
+
+/// This node's default identity: its hostname, or a fixed fallback.
+///
+/// A fallback rather than a failure, because a node that cannot read its own
+/// hostname is still a working origin — it just needs an operator to name it
+/// before its metrics can be told from another's.
+fn node_name() -> Arc<str> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .map_or_else(|| Arc::from("rushls"), |name| Arc::from(name.trim()))
 }
 
 /// Binds one viewer-facing or metrics listener.
@@ -749,21 +781,30 @@ async fn run_http<L>(
     metrics: Option<MetricsEndpoint>,
     readiness: Readiness,
     stop: watch::Receiver<bool>,
+    shutdown: Duration,
 ) -> Result<(), RuntimeError>
 where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
 {
-    http::serve(
+    let served = http::serve(
         listener,
         application,
         config,
         metrics,
         readiness,
         wait_for_stop(stop),
-    )
-    .await
-    .map_err(RuntimeError::Http)
+    );
+    // The drain is bounded rather than open-ended. A blocking playlist reload
+    // is deliberately parked for up to three target durations, so without a
+    // bound a restart could outlive its orchestrator's grace period and be
+    // hard-killed mid-drain, which is the outcome the graceful path exists to
+    // avoid. Viewers still holding a parked request are dropped at the
+    // deadline; they reload.
+    match tokio::time::timeout(shutdown, served).await {
+        Ok(result) => result.map_err(RuntimeError::Http),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Reports a listener's real address, or the failure to learn it.
@@ -875,13 +916,6 @@ mod tests {
         assert!(matches!(
             node(NodeConfig {
                 maintenance_interval: Duration::ZERO,
-                ..NodeConfig::default()
-            }),
-            Err(RuntimeError::InvalidConfiguration(_))
-        ));
-        assert!(matches!(
-            node(NodeConfig {
-                maximum_pending_publishers_per_listener: 0,
                 ..NodeConfig::default()
             }),
             Err(RuntimeError::InvalidConfiguration(_))
