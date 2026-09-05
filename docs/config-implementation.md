@@ -1,9 +1,13 @@
 # RFC companion: what the configuration asks the application to become
 
-> **Status: largely implemented.** Entries below marked *not built* remain
-> outstanding: playback authorization, `[record]`, the disk tier, delta
-> playlists, payload-carrying hooks, mutual TLS, and enforcing
-> `memory_per_publisher`. Everything else has landed.
+> **Status: largely implemented.** Outstanding, in the order they are least
+> to most self-contained: `${VAR}` interpolation in string values, effective
+> retention-depth reporting, moderate timestamp jumps becoming discontinuities,
+> payload-carrying hooks, `[record]`, mutual TLS to outbound destinations,
+> delta playlists, the disk tier, playback authorization, and enforcing
+> `memory_per_publisher`. Every key belonging to an unbuilt feature is refused
+> at startup by name, so nothing here silently does nothing. Everything else
+> has landed.
 >
 > This exists because [config.md](config.md) deliberately designs the
 > configuration **without regard for what the internals currently look like**.

@@ -47,7 +47,7 @@ use crate::{
 pub struct ResolvedAppConfig {
     pub node: NodeConfig,
     pub authenticator: Arc<dyn Authenticator>,
-    /// `None` unless `[hooks.endpoints]` names at least one destination.
+    /// `None` unless `[hook.<name>]` names at least one destination.
     pub hooks: Option<ResolvedHooks>,
     /// Settings that are legal but probably not what was meant.
     ///

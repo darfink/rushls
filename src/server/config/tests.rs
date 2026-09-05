@@ -1123,3 +1123,4 @@ video = { codecs = ["text"] }
     assert!(matches!(wrong_kind, Err(ConfigError::Invalid(_))));
     Ok(())
 }
+
