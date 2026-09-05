@@ -42,6 +42,16 @@ const FLV_PREVIOUS_TAG_SIZE_BYTES: usize = 4;
 const FLV_TAG_OVERHEAD: usize = FLV_TAG_HEADER_BYTES + FLV_PREVIOUS_TAG_SIZE_BYTES;
 const FLV_MAXIMUM_PAYLOAD_BYTES: usize = 0x00ff_ffff;
 
+/// Malformed Enhanced FLV framing refuses the publisher, always.
+///
+/// Not an operator setting. A publisher that cannot describe its own media
+/// correctly is refused on the same footing as one that fails the handshake;
+/// keeping the bytes as opaque instead only defers the failure to a layer with
+/// less context, turning a protocol error into a packaging error. This is
+/// separate from `[accept]`, which decides *which* codecs are admitted rather
+/// than whether the framing is well-formed at all.
+const ENHANCED_VALIDATION: EnhancedValidationMode = EnhancedValidationMode::Strict;
+
 /// Resource and memory policy for one RTMP connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RtmpConfig {
@@ -55,8 +65,6 @@ pub struct RtmpConfig {
     /// dribbles one byte per second defeats the first and is caught by the
     /// second.
     pub timeouts: ServerSessionTimeouts,
-    /// Enhanced FLV structural validation policy.
-    pub enhanced_validation: EnhancedValidationMode,
     /// Encoded FLV bytes allowed to wait for AVFormat.
     pub maximum_buffered_flv_bytes: NonZeroUsize,
     /// Application limit below the FLV format's fixed 24-bit tag-size ceiling.
@@ -79,7 +87,6 @@ impl Default for RtmpConfig {
                 session_read: Some(Duration::from_secs(10)),
                 write: Some(Duration::from_secs(10)),
             },
-            enhanced_validation: EnhancedValidationMode::Strict,
             maximum_buffered_flv_bytes: nz::usize!(16 * 1024 * 1024),
             maximum_tag_payload_bytes: nz::usize!(8 * 1024 * 1024),
             avformat: AvformatConfig::default(),
@@ -585,7 +592,7 @@ where
                     } => {
                         EnhancedCapabilities::parse(
                             &additional_properties,
-                            config.enhanced_validation,
+                            ENHANCED_VALIDATION,
                         )
                         .map_err(String::into_boxed_str)?;
                         follow_up.extend(
@@ -634,7 +641,7 @@ where
                     ServerSessionEvent::AudioDataReceived {
                         data, timestamp, ..
                     } => {
-                        let media = ValidatedMedia::parse_audio(data, config.enhanced_validation)
+                        let media = ValidatedMedia::parse_audio(data, ENHANCED_VALIDATION)
                             .map_err(|error| error.to_string().into_boxed_str())?;
                         let stream_id = handler.active_stream_id.ok_or_else(|| {
                             Box::<str>::from("audio arrived before publish acceptance")
@@ -652,7 +659,7 @@ where
                     ServerSessionEvent::VideoDataReceived {
                         data, timestamp, ..
                     } => {
-                        let media = ValidatedMedia::parse_video(data, config.enhanced_validation)
+                        let media = ValidatedMedia::parse_video(data, ENHANCED_VALIDATION)
                             .map_err(|error| error.to_string().into_boxed_str())?;
                         let stream_id = handler.active_stream_id.ok_or_else(|| {
                             Box::<str>::from("video arrived before publish acceptance")
@@ -676,7 +683,7 @@ where
                         let metadata = ValidatedMetadata::parse(
                             raw_payload,
                             raw_metadata,
-                            config.enhanced_validation,
+                            ENHANCED_VALIDATION,
                         )
                         .map_err(|error| error.to_string().into_boxed_str())?;
                         let stream_id = handler.active_stream_id.ok_or_else(|| {

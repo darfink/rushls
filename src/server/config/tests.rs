@@ -201,12 +201,12 @@ fn credentialed_wildcard_cors_is_rejected() -> Result<(), Box<dyn Error>> {
 #[test]
 fn metrics_endpoint_and_authentication_resolve_from_configuration() -> Result<(), Box<dyn Error>> {
     let config = resolve_with_env(&[
-        ("RUSHLS_METRICS_ENABLED", "true"),
+        ("RUSHLS_METRICS_LISTEN", "127.0.0.1:9090"),
         ("RUSHLS_METRICS_TOKEN", "scrape-secret"),
         ("RUSHLS_METRICS_PER_STREAM", "true"),
     ])??;
 
-    assert!(config.node.metrics.enabled);
+    assert!(config.node.metrics.listen.is_some());
     assert!(config.node.metrics.token.is_some());
     assert!(config.node.metrics.export.per_stream);
     Ok(())
@@ -508,91 +508,71 @@ fn load_toml(configuration: &str) -> Result<Result<AppConfig, ConfigError>, Box<
 }
 
 #[test]
-fn rtmp_phase_timeouts_inherit_the_peer_timeout() -> Result<(), Box<dyn Error>> {
-    // The point of the single knob: one value an operator can reason about,
-    // reaching every phase without naming them.
+fn the_rtmp_timeout_derives_a_tighter_handshake_limit() -> Result<(), Box<dyn Error>> {
+    // One operator-facing value. The unauthenticated phase is bounded by a
+    // constant the session limit cannot loosen, because holding a socket open
+    // before proving anything is the cheapest attack against an ingest node.
     let resolved = resolve_toml(
         r#"
 [ingest.rtmp]
-peer_timeout = "15s"
+timeout = "15s"
 "#,
     )?
-    .unwrap_or_else(|error| panic!("peer_timeout alone must resolve: {error}"));
+    .unwrap_or_else(|error| panic!("a timeout alone must resolve: {error}"));
 
     let timeouts = resolved.node.rtmp.timeouts;
-    assert_eq!(timeouts.handshake_read, Some(Duration::from_secs(15)));
     assert_eq!(timeouts.session_read, Some(Duration::from_secs(15)));
     assert_eq!(timeouts.write, Some(Duration::from_secs(15)));
+    assert_eq!(
+        timeouts.handshake_read,
+        Some(Duration::from_secs(5)),
+        "a generous session timeout must not become a generous handshake one"
+    );
     Ok(())
 }
 
 #[test]
-fn a_named_phase_overrides_the_peer_timeout() -> Result<(), Box<dyn Error>> {
-    // Inheritance is per field, not all-or-nothing: naming one phase must not
-    // silently drop the others back to their built-in defaults.
+fn a_tight_rtmp_timeout_also_tightens_the_handshake() -> Result<(), Box<dyn Error>> {
+    // The derivation is the lesser of the two, so tightening the session
+    // limit never leaves the unauthenticated phase the more patient one.
     let resolved = resolve_toml(
         r#"
 [ingest.rtmp]
-peer_timeout = "15s"
-handshake_read_timeout = "3s"
+timeout = "2s"
 "#,
     )?
-    .unwrap_or_else(|error| panic!("a partial override must resolve: {error}"));
+    .unwrap_or_else(|error| panic!("a tight timeout must resolve: {error}"));
 
     let timeouts = resolved.node.rtmp.timeouts;
-    assert_eq!(timeouts.handshake_read, Some(Duration::from_secs(3)));
-    assert_eq!(timeouts.session_read, Some(Duration::from_secs(15)));
-    assert_eq!(timeouts.write, Some(Duration::from_secs(15)));
+    assert_eq!(timeouts.handshake_read, Some(Duration::from_secs(2)));
+    assert_eq!(timeouts.session_read, Some(Duration::from_secs(2)));
     Ok(())
 }
 
 #[test]
-fn a_timeout_can_be_disabled_explicitly() -> Result<(), Box<dyn Error>> {
-    // "No timeout" has to be expressible, or an operator who wants it writes
-    // an absurd number instead — which reads as a mistake and behaves like one.
+fn a_disabled_rtmp_timeout_still_bounds_the_handshake() -> Result<(), Box<dyn Error>> {
+    // "No timeout" stays expressible for a trusted link, but it applies to the
+    // publisher that proved itself, never to a peer that has not.
     let resolved = resolve_toml(
         r#"
 [ingest.rtmp]
-peer_timeout = "15s"
-write_timeout = "off"
+timeout = "off"
 "#,
     )?
     .unwrap_or_else(|error| panic!("a disabled timeout must resolve: {error}"));
 
-    assert_eq!(resolved.node.rtmp.timeouts.write, None);
-    assert!(
-        resolved
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("write_timeout is disabled")),
-        "disabling a timeout must be surfaced: {:?}",
+    let timeouts = resolved.node.rtmp.timeouts;
+    assert_eq!(timeouts.session_read, None);
+    assert_eq!(timeouts.write, None);
+    assert_eq!(timeouts.handshake_read, Some(Duration::from_secs(5)));
+    assert_eq!(
+        resolved.warnings.len(),
+        1,
+        "an unbounded wait on a public bind should not be invisible: {:?}",
         resolved.warnings
     );
     Ok(())
 }
-
-#[test]
-fn the_unauthenticated_phase_may_not_be_the_patient_one() -> Result<(), Box<dyn Error>> {
-    // A handshake read outliving an established read inverts the intent, and
-    // is the shape a global multiplier would produce by accident.
-    let Err(error) = resolve_toml(
-        r#"
-[ingest.rtmp]
-peer_timeout = "10s"
-handshake_read_timeout = "30s"
-"#,
-    )?
-    else {
-        panic!("an inverted handshake timeout must be refused");
-    };
-
-    assert!(
-        error.to_string().contains("must not exceed"),
-        "unexpected error: {error}"
-    );
-    Ok(())
-}
-
 #[test]
 fn the_stall_deadline_follows_the_segment_duration() -> Result<(), Box<dyn Error>> {
     // The reason this is relative. An absolute value sized against a 6s
@@ -658,7 +638,7 @@ fn an_srt_idle_deadline_inside_the_latency_window_is_refused() -> Result<(), Box
         r#"
 [ingest.srt]
 latency = "2s"
-peer_idle_timeout = "1s"
+timeout = "1s"
 "#,
     )?
     else {
@@ -700,12 +680,12 @@ maximum_pending_handshakes = 32
 }
 
 #[test]
-fn a_session_read_below_a_keyframe_interval_is_refused() -> Result<(), Box<dyn Error>> {
+fn an_rtmp_timeout_below_a_keyframe_interval_is_refused() -> Result<(), Box<dyn Error>> {
     // Hardening that drops legitimate publishers is an outage, not a defence.
     let Err(error) = resolve_toml(
         r#"
 [ingest.rtmp]
-peer_timeout = "500ms"
+timeout = "500ms"
 "#,
     )?
     else {

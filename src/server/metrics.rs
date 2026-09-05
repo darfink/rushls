@@ -1,4 +1,4 @@
-use std::{fmt::Write, sync::Arc};
+use std::{fmt::Write, net::SocketAddr, sync::Arc};
 
 use cc_metrics::escape_label;
 
@@ -25,8 +25,17 @@ pub struct ExportPolicy {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MetricsConfig {
-    /// Whether the HTTP server exposes `/metrics`.
-    pub enabled: bool,
+    /// Where metrics are served, or `None` to export nothing.
+    ///
+    /// Its own listener, defaulting to loopback: Prometheus series carry
+    /// stream names, which on a public origin is the list of everything
+    /// currently published and not something the viewer-facing port should
+    /// offer. Setting this to the viewer address deliberately shares that
+    /// port, which makes the sharing visible in the file rather than magic.
+    ///
+    /// Presence is the switch. An `enabled` flag beside an address that also
+    /// accepted "off" was two disable switches meaning different things.
+    pub listen: Option<SocketAddr>,
     /// When present, scrapes must authenticate with this bearer token.
     pub token: Option<MetricsToken>,
     pub export: ExportPolicy,

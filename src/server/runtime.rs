@@ -42,7 +42,13 @@ use super::{
 pub struct NodeConfig {
     pub rtmp_address: SocketAddr,
     pub srt_address: SocketAddr,
-    pub http_address: SocketAddr,
+    /// Cleartext viewer listener. `None` serves HTTPS only.
+    pub http_address: Option<SocketAddr>,
+    /// TLS viewer listener, bound independently of the cleartext one.
+    ///
+    /// Separate addresses because enabling TLS should *add* HTTPS rather than
+    /// move cleartext off its port, which is what one shared socket did.
+    pub https_address: Option<SocketAddr>,
     pub maintenance_interval: Duration,
     pub maximum_sessions: usize,
     /// Connections one ingest listener may be admitting at once.
@@ -72,7 +78,8 @@ impl Default for NodeConfig {
         Self {
             rtmp_address: "0.0.0.0:1935".parse().expect("constant address is valid"),
             srt_address: "[::]:9000".parse().expect("constant address is valid"),
-            http_address: "0.0.0.0:8080".parse().expect("constant address is valid"),
+            http_address: Some("0.0.0.0:8080".parse().expect("constant address is valid")),
+            https_address: None,
             maintenance_interval: Duration::from_secs(1),
             maximum_sessions: 256,
             maximum_pending_publishers_per_listener: 64,
@@ -349,13 +356,27 @@ impl Node {
             address: self.config.srt_address,
             source,
         })?;
-        let http_listener =
-            TcpListener::bind(self.config.http_address)
-                .await
-                .map_err(|source| RuntimeError::BindHttp {
-                    address: self.config.http_address,
-                    source,
-                })?;
+        // Each viewer listener binds on its own, so enabling TLS adds HTTPS
+        // beside cleartext rather than moving it.
+        let http_listener = match self.config.http_address {
+            Some(address) => Some(bind_http(address).await?),
+            None => None,
+        };
+        let https_listener = match self.config.https_address {
+            Some(address) => Some(bind_http(address).await?),
+            None => None,
+        };
+        // A metrics address equal to a viewer one is how an operator asks to
+        // share that port, so it must not be bound a second time.
+        let metrics_listener = match self.config.metrics.listen {
+            Some(address)
+                if Some(address) != self.config.http_address
+                    && Some(address) != self.config.https_address =>
+            {
+                Some(bind_http(address).await?)
+            }
+            _ => None,
+        };
 
         let events = self.services.events.clone();
         // Reported from the bound listeners rather than from configuration,
@@ -372,6 +393,8 @@ impl Node {
             rtmp_listener,
             srt_listener,
             http_listener,
+            https_listener,
+            metrics_listener,
             &events,
             &readiness,
             stop_rx,
@@ -413,7 +436,9 @@ impl Node {
         tasks: &mut JoinSet<Result<(), RuntimeError>>,
         rtmp_listener: TcpListener,
         srt_listener: SrtListener,
-        http_listener: TcpListener,
+        http_listener: Option<TcpListener>,
+        https_listener: Option<TcpListener>,
+        metrics_listener: Option<TcpListener>,
         events: &Events,
         readiness: &Readiness,
         stop_rx: watch::Receiver<bool>,
@@ -437,16 +462,47 @@ impl Node {
             PendingPublishers::new(maximum_pending),
             stop_rx.clone(),
         ));
-        // The listener type differs but the server does not: both arms run the
-        // same router, the same graceful shutdown, and the same task.
-        //
+
+        // Metrics are served on a viewer listener only when the operator gave
+        // them that same address; otherwise they get their own and the viewer
+        // ports do not answer for them at all.
+        let shared_metrics = self
+            .config
+            .metrics
+            .listen
+            .filter(|address| {
+                Some(*address) == self.config.http_address
+                    || Some(*address) == self.config.https_address
+            })
+            .and(self.metrics_endpoint());
+
+        if let Some(listener) = http_listener {
+            report_bound(events, Protocol::Http, listener.local_addr());
+            tasks.spawn(run_http(
+                listener,
+                Arc::clone(&self.application),
+                self.config.http.clone(),
+                shared_metrics.clone(),
+                readiness.clone(),
+                stop_rx.clone(),
+            ));
+        }
+
         // HTTPS is announced only once TLS is actually up. Announcing it
         // alongside the other listeners would put "HTTPS listening on …" in
         // the log immediately above the certificate error that stopped the
         // process from ever serving.
-        if let Some(settings) = self.config.http.tls.clone() {
+        if let Some(listener) = https_listener {
+            let settings = self
+                .config
+                .http
+                .tls
+                .clone()
+                .ok_or(RuntimeError::InvalidConfiguration(
+                    "an HTTPS listener needs a certificate and key",
+                ))?;
             let listener = http::bind_tls(
-                http_listener,
+                listener,
                 settings,
                 self.services.meters.clone(),
                 events.clone(),
@@ -456,14 +512,16 @@ impl Node {
                 listener,
                 Arc::clone(&self.application),
                 self.config.http.clone(),
-                self.metrics_endpoint(),
+                shared_metrics,
                 readiness.clone(),
                 stop_rx.clone(),
             ));
-        } else {
-            report_bound(events, Protocol::Http, http_listener.local_addr());
+        }
+
+        if let Some(listener) = metrics_listener {
+            report_bound(events, Protocol::Http, listener.local_addr());
             tasks.spawn(run_http(
-                http_listener,
+                listener,
                 Arc::clone(&self.application),
                 self.config.http.clone(),
                 self.metrics_endpoint(),
@@ -471,6 +529,7 @@ impl Node {
                 stop_rx.clone(),
             ));
         }
+
         tasks.spawn(run_maintenance(
             self.store.clone(),
             Arc::clone(&self.hls),
@@ -484,9 +543,16 @@ impl Node {
     fn metrics_endpoint(&self) -> Option<MetricsEndpoint> {
         self.config
             .metrics
-            .enabled
-            .then(|| MetricsEndpoint::new(self.metrics.clone(), self.config.metrics.token.clone()))
+            .listen
+            .map(|_| MetricsEndpoint::new(self.metrics.clone(), self.config.metrics.token.clone()))
     }
+}
+
+/// Binds one viewer-facing or metrics listener.
+async fn bind_http(address: SocketAddr) -> Result<TcpListener, RuntimeError> {
+    TcpListener::bind(address)
+        .await
+        .map_err(|source| RuntimeError::BindHttp { address, source })
 }
 
 /// What one `accept` produced.
@@ -854,7 +920,7 @@ mod tests {
             NodeConfig {
                 rtmp_address: "127.0.0.1:0".parse().expect("constant is valid"),
                 srt_address: "127.0.0.1:0".parse().expect("constant is valid"),
-                http_address: "127.0.0.1:0".parse().expect("constant is valid"),
+                http_address: Some("127.0.0.1:0".parse().expect("constant is valid")),
                 ..NodeConfig::default()
             },
             Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>),

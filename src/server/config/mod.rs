@@ -17,7 +17,7 @@ use std::{
 };
 
 use bytesize::ByteSize;
-use cc_rtmp::{EnhancedValidationMode, ServerSessionTimeouts};
+use cc_rtmp::ServerSessionTimeouts;
 use conf::{Conf, find_parameter, introspection::ProgramOptionMeta};
 use serde::Deserialize;
 use thiserror::Error;
@@ -217,7 +217,7 @@ impl AppConfig {
                 .maximum_pending_publishers_per_listener,
             rtmp_address: self.ingest.rtmp.listen,
             srt_address: self.ingest.srt.listen,
-            http_address: self.http.listen,
+            http_address: Some(self.http.listen),
             ..NodeConfig::default()
         };
         self.ingest.rtmp.apply(&mut node, &mut warnings)?;
@@ -814,15 +814,19 @@ pub struct RtmpAppConfig {
     /// Address receiving RTMP publishers.
     #[conf(parameter, long, env, default_value = "0.0.0.0:1935")]
     pub listen: SocketAddr,
-    /// Enhanced RTMP validation policy (`strict` or `passthrough`).
-    #[conf(parameter, long, env, default_value = "strict")]
-    enhanced_validation: EnhancedValidationMode,
-    /// How long an RTMP peer may produce nothing before its session is closed.
+    /// How long an established publisher may produce nothing before its
+    /// session is closed.
     ///
-    /// One value for connection liveness, which is what most operators want to
-    /// think about: a peer that connects and then stalls costs a socket until
-    /// something reclaims it. The per-phase settings below inherit this, and
-    /// each may be overridden on its own.
+    /// One operator-facing value. The handshake gets its own, tighter limit,
+    /// derived rather than configured: the two phases are not equivalent and
+    /// sizing them together would be wrong in one direction or the other. A
+    /// handshake covers an unauthenticated peer, which is the cheapest way to
+    /// hold a socket open; an established session covers a publisher that has
+    /// proved itself, where a tight limit drops a legitimate stream between
+    /// keyframes.
+    ///
+    /// Exposing both invites exactly the pairing the derivation prevents: a
+    /// generous session timeout accidentally applied to unauthenticated peers.
     #[conf(
         parameter,
         long,
@@ -831,69 +835,32 @@ pub struct RtmpAppConfig {
         value_parser = parse_optional_duration,
         serde(use_value_parser)
     )]
-    peer_timeout: OptionalDuration,
-    /// Maximum time allowed for each handshake read.
-    ///
-    /// This one is worth tightening below `peer_timeout`: the peer is
-    /// unauthenticated here, so a stalled handshake is the cheapest way to
-    /// hold a socket open.
-    #[conf(
-        parameter,
-        long,
-        env,
-        value_parser = parse_optional_duration,
-        serde(use_value_parser)
-    )]
-    handshake_read_timeout: Option<OptionalDuration>,
-    /// Maximum time allowed for each established-session read.
-    ///
-    /// Worth keeping generous: an established publisher on a poor network is
-    /// still a publisher, and this is where an over-tight timeout turns
-    /// hardening into an outage.
-    #[conf(
-        parameter,
-        long,
-        env,
-        value_parser = parse_optional_duration,
-        serde(use_value_parser)
-    )]
-    session_read_timeout: Option<OptionalDuration>,
-    /// Maximum time allowed for each socket write.
-    #[conf(
-        parameter,
-        long,
-        env,
-        value_parser = parse_optional_duration,
-        serde(use_value_parser)
-    )]
-    write_timeout: Option<OptionalDuration>,
+    timeout: OptionalDuration,
 }
 
+/// The unauthenticated phase is never more patient than a few seconds, however
+/// generous an established session is allowed to be.
+const MAXIMUM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl RtmpAppConfig {
-    /// Resolve the per-phase timeouts, applying `peer_timeout` where a phase
-    /// names no value of its own.
+    /// Derives the per-phase timeouts from the one operator-facing value.
     fn timeouts(&self) -> ServerSessionTimeouts {
+        let session = self.timeout.0;
         ServerSessionTimeouts {
-            handshake_read: self.handshake_read_timeout.unwrap_or(self.peer_timeout).0,
-            session_read: self.session_read_timeout.unwrap_or(self.peer_timeout).0,
-            write: self.write_timeout.unwrap_or(self.peer_timeout).0,
+            // The lesser of the session limit and the constant: a disabled
+            // session timeout still leaves the handshake bounded, because an
+            // unauthenticated peer is the one that should never be trusted to
+            // hold a socket indefinitely.
+            handshake_read: Some(session.map_or(MAXIMUM_HANDSHAKE_TIMEOUT, |session| {
+                session.min(MAXIMUM_HANDSHAKE_TIMEOUT)
+            })),
+            session_read: session,
+            write: session,
         }
     }
 
     fn apply(&self, node: &mut NodeConfig, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
         let timeouts = self.timeouts();
-
-        // A handshake read that outlives an established read inverts the
-        // intent: the unauthenticated phase would be the more patient one.
-        if let (Some(handshake), Some(session)) = (timeouts.handshake_read, timeouts.session_read)
-            && handshake > session
-        {
-            return Err(ConfigError::Invalid(format!(
-                "the RTMP handshake read timeout ({handshake:?}) must not exceed the \
-                 established-session read timeout ({session:?}): the unauthenticated \
-                 phase should be the stricter one"
-            )));
-        }
 
         // A session read shorter than a keyframe interval drops publishers
         // mid-GOP. Nothing here knows the publisher's cadence, so this only
@@ -902,28 +869,22 @@ impl RtmpAppConfig {
             && session < Duration::from_secs(1)
         {
             return Err(ConfigError::Invalid(format!(
-                "the RTMP established-session read timeout ({session:?}) is below one \
-                 second, which drops publishers between ordinary keyframes"
+                "the RTMP timeout ({session:?}) is below one second, which drops publishers \
+                 between ordinary keyframes"
             )));
         }
 
         node.rtmp.timeouts = timeouts;
-        node.rtmp.enhanced_validation = self.enhanced_validation;
 
         // Disabling a timeout is legitimate on a trusted link and a liability
         // on a public one, and nothing here can tell which this is. Say so
         // rather than let an unbounded wait be invisible.
-        for (name, value) in [
-            ("handshake_read_timeout", timeouts.handshake_read),
-            ("session_read_timeout", timeouts.session_read),
-            ("write_timeout", timeouts.write),
-        ] {
-            if value.is_none() {
-                warnings.push(format!(
-                    "RTMP {name} is disabled: a peer that stops responding holds its \
-                     connection until it is closed from the other end"
-                ));
-            }
+        if timeouts.session_read.is_none() {
+            warnings.push(
+                "the RTMP timeout is disabled: a publisher that stops responding holds its \
+                 connection until it is closed from the other end"
+                    .to_owned(),
+            );
         }
 
         Ok(())
@@ -976,10 +937,15 @@ pub struct SrtAppConfig {
     latency: Duration,
     /// How long an SRT peer may send nothing before its session is dropped.
     ///
-    /// Deliberately not folded into the RTMP `peer_timeout`: SRT is
-    /// connectionless and keeps its own keepalive, so this bounds a
-    /// protocol-level idle rather than a stalled socket read. Sharing a knob
-    /// would imply the two move together, and they should not.
+    /// Deliberately not folded into the RTMP `timeout`: SRT is connectionless
+    /// and keeps its own keepalive, so this bounds a protocol-level idle
+    /// rather than a stalled socket read. Sharing a knob would imply the two
+    /// move together, and they should not.
+    ///
+    /// Bounded below by `latency`: a deadline inside the receiver's own
+    /// reordering window fires on packets the transport is still legitimately
+    /// waiting for, which is why raising `latency` for a long-haul link
+    /// without raising this is refused rather than tolerated.
     #[conf(
         parameter,
         long,
@@ -988,7 +954,7 @@ pub struct SrtAppConfig {
         value_parser = humantime::parse_duration,
         serde(use_value_parser)
     )]
-    peer_idle_timeout: Duration,
+    timeout: Duration,
     /// Optional passphrase; absent accepts unencrypted SRT.
     #[conf(parameter, env, secret)]
     passphrase: Option<String>,
@@ -1013,10 +979,10 @@ impl SrtAppConfig {
         }
         // An idle deadline inside the receiver's own latency window would fire
         // on packets the transport is still legitimately waiting to reorder.
-        if self.peer_idle_timeout <= self.latency {
+        if self.timeout <= self.latency {
             return Err(invalid(format!(
-                "SRT peer_idle_timeout ({:?}) must exceed the receive latency ({:?})",
-                self.peer_idle_timeout, self.latency
+                "the SRT timeout ({:?}) must exceed the receive latency ({:?})",
+                self.timeout, self.latency
             )));
         }
         let passphrase = resolve_optional_text_secret(
@@ -1025,7 +991,7 @@ impl SrtAppConfig {
             self.passphrase_file.as_ref(),
         )?;
         node.srt.latency = self.latency;
-        node.srt.peer_idle_timeout = self.peer_idle_timeout;
+        node.srt.peer_idle_timeout = self.timeout;
         node.srt.encryption = passphrase
             .as_ref()
             .map(|passphrase| {
@@ -1359,9 +1325,14 @@ impl TlsAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct MetricsAppConfig {
-    /// Expose Prometheus metrics at `/metrics` on the HTTP listener.
-    #[conf(parameter, long, env, default_value = "false")]
-    enabled: bool,
+    /// Where metrics are served. Absent exports nothing.
+    ///
+    /// Its own listener, defaulting to loopback where set: per-stream series
+    /// name every stream currently published, which the viewer-facing port
+    /// should not offer. Set it to the HTTP address to share that port
+    /// instead, which is then a visible choice rather than a magic value.
+    #[conf(parameter, long, env)]
+    listen: Option<SocketAddr>,
     /// Optional bearer token required to scrape `/metrics`.
     #[conf(parameter, env, secret)]
     token: Option<String>,
@@ -1384,7 +1355,7 @@ impl MetricsAppConfig {
             return Err(invalid("metrics token must not be empty"));
         }
         Ok(MetricsConfig {
-            enabled: self.enabled,
+            listen: self.listen,
             token: token.map(MetricsToken::new),
             export: ExportPolicy {
                 per_stream: self.per_stream,
