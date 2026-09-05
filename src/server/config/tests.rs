@@ -397,6 +397,57 @@ io_buffer_size = "64KiB"
 }
 
 #[test]
+fn file_values_interpolate_from_the_environment() -> Result<(), Box<dyn Error>> {
+    let resolved = resolve_with(
+        r#"
+name = "${NODE_NAME}"
+
+[auth.publish]
+url = "http://${AUTH_HOST}/admit"
+token = "${AUTH_TOKEN}"
+"#,
+        &[],
+        &[
+            ("NODE_NAME", "origin-7"),
+            ("AUTH_HOST", "auth.internal:8081"),
+            ("AUTH_TOKEN", "s3cret"),
+        ],
+    )??;
+
+    assert_eq!(&*resolved.node.name, "origin-7");
+    Ok(())
+}
+
+#[test]
+fn an_undefined_variable_stops_startup() -> Result<(), Box<dyn Error>> {
+    // The failure that matters most: substituting an empty string into a token
+    // would silently disable the check it was protecting.
+    let error = resolve_with(r#"name = "${MISSING}""#, &[], &[])?
+        .err()
+        .ok_or("an undefined variable is refused")?
+        .to_string();
+
+    assert!(error.contains("MISSING"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn interpolation_composes_with_an_environment_override() -> Result<(), Box<dyn Error>> {
+    // Interpolation runs on the file before overrides apply, so the two
+    // compose rather than compete: the file resolves its reference, and a
+    // RUSHLS_ override still replaces the result.
+    let resolved = resolve_with(
+        r#"name = "${NODE_NAME}""#,
+        &[],
+        &[("NODE_NAME", "from-file"), ("RUSHLS_NAME", "from-override")],
+    )??;
+
+    assert_eq!(&*resolved.node.name, "from-override");
+    Ok(())
+}
+
+
+#[test]
 fn keys_for_unbuilt_features_are_refused_by_name() -> Result<(), Box<dyn Error>> {
     // The reference describes several features this node does not have. Their
     // keys must fail startup rather than be accepted and do nothing, which is

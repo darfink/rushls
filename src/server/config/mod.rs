@@ -75,6 +75,11 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("could not interpolate {path}: {source}")]
+    Interpolation {
+        path: PathBuf,
+        source: interpolate::InterpolationError,
+    },
     #[error("could not read {secret} from {path}: {source}")]
     SecretRead {
         secret: String,
@@ -187,7 +192,7 @@ impl AppConfig {
         let path = find_parameter("config", args.clone())
             .map(PathBuf::from)
             .or_else(|| env_value(&env, "RUSHLS_CONFIG").map(PathBuf::from));
-        let builder = Self::conf_builder().args(args).env(env);
+        let builder = Self::conf_builder().args(args).env(env.clone());
 
         match path {
             Some(path) => {
@@ -195,8 +200,18 @@ impl AppConfig {
                     path: path.clone(),
                     source,
                 })?;
-                let document =
+                let mut document =
                     toml::from_str::<toml::Value>(&text).map_err(|source| ConfigError::Toml {
+                        path: path.clone(),
+                        source,
+                    })?;
+                // Before the settings layer sees the tree, so `${VAR}` in the
+                // file and a `RUSHLS_` override compose rather than compete:
+                // the reference is resolved here and an override still
+                // replaces the result.
+                interpolate::Environment::new(env)
+                    .interpolate(&mut document)
+                    .map_err(|source| ConfigError::Interpolation {
                         path: path.clone(),
                         source,
                     })?;
@@ -2052,6 +2067,8 @@ fn parse_nonzero_u32(label: &str, value: &str) -> Result<NonZeroU32, String> {
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
 }
+
+mod interpolate;
 
 #[cfg(test)]
 mod tests;

@@ -1,10 +1,10 @@
 # RFC companion: what the configuration asks the application to become
 
 > **Status: largely implemented.** Outstanding, in the order they are least
-> to most self-contained: `${VAR}` interpolation in string values, effective
-> retention-depth reporting, moderate timestamp jumps becoming discontinuities,
-> payload-carrying hooks, `[record]`, mutual TLS to outbound destinations,
-> delta playlists, the disk tier, playback authorization, and enforcing
+> to most self-contained: effective retention-depth reporting, mutual TLS to
+> outbound destinations, moderate timestamp jumps becoming discontinuities,
+> payload-carrying hooks, `[record]`, delta playlists, the disk tier,
+> playback authorization, and enforcing
 > `memory_per_publisher`. Every key belonging to an unbuilt feature is refused
 > at startup by name, so nothing here silently does nothing. Everything else
 > has landed.
@@ -414,6 +414,12 @@ literal dollar, undefined is an error, `${VAR:-fallback}` for a deliberate
 default. String leaves only. The insertion point is clean: the file is already
 parsed into a value tree before the settings layer sees it, so substitution
 happens there and still composes with environment and command-line overrides.
+
+Built. The braces are what let a value be composed from several variables and
+sit against surrounding text, and they keep the sigil distinct from
+`[record] pattern`, whose `{stream}` and `{time:...}` placeholders carry no
+`$` and are expanded per segment by a different layer. One resolves once at
+startup from the environment; the other resolves per file from media.
 
 **An inline form for every secret**, alongside the existing `_file` forms.
 Setting both is refused rather than ordered by precedence.
