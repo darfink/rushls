@@ -56,8 +56,11 @@ const DEFAULT_POLICY: &str = "default";
 #[derive(Clone, derive_more::Debug)]
 pub struct HttpAuthConfig {
     pub endpoint: Endpoint,
-    /// Selected when an allowing response names no policy.
-    pub default_policy: String,
+    /// Applied when an allowing response names no policy.
+    ///
+    /// The unnamed `[accept]` set itself, rather than an entry a reserved name
+    /// points at: naming the default would make it possible to have none.
+    pub default: StreamPolicy,
     /// Every policy a response may name, resolved at start-up.
     pub policies: BTreeMap<String, StreamPolicy>,
     #[debug(skip)]
@@ -81,19 +84,17 @@ impl HttpAuthenticator {
         if allowed.stream_id.trim().is_empty() {
             return Err(service("the response named an empty stream"));
         }
-        let name = allowed
-            .policy
-            .as_deref()
-            .unwrap_or(&self.config.default_policy);
-        let policy = self
-            .config
-            .policies
-            .get(name)
+        let policy = match allowed.policy.as_deref() {
+            // Naming nothing is the common case and takes `[accept]` itself.
+            None => &self.config.default,
             // Fails closed rather than falling back to the default: a service
             // naming a policy this node does not have is either misconfigured
             // or looking at a different version of the configuration, and
             // quietly substituting a policy would apply limits nobody chose.
-            .ok_or_else(|| service(format!("the response named unknown policy `{name}`")))?;
+            Some(name) => self.config.policies.get(name).ok_or_else(|| {
+                service(format!("the response named unknown policy `{name}`"))
+            })?,
+        };
 
         Ok(PublishGrant {
             stream_id: StreamId::new(allowed.stream_id),
@@ -242,7 +243,7 @@ impl Default for HttpAuthConfig {
         Self {
             endpoint: Endpoint::parse("http://127.0.0.1:8081/admit")
                 .expect("a constant endpoint is valid"),
-            default_policy: DEFAULT_POLICY.into(),
+            default: StreamPolicy::permissive(),
             policies: BTreeMap::from([(DEFAULT_POLICY.into(), StreamPolicy::permissive())]),
             bearer: None,
         }

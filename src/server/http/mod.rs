@@ -28,6 +28,7 @@ pub mod fixtures;
 #[cfg(test)]
 mod tests;
 
+use std::net::SocketAddr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -71,6 +72,11 @@ pub struct HttpConfig {
     pub cors: CorsConfig,
     /// Absent serves cleartext, which is the right answer behind a proxy.
     pub tls: Option<TlsSettings>,
+    /// Where HTTPS is served, when TLS is configured.
+    ///
+    /// Beside the certificate rather than inside `TlsSettings`, which is
+    /// shared with another application that binds its own listeners.
+    pub tls_address: Option<SocketAddr>,
 }
 
 impl HttpConfig {

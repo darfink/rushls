@@ -15,17 +15,17 @@ use crate::{
     delivery::store::{DurationRule, TargetDurationMultiple},
     domain::{Codec, StreamId},
     observe::lifecycle::Kind,
-    server::{AllowedOrigins, NodeConfig, ResolvedAppConfig},
+    server::{AllowedOrigins, ResolvedAppConfig},
 };
 
 use super::{AppConfig, ConfigError, decimal_fraction, parse_playlist_window};
 
 const BASE_CONFIG: &str = "";
 
-#[tokio::test]
-async fn the_reference_file_resolves_to_the_runtime_defaults() -> Result<(), Box<dyn Error>> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rushls.toml");
-    let config = AppConfig::load_from(
+/// Loads one shipped file exactly as the binary would.
+fn load_shipped(name: &str) -> Result<ResolvedAppConfig, Box<dyn Error>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(name);
+    Ok(AppConfig::load_from(
         os([
             "rushls",
             "--config",
@@ -33,16 +33,94 @@ async fn the_reference_file_resolves_to_the_runtime_defaults() -> Result<(), Box
         ]),
         std::iter::empty(),
     )?
-    .resolve_from(std::iter::empty())?;
+    .resolve_from(std::iter::empty())?)
+}
 
-    assert_eq!(config.node, NodeConfig::default());
+#[tokio::test]
+async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults()
+-> Result<(), Box<dyn Error>> {
+    // The local starter narrows the listeners and nothing else, so anything
+    // that drifts away from a compiled default here is an accident.
+    let config = load_shipped("rushls.toml")?;
+
+    assert_eq!(
+        config.node.rtmp_address,
+        "127.0.0.1:1935".parse().expect("constant is valid")
+    );
+    assert_eq!(
+        config.node.http_address,
+        Some("127.0.0.1:8080".parse().expect("constant is valid"))
+    );
+    assert_eq!(config.node.https_address, None);
+    assert_eq!(config.node.metrics.listen, None, "metrics are off by default");
+
     let grant = config
         .authenticator
         .authenticate(&request("ignored"))
         .await?;
-    assert_eq!(grant.stream_id, StreamId::new("live/presented-key"));
-    assert_eq!(grant.principal, Principal("anonymous".into()));
-    assert_eq!(grant.policy, StreamPolicy::permissive());
+    assert_eq!(
+        grant.policy,
+        StreamPolicy {
+            // The one narrowing the compiled default makes: silent
+            // replacement of a live publisher needs an explicit opt-in.
+            takeovers: TakeoverPolicy::Deny,
+            ..StreamPolicy::permissive()
+        },
+        "anyone may publish anything this origin can mux, at any speed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_reference_file_resolves_to_the_hardened_configuration()
+-> Result<(), Box<dyn Error>> {
+    // This replaces a test that read the library defaults back out and
+    // asserted the file matched them, which asserts nothing once the file and
+    // the code are independent. Every value below is written in the file, so
+    // this fails if either side moves without the other.
+    let config = load_shipped("rushls.reference.toml")?;
+
+    assert_eq!(config.node.shutdown, Duration::from_secs(10));
+    assert_eq!(
+        config.node.rtmp_address,
+        "[::]:1935".parse().expect("constant is valid")
+    );
+    assert_eq!(
+        config.node.srt_address,
+        "[::]:9000".parse().expect("constant is valid")
+    );
+    assert_eq!(
+        config.node.http_address,
+        Some("[::]:8080".parse().expect("constant is valid"))
+    );
+    assert_eq!(
+        config.node.metrics.listen,
+        Some("127.0.0.1:9090".parse().expect("constant is valid")),
+        "metrics get their own loopback listener, never the viewer port"
+    );
+
+    assert_eq!(config.node.maximum_sessions, 64);
+    assert_eq!(config.node.store.maximum_streams, 256);
+    assert_eq!(
+        config.node.store.retention.maximum_payload_bytes,
+        256 * 1024 * 1024
+    );
+    assert_eq!(config.node.store.retention.retain, Duration::from_mins(1));
+    assert_eq!(
+        config.node.session.segmentation.desired_segment_duration,
+        Duration::from_secs(6)
+    );
+    assert_eq!(config.node.session.supervision.health.stall, Duration::from_secs(12));
+
+    // The reference configures an admission service, so the node is closed.
+    assert!(
+        config
+            .authenticator
+            .authenticate(&request("ignored"))
+            .await
+            .is_err(),
+        "the reference points at an admission service that is not running here"
+    );
     Ok(())
 }
 
@@ -57,7 +135,13 @@ async fn open_authentication_is_the_builtin_default() -> Result<(), Box<dyn Erro
 
     assert_eq!(grant.stream_id, StreamId::new("live/presented-key"));
     assert_eq!(grant.principal, Principal("anonymous".into()));
-    assert_eq!(grant.policy, StreamPolicy::permissive());
+    assert_eq!(
+        grant.policy,
+        StreamPolicy {
+            takeovers: TakeoverPolicy::Deny,
+            ..StreamPolicy::permissive()
+        }
+    );
     Ok(())
 }
 
@@ -65,11 +149,11 @@ async fn open_authentication_is_the_builtin_default() -> Result<(), Box<dyn Erro
 fn cli_overrides_environment_which_overrides_toml() -> Result<(), Box<dyn Error>> {
     let config = resolve_with(
         r"
-[server]
-maximum_concurrent_publishers = 10
+[capacity]
+publishers = 10
 ",
-        &["--server-maximum-concurrent-publishers", "30"],
-        &[("RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHERS", "20")],
+        &["--capacity-publishers", "30"],
+        &[("RUSHLS_CAPACITY_PUBLISHERS", "20")],
     )??;
 
     assert_eq!(config.node.maximum_sessions, 30);
@@ -80,10 +164,10 @@ maximum_concurrent_publishers = 10
 fn unknown_rushls_environment_variables_warn_instead_of_failing() -> Result<(), Box<dyn Error>> {
     let env = [
         // A recognized override and a variable outside the namespace stay quiet.
-        ("RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHERS", "20"),
+        ("RUSHLS_CAPACITY_PUBLISHERS", "20"),
         ("PAGER", "less"),
         // Two misspellings are named, in a stable order.
-        ("RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHER", "20"),
+        ("RUSHLS_CAPACITY_MAXIMUM_CONCURRENT_PUBLISHER", "20"),
         ("RUSHLS_TLS_CERTIFICATE", "/tmp/certificate.pem"),
     ]
     .into_iter()
@@ -91,10 +175,15 @@ fn unknown_rushls_environment_variables_warn_instead_of_failing() -> Result<(), 
     let resolved = AppConfig::load_and_resolve_from(os(["rushls"]), env)?;
 
     assert_eq!(resolved.node.maximum_sessions, 20);
+    let unrecognized: Vec<&String> = resolved
+        .warnings
+        .iter()
+        .filter(|warning| warning.starts_with("unrecognized"))
+        .collect();
     assert_eq!(
-        resolved.warnings.as_slice(),
+        unrecognized,
         [
-            "unrecognized environment variable RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHER is ignored",
+            "unrecognized environment variable RUSHLS_CAPACITY_MAXIMUM_CONCURRENT_PUBLISHER is ignored",
             "unrecognized environment variable RUSHLS_TLS_CERTIFICATE is ignored",
         ]
     );
@@ -127,10 +216,10 @@ fn static_authentication_is_removed() -> Result<(), Box<dyn Error>> {
 async fn open_authentication_accepts_any_credential_and_preserves_the_resource()
 -> Result<(), Box<dyn Error>> {
     let config = resolve_toml(
-        r#"
-[auth.policies.default]
-takeovers = "deny"
-"#,
+        r"
+[accept]
+takeover = false
+",
     )??;
 
     let grant = config
@@ -152,7 +241,13 @@ async fn open_authentication_uses_the_builtin_policy_when_http_is_omitted()
         .authenticator
         .authenticate(&request("ignored"))
         .await?;
-    assert_eq!(grant.policy, StreamPolicy::permissive());
+    assert_eq!(
+        grant.policy,
+        StreamPolicy {
+            takeovers: TakeoverPolicy::Deny,
+            ..StreamPolicy::permissive()
+        }
+    );
     Ok(())
 }
 
@@ -227,7 +322,7 @@ fn existing_optional_secrets_accept_mounted_files() -> Result<(), Box<dyn Error>
         r#"
 {BASE_CONFIG}
 
-[ingest.srt]
+[srt]
 passphrase_file = "{}"
 
 [metrics]
@@ -277,8 +372,8 @@ fn unknown_toml_keys_are_rejected() -> Result<(), Box<dyn Error>> {
     assert!(
         load_toml(
             r"
-[server]
-maximum_concurrent_publishers = 10
+[capacity]
+publishers = 10
 maximum_concurrent_publisherz = 11
 "
         )?
@@ -309,8 +404,8 @@ fn the_admission_budget_derives_from_the_publisher_budget() -> Result<(), Box<dy
     // unauthenticated sockets.
     let config = resolve_toml(
         r"
-[server]
-maximum_concurrent_publishers = 40
+[capacity]
+publishers = 40
 ",
     )??;
 
@@ -326,7 +421,7 @@ maximum_concurrent_publishers = 40
 #[test]
 fn configured_http_auth_resolves_and_guards_its_own_settings() -> Result<(), Box<dyn Error>> {
     let valid = r#"
-[auth.http]
+[auth.publish]
 url = "http://auth-sidecar:8081/v1/publish/admit"
 "#;
     assert!(
@@ -338,18 +433,18 @@ url = "http://auth-sidecar:8081/v1/publish/admit"
     // takes effect: the session gives up first and blames a stage rather than
     // the service that did not answer.
     let outlives_admission = r#"
-[auth.http]
+[auth.publish]
 url = "http://auth-sidecar:8081/admit"
 request_timeout = "30s"
 "#;
     // A response may only name a policy this node actually has.
     let unknown_default = r#"
-[auth.http]
+[auth.publish]
 url = "http://auth-sidecar:8081/admit"
 default_policy = "nonexistent"
     "#;
     let unusable_url = r#"
-[auth.http]
+[auth.publish]
 url = "not-a-url"
 "#;
     for configuration in [outlives_admission, unknown_default, unusable_url] {
@@ -365,7 +460,7 @@ url = "not-a-url"
 #[test]
 fn http_auth_is_selected_by_the_optional_table() -> Result<(), Box<dyn Error>> {
     let configuration = r#"
-[auth.http]
+[auth.publish]
 url = "http://auth-sidecar:8081/admit"
 "#;
     assert!(resolve_toml(configuration)?.is_ok());
@@ -375,7 +470,7 @@ url = "http://auth-sidecar:8081/admit"
 
 #[test]
 fn hooks_are_absent_until_an_endpoint_is_configured() -> Result<(), Box<dyn Error>> {
-    let resolved = resolve_toml("[server]\nname = \"studio\"\n")??;
+    let resolved = resolve_toml("name = \"studio\"\n")??;
 
     assert!(
         resolved.hooks.is_none(),
@@ -388,10 +483,9 @@ fn hooks_are_absent_until_an_endpoint_is_configured() -> Result<(), Box<dyn Erro
 fn a_configured_endpoint_resolves_to_a_subscription() -> Result<(), Box<dyn Error>> {
     let resolved = resolve_toml(
         r#"
-[server]
 name = "studio"
 
-[hooks.endpoints.automation]
+[hook.endpoints.automation]
 url = "http://automation:9000/events"
 events = ["session.started", "session.ended"]
 maximum_attempts = 2
@@ -420,29 +514,29 @@ maximum_attempts = 2
 #[test]
 fn an_endpoint_that_could_never_deliver_is_rejected() -> Result<(), Box<dyn Error>> {
     let unknown_event = r#"
-[hooks.endpoints.automation]
+[hook.endpoints.automation]
 url = "http://automation:9000/events"
 events = ["session.exploded"]
 "#;
     let no_events = r#"
-[hooks.endpoints.automation]
+[hook.endpoints.automation]
 url = "http://automation:9000/events"
 events = []
 "#;
     let no_attempts = r#"
-[hooks.endpoints.automation]
+[hook.endpoints.automation]
 url = "http://automation:9000/events"
 events = ["session.ended"]
 maximum_attempts = 0
 "#;
     let no_queue = r#"
-[hooks.endpoints.automation]
+[hook.endpoints.automation]
 url = "http://automation:9000/events"
 events = ["session.ended"]
 queue_capacity = 0
 "#;
     let unusable_url = r#"
-[hooks.endpoints.automation]
+[hook.endpoints.automation]
 url = "automation:9000"
 events = ["session.ended"]
 "#;
@@ -516,7 +610,7 @@ fn the_rtmp_timeout_derives_a_tighter_handshake_limit() -> Result<(), Box<dyn Er
     // before proving anything is the cheapest attack against an ingest node.
     let resolved = resolve_toml(
         r#"
-[ingest.rtmp]
+[rtmp]
 timeout = "15s"
 "#,
     )?
@@ -539,7 +633,7 @@ fn a_tight_rtmp_timeout_also_tightens_the_handshake() -> Result<(), Box<dyn Erro
     // limit never leaves the unauthenticated phase the more patient one.
     let resolved = resolve_toml(
         r#"
-[ingest.rtmp]
+[rtmp]
 timeout = "2s"
 "#,
     )?
@@ -557,7 +651,7 @@ fn a_disabled_rtmp_timeout_still_bounds_the_handshake() -> Result<(), Box<dyn Er
     // publisher that proved itself, never to a peer that has not.
     let resolved = resolve_toml(
         r#"
-[ingest.rtmp]
+[rtmp]
 timeout = "off"
 "#,
     )?
@@ -567,58 +661,92 @@ timeout = "off"
     assert_eq!(timeouts.session_read, None);
     assert_eq!(timeouts.write, None);
     assert_eq!(timeouts.handshake_read, Some(Duration::from_secs(5)));
-    assert_eq!(
-        resolved.warnings.len(),
-        1,
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("RTMP timeout is disabled")),
         "an unbounded wait on a public bind should not be invisible: {:?}",
         resolved.warnings
     );
     Ok(())
 }
 #[test]
-fn the_stall_deadline_follows_the_segment_duration() -> Result<(), Box<dyn Error>> {
-    // The reason this is relative. An absolute value sized against a 6s
-    // segment becomes stall detection that fires before one segment can
-    // complete the moment segmentation is retuned.
+fn the_stall_deadline_is_an_absolute_duration() -> Result<(), Box<dyn Error>> {
+    // Absolute rather than a segment multiple: `stall` measures the publisher,
+    // not the playlist, so it is the same question whatever cadence this node
+    // happens to be packaging at.
     let resolved = resolve_toml(
         r#"
-[hls]
-segment_duration = "10s"
-part_duration = "1s"
+[accept]
+stall = "20s"
 "#,
     )?
-    .unwrap_or_else(|error| panic!("a longer segment duration must resolve: {error}"));
+    .unwrap_or_else(|error| panic!("a stall deadline must resolve: {error}"));
 
-    let health = resolved.node.session.supervision.health;
-    assert_eq!(health.stall, Duration::from_secs(20));
+    assert_eq!(
+        resolved.node.session.supervision.health.stall,
+        Duration::from_secs(20)
+    );
     Ok(())
 }
 
 #[test]
-fn a_stall_deadline_may_be_pinned_to_an_absolute() -> Result<(), Box<dyn Error>> {
-    // A deployment with its own reasons keeps the fixed form available.
-    let resolved = resolve_toml(
+fn a_stall_shorter_than_one_segment_is_refused() -> Result<(), Box<dyn Error>> {
+    // A deadline inside one segment fails a publisher that is merely between
+    // keyframes, which is hardening turned into an outage.
+    let Err(error) = resolve_toml(
         r#"
-[ingest.health]
-stall = "20s"
+[hls]
+segment = "10s"
+
+[accept]
+stall = "5s"
 "#,
     )?
-    .unwrap_or_else(|error| panic!("a fixed stall deadline must resolve: {error}"));
+    else {
+        panic!("a stall inside one segment must be refused");
+    };
 
-    let health = resolved.node.session.supervision.health;
-    assert_eq!(health.stall, Duration::from_secs(20));
+    assert!(
+        error.to_string().contains("segment duration"),
+        "unexpected error: {error}"
+    );
     Ok(())
 }
 
+#[test]
+fn a_stall_may_be_disabled_on_a_trusted_link() -> Result<(), Box<dyn Error>> {
+    let resolved = resolve_toml(
+        r#"
+[accept]
+stall = "off"
+"#,
+    )?
+    .unwrap_or_else(|error| panic!("a disabled stall must resolve: {error}"));
+
+    assert_eq!(
+        resolved.node.session.supervision.health.stall,
+        Duration::MAX
+    );
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("accept.stall is off")),
+        "an unbounded wait should not be invisible: {:?}",
+        resolved.warnings
+    );
+    Ok(())
+}
 #[test]
 fn a_stall_deadline_shorter_than_its_sampling_is_refused() -> Result<(), Box<dyn Error>> {
     // Sampling cannot observe a deadline shorter than its own period, so such
     // a value is not the tighter detection it appears to be.
     let Err(error) = resolve_toml(
         r#"
-[ingest.health]
+[accept]
 stall = "500ms"
-health_interval = "1s"
 "#,
     )?
     else {
@@ -638,7 +766,7 @@ fn an_srt_idle_deadline_inside_the_latency_window_is_refused() -> Result<(), Box
     // transport is still legitimately waiting for.
     let Err(error) = resolve_toml(
         r#"
-[ingest.srt]
+[srt]
 latency = "2s"
 timeout = "1s"
 "#,
@@ -686,7 +814,7 @@ fn an_rtmp_timeout_below_a_keyframe_interval_is_refused() -> Result<(), Box<dyn 
     // Hardening that drops legitimate publishers is an outage, not a defence.
     let Err(error) = resolve_toml(
         r#"
-[ingest.rtmp]
+[rtmp]
 timeout = "500ms"
 "#,
     )?
@@ -785,7 +913,7 @@ fn hold_back_accepts_both_forms_and_refuses_a_stalling_one() -> Result<(), Box<d
     let relative = resolve_toml(
         r#"
 [hls]
-part_duration = "1s"
+part = "1s"
 hold_back = "4x"
 "#,
     )??;
@@ -797,7 +925,7 @@ hold_back = "4x"
     let absolute = resolve_toml(
         r#"
 [hls]
-part_duration = "1s"
+part = "1s"
 hold_back = "2500ms"
 "#,
     )??;
@@ -811,7 +939,7 @@ hold_back = "2500ms"
     let error = resolve_toml(
         r#"
 [hls]
-part_duration = "1s"
+part = "1s"
 hold_back = "1s"
 "#,
     )?
@@ -827,8 +955,8 @@ fn the_playlist_window_becomes_the_retention_window() -> Result<(), Box<dyn Erro
     let config = resolve_toml(
         r#"
 [hls]
-segment_duration = "6s"
-playlist_window = "18s"
+segment = "6s"
+retain = "18s"
 "#,
     )??;
 
@@ -843,8 +971,8 @@ fn a_fixed_window_below_three_target_durations_is_refused() -> Result<(), Box<dy
         resolve_toml(
             r#"
 [hls]
-segment_duration = "6s"
-playlist_window = "12s"
+segment = "6s"
+retain = "12s"
 "#,
         )?
         .is_err(),
@@ -859,9 +987,9 @@ fn a_reconnect_window_below_the_hold_back_is_refused() -> Result<(), Box<dyn Err
         resolve_toml(
             r#"
 [hls]
-segment_duration = "6s"
+segment = "6s"
 
-[storage]
+[capacity]
 inactive_stream_retention = "5s"
 "#,
         )?
@@ -871,7 +999,7 @@ inactive_stream_retention = "5s"
     assert!(
         resolve_toml(
             r#"
-[storage]
+[capacity]
 inactive_stream_retention = "0s"
 "#,
         )?
@@ -929,7 +1057,7 @@ fn an_unknown_enumerated_value_names_the_alternatives() -> Result<(), Box<dyn Er
     // The point of these messages is that an operator who typos one does not
     // have to go and read the reference file to find out what was allowed.
     let key_length = load_toml(&format!(
-        "{BASE_CONFIG}\n[ingest.srt]\nencryption_key_length = \"aes999\"\n"
+        "{BASE_CONFIG}\n[srt]\nencryption_key_length = \"aes999\"\n"
     ))?
     .err()
     .ok_or("an unknown key length is refused")?
@@ -944,8 +1072,8 @@ async fn in_band_text_captions_are_enabled_per_policy() -> Result<(), Box<dyn Er
     let config = resolve_toml(
         r#"
 [auth]
-[auth.policies.default]
-subtitle_codecs = ["text", "webvtt"]
+[accept]
+subtitles = { codecs = ["text", "webvtt"] }
 "#,
     )??;
 
@@ -963,8 +1091,8 @@ subtitle_codecs = ["text", "webvtt"]
     // misplaced entry silently widen what a publisher may send.
     let wrong_kind = resolve_toml(
         r#"
-[auth.policies.default]
-video_codecs = ["text"]
+[accept]
+video = { codecs = ["text"] }
 "#,
     )?;
     assert!(matches!(wrong_kind, Err(ConfigError::Invalid(_))));

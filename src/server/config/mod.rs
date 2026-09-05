@@ -9,7 +9,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt, fs,
     net::SocketAddr,
-    num::NonZeroU32,
+    num::{NonZeroU16, NonZeroU32},
     path::PathBuf,
     str::FromStr,
     sync::Arc,
@@ -24,8 +24,9 @@ use thiserror::Error;
 
 use crate::{
     admission::{
-        Authenticator, Bounds, Ceiling, Codecs, FrameBox, HttpAuthConfig, HttpAuthenticator,
-        OpenStreamAuthenticator, Pace, Resolution, StreamPolicy, TakeoverPolicy,
+        Authenticator, Bounds, Ceiling, Codecs, Floor, FrameBox, HttpAuthConfig,
+        HttpAuthenticator, OpenStreamAuthenticator, Pace, Resolution, StreamPolicy,
+        TakeoverPolicy,
     },
     delivery::hls::uri::UriBase,
     delivery::store::{DurationRule, TargetDurationMultiple},
@@ -115,22 +116,26 @@ pub struct AppConfig {
     #[conf(parameter, long, env = "CONFIG", serde(skip))]
     pub config: Option<PathBuf>,
 
-    #[conf(flatten, prefix)]
-    pub server: ServerAppConfig,
+    #[conf(flatten, serde(flatten))]
+    pub node: ServerAppConfig,
     #[conf(flatten, prefix)]
     pub auth: AuthAppConfig,
     #[conf(flatten, prefix)]
-    pub ingest: IngestAppConfig,
+    pub rtmp: RtmpAppConfig,
+    #[conf(flatten, prefix)]
+    pub srt: SrtAppConfig,
+    #[conf(flatten, prefix)]
+    pub accept: AcceptAppConfig,
     #[conf(flatten, prefix)]
     pub hls: HlsAppConfig,
     #[conf(flatten, prefix)]
-    pub storage: StorageAppConfig,
+    pub capacity: CapacityAppConfig,
     #[conf(flatten, prefix)]
     pub http: HttpAppConfig,
     #[conf(flatten, prefix)]
     pub metrics: MetricsAppConfig,
     #[conf(flatten, prefix)]
-    pub hooks: HooksAppConfig,
+    pub hook: HooksAppConfig,
 }
 
 impl AppConfig {
@@ -206,36 +211,52 @@ impl AppConfig {
         let mut client = LazyHttpClient::default();
         let mut warnings = Vec::new();
         warnings.extend(Self::unrecognized_environment(env));
+
+        let (default_policy, policies) = self.accept.resolve()?;
+        let stall = self.accept.stall;
+        let open_admission = self.auth.is_open();
         let authenticator = self.auth.resolve(
+            default_policy,
+            policies,
             defaults.session.maximum_admission_time,
             &mut client,
         )?;
+
         let mut node = NodeConfig {
-            maximum_sessions: self.server.maximum_concurrent_publishers,
-            shutdown: self.server.shutdown,
-            rtmp_address: self.ingest.rtmp.listen,
-            srt_address: self.ingest.srt.listen,
-            http_address: Some(self.http.listen),
+            maximum_sessions: self.capacity.publishers,
+            shutdown: self.node.shutdown,
+            rtmp_address: self.rtmp.listen,
+            srt_address: self.srt.listen,
+            http_address: self.http.listen.0,
             ..NodeConfig::default()
         };
-        if let Some(name) = self.server.name.as_deref().map(str::trim).filter(|name| !name.is_empty())
+        if let Some(name) = self
+            .node
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
         {
             node.name = std::sync::Arc::from(name);
         }
-        self.ingest.rtmp.apply(&mut node, &mut warnings)?;
-        self.ingest.srt.apply(&mut node)?;
+        self.rtmp.apply(&mut node, &mut warnings)?;
+        self.srt.apply(&mut node)?;
         self.hls.apply(&mut node)?;
-        // After HLS: the relative stall forms are sized by the segment
-        // duration, which `hls.apply` is what establishes.
-        self.ingest
-            .health
-            .apply(&mut node, self.hls.segment_duration())?;
-        // Same reason as health: the reconnect window is validated against the
-        // segment duration, which only `hls.apply` establishes.
-        self.storage.apply(&mut node)?;
+        // After HLS: a stall expressed as a multiple is sized by the segment
+        // duration, which only `hls.apply` establishes.
+        apply_stall(&mut node, stall, self.hls.segment_duration())?;
+        self.capacity.apply(&mut node)?;
+        node.hls.uri_base = UriBase::new(self.http.public_url.clone());
         node.http = self.http.resolve()?;
+        node.https_address = node.http.tls_address;
         node.metrics = self.metrics.resolve()?;
-        let hooks = self.hooks.resolve(&node, &mut client)?;
+        if node.http_address.is_none() && node.https_address.is_none() {
+            return Err(invalid(
+                "both listeners are off, so this node could serve nothing",
+            ));
+        }
+        let hooks = self.hook.resolve(&node, &mut client)?;
+        warnings.extend(startup_warnings(&node, open_admission));
 
         Ok(ResolvedAppConfig {
             node,
@@ -244,6 +265,7 @@ impl AppConfig {
             warnings,
         })
     }
+
 
     /// `RUSHLS_`-prefixed environment variables that no option reads.
     ///
@@ -294,41 +316,36 @@ pub struct ServerAppConfig {
         serde(use_value_parser)
     )]
     pub shutdown: Duration,
-    /// Maximum publishers that may be active at the same time.
-    #[conf(parameter, long, env, default_value = "256")]
-    pub maximum_concurrent_publishers: usize,
 }
 
 #[derive(Conf)]
 #[conf(serde)]
 pub struct AuthAppConfig {
-    /// Named policy profiles selected by configured publishers.
-    #[conf(parameter, value_parser = TomlTable::<PolicyAppConfig>::from_str)]
-    policies: Option<TomlTable<PolicyAppConfig>>,
     /// Optional external admission service. When omitted, admission is open
-    /// and the requested resource uses the `default` policy.
-    #[conf(flatten, prefix = "http", serde(rename = "http"))]
-    http: Option<HttpAuthAppConfig>,
+    /// and every publisher gets the default accept set.
+    #[conf(flatten, prefix = "publish", serde(rename = "publish"))]
+    publish: Option<HttpAuthAppConfig>,
 }
 
 impl AuthAppConfig {
+    /// Whether anyone who can reach an ingest listener may publish.
+    fn is_open(&self) -> bool {
+        self.publish.is_none()
+    }
+
     fn resolve(
         self,
+        default: StreamPolicy,
+        policies: BTreeMap<String, StreamPolicy>,
         admission_deadline: Duration,
         client: &mut LazyHttpClient,
     ) -> Result<Arc<dyn Authenticator>, ConfigError> {
-        let mut profiles = self.policies.unwrap_or_default();
-        profiles.0.entry("default".into()).or_default();
-        let policies = resolve_policies(profiles)?;
-
-        if let Some(http) = self.http {
-            http.resolve(policies, admission_deadline, client)
+        if let Some(publish) = self.publish {
+            publish
+                .resolve(default, policies, admission_deadline, client)
                 .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
         } else {
-            let policy = policies
-                .get("default")
-                .expect("the default policy is inserted above");
-            Ok(Arc::new(OpenStreamAuthenticator::new(policy.clone())))
+            Ok(Arc::new(OpenStreamAuthenticator::new(default)))
         }
     }
 }
@@ -352,9 +369,6 @@ pub struct HttpAuthAppConfig {
     /// Largest decision this node will read.
     #[conf(parameter, long, env, default_value = "64KiB", serde(use_value_parser))]
     maximum_response_bytes: ByteSize,
-    /// Policy applied when an allowing response names none.
-    #[conf(parameter, long, env, default_value = "default")]
-    default_policy: String,
     /// Bearer credential presented to the service.
     #[conf(parameter, env, secret)]
     token: Option<String>,
@@ -366,6 +380,7 @@ pub struct HttpAuthAppConfig {
 impl HttpAuthAppConfig {
     fn resolve(
         self,
+        default: StreamPolicy,
         policies: BTreeMap<String, StreamPolicy>,
         admission_deadline: Duration,
         client: &mut LazyHttpClient,
@@ -379,12 +394,6 @@ impl HttpAuthAppConfig {
                 self.request_timeout
             )));
         }
-        if !policies.contains_key(&self.default_policy) {
-            return Err(invalid(format!(
-                "the http auth provider selects unknown default policy `{}`",
-                self.default_policy
-            )));
-        }
         let token = resolve_optional_text_secret(
             "the auth service token",
             self.token.as_ref(),
@@ -394,7 +403,10 @@ impl HttpAuthAppConfig {
         Ok(HttpAuthenticator::new(
             HttpAuthConfig {
                 endpoint: Endpoint::parse(&self.url).map_err(|error| invalid(error.to_string()))?,
-                default_policy: self.default_policy,
+                // `[accept]` itself is the unnamed default, so a response
+                // naming no policy gets it. The reserved `default` policy
+                // name is gone with the table that needed one.
+                default,
                 policies,
                 bearer: token
                     .map(|token| BearerToken::new(&token))
@@ -429,6 +441,14 @@ pub struct HooksAppConfig {
     #[conf(parameter, long, env, default_value = "64KiB", serde(use_value_parser))]
     maximum_response_bytes: ByteSize,
     /// Destinations, keyed by a name that identifies them in logs and metrics.
+    ///
+    /// An open namespace, and one of only two: the sub-table names are the
+    /// operator's. A name is a key rather than a value -- it appears in logs
+    /// and metrics and must be unique -- so a table keyed by it makes
+    /// uniqueness structural, since TOML rejects a duplicate key. An array of
+    /// tables with a `name` field would turn that into a validation rule that
+    /// can be forgotten, and demote the name from the heading to a line inside
+    /// the block. Unknown keys *within* one still refuse.
     #[conf(parameter, value_parser = TomlTable::<HookEndpointAppConfig>::from_str)]
     endpoints: Option<TomlTable<HookEndpointAppConfig>>,
 }
@@ -613,211 +633,594 @@ impl LazyHttpClient {
     }
 }
 
-/// Turns each configured profile into the policy publishers select by name.
-fn resolve_policies(
-    profiles: TomlTable<PolicyAppConfig>,
-) -> Result<BTreeMap<String, StreamPolicy>, ConfigError> {
-    profiles
-        .0
-        .into_iter()
-        .map(|(name, configured)| {
-            if name.is_empty() {
-                return Err(invalid("auth policy name must not be empty"));
+/// Resolves the one stall deadline against the cadence it may be relative to.
+fn apply_stall(
+    node: &mut NodeConfig,
+    stall: OptionalDuration,
+    segment_duration: Duration,
+) -> Result<(), ConfigError> {
+    let Some(stall) = stall.0 else {
+        // "off" means no idle cap at all. Legitimate on a trusted link; the
+        // public-bind warning is what makes it visible elsewhere.
+        node.session.supervision.health.stall = Duration::MAX;
+        return Ok(());
+    };
+    if stall.is_zero() {
+        return Err(invalid("accept.stall must be nonzero"));
+    }
+    // Sampling cannot observe a deadline shorter than its own period, so such
+    // a value is not the tighter detection it looks like.
+    let interval = node.session.supervision.health_interval;
+    if stall < interval {
+        return Err(invalid(format!(
+            "accept.stall ({stall:?}) is shorter than the {interval:?} health interval, so it \
+             cannot be observed"
+        )));
+    }
+    // A stall shorter than one segment fails a publisher that is merely
+    // between keyframes.
+    if stall < segment_duration {
+        return Err(invalid(format!(
+            "accept.stall ({stall:?}) is shorter than the {segment_duration:?} segment duration, \
+             which drops publishers between ordinary keyframes"
+        )));
+    }
+    node.session.supervision.health.stall = stall;
+    Ok(())
+}
+
+/// Settings that are legal but probably not what was meant.
+///
+/// Warned rather than refused: each is a deliberate choice somewhere, and
+/// bouncing an administrator over a relationship they did not know existed is
+/// the nagging this design avoids. Hard refusals are kept for the genuinely
+/// unbootable.
+fn startup_warnings(node: &NodeConfig, open_admission: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let public = |address: &SocketAddr| !address.ip().is_loopback();
+
+    if open_admission && (public(&node.rtmp_address) || public(&node.srt_address)) {
+        warnings.push(
+            "an ingest listener is on a public address with no [auth.publish]: anyone who can \
+             reach it may publish"
+                .to_owned(),
+        );
+    }
+    if node.store.maximum_streams >= usize::MAX / 2 {
+        warnings.push("capacity.streams is effectively uncapped".to_owned());
+    }
+    if node.session.supervision.health.stall == Duration::MAX {
+        warnings.push(
+            "accept.stall is off: a publisher that goes quiet holds its stream name until it \
+             disconnects"
+                .to_owned(),
+        );
+    }
+    warnings
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct AcceptAppConfig {
+    /// Throttle applied to a publisher offering media faster than `pace`.
+    ///
+    /// Omit for no ceiling, which is the compiled default: a publisher pushing
+    /// as fast as its link allows is taken to be asking for exactly that.
+    #[conf(parameter, value_parser = TomlValue::<CeilingValue>::from_str)]
+    ceiling: Option<TomlValue<CeilingValue>>,
+    /// Minimum rate a publisher must sustain. Omit for no floor.
+    #[conf(parameter, value_parser = TomlValue::<FloorValue>::from_str)]
+    floor: Option<TomlValue<FloorValue>>,
+    /// How long nothing usable may arrive before the publisher is dropped.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "12s",
+        value_parser = parse_optional_duration,
+        serde(use_value_parser)
+    )]
+    stall: OptionalDuration,
+    /// Whether a second publisher may replace the one holding a stream name.
+    ///
+    /// Refusal by default, because silent replacement turns an encoder
+    /// reconnect or a leaked credential into a hijack with no signal. The cost
+    /// is a reconnect blackout after a half-open socket, bounded by `stall`.
+    #[conf(parameter, long, env, default_value = "false")]
+    takeover: bool,
+    #[conf(parameter, value_parser = TomlValue::<VideoAcceptValue>::from_str)]
+    video: Option<TomlValue<VideoAcceptValue>>,
+    #[conf(parameter, value_parser = TomlValue::<AudioAcceptValue>::from_str)]
+    audio: Option<TomlValue<AudioAcceptValue>>,
+    #[conf(parameter, value_parser = TomlValue::<SubtitleAcceptValue>::from_str)]
+    subtitles: Option<TomlValue<SubtitleAcceptValue>>,
+    /// Named alternatives an admission response may select by name.
+    #[conf(parameter, value_parser = TomlTable::<PolicyValue>::from_str)]
+    policy: Option<TomlTable<PolicyValue>>,
+}
+
+impl AcceptAppConfig {
+    /// The default policy, and every named alternative resolved beside it.
+    fn resolve(&self) -> Result<(StreamPolicy, BTreeMap<String, StreamPolicy>), ConfigError> {
+        let default = self.base()?;
+        let mut policies = BTreeMap::new();
+        for (name, configured) in self.policy.as_ref().map(|table| &table.0).into_iter().flatten() {
+            if name.trim().is_empty() {
+                return Err(invalid("an accept policy name must not be empty"));
             }
-            configured.resolve(&name).map(|policy| (name, policy))
-        })
-        .collect()
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PolicyAppConfig {
-    takeovers: Option<TakeoversValue>,
-    maximum_lead: Option<String>,
-    maximum_timestamp_jump: Option<String>,
-    video_codecs: Option<Vec<CodecValue>>,
-    audio_codecs: Option<Vec<CodecValue>>,
-    subtitle_codecs: Option<Vec<CodecValue>>,
-    maximum_video_tracks: Option<usize>,
-    maximum_audio_tracks: Option<usize>,
-    maximum_subtitle_tracks: Option<usize>,
-    maximum_video_resolution: Option<String>,
-    maximum_video_frame_rate: Option<String>,
-}
-
-impl PolicyAppConfig {
-    fn resolve(self, name: &str) -> Result<StreamPolicy, ConfigError> {
-        let mut policy = StreamPolicy::permissive();
-        if let Some(takeovers) = self.takeovers {
-            policy.takeovers = takeovers.into();
+            // A policy replaces `[accept]` wholesale rather than inheriting
+            // from it: reading one table must answer what it admits, without
+            // replaying a merge against another.
+            policies.insert(name.clone(), configured.resolve(name)?);
         }
-        // Interim mapping: this whole table is replaced by `[accept]` when the
-        // configuration layer is rewritten. `maximum_lead` becomes the burst,
-        // which is the closest the old surface can express.
-        if let Some(value) = &self.maximum_lead {
-            let burst = duration(name, "maximum_lead", value)?;
-            if burst.is_zero() {
-                return Err(invalid(format!(
-                    "auth policy `{name}`: maximum_lead must be nonzero"
-                )));
+        Ok((default, policies))
+    }
+
+    fn base(&self) -> Result<StreamPolicy, ConfigError> {
+        let policy = PolicyValue {
+            ceiling: self.ceiling.as_ref().map(|value| value.0.clone()),
+            floor: self.floor.as_ref().map(|value| value.0.clone()),
+            takeover: Some(self.takeover),
+            video: self.video.as_ref().map(|value| value.0.clone()),
+            audio: self.audio.as_ref().map(|value| value.0.clone()),
+            subtitles: self.subtitles.as_ref().map(|value| value.0.clone()),
+        };
+        policy.resolve("accept")
+    }
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct CapacityAppConfig {
+    /// Concurrent ingest sessions.
+    #[conf(parameter, long, env, default_value = "256")]
+    publishers: usize,
+    /// Streams live, plus those still held by `retain`.
+    ///
+    /// Separate from `publishers` because they answer different questions: a
+    /// publisher is an ingest session, a stream is a named presentation in the
+    /// store. Once `retain` can be long the two decouple hard.
+    #[conf(parameter, long, env, default_value = "1024")]
+    streams: usize,
+    /// Retained parts and segments for one stream.
+    ///
+    /// Bounds retained media only. A publisher also holds a fixed pipeline
+    /// cost while ingesting, reported as `rushls_session_pipeline_bytes`.
+    #[conf(parameter, long, env, default_value = "512MiB", serde(use_value_parser))]
+    memory_per_stream: ByteSize,
+}
+
+impl CapacityAppConfig {
+    fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
+        if self.publishers == 0 {
+            return Err(invalid("capacity.publishers must be at least one"));
+        }
+        if self.streams == 0 {
+            return Err(invalid("capacity.streams must be at least one"));
+        }
+        node.maximum_sessions = self.publishers;
+        node.store.maximum_streams = self.streams;
+        node.store.retention.maximum_payload_bytes =
+            nonzero_bytes("capacity.memory_per_stream", self.memory_per_stream)?;
+        Ok(())
+    }
+}
+
+/// One TOML value handed over as its own text.
+///
+/// `conf` gives a table-valued parameter as raw TOML rather than as a parsed
+/// value, so each of these parses itself. The same shape also lets an
+/// environment override carry a TOML fragment, which is what keeps a
+/// structured predicate overridable rather than file-only.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(transparent)]
+struct TomlValue<T>(T);
+
+impl<T: serde::de::DeserializeOwned> FromStr for TomlValue<T> {
+    type Err = toml::de::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Wrapped in a key so a bare inline table parses as a document, which
+        // is the form both a file fragment and an environment value take.
+        toml::from_str::<Wrapper<T>>(&format!("value = {value}")).map(|wrapper| Self(wrapper.value))
+    }
+}
+
+#[derive(Deserialize)]
+struct Wrapper<T> {
+    value: T,
+}
+
+/// A rate written as a multiple of wall clock: "1x", "0.5x", "2x".
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(try_from = "String")]
+struct PaceValue(Pace);
+
+impl TryFrom<String> for PaceValue {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let multiple = value
+            .strip_suffix('x')
+            .ok_or_else(|| format!("a pace must end in `x`, as in 1x; got `{value}`"))?;
+        let (numerator, denominator) = decimal_fraction(multiple)?;
+        let numerator = NonZeroU32::new(numerator)
+            .ok_or_else(|| "a pace must be greater than zero".to_owned())?;
+        let denominator = NonZeroU32::new(denominator)
+            .ok_or_else(|| "a pace must be greater than zero".to_owned())?;
+        Ok(Self(Pace::new(numerator, denominator)))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CeilingValue {
+    pace: PaceValue,
+    #[serde(default)]
+    burst: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FloorValue {
+    pace: PaceValue,
+    window: String,
+}
+
+/// A media predicate: exact, one of a set, or an inclusive range.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum BoundsValue<T> {
+    Exact(T),
+    OneOf(Vec<T>),
+    Range(RangeValue<T>),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RangeValue<T> {
+    min: Option<T>,
+    max: Option<T>,
+}
+
+impl<T> BoundsValue<T> {
+    fn resolve<U>(self, convert: impl Fn(T) -> U) -> Bounds<U> {
+        match self {
+            Self::Exact(value) => Bounds::Exact(convert(value)),
+            Self::OneOf(values) => Bounds::OneOf(values.into_iter().map(convert).collect()),
+            Self::Range(range) => Bounds::Range {
+                min: range.min.map(&convert),
+                max: range.max.map(&convert),
+            },
+        }
+    }
+}
+
+/// A frame size: a named preset, or explicit width and height.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum FrameBoxValue {
+    Named(String),
+    Explicit { width: u32, height: u32 },
+}
+
+impl FrameBoxValue {
+    /// Named sizes expand to boxes and then compare numerically, so a name is
+    /// never a point on a one-dimensional scale.
+    fn resolve(&self) -> Result<FrameBox, String> {
+        match self {
+            Self::Explicit { width, height } => Ok(FrameBox::new(*width, *height)),
+            Self::Named(name) => match name.to_ascii_lowercase().as_str() {
+                "sd" | "480p" => Ok(FrameBox::new(854, 480)),
+                "hd" | "720p" => Ok(FrameBox::new(1280, 720)),
+                "fhd" | "1080p" => Ok(FrameBox::new(1920, 1080)),
+                "qhd" | "1440p" => Ok(FrameBox::new(2560, 1440)),
+                "4k" | "2160p" => Ok(FrameBox::new(3840, 2160)),
+                "8k" | "4320p" => Ok(FrameBox::new(7680, 4320)),
+                other => match other.split_once('x') {
+                    Some((width, height)) => Ok(FrameBox::new(
+                        width.parse().map_err(|_| format!("`{other}` is not a size"))?,
+                        height.parse().map_err(|_| format!("`{other}` is not a size"))?,
+                    )),
+                    None => Err(format!("unknown resolution `{other}`")),
+                },
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum ResolutionValue {
+    Bounded(ResolutionBound),
+    Exact(FrameBoxValue),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolutionBound {
+    max: Option<FrameBoxValue>,
+}
+
+impl ResolutionValue {
+    fn resolve(&self) -> Result<Resolution, String> {
+        match self {
+            Self::Bounded(bound) => match &bound.max {
+                Some(max) => Ok(Resolution::AtMost(max.resolve()?)),
+                None => Ok(Resolution::Any),
+            },
+            Self::Exact(size) => Ok(Resolution::Exact(size.resolve()?)),
+        }
+    }
+}
+
+/// A frame rate: an integer, a decimal, or an exact quotient.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum RateValue {
+    Integer(u32),
+    Decimal(f64),
+    Quotient(String),
+}
+
+/// The broadcast decimals, and the rationals they actually name.
+///
+/// `29.97` read literally is `2997/100`, which is not `30000/1001`. The two
+/// are the same rate only because the decimal is conventional shorthand, so
+/// the mapping is explicit rather than derived. Everything else is its literal
+/// value, and comparison stays exact-rational either way.
+///
+/// Comparing to a tolerance was the alternative and is rejected: it would make
+/// `frame_rate = 30` quietly admit 29.97, which is the predicate not doing
+/// what it says, and no cutoff between two and three decimal places can be
+/// justified over the other.
+const NTSC_RATES: [(f64, u32, u32); 4] = [
+    (23.976, 24_000, 1_001),
+    (29.97, 30_000, 1_001),
+    (59.94, 60_000, 1_001),
+    (119.88, 120_000, 1_001),
+];
+
+impl RateValue {
+    fn resolve(&self) -> Result<FrameRate, String> {
+        match self {
+            Self::Integer(value) => {
+                let numerator = NonZeroU32::new(*value)
+                    .ok_or_else(|| "a frame rate must be positive".to_owned())?;
+                Ok(FrameRate::new(numerator, nz::u32!(1)))
             }
+            Self::Decimal(value) => {
+                if let Some((_, numerator, denominator)) = NTSC_RATES
+                    .iter()
+                    .find(|(decimal, _, _)| (decimal - value).abs() < f64::EPSILON)
+                {
+                    return Ok(FrameRate::new(
+                        NonZeroU32::new(*numerator).expect("constant is nonzero"),
+                        NonZeroU32::new(*denominator).expect("constant is nonzero"),
+                    ));
+                }
+                let (numerator, denominator) = decimal_fraction(&value.to_string())?;
+                Ok(FrameRate::new(
+                    NonZeroU32::new(numerator)
+                        .ok_or_else(|| "a frame rate must be positive".to_owned())?,
+                    NonZeroU32::new(denominator)
+                        .ok_or_else(|| "a frame rate must be positive".to_owned())?,
+                ))
+            }
+            Self::Quotient(value) => {
+                let (numerator, denominator) = value
+                    .split_once('/')
+                    .ok_or_else(|| format!("`{value}` is not a frame rate"))?;
+                Ok(FrameRate::new(
+                    parse_nonzero_u32("frame-rate numerator", numerator)?,
+                    parse_nonzero_u32("frame-rate denominator", denominator)?,
+                ))
+            }
+        }
+    }
+}
+
+/// A sample rate in hertz, accepting the friendly `"48kHz"` spelling anywhere
+/// a rate is written — including inside a range, since accepting it in one
+/// position and not the other would be the worst of both.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum SampleRateValue {
+    Hertz(u32),
+    Friendly(String),
+}
+
+impl SampleRateValue {
+    fn resolve(&self) -> Result<NonZeroU32, String> {
+        let hertz = match self {
+            Self::Hertz(value) => *value,
+            Self::Friendly(value) => {
+                let trimmed = value.trim();
+                let lowered = trimmed.to_ascii_lowercase();
+                match lowered.strip_suffix("khz") {
+                    Some(kilohertz) => {
+                        let (numerator, denominator) = decimal_fraction(kilohertz.trim())?;
+                        numerator.saturating_mul(1_000) / denominator.max(1)
+                    }
+                    None => lowered
+                        .strip_suffix("hz")
+                        .unwrap_or(&lowered)
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("`{trimmed}` is not a sample rate"))?,
+                }
+            }
+        };
+        NonZeroU32::new(hertz).ok_or_else(|| "a sample rate must be positive".to_owned())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VideoAcceptValue {
+    codecs: Option<Vec<CodecValue>>,
+    resolution: Option<ResolutionValue>,
+    frame_rate: Option<BoundsValue<RateValue>>,
+    tracks: Option<BoundsValue<usize>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AudioAcceptValue {
+    codecs: Option<Vec<CodecValue>>,
+    sample_rate: Option<BoundsValue<SampleRateValue>>,
+    channels: Option<BoundsValue<u16>>,
+    tracks: Option<BoundsValue<usize>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubtitleAcceptValue {
+    codecs: Option<Vec<CodecValue>>,
+    tracks: Option<BoundsValue<usize>>,
+}
+
+/// One complete accept set, whether the default or a named alternative.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyValue {
+    ceiling: Option<CeilingValue>,
+    floor: Option<FloorValue>,
+    takeover: Option<bool>,
+    video: Option<VideoAcceptValue>,
+    audio: Option<AudioAcceptValue>,
+    subtitles: Option<SubtitleAcceptValue>,
+}
+
+impl PolicyValue {
+    fn resolve(&self, name: &str) -> Result<StreamPolicy, ConfigError> {
+        let where_ = |error: String| invalid(format!("{name}: {error}"));
+        let mut policy = StreamPolicy::permissive();
+
+        if let Some(ceiling) = &self.ceiling {
+            let burst = match &ceiling.burst {
+                Some(value) => humantime::parse_duration(value)
+                    .map_err(|error| where_(format!("ceiling.burst {error}")))?,
+                None => Duration::from_secs(10),
+            };
             policy.ceiling = Some(Ceiling {
-                pace: Pace::realtime(),
+                pace: ceiling.pace.0,
                 burst,
             });
         }
-        if let Some(value) = &self.maximum_timestamp_jump {
-            policy.maximum_timestamp_jump = duration(name, "maximum_timestamp_jump", value)?;
+        if let Some(floor) = &self.floor {
+            let window = humantime::parse_duration(&floor.window)
+                .map_err(|error| where_(format!("floor.window {error}")))?;
+            if window.is_zero() {
+                return Err(where_("floor.window must be nonzero".to_owned()));
+            }
+            // A ceiling holding a publisher at exactly its floor makes
+            // ordinary jitter fatal, and no value of the pair is usable, so
+            // this is a refusal rather than a warning.
+            if let Some(ceiling) = policy.ceiling
+                && !floor.pace.0.is_slower_than(ceiling.pace)
+            {
+                return Err(where_(
+                    "floor.pace must be slower than ceiling.pace, or the ceiling holds the \
+                     publisher at exactly the floor and ordinary jitter trips it"
+                        .to_owned(),
+                ));
+            }
+            policy.floor = Some(Floor {
+                pace: floor.pace.0,
+                window,
+            });
         }
-        // Interim mapping onto the predicate shape. The old keys are all
-        // maxima, so each becomes a `{ max = .. }` bound; `[accept]` replaces
-        // this wholesale when the file is rewritten.
-        if let Some(codecs) = self.video_codecs {
-            policy.video.codecs = Codecs::OneOf(validate_codecs(
-                name,
-                "video codecs",
-                codecs,
-                &[Codec::H264, Codec::Hevc, Codec::Av1],
-            )?);
+        if let Some(takeover) = self.takeover {
+            policy.takeovers = if takeover {
+                TakeoverPolicy::Allow
+            } else {
+                TakeoverPolicy::Deny
+            };
         }
-        if let Some(codecs) = self.audio_codecs {
-            policy.audio.codecs = Codecs::OneOf(validate_codecs(
-                name,
-                "audio codecs",
-                codecs,
-                &[Codec::Aac, Codec::Opus],
-            )?);
+
+        if let Some(video) = &self.video {
+            if let Some(codecs) = &video.codecs {
+                policy.video.codecs = Codecs::OneOf(validate_codecs(
+                    name,
+                    "video codecs",
+                    codecs.clone(),
+                    &[Codec::H264, Codec::Hevc, Codec::Av1],
+                )?);
+            }
+            if let Some(resolution) = &video.resolution {
+                policy.video.resolution = resolution.resolve().map_err(where_)?;
+            }
+            if let Some(frame_rate) = &video.frame_rate {
+                policy.video.frame_rate = resolve_bounds(frame_rate.clone(), RateValue::resolve)
+                    .map_err(where_)?;
+            }
+            if let Some(tracks) = &video.tracks {
+                policy.video.tracks = tracks.clone().resolve(|value| value);
+            }
         }
-        if let Some(codecs) = self.subtitle_codecs {
-            policy.subtitles.codecs = Codecs::OneOf(validate_codecs(
-                name,
-                "subtitle codecs",
-                codecs,
-                &[Codec::WebVtt, Codec::SubRip, Codec::Text],
-            )?);
+        if let Some(audio) = &self.audio {
+            if let Some(codecs) = &audio.codecs {
+                policy.audio.codecs = Codecs::OneOf(validate_codecs(
+                    name,
+                    "audio codecs",
+                    codecs.clone(),
+                    &[Codec::Aac, Codec::Opus],
+                )?);
+            }
+            if let Some(sample_rate) = &audio.sample_rate {
+                policy.audio.sample_rate =
+                    resolve_bounds(sample_rate.clone(), SampleRateValue::resolve)
+                        .map_err(where_)?;
+            }
+            if let Some(channels) = &audio.channels {
+                policy.audio.channels = resolve_bounds(channels.clone(), |value| {
+                    NonZeroU16::new(*value)
+                        .ok_or_else(|| "channels must be positive".to_owned())
+                })
+                .map_err(where_)?;
+            }
+            if let Some(tracks) = &audio.tracks {
+                policy.audio.tracks = tracks.clone().resolve(|value| value);
+            }
         }
-        if let Some(maximum) = self.maximum_video_tracks {
-            policy.video.tracks = Bounds::at_most(maximum);
-        }
-        if let Some(maximum) = self.maximum_audio_tracks {
-            policy.audio.tracks = Bounds::at_most(maximum);
-        }
-        if let Some(maximum) = self.maximum_subtitle_tracks {
-            policy.subtitles.tracks = Bounds::at_most(maximum);
-        }
-        if let Some(resolution) = self.maximum_video_resolution {
-            let resolution = resolution
-                .parse::<ResolutionValue>()
-                .map_err(|error| invalid(format!("auth policy `{name}`: {error}")))?;
-            policy.video.resolution = Resolution::AtMost(FrameBox::new(
-                resolution.width.get(),
-                resolution.height.get(),
-            ));
-        }
-        if let Some(frame_rate) = self.maximum_video_frame_rate {
-            policy.video.frame_rate = Bounds::at_most(
-                frame_rate
-                    .parse::<FrameRateValue>()
-                    .map_err(|error| invalid(format!("auth policy `{name}`: {error}")))?
-                    .0,
-            );
+        if let Some(subtitles) = &self.subtitles {
+            if let Some(codecs) = &subtitles.codecs {
+                policy.subtitles.codecs = Codecs::OneOf(validate_codecs(
+                    name,
+                    "subtitle codecs",
+                    codecs.clone(),
+                    &[Codec::WebVtt, Codec::SubRip, Codec::Text],
+                )?);
+            }
+            if let Some(tracks) = &subtitles.tracks {
+                policy.subtitles.tracks = tracks.clone().resolve(|value| value);
+            }
         }
         Ok(policy)
     }
 }
 
-#[derive(Conf)]
-#[conf(serde)]
-pub struct IngestAppConfig {
-    #[conf(flatten, prefix)]
-    pub rtmp: RtmpAppConfig,
-    #[conf(flatten, prefix)]
-    pub srt: SrtAppConfig,
-    #[conf(flatten, prefix)]
-    pub health: HealthAppConfig,
+/// Resolves a predicate whose values need validating one at a time.
+fn resolve_bounds<T, U>(
+    bounds: BoundsValue<T>,
+    convert: impl Fn(&T) -> Result<U, String>,
+) -> Result<Bounds<U>, String> {
+    Ok(match bounds {
+        BoundsValue::Exact(value) => Bounds::Exact(convert(&value)?),
+        BoundsValue::OneOf(values) => Bounds::OneOf(
+            values
+                .iter()
+                .map(&convert)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        BoundsValue::Range(range) => Bounds::Range {
+            min: range.min.as_ref().map(&convert).transpose()?,
+            max: range.max.as_ref().map(&convert).transpose()?,
+        },
+    })
 }
 
-#[derive(Conf)]
-#[conf(serde)]
-pub struct HealthAppConfig {
-    /// How long a publisher may deliver nothing usable before it is dropped.
-    ///
-    /// Expressed as a multiple of the segment duration (`"1x"`) or a fixed
-    /// duration (`"12s"`). The multiple form is the safer default: an absolute
-    /// value that is sensible against a 6s segment silently becomes aggressive
-    /// when segmentation is retuned, and stall detection that fires before one
-    /// segment can complete fails healthy publishers.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "2x",
-        value_parser = parse_stall_rule,
-        serde(use_value_parser)
-    )]
-    stall: DurationRule,
-    /// How often liveness is judged while a session runs.
-    ///
-    /// A sampling rate rather than a policy: near the stall value above it
-    /// makes detection jittery, and well below it costs work for no extra
-    /// sensitivity.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "1s",
-        value_parser = humantime::parse_duration,
-        serde(use_value_parser)
-    )]
-    health_interval: Duration,
-}
-
-impl HealthAppConfig {
-    /// Resolve against the segment duration the relative form is sized by.
-    fn apply(&self, node: &mut NodeConfig, segment_duration: Duration) -> Result<(), ConfigError> {
-        if self.health_interval.is_zero() {
-            return Err(invalid("ingest.health.health_interval must be nonzero"));
-        }
-
-        let stall = self.stall.resolve(segment_duration);
-        if stall.is_zero() {
-            return Err(invalid("ingest.health.stall must be nonzero"));
-        }
-        // Sampling cannot observe a deadline shorter than its own period, so
-        // such a value is not the tighter detection it looks like.
-        if stall < self.health_interval {
-            return Err(invalid(format!(
-                "ingest.health.stall ({stall:?}) is shorter than the health \
-                 interval ({:?}), so it cannot be observed",
-                self.health_interval
-            )));
-        }
-
-        node.session.supervision.health.stall = stall;
-        node.session.supervision.health_interval = self.health_interval;
-        Ok(())
-    }
-}
-
-/// Parses a stall deadline: a multiple of the segment duration (`"1x"`) or a
-/// fixed duration (`"5s"`).
-fn parse_stall_rule(value: &str) -> Result<DurationRule, String> {
-    if let Some(multiple) = value.strip_suffix('x') {
-        let (numerator, denominator) = decimal_fraction(multiple)?;
-        if numerator == 0 {
-            return Err("a stall multiple must be greater than zero".to_owned());
-        }
-        let denominator = NonZeroU32::new(denominator)
-            .ok_or_else(|| "a stall multiple must be greater than zero".to_owned())?;
-        return Ok(DurationRule::MultipleOfTarget(TargetDurationMultiple::new(
-            numerator,
-            denominator,
-        )));
-    }
-    humantime::parse_duration(value)
-        .map(DurationRule::Fixed)
-        .map_err(|error| error.to_string())
-}
 
 #[derive(Conf)]
 #[conf(serde)]
@@ -920,6 +1323,33 @@ impl std::fmt::Display for OptionalDuration {
     }
 }
 
+/// An address that may be explicitly disabled.
+///
+/// Mirrors [`OptionalDuration`]: turning one listener off is how an operator
+/// says "HTTPS only", and an absurd address is not a way to spell that.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OptionalAddress(pub Option<SocketAddr>);
+
+impl std::fmt::Display for OptionalAddress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(address) => write!(formatter, "{address}"),
+            None => formatter.write_str("off"),
+        }
+    }
+}
+
+fn parse_optional_address(value: &str) -> Result<OptionalAddress, String> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("off") {
+        return Ok(OptionalAddress(None));
+    }
+    trimmed
+        .parse()
+        .map(|address| OptionalAddress(Some(address)))
+        .map_err(|error| format!("{error}"))
+}
+
 fn parse_optional_duration(value: &str) -> Result<OptionalDuration, String> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none") {
@@ -1017,9 +1447,6 @@ impl SrtAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct HlsAppConfig {
-    /// Absolute URL prefix for names emitted by playlists; empty is relative.
-    #[conf(parameter, long, env, default_value = "")]
-    public_base_url: String,
     /// Desired HLS segment duration. Keyframe cadence may adjust the result.
     #[conf(
         parameter,
@@ -1029,7 +1456,7 @@ pub struct HlsAppConfig {
         value_parser = humantime::parse_duration,
         serde(use_value_parser)
     )]
-    segment_duration: Duration,
+    segment: Duration,
     /// Desired low-latency HLS partial-segment duration.
     #[conf(
         parameter,
@@ -1039,7 +1466,7 @@ pub struct HlsAppConfig {
         value_parser = humantime::parse_duration,
         serde(use_value_parser)
     )]
-    part_duration: Duration,
+    part: Duration,
     /// Minimum completed media retained in each live playlist.
     ///
     /// A fixed duration (`"18s"`) or a multiple of the segment duration
@@ -1055,7 +1482,7 @@ pub struct HlsAppConfig {
         value_parser = parse_playlist_window,
         serde(use_value_parser)
     )]
-    playlist_window: DurationRule,
+    retain: DurationRule,
     /// How far behind the live edge a player is told to start.
     ///
     /// A multiple of the part duration (`"3x"`) or a fixed duration (`"3s"`).
@@ -1075,48 +1502,47 @@ pub struct HlsAppConfig {
 impl HlsAppConfig {
     /// The segment duration other sections size their relative values by.
     fn segment_duration(&self) -> Duration {
-        self.segment_duration
+        self.segment
     }
 
     fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
-        if self.segment_duration.is_zero() || self.part_duration.is_zero() {
+        if self.segment.is_zero() || self.part.is_zero() {
             return Err(invalid("HLS segment and part durations must be nonzero"));
         }
-        if self.part_duration > self.segment_duration {
+        if self.part > self.segment {
             return Err(invalid(
                 "HLS part duration must not exceed the segment duration",
             ));
         }
-        let window = self.playlist_window;
-        let window_duration = window.resolve(self.segment_duration);
+        let window = self.retain;
+        let window_duration = window.resolve(self.segment);
         if window_duration.is_zero() {
             return Err(invalid("HLS playlist window must be nonzero"));
         }
         if let DurationRule::Fixed(fixed) = window
-            && fixed < self.segment_duration.saturating_mul(3)
+            && fixed < self.segment.saturating_mul(3)
         {
             return Err(invalid(
                 "HLS playlist window must be at least three times the segment duration",
             ));
         }
         node.session.segmentation =
-            SegmentationPolicy::latency_first(self.segment_duration, self.part_duration);
+            SegmentationPolicy::latency_first(self.segment, self.part);
         // Interim mapping: the advertised window and the retention window are
         // one quantity now, so the old playlist knob resolves straight into
         // it. `[hls] retain` replaces this when the file is rewritten.
         node.store.retention.retain = window_duration;
-        node.hls.uri_base = UriBase::new(self.public_base_url.clone());
         // Refused rather than raised, unlike the retention floors: a hold-back
         // under two parts asks for a latency the protocol cannot deliver, and
         // honouring it approximately would advertise a promise that makes
         // clients stall.
-        let hold_back = self.hold_back.resolve(self.part_duration);
-        if hold_back < self.part_duration.saturating_mul(2) {
+        let hold_back = self.hold_back.resolve(self.part);
+        if hold_back < self.part.saturating_mul(2) {
             return Err(invalid(format!(
                 "HLS hold_back ({hold_back:?}) must be at least twice the part duration ({:?}): \
                  a client given less than two parts of head start runs out of buffered media \
                  on any loss",
-                self.part_duration
+                self.part
             )));
         }
         node.hls.timing.part_hold_back = self.hold_back;
@@ -1190,41 +1616,21 @@ fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
 
 #[derive(Conf)]
 #[conf(serde)]
-pub struct StorageAppConfig {
-    /// Maximum published or recently inactive streams retained by the process.
-    #[conf(parameter, long, env, default_value = "1024")]
-    maximum_streams: usize,
-    /// Maximum retained media payload for one stream.
+pub struct HttpAppConfig {
+    /// Address serving HLS and health probes, or `"off"` to serve HTTPS only.
     #[conf(
         parameter,
         long,
         env,
-        default_value = "512MiB",
+        default_value = "0.0.0.0:8080",
+        value_parser = parse_optional_address,
         serde(use_value_parser)
     )]
-    maximum_media_per_stream: ByteSize,
-}
-
-impl StorageAppConfig {
-    fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
-        if self.maximum_streams == 0 {
-            return Err(invalid("storage must allow at least one stream"));
-        }
-        node.store.maximum_streams = self.maximum_streams;
-        node.store.retention.maximum_payload_bytes = nonzero_bytes(
-            "maximum media retained per stream",
-            self.maximum_media_per_stream,
-        )?;
-        Ok(())
-    }
-}
-
-#[derive(Conf)]
-#[conf(serde)]
-pub struct HttpAppConfig {
-    /// Address serving HLS, health probes, and optional metrics.
-    #[conf(parameter, long, env, default_value = "0.0.0.0:8080")]
-    pub listen: SocketAddr,
+    pub listen: OptionalAddress,
+    /// Absolute URL prefix for the names playlists emit; empty is relative,
+    /// which is right behind a proxy or CDN.
+    #[conf(parameter, long, env, default_value = "")]
+    public_url: String,
     #[conf(flatten, prefix)]
     cors: CorsAppConfig,
     #[conf(flatten, prefix)]
@@ -1236,6 +1642,7 @@ impl HttpAppConfig {
         let config = HttpConfig {
             cors: self.cors.resolve()?,
             tls: self.tls.as_ref().map(TlsAppConfig::resolve).transpose()?,
+            tls_address: self.tls.as_ref().map(|tls| tls.listen),
         };
         config.validate().map_err(invalid)?;
         Ok(config)
@@ -1284,6 +1691,9 @@ impl CorsAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct TlsAppConfig {
+    /// Address serving HTTPS, bound independently of the cleartext listener.
+    #[conf(parameter, long, env, default_value = "[::]:8443")]
+    listen: SocketAddr,
     /// PEM certificate chain, leaf first.
     #[conf(parameter, long, env)]
     certificate: PathBuf,
@@ -1453,59 +1863,6 @@ impl From<TakeoversValue> for TakeoverPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct ResolutionValue {
-    width: NonZeroU32,
-    height: NonZeroU32,
-}
-
-impl FromStr for ResolutionValue {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (width, height) = value
-            .split_once(['x', 'X'])
-            .ok_or_else(|| "a resolution must be written as `WIDTHxHEIGHT`".to_owned())?;
-        Ok(Self {
-            width: parse_nonzero_u32("resolution width", width)?,
-            height: parse_nonzero_u32("resolution height", height)?,
-        })
-    }
-}
-
-impl fmt::Display for ResolutionValue {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(output, "{}x{}", self.width, self.height)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FrameRateValue(FrameRate);
-
-impl FromStr for FrameRateValue {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (numerator, denominator) = value.split_once('/').unwrap_or((value, "1"));
-        Ok(Self(FrameRate::new(
-            parse_nonzero_u32("frame-rate numerator", numerator)?,
-            parse_nonzero_u32("frame-rate denominator", denominator)?,
-        )))
-    }
-}
-
-impl fmt::Display for FrameRateValue {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let numerator = self.0.numerator();
-        let denominator = self.0.denominator().get();
-        if denominator == 1 {
-            write!(output, "{numerator}")
-        } else {
-            write!(output, "{numerator}/{denominator}")
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, derive_more::Display)]
 #[display(rename_all = "lowercase")]
 enum SrtKeyLengthValue {
@@ -1622,11 +1979,6 @@ fn env_value<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsSt
         .map(|(_, value)| value.as_os_str())
 }
 
-/// Parses one policy duration, naming the field an operator mistyped.
-fn duration(policy: &str, field: &str, value: &str) -> Result<Duration, ConfigError> {
-    humantime::parse_duration(value)
-        .map_err(|error| invalid(format!("auth policy `{policy}`: {field} {error}")))
-}
 
 fn resolve_optional_text_secret(
     label: &str,
