@@ -907,14 +907,12 @@ auth as `[auth] key_file`, further ingest protocols as new top-level tables,
 and `EVENT`-type playlists, which would arrive as a new `[hls]` field naming
 the playlist type rather than as a second retention window.
 
-**Mutual TLS to the admission service.** Specified in the reference as
-`client_certificate`, `client_key`, and `ca` under `[auth.publish]`, and not
-built. It is listed rather than deferred silently because the trust model
-above depends on it: a service permitted to widen this node's accept set
-should be authenticated by more than a bearer token wherever the path between
-them is not already private. The same three fields apply unchanged to a hook
-destination, which is why they are spelled generically rather than named for
-admission.
+**Mutual TLS to a hook destination.** The three fields exist under
+`[auth.publish]` and are built there; the same spelling applies unchanged to a
+hook, which is why they are not named for admission. What is missing is the
+plumbing: the hook dispatcher holds one client for every destination, so
+per-hook identity is a change to that layer rather than a configuration field,
+and the keys are refused there until it lands.
 
 Structural, and honestly not designed for: **transcoding**. A rendition ladder
 needs named variants and per-variant constraints, which is a new top-level

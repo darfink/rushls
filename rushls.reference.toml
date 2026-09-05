@@ -55,7 +55,8 @@ url = "http://auth.example.internal/v1/publish/admit"
 # token_file = "/run/secrets/rushls-auth-token"
 # token      = "..."                     # inline form; prefer token_file
 # This service may widen what this node accepts, so it is trusted. On an
-# untrusted network, prove the origin to it with a client certificate.
+# untrusted network, prove the origin to it and pin the issuer in return.
+# Certificates reload in place on rotation, as the TLS listener's do.
 # client_certificate = "/etc/rushls/auth/client.pem"
 # client_key         = "/etc/rushls/auth/client-key.pem"
 # ca                 = "/etc/rushls/auth/ca.pem"   # pin the service's issuer

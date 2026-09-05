@@ -325,6 +325,8 @@ dependencies = [
  "http-body-util",
  "hyper-rustls",
  "hyper-util",
+ "rustls",
+ "rustls-native-certs",
  "thiserror 2.0.20",
  "tokio",
 ]

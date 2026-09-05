@@ -15,7 +15,7 @@ use crate::{
     delivery::store::{DurationRule, TargetDurationMultiple},
     domain::{Codec, StreamId},
     observe::lifecycle::Kind,
-    server::{AllowedOrigins, ResolvedAppConfig},
+    server::{AllowedOrigins, ResolvedAppConfig, http::fixtures::{scratch, write_pair}},
 };
 
 use super::{AppConfig, ConfigError, decimal_fraction, parse_playlist_window};
@@ -443,6 +443,82 @@ fn interpolation_composes_with_an_environment_override() -> Result<(), Box<dyn E
     )??;
 
     assert_eq!(&*resolved.node.name, "from-override");
+    Ok(())
+}
+
+
+#[tokio::test]
+async fn mutual_tls_material_resolves_for_the_admission_service() -> Result<(), Box<dyn Error>> {
+    // The admission service may widen what this node accepts, so on an
+    // untrusted network it should be authenticated by more than a bearer
+    // token -- and this node should prove itself to it in return.
+    let directory = scratch("auth-mtls");
+    let (settings, _) = write_pair(&directory, "origin.internal");
+
+    let configuration = format!(
+        r#"
+[auth.publish]
+url = "https://auth.internal/admit"
+client_certificate = "{}"
+client_key = "{}"
+ca = "{}"
+"#,
+        settings.certificate.display(),
+        settings.key.display(),
+        settings.certificate.display(),
+    );
+
+    let resolved = resolve_toml(&configuration)??;
+    assert_eq!(
+        resolved.outbound_tls.len(),
+        1,
+        "the material is held for its rotation watch, not dropped once the \
+         client is built"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn half_a_client_certificate_pair_is_refused() -> Result<(), Box<dyn Error>> {
+    // Presenting a certificate needs its key, and a key alone proves nothing.
+    // Refused rather than ignored: a node that silently presented no identity
+    // would be rejected by the service later, with nothing here to explain it.
+    let directory = scratch("auth-mtls-half");
+    let (settings, _) = write_pair(&directory, "origin.internal");
+
+    for (line, missing) in [
+        (format!("client_certificate = \"{}\"", settings.certificate.display()), "client_key"),
+        (format!("client_key = \"{}\"", settings.key.display()), "client_certificate"),
+    ] {
+        let error = resolve_toml(&format!(
+            "[auth.publish]\nurl = \"https://auth.internal/admit\"\n{line}\n"
+        ))?
+        .err()
+        .ok_or("half a pair is refused")?
+        .to_string();
+        assert!(error.contains(missing), "{error}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unreadable_client_certificate_stops_startup() -> Result<(), Box<dyn Error>> {
+    let directory = scratch("auth-mtls-missing");
+    let error = resolve_toml(&format!(
+        r#"
+[auth.publish]
+url = "https://auth.internal/admit"
+client_certificate = "{}"
+client_key = "{}"
+"#,
+        directory.join("absent.pem").display(),
+        directory.join("absent.key").display(),
+    ))?
+    .err()
+    .ok_or("an unreadable identity is refused")?
+    .to_string();
+
+    assert!(error.contains("[auth.publish]"), "{error}");
     Ok(())
 }
 

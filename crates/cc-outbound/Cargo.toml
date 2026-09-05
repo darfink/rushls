@@ -16,6 +16,8 @@ http.workspace = true
 http-body-util.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
+rustls.workspace = true
+rustls-native-certs = "0.8"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
 

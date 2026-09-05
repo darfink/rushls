@@ -18,6 +18,8 @@ use std::{
 
 use bytesize::ByteSize;
 use cc_rtmp::ServerSessionTimeouts;
+use cc_tls::{ClientIdentity, load_roots};
+use rustls::pki_types::CertificateDer;
 use conf::{Conf, find_parameter, introspection::ProgramOptionMeta};
 use serde::Deserialize;
 use thiserror::Error;
@@ -54,6 +56,13 @@ pub struct ResolvedAppConfig {
     /// Returned rather than printed: configuration is read before a `Node`
     /// exists, so there is no observer yet, and the caller owns its output.
     pub warnings: Vec<String>,
+    /// Outbound mutual-TLS material, held for its rotation watches.
+    ///
+    /// Carried rather than dropped after building the clients: each entry owns
+    /// a filesystem watch, and dropping it would leave the client presenting
+    /// whatever certificate it started with until the process restarted --
+    /// which is the failure the watch exists to prevent, and a silent one.
+    pub outbound_tls: Vec<OutboundTls>,
 }
 
 /// Hooks and the client they deliver with, which carries their own deadline.
@@ -247,11 +256,13 @@ impl AppConfig {
         let (default_policy, policies) = self.accept.resolve()?;
         let stall = self.accept.stall;
         let open_admission = self.auth.is_open();
+        let mut outbound_tls = Vec::new();
         let authenticator = self.auth.resolve(
             default_policy,
             policies,
             defaults.session.maximum_admission_time,
             &mut client,
+            &mut outbound_tls,
         )?;
 
         let mut node = NodeConfig {
@@ -301,6 +312,7 @@ impl AppConfig {
             authenticator,
             hooks,
             warnings,
+            outbound_tls,
         })
     }
 
@@ -377,10 +389,17 @@ impl AuthAppConfig {
         policies: BTreeMap<String, StreamPolicy>,
         admission_deadline: Duration,
         client: &mut LazyHttpClient,
+        outbound_tls: &mut Vec<OutboundTls>,
     ) -> Result<Arc<dyn Authenticator>, ConfigError> {
         if let Some(publish) = self.publish {
             publish
-                .resolve(default, policies, admission_deadline, client)
+                .resolve(
+                    default,
+                    policies,
+                    admission_deadline,
+                    client,
+                    outbound_tls,
+                )
                 .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
         } else {
             Ok(Arc::new(OpenStreamAuthenticator::new(default)))
@@ -413,6 +432,15 @@ pub struct HttpAuthAppConfig {
     /// Reads the bearer credential from a mounted secret instead.
     #[conf(parameter, env)]
     token_file: Option<PathBuf>,
+    /// PEM certificate chain this node presents to the service.
+    #[conf(parameter, long, env)]
+    client_certificate: Option<PathBuf>,
+    /// PEM private key for that chain.
+    #[conf(parameter, long, env)]
+    client_key: Option<PathBuf>,
+    /// PEM authority to trust instead of the platform store.
+    #[conf(parameter, long, env)]
+    ca: Option<PathBuf>,
 }
 
 impl HttpAuthAppConfig {
@@ -422,6 +450,7 @@ impl HttpAuthAppConfig {
         policies: BTreeMap<String, StreamPolicy>,
         admission_deadline: Duration,
         client: &mut LazyHttpClient,
+        outbound_tls: &mut Vec<OutboundTls>,
     ) -> Result<HttpAuthenticator, ConfigError> {
         // A call allowed to outlive the admission deadline never gets to fail
         // on its own terms: the session times out first and reports a stage
@@ -451,13 +480,27 @@ impl HttpAuthAppConfig {
                     .transpose()
                     .map_err(|error| invalid(error.to_string()))?,
             },
-            client.with_limits(
-                self.request_timeout,
-                nonzero_bytes(
+            {
+                let limit = nonzero_bytes(
                     "the maximum auth response size",
                     self.maximum_response_bytes,
-                )?,
-            )?,
+                )?;
+                let tls = OutboundTlsAppConfig {
+                    certificate: self.client_certificate.clone(),
+                    key: self.client_key.clone(),
+                    ca: self.ca.clone(),
+                };
+                if tls.is_configured() {
+                    let tls = tls.resolve("[auth.publish]")?;
+                    let built = tls.client(self.request_timeout, limit)?;
+                    // The watch lives as long as the resolved configuration,
+                    // because dropping it stops rotations being noticed.
+                    outbound_tls.push(tls);
+                    built
+                } else {
+                    client.with_limits(self.request_timeout, limit)?
+                }
+            },
         ))
     }
 }
@@ -617,6 +660,103 @@ impl HookEndpointAppConfig {
     }
 }
 
+/// The mutual-TLS material one outbound destination presents and trusts.
+///
+/// Optional on every destination, and shared in shape between admission and
+/// hooks: both call operator-run services over a network the operator may not
+/// consider private, and the trust question is the same on each.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundTlsAppConfig {
+    /// PEM certificate chain this node presents, leaf first.
+    certificate: Option<PathBuf>,
+    /// PEM private key for that chain.
+    key: Option<PathBuf>,
+    /// PEM authority to trust instead of the platform store.
+    ///
+    /// Pinning matters as much as presenting: a client certificate proves this
+    /// node to the service, and pinning proves the service to this node. An
+    /// admission service that may widen what this origin accepts should be
+    /// authenticated in both directions.
+    ca: Option<PathBuf>,
+}
+
+impl OutboundTlsAppConfig {
+    /// Whether anything here needs a connector of its own.
+    fn is_configured(&self) -> bool {
+        self.certificate.is_some() || self.key.is_some() || self.ca.is_some()
+    }
+
+    /// Loads the identity and roots, starting a watch for rotations.
+    fn resolve(&self, label: &str) -> Result<OutboundTls, ConfigError> {
+        // Half a pair is a misconfiguration rather than a partial identity:
+        // presenting a certificate needs its key, and a key alone proves
+        // nothing. Refused rather than ignored, because a node that silently
+        // presented no identity would be rejected by the service later, with
+        // nothing here to explain why.
+        let identity = match (&self.certificate, &self.key) {
+            (Some(certificate), Some(key)) => Some(
+                ClientIdentity::new(
+                    certificate.clone(),
+                    key.clone(),
+                    Arc::new(cc_tls::IgnoreTlsEvents),
+                )
+                .map_err(|error| {
+                    invalid(format!("{label}: {error}"))
+                })?,
+            ),
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(invalid(format!(
+                    "{label} sets client_certificate without client_key"
+                )));
+            }
+            (None, Some(_)) => {
+                return Err(invalid(format!(
+                    "{label} sets client_key without client_certificate"
+                )));
+            }
+        };
+        let roots = self
+            .ca
+            .as_deref()
+            .map(|path| load_roots(path).map_err(|error| invalid(format!("{label}: {error}"))))
+            .transpose()?;
+
+        Ok(OutboundTls { identity, roots })
+    }
+}
+
+/// Resolved outbound TLS material, holding its own rotation watch.
+pub struct OutboundTls {
+    /// Held for its watch as much as its resolver: dropping it stops reloads.
+    identity: Option<ClientIdentity>,
+    roots: Option<Vec<CertificateDer<'static>>>,
+}
+
+impl OutboundTls {
+    /// A client presenting this destination's identity, under its own limits.
+    ///
+    /// Deliberately not drawn from the shared connector: an identity and a
+    /// pinned authority belong to the destination that configured them, and
+    /// pooling connections across destinations would mean presenting one
+    /// service's certificate to another. The cost is one connection pool per
+    /// destination that asks for mutual TLS, which is what asking for it means.
+    fn client(
+        &self,
+        request_timeout: Duration,
+        maximum_response_bytes: usize,
+    ) -> Result<HttpClient, ConfigError> {
+        HttpClient::with_identity(
+            ClientConfig::default(),
+            self.identity.as_ref().map(ClientIdentity::resolver),
+            self.roots.clone(),
+        )
+        .map(|client| client.with_limits(request_timeout, maximum_response_bytes))
+        .map_err(|error| invalid(error.to_string()))
+    }
+}
+
 /// Builds at most one outbound client, and only if something needs it.
 ///
 /// Reading the platform trust store and building a TLS configuration is real
@@ -643,6 +783,7 @@ impl LazyHttpClient {
         };
         Ok(shared.with_limits(request_timeout, maximum_response_bytes))
     }
+
 }
 
 /// Resolves the one stall deadline against the cadence it may be relative to.

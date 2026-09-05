@@ -1,8 +1,8 @@
 # RFC companion: what the configuration asks the application to become
 
 > **Status: largely implemented.** Outstanding, in the order they are least
-> to most self-contained: effective retention-depth reporting, mutual TLS to
-> outbound destinations, moderate timestamp jumps becoming discontinuities,
+> to most self-contained: effective retention-depth reporting, mutual TLS on
+> hook destinations, moderate timestamp jumps becoming discontinuities,
 > payload-carrying hooks, `[record]`, delta playlists, the disk tier,
 > playback authorization, and enforcing
 > `memory_per_publisher`. Every key belonging to an unbuilt feature is refused
@@ -360,11 +360,35 @@ is legibility — the file stays the whole truth about what the node accepts,
 reviewable and startup-validated, and the response only chooses among sets it
 defines.
 
-**Client certificates on outbound calls.** Specified for `[auth.publish]` and
-applicable unchanged to hooks. `outbound::ClientConfig` builds one shared
-connector today with no client-identity or custom-root path, so this is a
-per-destination TLS configuration rather than a parameter on an existing call.
-Not built; listed because the admission trust model leans on it.
+**Client certificates on outbound calls.** Built for `[auth.publish]`.
+
+The listener's rotation machinery is reused rather than duplicated: the
+resolver behind its `ArcSwap` now answers both `ResolvesServerCert` and
+`ResolvesClientCert`, and `ClientIdentity` owns a watch of the same kind. A
+client certificate expires exactly as a server one does, so giving the two
+different reload stories would have meant one of them silently not reloading —
+and a node that cannot renew without a restart drops publishers on rotation
+day.
+
+Resolution stays per handshake, so nothing rebuilds the client or rebinds a
+socket. Loading is fatal at startup and non-fatal on reload, matching the
+listener: a node told to present an identity it cannot read should not come up
+pretending it will be admitted, but a bad rotation should not start failing
+every call either.
+
+A pinned `ca` replaces the platform store rather than adding to it, because a
+deployment pinning its own authority wants that authority and not every public
+one as well. Trust roots are deliberately *not* watched: a root is what a
+rotation is validated against, and turns over on a far slower schedule than the
+leaf it signs.
+
+A destination configuring any of this gets its own connection pool. Pooling
+across destinations would mean presenting one service's certificate to another,
+so the cost of asking for mutual TLS is one pool per destination that asks.
+
+**Still outstanding for hooks.** `cc-hooks` holds one client for every
+destination, so per-hook identity is a change to that dispatcher rather than a
+configuration field. The keys are refused there until it lands.
 
 **An NTSC alias table in frame-rate parsing.** Four decimal spellings map to
 their true rationals before any comparison. Parsing only — `FrameRate::exceeds`

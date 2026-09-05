@@ -32,6 +32,7 @@ use rustls::{
     ServerConfig,
     crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+    client::ResolvesClientCert,
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
@@ -143,12 +144,30 @@ impl From<TlsError> for io::Error {
 }
 
 /// Answers every handshake from a slot that can be replaced underneath it.
+///
+/// Shared by both directions. A client certificate expires exactly as a server
+/// one does, so an outbound caller needs the same rotation story as a listener;
+/// giving each its own would mean one of them silently not reloading.
 #[derive(Debug)]
-struct CertificateResolver(ArcSwap<CertifiedKey>);
+pub struct CertificateResolver(ArcSwap<CertifiedKey>);
 
 impl ResolvesServerCert for CertificateResolver {
     fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(self.0.load_full())
+    }
+}
+
+impl ResolvesClientCert for CertificateResolver {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.load_full())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
     }
 }
 
@@ -176,6 +195,91 @@ fn load(settings: &TlsSettings, provider: &CryptoProvider) -> Result<CertifiedKe
         })?;
     CertifiedKey::from_der(chain, key, provider).map_err(TlsError::Unusable)
 }
+
+/// A client certificate and key that reload underneath a running caller.
+///
+/// The outbound mirror of [`TlsListener`], and deliberately built from the same
+/// parts. A client certificate expires on the same schedule a server one does,
+/// so a node that could not renew without a restart would drop publishers on
+/// rotation day — the failure the listener side already avoids.
+///
+/// Resolution happens per handshake through an [`ArcSwap`], so a rotation is one
+/// atomic store: connections already established keep the identity they
+/// negotiated with, and the next handshake picks up the new one.
+pub struct ClientIdentity {
+    resolver: Arc<CertificateResolver>,
+    /// Held because dropping it stops reloads.
+    _watcher: CertificateWatch,
+}
+
+impl ClientIdentity {
+    /// Loads the pair and starts watching for rotations.
+    ///
+    /// Failing at startup is fatal, unlike failing to reload later: a node
+    /// configured to present an identity it cannot read should not come up
+    /// pretending it will be admitted.
+    pub fn new<O: TlsObserver>(
+        certificate: PathBuf,
+        key: PathBuf,
+        observer: Arc<O>,
+    ) -> Result<Self, TlsError> {
+        // The watch is expressed in terms of a settings pair, and the two
+        // timeout fields it also carries are meaningless here. Passing the
+        // defaults keeps one loader rather than two that could disagree about
+        // what a usable pair is.
+        let settings = TlsSettings {
+            certificate,
+            key,
+            ..TlsSettings::default()
+        };
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let resolver = Arc::new(CertificateResolver(ArcSwap::from_pointee(load(
+            &settings, &provider,
+        )?)));
+        observer.certificate_loaded(&settings.certificate);
+
+        let watcher = CertificateWatch::start(
+            settings,
+            Arc::clone(&resolver),
+            provider,
+            observer,
+        )?;
+        Ok(Self {
+            resolver,
+            _watcher: watcher,
+        })
+    }
+
+    /// The resolver a `rustls` client configuration should ask per handshake.
+    ///
+    /// Handed out rather than a built configuration so the caller keeps
+    /// ownership of its own root store and protocol versions, which are not
+    /// this type's business.
+    pub fn resolver(&self) -> Arc<dyn ResolvesClientCert> {
+        Arc::clone(&self.resolver) as Arc<dyn ResolvesClientCert>
+    }
+}
+
+/// Reads PEM certificates to trust, for a caller pinning its own authority.
+///
+/// Not watched. A trust root is the thing a rotation is validated *against*,
+/// so it turns over on a different and far slower schedule than the leaf it
+/// signs; treating it as hot-reloadable would suggest otherwise.
+pub fn load_roots(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    let roots = CertificateDer::pem_file_iter(path)
+        .and_then(std::iter::Iterator::collect::<Result<Vec<_>, _>>)
+        .map_err(|source| TlsError::Unreadable {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if roots.is_empty() {
+        return Err(TlsError::Empty {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(roots)
+}
+
 
 /// A bound TLS listener plus the watch that keeps its certificate current.
 ///
@@ -303,8 +407,12 @@ impl<O: TlsObserver> axum::serve::Listener for TlsListener<O> {
     }
 }
 
-/// Keeps the debouncer and its pump alive for as long as the listener lives.
-struct CertificateWatch {
+/// Keeps the debouncer and its pump alive for as long as its owner lives.
+///
+/// Public so an outbound client can hold one too: dropping it silently stops
+/// reloads, so its lifetime has to be tied to whatever depends on the material
+/// staying current.
+pub struct CertificateWatch {
     _debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
     pump: tokio::task::JoinHandle<()>,
 }
@@ -316,7 +424,7 @@ impl Drop for CertificateWatch {
 }
 
 impl CertificateWatch {
-    fn start<O: TlsObserver>(
+    pub fn start<O: TlsObserver>(
         settings: TlsSettings,
         resolver: Arc<CertificateResolver>,
         provider: Arc<CryptoProvider>,
@@ -530,4 +638,82 @@ mod tests {
 
         assert_eq!(watched_directories(&settings), [PathBuf::from("/etc/tls")]);
     }
+
+    #[tokio::test]
+    async fn a_client_identity_presents_its_certificate_and_reloads_on_rotation() {
+        // The outbound mirror of the listener's rotation test. A client
+        // certificate expires the same way a server one does, so a node that
+        // could not renew without a restart would drop publishers on rotation
+        // day.
+        let directory = scratch("client-identity");
+        let (settings, first) = write_pair(&directory, "origin.internal");
+
+        let identity = ClientIdentity::new(
+            settings.certificate.clone(),
+            settings.key.clone(),
+            Arc::new(IgnoreTlsEvents),
+        )
+        .expect("the initial pair loads");
+
+        let presented = |identity: &ClientIdentity| {
+            ResolvesClientCert::resolve(&*identity.resolver, &[], &[])
+                .expect("an identity always resolves")
+                .cert[0]
+                .to_vec()
+        };
+        assert_eq!(presented(&identity), first);
+
+        // Rotate underneath the running identity.
+        let (_, second) = write_pair(&directory, "origin.internal");
+        assert_ne!(first, second, "the fixture generated a distinct pair");
+
+        // The watch debounces, so give it the debounce plus room to re-read.
+        for _ in 0..40 {
+            if presented(&identity) == second {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(
+            presented(&identity),
+            second,
+            "a rotated client certificate is picked up without a restart"
+        );
+    }
+
+    #[test]
+    fn a_client_identity_refuses_an_unreadable_pair_at_startup() {
+        // Fatal at startup, unlike a failed reload: a node configured to
+        // present an identity it cannot read should not come up pretending it
+        // will be admitted.
+        let directory = scratch("client-identity-missing");
+        assert!(matches!(
+            ClientIdentity::new(
+                directory.join("absent.pem"),
+                directory.join("absent.key"),
+                Arc::new(IgnoreTlsEvents),
+            ),
+            Err(TlsError::Unreadable { .. })
+        ));
+    }
+
+    #[test]
+    fn trust_roots_load_from_pem_and_an_empty_file_is_refused() {
+        let directory = scratch("roots");
+        let (settings, der) = write_pair(&directory, "authority.internal");
+
+        let roots = load_roots(&settings.certificate).expect("the authority loads");
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].to_vec(), der);
+
+        let empty = directory.join("empty.pem");
+        write_atomically(&empty, b"");
+        assert!(
+            matches!(load_roots(&empty), Err(TlsError::Empty { .. })),
+            "a file that parses but names no authority is refused rather than \
+             leaving an empty trust store that refuses every endpoint"
+        );
+    }
+
 }

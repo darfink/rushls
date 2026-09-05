@@ -18,7 +18,7 @@
 //! — so [`Endpoint::is_encrypted`] reports the scheme and leaves the judgement
 //! to the operator who chose the address.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Request, StatusCode, Uri, header};
@@ -27,6 +27,8 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
+use rustls::pki_types::CertificateDer;
+use rustls::client::ResolvesClientCert;
 use thiserror::Error;
 
 /// A validated destination.
@@ -201,6 +203,78 @@ impl HttpClient {
             },
         }
     }
+
+    /// Builds a client that also presents an identity, and may pin its trust.
+    ///
+    /// Separate from [`Self::new`] rather than an option on it, because the
+    /// two answer different questions: `new` is "who do I trust", this is
+    /// additionally "who am I". A caller that needs neither should not have to
+    /// say so.
+    ///
+    /// `identity` resolves per handshake, so a rotated certificate is picked up
+    /// without rebuilding this client or restarting the process. `roots`
+    /// replaces the platform store when present: a deployment pinning the
+    /// authority that signed its own services wants exactly that authority and
+    /// not every public one as well.
+    pub fn with_identity(
+        config: ClientConfig,
+        identity: Option<Arc<dyn ResolvesClientCert>>,
+        roots: Option<Vec<CertificateDer<'static>>>,
+    ) -> Result<Self, OutboundError> {
+        let mut connector = HttpConnector::new();
+        connector.set_connect_timeout(Some(config.connect_timeout));
+        connector.enforce_http(false);
+
+        let builder = rustls::ClientConfig::builder();
+        let builder = match roots {
+            Some(roots) => {
+                let mut store = rustls::RootCertStore::empty();
+                for root in roots {
+                    store
+                        .add(root)
+                        .map_err(|error| OutboundError::Unreachable(error.to_string()))?;
+                }
+                builder.with_root_certificates(store)
+            }
+            // The platform store, so an endpoint behind an internal authority
+            // works once that authority is installed the way everything else
+            // on the host already expects.
+            None => {
+                let mut store = rustls::RootCertStore::empty();
+                let loaded = rustls_native_certs::load_native_certs();
+                if loaded.certs.is_empty() {
+                    let reason = loaded
+                        .errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(OutboundError::Unreachable(format!(
+                        "no platform trust roots could be loaded: {reason}"
+                    )));
+                }
+                store.add_parsable_certificates(loaded.certs);
+                builder.with_root_certificates(store)
+            }
+        };
+
+        let tls = match identity {
+            Some(resolver) => builder.with_client_cert_resolver(resolver),
+            None => builder.with_no_client_auth(),
+        };
+
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(connector);
+
+        Ok(Self {
+            inner: Client::builder(TokioExecutor::new()).build(connector),
+            config,
+        })
+    }
+
 
     /// Builds a client trusting the platform's certificate store.
     ///
