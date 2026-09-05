@@ -551,37 +551,35 @@ impl LiveStream {
             &media,
             PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_)
         );
-        let capacity = |state: &StreamState| {
-            if adds_part && state.retained_parts() >= self.limits.maximum_parts {
-                return Err(StoreWriteError::PartCapacityExceeded {
-                    maximum: self.limits.maximum_parts,
-                });
-            }
-            if adds_segment && state.retained_segments() >= self.limits.maximum_segments {
-                return Err(StoreWriteError::SegmentCapacityExceeded {
-                    maximum: self.limits.maximum_segments,
-                });
-            }
-            if state
-                .retained_payload_bytes
-                .checked_add(additional)
-                .is_none_or(|total| total > self.limits.maximum_payload_bytes)
-            {
-                return Err(StoreWriteError::PayloadCapacityExceeded {
-                    maximum: self.limits.maximum_payload_bytes,
-                    additional,
-                });
-            }
-            Ok(())
+        // Make room rather than refuse. Every budget here bounds *retention*,
+        // and the only honest way to hold a bound while media keeps arriving
+        // is to drop the oldest media rather than the newest — which is what
+        // refusing amounted to, since a rejected write fails the session.
+        //
+        // At a long `retain` every one of these is reached in ordinary
+        // operation: bytes first at a high bitrate, the segment count first at
+        // a short cadence. All three therefore shed.
+        let over_capacity = |state: &StreamState| {
+            (adds_part && state.retained_parts() >= self.limits.maximum_parts)
+                || (adds_segment && state.retained_segments() >= self.limits.maximum_segments)
+                || state
+                    .retained_payload_bytes
+                    .checked_add(additional)
+                    .is_none_or(|total| total > self.limits.maximum_payload_bytes)
         };
-        if let Err(rejected) = capacity(&state) {
-            // Expired media from *other* renditions can still stand in the
-            // way of a hard ceiling; reclaim everything before refusing.
-            if state.sweep_expired(now) {
-                self.advance_media_revision();
-                capacity(&state)?;
+        if over_capacity(&state) {
+            // Expired media from *other* renditions can still stand in the way,
+            // and reclaiming it is free, so it goes first.
+            let mut reclaimed = state.sweep_expired(now);
+            // Then retire history, oldest first, until the write fits. Bounded
+            // by the number of retained segments: `shed_oldest` reports when a
+            // rendition has nothing left to give, so this cannot spin.
+            while over_capacity(&state) && state.shed_oldest() {
+                reclaimed = true;
             }
-            return Err(rejected);
+            if reclaimed {
+                self.advance_media_revision();
+            }
         }
 
         let advertised_before = state.renditions[index].bitrate.snapshot().advertised();
@@ -665,6 +663,30 @@ impl StreamState {
         self.prune_publication_anchors();
         self.recalculate_retained_bytes();
         changed
+    }
+
+    /// Retires the oldest retired segment held by any rendition.
+    ///
+    /// Oldest across the whole stream rather than per rendition, so a stream
+    /// whose renditions publish at different cadences sheds in publication
+    /// order instead of unevenly truncating whichever one the write landed in.
+    fn shed_oldest(&mut self) -> bool {
+        let Some(index) = self
+            .renditions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, rendition)| rendition.oldest_shed_candidate().map(|at| (at, index)))
+            .min()
+            .map(|(_, index)| index)
+        else {
+            return false;
+        };
+        let shed = self.renditions[index].shed_oldest();
+        if shed {
+            self.renditions[index].publish_snapshot();
+            self.recalculate_retained_bytes();
+        }
+        shed
     }
 
     /// Sweeps one rendition's expired resources, republishing its snapshot

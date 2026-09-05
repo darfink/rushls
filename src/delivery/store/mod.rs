@@ -67,24 +67,36 @@ pub use media::{
     RenditionLiveEdge, RenditionSnapshot, SegmentBody, StoredInitialization, StoredPart,
     StoredSegment, StoredSegmentKind,
 };
-pub use retention::{DurationRule, RetentionPolicy, TargetDurationMultiple};
+pub use retention::{
+    DurationRule, MINIMUM_PLAYLIST_SEGMENTS, RetentionPolicy, TargetDurationMultiple,
+};
 pub use stream::LiveStream;
 
 /// Process-wide bounds and lifecycle policy for [`StreamStore`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreLimits {
     pub maximum_streams: usize,
-    /// How long an unleased stream remains fetchable for reconnection.
-    pub idle_retention: Duration,
     /// Cohesive HLS retention and capacity policy applied to each stream.
     pub retention: RetentionPolicy,
+}
+
+impl StoreLimits {
+    /// How long an unleased stream stays available for a publisher to return.
+    ///
+    /// The same window its media is fetchable for, deliberately. A stream that
+    /// still has playable media is one a viewer can still be watching, and
+    /// retiring it early would end that playback; a stream whose media has all
+    /// expired has nothing left to resume into. One window answers both, so
+    /// there is no second retention concept to keep in step with this one.
+    pub fn reconnect_window(&self) -> Duration {
+        self.retention.retain
+    }
 }
 
 impl Default for StoreLimits {
     fn default() -> Self {
         Self {
             maximum_streams: 1_024,
-            idle_retention: Duration::from_secs(30),
             retention: RetentionPolicy::default(),
         }
     }
@@ -245,7 +257,7 @@ impl StreamStore {
 
         for (stream, live) in current.iter() {
             live.sweep_expired();
-            if live.retire_if_idle_for(self.limits.idle_retention) {
+            if live.retire_if_idle_for(self.limits.reconnect_window()) {
                 // Only a stream viewers could reach becomes unreachable. One
                 // that never served anything was never available to lose.
                 if live.was_announced() {

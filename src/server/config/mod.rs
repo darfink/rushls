@@ -24,8 +24,8 @@ use thiserror::Error;
 
 use crate::{
     admission::{
-        Authenticator, HttpAuthConfig, HttpAuthenticator, IngestTimingPolicy,
-        OpenStreamAuthenticator, StreamPolicy, TakeoverPolicy,
+        Authenticator, Ceiling, HttpAuthConfig, HttpAuthenticator, OpenStreamAuthenticator, Pace,
+        StreamPolicy, TakeoverPolicy,
     },
     delivery::hls::uri::UriBase,
     delivery::store::{DurationRule, TargetDurationMultiple},
@@ -206,12 +206,9 @@ impl AppConfig {
         let mut client = LazyHttpClient::default();
         let mut warnings = Vec::new();
         warnings.extend(Self::unrecognized_environment(env));
-        let part_duration = self.hls.part_duration;
         let authenticator = self.auth.resolve(
             defaults.session.maximum_admission_time,
-            part_duration,
             &mut client,
-            &mut warnings,
         )?;
         let mut node = NodeConfig {
             maximum_sessions: self.server.maximum_concurrent_publishers,
@@ -233,7 +230,7 @@ impl AppConfig {
             .apply(&mut node, self.hls.segment_duration())?;
         // Same reason as health: the reconnect window is validated against the
         // segment duration, which only `hls.apply` establishes.
-        self.storage.apply(&mut node, self.hls.segment_duration())?;
+        self.storage.apply(&mut node)?;
         node.http = self.http.resolve()?;
         node.metrics = self.metrics.resolve()?;
         let hooks = self.hooks.resolve(&mut client)?;
@@ -297,14 +294,11 @@ impl AuthAppConfig {
     fn resolve(
         self,
         admission_deadline: Duration,
-        part_duration: Duration,
         client: &mut LazyHttpClient,
-        warnings: &mut Vec<String>,
     ) -> Result<Arc<dyn Authenticator>, ConfigError> {
         let mut profiles = self.policies.unwrap_or_default();
         profiles.0.entry("default".into()).or_default();
         let policies = resolve_policies(profiles)?;
-        warn_about_tight_pacing(&policies, part_duration, warnings);
 
         if let Some(http) = self.http {
             http.resolve(policies, admission_deadline, client)
@@ -624,26 +618,10 @@ fn resolve_policies(
         .collect()
 }
 
-/// What happens when a publisher's media runs ahead of wall clock.
-///
-/// Named for the condition rather than the mechanism, because that is the
-/// question an operator is answering: a file pushed at full speed and an
-/// encoder catching up after a stall both look like this, and only the
-/// operator knows which of the two their publishers are.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum FasterThanRealtimeValue {
-    /// Sleep the publisher until wall clock catches up.
-    Pace,
-    /// Refuse the publication instead.
-    Reject,
-}
-
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyAppConfig {
     takeovers: Option<TakeoversValue>,
-    faster_than_realtime: Option<FasterThanRealtimeValue>,
     maximum_lead: Option<String>,
     maximum_timestamp_jump: Option<String>,
     video_codecs: Option<Vec<CodecValue>>,
@@ -657,84 +635,29 @@ struct PolicyAppConfig {
 }
 
 impl PolicyAppConfig {
-    /// Builds the timing rule from one threshold and one choice of response.
-    ///
-    /// Both modes tolerate the same thing — media running ahead of wall clock
-    /// — so `maximum_lead` means one thing regardless of which is selected,
-    /// and only the consequence of exceeding it changes.
-    fn resolve_timing(
-        &self,
-        name: &str,
-        current: IngestTimingPolicy,
-    ) -> Result<IngestTimingPolicy, ConfigError> {
-        let inherited = match current {
-            IngestTimingPolicy::RequireRealtime { maximum_lead }
-            | IngestTimingPolicy::PaceToRealtime { maximum_lead, .. } => maximum_lead,
-        };
-        let maximum_lead = match &self.maximum_lead {
-            Some(value) => duration(name, "maximum_lead", value)?,
-            None => inherited,
-        };
-        if maximum_lead.is_zero() {
-            return Err(invalid(format!(
-                "auth policy `{name}`: maximum_lead must be nonzero; a \
-                 publisher cannot be required to never run ahead at all"
-            )));
-        }
-
-        let mode = self.faster_than_realtime.unwrap_or(match current {
-            IngestTimingPolicy::PaceToRealtime { .. } => FasterThanRealtimeValue::Pace,
-            IngestTimingPolicy::RequireRealtime { .. } => FasterThanRealtimeValue::Reject,
-        });
-
-        match mode {
-            FasterThanRealtimeValue::Reject => {
-                // A jump limit only makes sense where the response is to wait.
-                // Rejecting already catches a broken timeline through the lead
-                // itself, so this key would silently do nothing.
-                if self.maximum_timestamp_jump.is_some() {
-                    return Err(invalid(format!(
-                        "auth policy `{name}`: maximum_timestamp_jump applies \
-                         only to `faster_than_realtime = \"pace\"`, because \
-                         rejecting already catches a forward jump through \
-                         maximum_lead"
-                    )));
-                }
-                Ok(IngestTimingPolicy::RequireRealtime { maximum_lead })
-            }
-            FasterThanRealtimeValue::Pace => {
-                let inherited_jump = match current {
-                    IngestTimingPolicy::PaceToRealtime {
-                        maximum_timestamp_jump,
-                        ..
-                    } => maximum_timestamp_jump,
-                    IngestTimingPolicy::RequireRealtime { .. } => default_maximum_timestamp_jump(),
-                };
-                let maximum_timestamp_jump = match &self.maximum_timestamp_jump {
-                    Some(value) => duration(name, "maximum_timestamp_jump", value)?,
-                    None => inherited_jump,
-                };
-                if maximum_timestamp_jump <= maximum_lead {
-                    return Err(invalid(format!(
-                        "auth policy `{name}`: maximum_timestamp_jump must \
-                         exceed maximum_lead, or every tolerated lead would \
-                         also be a broken timeline"
-                    )));
-                }
-                Ok(IngestTimingPolicy::PaceToRealtime {
-                    maximum_lead,
-                    maximum_timestamp_jump,
-                })
-            }
-        }
-    }
-
     fn resolve(self, name: &str) -> Result<StreamPolicy, ConfigError> {
         let mut policy = StreamPolicy::permissive();
         if let Some(takeovers) = self.takeovers {
             policy.takeovers = takeovers.into();
         }
-        policy.ingest_timing = self.resolve_timing(name, policy.ingest_timing)?;
+        // Interim mapping: this whole table is replaced by `[accept]` when the
+        // configuration layer is rewritten. `maximum_lead` becomes the burst,
+        // which is the closest the old surface can express.
+        if let Some(value) = &self.maximum_lead {
+            let burst = duration(name, "maximum_lead", value)?;
+            if burst.is_zero() {
+                return Err(invalid(format!(
+                    "auth policy `{name}`: maximum_lead must be nonzero"
+                )));
+            }
+            policy.ceiling = Some(Ceiling {
+                pace: Pace::realtime(),
+                burst,
+            });
+        }
+        if let Some(value) = &self.maximum_timestamp_jump {
+            policy.maximum_timestamp_jump = duration(name, "maximum_timestamp_jump", value)?;
+        }
         if let Some(codecs) = self.video_codecs {
             policy.accepted_video_codecs = validate_codecs(
                 name,
@@ -795,46 +718,27 @@ pub struct IngestAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct HealthAppConfig {
-    /// How long the input may deliver nothing before the session is failed.
+    /// How long a publisher may deliver nothing usable before it is dropped.
     ///
     /// Expressed as a multiple of the segment duration (`"1x"`) or a fixed
-    /// duration (`"5s"`). The multiple form is the safer default: an absolute
-    /// value that is sensible against a 6s segment silently becomes
-    /// aggressive when segmentation is retuned, and stall detection that
-    /// fires before one segment can complete fails healthy publishers.
+    /// duration (`"12s"`). The multiple form is the safer default: an absolute
+    /// value that is sensible against a 6s segment silently becomes aggressive
+    /// when segmentation is retuned, and stall detection that fires before one
+    /// segment can complete fails healthy publishers.
     #[conf(
         parameter,
         long,
         env,
-        default_value = "1x",
+        default_value = "2x",
         value_parser = parse_stall_rule,
         serde(use_value_parser)
     )]
-    source_stall: DurationRule,
-    /// How long normalization may produce nothing while input still arrives.
-    ///
-    /// Distinct from `source_stall`: this is the publisher still sending while
-    /// the media stops making sense, which is a different fault from the
-    /// publisher going quiet.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "1x",
-        value_parser = parse_stall_rule,
-        serde(use_value_parser)
-    )]
-    media_stall: DurationRule,
-    /// How far past its own output cadence a session may fall behind.
-    ///
-    /// Always relative, because the quantity it bounds is the cadence itself.
-    #[conf(parameter, long, env, default_value = "3")]
-    publication_stall_multiplier: u32,
+    stall: DurationRule,
     /// How often liveness is judged while a session runs.
     ///
-    /// A sampling rate rather than a policy: near the stall values above it
-    /// makes detection jittery, and well below them it costs work for no
-    /// extra sensitivity.
+    /// A sampling rate rather than a policy: near the stall value above it
+    /// makes detection jittery, and well below it costs work for no extra
+    /// sensitivity.
     #[conf(
         parameter,
         long,
@@ -847,40 +751,27 @@ pub struct HealthAppConfig {
 }
 
 impl HealthAppConfig {
-    /// Resolve against the segment duration the relative forms are sized by.
+    /// Resolve against the segment duration the relative form is sized by.
     fn apply(&self, node: &mut NodeConfig, segment_duration: Duration) -> Result<(), ConfigError> {
-        if self.publication_stall_multiplier == 0 {
-            return Err(invalid(
-                "ingest.health.publication_stall_multiplier must be at least one",
-            ));
-        }
         if self.health_interval.is_zero() {
             return Err(invalid("ingest.health.health_interval must be nonzero"));
         }
 
-        let source_stall = self.source_stall.resolve(segment_duration);
-        let media_stall = self.media_stall.resolve(segment_duration);
-        for (name, value) in [("source_stall", source_stall), ("media_stall", media_stall)] {
-            if value.is_zero() {
-                return Err(invalid(format!("ingest.health.{name} must be nonzero")));
-            }
-            // Sampling cannot observe a deadline shorter than its own period,
-            // so such a value is not the tighter detection it looks like.
-            if value < self.health_interval {
-                return Err(invalid(format!(
-                    "ingest.health.{name} ({value:?}) is shorter than the health \
-                     interval ({:?}), so it cannot be observed",
-                    self.health_interval
-                )));
-            }
+        let stall = self.stall.resolve(segment_duration);
+        if stall.is_zero() {
+            return Err(invalid("ingest.health.stall must be nonzero"));
+        }
+        // Sampling cannot observe a deadline shorter than its own period, so
+        // such a value is not the tighter detection it looks like.
+        if stall < self.health_interval {
+            return Err(invalid(format!(
+                "ingest.health.stall ({stall:?}) is shorter than the health \
+                 interval ({:?}), so it cannot be observed",
+                self.health_interval
+            )));
         }
 
-        node.session.supervision.health.source_stall_timeout = source_stall;
-        node.session.supervision.health.media_stall_timeout = media_stall;
-        node.session
-            .supervision
-            .health
-            .stalled_publication_multiplier = self.publication_stall_multiplier;
+        node.session.supervision.health.stall = stall;
         node.session.supervision.health_interval = self.health_interval;
         Ok(())
     }
@@ -1177,6 +1068,20 @@ pub struct HlsAppConfig {
         serde(use_value_parser)
     )]
     playlist_window: DurationRule,
+    /// How far behind the live edge a player is told to start.
+    ///
+    /// A multiple of the part duration (`"3x"`) or a fixed duration (`"3s"`).
+    /// This is the floor on live-edge latency, and the multiple form is the
+    /// default because the quantity it bounds is the part cadence itself.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "3x",
+        value_parser = parse_playlist_window,
+        serde(use_value_parser)
+    )]
+    hold_back: DurationRule,
 }
 
 impl HlsAppConfig {
@@ -1208,16 +1113,25 @@ impl HlsAppConfig {
         }
         node.session.segmentation =
             SegmentationPolicy::latency_first(self.segment_duration, self.part_duration);
-        // The store keeps a tag-count floor beside the duration floor; the
-        // count is derived from the same window so the knob means one thing,
-        // whatever cadence a rendition actually locks.
-        let minimum_segments = window_duration
-            .as_nanos()
-            .div_ceil(self.segment_duration.as_nanos().max(1));
-        node.store.retention.minimum_playlist_segments =
-            usize::try_from(minimum_segments.max(1)).unwrap_or(usize::MAX);
-        node.store.retention.minimum_playlist_duration = window;
+        // Interim mapping: the advertised window and the retention window are
+        // one quantity now, so the old playlist knob resolves straight into
+        // it. `[hls] retain` replaces this when the file is rewritten.
+        node.store.retention.retain = window_duration;
         node.hls.uri_base = UriBase::new(self.public_base_url.clone());
+        // Refused rather than raised, unlike the retention floors: a hold-back
+        // under two parts asks for a latency the protocol cannot deliver, and
+        // honouring it approximately would advertise a promise that makes
+        // clients stall.
+        let hold_back = self.hold_back.resolve(self.part_duration);
+        if hold_back < self.part_duration.saturating_mul(2) {
+            return Err(invalid(format!(
+                "HLS hold_back ({hold_back:?}) must be at least twice the part duration ({:?}): \
+                 a client given less than two parts of head start runs out of buffered media \
+                 on any loss",
+                self.part_duration
+            )));
+        }
+        node.hls.timing.part_hold_back = self.hold_back;
         Ok(())
     }
 }
@@ -1292,21 +1206,6 @@ pub struct StorageAppConfig {
     /// Maximum published or recently inactive streams retained by the process.
     #[conf(parameter, long, env, default_value = "1024")]
     maximum_streams: usize,
-    /// Time an inactive stream remains available for a publisher to reconnect.
-    ///
-    /// At least three times the segment duration. A viewer holds playable
-    /// media when its publisher goes away — `HOLD-BACK` at the live edge,
-    /// more after seeking back — and a shorter window retires the stream
-    /// while that media is still being played.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "30s",
-        value_parser = humantime::parse_duration,
-        serde(use_value_parser)
-    )]
-    inactive_stream_retention: Duration,
     /// Maximum retained media payload for one stream.
     #[conf(
         parameter,
@@ -1319,29 +1218,11 @@ pub struct StorageAppConfig {
 }
 
 impl StorageAppConfig {
-    /// Resolve against the segment duration the reconnect floor is sized by.
-    fn apply(&self, node: &mut NodeConfig, segment_duration: Duration) -> Result<(), ConfigError> {
+    fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
         if self.maximum_streams == 0 {
             return Err(invalid("storage must allow at least one stream"));
         }
-        // A viewer is handed content the playlist already advertised: a
-        // standard player sits HOLD-BACK behind the live edge, and a scrubbing
-        // one may be anywhere in the window. Retiring the stream sooner than
-        // the shortest of those promises cuts off playback of media that was
-        // promised as fetchable, so a reconnect window below the protocol's
-        // own three-target floor is refused rather than silently raised.
-        let reconnect_floor = segment_duration.saturating_mul(3);
-        if self.inactive_stream_retention < reconnect_floor {
-            return Err(invalid(format!(
-                "storage inactive_stream_retention ({:?}) must be at least three times the \
-                 segment duration ({reconnect_floor:?}): a viewer at the live edge still \
-                 holds HOLD-BACK worth of playable media when its publisher goes away, and \
-                 a shorter reconnect window retires the stream out from under it",
-                self.inactive_stream_retention
-            )));
-        }
         node.store.maximum_streams = self.maximum_streams;
-        node.store.idle_retention = self.inactive_stream_retention;
         node.store.retention.maximum_payload_bytes = nonzero_bytes(
             "maximum media retained per stream",
             self.maximum_media_per_stream,
@@ -1748,53 +1629,10 @@ fn env_value<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsSt
         .map(|(_, value)| value.as_os_str())
 }
 
-/// Flags a pacing threshold tight enough to throttle a well-behaved publisher.
-///
-/// The pacer works on individual samples, so an encoder that hands over a whole
-/// group of pictures at once is legitimately that far ahead the instant it does
-/// — through no fault of its own. A lead below the node's own part duration is
-/// therefore near-certainly too tight, and the symptom is not an error but
-/// backpressure and rising latency, which reads as a network problem.
-///
-/// Only for `pace`. Under `reject` a tight lead is the entire point: that is
-/// how an operator says a stream must be genuinely live.
-fn warn_about_tight_pacing(
-    policies: &BTreeMap<String, StreamPolicy>,
-    part_duration: Duration,
-    warnings: &mut Vec<String>,
-) {
-    for (name, policy) in policies {
-        if let IngestTimingPolicy::PaceToRealtime { maximum_lead, .. } = policy.ingest_timing
-            && maximum_lead < part_duration
-        {
-            warnings.push(format!(
-                "auth policy `{name}` paces at a maximum_lead of {maximum_lead:?}, \
-                 below the {part_duration:?} part duration; a publisher that \
-                 emits a group of pictures at a time will be slowed even when \
-                 it is running at realtime"
-            ));
-        }
-    }
-}
-
 /// Parses one policy duration, naming the field an operator mistyped.
 fn duration(policy: &str, field: &str, value: &str) -> Result<Duration, ConfigError> {
     humantime::parse_duration(value)
         .map_err(|error| invalid(format!("auth policy `{policy}`: {field} {error}")))
-}
-
-/// Used when a policy switches to pacing without naming a jump limit.
-///
-/// Read from the built-in permissive policy rather than written twice, so the
-/// default cannot drift from the one the library ships.
-fn default_maximum_timestamp_jump() -> Duration {
-    match StreamPolicy::permissive().ingest_timing {
-        IngestTimingPolicy::PaceToRealtime {
-            maximum_timestamp_jump,
-            ..
-        } => maximum_timestamp_jump,
-        IngestTimingPolicy::RequireRealtime { .. } => Duration::from_secs(10),
-    }
 }
 
 fn resolve_optional_text_secret(

@@ -46,11 +46,7 @@ pub async fn supervise(
     session: &mut LiveSession,
     context: &SessionContext,
     policy: SupervisionPolicy,
-    expected_publication_interval: Duration,
 ) -> Result<SessionOutcome, SupervisionError> {
-    // The session has just entered Running, which is also the instant the
-    // muxer's first publication is owed from.
-    let running_since = Instant::now();
     let mut checks = tokio::time::interval(policy.health_interval);
     checks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // The first tick completes immediately; consume it so the first real
@@ -75,9 +71,7 @@ pub async fn supervise(
                     context.meters(),
                     Instant::now(),
                     context.phase(),
-                    expected_publication_interval,
                     policy.health,
-                    running_since,
                 );
                 if evaluation.is_stalled() {
                     context.meters().process().unhealthy_termination();

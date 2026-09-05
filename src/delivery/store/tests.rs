@@ -29,8 +29,13 @@ fn stream() -> StreamId {
 fn limits() -> StoreLimits {
     StoreLimits {
         maximum_streams: 8,
-        idle_retention: Duration::from_secs(30),
-        retention: RetentionPolicy::default(),
+        retention: RetentionPolicy {
+            // Six six-second segments. Pinned rather than taken from the
+            // default so these fixtures describe a window of a known size,
+            // independent of whatever `retain` a shipped file chooses.
+            retain: Duration::from_secs(36),
+            ..RetentionPolicy::default()
+        },
     }
 }
 
@@ -194,10 +199,12 @@ fn configure(lease: &StreamLease, rendition: u32, chunked: bool) {
 }
 
 #[test]
-fn fractional_playlist_duration_policy_controls_the_visible_window() {
+fn a_retain_below_the_protocol_floor_is_raised_to_it() {
     let mut limits = limits();
-    limits.retention.minimum_playlist_segments = 0;
-    limits.retention.minimum_playlist_duration = TargetDurationMultiple::new(3, nz::u32!(2)).into();
+    // Nine seconds against six-second segments is one and a half targets,
+    // below the three a live playlist must carry. It is raised rather than
+    // refused, so the window holds three segments and not one.
+    limits.retention.retain = Duration::from_secs(9);
     let store = StreamStore::new(limits);
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
@@ -216,8 +223,8 @@ fn fractional_playlist_duration_policy_controls_the_visible_window() {
     }
 
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
-    assert_eq!(snapshot.segments.len(), 2);
-    assert_eq!(snapshot.segments[0].msn, Msn(1));
+    assert_eq!(snapshot.segments.len(), 3);
+    assert_eq!(snapshot.segments[0].msn, Msn(0));
 }
 
 #[test]
@@ -842,6 +849,11 @@ fn part_tag_retention_never_exposes_only_a_parent_segment_suffix() {
 
 #[tokio::test(start_paused = true)]
 async fn removed_segments_obey_their_availability_deadline() {
+    // `retain` is both the advertised window and the fetch promise, so a
+    // segment reaches its deadline at about the moment it leaves the playlist.
+    // What this pins is the grace between the two: a client that began
+    // fetching just before departure keeps the segment for one target
+    // duration, and no longer.
     let store = store();
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
@@ -860,10 +872,9 @@ async fn removed_segments_obey_their_availability_deadline() {
             tokio::time::advance(Duration::from_secs(6)).await;
         }
     }
+
+    // The seventh publication pushed the first out of the 36s window.
     let first = SegmentId(1);
-    assert!(lease.live().segment(RenditionId(0), first).is_some());
-    tokio::time::advance(Duration::from_secs(6)).await;
-    assert!(lease.live().segment(RenditionId(0), first).is_none());
     assert_eq!(
         lease
             .live()
@@ -873,16 +884,26 @@ async fn removed_segments_obey_their_availability_deadline() {
             .len(),
         6
     );
-}
+    assert!(
+        lease.live().segment(RenditionId(0), first).is_some(),
+        "a segment that just left the window is still fetchable, so a request \
+         already in flight for it does not fail"
+    );
 
+    tokio::time::advance(Duration::from_secs(6)).await;
+    store.maintain();
+    assert!(
+        lease.live().segment(RenditionId(0), first).is_none(),
+        "past its grace the promise has expired and the media is released"
+    );
+}
 #[test]
 fn live_window_never_falls_below_three_target_durations() {
     let mut limits = limits();
     // The shipped default is a six-target window; this test pins the floor
     // the spec makes mandatory, so the mechanism is what is being exercised
     // rather than whichever default is current.
-    limits.retention.minimum_playlist_duration =
-        DurationRule::MultipleOfTarget(TargetDurationMultiple::integer(3));
+    limits.retention.retain = Duration::from_secs(18);
     let store = StreamStore::new(limits);
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
@@ -940,7 +961,10 @@ async fn initializations_live_until_every_dependent_resource_expires() {
 }
 
 #[test]
-fn payload_capacity_failure_does_not_mutate_the_open_segment() {
+fn a_stream_over_its_byte_budget_sheds_history_rather_than_failing_the_write() {
+    // The budget bounds retention, not the session. Refusing here — the
+    // previous behaviour — killed the publisher, and at a long `retain` that
+    // is the ordinary case rather than an edge one.
     let mut limits = limits();
     limits.retention.maximum_payload_bytes = 4;
     let store = StreamStore::new(limits);
@@ -951,19 +975,17 @@ fn payload_capacity_failure_does_not_mutate_the_open_segment() {
 
     assert_eq!(
         lease.write(chunk(0, 0, 1, 1, 1, 1)),
-        Err(StoreWriteError::PayloadCapacityExceeded {
-            maximum: 4,
-            additional: 1,
-        })
+        Ok(true),
+        "a write that does not fit sheds the oldest media instead of failing"
     );
-    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
-    let open = snapshot.open_segment.as_ref().unwrap();
-    assert_eq!(open.parts.len(), 1);
-    assert_eq!(lease.live().retained_payload_bytes(), 4);
+    assert!(
+        lease.live().retained_payload_bytes() <= 4 + 1,
+        "retention stays bounded by the budget it was given"
+    );
 }
 
 #[test]
-fn object_capacity_failure_is_atomic_even_for_empty_payloads() {
+fn a_stream_over_its_part_budget_sheds_rather_than_failing_the_write() {
     let mut limits = limits();
     limits.retention.maximum_parts = 1;
     let store = StreamStore::new(limits);
@@ -971,17 +993,16 @@ fn object_capacity_failure_is_atomic_even_for_empty_payloads() {
     configure(&lease, 0, true);
     write(&lease, chunk(0, 0, 0, 0, 1, 0));
 
-    assert_eq!(
-        lease.write(chunk(0, 0, 1, 1, 1, 0)),
-        Err(StoreWriteError::PartCapacityExceeded { maximum: 1 })
-    );
+    assert_eq!(lease.write(chunk(0, 0, 1, 1, 1, 0)), Ok(true));
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
-    assert_eq!(snapshot.open_segment.as_ref().unwrap().parts.len(), 1);
-    assert_eq!(snapshot.live_edge.next_part_id, Some(PartId(2)));
+    assert_eq!(snapshot.live_edge.next_part_id, Some(PartId(3)));
 }
 
 #[test]
-fn segment_count_capacity_failure_is_atomic() {
+fn a_stream_over_its_segment_budget_sheds_rather_than_failing_the_write() {
+    // The budget most easily reached in practice: a short cadence with a long
+    // retain needs far more segment slots than the compiled ceiling allows,
+    // and refusing meant the session died part-way through a broadcast.
     let mut limits = limits();
     limits.retention.maximum_segments = 6;
     let store = StreamStore::new(limits);
@@ -1000,18 +1021,14 @@ fn segment_count_capacity_failure_is_atomic() {
         );
     }
 
-    assert_eq!(
-        lease.write(direct(0, 6, 36, 6, 0)),
-        Err(StoreWriteError::SegmentCapacityExceeded { maximum: 6 })
-    );
+    assert_eq!(lease.write(direct(0, 6, 36, 6, 0)), Ok(true));
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
-    assert_eq!(snapshot.segments.len(), 6);
     assert_eq!(
         snapshot.live_edge.last_segment,
-        Some((Msn(5), SegmentId(6)))
+        Some((Msn(6), SegmentId(7))),
+        "the newest media is kept and the oldest is what gives way"
     );
 }
-
 #[test]
 fn ending_and_releasing_a_rendition_keeps_it_terminal() {
     let store = store();
@@ -1371,7 +1388,7 @@ async fn a_reconnect_does_not_announce_a_stream_viewers_never_lost() {
 
     // Nobody comes back this time.
     drop(second);
-    tokio::time::advance(limits().idle_retention + Duration::from_secs(1)).await;
+    tokio::time::advance(limits().reconnect_window() + Duration::from_secs(1)).await;
 
     assert_eq!(
         store.maintain().retired,
@@ -1387,7 +1404,7 @@ async fn a_stream_that_never_served_anything_never_became_unavailable() {
     let lease = lease(&store, &[(0, true)]);
 
     drop(lease);
-    tokio::time::advance(limits().idle_retention + Duration::from_secs(1)).await;
+    tokio::time::advance(limits().reconnect_window() + Duration::from_secs(1)).await;
 
     assert_eq!(
         store.maintain(),

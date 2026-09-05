@@ -369,21 +369,21 @@ impl SessionMeters {
     pub fn source_idle_for(&self, now: Instant) -> Option<Duration> {
         self.counters
             .source_seen
-            .idle_for(self.counters.started_at, now)
+            .idle_for(self.counters.active_elapsed(now))
     }
 
     /// How long ago normalization last produced a sample.
     pub fn media_idle_for(&self, now: Instant) -> Option<Duration> {
         self.counters
             .media_seen
-            .idle_for(self.counters.started_at, now)
+            .idle_for(self.counters.active_elapsed(now))
     }
 
     /// How long ago a chunk or complete segment became available to viewers.
     pub fn publication_idle_for(&self, now: Instant) -> Option<Duration> {
         self.counters
             .publication_seen
-            .idle_for(self.counters.started_at, now)
+            .idle_for(self.counters.active_elapsed(now))
     }
 
     pub fn publisher_backpressured(&self) -> bool {
@@ -403,30 +403,50 @@ impl SessionMeters {
 /// Stored as one atomic so a stage can mark it from the same batch update it
 /// was already making, without a lock and without a second timestamp source to
 /// drift from the counters an operator reads.
+///
+/// Measured on the session's *active* clock rather than wall clock — see
+/// [`SessionCounters::active_elapsed`].
 #[derive(Debug, Default)]
 struct LivenessMark(AtomicU64);
 
 impl LivenessMark {
-    /// Records "now", measured from the session's own start.
+    /// Records the current active-clock reading.
     ///
     /// The stored value is biased by one so that zero — the initial state —
     /// unambiguously means never, without needing a second flag to say so.
-    fn mark(&self, started_at: Instant) {
-        let elapsed = Instant::now().saturating_duration_since(started_at);
+    fn mark(&self, active_elapsed: Duration) {
         let nanos =
-            u64::try_from(elapsed.as_nanos().min(u128::from(u64::MAX - 1))).unwrap_or(u64::MAX);
+            u64::try_from(active_elapsed.as_nanos().min(u128::from(u64::MAX - 1))).unwrap_or(u64::MAX);
         self.0.store(nanos + 1, Ordering::Relaxed);
     }
 
     /// How long ago this was last marked, or `None` if it never was.
-    fn idle_for(&self, started_at: Instant, now: Instant) -> Option<Duration> {
+    fn idle_for(&self, active_elapsed: Duration) -> Option<Duration> {
         let stored = self.0.load(Ordering::Relaxed);
         if stored == 0 {
             return None;
         }
 
-        let seen_at = started_at + Duration::from_nanos(stored - 1);
-        Some(now.saturating_duration_since(seen_at))
+        Some(active_elapsed.saturating_sub(Duration::from_nanos(stored - 1)))
+    }
+}
+
+impl SessionCounters {
+    /// Elapsed session time with deliberate pacing sleeps removed.
+    ///
+    /// Liveness is measured on this clock rather than on wall clock, because a
+    /// publisher the pacer is sleeping is idle by this node's own instruction.
+    /// Charging that against a stall deadline would drop exactly the publishers
+    /// a `ceiling` is throttling correctly.
+    ///
+    /// Discounting the sleep rather than suppressing the check is what keeps
+    /// the alarm armed throughout: a stage that genuinely stops producing while
+    /// the pacer happens to be sleeping still ages on this clock, because only
+    /// the sleeping is subtracted and not the silence around it.
+    fn active_elapsed(&self, now: Instant) -> Duration {
+        let paced = Duration::from_nanos(self.pacing_delay_nanos.load(Ordering::Relaxed));
+        now.saturating_duration_since(self.started_at)
+            .saturating_sub(paced)
     }
 }
 
@@ -439,7 +459,7 @@ impl SourceMeters for SessionCounters {
         add(&self.process.counters.packets_received, packets);
         add(&self.process.counters.packets_lost, lost);
         if bytes > 0 || packets > 0 {
-            self.source_seen.mark(self.started_at);
+            self.source_seen.mark(self.active_elapsed(Instant::now()));
         }
     }
 
@@ -455,7 +475,7 @@ impl MediaMeters for SessionCounters {
         raise(&self.peak_packets_per_batch, packets);
         raise(&self.peak_samples_per_batch, samples);
         if samples > 0 {
-            self.media_seen.mark(self.started_at);
+            self.media_seen.mark(self.active_elapsed(Instant::now()));
         }
     }
 
@@ -492,7 +512,7 @@ impl DeliveryMeters for SessionCounters {
         add(&self.process.counters.parts_published, parts);
         add(&self.process.counters.segments_published, segments);
         if parts > 0 || segments > 0 {
-            self.publication_seen.mark(self.started_at);
+            self.publication_seen.mark(self.active_elapsed(Instant::now()));
         }
     }
 }

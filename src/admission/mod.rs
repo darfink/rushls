@@ -96,36 +96,95 @@ pub enum TakeoverPolicy {
     Allow,
 }
 
-/// How an admitted publication may advance relative to wall clock.
+/// How fast media may be offered, as a multiple of wall clock.
 ///
-/// This is a stream authorization decision rather than a transport setting:
-/// RTMP and SRT publications can both be either genuinely live or replayed
-/// from a file.
+/// An exact rational rather than a float: `1x` has to mean exactly realtime,
+/// and comparing accumulated media time against wall time through a rounded
+/// multiplier drifts over a long publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IngestTimingPolicy {
-    /// Reject a publisher once normalized media gets this far ahead.
-    RequireRealtime { maximum_lead: Duration },
-    /// Apply backpressure when normalized media gets ahead of wall clock.
-    PaceToRealtime {
-        /// Lead tolerated before the publisher is slept back to realtime.
-        ///
-        /// The same quantity [`Self::RequireRealtime`] rejects on, which is
-        /// why both spell it the same way: how far ahead media may run. Only
-        /// the answer to running further differs.
-        ///
-        /// Applies for the whole publication, not just its opening burst.
-        maximum_lead: Duration,
-        /// Reject a forward discontinuity this large rather than sleeping for
-        /// what is probably a broken timeline.
-        maximum_timestamp_jump: Duration,
-    },
+pub struct Pace {
+    numerator: NonZeroU32,
+    denominator: NonZeroU32,
+}
+
+impl Pace {
+    pub const fn new(numerator: NonZeroU32, denominator: NonZeroU32) -> Self {
+        Self {
+            numerator,
+            denominator,
+        }
+    }
+
+    /// Exactly wall clock.
+    pub const fn realtime() -> Self {
+        Self::new(nz::u32!(1), nz::u32!(1))
+    }
+
+    /// The media time this pace earns over `elapsed` of wall clock.
+    pub fn media_for(self, elapsed: Duration) -> Duration {
+        let nanos = elapsed
+            .as_nanos()
+            .saturating_mul(u128::from(self.numerator.get()))
+            / u128::from(self.denominator.get());
+        crate::domain::duration_from_nanos_saturating(nanos)
+    }
+
+    /// The wall clock needed to earn `media` at this pace.
+    pub fn wall_for(self, media: Duration) -> Duration {
+        let nanos = media
+            .as_nanos()
+            .saturating_mul(u128::from(self.denominator.get()))
+            / u128::from(self.numerator.get());
+        crate::domain::duration_from_nanos_saturating(nanos)
+    }
+
+    /// Whether this pace is strictly slower than `other`.
+    pub fn is_slower_than(self, other: Self) -> bool {
+        u64::from(self.numerator.get()) * u64::from(other.denominator.get())
+            < u64::from(other.numerator.get()) * u64::from(self.denominator.get())
+    }
+}
+
+/// The throttle applied to a publisher offering media faster than `pace`.
+///
+/// Enforcement is backpressure only: exceeding the bucket sleeps, and nothing
+/// here ever ends a session. A publisher that is merely fast is not a fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ceiling {
+    /// Long-run rate the bucket refills at.
+    pub pace: Pace,
+    /// Media time the bucket may hold, which is the head start a publisher
+    /// gets and the size of any burst it may take after running slow.
+    ///
+    /// Consumable, unlike the standing allowance it replaces: a publisher that
+    /// spends it must earn it back at `pace` before bursting again.
+    pub burst: Duration,
+}
+
+/// The minimum rate a publisher must sustain to stay admitted.
+///
+/// Where a ceiling throttles, this disconnects: it is how an operator says a
+/// stream must be genuinely live rather than merely present.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Floor {
+    pub pace: Pace,
+    /// Averaging window. The first one is startup grace, because a publisher
+    /// cannot have sustained any rate before it has run for a window.
+    pub window: Duration,
 }
 
 /// What a principal is allowed to publish.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamPolicy {
     pub takeovers: TakeoverPolicy,
-    pub ingest_timing: IngestTimingPolicy,
+    /// Absent means no rate ceiling: media is packaged as fast as it arrives.
+    pub ceiling: Option<Ceiling>,
+    /// Absent means no minimum rate.
+    pub floor: Option<Floor>,
+    /// A forward jump beyond this is a broken timeline rather than media to
+    /// wait for. Enforced whether or not a ceiling is configured, because a
+    /// jump inflates the timeline regardless of who is pacing it.
+    pub maximum_timestamp_jump: Duration,
     pub accepted_video_codecs: Vec<Codec>,
     pub accepted_audio_codecs: Vec<Codec>,
     pub accepted_subtitle_codecs: Vec<Codec>,
@@ -158,10 +217,11 @@ impl StreamPolicy {
     pub fn permissive() -> Self {
         Self {
             takeovers: TakeoverPolicy::Allow,
-            ingest_timing: IngestTimingPolicy::PaceToRealtime {
-                maximum_lead: Duration::from_secs(2),
-                maximum_timestamp_jump: Duration::from_secs(10),
-            },
+            // No ceiling: a publisher offering media as fast as its link
+            // allows is taken to be asking for exactly that.
+            ceiling: None,
+            floor: None,
+            maximum_timestamp_jump: Duration::from_secs(10),
             accepted_video_codecs: vec![Codec::H264, Codec::Hevc, Codec::Av1],
             accepted_audio_codecs: vec![Codec::Aac, Codec::Opus],
             accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::SubRip, Codec::Text],

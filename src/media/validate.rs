@@ -222,7 +222,9 @@ mod tests {
     fn policy() -> StreamPolicy {
         StreamPolicy {
             takeovers: crate::admission::TakeoverPolicy::Allow,
-            ingest_timing: StreamPolicy::permissive().ingest_timing,
+            ceiling: None,
+            floor: None,
+            maximum_timestamp_jump: std::time::Duration::from_secs(10),
             accepted_video_codecs: vec![Codec::H264],
             accepted_audio_codecs: vec![Codec::Aac],
             accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::SubRip],

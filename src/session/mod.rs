@@ -278,7 +278,9 @@ async fn pipeline(
     .await?;
 
     let pacer = media::MediaPacer::after_preroll(
-        grant.policy.ingest_timing,
+        grant.policy.ceiling,
+        grant.policy.floor,
+        grant.policy.maximum_timestamp_jump,
         &timeline,
         &preroll.buffered,
         context.meters().media_view(),
@@ -292,7 +294,6 @@ async fn pipeline(
         time_anchor: std::time::SystemTime::now(),
         events: context.events(),
     })?;
-    let expected_publication_interval = started.muxer.expected_publication_interval();
     let publisher = services
         .publishers
         .start(context.stream(), Arc::clone(&started.presentation))?;
@@ -306,13 +307,7 @@ async fn pipeline(
     context.enter(Phase::Running);
     context.emit(SessionEvent::Running);
     let mut live = LiveSession::new(head, tail, pacer, preroll.buffered, preroll.input_state);
-    let supervised = supervise(
-        &mut live,
-        context,
-        config.supervision,
-        expected_publication_interval,
-    )
-    .await;
+    let supervised = supervise(&mut live, context, config.supervision).await;
 
     // A real failure decides the session's fate before the drain gets a say:
     // draining a broken pipeline is best-effort by definition, and letting it

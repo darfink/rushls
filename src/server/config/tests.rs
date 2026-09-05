@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     admission::{
-        ClientInfo, IngestProtocol, IngestTimingPolicy, PresentedCredential, Principal,
+        ClientInfo, IngestProtocol, PresentedCredential, Principal,
         PublishRequest, PublishResource, StreamPolicy, TakeoverPolicy,
     },
     delivery::store::{DurationRule, TargetDurationMultiple},
@@ -594,8 +594,8 @@ handshake_read_timeout = "30s"
 }
 
 #[test]
-fn stall_deadlines_follow_the_segment_duration() -> Result<(), Box<dyn Error>> {
-    // The reason these are relative. An absolute value sized against a 6s
+fn the_stall_deadline_follows_the_segment_duration() -> Result<(), Box<dyn Error>> {
+    // The reason this is relative. An absolute value sized against a 6s
     // segment becomes stall detection that fires before one segment can
     // complete the moment segmentation is retuned.
     let resolved = resolve_toml(
@@ -608,8 +608,7 @@ part_duration = "1s"
     .unwrap_or_else(|error| panic!("a longer segment duration must resolve: {error}"));
 
     let health = resolved.node.session.supervision.health;
-    assert_eq!(health.source_stall_timeout, Duration::from_secs(10));
-    assert_eq!(health.media_stall_timeout, Duration::from_secs(10));
+    assert_eq!(health.stall, Duration::from_secs(20));
     Ok(())
 }
 
@@ -619,15 +618,13 @@ fn a_stall_deadline_may_be_pinned_to_an_absolute() -> Result<(), Box<dyn Error>>
     let resolved = resolve_toml(
         r#"
 [ingest.health]
-source_stall = "20s"
+stall = "20s"
 "#,
     )?
     .unwrap_or_else(|error| panic!("a fixed stall deadline must resolve: {error}"));
 
     let health = resolved.node.session.supervision.health;
-    assert_eq!(health.source_stall_timeout, Duration::from_secs(20));
-    // The unset one still follows the cadence.
-    assert_eq!(health.media_stall_timeout, Duration::from_secs(6));
+    assert_eq!(health.stall, Duration::from_secs(20));
     Ok(())
 }
 
@@ -638,7 +635,7 @@ fn a_stall_deadline_shorter_than_its_sampling_is_refused() -> Result<(), Box<dyn
     let Err(error) = resolve_toml(
         r#"
 [ingest.health]
-source_stall = "500ms"
+stall = "500ms"
 health_interval = "1s"
 "#,
     )?
@@ -800,7 +797,51 @@ fn decimal_fractions_reduce_exactly() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn the_playlist_window_becomes_both_retention_floors() -> Result<(), Box<dyn Error>> {
+fn hold_back_accepts_both_forms_and_refuses_a_stalling_one() -> Result<(), Box<dyn Error>> {
+    // The multiple form tracks a retuned part cadence, which is why it is the
+    // default; the absolute exists for a deployment that pins latency itself.
+    let relative = resolve_toml(
+        r#"
+[hls]
+part_duration = "1s"
+hold_back = "4x"
+"#,
+    )??;
+    assert_eq!(
+        relative.node.hls.timing.part_hold_back.resolve(Duration::from_secs(1)),
+        Duration::from_secs(4)
+    );
+
+    let absolute = resolve_toml(
+        r#"
+[hls]
+part_duration = "1s"
+hold_back = "2500ms"
+"#,
+    )??;
+    assert_eq!(
+        absolute.node.hls.timing.part_hold_back.resolve(Duration::from_secs(1)),
+        Duration::from_millis(2_500)
+    );
+
+    // Below two parts a client runs out of buffered media on any loss, which
+    // is a latency the protocol cannot deliver rather than an aggressive one.
+    let error = resolve_toml(
+        r#"
+[hls]
+part_duration = "1s"
+hold_back = "1s"
+"#,
+    )?
+    .err()
+    .ok_or("a hold-back under two parts is refused")?
+    .to_string();
+    assert!(error.contains("hold_back"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn the_playlist_window_becomes_the_retention_window() -> Result<(), Box<dyn Error>> {
     let config = resolve_toml(
         r#"
 [hls]
@@ -810,11 +851,7 @@ playlist_window = "18s"
     )??;
 
     let retention = config.node.store.retention;
-    assert_eq!(retention.minimum_playlist_segments, 3);
-    assert_eq!(
-        retention.minimum_playlist_duration,
-        DurationRule::Fixed(Duration::from_secs(18))
-    );
+    assert_eq!(retention.retain, Duration::from_secs(18));
     Ok(())
 }
 
@@ -858,30 +895,6 @@ inactive_stream_retention = "0s"
         )?
         .is_err(),
         "a zero reconnect window retires every idle stream on the next tick"
-    );
-    Ok(())
-}
-
-#[test]
-fn a_reconnect_window_is_measured_against_the_configured_segment_duration()
--> Result<(), Box<dyn Error>> {
-    // The floor tracks the cadence rather than a constant: five seconds clears
-    // three one-second segments, having been refused against six-second ones.
-    let config = resolve_toml(
-        r#"
-[hls]
-segment_duration = "1s"
-part_duration = "1s"
-
-[storage]
-inactive_stream_retention = "5s"
-"#,
-    )??;
-
-    assert_eq!(
-        config.node.store.idle_retention,
-        Duration::from_secs(5),
-        "a legal reconnect window is stored as written, never raised"
     );
     Ok(())
 }
@@ -941,132 +954,6 @@ fn an_unknown_enumerated_value_names_the_alternatives() -> Result<(), Box<dyn Er
     .to_string();
     assert!(key_length.contains("aes128"), "{key_length}");
     assert!(key_length.contains("aes256"), "{key_length}");
-    Ok(())
-}
-
-#[tokio::test]
-async fn one_threshold_serves_both_timing_modes() -> Result<(), Box<dyn Error>> {
-    let paced = resolve_toml(
-        r#"
-[auth.policies.default]
-faster_than_realtime = "pace"
-maximum_lead = "4s"
-maximum_timestamp_jump = "30s"
-"#,
-    )??
-    .authenticator
-    .authenticate(&request("ignored"))
-    .await?;
-    assert_eq!(
-        paced.policy.ingest_timing,
-        IngestTimingPolicy::PaceToRealtime {
-            maximum_lead: Duration::from_secs(4),
-            maximum_timestamp_jump: Duration::from_secs(30),
-        }
-    );
-
-    let strict = resolve_toml(
-        r#"
-[auth.policies.default]
-faster_than_realtime = "reject"
-maximum_lead = "500ms"
-"#,
-    )??
-    .authenticator
-    .authenticate(&request("ignored"))
-    .await?;
-    assert_eq!(
-        strict.policy.ingest_timing,
-        IngestTimingPolicy::RequireRealtime {
-            maximum_lead: Duration::from_millis(500),
-        },
-        "the same key means the same thing under either mode; only the \
-         response to exceeding it changes"
-    );
-    Ok(())
-}
-
-#[test]
-fn a_timing_setting_that_could_never_apply_is_rejected() -> Result<(), Box<dyn Error>> {
-    // Rejecting already catches a forward jump through the lead itself, so this
-    // key would silently do nothing.
-    let jump_without_pacing = r#"
-[auth.policies.default]
-faster_than_realtime = "reject"
-maximum_timestamp_jump = "30s"
-"#;
-    // Every tolerated lead would also be a broken timeline.
-    let jump_below_lead = r#"
-[auth.policies.default]
-maximum_lead = "10s"
-maximum_timestamp_jump = "5s"
-"#;
-    let no_lead_at_all = r#"
-[auth.policies.default]
-maximum_lead = "0s"
-"#;
-    let unparsable = r#"
-[auth.policies.default]
-maximum_lead = "soon"
-"#;
-    let misspelled = r#"
-[auth.policies.default]
-faster_then_realtime = "pace"
-"#;
-
-    for configuration in [
-        jump_without_pacing,
-        jump_below_lead,
-        no_lead_at_all,
-        unparsable,
-        misspelled,
-    ] {
-        assert!(
-            resolve_toml(configuration)?.is_err(),
-            "expected a startup error for:{configuration}"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn a_lead_tighter_than_a_part_warns_without_refusing() -> Result<(), Box<dyn Error>> {
-    let resolved = resolve_toml(
-        r#"
-[hls]
-part_duration = "1s"
-
-[auth.policies.default]
-faster_than_realtime = "pace"
-maximum_lead = "200ms"
-"#,
-    )??;
-
-    assert_eq!(
-        resolved.warnings.len(),
-        1,
-        "pacing below the part duration throttles an encoder that is keeping \
-         up, and the symptom looks like a network problem: {:?}",
-        resolved.warnings
-    );
-    assert!(
-        resolved.warnings[0].contains("default"),
-        "it names the policy"
-    );
-
-    // The same lead under `reject` is not a mistake — it is how an operator
-    // says a stream must be genuinely live.
-    let strict = resolve_toml(
-        r#"
-[hls]
-part_duration = "1s"
-
-[auth.policies.default]
-faster_than_realtime = "reject"
-maximum_lead = "200ms"
-"#,
-    )??;
-    assert!(strict.warnings.is_empty());
     Ok(())
 }
 

@@ -141,7 +141,16 @@ fn an_open_segment_is_described_before_its_first_part_is_offered()
 #[test]
 fn a_departed_discontinuity_survives_as_a_sequence_number() -> Result<(), Box<dyn std::error::Error>>
 {
-    let store = StreamStore::default();
+    // A six-segment window, so the seventh publication below genuinely pushes
+    // the discontinuity out of it. Pinned rather than defaulted: what is under
+    // test is what survives departure, not how wide a shipped `retain` is.
+    let store = StreamStore::new(crate::delivery::hls::StoreLimits {
+        retention: crate::delivery::hls::RetentionPolicy {
+            retain: std::time::Duration::from_secs(36),
+            ..crate::delivery::hls::RetentionPolicy::default()
+        },
+        ..crate::delivery::hls::StoreLimits::default()
+    });
     let first = lease(&store, vec![video(0)]);
     write(&first, initialization(0, 1));
     write(&first, chunk(0, 0, 0, 0));

@@ -1029,7 +1029,7 @@ mod cache_tests {
         );
 
         drop(lease);
-        tokio::time::advance(store.limits().idle_retention + Duration::from_secs(1)).await;
+        tokio::time::advance(store.limits().reconnect_window() + Duration::from_secs(1)).await;
         let retired = store.maintain().retired;
 
         assert_eq!(

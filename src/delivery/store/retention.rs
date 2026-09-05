@@ -4,7 +4,10 @@ use tokio::time::Instant;
 
 use crate::domain::duration_from_nanos_saturating;
 
-const DEFAULT_VISIBLE_SEGMENTS: usize = 6;
+/// Live playlists must carry at least three target durations
+/// (draft-pantos-hls-rfc8216bis-22, section 6.2.1), so this is a floor on the
+/// window rather than a tunable: below it a conforming player cannot play.
+pub const MINIMUM_PLAYLIST_SEGMENTS: usize = 3;
 const DEFAULT_MAXIMUM_RETAINED_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 const DEFAULT_MAXIMUM_RETAINED_PARTS: usize = 16_384;
 const DEFAULT_MAXIMUM_RETAINED_SEGMENTS: usize = 4_096;
@@ -100,29 +103,31 @@ impl From<TargetDurationMultiple> for DurationRule {
 /// fractional target-duration multiples allow deployment-specific guidance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetentionPolicy {
-    /// Tag-count floor for the playlist window.
+    /// How long media stays fetchable, and therefore how much the live
+    /// playlist advertises.
     ///
-    /// The server configuration derives this from its single playlist-window
-    /// knob so the window means the same thing whatever a rendition's cadence
-    /// locks to; the duration floor below is the same window in seconds.
-    pub minimum_playlist_segments: usize,
-    pub minimum_playlist_duration: DurationRule,
+    /// One quantity, not two. Media a playlist does not name is media no
+    /// player can request, so a retention window wider than the advertised one
+    /// would hold bytes nothing could reach. Both meanings move together.
+    pub retain: Duration,
     pub part_tag_retention: DurationRule,
     /// How long a part URI remains fetchable after its tag disappears.
     pub part_fetch_grace_period: DurationRule,
-    /// Optional segment grace beginning when its tag disappears.
-    ///
-    /// `None` preserves the protocol-derived availability deadline based on
-    /// the longest playlist in which the segment appeared.
-    pub segment_fetch_grace_period: Option<DurationRule>,
     pub maximum_payload_bytes: usize,
     pub maximum_parts: usize,
     pub maximum_segments: usize,
 }
 
 impl RetentionPolicy {
+    /// The advertised window, never below the protocol's three-segment floor.
+    ///
+    /// Raised rather than refused: an operator who wrote a short `retain` said
+    /// something unambiguous, and refusing to serve over an arithmetic
+    /// relationship they did not know about helps nobody. The configuration
+    /// layer warns when it has to do this.
     pub fn minimum_playlist_duration_for(self, target: Duration) -> Duration {
-        self.minimum_playlist_duration.resolve(target)
+        self.retain
+            .max(target.saturating_mul(u32::try_from(MINIMUM_PLAYLIST_SEGMENTS).unwrap_or(3)))
     }
 
     pub fn part_tag_retention_for(self, target: Duration) -> Duration {
@@ -133,33 +138,39 @@ impl RetentionPolicy {
         removed_at.checked_add(self.part_fetch_grace_period.resolve(target))
     }
 
+    /// When a segment stops being fetchable, measured from publication.
+    ///
+    /// `retain` is a promise to viewers about how far back a playlist can
+    /// point, so it is the only thing that decides this. The previous
+    /// derivation — publication plus one segment plus the longest playlist the
+    /// segment appeared in — made a long `retain` unreachable in practice,
+    /// because a segment expired a playlist-window after publication however
+    /// much retention had been configured.
+    ///
+    /// The advertised window is `retain` wide, so a segment reaches this
+    /// deadline at about the moment it leaves the playlist. A client that
+    /// started fetching it just before would otherwise lose it mid-transfer,
+    /// so departure carries a grace of one target duration. That grace is
+    /// derived from cadence rather than configured: it covers a request
+    /// already in flight and nothing longer.
     pub fn segment_fetch_deadline(
         self,
+        first_published_at: Instant,
         removed_at: Instant,
         target: Duration,
-        first_published_at: Instant,
-        segment_duration: Duration,
-        longest_playlist_duration: Duration,
     ) -> Option<Instant> {
-        match self.segment_fetch_grace_period {
-            Some(rule) => removed_at.checked_add(rule.resolve(target)),
-            None => first_published_at
-                .checked_add(segment_duration.saturating_add(longest_playlist_duration)),
-        }
+        let promised = first_published_at.checked_add(self.retain)?;
+        let in_flight = removed_at.checked_add(target)?;
+        Some(promised.max(in_flight))
     }
 }
 
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
-            minimum_playlist_segments: DEFAULT_VISIBLE_SEGMENTS,
-            // Six segments, or six target durations, whichever keeps more:
-            // the default matches the shipped configuration's `6x` playlist
-            // window, and comfortably clears the spec's three-target floor.
-            minimum_playlist_duration: TargetDurationMultiple::integer(6).into(),
+            retain: Duration::from_mins(1),
             part_tag_retention: TargetDurationMultiple::integer(3).into(),
             part_fetch_grace_period: TargetDurationMultiple::integer(3).into(),
-            segment_fetch_grace_period: None,
             maximum_payload_bytes: DEFAULT_MAXIMUM_RETAINED_PAYLOAD_BYTES,
             maximum_parts: DEFAULT_MAXIMUM_RETAINED_PARTS,
             maximum_segments: DEFAULT_MAXIMUM_RETAINED_SEGMENTS,
@@ -186,22 +197,34 @@ mod tests {
 
     #[test]
     fn a_segment_fetch_grace_override_starts_when_the_tag_is_removed() {
-        let removed_at = Instant::now();
+        // `retain` is the whole answer: a segment stays fetchable for exactly
+        // as long as the operator promised, however long the playlist it
+        // appeared in happened to be.
+        let published_at = Instant::now();
         let policy = RetentionPolicy {
-            segment_fetch_grace_period: Some(TargetDurationMultiple::new(3, nz::u32!(2)).into()),
+            retain: Duration::from_hours(2),
             ..RetentionPolicy::default()
         };
 
         let deadline = policy
-            .segment_fetch_deadline(
-                removed_at,
-                Duration::from_secs(6),
-                removed_at,
-                Duration::from_secs(6),
-                Duration::from_secs(36),
-            )
+            .segment_fetch_deadline(published_at, published_at, Duration::from_secs(6))
             .expect("the deadline fits");
 
-        assert_eq!(deadline.duration_since(removed_at), Duration::from_secs(9));
+        assert_eq!(deadline.duration_since(published_at), Duration::from_hours(2));
+    }
+
+    #[test]
+    fn the_advertised_window_never_falls_below_the_protocol_floor() {
+        let policy = RetentionPolicy {
+            retain: Duration::from_secs(5),
+            ..RetentionPolicy::default()
+        };
+
+        assert_eq!(
+            policy.minimum_playlist_duration_for(Duration::from_secs(6)),
+            Duration::from_secs(18),
+            "a retain below three target durations is raised to it rather \
+             than refused"
+        );
     }
 }

@@ -31,7 +31,8 @@ use crate::{
 use super::{
     InitializationId, Msn, OpenSegment, PartCursor, PartId, PartIndex, PlaylistContract,
     PublishedSegments, RenditionBitrateStatistics, RenditionSnapshot, RenditionView,
-    RetentionPolicy, SegmentBody, SegmentId, StoreWriteError, StoredInitialization, StoredPart,
+    MINIMUM_PLAYLIST_SEGMENTS, RetentionPolicy, SegmentBody, SegmentId, StoreWriteError,
+    StoredInitialization, StoredPart,
     StoredSegment, StoredSegmentKind,
     bitrate::BitrateTracker,
     media::{segment_byte_len, segment_resource_bytes},
@@ -841,7 +842,7 @@ impl RenditionState {
         });
         let minimum_playlist_duration = retention.minimum_playlist_duration_for(segment_target);
         let mut playlist_duration = self.visible_playlist_duration();
-        while self.visible_segments.len() > retention.minimum_playlist_segments {
+        while self.visible_segments.len() > MINIMUM_PLAYLIST_SEGMENTS {
             let Some(removed) = self.visible_segments.front().copied() else {
                 break;
             };
@@ -872,11 +873,9 @@ impl RenditionState {
             }
             resource.visible = false;
             resource.expires_at = retention.segment_fetch_deadline(
+                resource.first_published_at,
                 now,
                 segment_target,
-                resource.first_published_at,
-                removed_duration,
-                resource.longest_playlist_duration,
             );
         }
         for id in &self.visible_segments {
@@ -1024,6 +1023,50 @@ impl RenditionState {
             resource.playlist_visible = false;
             resource.expires_at = retention.part_fetch_deadline(now, resource.segment_target);
         }
+    }
+
+    /// When the oldest sheddable segment was published, if there is one.
+    ///
+    /// Lets the stream pick the globally oldest across renditions before
+    /// asking any one of them to give something up.
+    pub fn oldest_shed_candidate(&self) -> Option<Instant> {
+        self.segment_resources
+            .values()
+            .filter(|resource| !resource.visible)
+            .map(|resource| resource.first_published_at)
+            .min()
+    }
+
+    /// Retires the oldest invisible segment, releasing whatever it held.
+    ///
+    /// Returns whether anything was reclaimed. Only segments that have already
+    /// left the playlist window are eligible: a visible one is named by a
+    /// playlist a viewer may be holding, and dropping it would produce a 404
+    /// mid-playback rather than a bounded loss of history.
+    ///
+    /// This is what makes a byte or object budget a *retention* bound rather
+    /// than a failure mode. Refusing the write instead — the previous
+    /// behaviour — ended the publisher's session, which at a long `retain` is
+    /// the ordinary case rather than the edge one.
+    pub fn shed_oldest(&mut self) -> bool {
+        let oldest = self
+            .segment_resources
+            .iter()
+            .filter(|(_, resource)| !resource.visible)
+            .min_by_key(|(id, resource)| (resource.first_published_at, **id))
+            .map(|(id, _)| *id);
+        let Some(oldest) = oldest else {
+            return false;
+        };
+        // Expiring it now routes the release through the one path that knows
+        // how to unpick a chunked segment's parts, rather than duplicating
+        // that accounting here.
+        if let Some(resource) = self.segment_resources.get_mut(&oldest) {
+            resource.expires_at = Some(Instant::now());
+        }
+        self.sweep_expired(Instant::now());
+        self.forget_unreachable_initializations();
+        true
     }
 
     pub fn sweep_expired(&mut self, now: Instant) {

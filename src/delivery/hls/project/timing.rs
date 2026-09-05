@@ -9,7 +9,7 @@
 use std::time::{Duration, SystemTime};
 
 use crate::{
-    delivery::hls::{PlaylistContract, TargetDurationMultiple, manifest::ServerControl},
+    delivery::hls::{DurationRule, PlaylistContract, TargetDurationMultiple, manifest::ServerControl},
     domain::{TickTimestamp, Timebase},
 };
 
@@ -24,10 +24,18 @@ use crate::{
 pub struct DeliveryTimingPolicy {
     /// Multiple of the longest target duration; Apple requires at least 3.
     pub hold_back: TargetDurationMultiple,
-    /// Multiple of the longest part target; Apple requires at least 3.
-    pub part_hold_back: TargetDurationMultiple,
-    /// Maximum blocking-reload and preload-hint wait.
-    pub blocking_reload: TargetDurationMultiple,
+    /// How far behind the live edge a player is told to start.
+    ///
+    /// The floor on live-edge latency, and the one delivery timing value an
+    /// operator sets: below roughly three part durations a client on a lossy
+    /// link runs out of buffered parts and stalls, above it every viewer waits
+    /// longer than they need to, and which way to err depends on the audience's
+    /// network rather than on anything this node can measure.
+    ///
+    /// A [`DurationRule`] so it takes either the multiple form, which tracks a
+    /// retuned part cadence, or an absolute a deployment pins for its own
+    /// reasons.
+    pub part_hold_back: DurationRule,
     pub can_block_reload: bool,
 }
 
@@ -35,8 +43,7 @@ impl Default for DeliveryTimingPolicy {
     fn default() -> Self {
         Self {
             hold_back: TargetDurationMultiple::integer(3),
-            part_hold_back: TargetDurationMultiple::integer(3),
-            blocking_reload: TargetDurationMultiple::integer(3),
+            part_hold_back: DurationRule::MultipleOfTarget(TargetDurationMultiple::integer(3)),
             can_block_reload: true,
         }
     }
@@ -73,7 +80,7 @@ pub fn server_control(
 
     Some(ServerControl {
         hold_back: Some(policy.hold_back.apply(longest_target?)),
-        part_hold_back: longest_part_target.map(|target| policy.part_hold_back.apply(target)),
+        part_hold_back: longest_part_target.map(|target| policy.part_hold_back.resolve(target)),
         can_block_reload: policy.can_block_reload,
         can_skip_until: None,
         can_skip_dateranges: false,
@@ -82,15 +89,33 @@ pub fn server_control(
 
 /// How long a blocking playlist reload may be left unsatisfied.
 ///
-/// The default is three target durations, after which the request is answered
-/// with a temporary failure rather than held indefinitely.
+/// Derived from the advertised hold-back rather than configured beside it. A
+/// client told to sit `part_hold_back` behind the edge will request a part
+/// that far ahead, so a deadline shorter than the hold-back would expire on
+/// exactly the requests this origin invited. Written as two independent
+/// constants the two agreed by coincidence, and nothing would have told the
+/// next person retuning either that the pair was load-bearing.
+///
+/// Three target durations is the protocol's own floor; the hold-back plus one
+/// part is what makes an invited request satisfiable. The wider of the two
+/// wins, after which the request is answered with a temporary failure rather
+/// than held indefinitely.
 pub fn blocking_reload_deadline(
     contract: PlaylistContract,
     policy: DeliveryTimingPolicy,
 ) -> Duration {
-    policy
-        .blocking_reload
-        .apply(Duration::from_secs(contract.target_duration.get()))
+    let target = Duration::from_secs(contract.target_duration.get());
+    let protocol_floor = TargetDurationMultiple::integer(3).apply(target);
+    let Some(part_target) = contract.part_target else {
+        // Without parts there is no part hold-back to outlive.
+        return protocol_floor;
+    };
+    protocol_floor.max(
+        policy
+            .part_hold_back
+            .resolve(part_target)
+            .saturating_add(part_target),
+    )
 }
 
 /// The wall-clock time at which media starting at `media_start` is presented.
@@ -159,18 +184,39 @@ mod tests {
     }
 
     #[test]
-    fn blocking_reload_uses_the_delivery_timing_policy() {
+    fn the_blocking_deadline_never_expires_on_a_request_the_hold_back_invites() {
+        // A client told to sit three parts behind the edge asks for a part that
+        // far ahead. The deadline has to outlive that request, so it tracks the
+        // hold-back rather than sitting beside it as an independent constant.
         let policy = DeliveryTimingPolicy {
-            blocking_reload: TargetDurationMultiple::integer(4),
+            part_hold_back: DurationRule::Fixed(Duration::from_secs(30)),
             ..DeliveryTimingPolicy::default()
         };
 
         assert_eq!(
             blocking_reload_deadline(contract(6, Some(1)), policy),
-            Duration::from_secs(24)
+            Duration::from_secs(31),
+            "the hold-back plus one part, once that exceeds the protocol floor"
         );
     }
 
+    #[test]
+    fn the_blocking_deadline_keeps_the_protocol_floor_for_a_short_hold_back() {
+        assert_eq!(
+            blocking_reload_deadline(contract(6, Some(1)), DeliveryTimingPolicy::default()),
+            Duration::from_secs(18),
+            "three target durations, which a three-part hold-back does not reach"
+        );
+    }
+
+    #[test]
+    fn a_segment_only_presentation_blocks_on_the_protocol_floor_alone() {
+        assert_eq!(
+            blocking_reload_deadline(contract(6, None), DeliveryTimingPolicy::default()),
+            Duration::from_secs(18),
+            "with no parts there is no part hold-back to outlive"
+        );
+    }
     #[test]
     fn program_date_time_handles_media_beginning_before_its_anchor() {
         let anchor = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
