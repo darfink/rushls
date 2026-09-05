@@ -18,9 +18,11 @@ use crate::domain::{BoxFuture, Codec, FrameRate, StreamId};
 
 mod http;
 mod open;
+mod predicate;
 
 pub use http::{HttpAuthConfig, HttpAuthenticator};
 pub use open::OpenStreamAuthenticator;
+pub use predicate::{Bounds, Codecs, FrameBox, Resolution};
 
 #[cfg(test)]
 mod fixtures;
@@ -173,7 +175,38 @@ pub struct Floor {
     pub window: Duration,
 }
 
+/// Which video a publisher may offer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VideoAccept {
+    pub codecs: Codecs,
+    pub resolution: Resolution,
+    pub frame_rate: Bounds<FrameRate>,
+    pub tracks: Bounds<usize>,
+}
+
+/// Which audio a publisher may offer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AudioAccept {
+    pub codecs: Codecs,
+    /// Hertz. Compared numerically, never as text, because `"8kHz"` sorts
+    /// above `"48kHz"` lexicographically.
+    pub sample_rate: Bounds<NonZeroU32>,
+    pub channels: Bounds<NonZeroU16>,
+    pub tracks: Bounds<usize>,
+}
+
+/// Which subtitles a publisher may offer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SubtitleAccept {
+    pub codecs: Codecs,
+    pub tracks: Bounds<usize>,
+}
+
 /// What a principal is allowed to publish.
+///
+/// The admission controls and the media predicates sit together because they
+/// answer one question — may this publisher send this, on these terms — and
+/// are the only rules that may act on a live session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamPolicy {
     pub takeovers: TakeoverPolicy,
@@ -185,17 +218,9 @@ pub struct StreamPolicy {
     /// wait for. Enforced whether or not a ceiling is configured, because a
     /// jump inflates the timeline regardless of who is pacing it.
     pub maximum_timestamp_jump: Duration,
-    pub accepted_video_codecs: Vec<Codec>,
-    pub accepted_audio_codecs: Vec<Codec>,
-    pub accepted_subtitle_codecs: Vec<Codec>,
-    pub maximum_audio_tracks: usize,
-    pub maximum_subtitle_tracks: usize,
-    pub maximum_video_tracks: usize,
-    pub maximum_video_width: NonZeroU32,
-    pub maximum_video_height: NonZeroU32,
-    pub maximum_video_frame_rate: FrameRate,
-    pub maximum_audio_sample_rate: NonZeroU32,
-    pub maximum_audio_channels: NonZeroU16,
+    pub video: VideoAccept,
+    pub audio: AudioAccept,
+    pub subtitles: SubtitleAccept,
 }
 
 impl StreamPolicy {
@@ -222,17 +247,22 @@ impl StreamPolicy {
             ceiling: None,
             floor: None,
             maximum_timestamp_jump: Duration::from_secs(10),
-            accepted_video_codecs: vec![Codec::H264, Codec::Hevc, Codec::Av1],
-            accepted_audio_codecs: vec![Codec::Aac, Codec::Opus],
-            accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::SubRip, Codec::Text],
-            maximum_audio_tracks: 8,
-            maximum_subtitle_tracks: 8,
-            maximum_video_tracks: 8,
-            maximum_video_width: nz::u32!(7680),
-            maximum_video_height: nz::u32!(4320),
-            maximum_video_frame_rate: FrameRate::new(nz::u32!(240), nz::u32!(1)),
-            maximum_audio_sample_rate: nz::u32!(192_000),
-            maximum_audio_channels: nz::u16!(32),
+            // Codecs are the muxable set rather than `Any`: they name what
+            // this origin can package, which is a capability rather than a
+            // policy, and a track it cannot mux must be refused at admission
+            // instead of failing seconds into the session.
+            video: VideoAccept {
+                codecs: Codecs::OneOf(vec![Codec::H264, Codec::Hevc, Codec::Av1]),
+                ..VideoAccept::default()
+            },
+            audio: AudioAccept {
+                codecs: Codecs::OneOf(vec![Codec::Aac, Codec::Opus]),
+                ..AudioAccept::default()
+            },
+            subtitles: SubtitleAccept {
+                codecs: Codecs::OneOf(vec![Codec::WebVtt, Codec::SubRip, Codec::Text]),
+                ..SubtitleAccept::default()
+            },
         }
     }
 }

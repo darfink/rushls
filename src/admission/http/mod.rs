@@ -17,11 +17,20 @@
 //!
 //! # What the response may decide
 //!
-//! Identity, and a policy *by name*. Never the policy itself. Letting a
-//! response carry codec limits or track counts would make the sidecar's JSON a
-//! second definition of [`StreamPolicy`], free to drift from the one this node
-//! can actually enforce, and would move the safety ceiling outside the
-//! process. Names are looked up locally, and an unknown one denies.
+//! Identity, and a policy *by name*. Never the policy itself.
+//!
+//! The reason is legibility rather than defence. The admission service is
+//! trusted — it may select a policy that widens what this node accepts, which
+//! is how a deployment expresses "this account may publish 4K" on an origin
+//! whose default is smaller. What it may not do is *define* that policy in its
+//! response, because then no one could tell what an origin accepts by reading
+//! its configuration: the answer would live partly in a service's source.
+//!
+//! Keeping every admissible set in the file makes it reviewable, diffable, and
+//! validated at startup, and leaves the response choosing among sets rather
+//! than inventing one. A deployment that needs a new shape adds a policy and
+//! restarts, which is the same cost as any other change to what this node
+//! admits. Names are looked up locally, and an unknown one denies.
 
 use std::collections::BTreeMap;
 

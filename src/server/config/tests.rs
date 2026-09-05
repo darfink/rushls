@@ -972,8 +972,8 @@ subtitle_codecs = ["text", "webvtt"]
         .authenticate(&request("camera-key"))
         .await?;
     assert_eq!(
-        grant.policy.accepted_subtitle_codecs,
-        vec![Codec::Text, Codec::WebVtt]
+        grant.policy.subtitles.codecs,
+        crate::admission::Codecs::OneOf(vec![Codec::Text, Codec::WebVtt])
     );
 
     // A codec name is valid for one media kind only: in-band text is not

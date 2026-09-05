@@ -24,8 +24,8 @@ use thiserror::Error;
 
 use crate::{
     admission::{
-        Authenticator, Ceiling, HttpAuthConfig, HttpAuthenticator, OpenStreamAuthenticator, Pace,
-        StreamPolicy, TakeoverPolicy,
+        Authenticator, Bounds, Ceiling, Codecs, FrameBox, HttpAuthConfig, HttpAuthenticator,
+        OpenStreamAuthenticator, Pace, Resolution, StreamPolicy, TakeoverPolicy,
     },
     delivery::hls::uri::UriBase,
     delivery::store::{DurationRule, TargetDurationMultiple},
@@ -658,47 +658,58 @@ impl PolicyAppConfig {
         if let Some(value) = &self.maximum_timestamp_jump {
             policy.maximum_timestamp_jump = duration(name, "maximum_timestamp_jump", value)?;
         }
+        // Interim mapping onto the predicate shape. The old keys are all
+        // maxima, so each becomes a `{ max = .. }` bound; `[accept]` replaces
+        // this wholesale when the file is rewritten.
         if let Some(codecs) = self.video_codecs {
-            policy.accepted_video_codecs = validate_codecs(
+            policy.video.codecs = Codecs::OneOf(validate_codecs(
                 name,
                 "video codecs",
                 codecs,
                 &[Codec::H264, Codec::Hevc, Codec::Av1],
-            )?;
+            )?);
         }
         if let Some(codecs) = self.audio_codecs {
-            policy.accepted_audio_codecs =
-                validate_codecs(name, "audio codecs", codecs, &[Codec::Aac, Codec::Opus])?;
+            policy.audio.codecs = Codecs::OneOf(validate_codecs(
+                name,
+                "audio codecs",
+                codecs,
+                &[Codec::Aac, Codec::Opus],
+            )?);
         }
         if let Some(codecs) = self.subtitle_codecs {
-            policy.accepted_subtitle_codecs = validate_codecs(
+            policy.subtitles.codecs = Codecs::OneOf(validate_codecs(
                 name,
                 "subtitle codecs",
                 codecs,
                 &[Codec::WebVtt, Codec::SubRip, Codec::Text],
-            )?;
+            )?);
         }
         if let Some(maximum) = self.maximum_video_tracks {
-            policy.maximum_video_tracks = maximum;
+            policy.video.tracks = Bounds::at_most(maximum);
         }
         if let Some(maximum) = self.maximum_audio_tracks {
-            policy.maximum_audio_tracks = maximum;
+            policy.audio.tracks = Bounds::at_most(maximum);
         }
         if let Some(maximum) = self.maximum_subtitle_tracks {
-            policy.maximum_subtitle_tracks = maximum;
+            policy.subtitles.tracks = Bounds::at_most(maximum);
         }
         if let Some(resolution) = self.maximum_video_resolution {
             let resolution = resolution
                 .parse::<ResolutionValue>()
                 .map_err(|error| invalid(format!("auth policy `{name}`: {error}")))?;
-            policy.maximum_video_width = resolution.width;
-            policy.maximum_video_height = resolution.height;
+            policy.video.resolution = Resolution::AtMost(FrameBox::new(
+                resolution.width.get(),
+                resolution.height.get(),
+            ));
         }
         if let Some(frame_rate) = self.maximum_video_frame_rate {
-            policy.maximum_video_frame_rate = frame_rate
-                .parse::<FrameRateValue>()
-                .map_err(|error| invalid(format!("auth policy `{name}`: {error}")))?
-                .0;
+            policy.video.frame_rate = Bounds::at_most(
+                frame_rate
+                    .parse::<FrameRateValue>()
+                    .map_err(|error| invalid(format!("auth policy `{name}`: {error}")))?
+                    .0,
+            );
         }
         Ok(policy)
     }

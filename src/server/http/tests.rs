@@ -1383,9 +1383,13 @@ mod end_to_end {
     /// Publishes a captioned FLV and returns its whole WebVTT rendition.
     async fn published_captions(name: &[u8]) -> String {
         let mut policy = StreamPolicy::permissive();
-        policy
-            .accepted_subtitle_codecs
-            .push(crate::domain::Codec::Text);
+        // Bare cue text arrives from FLV script data, which the permissive
+        // set does not name.
+        policy.subtitles.codecs = crate::admission::Codecs::OneOf(vec![
+            crate::domain::Codec::WebVtt,
+            crate::domain::Codec::SubRip,
+            crate::domain::Codec::Text,
+        ]);
         let (node, session) = node_with_policy(policy);
         let cues: [(u32, &[u8]); 3] = [
             (40, b"first caption"),

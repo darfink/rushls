@@ -110,11 +110,24 @@ impl Codec {
 }
 
 /// Exact declared video cadence in frames per second.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// Equality is by *value*, not by representation: `60/1` and `120/2` are the
+/// same cadence and compare equal, which is what lets a configured rate match
+/// a publisher that spelled it differently.
+#[derive(Clone, Copy, Debug)]
 pub struct FrameRate {
     numerator: NonZeroU32,
     denominator: NonZeroU32,
 }
+
+impl PartialEq for FrameRate {
+    fn eq(&self, other: &Self) -> bool {
+        u64::from(self.numerator.get()) * u64::from(other.denominator.get())
+            == u64::from(other.numerator.get()) * u64::from(self.denominator.get())
+    }
+}
+
+impl Eq for FrameRate {}
 
 impl FrameRate {
     pub const fn new(numerator: NonZeroU32, denominator: NonZeroU32) -> Self {
@@ -133,8 +146,36 @@ impl FrameRate {
     }
 
     pub fn exceeds(self, maximum: Self) -> bool {
-        u64::from(self.numerator.get()) * u64::from(maximum.denominator.get())
-            > u64::from(maximum.numerator.get()) * u64::from(self.denominator.get())
+        self > maximum
+    }
+}
+
+/// Compared as exact rationals, never as floats.
+///
+/// `29.97` and `30000/1001` are the same rate and must order identically;
+/// rounding either before comparison would make a predicate admit or refuse on
+/// a difference that does not exist.
+impl Ord for FrameRate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let left = u64::from(self.numerator.get()) * u64::from(other.denominator.get());
+        let right = u64::from(other.numerator.get()) * u64::from(self.denominator.get());
+        left.cmp(&right)
+    }
+}
+
+impl PartialOrd for FrameRate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for FrameRate {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.denominator.get() == 1 {
+            write!(output, "{}fps", self.numerator)
+        } else {
+            write!(output, "{}/{}fps", self.numerator, self.denominator)
+        }
     }
 }
 

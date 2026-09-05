@@ -828,7 +828,10 @@ async fn a_disallowed_codec_ends_the_session_before_any_media_is_planned() {
     let harness = Harness::new(
         None,
         StreamPolicy {
-            accepted_video_codecs: vec![Codec::Av1],
+            video: crate::admission::VideoAccept {
+                codecs: crate::admission::Codecs::OneOf(vec![Codec::Av1]),
+                ..crate::admission::VideoAccept::default()
+            },
             ..StreamPolicy::permissive()
         },
         Faults::default(),

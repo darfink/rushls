@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::{
-    admission::StreamPolicy,
+    admission::{Bounds, FrameBox, StreamPolicy},
     domain::{
         Codec, DiscoveredTrack, FrameRate, MediaKind, MediaParameters, TrackCatalog, TrackCounts,
         TrackId,
@@ -63,43 +63,37 @@ impl PresentationPlan {
 pub enum ValidationError {
     #[error("{track_id} uses {codec:?}, which this stream may not publish")]
     UnsupportedCodec { track_id: TrackId, codec: Codec },
-    #[error("the stream published {found} {kind:?} tracks but may publish at most {limit}")]
-    TrackLimitExceeded {
+    #[error("the stream published {found} {kind:?} tracks, but this stream admits {admitted}")]
+    TrackCountRefused {
         kind: MediaKind,
-        limit: usize,
+        admitted: String,
         found: usize,
     },
     #[error("the stream published no audio or video track")]
     NoPresentableTrack,
-    #[error("{track_id} declares video width {found}, above the permitted maximum {maximum}")]
-    VideoWidthExceeded {
+    #[error("{track_id} is {found}, but this stream admits {admitted}")]
+    ResolutionRefused {
         track_id: TrackId,
-        found: u32,
-        maximum: u32,
+        found: FrameBox,
+        admitted: String,
     },
-    #[error("{track_id} declares video height {found}, above the permitted maximum {maximum}")]
-    VideoHeightExceeded {
-        track_id: TrackId,
-        found: u32,
-        maximum: u32,
-    },
-    #[error("{track_id} declares a frame rate above the permitted maximum")]
-    VideoFrameRateExceeded {
+    #[error("{track_id} runs at {found}, but this stream admits {admitted}")]
+    FrameRateRefused {
         track_id: TrackId,
         found: FrameRate,
-        maximum: FrameRate,
+        admitted: String,
     },
-    #[error("{track_id} declares audio sample rate {found}, above the permitted maximum {maximum}")]
-    AudioSampleRateExceeded {
+    #[error("{track_id} samples at {found}Hz, but this stream admits {admitted}")]
+    SampleRateRefused {
         track_id: TrackId,
         found: u32,
-        maximum: u32,
+        admitted: String,
     },
-    #[error("{track_id} declares {found} audio channels, above the permitted maximum {maximum}")]
-    AudioChannelsExceeded {
+    #[error("{track_id} carries {found} channels, but this stream admits {admitted}")]
+    ChannelsRefused {
         track_id: TrackId,
         found: u16,
-        maximum: u16,
+        admitted: String,
     },
 }
 
@@ -109,27 +103,27 @@ pub fn validate(
     policy: &StreamPolicy,
 ) -> Result<PresentationPlan, ValidationError> {
     let counts = tracks.counts();
-    check_limit(MediaKind::Audio, counts.audio, policy.maximum_audio_tracks)?;
-    check_limit(
+    check_count(MediaKind::Audio, counts.audio, &policy.audio.tracks)?;
+    check_count(
         MediaKind::Subtitle,
         counts.subtitle,
-        policy.maximum_subtitle_tracks,
+        &policy.subtitles.tracks,
     )?;
-    check_limit(MediaKind::Video, counts.video, policy.maximum_video_tracks)?;
+    check_count(MediaKind::Video, counts.video, &policy.video.tracks)?;
     if counts.audio == 0 && counts.video == 0 {
         return Err(ValidationError::NoPresentableTrack);
     }
 
     for track in tracks.tracks() {
         let accepted = match track.kind() {
-            MediaKind::Audio => policy.accepted_audio_codecs.contains(&track.codec),
-            MediaKind::Video => policy.accepted_video_codecs.contains(&track.codec),
+            MediaKind::Audio => policy.audio.codecs.admits(track.codec),
+            MediaKind::Video => policy.video.codecs.admits(track.codec),
             // Checked like any other kind. Subtitles used to be waved through
             // on the grounds that the muxer would decide — but the muxer runs
             // after pre-roll has already buffered the publisher's media, so
             // "decide later" meant accepting a session that could not be
             // packaged and failing it seconds in rather than at the handshake.
-            MediaKind::Subtitle => policy.accepted_subtitle_codecs.contains(&track.codec),
+            MediaKind::Subtitle => policy.subtitles.codecs.admits(track.codec),
         };
         if !accepted {
             return Err(ValidationError::UnsupportedCodec {
@@ -153,27 +147,24 @@ fn validate_media(track: &DiscoveredTrack, policy: &StreamPolicy) -> Result<(), 
             frame_rate,
             ..
         } => {
-            if width > policy.maximum_video_width {
-                return Err(ValidationError::VideoWidthExceeded {
+            let found = FrameBox::new(width.get(), height.get());
+            if !policy.video.resolution.admits(found) {
+                return Err(ValidationError::ResolutionRefused {
                     track_id: track.id,
-                    found: width.get(),
-                    maximum: policy.maximum_video_width.get(),
+                    found,
+                    admitted: policy.video.resolution.to_string(),
                 });
             }
-            if height > policy.maximum_video_height {
-                return Err(ValidationError::VideoHeightExceeded {
-                    track_id: track.id,
-                    found: height.get(),
-                    maximum: policy.maximum_video_height.get(),
-                });
-            }
+            // A track that declares no rate cannot be judged against one. It
+            // is admitted rather than refused: discovery not having observed a
+            // cadence is this node's gap, not the publisher's.
             if let Some(frame_rate) = frame_rate
-                && frame_rate.exceeds(policy.maximum_video_frame_rate)
+                && !policy.video.frame_rate.admits(&frame_rate)
             {
-                return Err(ValidationError::VideoFrameRateExceeded {
+                return Err(ValidationError::FrameRateRefused {
                     track_id: track.id,
                     found: frame_rate,
-                    maximum: policy.maximum_video_frame_rate,
+                    admitted: policy.video.frame_rate.to_string(),
                 });
             }
         }
@@ -182,18 +173,18 @@ fn validate_media(track: &DiscoveredTrack, policy: &StreamPolicy) -> Result<(), 
             channels,
             ..
         } => {
-            if sample_rate > policy.maximum_audio_sample_rate {
-                return Err(ValidationError::AudioSampleRateExceeded {
+            if !policy.audio.sample_rate.admits(&sample_rate) {
+                return Err(ValidationError::SampleRateRefused {
                     track_id: track.id,
                     found: sample_rate.get(),
-                    maximum: policy.maximum_audio_sample_rate.get(),
+                    admitted: policy.audio.sample_rate.to_string(),
                 });
             }
-            if channels > policy.maximum_audio_channels {
-                return Err(ValidationError::AudioChannelsExceeded {
+            if !policy.audio.channels.admits(&channels) {
+                return Err(ValidationError::ChannelsRefused {
                     track_id: track.id,
                     found: channels.get(),
-                    maximum: policy.maximum_audio_channels.get(),
+                    admitted: policy.audio.channels.to_string(),
                 });
             }
         }
@@ -202,16 +193,27 @@ fn validate_media(track: &DiscoveredTrack, policy: &StreamPolicy) -> Result<(), 
     Ok(())
 }
 
-fn check_limit(kind: MediaKind, found: usize, limit: usize) -> Result<(), ValidationError> {
-    if found > limit {
-        return Err(ValidationError::TrackLimitExceeded { kind, limit, found });
+fn check_count(
+    kind: MediaKind,
+    found: usize,
+    admitted: &Bounds<usize>,
+) -> Result<(), ValidationError> {
+    if admitted.admits(&found) {
+        return Ok(());
     }
-    Ok(())
+    Err(ValidationError::TrackCountRefused {
+        kind,
+        admitted: admitted.to_string(),
+        found,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::fixtures::{TrackBuilder, catalog};
+    use crate::{
+        admission::Resolution,
+        domain::fixtures::{TrackBuilder, catalog},
+    };
 
     use super::*;
 
@@ -225,17 +227,22 @@ mod tests {
             ceiling: None,
             floor: None,
             maximum_timestamp_jump: std::time::Duration::from_secs(10),
-            accepted_video_codecs: vec![Codec::H264],
-            accepted_audio_codecs: vec![Codec::Aac],
-            accepted_subtitle_codecs: vec![Codec::WebVtt, Codec::SubRip],
-            maximum_audio_tracks: 1,
-            maximum_subtitle_tracks: 2,
-            maximum_video_tracks: 1,
-            maximum_video_width: nz::u32!(3840),
-            maximum_video_height: nz::u32!(2160),
-            maximum_video_frame_rate: FrameRate::new(nz::u32!(60), nz::u32!(1)),
-            maximum_audio_sample_rate: nz::u32!(96_000),
-            maximum_audio_channels: nz::u16!(8),
+            video: crate::admission::VideoAccept {
+                codecs: crate::admission::Codecs::OneOf(vec![Codec::H264]),
+                resolution: crate::admission::Resolution::AtMost(FrameBox::new(3840, 2160)),
+                frame_rate: Bounds::at_most(FrameRate::new(nz::u32!(60), nz::u32!(1))),
+                tracks: Bounds::at_most(1),
+            },
+            audio: crate::admission::AudioAccept {
+                codecs: crate::admission::Codecs::OneOf(vec![Codec::Aac]),
+                sample_rate: Bounds::at_most(nz::u32!(96_000)),
+                channels: Bounds::at_most(nz::u16!(8)),
+                tracks: Bounds::at_most(1),
+            },
+            subtitles: crate::admission::SubtitleAccept {
+                codecs: crate::admission::Codecs::OneOf(vec![Codec::WebVtt, Codec::SubRip]),
+                tracks: Bounds::at_most(2),
+            },
         }
     }
 
@@ -274,9 +281,9 @@ mod tests {
 
         assert_eq!(
             validate(&tracks, &policy()),
-            Err(ValidationError::TrackLimitExceeded {
+            Err(ValidationError::TrackCountRefused {
                 kind: MediaKind::Audio,
-                limit: 1,
+                admitted: "at most 1".to_owned(),
                 found: 2,
             })
         );
@@ -317,7 +324,8 @@ mod tests {
         );
 
         let mut enabled = policy();
-        enabled.accepted_subtitle_codecs.push(Codec::Text);
+        enabled.subtitles.codecs =
+            crate::admission::Codecs::OneOf(vec![Codec::WebVtt, Codec::SubRip, Codec::Text]);
         let plan = validate(&tracks, &enabled).expect("text subtitles are accepted when enabled");
         assert_eq!(plan.counts().subtitle, 1);
     }
@@ -368,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_video_dimensions_or_frame_rate_above_policy() {
+    fn a_resolution_bound_is_a_box_rather_than_two_independent_limits() {
         let mut video = track(0, MediaKind::Video, Codec::H264);
         video.parameters = MediaParameters::Video {
             width: nz::u32!(3840),
@@ -377,29 +385,90 @@ mod tests {
             video_delay: 0,
         };
         let mut constrained = policy();
-        constrained.maximum_video_width = nz::u32!(1920);
+        constrained.video.resolution = Resolution::AtMost(FrameBox::new(1920, 1080));
 
         assert!(matches!(
             validate(&catalog(vec![video.clone()]), &constrained),
-            Err(ValidationError::VideoWidthExceeded { .. })
+            Err(ValidationError::ResolutionRefused { .. })
         ));
 
-        constrained.maximum_video_width = nz::u32!(3840);
-        constrained.maximum_video_height = nz::u32!(1080);
-        assert!(matches!(
-            validate(&catalog(vec![video.clone()]), &constrained),
-            Err(ValidationError::VideoHeightExceeded { .. })
-        ));
-
-        constrained.maximum_video_height = nz::u32!(2160);
-        assert!(matches!(
-            validate(&catalog(vec![video]), &constrained),
-            Err(ValidationError::VideoFrameRateExceeded { .. })
-        ));
+        constrained.video.resolution = Resolution::AtMost(FrameBox::new(3840, 2160));
+        assert!(
+            matches!(
+                validate(&catalog(vec![video]), &constrained),
+                Err(ValidationError::FrameRateRefused { .. })
+            ),
+            "the frame fits the box, so the rate is what refuses it"
+        );
     }
 
     #[test]
-    fn rejects_audio_sample_rate_or_channels_above_policy() {
+    fn a_portrait_source_fits_a_landscape_box() {
+        // Checking width and height against their own limits refused this,
+        // which is wrong: a bounding box has no orientation.
+        let mut portrait = track(0, MediaKind::Video, Codec::H264);
+        portrait.parameters = MediaParameters::Video {
+            width: nz::u32!(1080),
+            height: nz::u32!(1920),
+            frame_rate: None,
+            video_delay: 0,
+        };
+        let mut constrained = policy();
+        constrained.video.resolution = Resolution::AtMost(FrameBox::new(1920, 1080));
+
+        assert!(validate(&catalog(vec![portrait]), &constrained).is_ok());
+    }
+
+    #[test]
+    fn a_frame_rate_bound_may_have_a_floor_as_well_as_a_ceiling() {
+        let mut video = track(0, MediaKind::Video, Codec::H264);
+        video.parameters = MediaParameters::Video {
+            width: nz::u32!(1920),
+            height: nz::u32!(1080),
+            frame_rate: Some(FrameRate::new(nz::u32!(15), nz::u32!(1))),
+            video_delay: 0,
+        };
+        let mut constrained = policy();
+        constrained.video.frame_rate = Bounds::Range {
+            min: Some(FrameRate::new(nz::u32!(24), nz::u32!(1))),
+            max: Some(FrameRate::new(nz::u32!(60), nz::u32!(1))),
+        };
+
+        assert!(
+            matches!(
+                validate(&catalog(vec![video]), &constrained),
+                Err(ValidationError::FrameRateRefused { .. })
+            ),
+            "minimum bounds are new: the old surface could only cap"
+        );
+    }
+
+    #[test]
+    fn ntsc_rates_compare_as_exact_rationals() {
+        // 30000/1001 is not 30, and a predicate that says 30 must not admit
+        // it. Comparison stays rational rather than rounding either side.
+        let mut video = track(0, MediaKind::Video, Codec::H264);
+        video.parameters = MediaParameters::Video {
+            width: nz::u32!(1920),
+            height: nz::u32!(1080),
+            frame_rate: Some(FrameRate::new(nz::u32!(30_000), nz::u32!(1_001))),
+            video_delay: 0,
+        };
+        let mut constrained = policy();
+        constrained.video.frame_rate = Bounds::Exact(FrameRate::new(nz::u32!(30), nz::u32!(1)));
+        assert!(matches!(
+            validate(&catalog(vec![video.clone()]), &constrained),
+            Err(ValidationError::FrameRateRefused { .. })
+        ));
+
+        // The same rate spelled differently is the same rate.
+        constrained.video.frame_rate =
+            Bounds::Exact(FrameRate::new(nz::u32!(60_000), nz::u32!(2_002)));
+        assert!(validate(&catalog(vec![video]), &constrained).is_ok());
+    }
+
+    #[test]
+    fn rejects_audio_sample_rate_or_channels_outside_policy() {
         let mut audio = track(0, MediaKind::Audio, Codec::Aac);
         audio.parameters = MediaParameters::Audio {
             sample_rate: nz::u32!(192_000),
@@ -412,14 +481,36 @@ mod tests {
 
         assert!(matches!(
             validate(&catalog(vec![audio.clone()]), &constrained),
-            Err(ValidationError::AudioSampleRateExceeded { .. })
+            Err(ValidationError::SampleRateRefused { .. })
         ));
 
         let mut channels_only = constrained;
-        channels_only.maximum_audio_sample_rate = nz::u32!(192_000);
+        channels_only.audio.sample_rate = Bounds::at_most(nz::u32!(192_000));
         assert!(matches!(
             validate(&catalog(vec![audio]), &channels_only),
-            Err(ValidationError::AudioChannelsExceeded { .. })
+            Err(ValidationError::ChannelsRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn a_sample_rate_floor_refuses_a_rate_below_it() {
+        let mut audio = track(0, MediaKind::Audio, Codec::Aac);
+        audio.parameters = MediaParameters::Audio {
+            sample_rate: nz::u32!(32_000),
+            channels: nz::u16!(2),
+            frame_size: Some(nz::u32!(1_024)),
+            bit_depth: Some(nz::u16!(16)),
+            timing: crate::domain::AudioTiming::default(),
+        };
+        let mut constrained = policy();
+        constrained.audio.sample_rate = Bounds::Range {
+            min: Some(nz::u32!(44_100)),
+            max: Some(nz::u32!(48_000)),
+        };
+
+        assert!(matches!(
+            validate(&catalog(vec![audio]), &constrained),
+            Err(ValidationError::SampleRateRefused { .. })
         ));
     }
 }
