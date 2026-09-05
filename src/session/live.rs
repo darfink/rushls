@@ -183,11 +183,8 @@ impl SampleSource for MediaHead {
                 self.drained = true;
             }
             let produced = samples.produced()?;
-            self.density.admit(
-                consumed.payload_bytes as u64,
-                consumed.packets as u64,
-                &self.normalized,
-            )?;
+            self.density
+                .admit(consumed.packets as u64, &self.normalized)?;
             for sample in self.normalized.drain(..) {
                 out.push(sample);
             }

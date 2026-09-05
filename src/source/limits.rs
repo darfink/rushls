@@ -38,7 +38,6 @@ pub struct InputLimits {
     /// it releases reordered samples in bursts — so this is deliberately looser
     /// than the packet cap rather than equal to it.
     pub maximum_samples_per_batch: usize,
-    pub maximum_bytes_per_media_second: u64,
     pub maximum_packets_per_media_second: u64,
     pub maximum_samples_per_media_second: u64,
     /// Averaging window for media-density limits.
@@ -54,16 +53,15 @@ pub struct InputLimits {
 impl InputLimits {
     /// Generous headroom over any realistic contribution feed.
     ///
-    /// 100 Mb/s and 50k packets/s are far above a single 4K contribution
-    /// encoder, so a legitimate publisher never notices these; they exist to
-    /// put a ceiling on what a hostile one can cost.
+    /// 50k packets/s is far above a single 4K contribution encoder, so a
+    /// legitimate publisher never notices these; they exist to put a ceiling on
+    /// what a hostile one can cost.
     pub fn permissive() -> Self {
         Self {
             maximum_packets_per_batch: 4_096,
             maximum_payload_bytes_per_packet: 8 * 1024 * 1024,
-            maximum_payload_bytes_per_batch: 16 * 1024 * 1024,
+            maximum_payload_bytes_per_batch: super::PipelineMemory::BATCH,
             maximum_samples_per_batch: 16_384,
-            maximum_bytes_per_media_second: 12_500_000,
             maximum_packets_per_media_second: 50_000,
             maximum_samples_per_media_second: 50_000,
             media_density_window: Duration::from_secs(1),

@@ -419,6 +419,36 @@ playlist reload is a held HTTP request bounded by `shutdown` on the way out,
 and fan-out is the layer in front of this node to own. Capping viewers here
 would turn a CDN sizing answer into an origin config field.
 
+### What the node actually costs
+
+`memory_per_stream` bounds retained parts and segments. It does not cover what
+a publisher holds on the way there, and that is not small: transport framing,
+the demuxer queue, an in-flight batch, pre-roll, and container probing come to
+**120MiB per publisher**, held only while ingesting and released the moment a
+session ends.
+
+```
+worst case = streams x memory_per_stream      retained media, outlives the publisher
+           + publishers x 120MiB              ingest only, released on disconnect
+```
+
+The two terms have different lifetimes, which is the same seam `publishers` and
+`streams` already sit on. At the reference's own numbers that is 64GiB of
+retained media and 7.5GiB of pipeline.
+
+The pipeline figure is a compiled constant rather than a setting, because an
+operator has no basis on which to choose one: it is driven by track count and
+group-of-pictures structure, which belong to the publisher rather than to the
+deployment, and a value chosen too low breaks discovery for multi-rendition
+contributors. What is owed instead is the guarantee and a way to check it, so
+it is exported per session as `rushls_session_pipeline_bytes`.
+
+A `memory_per_publisher` cap appears commented in the reference and is not
+built. Enforcing one shared budget means deciding what a stage does when
+another holds the bytes it wants — failing the session kills a healthy
+publisher on a transient peak, blocking turns a memory cap into a stall — and
+that is a decision worth making against real numbers from the metric.
+
 ## Timeouts
 
 `[rtmp] timeout` is the idle limit for an **established** publisher: how long

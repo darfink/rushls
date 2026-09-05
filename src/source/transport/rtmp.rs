@@ -87,7 +87,8 @@ impl Default for RtmpConfig {
                 session_read: Some(Duration::from_secs(10)),
                 write: Some(Duration::from_secs(10)),
             },
-            maximum_buffered_flv_bytes: nz::usize!(16 * 1024 * 1024),
+            maximum_buffered_flv_bytes: NonZeroUsize::new(crate::source::PipelineMemory::TRANSPORT)
+                .expect("the transport budget is nonzero"),
             maximum_tag_payload_bytes: nz::usize!(8 * 1024 * 1024),
             avformat: AvformatConfig::default(),
             input_limits: InputLimits::permissive(),

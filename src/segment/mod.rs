@@ -60,7 +60,7 @@ impl PrerollLimits {
     /// Room for several seconds of high-bitrate multi-track media.
     pub fn permissive() -> Self {
         Self {
-            maximum_buffered_bytes: 64 * 1024 * 1024,
+            maximum_buffered_bytes: crate::source::PipelineMemory::PREROLL,
             maximum_buffered_samples: 16_384,
             maximum_wall_time: Duration::from_secs(15),
             maximum_media_duration: Duration::from_secs(30),

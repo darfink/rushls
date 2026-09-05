@@ -9,6 +9,7 @@
 
 mod caption;
 mod limits;
+mod memory;
 mod packet;
 mod publish;
 
@@ -16,6 +17,7 @@ pub mod avformat;
 pub mod transport;
 
 pub use caption::{CaptionObservation, H264CaptionDetector};
+pub use memory::PipelineMemory;
 pub use limits::{
     BatchUnit, BoundedBatch, BoundedPacketBatch, DensityUnit, InputLimits, LimitError,
     PacketBatchStats,

@@ -21,7 +21,6 @@ pub struct MediaDensityWindow {
     timeline: TimelineCalibration,
     window_start: Option<MediaInstant>,
     latest: Option<(TrackId, MediaInstant)>,
-    bytes: u64,
     packets: u64,
     samples: u64,
 }
@@ -33,7 +32,6 @@ impl MediaDensityWindow {
             timeline: timeline.clone(),
             window_start: None,
             latest: None,
-            bytes: 0,
             packets: 0,
             samples: 0,
         }
@@ -41,7 +39,6 @@ impl MediaDensityWindow {
 
     pub fn admit(
         &mut self,
-        bytes: u64,
         packets: u64,
         samples: &[NormalizedSample],
     ) -> Result<(), MediaDensityError> {
@@ -61,7 +58,6 @@ impl MediaDensityWindow {
                 // a full window, everything before it stops counting.
                 Some(start) if elapsed(start)? >= self.limits.media_density_window => {
                     self.window_start = Some(current);
-                    self.bytes = 0;
                     self.packets = 0;
                     self.samples = 0;
                 }
@@ -69,18 +65,11 @@ impl MediaDensityWindow {
             }
         }
 
-        self.bytes = self.bytes.saturating_add(bytes);
         self.packets = self.packets.saturating_add(packets);
         self.samples = self
             .samples
             .saturating_add(u64::try_from(samples.len()).unwrap_or(u64::MAX));
 
-        check(
-            self.bytes,
-            self.limits.maximum_bytes_per_media_second,
-            self.limits.media_density_window,
-            DensityUnit::Bytes,
-        )?;
         check(
             self.packets,
             self.limits.maximum_packets_per_media_second,
@@ -168,7 +157,6 @@ mod tests {
 
     fn limits() -> InputLimits {
         InputLimits {
-            maximum_bytes_per_media_second: 1_000,
             maximum_packets_per_media_second: 2,
             maximum_samples_per_media_second: 2,
             media_density_window: Duration::from_secs(1),
@@ -180,11 +168,11 @@ mod tests {
     fn identical_timestamps_cannot_hide_unbounded_packet_density() {
         let mut density = MediaDensityWindow::new(limits(), &timeline());
         density
-            .admit(10, 2, &[sample(0)])
+            .admit(2, &[sample(0)])
             .expect("the first media window is within its cap");
 
         assert_eq!(
-            density.admit(10, 1, &[sample(0)]),
+            density.admit(1, &[sample(0)]),
             Err(MediaDensityError::Limit(LimitError::MediaDensityExceeded {
                 unit: DensityUnit::Packets,
                 limit: 2,
@@ -199,7 +187,7 @@ mod tests {
 
         for second in 0..10 {
             density
-                .admit(10, 1, &[sample(second)])
+                .admit(1, &[sample(second)])
                 .expect("one packet per media second is valid");
         }
     }

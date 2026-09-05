@@ -37,7 +37,10 @@ impl Default for AvformatConfig {
         Self {
             io_buffer_size: nz::usize!(32 * 1024),
             packet_channel_capacity: nz::usize!(64),
-            maximum_queued_payload_bytes: nz::usize!(16 * 1024 * 1024),
+            maximum_queued_payload_bytes: NonZeroUsize::new(
+                crate::source::PipelineMemory::DEMUX_QUEUE,
+            )
+            .expect("the demux queue budget is nonzero"),
         }
     }
 }

@@ -233,6 +233,9 @@ pub struct MeterSnapshot {
     pub media_lead: Duration,
     pub pacing_delay: Duration,
     pub publisher_backpressured: bool,
+    /// The per-publisher pipeline ceiling, so worst-case node memory is
+    /// computable from what is scraped rather than from the documentation.
+    pub pipeline_bytes: u64,
 }
 
 // Declared apart from the storage above because the storage is not a plain
@@ -283,6 +286,10 @@ series! {
         Gauge("rushls_session_publisher_backpressured",
             "Whether an active publisher is currently backpressured.")
             = |snapshot: &MeterSnapshot| snapshot.publisher_backpressured,
+        Gauge("rushls_session_pipeline_bytes",
+            "Bytes one publisher may hold before the store, which \
+             `memory_per_stream` does not cover.")
+            = |snapshot: &MeterSnapshot| snapshot.pipeline_bytes,
     }
 }
 
@@ -358,6 +365,7 @@ impl SessionMeters {
             media_lead: Duration::from_nanos(get(&counters.media_lead_nanos)),
             pacing_delay: Duration::from_nanos(get(&counters.pacing_delay_nanos)),
             publisher_backpressured: counters.publisher_backpressured.load(Ordering::Relaxed),
+            pipeline_bytes: crate::source::PipelineMemory::TOTAL as u64,
         }
     }
 
