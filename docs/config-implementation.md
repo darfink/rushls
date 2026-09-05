@@ -1,18 +1,19 @@
 # RFC companion: what the configuration asks the application to become
 
-> **Status: proposed.** A ledger, not a plan. Nothing here is implemented and
-> no ordering is committed to.
+> **Status: largely implemented.** Entries below marked *not built* remain
+> outstanding: playback authorization, `[record]`, the disk tier, delta
+> playlists, payload-carrying hooks, mutual TLS, and enforcing
+> `memory_per_publisher`. Everything else has landed.
 >
 > This exists because [config.md](config.md) deliberately designs the
 > configuration **without regard for what the internals currently look like**.
 > That is the point of the exercise: the operator surface is chosen first, and
-> the application changes to serve it. This file is the honest accounting of
-> what that costs, so the cost is visible while the design is still cheap to
-> change.
+> the application changes to serve it. This file was the honest accounting of
+> what that would cost; it is kept as the record of why each change was made.
 >
 > Every entry is a place where the proposed configuration describes behaviour
-> the application does not have yet. None of them are reasons to change the
-> configuration — they are the work the configuration implies.
+> the application did not have. None of them were reasons to change the
+> configuration — they were the work the configuration implied.
 
 ## Why this ledger exists
 

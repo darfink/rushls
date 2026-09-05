@@ -397,6 +397,31 @@ io_buffer_size = "64KiB"
 }
 
 #[test]
+fn keys_for_unbuilt_features_are_refused_by_name() -> Result<(), Box<dyn Error>> {
+    // The reference describes several features this node does not have. Their
+    // keys must fail startup rather than be accepted and do nothing, which is
+    // the silent-misconfiguration failure the whole design is against.
+    for configuration in [
+        // Playback authorization.
+        "[auth.playback]\nsecret = \"shh\"\n",
+        // The disk tier.
+        "[capacity]\ndisk_per_stream = \"8GiB\"\n",
+        // Mutual TLS to the admission service.
+        "[auth.publish]\nurl = \"http://auth\"\nclient_certificate = \"/x.pem\"\n",
+        // Payload-carrying hooks.
+        "[hook.archive]\nurl = \"http://archive\"\nevents = [\"session.started\"]\npayload = true\n",
+        // The local archive.
+        "[record]\ndir = \"/archive\"\n",
+    ] {
+        assert!(
+            resolve_toml(configuration)?.is_err(),
+            "expected a startup error for:\n{configuration}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn the_admission_budget_derives_from_the_publisher_budget() -> Result<(), Box<dyn Error>> {
     // A pending admission is a precursor to an ingest session, so the
     // publisher budget is its parent. The stream budget deliberately is not: a
@@ -485,7 +510,7 @@ fn a_configured_endpoint_resolves_to_a_subscription() -> Result<(), Box<dyn Erro
         r#"
 name = "studio"
 
-[hook.endpoints.automation]
+[hook.automation]
 url = "http://automation:9000/events"
 events = ["session.started", "session.ended"]
 maximum_attempts = 2
@@ -514,29 +539,29 @@ maximum_attempts = 2
 #[test]
 fn an_endpoint_that_could_never_deliver_is_rejected() -> Result<(), Box<dyn Error>> {
     let unknown_event = r#"
-[hook.endpoints.automation]
+[hook.automation]
 url = "http://automation:9000/events"
 events = ["session.exploded"]
 "#;
     let no_events = r#"
-[hook.endpoints.automation]
+[hook.automation]
 url = "http://automation:9000/events"
 events = []
 "#;
     let no_attempts = r#"
-[hook.endpoints.automation]
+[hook.automation]
 url = "http://automation:9000/events"
 events = ["session.ended"]
 maximum_attempts = 0
 "#;
     let no_queue = r#"
-[hook.endpoints.automation]
+[hook.automation]
 url = "http://automation:9000/events"
 events = ["session.ended"]
 queue_capacity = 0
 "#;
     let unusable_url = r#"
-[hook.endpoints.automation]
+[hook.automation]
 url = "automation:9000"
 events = ["session.ended"]
 "#;

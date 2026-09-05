@@ -134,8 +134,25 @@ pub struct AppConfig {
     pub http: HttpAppConfig,
     #[conf(flatten, prefix)]
     pub metrics: MetricsAppConfig,
-    #[conf(flatten, prefix)]
-    pub hook: HooksAppConfig,
+    /// Local segment archive. Specified in the reference and **not built**.
+    ///
+    /// Present so the key is refused by name rather than silently ignored: a
+    /// configuration that writes no files while an operator believes it does
+    /// is the failure mode this design exists to remove.
+    #[conf(parameter, value_parser = TomlValue::<toml::Value>::from_str)]
+    pub record: Option<TomlValue<toml::Value>>,
+    /// Hook destinations, keyed by the name that identifies each in logs and
+    /// metrics.
+    ///
+    /// An open namespace, and one of only two: the sub-table names are the
+    /// operator's own. A name is a key rather than a value -- it appears in
+    /// logs and metrics and must be unique -- so a table keyed by it makes
+    /// uniqueness structural, since TOML rejects a duplicate key. An array of
+    /// tables with a `name` field would turn that into a validation rule that
+    /// can be forgotten, and demote the name from the heading to a line inside
+    /// the block. Unknown keys *within* one still refuse.
+    #[conf(parameter, value_parser = TomlTable::<HookEndpointAppConfig>::from_str)]
+    pub hook: Option<TomlTable<HookEndpointAppConfig>>,
 }
 
 impl AppConfig {
@@ -255,7 +272,13 @@ impl AppConfig {
                 "both listeners are off, so this node could serve nothing",
             ));
         }
-        let hooks = self.hook.resolve(&node, &mut client)?;
+        if self.record.is_some() {
+            return Err(invalid(
+                "[record] is specified in the reference configuration but not yet implemented; \
+                 remove it rather than run a node that writes no archive",
+            ));
+        }
+        let hooks = resolve_hooks(self.hook, &node, &mut client)?;
         warnings.extend(startup_warnings(&node, open_admission));
 
         Ok(ResolvedAppConfig {
@@ -424,73 +447,47 @@ impl HttpAuthAppConfig {
     }
 }
 
-#[derive(Conf)]
-#[conf(serde)]
-pub struct HooksAppConfig {
-    /// Deadline for one delivery attempt, connection included.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "5s",
-        value_parser = humantime::parse_duration,
-        serde(use_value_parser)
-    )]
-    request_timeout: Duration,
-    /// Largest response this node will read from an endpoint.
-    #[conf(parameter, long, env, default_value = "64KiB", serde(use_value_parser))]
-    maximum_response_bytes: ByteSize,
-    /// Destinations, keyed by a name that identifies them in logs and metrics.
-    ///
-    /// An open namespace, and one of only two: the sub-table names are the
-    /// operator's. A name is a key rather than a value -- it appears in logs
-    /// and metrics and must be unique -- so a table keyed by it makes
-    /// uniqueness structural, since TOML rejects a duplicate key. An array of
-    /// tables with a `name` field would turn that into a validation rule that
-    /// can be forgotten, and demote the name from the heading to a line inside
-    /// the block. Unknown keys *within* one still refuse.
-    #[conf(parameter, value_parser = TomlTable::<HookEndpointAppConfig>::from_str)]
+/// Deadline for one hook delivery attempt, connection included.
+///
+/// Compiled rather than configured: the reference deliberately exposes no
+/// per-hook queue depth, retry count, or response ceiling, because none of
+/// them is a question an operator can answer better than the node can.
+const HOOK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Largest response this node will read from a hook endpoint.
+const HOOK_MAXIMUM_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Builds the configured destinations, or nothing when none are named.
+fn resolve_hooks(
     endpoints: Option<TomlTable<HookEndpointAppConfig>>,
-}
-
-impl HooksAppConfig {
-    fn resolve(
-        self,
-        node: &NodeConfig,
-        client: &mut LazyHttpClient,
-    ) -> Result<Option<ResolvedHooks>, ConfigError> {
-        let endpoints = self.endpoints.unwrap_or_default();
-        if endpoints.0.is_empty() {
-            // Nothing configured, so nothing is built — including the outbound
-            // client, which a node delivering no events should not pay for.
-            return Ok(None);
-        }
-
-        let mut hooks = Vec::with_capacity(endpoints.0.len());
-        for (name, endpoint) in endpoints.0 {
-            hooks.push(endpoint.resolve(&name)?);
-        }
-
-        Ok(Some(ResolvedHooks {
-            config: HooksConfig {
-                // Both drains answer one operator question and share one
-                // budget; the producer identity is the node name rather than
-                // a second spelling of the same thing.
-                drain_timeout: node.shutdown,
-                hooks,
-                ..HooksConfig::new(node.name.to_string())
-            },
-            // A hook may wait far longer than admission may, which is why the
-            // limits are per-request rather than baked into a shared client.
-            client: client.with_limits(
-                self.request_timeout,
-                nonzero_bytes(
-                    "the maximum hook response size",
-                    self.maximum_response_bytes,
-                )?,
-            )?,
-        }))
+    node: &NodeConfig,
+    client: &mut LazyHttpClient,
+) -> Result<Option<ResolvedHooks>, ConfigError> {
+    let endpoints = endpoints.unwrap_or_default();
+    if endpoints.0.is_empty() {
+        // Nothing configured, so nothing is built — including the outbound
+        // client, which a node delivering no events should not pay for.
+        return Ok(None);
     }
+
+    let mut hooks = Vec::with_capacity(endpoints.0.len());
+    for (name, endpoint) in endpoints.0 {
+        hooks.push(endpoint.resolve(&name)?);
+    }
+
+    Ok(Some(ResolvedHooks {
+        config: HooksConfig {
+            // Both drains answer one operator question and share one budget;
+            // the producer identity is the node name rather than a second
+            // spelling of the same thing.
+            drain_timeout: node.shutdown,
+            hooks,
+            ..HooksConfig::new(node.name.to_string())
+        },
+        // A hook may wait far longer than admission may, which is why the
+        // limits are per-request rather than baked into a shared client.
+        client: client.with_limits(HOOK_REQUEST_TIMEOUT, HOOK_MAXIMUM_RESPONSE_BYTES)?,
+    }))
 }
 
 /// A TOML table of entries keyed by the name an operator chose.
@@ -501,7 +498,7 @@ impl HooksAppConfig {
 /// differ in nothing but what they hold.
 #[derive(Debug, Deserialize)]
 #[serde(transparent)]
-struct TomlTable<T>(BTreeMap<String, T>);
+pub struct TomlTable<T>(BTreeMap<String, T>);
 
 // Hand-written rather than derived: an empty table is meaningful for every `T`,
 // and deriving would demand `T: Default` for no reason.
@@ -521,7 +518,7 @@ impl<T: serde::de::DeserializeOwned> FromStr for TomlTable<T> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HookEndpointAppConfig {
+pub struct HookEndpointAppConfig {
     /// Where deliveries are posted.
     url: String,
     /// Which events this endpoint receives.
@@ -814,7 +811,7 @@ impl CapacityAppConfig {
 /// structured predicate overridable rather than file-only.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(transparent)]
-struct TomlValue<T>(T);
+pub struct TomlValue<T>(T);
 
 impl<T: serde::de::DeserializeOwned> FromStr for TomlValue<T> {
     type Err = toml::de::Error;

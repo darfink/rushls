@@ -1,26 +1,28 @@
 # RFC: the Rushls configuration surface
 
-> **Status: proposed.** This is a design under review, not a description of
-> what the application does today. Nothing here is implemented.
+> **Status: implemented**, apart from the features named as not built below:
+> playback authorization, `[record]`, the disk tier, delta playlists,
+> payload-carrying hooks, and mutual TLS. Their keys are refused at startup
+> rather than silently accepted.
 >
-> **The goal is inverted on purpose.** This document does not describe how to
-> configure the current internals. It describes the configuration an
-> administrator would want if the internals did not exist yet — and the
-> application is then expected to change to serve it. Where this document and
-> the code disagree, the code is what moves.
+> **The goal was inverted on purpose.** This document does not describe how to
+> configure the internals. It describes the configuration an administrator
+> would want if the internals did not exist yet — and the application was then
+> changed to serve it. Where this document and the code disagree, the code is
+> what moves.
 >
 > Replaces the earlier open discussion in `CONFIG.md`, now removed. That
 > document contradicted this design in several places.
 
-The proposed surface is [rushls.reference.toml](../rushls.reference.toml).
+The surface is [rushls.reference.toml](../rushls.reference.toml).
 That file is the contract. This document is why it is shaped that way, and it
 records the promises the file makes but cannot explain in a one-line comment.
 
 ## What this is reacting to
 
-The current `rushls.toml` is a complete reference — every knob, every default,
-an essay per field — pretending to be the file a new administrator opens.
-Three consequences:
+The `rushls.toml` this replaced was a complete reference — every knob, every
+default, an essay per field — pretending to be the file a new administrator
+opens. Three consequences:
 
 1. **The altitude is flat.** `listen` sits beside `publication_stall_multiplier`
    and hook `queue_capacity`.
