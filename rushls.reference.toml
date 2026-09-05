@@ -23,6 +23,7 @@ timeout = "10s"                          # idle limit for an established publish
 [srt]
 listen  = "[::]:9000"
 latency = "120ms"                        # raise on lossy or long-haul links
+timeout = "5s"                           # idle limit for a peer; must exceed latency
 # passphrase_file = "/run/secrets/rushls-srt-passphrase"
 # passphrase      = "..."                # inline form; prefer passphrase_file
 # encryption      = "aes256"
@@ -53,6 +54,11 @@ max_age           = "10min"
 url = "http://auth.example.internal/v1/publish/admit"
 # token_file = "/run/secrets/rushls-auth-token"
 # token      = "..."                     # inline form; prefer token_file
+# This service may widen what this node accepts, so it is trusted. On an
+# untrusted network, prove the origin to it with a client certificate.
+# client_certificate = "/etc/rushls/auth/client.pem"
+# client_key         = "/etc/rushls/auth/client-key.pem"
+# ca                 = "/etc/rushls/auth/ca.pem"   # pin the service's issuer
 
 # Who may watch. Omit this table and anyone with the URL may. Viewers present a
 # JWT, which is verified locally: no request leaves this node per playlist
@@ -95,17 +101,29 @@ tracks      = { max = 8 }
 codecs = ["webvtt", "subrip", "text"]
 tracks = { max = 8 }
 
+# Named alternatives to the predicates above, selected by an auth response
+# returning {"policy": "premium"}. Each holds the same schema as [accept] and
+# replaces it wholesale for that publisher. Omit unless a service names one.
+# [accept.policy.premium]
+# video = { resolution = { max = "4k" }, frame_rate = { max = 60 } }
+# audio = { channels = { max = 6 } }
+
 [hls]
 segment  = "6s"                          # target length of each media file
 part     = "1s"                          # low-latency update interval; shorter than segment
+hold_back = "3x"                         # live-edge latency floor, as a multiple of part
+#          = "3s"                        # or an absolute duration; both forms are accepted
 retain   = "1m"                          # how long media stays fetchable, live and after a drop
-# playlist = "1m"                        # advertised live window; default min("1m", retain)
 # retain is clipped by memory_per_stream. At 5 Mbps, 256MiB holds about 7m.
 
 [capacity]
 publishers        = 64                   # concurrent ingest sessions
 streams           = 256                  # live, plus those still held by retain; when full, a new stream is refused
-memory_per_stream = "256MiB"             # bytes; worst-case RAM is about streams x this
+memory_per_stream = "256MiB"             # retained parts and segments; worst-case is streams x this,
+                                         # plus a fixed per-publisher pipeline cost while ingesting
+# memory_per_publisher = "128MiB"        # not yet implemented; today the pipeline cost is a
+                                         # compiled per-publisher ceiling, reported per session
+                                         # as rushls_session_pipeline_bytes
 # disk_per_stream = "8GiB"               # older media spills here; omit to stay in memory
 # dir             = "/var/lib/rushls"    # required with disk_per_stream; startup fails without it
 

@@ -49,6 +49,21 @@ whether a fresh initialization segment is required after one.
 
 Only an implausible jump — hours, an epoch change — should remain fatal.
 
+**Not in the first adoption.** The intended end state, recorded so the pacing
+work does not foreclose it: a small forward jump is treated as *elapsed media
+time* — a three-second jump means the timeline advanced three seconds, and the
+token bucket is charged accordingly rather than counting the samples that did
+not arrive — while a large jump becomes a discontinuity that resets both the
+timeline and the pacing state. This falls out of a token bucket charged by
+media-time delta, so the initial implementation should charge that way even
+while every jump above the threshold stays fatal.
+
+The depth here is cross-track coherence. The pacer's watermark is the maximum
+across all tracks, so a discontinuity has to be applied to every track at one
+agreed point or they desynchronise at the splice. That, the segment-boundary
+requirement, and the initialization question are why this is deferred rather
+than folded in.
+
 ## Health
 
 **`stall` stays idle-based.** No work needed, recorded because it was nearly
@@ -56,6 +71,72 @@ specified as behind-ness against wall clock, which the evaluator does not
 measure and which would disconnect a slightly slow encoder on a timer. The
 existing source and media idle checks collapse into one operator-facing
 duration.
+
+**The publication deadline is deleted, not re-derived.** `HealthEvaluation`
+today has a third alarm beside the two idle checks: `PublicationStalled`,
+which fires when nothing reaches the store for
+`expected_publication_interval x stalled_publication_multiplier` measured in
+wall time. It is the check that must go under `ceiling` and `floor`, because
+a legitimately throttled or slow publisher trips it on a timer.
+
+Deleting it costs one property worth naming. The three alarms sit at three
+different stages — `source_progress` at demux, `media_progress` at
+normalization, `delivery_progress` at the store — and pacing suppresses the
+first two deliberately, because a sleeping pacer stops the loop reading input.
+So while a publisher is being throttled, the publication deadline is currently
+the only alarm still armed, and a muxer that consumed samples and emitted
+nothing would go unnoticed without it.
+
+That property should be recovered by **making the two surviving alarms
+pacing-aware rather than pacing-suppressed**. The idle checks are suppressed
+only because a pacing sleep makes their clocks meaningless; excluding time
+spent sleeping from those clocks, rather than muting the checks outright,
+keeps them armed throughout. A muxer that stops producing then shows up as
+media silence, which is what it is, and no alarm needs to know about
+wall-clock cadence at all.
+
+A muxer accepting samples and emitting nothing is otherwise a bug rather than
+an operational condition, and one that the segmentation contract — parts and
+segments of a declared duration — already constrains. It does not warrant a
+wall-clock deadline that a slow publisher can trip.
+
+**What remains is one check, not three.** The two idle alarms collapse into
+the single operator-facing `stall`, and what it watches is *usable media* —
+the normalization signal. The demux-stage signal stops being a separate alarm:
+a source delivering bytes that never become media is what `stall` is for, and
+splitting it in two only ever changed which stage the message named.
+
+That naming is worth keeping, but as an **attribution on the event**, not as a
+second timer. When `stall` fires, whether bytes were still arriving is the
+difference between a dead peer and a broken elementary stream, and an operator
+reading "stalled" without it goes looking in the wrong layer. The counters
+that answer it already exist and are already exported, so this is a field on
+the event rather than machinery.
+
+**`stall` cannot become metrics-only.** Reporting is the right home for
+everything diagnostic here, but this one check terminates a session, and
+nothing else does: a publisher whose socket is open and silent holds its
+registration, its stream name, and a publisher slot until something ends it.
+Scraped metrics inform an operator; they do not free the slot. `stall` stays
+the one health signal with teeth, which is why it is also the only one the
+reference exposes.
+
+**Slowness is reported, not diagnosed here.** How far media time trails wall
+time is what `floor` measures, and `floor` is the only thing that should end a
+session for it. Where an operator sets no floor, drift is a fact to expose —
+the meters already carry it — not a fault to invent a threshold for.
+
+The same division applies to the stages generally: **health terminates,
+metrics explain.** Per-stage progress counters stay and are what an operator
+scrapes to find which layer stopped; what goes is the idea that each stage
+needs its own configurable deadline. Three timers were three chances to fail a
+healthy publisher, and none of them told an operator anything the counters do
+not.
+
+Net effect on `HealthEvaluation`: `SourceStalled` and `MediaStalled` become
+one variant carrying the attribution, `PublicationStalled` and its multiplier
+and floor go entirely, and `PacingPublisher` disappears with the suppression
+it existed to express. `HealthPolicy` reduces to one duration.
 
 ## HTTP
 
@@ -81,6 +162,91 @@ session. Long retention windows make that the common case rather than the edge
 case. The eviction machinery exists; the change is to drop oldest rather than
 only time-expired media in the same retry path.
 
+The same applies to `maximum_parts` and `maximum_segments`, which fail the
+same way and are compiled constants. At `segment = "1s"` with `retain = "2h"`
+a stream needs 7200 segments against a 4096 ceiling, so the session dies
+part-way through with no operator setting that explains why. Shedding has to
+cover all three budgets, not only bytes.
+
+Once shedding is in, the store can no longer refuse a write for capacity, and
+that is what keeps the pipeline synchronous. An asynchronous write that waited
+for store capacity would couple output cadence to retention pressure, letting
+one stream's eviction sweep stall another's muxer. Dropping the oldest media
+removes the condition that would have needed waiting on.
+
+**Transient pipeline memory is unaccounted for.** `memory_per_stream` bounds
+retained parts and segments, which is what it should mean to an operator. It
+does not bound what a publisher holds *before* the store, and that is
+substantial: per RTMP session, 16MiB of buffered FLV, 16MiB queued for
+AVFormat, 16MiB of in-flight batch, 64MiB of pre-roll, and 8MiB of discovery
+probe — roughly 120MiB that appears nowhere in `streams x memory_per_stream`.
+SRT adds its own receive buffer.
+
+These stay compiled rather than becoming operator settings: they are
+properties of the pipeline, not policy, and deriving them from
+`memory_per_stream` would wrongly couple retained-window sizing to demux
+buffer sizing. The work is to name the per-publisher total as one constant
+that the individual buffers derive from, and to state the worst case as
+`publishers x` that figure in `config.md`, so capacity planning has the
+number without gaining a knob.
+
+The individual buffers stay internal, but the **total** is an operator-facing
+fact and documenting it alone is not enough. The two terms have different
+lifetimes, which is the same seam `publishers` and `streams` already sit on:
+retained media is charged per stream and outlives its publisher by `retain`,
+while pipeline memory is charged per publisher and is released the moment
+ingest stops. Worst-case memory is therefore
+`streams x memory_per_stream + publishers x <pipeline cost>`, and a
+configuration that presents only the first term as *the* memory setting
+understates the node.
+
+It stays a constant rather than becoming a knob because an operator has no
+basis on which to choose a value: the figure is driven by track count and
+group-of-pictures structure, which are properties of the publisher rather than
+of the deployment. A knob whose correct value is unknowable invites tuning
+that can only break discovery for multi-rendition contributors. What is owed
+instead is the guarantee and a way to check it: the per-publisher ceiling
+named in `config.md`, the reference stating that `memory_per_stream` covers
+retained media only, and a metric for pipeline bytes in use — per publisher
+and in aggregate — so the promise is verifiable on the box rather than only
+asserted here. If a deployment later proves it needs the cap, the additive
+move is a `[capacity] memory_per_publisher` sibling.
+
+**Decided: no `memory_per_publisher` knob for now.** Ship the guarantee, the
+documented figure, and the metric. The knob stays a named future move rather
+than part of this adoption, because a value an operator cannot derive from
+anything they observe is not a setting they can use, and the metric is what
+would tell them they need one.
+
+It appears commented in the reference so the memory model is visible where
+operators read, and it is intended to land — **last**, after everything else
+in this adoption. The ordering is not arbitrary: reporting the total is a sum
+over figures the buffers already maintain, while enforcing one shared budget
+means deciding what a stage does when another holds the bytes it wants. Fail
+the session and a transient peak kills a healthy publisher; block and a memory
+cap becomes a stall. That choice should be made against real numbers from the
+metric rather than ahead of them.
+
+Pre-roll dominates that total and must **not** be shrunk on the strength of
+its size alone. Its horizon is applied per track, so a multi-rendition
+publisher legitimately needs the headroom: pre-roll cannot lock until every
+video track has shown a compatible keyframe cadence, and samples are charged
+at retained cost — `size_of::<NormalizedSample>() + payload` — so many small
+access units consume the budget far faster than their payloads suggest.
+
+**A process-wide view of ingest rate.** The density limits are per session, so
+a full node of publishers each sitting just under its own limit is unbounded
+in aggregate. A metric at minimum.
+
+**Drop `maximum_bytes_per_media_second`.** 100 Mb/s is inside what a 4K
+multi-rendition contribution can reach, and a publisher throttled on a node
+whose operator set no limit is the surprise this design exists to remove. It
+is not load-bearing for memory: the batch and channel caps bound retained
+bytes on their own, and this one bounds only sustained rate, which the link
+already bounds. The packet and sample density caps stay — they catch
+degenerate inputs, such as floods of empty access units, that byte caps cannot
+see, and no legitimate encoder approaches them.
+
 **Tier caps are bytes only.** A duration form was considered and dropped: at a variable
 bitrate it has no fixed byte meaning, so it would be a second, weaker way of writing
 `retain`. `retain` stays the time promise, the tiers stay the spend.
@@ -96,12 +262,48 @@ to find out.
 
 ## Delivery
 
-**Delta playlists.** Not required for long retention with a short advertised
-window, which is the useful configuration today. Required before a long
-*advertised* window is practical, since without them every client re-fetches
-the full segment list on each reload. Currently withheld deliberately:
-advertising a skip boundary commits the origin to rendering skipped playlists,
-and the two must ship together.
+**An operator-facing `hold_back`.** `DeliveryTimingPolicy::part_hold_back` is
+a compiled three-times-part-target multiple today and nothing reaches it. It
+becomes a `DurationRule` under `[hls]`, accepting the multiple and absolute
+forms already used by the stall rules, and is refused below two
+part durations rather than raised.
+
+**The blocking-reload deadline stops being independent.** It is a separate
+three-times multiple in the same policy, so an operator raising `hold_back`
+past it would produce reload deadlines that expire on precisely the requests
+the advertised hold-back invites. It must be derived as
+`max(3 x target, hold_back + part)`. This relationship belongs in the
+derivation itself rather than in a comment beside two constants that happen to
+agree: written as two independent defaults, the next person to retune either
+one has nothing telling them the pair is load-bearing.
+
+**Delta playlists, and no `playlist` window.** `retain` is both what stays
+fetchable and what the playlist advertises; the separate advertised window is
+dropped. A player can only request what a playlist names, so a shorter
+advertised window makes the remainder unreachable rather than cheaper.
+
+The argument for splitting them was reload cost — a long window means
+re-sending every segment line on each reload — and that is precisely what
+Playlist Delta Updates remove. Once `CAN-SKIP-UNTIL` is advertised, a reload
+costs what changed, so the motivation for a short advertised window over deep
+retention disappears rather than being served by a second knob.
+
+The skip boundary does not become a setting either. The specification fixes it
+at no less than six target durations, and it bounds what one delta response may
+omit, not what the playlist advertises — a client without a prior copy still
+gets the full window. It is derived from `segment`.
+
+Delta playlists stay withheld until they can ship whole: advertising a skip
+boundary commits the origin to rendering skipped playlists, and `EXT-X-SKIP`
+requires `EXT-X-VERSION` 9. Collapsing the two windows into `retain` is
+independent of that work and can land first; what depends on deltas is whether
+a *deep* `retain` is affordable to advertise, which is a performance property
+rather than a correctness one.
+
+The one thing that must not be lost is the grace period for a segment that has
+just left the window while a client is still fetching it. That is seconds,
+derived from cadence, and is the only sense in which anything outlives the
+advertised window.
 
 **Playback authorization.** Entirely absent today: the delivery surface has no
 notion of a viewer identity, and authorization exists only for publishers. Adds
@@ -137,6 +339,36 @@ sized for small JSON, so backpressure and drop behaviour need review.
 
 ## Configuration layer
 
+**Named policies only; no inline predicates in a response.** A response may
+carry `policy`, naming an entry under `[accept.policy]` that replaces
+`[accept]` wholesale, and nothing else about media. This is close to what the
+code already does: `BTreeMap<String, StreamPolicy>` resolved at startup, with
+an unknown name failing closed. Three changes remain — policies move under
+`[accept.policy]` and take the new predicate schema, a policy may widen as
+well as narrow the compiled default, and the reserved `default` name goes away
+in favour of `[accept]` itself being the unnamed default.
+
+The module note in `admission/http` arguing that a response must never carry
+policy is therefore *upheld* rather than reversed, but its reasoning is
+replaced: it defends against an untrusted sidecar, where the actual argument
+is legibility — the file stays the whole truth about what the node accepts,
+reviewable and startup-validated, and the response only chooses among sets it
+defines.
+
+**Client certificates on outbound calls.** Specified for `[auth.publish]` and
+applicable unchanged to hooks. `outbound::ClientConfig` builds one shared
+connector today with no client-identity or custom-root path, so this is a
+per-destination TLS configuration rather than a parameter on an existing call.
+Not built; listed because the admission trust model leans on it.
+
+**An NTSC alias table in frame-rate parsing.** Four decimal spellings map to
+their true rationals before any comparison. Parsing only — `FrameRate::exceeds`
+is already exact.
+
+**Environment values parse as TOML fragments.** The existing `TomlTable`
+`value_parser` pattern generalised: structured predicates stay overridable and
+the file and environment share one parser.
+
 **A metrics listener of its own.** Metrics are served on the HTTP listener
 today. Needs a third bound address, defaulting to loopback. Configuring it to
 the HTTP address keeps the current shared-port behaviour, which means the
@@ -145,6 +377,28 @@ router must serve metrics on either listener depending on how they resolve.
 **A derived handshake timeout.** One operator-facing RTMP timeout fans out to
 an established-session limit and a shorter unauthenticated-handshake limit.
 The per-phase overrides that exist today are removed.
+
+**Enhanced RTMP validation is always strict.** `EnhancedValidationMode` and
+its `passthrough` arm are removed rather than left unreachable. Malformed
+Enhanced FLV framing or invalid capability fields refuse the publisher, on the
+same footing as a failed handshake: a publisher that cannot describe its own
+media correctly is not one this origin should package. Keeping opaque bytes
+instead defers the failure to a layer with less context and turns a protocol
+error into a packaging error. If real publishers turn out to violate the
+specification in practice, the answer is to decide deliberately which
+deviation to tolerate, not to leave a switch that disables the whole check.
+This is separate from `[accept]`, which decides *which* codecs are admitted;
+this decides whether the framing is well-formed at all.
+
+**`[srt] timeout` becomes operator-facing and keeps its `latency` floor.**
+`SrtConfig::peer_idle_timeout` exists and is already validated as strictly
+greater than `latency`; the reference now exposes both, so the invariant moves
+from an internal default pairing to a relationship between two configured
+values and must be refused rather than silently adjusted.
+
+**`floor.pace` must be refused at or above `ceiling.pace`.** A ceiling holding
+a publisher at exactly the floor makes ordinary jitter fatal, and no value of
+the pair is usable, so this is a refusal rather than a warning.
 
 **Exact-rational frame rate comparison and unit aliases everywhere.** Rates
 compare as rationals rather than floats, and the friendly sample-rate spelling

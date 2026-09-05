@@ -128,6 +128,30 @@ before comparison. The quotient form is a string; a bare `30000/1001` is not
 valid TOML. `frame_rate = 30` therefore does not admit 29.97 — the predicate
 doing what it says — and the range form is how a deployment accepts both.
 
+That equivalence is an **alias, not arithmetic**. `29.97` read literally is
+`2997/100`, which is not `30000/1001`; the two are the same rate only because
+the broadcast decimals are conventional shorthand for the NTSC rationals, so
+the parser maps them explicitly:
+
+| Written | Parsed as |
+| --- | --- |
+| `23.976` | `24000/1001` |
+| `29.97` | `30000/1001` |
+| `59.94` | `60000/1001` |
+| `119.88` | `120000/1001` |
+
+Every other decimal is its literal value. The table is closed and short
+because it covers exactly the spellings encoders report, and it lives in
+parsing alone — comparison stays exact-rational and needs to know nothing
+about it.
+
+Comparing to a tolerance was the alternative and is rejected. A predicate that
+admits within two decimal places makes `frame_rate = 30` quietly accept 29.97,
+which is the predicate not doing what it says, and the mistake is invisible:
+a deployment that meant exactly 30 receives NTSC sources indefinitely without
+a signal. There is also no defensible cutoff — two places admits 29.97 and
+three does not, and neither number can be justified over the other.
+
 Resolution is **two-dimensional**. A named size is a bounding box, not a point
 on a scale: `{ max = "4k" }` means the frame fits inside 3840x2160, with axes
 swapped for portrait. Anamorphic and portrait sources break any one-dimensional
@@ -147,14 +171,52 @@ form `{ max = { width = 3840, height = 2160 } }` is always legal.
 
 ### Layering
 
-Two layers, same schema, later wins:
+There are two layers and **one** way to move between them. `[accept]` is the
+default for every publisher. An admission response may select a different
+named policy, and that is all it may do:
 
-1. `[accept]` and its nested tables — the default for every publisher.
-2. The auth response’s `accept` object — an optional partial overlay.
+```toml
+[accept.policy.premium]
+video = { resolution = { max = "4k" }, frame_rate = { max = 60 } }
+audio = { channels = { max = 6 } }
+```
 
-Only listed keys override. An overlay of
-`{"video": {"resolution": {"max": "1080p"}}}` leaves `video.frame_rate` and the audio predicates untouched.
-Unknown keys in an overlay deny the publisher, fail-closed.
+`{"policy": "premium"}` selects it. A policy **replaces `[accept]` wholesale**
+for that publisher: it does not inherit the top-level tables, so anything it
+leaves unsaid takes the compiled default rather than the file's value. Each
+entry holds the same schema as `[accept]` itself, including the pacing bounds,
+and is resolved at startup — so a name no policy defines fails the node, not
+the publisher, and admission costs a map lookup rather than a parse.
+
+Omitting `policy` applies `[accept]`, which is the common case.
+
+**A response cannot carry predicates inline.** An earlier draft let it send an
+`accept` object that overrode the file per table. Both exist to answer one
+question — what may this publisher send — and offering two answers means every
+deployment has to decide which it uses, while anyone reading a node's
+configuration has to consult the auth service's source to know what actually
+applies. A named policy keeps the whole admissible set in the file, where it
+can be reviewed, diffed, and validated at startup; the response chooses among
+sets rather than defining one.
+
+That an inline object could express something a policy cannot is not a real
+advantage: a per-account rule still comes from a finite set the operator
+decided on, and enumerating that set is what makes it auditable. A deployment
+that genuinely needs a new shape adds a policy and restarts, which is the same
+cost as every other change to what this node accepts.
+
+A policy may **widen as well as narrow**. One that could only tighten cannot
+say "this account may publish 4K" on a node defaulting to 1080p, which is an
+ordinary tenant rule; requiring it to be expressible would push every
+deployment into a permissive base and make the base meaningless. Widening is
+safe here in a way an inline override was not, because the widened set is
+still one the operator wrote down.
+
+This supersedes an earlier rule that a response could name only a policy and
+never carry one — which is, in the end, where this lands again, for a
+different reason. That rule was defensive, assuming a semi-trusted sidecar.
+This one is about legibility: the file stays the whole truth about what the
+node accepts.
 
 There is deliberately no per-app or per-path layer. RTMP has a path namespace
 and SRT's compact stream id does not, so a path-keyed table would need a story
@@ -167,7 +229,7 @@ belong on the auth service, which already knows the account and the stream.
 side so their kinship reads at a glance. `ceiling` throttles, `stall` and
 `floor` disconnect — that difference in enforcement is why ceiling and floor
 stay two objects rather than one list. All three are per-publisher contracts,
-so the auth overlay may narrow any of them per account.
+so a named policy may set any of them per account.
 
 ```toml
 ceiling = { pace = "1x", burst = "10s" }     # at most realtime, ten-second head start
@@ -177,7 +239,11 @@ stall   = "12s"                                # nothing usable for 12s: dropped
 
 Exceeding the ceiling **waits**. Transport backpressure is the entire
 enforcement: a publisher cannot dump unbounded media into the process, and a
-file pushed at 100x still plays, slowed to live. There is no
+file pushed at 100x still plays, slowed to live — *when a ceiling is set*.
+Omitting `ceiling` is the compiled default and means exactly what it says: a
+file pushed as fast as the link allows is packaged as fast as it arrives, and
+plays as fast-forward. That is taken to be what an operator asked for by
+setting no limit, which is why the starter file sets none either. There is no
 disconnect-on-too-fast setting today, because refusing turns an encoder
 catch-up or a large group-of-pictures into an outage. If one ever lands it
 belongs here as a third bound — same `{ pace, window }` shape, disconnect
@@ -211,6 +277,15 @@ At `true`, the newcomer replaces it: the old session is closed and viewers see
 a discontinuity at the join. The default is refusal because silent replacement
 turns an encoder reconnect or a leaked credential into a hijack with no signal.
 
+The cost of that default is a reconnect blackout. A publisher whose network
+drops without closing its socket still holds the name until `stall` fires, so
+an encoder returning before then is refused — at `stall = "12s"`, up to twelve
+seconds of dead air on every partition. Which way to err is a judgement about
+the deployment: `takeover = true` favours reconnect speed and accepts that
+anyone with the credential can seize a live stream, while the default favours
+holding the name and accepts the gap. Operators keeping the default should
+size `stall` with this in mind, since it is what bounds the blackout.
+
 `ceiling`, `stall`, `floor`, and `takeover` deliberately do **not** take the
 predicate constructors above. Those answer "which values are in the admit
 set"; a refill rate is not a value to test membership against. "Exactly 1x"
@@ -224,17 +299,34 @@ knowledge the auth service has and the origin does not.
 ## HLS
 
 `segment` and `part` are output cadence. `retain` is **how long media stays
-fetchable** — while live, and after the publisher drops. `playlist` is how much
-the live playlist advertises, defaulting to `min("1m", retain)`.
+fetchable** — while live, and after the publisher drops. It is also **what the
+live playlist advertises**: the two are one setting, not two.
 
-Splitting them is what makes long history usable: `retain = "2h"` with
-`playlist = "1m"` gives depth without making every player re-fetch hours of
-segment lines on each reload.
+There is deliberately no separate `playlist` window. Media a playlist does not
+name is media no player can ask for, so retaining beyond the advertised window
+produces bytes reachable only by a consumer that already holds the URLs — which
+a player never does. The one durable exception is a segment that has just
+*left* the window while a client is still fetching it, and that is a grace
+period measured in seconds, derived from the cadence rather than configured.
 
-Both have a floor of **three segments**, which live playlists require. A
-`retain` or `playlist` below that is raised to it with a warning rather than
-refused: the intent is unambiguous and refusing to boot over an arithmetic
-relationship an operator did not know about is the nagging this design avoids.
+An earlier draft split them so that a long history could sit behind a short
+advertised window, on the grounds that advertising hours of segment lines is
+expensive to re-send on every reload. That reasoning describes a client
+re-fetching a whole playlist, which is what Playlist Delta Updates exist to
+stop: with `CAN-SKIP-UNTIL`, a reload costs what changed rather than what the
+window holds. Once deltas ship, the cost that motivated splitting is gone, and
+a split would only mean holding media nobody can name.
+
+The skip boundary is not the reason to split either. The specification fixes
+it at **at least six target durations**, and it bounds what a delta may *omit
+from one response*, not what the playlist advertises: a client without a prior
+copy still receives the full window. So the boundary is a property of the
+delta mechanism, derived from `segment`, and never an operator setting.
+
+`retain` has a floor of **three segments**, which live playlists require. A
+shorter value is raised to it with a warning rather than refused: the intent is
+unambiguous and refusing to boot over an arithmetic relationship an operator
+did not know about is the nagging this design avoids.
 
 `retain` is **time only**, never bytes. It is a promise to viewers about how
 far back a playlist can point, and viewers seek along time. The storage tiers
@@ -246,6 +338,41 @@ A duration form on the tiers was considered and dropped. "Hold 30 seconds of
 memory" has no fixed byte meaning at a variable bitrate, so it would be a
 second, weaker way of writing `retain` — and the number an operator needs for
 capacity planning is the one that multiplies by `streams`.
+
+### `hold_back`
+
+`hold_back` is how far behind the live edge a player is told to start, and it
+is therefore **the floor on live-edge latency**. It takes either a multiple of
+`part` (`"3x"`, the default) or an absolute duration (`"3s"`), the same two
+forms `playlist` accepts.
+
+It is exposed while the other delivery timing values stay compiled because it
+is the only one that is a genuine tradeoff rather than a correctness
+constraint. Below roughly three part durations a client on a lossy link runs
+out of buffered parts and stalls; above it, every viewer waits longer than
+they need to. Which side to err on depends on the audience's network, which
+the origin cannot know. The segment-level `HOLD-BACK` stays derived at three
+target durations, where the specification leaves no such latitude.
+
+The multiple form is the default because the quantity it bounds is the part
+cadence itself: an absolute value chosen against `part = "1s"` silently
+becomes aggressive when parts are retuned, which is the same reasoning the
+stall rules use.
+
+A value below **two part durations** is refused rather than raised. This is
+deliberately unlike the `retain` and `playlist` floors, which are raised with
+a warning: there the operator's intent is unambiguous and only the arithmetic
+was wrong, whereas a hold-back under two parts asks for a latency the protocol
+cannot deliver, and honouring it approximately would mean advertising a
+promise that makes players stall.
+
+The blocking-reload deadline is **derived from this value**, not configured
+beside it. A client asked to sit `hold_back` behind the edge will request a
+part that far ahead, so a reload deadline shorter than the hold-back would
+expire on requests the origin itself told the client to make. The deadline is
+`max(3 x target, hold_back + part)`, which keeps the protocol's own floor
+while guaranteeing any request the advertised hold-back invites can be
+satisfied.
 
 ## Storage tiers
 
@@ -311,12 +438,22 @@ bounded by a constant". Exposing both invites the pairing that the derived form
 prevents: a generous session timeout accidentally applied to unauthenticated
 peers.
 
-Three idle-adjacent knobs, three different signals. `[rtmp] timeout` is socket
-silence — any bytes reset it — and stays per-protocol because only RTMP needs
-its own transport guard. `stall` is usable-media silence, protocol-agnostic.
-`floor` is usable-media rate. Collapse any two and one failure mode loses its
-tuning: a dead socket wants seconds, a degraded encoder wants tens of seconds
-with a pace attached.
+`[srt] timeout` is the same idea one protocol over, and stays separate rather
+than folding into the RTMP one. SRT is connectionless and keeps its own
+keepalive, so this bounds a protocol-level idle rather than a stalled socket
+read, and the two are sized against different things. This one in particular
+is **bounded below by `latency`**: a deadline inside the receiver's own
+reordering window would fire on packets the transport is still legitimately
+waiting for, so a `timeout` at or under `latency` is refused. Raising
+`latency` for a long-haul link without raising `timeout` is the mistake that
+check exists to catch.
+
+Four idle-adjacent knobs, three different signals. `[rtmp] timeout` and
+`[srt] timeout` are transport silence — any bytes reset them — and stay
+per-protocol because what counts as silence differs. `stall` is usable-media
+silence, protocol-agnostic. `floor` is usable-media rate. Collapse any of them
+and one failure mode loses its tuning: a dead socket wants seconds, a degraded
+encoder wants tens of seconds with a pace attached.
 
 ## Shutdown
 
@@ -493,13 +630,20 @@ One HTTP service, asked once per publisher:
 ```json
 {"decision": "allow", "stream": "live/camera", "user": "account-42"}
 {"decision": "allow", "stream": "live/camera", "user": "account-42",
- "accept": {"video": {"resolution": {"max": "1080p"}}}}
+ "policy": "premium"}
 {"decision": "deny", "reason": "subscription_inactive"}
 ```
 
-No policy names. The optional `accept` overlay uses the same field names as the
-TOML, which is what lets a control plane express per-account terms without a
-configuration change — the single largest functional gain in this design.
+`policy` names an entry under `[accept.policy]`, replacing `[accept]` for that
+publisher; omitting it applies `[accept]`. That is the whole of what a response
+may decide about media, and Layering above says why it is a name rather than
+the predicates themselves.
+
+**The admission service is trusted.** A policy may widen what this node
+accepts, so a service choosing policies can admit more than the default
+allows — bounded, though, by the set the file defines, which is the point of
+naming rather than carrying. The channel still carries real authority: a
+bearer token at minimum, and on an untrusted network a client certificate.
 
 The request is a POST with a JSON body carrying four fields: `protocol` (`rtmp`
 or `srt`), `stream` (the requested name), `remote` (the peer address), and a unique
@@ -627,12 +771,38 @@ Setting both forms of one secret is refused rather than resolved by precedence.
 
 Unknown keys refuse. A misspelled table or field fails startup with its path,
 because silently ignoring it would run an open node the operator thought was
-closed. This is the same fail-closed instinct as the auth overlay.
+closed. This is the same fail-closed instinct as an unknown policy name.
+
+**Two tables are open namespaces**, and are the only exceptions: `[hook.*]`
+and `[accept.policy.*]`, whose sub-table names the operator chooses. The names
+are keys rather than values — a hook's name identifies it in logs and metrics,
+and a policy's is what an auth response selects — so a table keyed by name
+makes uniqueness structural, since TOML rejects a duplicate key for us. The
+alternative spelling, an array of tables with a `name` field, turns
+uniqueness into a validation rule that has to be written and can be forgotten,
+and demotes the name from the heading to a line inside the block, which reads
+worse in a file built to be skimmed. Unknown keys *within* one of these tables
+still refuse.
 
 Precedence is file, then environment, then command line; later wins. Environment
 uses the existing `RUSHLS_` names, so containers can inject secrets without
 rewriting the file. Interpolation runs on file values before overrides apply, so
 `${VAR}` in the file and a `RUSHLS_` override compose rather than compete.
+
+An environment value is **a TOML fragment**, not a second grammar. A scalar
+needs no ceremony, because a bare scalar is already valid TOML on the
+right-hand side:
+
+```
+RUSHLS_HLS_SEGMENT=6s
+RUSHLS_ACCEPT_VIDEO_FRAME_RATE='{ min = 24, max = 60 }'
+```
+
+Structured predicates therefore stay overridable, which a scalars-only rule
+would have prevented for much of `[accept]`, and they are parsed by the same
+code that parses the file, so a predicate means exactly one thing in both
+places. JSON was the alternative and is rejected for being a second grammar
+for values the file already spells.
 
 The file is read at startup. New certificates and rotated JWKS keys take effect
 without a restart; anything else requires one. There is deliberately no reload
@@ -688,7 +858,7 @@ administrator over a relationship they did not know existed should warn.
 
 ## Deliberately not included
 
-- Per-path or per-app accept maps — the auth overlay covers it.
+- Per-path or per-app accept maps — named policies cover it.
 - A disconnect-on-too-fast setting.
 - Classic HLS, or a `low_latency` flag. The origin is low-latency HLS.
 - `log_level` — `RUST_LOG` already does this.
@@ -702,7 +872,17 @@ administrator over a relationship they did not know existed should warn.
 
 Additive, no reorganization needed: a `[dash]` sibling to `[hls]`, stream-key
 auth as `[auth] key_file`, further ingest protocols as new top-level tables,
-and `EVENT`-type playlists as a value on `playlist`.
+and `EVENT`-type playlists, which would arrive as a new `[hls]` field naming
+the playlist type rather than as a second retention window.
+
+**Mutual TLS to the admission service.** Specified in the reference as
+`client_certificate`, `client_key`, and `ca` under `[auth.publish]`, and not
+built. It is listed rather than deferred silently because the trust model
+above depends on it: a service permitted to widen this node's accept set
+should be authenticated by more than a bearer token wherever the path between
+them is not already private. The same three fields apply unchanged to a hook
+destination, which is why they are spelled generically rather than named for
+admission.
 
 Structural, and honestly not designed for: **transcoding**. A rendition ladder
 needs named variants and per-variant constraints, which is a new top-level
