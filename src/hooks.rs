@@ -249,8 +249,9 @@ impl EventObserver for HookObserver {
     }
 
     fn observe_stream(&self, stream: StreamId, event: StreamEvent) {
-        self.hooks
-            .deliver(&self.projector.project_stream(stream.clone(), event));
+        if let Some(projected) = self.projector.project_stream(stream.clone(), event) {
+            self.hooks.deliver(&projected);
+        }
         self.inner.observe_stream(stream, event);
     }
 

@@ -5,7 +5,9 @@ use std::{
 
 use crate::{
     delivery::{Origin, uri::MediaResource},
-    domain::{MediaKind, Payload, RenditionId, StreamId, Timebase, fixtures::TrackBuilder},
+    domain::{
+        MediaKind, Payload, RenditionId, SessionId, StreamId, Timebase, fixtures::TrackBuilder,
+    },
     media::fixtures::presentation as validated,
     mux::{
         InitializationSegment, MediaSegmentFormat, PackagedChunk, PackagedMedia,
@@ -13,6 +15,7 @@ use crate::{
         PackagingRenditionId, PackagingSegmentId, RenditionConfig, RenditionKey,
         fixtures::{RenditionBuilder, config, presentation_at},
     },
+    observe::{EventObserver, Events, RetentionClipReason, SessionEvent, StreamEvent},
 };
 
 use super::*;
@@ -170,6 +173,29 @@ fn direct(rendition: u32, segment: u64, start: i64, duration: u64, bytes: usize)
 
 fn write(lease: &StreamLease, media: PackagedMedia) {
     assert_eq!(lease.write(media), Ok(true));
+}
+
+#[derive(Clone, Default)]
+struct StreamLog(Arc<parking_lot::Mutex<Vec<(StreamId, StreamEvent)>>>);
+
+impl EventObserver for StreamLog {
+    fn observe(&self, _session: SessionId, _event: SessionEvent) {}
+
+    fn observe_stream(&self, stream: StreamId, event: StreamEvent) {
+        self.0.lock().push((stream, event));
+    }
+}
+
+impl StreamLog {
+    fn clips(&self) -> Vec<StreamEvent> {
+        self.0
+            .lock()
+            .iter()
+            .filter_map(|(_, event)| {
+                matches!(event, StreamEvent::RetentionClipped { .. }).then_some(*event)
+            })
+            .collect()
+    }
 }
 
 /// Publishes one whole six-second segment as the parts that compose it.
@@ -1084,6 +1110,139 @@ fn byte_pressure_clips_the_playlist_until_the_write_fits() {
 }
 
 #[test]
+fn memory_pressure_emits_one_clip_event() {
+    let log = StreamLog::default();
+    let mut limits = limits();
+    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.maximum_payload_bytes = 101;
+    let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    for id in 0..20 {
+        write(
+            &lease,
+            direct(
+                0,
+                id,
+                i64::try_from(id).expect("fixture id fits i64") * 6,
+                6,
+                10,
+            ),
+        );
+    }
+    let clips = log.clips();
+    assert_eq!(clips.len(), 1, "{clips:?}");
+    assert!(
+        matches!(
+            clips[0],
+            StreamEvent::RetentionClipped {
+                reason: RetentionClipReason::Memory,
+                requested,
+                held,
+            } if requested == Duration::from_hours(2) && held < requested
+        ),
+        "{clips:?}"
+    );
+}
+
+#[test]
+fn retain_trim_does_not_emit_a_clip_event() {
+    let log = StreamLog::default();
+    let store = StreamStore::new(limits()).with_events(Events::new(Arc::new(log.clone())));
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    for id in 0..10 {
+        write(
+            &lease,
+            direct(
+                0,
+                id,
+                i64::try_from(id).expect("fixture id fits i64") * 6,
+                6,
+                10,
+            ),
+        );
+    }
+    assert_eq!(
+        lease.live().retention_depth().held,
+        Duration::from_secs(36),
+        "the window is retain, not a byte cap"
+    );
+    assert!(
+        log.clips().is_empty(),
+        "sliding off retain is the window the operator asked for"
+    );
+}
+
+#[test]
+fn a_full_sibling_does_not_hide_capacity_drops() -> Result<(), Box<dyn std::error::Error>> {
+    let log = StreamLog::default();
+    let mut limits = limits();
+    limits.retention.retain = Duration::from_mins(1);
+    limits.retention.maximum_payload_bytes = 51;
+    let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
+    let lease = lease(&store, &[(0, false), (1, false)]);
+    configure(&lease, 0, false);
+    configure(&lease, 1, false);
+    for id in 0..4 {
+        write(&lease, direct(0, id, i64::try_from(id)? * 6, 6, 10));
+    }
+    for id in 0..10 {
+        write(&lease, direct(1, id, i64::try_from(id)? * 6, 6, 0));
+    }
+    assert!(
+        log.clips().is_empty(),
+        "a stream still filling its window is normal"
+    );
+    write(&lease, direct(0, 4, 24, 6, 10));
+    assert_eq!(lease.live().retention_depth().held, Duration::from_mins(1));
+    assert_eq!(
+        log.clips(),
+        vec![StreamEvent::RetentionClipped {
+            reason: RetentionClipReason::Memory,
+            requested: Duration::from_mins(1),
+            held: Duration::from_secs(24),
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn object_pressure_emits_one_clip_event() {
+    let log = StreamLog::default();
+    let mut limits = limits();
+    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.maximum_segments = 6;
+    let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    for id in 0..8 {
+        write(
+            &lease,
+            direct(
+                0,
+                id,
+                i64::try_from(id).expect("fixture id fits i64") * 6,
+                6,
+                0,
+            ),
+        );
+    }
+    let clips = log.clips();
+    assert_eq!(clips.len(), 1, "{clips:?}");
+    assert!(
+        matches!(
+            clips[0],
+            StreamEvent::RetentionClipped {
+                reason: RetentionClipReason::Objects,
+                ..
+            }
+        ),
+        "{clips:?}"
+    );
+}
+
+#[test]
 fn the_playlist_floor_may_remain_over_the_byte_cap() {
     let mut limits = limits();
     limits.retention.retain = Duration::from_hours(2);
@@ -1685,7 +1844,8 @@ async fn spill_keeps_playlist_duration_and_serves_the_same_payload() {
         directory: directory.clone(),
         maximum_payload_bytes: 10_000,
     });
-    let store = StreamStore::new(limits);
+    let log = StreamLog::default();
+    let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
     for id in 0..8 {
@@ -1727,6 +1887,10 @@ async fn spill_keeps_playlist_duration_and_serves_the_same_payload() {
         .await
         .expect("spilled media is still fetchable");
     assert_eq!(object.body.len(), 10);
+    assert!(
+        log.clips().is_empty(),
+        "spilling preserves history and must stay quiet"
+    );
     drop(store);
     let _ = std::fs::remove_dir_all(directory);
 }
@@ -1888,6 +2052,43 @@ fn both_tiers_full_hides_and_drops_so_held_falls() {
         depth.held < Duration::from_secs(72),
         "twelve parents cannot all remain named"
     );
+    drop(store);
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn disk_pressure_emits_one_clip_event() {
+    let directory = scratch_disk("disk-clip");
+    let log = StreamLog::default();
+    let mut limits = limits();
+    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.maximum_payload_bytes = 41;
+    limits.disk = Some(DiskLimits {
+        directory: directory.clone(),
+        maximum_payload_bytes: 30,
+    });
+    let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    for id in 0..12 {
+        write(
+            &lease,
+            direct(0, id, i64::try_from(id).expect("id") * 6, 6, 10),
+        );
+    }
+    wait_until("disk cap clips the playlist", || {
+        log.clips().iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::RetentionClipped {
+                    reason: RetentionClipReason::Disk,
+                    ..
+                }
+            )
+        })
+    });
+    assert_eq!(log.clips().len(), 1, "{:?}", log.clips());
+    drop(lease);
     drop(store);
     let _ = std::fs::remove_dir_all(directory);
 }

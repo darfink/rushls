@@ -301,7 +301,7 @@ impl Node {
         // different supposedly process-wide limit.
         config.rtmp.input_limits = config.session.input;
         config.srt.input_limits = config.session.input;
-        let store = StreamStore::try_new(config.store.clone())?;
+        let store = StreamStore::try_new(config.store.clone())?.with_events(events.clone());
         let sessions = Registry::with_capacity(config.maximum_sessions);
         let meters = ProcessMeters::default();
         let services = Services {

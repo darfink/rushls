@@ -24,7 +24,8 @@ mod meters;
 pub use counters::{MetricKind, Reading, Series};
 pub use delivery::{HlsMeters, HlsSnapshot, OriginMeters, OriginSnapshot};
 pub use events::{
-    EventObserver, EventSink, Events, NodeEvent, Protocol, SessionEnd, SessionEvent, StreamEvent,
+    EventObserver, EventSink, Events, NodeEvent, Protocol, RetentionClipReason, SessionEnd,
+    SessionEvent, StreamEvent,
 };
 pub use meters::{
     DeliveryMeters, MediaMeters, MeterSnapshot, MuxMeters, ProcessMeters, ProcessSnapshot,

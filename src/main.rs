@@ -151,6 +151,19 @@ impl EventObserver for TracingEvents {
         match event {
             StreamEvent::Available => info!(stream = %stream, "playable"),
             StreamEvent::Retired => info!(stream = %stream, "no longer reachable"),
+            StreamEvent::RetentionClipped {
+                reason,
+                requested,
+                held,
+            } => {
+                warn!(
+                    stream = %stream,
+                    capacity = %reason,
+                    retain = %humantime::format_duration(requested),
+                    retained = %humantime::format_duration(held),
+                    "storage capacity reached; oldest media dropped"
+                );
+            }
         }
     }
 

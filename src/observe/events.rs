@@ -278,10 +278,7 @@ pub trait EventObserver: Send + Sync {
     fn observe_node(&self, _event: NodeEvent) {}
 }
 
-/// What changed about a stream's own lifetime.
-///
-/// Deliberately two variants. Everything else worth reporting about a stream
-/// happens to a publisher, and belongs in [`SessionEvent`].
+/// What changed about a stream's own lifetime, rather than one publisher's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamEvent {
     /// The store has a presentation a viewer can play.
@@ -291,6 +288,26 @@ pub enum StreamEvent {
     /// Only reported for a stream that was playable: one retired without ever
     /// serving anything never became unavailable, because it never was.
     Retired,
+    /// Oldest playable media was dropped because a byte or object cap is full.
+    ///
+    /// Sliding off `retain` is silent. This fires once when a cap first
+    /// shortens the playlist, and again only if the playlist later fills
+    /// `retain` and a cap drops media again.
+    RetentionClipped {
+        reason: RetentionClipReason,
+        requested: Duration,
+        held: Duration,
+    },
+}
+
+/// The storage limit that forced media to be dropped.
+#[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
+#[display(rename_all = "lowercase")]
+pub enum RetentionClipReason {
+    Memory,
+    Disk,
+    #[display("part or segment count")]
+    Objects,
 }
 
 /// The process-wide event destination.

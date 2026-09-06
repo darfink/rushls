@@ -243,13 +243,13 @@ impl Projector {
 
     /// Projects a stream-lifetime fact, which belongs to no session.
     ///
-    /// Trivial today, and here rather than at the call site so that every
-    /// internal-to-public translation stays in one file: what a consumer is
-    /// told is decided in this module or nowhere.
-    pub fn project_stream(&self, stream: StreamId, event: StreamEvent) -> Event {
+    /// `None` when the fact is operator-facing but not a public lifecycle
+    /// event: capacity clipping the playlist is logged, not delivered.
+    pub fn project_stream(&self, stream: StreamId, event: StreamEvent) -> Option<Event> {
         match event {
-            StreamEvent::Available => Event::StreamAvailable(StreamAvailable { stream }),
-            StreamEvent::Retired => Event::StreamUnavailable(StreamUnavailable { stream }),
+            StreamEvent::Available => Some(Event::StreamAvailable(StreamAvailable { stream })),
+            StreamEvent::Retired => Some(Event::StreamUnavailable(StreamUnavailable { stream })),
+            StreamEvent::RetentionClipped { .. } => None,
         }
     }
 
@@ -429,8 +429,12 @@ mod tests {
         let projector = Projector::new();
         let stream = StreamId::new("live/camera");
 
-        let available = projector.project_stream(stream.clone(), StreamEvent::Available);
-        let retired = projector.project_stream(stream.clone(), StreamEvent::Retired);
+        let available = projector
+            .project_stream(stream.clone(), StreamEvent::Available)
+            .expect("availability is public");
+        let retired = projector
+            .project_stream(stream.clone(), StreamEvent::Retired)
+            .expect("retirement is public");
 
         assert_eq!(available.kind(), Kind::StreamAvailable);
         assert_eq!(retired.kind(), Kind::StreamUnavailable);
@@ -440,6 +444,19 @@ mod tests {
             (None, None),
             "a stream can be made playable by one publisher and kept playable \
              by the next, so naming one would be picking arbitrarily"
+        );
+        assert!(
+            projector
+                .project_stream(
+                    stream,
+                    StreamEvent::RetentionClipped {
+                        reason: crate::observe::RetentionClipReason::Memory,
+                        requested: Duration::from_mins(15),
+                        held: Duration::from_secs(18),
+                    },
+                )
+                .is_none(),
+            "capacity clipping is logged, not a public lifecycle event"
         );
     }
 

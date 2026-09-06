@@ -38,6 +38,7 @@ use parking_lot::Mutex;
 use crate::{
     domain::{Payload, RenditionId, StreamId},
     mux::{ClosedCaptionService, PackagedMedia, PackagedPresentation, PackagingRenditionId},
+    observe::Events,
 };
 
 mod bitrate;
@@ -128,6 +129,7 @@ pub struct StreamStore {
     mutations: Arc<Mutex<()>>,
     limits: StoreLimits,
     disk: Option<Arc<DiskTier>>,
+    events: Events,
 }
 
 impl fmt::Debug for StreamStore {
@@ -160,7 +162,17 @@ impl StreamStore {
             mutations: Arc::new(Mutex::new(())),
             limits,
             disk,
+            events: Events::default(),
         })
+    }
+
+    /// Where capacity clipping and other stream facts are reported.
+    ///
+    /// Call before any lease: streams created earlier keep the destination
+    /// they were born with.
+    #[must_use]
+    pub fn with_events(self, events: Events) -> Self {
+        Self { events, ..self }
     }
 
     pub(crate) fn disk(&self) -> Option<&Arc<DiskTier>> {
@@ -198,10 +210,11 @@ impl StreamStore {
                     maximum: self.limits.maximum_streams,
                 });
             }
-            let live = Arc::new(LiveStream::new(
+            let live = Arc::new(LiveStream::with_events(
                 stream.clone(),
                 self.limits.retention,
                 self.disk.clone(),
+                self.events.clone(),
             ));
             live.attach_handle(Arc::downgrade(&live));
             let mut next = (*current).clone();

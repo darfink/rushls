@@ -26,6 +26,7 @@ use tokio::{sync::watch, time::Instant};
 use crate::{
     domain::{Payload, RenditionId, StreamId},
     mux::{ClosedCaptionService, PackagedMedia, PackagedPresentation, PackagingRenditionId},
+    observe::{Events, RetentionClipReason, StreamEvent},
 };
 
 use super::{
@@ -76,6 +77,7 @@ pub struct LiveStream {
     /// Process-wide identity for this stream's spill paths. Not the public id.
     disk_epoch: u64,
     this: OnceLock<Weak<LiveStream>>,
+    events: Events,
     state: RwLock<StreamState>,
     /// Slow-changing request-facing topology and lifecycle state. Each
     /// rendition replaces its media snapshot independently.
@@ -110,10 +112,23 @@ pub struct StreamState {
     retained_payload_bytes: usize,
     retained_disk_bytes: usize,
     spill_failed: bool,
+    /// Whether the advertised window is currently shorter than `retain`
+    /// because a byte or object cap shed history. Latched so a high-bitrate
+    /// publisher does not warn on every parent.
+    capacity_clipped: bool,
 }
 
 impl LiveStream {
     pub fn new(id: StreamId, limits: RetentionPolicy, disk: Option<Arc<DiskTier>>) -> Self {
+        Self::with_events(id, limits, disk, Events::default())
+    }
+
+    pub fn with_events(
+        id: StreamId,
+        limits: RetentionPolicy,
+        disk: Option<Arc<DiskTier>>,
+        events: Events,
+    ) -> Self {
         let disk_capacity = disk.as_ref().map_or(0, |tier| tier.maximum_payload_bytes());
         let snapshot = StreamSnapshot {
             revision: 0,
@@ -131,6 +146,7 @@ impl LiveStream {
             disk_capacity,
             disk_epoch: NEXT_DISK_EPOCH.fetch_add(1, Ordering::Relaxed),
             this: OnceLock::new(),
+            events,
             state: RwLock::new(StreamState {
                 renditions: Vec::new(),
                 active_presentation: None,
@@ -144,6 +160,7 @@ impl LiveStream {
                 retained_payload_bytes: 0,
                 retained_disk_bytes: 0,
                 spill_failed: false,
+                capacity_clipped: false,
             }),
             snapshot: ArcSwap::from_pointee(snapshot),
             media_revision: AtomicU64::new(0),
@@ -629,13 +646,27 @@ impl LiveStream {
             self.disk_capacity > 0 && state.retained_disk_bytes > self.disk_capacity
         };
         let spill_blocked = self.disk.is_none();
-        if over_objects(&state) || over_disk(&state) || (over_memory(&state) && spill_blocked) {
+        let capacity_reason = |state: &StreamState| {
+            if over_disk(state) {
+                Some(RetentionClipReason::Disk)
+            } else if over_memory(state) && spill_blocked {
+                Some(RetentionClipReason::Memory)
+            } else if over_objects(state) {
+                Some(RetentionClipReason::Objects)
+            } else {
+                None
+            }
+        };
+        let mut dropped_for = None;
+        if capacity_reason(&state).is_some() {
             let mut reclaimed = state.sweep_expired(now);
-            while (over_objects(&state)
-                || over_disk(&state)
-                || (over_memory(&state) && spill_blocked))
-                && state.shed_oldest()
-            {
+            // Expiry may satisfy a limit. Report only the limit that still
+            // requires dropping media after that ordinary cleanup.
+            while let Some(reason) = capacity_reason(&state) {
+                if !state.shed_oldest() {
+                    break;
+                }
+                dropped_for.get_or_insert(reason);
                 reclaimed = true;
             }
             if reclaimed {
@@ -656,7 +687,9 @@ impl LiveStream {
             state.bump_catalog();
             Catalog::Republished
         };
+        let clip = self.take_clip_event(&mut state, dropped_for);
         self.commit(state, catalog, [update]);
+        self.emit_clip(clip);
         self.maybe_spill();
         Ok(true)
     }
@@ -678,6 +711,46 @@ impl LiveStream {
                 .fetch_update(Ordering::Release, Ordering::Relaxed, |revision| {
                     Some(revision.saturating_add(1))
                 });
+    }
+
+    fn emit_clip(&self, event: Option<StreamEvent>) {
+        if let Some(event) = event {
+            self.events.stream(self.id.clone(), event);
+        }
+    }
+
+    /// First time capacity, not `retain`, sized the advertised window.
+    fn take_clip_event(
+        &self,
+        state: &mut StreamState,
+        dropped_for: Option<RetentionClipReason>,
+    ) -> Option<StreamEvent> {
+        if dropped_for.is_none() && !state.capacity_clipped {
+            return None;
+        }
+        // A longer sibling must not hide missing history in another rendition.
+        // Empty renditions have no playable history to lose.
+        let held = state
+            .renditions
+            .iter()
+            .map(|rendition| advertised_duration(&rendition.view().snapshot()))
+            .filter(|duration| !duration.is_zero())
+            .min()
+            .unwrap_or(Duration::ZERO);
+        if held >= self.limits.retain {
+            state.capacity_clipped = false;
+            return None;
+        }
+        let reason = dropped_for?;
+        if state.capacity_clipped {
+            return None;
+        }
+        state.capacity_clipped = true;
+        Some(StreamEvent::RetentionClipped {
+            reason,
+            requested: self.limits.retain,
+            held,
+        })
     }
 
     pub fn is_backpressured(&self) -> bool {
@@ -766,7 +839,10 @@ impl LiveStream {
                     .expect("candidate rendition")
                     .abort_spill(segment);
                 if state.shed_oldest() {
+                    let clip = self.take_clip_event(&mut state, Some(RetentionClipReason::Disk));
                     self.advance_media_revision();
+                    drop(state);
+                    self.emit_clip(clip);
                     continue;
                 }
                 return;
@@ -794,31 +870,39 @@ impl LiveStream {
     }
 
     pub fn finish_spill(&self, outcome: &SpillOutcome) {
-        let mut state = self.state.write();
-        let applied = state
-            .renditions
-            .iter_mut()
-            .find(|item| item.rendition_id == outcome.rendition)
-            .is_some_and(|rendition| rendition.finish_spill(outcome));
-        if applied {
-            if let Some(rendition) = state
+        let clip = {
+            let mut state = self.state.write();
+            let applied = state
                 .renditions
                 .iter_mut()
                 .find(|item| item.rendition_id == outcome.rendition)
-            {
-                rendition.publish_snapshot();
+                .is_some_and(|rendition| rendition.finish_spill(outcome));
+            if applied {
+                if let Some(rendition) = state
+                    .renditions
+                    .iter_mut()
+                    .find(|item| item.rendition_id == outcome.rendition)
+                {
+                    rendition.publish_snapshot();
+                }
+                state.recalculate_retained_bytes();
+                // Spills enqueued before the disk counter caught up can land over
+                // cap; treat that as the same full-disk backpressure as a write.
+                let mut shed = false;
+                while self.disk_capacity > 0
+                    && state.retained_disk_bytes > self.disk_capacity
+                    && state.shed_oldest()
+                {
+                    shed = true;
+                }
+                self.advance_media_revision();
+                self.take_clip_event(&mut state, shed.then_some(RetentionClipReason::Disk))
+            } else {
+                super::disk::forget_spilled(&outcome.objects);
+                None
             }
-            state.recalculate_retained_bytes();
-            // Spills enqueued before the disk counter caught up can land over
-            // cap; treat that as the same full-disk backpressure as a write.
-            while self.disk_capacity > 0
-                && state.retained_disk_bytes > self.disk_capacity
-                && state.shed_oldest()
-            {}
-            self.advance_media_revision();
-        } else {
-            super::disk::forget_spilled(&outcome.objects);
-        }
+        };
+        self.emit_clip(clip);
     }
 
     pub fn fail_spill(&self, rendition: RenditionId, segment: SegmentId) {
