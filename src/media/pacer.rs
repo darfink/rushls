@@ -4,9 +4,9 @@ use thiserror::Error;
 use tokio::time::Instant;
 
 use crate::{
-    admission::{Ceiling, Floor},
+    admission::{Ceiling, Floor, Pace},
     domain::{MediaInstant, TrackId},
-    observe::MediaMeters,
+    observe::{EventSink, MediaMeters, SessionEvent},
 };
 
 use super::{NormalizedSample, TimelineCalibration};
@@ -129,7 +129,7 @@ pub enum PacingError {
     },
 }
 
-/// Consumable permission to run ahead of wall clock.
+/// Enforces a [`Ceiling`]: consumable permission to run ahead of wall clock.
 ///
 /// Charged in *media time*: advancing the timeline by one second spends one
 /// second, however many samples carried it. That is what lets a forward jump
@@ -140,7 +140,11 @@ pub enum PacingError {
 /// indefinitely and which — because it was measured against an anchor fixed at
 /// pre-roll — let a slow publisher accrue unbounded credit and then spend it
 /// in one burst.
-struct TokenBucket {
+///
+/// Named for the bound it enforces rather than for the token bucket it is,
+/// so it reads beside [`FloorWindow`]: one type per configured bound, each
+/// naming the bound first and its mechanism second.
+struct CeilingBucket {
     ceiling: Ceiling,
     /// Media time available to spend without waiting.
     available: Duration,
@@ -148,7 +152,7 @@ struct TokenBucket {
     refilled_at: Instant,
 }
 
-impl TokenBucket {
+impl CeilingBucket {
     fn new(ceiling: Ceiling, now: Instant) -> Self {
         Self {
             ceiling,
@@ -188,7 +192,8 @@ impl TokenBucket {
     }
 }
 
-/// Whether a publisher is sustaining the minimum rate its policy requires.
+/// Enforces a [`Floor`]: whether a publisher sustains the minimum rate its
+/// policy requires.
 ///
 /// Sliding rather than fixed windows would need a history of samples; this
 /// keeps one accumulator per window and only judges a window once it has run
@@ -230,12 +235,83 @@ impl FloorWindow {
     }
 }
 
+/// Reports whether media time is keeping up with wall clock.
+///
+/// Deliberately toothless, and deliberately unconditional. A publisher falling
+/// behind realtime is ended by `floor` or by nothing at all — that is the
+/// division the deleted publication deadline violated — but an operator who
+/// configured no floor still wants to hear that their live stream is drifting.
+/// So this only ever emits, and it emits whether or not either bound is set.
+///
+/// The same fixed-window shape as [`FloorWindow`], for the same reason: one
+/// accumulator, judged once per window, with the first window as grace.
+struct DriftMonitor {
+    started_at: Instant,
+    media: Duration,
+    /// Whether the last judged window was reported as behind, so each
+    /// transition is announced once rather than every window. Without this a
+    /// publisher that stays behind logs on a timer forever.
+    behind: bool,
+}
+
+impl DriftMonitor {
+    /// How long a window is judged over.
+    ///
+    /// Compiled rather than configured: this reports, so its sensitivity is
+    /// not an operator's tradeoff to make. Long enough that a GOP boundary or
+    /// a retransmit does not read as drift.
+    const WINDOW: Duration = Duration::from_secs(10);
+
+    /// How far below realtime a window must fall to count as behind.
+    ///
+    /// The hysteresis gap is the point: a publisher hovering at exactly
+    /// realtime would otherwise alternate every window. Recovering needs 95%
+    /// of realtime, while falling behind needs to drop under 90%.
+    const BEHIND: Pace = Pace::new(nz::u32!(9), nz::u32!(10));
+    const RECOVERED: Pace = Pace::new(nz::u32!(19), nz::u32!(20));
+
+    fn new(now: Instant) -> Self {
+        Self {
+            started_at: now,
+            media: Duration::ZERO,
+            behind: false,
+        }
+    }
+
+    /// Adds media-time progress and reports a change of state, if any.
+    fn observe(&mut self, media: Duration, now: Instant, events: &EventSink) {
+        self.media = self.media.saturating_add(media);
+        let elapsed = now.saturating_duration_since(self.started_at);
+        if elapsed < Self::WINDOW {
+            return;
+        }
+        let observed = self.media;
+        self.started_at = now;
+        self.media = Duration::ZERO;
+
+        if self.behind {
+            if observed >= Self::RECOVERED.media_for(elapsed) {
+                self.behind = false;
+                events.emit(SessionEvent::PublisherTrackingRealtime);
+            }
+        } else if observed < Self::BEHIND.media_for(elapsed) {
+            self.behind = true;
+            events.emit(SessionEvent::PublisherBehindRealtime {
+                window: elapsed,
+                media: observed,
+            });
+        }
+    }
+}
+
 /// Maps normalized media time onto a monotonic wall clock without rewriting it.
 pub struct MediaPacer {
     /// Absent means unthrottled: media is admitted as fast as it arrives.
-    bucket: Option<TokenBucket>,
+    ceiling: Option<CeilingBucket>,
     /// Absent means no minimum rate is required.
     floor: Option<FloorWindow>,
+    /// Always present: drift is reported whether or not a bound is set.
+    drift: DriftMonitor,
     maximum_timestamp_jump: Duration,
     timeline: TimelineCalibration,
     watermark: MediaWatermark,
@@ -259,8 +335,9 @@ impl MediaPacer {
         }
         let now = Instant::now();
         Ok(Self {
-            bucket: ceiling.map(|ceiling| TokenBucket::new(ceiling, now)),
+            ceiling: ceiling.map(|ceiling| CeilingBucket::new(ceiling, now)),
             floor: floor.map(|floor| FloorWindow::new(floor, now)),
+            drift: DriftMonitor::new(now),
             maximum_timestamp_jump,
             timeline: timeline.clone(),
             watermark,
@@ -273,7 +350,11 @@ impl MediaPacer {
     /// A sleeping call stops the live loop from draining the next bounded
     /// input batch, which is the entire backpressure mechanism: a publisher
     /// cannot push media into the process faster than this returns.
-    pub async fn pace(&mut self, sample: &NormalizedSample) -> Result<(), PacingError> {
+    pub async fn pace(
+        &mut self,
+        sample: &NormalizedSample,
+        events: &EventSink,
+    ) -> Result<(), PacingError> {
         let previous = self.watermark.get();
         // Work against a copy and commit only after any sleep finishes. The
         // supervision loop may cancel this future to service a stop or health
@@ -311,17 +392,20 @@ impl MediaPacer {
         if let Some(floor) = &mut self.floor {
             floor.observe(advance, now)?;
         }
+        // After the floor, so a publisher failing one is disconnected rather
+        // than first told it is slow.
+        self.drift.observe(advance, now, events);
 
-        match &mut self.bucket {
+        match &mut self.ceiling {
             None => {
                 self.meters
                     .pacing_observation(Duration::ZERO, Duration::ZERO, false);
             }
-            Some(bucket) => {
-                let delay = bucket.take(advance, now);
+            Some(ceiling) => {
+                let delay = ceiling.take(advance, now);
                 if delay.is_zero() {
                     self.meters
-                        .pacing_observation(bucket.available, Duration::ZERO, false);
+                        .pacing_observation(ceiling.available, Duration::ZERO, false);
                 } else {
                     let mut wait = PacingWait::new(self.meters.as_ref(), delay);
                     tokio::time::sleep(delay).await;
@@ -336,13 +420,41 @@ impl MediaPacer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
     use crate::{
         admission::Pace,
+        domain::SessionId,
         media::fixtures::{video_sample_at as sample, video_timeline as timeline},
-        observe::{ProcessMeters, SessionMeters},
+        observe::{EventObserver, Events, ProcessMeters, SessionMeters},
     };
 
     use super::*;
+
+    /// Collects what the pacer reported, so drift assertions read what an
+    /// operator would see rather than internal state.
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<SessionEvent>>);
+
+    impl EventObserver for Recorder {
+        fn observe(&self, _session: SessionId, event: SessionEvent) {
+            self.0.lock().push(event);
+        }
+    }
+
+    fn recorder() -> (Arc<Recorder>, EventSink) {
+        let recorder = Arc::new(Recorder::default());
+        let sink = Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>)
+            .scoped(SessionId(nz::u64!(1)));
+        (recorder, sink)
+    }
+
+    /// An outlet for tests that are not about what was reported.
+    fn discard() -> EventSink {
+        Events::default().scoped(SessionId(nz::u64!(1)))
+    }
 
     fn ceiling(burst_secs: u64) -> Ceiling {
         Ceiling {
@@ -374,10 +486,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn media_within_the_burst_is_admitted_without_waiting() {
         let meters = meters();
+        let events = discard();
         let mut pacer = pacer(Some(ceiling(10)), None, &meters);
         let started = Instant::now();
 
-        pacer.pace(&sample(3)).await.expect("three seconds fit");
+        pacer.pace(&sample(3), &events).await.expect("three seconds fit");
 
         assert_eq!(Instant::now().saturating_duration_since(started), Duration::ZERO);
     }
@@ -385,12 +498,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn media_beyond_the_burst_waits_for_the_shortfall() {
         let meters = meters();
+        let events = discard();
         // Two seconds of burst against a three-second advance: one second is
         // unearned and has to be waited for at 1x.
         let mut pacer = pacer(Some(ceiling(2)), None, &meters);
         let started = Instant::now();
 
-        pacer.pace(&sample(3)).await.expect("the shortfall is slept");
+        pacer.pace(&sample(3), &events).await.expect("the shortfall is slept");
 
         assert_eq!(
             Instant::now().saturating_duration_since(started),
@@ -405,6 +519,7 @@ mod tests {
         // publisher could then replay a backlog at any speed. The bucket caps
         // what idling is worth at exactly `burst`.
         let meters = meters();
+        let events = discard();
         let mut pacer = MediaPacer::after_preroll(
             Some(ceiling(5)),
             None,
@@ -422,7 +537,7 @@ mod tests {
         let started = Instant::now();
         // A minute of media offered at once: only the five-second burst is
         // available, so the remaining 55s must be earned in real time.
-        pacer.pace(&sample(60)).await.expect("the excess is slept");
+        pacer.pace(&sample(60), &events).await.expect("the excess is slept");
 
         assert_eq!(
             Instant::now().saturating_duration_since(started),
@@ -434,6 +549,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_faster_pace_earns_media_time_proportionally() {
         let meters = meters();
+        let events = discard();
         let mut pacer = pacer(
             Some(Ceiling {
                 pace: Pace::new(nz::u32!(2), nz::u32!(1)),
@@ -446,7 +562,7 @@ mod tests {
 
         // Ten seconds of media, two earned by the burst; the remaining eight
         // arrive at 2x and so cost four seconds of wall clock.
-        pacer.pace(&sample(10)).await.expect("the shortfall is slept at 2x");
+        pacer.pace(&sample(10), &events).await.expect("the shortfall is slept at 2x");
 
         assert_eq!(
             Instant::now().saturating_duration_since(started),
@@ -457,6 +573,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_absent_ceiling_never_waits() {
         let meters = meters();
+        let events = discard();
         let mut pacer = pacer(None, None, &meters);
         let started = Instant::now();
 
@@ -464,7 +581,7 @@ mod tests {
         // is under test is that none of it waits, not how far each step moves.
         for seconds in 1..=100 {
             pacer
-                .pace(&sample(seconds))
+                .pace(&sample(seconds), &events)
                 .await
                 .expect("an unthrottled publisher is never delayed");
         }
@@ -475,6 +592,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_forward_jump_is_refused_even_without_a_ceiling() {
         let meters = meters();
+        let events = discard();
         let mut pacer = MediaPacer::after_preroll(
             None,
             None,
@@ -486,7 +604,7 @@ mod tests {
         .expect("pre-roll establishes the watermark");
 
         assert_eq!(
-            pacer.pace(&sample(3)).await,
+            pacer.pace(&sample(3), &events).await,
             Err(PacingError::TimestampJump {
                 maximum: Duration::from_secs(1),
                 jump: Duration::from_secs(3),
@@ -499,6 +617,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_publisher_sustaining_the_floor_is_admitted() {
         let meters = meters();
+        let events = discard();
         let floor = Floor {
             pace: Pace::new(nz::u32!(1), nz::u32!(2)),
             window: Duration::from_secs(30),
@@ -509,7 +628,7 @@ mod tests {
         for second in 1..=40 {
             tokio::time::advance(Duration::from_secs(1)).await;
             pacer
-                .pace(&sample(second))
+                .pace(&sample(second), &events)
                 .await
                 .expect("a realtime publisher clears a half-speed floor");
         }
@@ -518,6 +637,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_publisher_below_the_floor_is_disconnected() {
         let meters = meters();
+        let events = discard();
         let floor = Floor {
             pace: Pace::new(nz::u32!(1), nz::u32!(2)),
             window: Duration::from_secs(30),
@@ -528,7 +648,7 @@ mod tests {
         let mut result = Ok(());
         for second in 1..=10 {
             tokio::time::advance(Duration::from_secs(10)).await;
-            result = pacer.pace(&sample(second)).await;
+            result = pacer.pace(&sample(second), &events).await;
             if result.is_err() {
                 break;
             }
@@ -543,6 +663,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_first_window_is_startup_grace() {
         let meters = meters();
+        let events = discard();
         let floor = Floor {
             pace: Pace::realtime(),
             window: Duration::from_secs(30),
@@ -552,7 +673,7 @@ mod tests {
         // Well below the floor, but inside the first window, so not yet judged.
         tokio::time::advance(Duration::from_secs(20)).await;
         pacer
-            .pace(&sample(1))
+            .pace(&sample(1), &events)
             .await
             .expect("a publisher is not judged before its first window elapses");
     }
@@ -560,12 +681,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_wait_retries_without_losing_or_double_pacing_the_sample() {
         let meters = meters();
+        let events = discard();
         let mut pacer = pacer(Some(ceiling(1)), None, &meters);
         let ahead = sample(3);
 
         tokio::select! {
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
-            result = pacer.pace(&ahead) => {
+            result = pacer.pace(&ahead, &events) => {
                 panic!("the two-second pacing wait completed early: {result:?}");
             }
         }
@@ -573,9 +695,96 @@ mod tests {
         assert!(meters.snapshot().publisher_backpressured);
 
         pacer
-            .pace(&ahead)
+            .pace(&ahead, &events)
             .await
             .expect("the retry waits only for the remaining shortfall");
         assert!(!meters.snapshot().publisher_backpressured);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_publisher_drifting_behind_realtime_is_reported_without_a_floor() {
+        // The case an operator most wants to hear about and the one nothing
+        // ends: no floor is set, so this publisher runs indefinitely while its
+        // "live" stream falls further behind.
+        let meters = meters();
+        let (recorded, events) = recorder();
+        let mut pacer = pacer(None, None, &meters);
+
+        // A second of media for every four of wall clock: 0.25x.
+        for second in 1..=10 {
+            tokio::time::advance(Duration::from_secs(4)).await;
+            pacer
+                .pace(&sample(second), &events)
+                .await
+                .expect("drift is reported, never enforced");
+        }
+
+        assert!(
+            recorded
+                .0
+                .lock()
+                .iter()
+                .any(|event| matches!(event, SessionEvent::PublisherBehindRealtime { .. })),
+            "a publisher at a quarter of realtime is reported behind"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_publisher_held_at_its_ceiling_is_not_reported_behind() {
+        // The regression that matters: this node is the one slowing the
+        // publisher down, so reporting it as drifting would blame a publisher
+        // for obeying an instruction. Realtime media against a realtime
+        // ceiling sits exactly on the hysteresis boundary.
+        let meters = meters();
+        let (recorded, events) = recorder();
+        let mut pacer = pacer(Some(ceiling(2)), None, &meters);
+
+        for second in 1..=120 {
+            pacer
+                .pace(&sample(second), &events)
+                .await
+                .expect("a throttled publisher keeps running");
+        }
+
+        assert!(
+            recorded.0.lock().is_empty(),
+            "a publisher the ceiling is pacing at exactly realtime is not \
+             drifting, it is complying: {:?}",
+            recorded.0.lock()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_is_reported_once_rather_than_every_window() {
+        // Hysteresis is what makes this usable: without it a publisher
+        // hovering near realtime logs on a timer forever.
+        let meters = meters();
+        let (recorded, events) = recorder();
+        let mut pacer = pacer(None, None, &meters);
+
+        let mut media = 0;
+        // Behind for two windows, then keeping up for two.
+        for _ in 0..60 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            media += 1;
+            pacer.pace(&sample(media), &events).await.expect("half speed");
+        }
+        for _ in 0..120 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            media += 1;
+            pacer.pace(&sample(media), &events).await.expect("realtime");
+        }
+
+        let reported: Vec<_> = recorded.0.lock().clone();
+        assert!(
+            matches!(
+                reported.as_slice(),
+                [
+                    SessionEvent::PublisherBehindRealtime { .. },
+                    SessionEvent::PublisherTrackingRealtime
+                ]
+            ),
+            "each transition is announced exactly once, got {reported:?}"
+        );
     }
 }

@@ -131,6 +131,28 @@ time is what `floor` measures, and `floor` is the only thing that should end a
 session for it. Where an operator sets no floor, drift is a fact to expose —
 the meters already carry it — not a fault to invent a threshold for.
 
+A gauge alone turned out to be too quiet for the case that matters most. A
+node with no `floor` — the default — has nothing that ends a drifting session
+and nothing that mentions it either, so a stream that is nominally live but
+running at a quarter speed is visible only to whoever is already watching the
+graph. `DriftMonitor` in the pacer closes that: it emits
+`PublisherBehindRealtime` and `PublisherTrackingRealtime`, and does nothing
+else. It never fails a session, which is what keeps it from becoming the
+publication deadline again under a new name.
+
+Three properties make it reportable rather than noisy. It emits on
+*transitions*, so a stream an hour behind logs twice rather than on a timer.
+Its thresholds have a hysteresis gap — behind at under 90% of realtime,
+recovered at 95% — because a publisher hovering near realtime would otherwise
+alternate every window. And it is charged the same media-time delta the
+ceiling bucket is, so a publisher held at exactly its ceiling registers as
+complying rather than drifting; blaming a publisher for obeying this node's own
+instruction is precisely the bug that was removed.
+
+Its window and thresholds are compiled. A knob controlling when a log line
+appears is not a tradeoff an operator is better placed to make than the node,
+and exposing it would re-open the question of what happens when it is crossed.
+
 The same division applies to the stages generally: **health terminates,
 metrics explain.** Per-stage progress counters stay and are what an operator
 scrapes to find which layer stopped; what goes is the idea that each stage
@@ -270,8 +292,16 @@ to find out.
 **An operator-facing `hold_back`.** `DeliveryTimingPolicy::part_hold_back` is
 a compiled three-times-part-target multiple today and nothing reaches it. It
 becomes a `DurationRule` under `[hls]`, accepting the multiple and absolute
-forms already used by the stall rules, and is refused below two
-part durations rather than raised.
+forms already used by the stall rules.
+
+Two thresholds guard it, because the specification has two. Below **two** part
+durations is refused: `EXT-X-PART-HOLD-BACK` MUST be at least twice the part
+target, so a value the protocol forbids cannot be honoured approximately, and
+advertising it anyway makes clients stall. Between two and three is
+**warned**: three is a SHOULD, and a deployment on a controlled network may
+legitimately want the lower latency. Refusing there would deny a legal choice,
+and silently raising it would ignore an unambiguous instruction — so the value
+is honoured and the operator is told what they gave up.
 
 **The blocking-reload deadline stops being independent.** It is a separate
 three-times multiple in the same policy, so an operator raising `hold_back`

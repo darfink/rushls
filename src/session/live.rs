@@ -456,7 +456,7 @@ impl LiveSession {
         // cancel this future without losing the batch or accidentally treating
         // its next sample as already paced.
         while let Some(sample) = self.samples.front() {
-            self.pacer.pace(sample).await?;
+            self.pacer.pace(sample, events).await?;
             let sample = self
                 .samples
                 .pop_front()

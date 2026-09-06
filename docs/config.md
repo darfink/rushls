@@ -260,6 +260,14 @@ the compiled default. The first window is startup grace, and discontinuities
 neither credit nor reset progress; only discontinuity-corrected media-time
 counts.
 
+Omitting `floor` means nothing *ends* a slow session — it does not mean
+nothing notices. A publisher whose media time falls below 90% of wall clock is
+logged as behind realtime, and logged again when it recovers past 95%. This
+reports and never enforces: it is how an operator with no floor learns that a
+nominally live stream is running at a quarter speed, without this node
+inventing a threshold that disconnects. A publisher held at its `ceiling` is
+never reported, because it is complying with an instruction this node gave it.
+
 `stall` is **"nothing usable arrived for this long"** — no packets, or packets
 that do not become media. It is explicitly *not* lag against wall clock, and
 it stays idle-based on purpose: it is the fast dead-versus-alive signal, and
@@ -361,12 +369,19 @@ cadence itself: an absolute value chosen against `part = "1s"` silently
 becomes aggressive when parts are retuned, which is the same reasoning the
 stall rules use.
 
-A value below **two part durations** is refused rather than raised. This is
-deliberately unlike the `retain` and `playlist` floors, which are raised with
-a warning: there the operator's intent is unambiguous and only the arithmetic
-was wrong, whereas a hold-back under two parts asks for a latency the protocol
-cannot deliver, and honouring it approximately would mean advertising a
-promise that makes players stall.
+There are two thresholds, because HLS has two. A value below **two part
+durations** is refused: the specification requires at least twice the part
+target, so this asks for a latency the protocol cannot deliver, and honouring
+it approximately would advertise a promise that makes players stall. A value
+between two and three parts is **warned and then honoured**: three is a
+recommendation rather than a requirement, and a deployment on a controlled
+network may want the lower latency knowingly.
+
+The split matters because the two failures are different. Below two, the
+configuration is invalid and no approximation is faithful to it. Between two
+and three it is valid, unusual, and possibly deliberate — so it is applied as
+written, with the tradeoff named. Silently raising it would be the one
+response that ignores an unambiguous instruction.
 
 The blocking-reload deadline is **derived from this value**, not configured
 beside it. A client asked to sit `hold_back` behind the edge will request a

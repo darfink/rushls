@@ -522,6 +522,8 @@ fn name(event: &SessionEvent) -> &'static str {
         SessionEvent::Running => "running",
         SessionEvent::TrackSetChanged => "track_set_changed",
         SessionEvent::CodecParametersChanged { .. } => "codec_parameters_changed",
+        SessionEvent::PublisherBehindRealtime { .. } => "publisher_behind_realtime",
+        SessionEvent::PublisherTrackingRealtime => "publisher_tracking_realtime",
         SessionEvent::Unhealthy { .. } => "unhealthy",
         SessionEvent::Draining => "draining",
         SessionEvent::DrainFailed { .. } => "drain_failed",

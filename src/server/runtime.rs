@@ -793,17 +793,25 @@ where
         config,
         metrics,
         readiness,
-        wait_for_stop(stop),
+        wait_for_stop(stop.clone()),
     );
+    tokio::pin!(served);
     // The drain is bounded rather than open-ended. A blocking playlist reload
     // is deliberately parked for up to three target durations, so without a
     // bound a restart could outlive its orchestrator's grace period and be
     // hard-killed mid-drain, which is the outcome the graceful path exists to
     // avoid. Viewers still holding a parked request are dropped at the
     // deadline; they reload.
-    match tokio::time::timeout(shutdown, served).await {
-        Ok(result) => result.map_err(RuntimeError::Http),
-        Err(_) => Ok(()),
+    // The bound covers only the drain after the stop signal.
+    tokio::select! {
+        biased;
+        result = &mut served => result.map_err(RuntimeError::Http),
+        () = wait_for_stop(stop) => {
+            match tokio::time::timeout(shutdown, served).await {
+                Ok(result) => result.map_err(RuntimeError::Http),
+                Err(_) => Ok(()),
+            }
+        }
     }
 }
 

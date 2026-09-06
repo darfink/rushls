@@ -1184,6 +1184,36 @@ hold_back = "1s"
 }
 
 #[test]
+fn a_hold_back_between_two_and_three_parts_is_warned_rather_than_refused()
+-> Result<(), Box<dyn Error>> {
+    // Two thresholds because the specification has two. Three parts is a
+    // SHOULD, so a deployment on a good network may legitimately want the
+    // lower latency and only needs telling; two is a MUST and stays refused.
+    let resolved = resolve_toml(
+        r#"
+[hls]
+part = "1s"
+hold_back = "2s"
+"#,
+    )??;
+
+    assert_eq!(
+        resolved.node.hls.timing.part_hold_back.resolve(Duration::from_secs(1)),
+        Duration::from_secs(2),
+        "the operator's value is honoured, not raised to the recommendation"
+    );
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("hold_back")),
+        "{:?}",
+        resolved.warnings
+    );
+    Ok(())
+}
+
+#[test]
 fn the_playlist_window_becomes_the_retention_window() -> Result<(), Box<dyn Error>> {
     let config = resolve_toml(
         r#"

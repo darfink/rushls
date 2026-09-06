@@ -100,6 +100,25 @@ pub enum SessionEvent {
     CodecParametersChanged {
         track: TrackId,
     },
+    /// Media time is advancing slower than wall clock.
+    ///
+    /// Diagnostic only: a slow publisher is ended by `floor` or by nothing at
+    /// all, and inventing a second threshold with teeth is exactly what the
+    /// deleted publication deadline did. This exists because an operator who
+    /// set no floor still wants to know their live stream is not live, and a
+    /// scraped gauge answers that only for whoever is watching the graph.
+    ///
+    /// Reported once per transition rather than once per window, so a stream
+    /// that stays behind for an hour logs twice: here, and again at
+    /// [`Self::PublisherTrackingRealtime`] when it recovers.
+    PublisherBehindRealtime {
+        /// The window judged, which is wall clock rather than media time.
+        window: Duration,
+        /// Media advanced across it. Less than `window`, by definition.
+        media: Duration,
+    },
+    /// Media time is keeping up with wall clock again.
+    PublisherTrackingRealtime,
     Unhealthy {
         reason: String,
     },

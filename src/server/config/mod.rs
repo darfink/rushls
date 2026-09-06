@@ -284,7 +284,7 @@ impl AppConfig {
         }
         self.rtmp.apply(&mut node, &mut warnings)?;
         self.srt.apply(&mut node)?;
-        self.hls.apply(&mut node)?;
+        self.hls.apply(&mut node, &mut warnings)?;
         // After HLS: a stall expressed as a multiple is sized by the segment
         // duration, which only `hls.apply` establishes.
         apply_stall(&mut node, stall, self.hls.segment_duration())?;
@@ -1693,7 +1693,7 @@ impl HlsAppConfig {
         self.segment
     }
 
-    fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
+    fn apply(&self, node: &mut NodeConfig, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
         if self.segment.is_zero() || self.part.is_zero() {
             return Err(invalid("HLS segment and part durations must be nonzero"));
         }
@@ -1720,10 +1720,12 @@ impl HlsAppConfig {
         // one quantity now, so the old playlist knob resolves straight into
         // it. `[hls] retain` replaces this when the file is rewritten.
         node.store.retention.retain = window_duration;
-        // Refused rather than raised, unlike the retention floors: a hold-back
-        // under two parts asks for a latency the protocol cannot deliver, and
-        // honouring it approximately would advertise a promise that makes
-        // clients stall.
+        // Two thresholds, because the specification has two. Below three parts
+        // is a SHOULD, so it is warned: a deployment on a good network may
+        // genuinely want the latency, and refusing would deny a legitimate
+        // choice. Below two parts is a MUST, so it is refused — a value the
+        // protocol forbids cannot be honoured approximately, and advertising
+        // it anyway makes clients stall.
         let hold_back = self.hold_back.resolve(self.part);
         if hold_back < self.part.saturating_mul(2) {
             return Err(invalid(format!(
@@ -1732,6 +1734,12 @@ impl HlsAppConfig {
                  on any loss",
                 self.part
             )));
+        }
+        if hold_back < self.part.saturating_mul(3) {
+            warnings.push(format!(
+                "hls.hold_back ({hold_back:?}) is below the three part durations HLS \
+                 recommends; clients on a lossy link may stall at the live edge"
+            ));
         }
         node.hls.timing.part_hold_back = self.hold_back;
         Ok(())

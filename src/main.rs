@@ -104,6 +104,23 @@ impl EventObserver for TracingEvents {
             SessionEvent::CodecParametersChanged { track } => {
                 warn!(session = %session, track = %track, "codec parameters changed");
             }
+            SessionEvent::PublisherBehindRealtime { window, media } => {
+                let pace = if window.is_zero() {
+                    0.0
+                } else {
+                    media.as_secs_f64() / window.as_secs_f64()
+                };
+                warn!(
+                    session = %session,
+                    window = ?window,
+                    media = ?media,
+                    pace = %format!("{pace:.2}x"),
+                    "publisher is behind realtime"
+                );
+            }
+            SessionEvent::PublisherTrackingRealtime => {
+                info!(session = %session, "publisher is tracking realtime again");
+            }
             SessionEvent::Unhealthy { reason } => {
                 warn!(session = %session, reason = %reason, "unhealthy");
             }
