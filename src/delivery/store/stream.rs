@@ -13,7 +13,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -24,16 +24,24 @@ use parking_lot::{RwLock, RwLockWriteGuard};
 use tokio::{sync::watch, time::Instant};
 
 use crate::{
-    domain::{Payload, RenditionId},
+    domain::{Payload, RenditionId, StreamId},
     mux::{ClosedCaptionService, PackagedMedia, PackagedPresentation, PackagingRenditionId},
 };
 
 use super::{
     PartId, PlaylistContract, PublicationAnchor, RenditionCatalogEntry, RenditionLiveEdge,
-    RenditionSnapshot, ResolvedPresentation, ResolvedRenditionGroup, RetentionPolicy, SegmentId,
-    StoreWriteError, StoredPart, StoredSegment, StreamSnapshot,
+    RenditionSnapshot, ResolvedPresentation, ResolvedRenditionGroup, RetentionDepth,
+    RetentionPolicy, SegmentId, StoreWriteError, StoredPart, StoredSegment, StreamSnapshot,
+    disk::{DiskTier, SpillJob, SpillObject, SpillOutcome},
     rendition::{EdgeUpdate, RenditionState, notify_edges},
 };
+
+/// Distinguishes two [`LiveStream`] values that reuse a public stream id.
+///
+/// After retirement the catalog may mint a new stream with the same name while
+/// a spill job from the predecessor is still queued. Jobs carry this epoch so
+/// their files cannot land in the successor's directory.
+static NEXT_DISK_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 /// Whether a mutation changed what the catalog says about the stream.
 ///
@@ -61,7 +69,13 @@ enum Media {
 /// Live media for one logical stream, shared by publishers and readers.
 #[derive(Debug)]
 pub struct LiveStream {
+    id: StreamId,
     limits: RetentionPolicy,
+    disk: Option<Arc<DiskTier>>,
+    disk_capacity: usize,
+    /// Process-wide identity for this stream's spill paths. Not the public id.
+    disk_epoch: u64,
+    this: OnceLock<Weak<LiveStream>>,
     state: RwLock<StreamState>,
     /// Slow-changing request-facing topology and lifecycle state. Each
     /// rendition replaces its media snapshot independently.
@@ -94,10 +108,12 @@ pub struct StreamState {
     /// When the current publisher released its lease, if currently idle.
     idle_since: Option<Instant>,
     retained_payload_bytes: usize,
+    retained_disk_bytes: usize,
 }
 
 impl LiveStream {
-    pub fn new(limits: RetentionPolicy) -> Self {
+    pub fn new(id: StreamId, limits: RetentionPolicy, disk: Option<Arc<DiskTier>>) -> Self {
+        let disk_capacity = disk.as_ref().map_or(0, |tier| tier.maximum_payload_bytes());
         let snapshot = StreamSnapshot {
             revision: 0,
             media_catalog_revision: 0,
@@ -108,7 +124,12 @@ impl LiveStream {
             renditions: Arc::from([]),
         };
         Self {
+            id,
             limits,
+            disk,
+            disk_capacity,
+            disk_epoch: NEXT_DISK_EPOCH.fetch_add(1, Ordering::Relaxed),
+            this: OnceLock::new(),
             state: RwLock::new(StreamState {
                 renditions: Vec::new(),
                 active_presentation: None,
@@ -120,6 +141,7 @@ impl LiveStream {
                 publication: 0,
                 idle_since: Some(Instant::now()),
                 retained_payload_bytes: 0,
+                retained_disk_bytes: 0,
             }),
             snapshot: ArcSwap::from_pointee(snapshot),
             media_revision: AtomicU64::new(0),
@@ -179,8 +201,39 @@ impl LiveStream {
         self.snapshot.load().idle
     }
 
+    pub fn attach_handle(&self, this: Weak<Self>) {
+        let _ = self.this.set(this);
+    }
+
     pub fn retained_payload_bytes(&self) -> usize {
         self.state.read().retained_payload_bytes
+    }
+
+    pub fn retained_disk_bytes(&self) -> usize {
+        self.state.read().retained_disk_bytes
+    }
+
+    pub fn disk_epoch(&self) -> u64 {
+        self.disk_epoch
+    }
+
+    /// Configured retain versus what this stream currently advertises and holds.
+    pub fn retention_depth(&self) -> RetentionDepth {
+        let snapshot = self.snapshot();
+        let held = snapshot
+            .renditions
+            .iter()
+            .map(|entry| advertised_duration(&entry.snapshot()))
+            .max()
+            .unwrap_or(Duration::ZERO);
+        RetentionDepth {
+            requested: self.limits.retain,
+            held,
+            memory_bytes: self.retained_payload_bytes(),
+            memory_capacity: self.limits.maximum_payload_bytes,
+            disk_bytes: self.state.read().retained_disk_bytes,
+            disk_capacity: self.disk_capacity,
+        }
     }
 
     /// Returns the current immutable request-facing snapshot.
@@ -545,7 +598,7 @@ impl LiveStream {
         if state.sweep_rendition(index, now) {
             self.advance_media_revision();
         }
-        let additional = state.renditions[index].additional_bytes_for(&media)?;
+        let additional = state.renditions[index].additional_bytes_for(&media, gzip.as_ref())?;
         let adds_part = matches!(&media, PackagedMedia::Chunk(_));
         let adds_segment = matches!(
             &media,
@@ -559,22 +612,28 @@ impl LiveStream {
         // At a long `retain` every one of these is reached in ordinary
         // operation: bytes first at a high bitrate, the segment count first at
         // a short cadence. All three therefore shed.
-        let over_capacity = |state: &StreamState| {
-            (adds_part && state.retained_parts() >= self.limits.maximum_parts)
-                || (adds_segment && state.retained_segments() >= self.limits.maximum_segments)
-                || state
-                    .retained_payload_bytes
-                    .checked_add(additional)
-                    .is_none_or(|total| total > self.limits.maximum_payload_bytes)
+        let over_objects = |state: &StreamState| {
+            (adds_part && state.memory_resident_parts() >= self.limits.maximum_parts)
+                || (adds_segment
+                    && state.memory_resident_segments() >= self.limits.maximum_segments)
         };
-        if over_capacity(&state) {
-            // Expired media from *other* renditions can still stand in the way,
-            // and reclaiming it is free, so it goes first.
+        let over_memory = |state: &StreamState| {
+            state
+                .retained_payload_bytes
+                .checked_add(additional)
+                .is_none_or(|total| total > self.limits.maximum_payload_bytes)
+        };
+        let over_disk = |state: &StreamState| {
+            self.disk_capacity > 0 && state.retained_disk_bytes > self.disk_capacity
+        };
+        let spill_blocked = self.disk.as_ref().is_none_or(|disk| disk.queue_is_full());
+        if over_objects(&state) || over_disk(&state) || (over_memory(&state) && spill_blocked) {
             let mut reclaimed = state.sweep_expired(now);
-            // Then retire history, oldest first, until the write fits. Bounded
-            // by the number of retained segments: `shed_oldest` reports when a
-            // rendition has nothing left to give, so this cannot spin.
-            while over_capacity(&state) && state.shed_oldest() {
+            while (over_objects(&state)
+                || over_disk(&state)
+                || (over_memory(&state) && spill_blocked))
+                && state.shed_oldest()
+            {
                 reclaimed = true;
             }
             if reclaimed {
@@ -588,13 +647,15 @@ impl LiveStream {
         state.recalculate_retained_bytes();
         let advertised_after = state.renditions[index].bitrate.snapshot().advertised();
         let update = state.renditions[index].commit(false);
-        let catalog = if advertised_before == advertised_after {
+        let anchors_changed = state.prune_publication_anchors();
+        let catalog = if advertised_before == advertised_after && !anchors_changed {
             Catalog::Unchanged
         } else {
             state.bump_catalog();
             Catalog::Republished
         };
         self.commit(state, catalog, [update]);
+        self.maybe_spill();
         Ok(true)
     }
 
@@ -615,6 +676,110 @@ impl LiveStream {
                 .fetch_update(Ordering::Release, Ordering::Relaxed, |revision| {
                     Some(revision.saturating_add(1))
                 });
+    }
+
+    fn maybe_spill(&self) {
+        let Some(disk) = self.disk.clone() else {
+            return;
+        };
+        let Some(weak) = self.this.get().cloned() else {
+            return;
+        };
+        loop {
+            if disk.queue_is_full() {
+                self.shed_until_memory_fits();
+                return;
+            }
+            let mut state = self.state.write();
+            if state.retained_payload_bytes <= self.limits.maximum_payload_bytes {
+                return;
+            }
+            if self.disk_capacity > 0 && state.retained_disk_bytes > self.disk_capacity {
+                drop(state);
+                self.shed_until_memory_fits();
+                return;
+            }
+            // In-flight spills still occupy RAM. Leaving them mapped is the
+            // bounded over-cap window; shedding here would drop media disk is
+            // already writing.
+            let Some((rendition, segment, objects)) = state.take_spill_candidate() else {
+                return;
+            };
+            drop(state);
+            let job = SpillJob {
+                live: weak.clone(),
+                stream: self.id.clone(),
+                epoch: self.disk_epoch,
+                rendition,
+                segment,
+                objects,
+            };
+            if !disk.try_enqueue(job) {
+                let mut state = self.state.write();
+                if let Some(rendition) = state
+                    .renditions
+                    .iter_mut()
+                    .find(|item| item.rendition_id == rendition)
+                {
+                    rendition.abort_spill(segment);
+                }
+                drop(state);
+                self.shed_until_memory_fits();
+                return;
+            }
+        }
+    }
+
+    fn shed_until_memory_fits(&self) {
+        let mut state = self.state.write();
+        let mut changed = false;
+        while state.retained_payload_bytes > self.limits.maximum_payload_bytes
+            && state.shed_oldest()
+        {
+            changed = true;
+        }
+        if changed {
+            self.advance_media_revision();
+        }
+    }
+
+    pub fn finish_spill(&self, outcome: &SpillOutcome) {
+        let mut state = self.state.write();
+        let applied = state
+            .renditions
+            .iter_mut()
+            .find(|item| item.rendition_id == outcome.rendition)
+            .is_some_and(|rendition| rendition.finish_spill(outcome));
+        if applied {
+            if let Some(rendition) = state
+                .renditions
+                .iter_mut()
+                .find(|item| item.rendition_id == outcome.rendition)
+            {
+                rendition.publish_snapshot();
+            }
+            state.recalculate_retained_bytes();
+            // Spills enqueued before the disk counter caught up can land over
+            // cap; treat that as the same full-disk backpressure as a write.
+            while self.disk_capacity > 0
+                && state.retained_disk_bytes > self.disk_capacity
+                && state.shed_oldest()
+            {}
+            self.advance_media_revision();
+        } else {
+            super::disk::forget_spilled(&outcome.objects);
+        }
+    }
+
+    pub fn abort_spill(&self, rendition: RenditionId, segment: SegmentId) {
+        let mut state = self.state.write();
+        if let Some(rendition) = state
+            .renditions
+            .iter_mut()
+            .find(|item| item.rendition_id == rendition)
+        {
+            rendition.abort_spill(segment);
+        }
     }
 }
 
@@ -711,7 +876,8 @@ impl StreamState {
         changed
     }
 
-    fn prune_publication_anchors(&mut self) {
+    fn prune_publication_anchors(&mut self) -> bool {
+        let before = self.publication_anchors.len();
         let current = self.publication;
         self.publication_anchors.retain(|anchor| {
             anchor.publication == current
@@ -720,6 +886,7 @@ impl StreamState {
                     .iter()
                     .any(|rendition| rendition.references_publication(anchor.publication))
         });
+        self.publication_anchors.len() != before
     }
 
     fn recalculate_retained_bytes(&mut self) {
@@ -728,19 +895,57 @@ impl StreamState {
             .iter()
             .map(RenditionState::retained_payload_bytes)
             .sum();
+        self.retained_disk_bytes = self
+            .renditions
+            .iter()
+            .map(RenditionState::retained_disk_bytes)
+            .sum();
     }
 
-    fn retained_parts(&self) -> usize {
+    fn memory_resident_parts(&self) -> usize {
         self.renditions
             .iter()
-            .map(RenditionState::retained_parts)
+            .map(RenditionState::memory_resident_parts)
             .sum()
     }
 
-    fn retained_segments(&self) -> usize {
+    fn memory_resident_segments(&self) -> usize {
         self.renditions
             .iter()
-            .map(RenditionState::retained_segments)
+            .map(RenditionState::memory_resident_segments)
             .sum()
     }
+
+    fn take_spill_candidate(&mut self) -> Option<(RenditionId, SegmentId, Vec<SpillObject>)> {
+        let index = self
+            .renditions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, rendition)| {
+                rendition
+                    .oldest_memory_spill_candidate()
+                    .map(|at| (at, index))
+            })
+            .min()
+            .map(|(_, index)| index)?;
+        let rendition = &mut self.renditions[index];
+        let rendition_id = rendition.rendition_id;
+        rendition
+            .prepare_spill()
+            .map(|(segment, objects)| (rendition_id, segment, objects))
+    }
+}
+
+/// Playlist media time a viewer walking this snapshot would see.
+fn advertised_duration(snapshot: &RenditionSnapshot) -> Duration {
+    let mut total = snapshot
+        .segments
+        .iter()
+        .fold(Duration::ZERO, |total, segment| {
+            total.saturating_add(segment.timebase.ticks_to_duration(segment.duration))
+        });
+    if let (Some(open), Some(config)) = (&snapshot.open_segment, snapshot.config) {
+        total = total.saturating_add(config.timebase.ticks_to_duration(open.duration));
+    }
+    total
 }

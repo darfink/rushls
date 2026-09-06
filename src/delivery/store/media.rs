@@ -11,6 +11,7 @@ use crate::domain::{Payload, RenditionId, TickDuration, TickTimestamp, Timebase}
 use crate::mux::{PackagingSegmentId, RenditionConfig};
 use derive_more::Deref;
 
+use super::disk::HeldBytes;
 use super::{InitializationId, Msn, PartCursor, PartId, PlaylistContract, SegmentId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,19 +43,19 @@ pub struct StoredPart {
     pub duration: TickDuration,
     pub timebase: Timebase,
     pub independent: bool,
-    pub payload: Payload,
+    pub payload: HeldBytes,
     /// The gzip encoding of this resource, for the text formats HLS asks
     /// servers to transfer compressed.
     ///
     /// Computed once by the publisher rather than per request, and held here
     /// opaquely: the store never inspects it and does not know which formats
     /// are text.
-    pub gzip: Option<Payload>,
+    pub gzip: Option<HeldBytes>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SegmentBody {
-    Contiguous(Payload),
+    Contiguous(HeldBytes),
     Chunked(Arc<[Arc<StoredPart>]>),
 }
 
@@ -104,7 +105,7 @@ pub struct StoredSegment {
     /// Computed once by the publisher rather than per request, and held here
     /// opaquely: the store never inspects it and does not know which formats
     /// are text.
-    pub gzip: Option<Payload>,
+    pub gzip: Option<HeldBytes>,
 }
 
 /// Completed segments and the prefix frontier controlling their PART tags.
@@ -148,10 +149,18 @@ impl PublishedSegments {
 /// resource for bitrate accounting.
 pub fn segment_resource_bytes(segment: &StoredSegment) -> usize {
     let payload = match &segment.kind {
-        StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) => payload.len(),
+        StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) => payload.memory_bytes(),
         StoredSegmentKind::Media(SegmentBody::Chunked(_)) | StoredSegmentKind::Gap => 0,
     };
-    payload.saturating_add(segment.gzip.as_ref().map_or(0, Payload::len))
+    payload.saturating_add(segment.gzip.as_ref().map_or(0, HeldBytes::memory_bytes))
+}
+
+pub fn segment_disk_bytes(segment: &StoredSegment) -> usize {
+    let payload = match &segment.kind {
+        StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) => payload.disk_bytes(),
+        StoredSegmentKind::Media(SegmentBody::Chunked(_)) | StoredSegmentKind::Gap => 0,
+    };
+    payload.saturating_add(segment.gzip.as_ref().map_or(0, HeldBytes::disk_bytes))
 }
 
 /// The size of the media a completed segment carries, reassembled.

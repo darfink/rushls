@@ -16,6 +16,7 @@ use crate::{
     },
     delivery::{
         DeliveryError, DeliveryFailure, Origin, Response as DeliveryResponse, Reuse,
+        store::DiskError,
         uri::{MediaResourcePath, parse_media_path},
     },
     hooks::Hooks,
@@ -141,6 +142,8 @@ pub enum RuntimeError {
     /// operator has to go and fix.
     #[error("could not start TLS: {0}")]
     Tls(#[from] TlsError),
+    #[error(transparent)]
+    Disk(#[from] DiskError),
     #[error("RTMP listener failed: {0}")]
     Rtmp(std::io::Error),
     #[error("SRT listener stopped unexpectedly")]
@@ -281,7 +284,7 @@ impl Node {
         // different supposedly process-wide limit.
         config.rtmp.input_limits = config.session.input;
         config.srt.input_limits = config.session.input;
-        let store = StreamStore::new(config.store);
+        let store = StreamStore::try_new(config.store.clone())?;
         let sessions = Registry::with_capacity(config.maximum_sessions);
         let meters = ProcessMeters::default();
         let services = Services {

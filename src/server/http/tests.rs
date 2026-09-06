@@ -304,11 +304,24 @@ async fn enabled_metrics_can_be_exposed_without_authentication() {
     let reply = request(harness.address, "GET", "/metrics", &[]).await;
 
     assert_eq!(reply.status, 200);
+    let body = String::from_utf8(reply.body).expect("metrics are UTF-8");
+    assert!(body.contains("rushls_active_sessions 0\n"));
+    assert!(body.contains("rushls_retained_payload_bytes 0\n"));
+    assert!(body.contains("rushls_retained_disk_bytes 0\n"));
+    assert!(body.contains("rushls_disk_spill_pending 0\n"));
+    assert!(body.contains("rushls_disk_spills_failed_total 0\n"));
+    assert!(body.contains("rushls_retention_capacity_bytes{tier=\"memory\"} 0\n"));
+    assert!(body.contains("rushls_retention_capacity_bytes{tier=\"disk\"} 0\n"));
     assert!(
-        String::from_utf8(reply.body)
-            .expect("metrics are UTF-8")
-            .contains("rushls_active_sessions 0\n")
+        !body.contains("rushls_stream_retention_held_seconds{"),
+        "per-stream retention is a separate scrape"
     );
+
+    let streams = request(harness.address, "GET", "/metrics/streams", &[]).await;
+    assert_eq!(streams.status, 200);
+    let streams = String::from_utf8(streams.body).expect("metrics are UTF-8");
+    assert!(streams.contains("# TYPE rushls_stream_retention_held_seconds gauge\n"));
+    assert!(streams.contains("# TYPE rushls_stream_retained_bytes gauge\n"));
     harness.stop().await;
 }
 
@@ -319,6 +332,8 @@ async fn metrics_are_absent_unless_the_endpoint_is_enabled() {
     let reply = request(harness.address, "GET", "/metrics", &[]).await;
 
     assert_eq!(reply.status, 404);
+    let streams = request(harness.address, "GET", "/metrics/streams", &[]).await;
+    assert_eq!(streams.status, 404);
     harness.stop().await;
 }
 
@@ -355,6 +370,17 @@ async fn metrics_require_the_configured_bearer_token() {
         accepted.header("content-type"),
         Some("text/plain; version=0.0.4; charset=utf-8")
     );
+
+    let streams_missing = request(harness.address, "GET", "/metrics/streams", &[]).await;
+    assert_eq!(streams_missing.status, 401);
+    let streams = request(
+        harness.address,
+        "GET",
+        "/metrics/streams",
+        &[("Authorization", "Bearer scrape-secret")],
+    )
+    .await;
+    assert_eq!(streams.status, 200);
     assert_eq!(accepted.header("cache-control"), Some("no-store"));
     let body = String::from_utf8(accepted.body).expect("metrics are UTF-8");
     assert!(body.contains("rushls_active_sessions 0\n"));

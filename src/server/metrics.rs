@@ -1,9 +1,10 @@
-use std::{fmt::Write, net::SocketAddr, sync::Arc};
+use std::{fmt::Write, net::SocketAddr, sync::Arc, time::Duration};
 
 use cc_metrics::escape_label;
 
 use crate::{
-    delivery::hls::StreamStore,
+    delivery::hls::{RetentionDepth, StreamStore},
+    domain::StreamId,
     hooks::{HOOK_SERIES, HookSnapshot, Hooks},
     observe::{
         HlsMeters, HlsSnapshot, MeterSnapshot, MetricKind, OriginMeters, OriginSnapshot,
@@ -54,6 +55,22 @@ pub struct MetricsSnapshot {
     pub streams: Vec<SessionSnapshot>,
     /// Delivery counters per configured hook.
     pub hooks: Vec<(Arc<str>, HookSnapshot)>,
+    /// Payload bytes currently held for viewers, memory tier.
+    pub retained_payload_bytes: usize,
+    /// Payload bytes currently held for viewers on disk.
+    pub retained_disk_bytes: usize,
+    /// Sum of per-stream memory caps for streams this node currently retains.
+    pub retention_memory_capacity: usize,
+    /// Sum of per-stream disk caps; zero when the node is memory-only.
+    pub retention_disk_capacity: usize,
+    /// Spill jobs accepted and not yet finished.
+    pub spill_pending: usize,
+    /// Spill writes that failed; media stayed in memory.
+    pub spills_failed: u64,
+    /// Configured `retain`, identical for every stream on this node today.
+    pub retention_requested: Duration,
+    /// One reading per retained stream, including idle ones.
+    pub retention: Vec<(StreamId, RetentionDepth)>,
 }
 
 /// A configured HTTP exporter backed by the node's live metrics reader.
@@ -78,6 +95,14 @@ impl MetricsEndpoint {
 
     pub fn render(&self) -> String {
         render(&self.reader.snapshot())
+    }
+
+    /// Per-stream retention, including idle streams still within `retain`.
+    ///
+    /// Served at `/metrics/streams` so the scraper chooses the unbounded
+    /// cardinality, rather than a node-side flag.
+    pub fn render_streams(&self) -> String {
+        render_retention(&self.reader.snapshot())
     }
 }
 
@@ -129,6 +154,12 @@ impl MetricsReader {
     pub fn snapshot(&self) -> MetricsSnapshot {
         let sessions = self.sessions.snapshot();
         let published = self.store.leased();
+        let mut retention = self.store.live_streams();
+        retention.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        let retention: Vec<(StreamId, RetentionDepth)> = retention
+            .into_iter()
+            .map(|(id, live)| (id, live.retention_depth()))
+            .collect();
         MetricsSnapshot {
             process: self.meters.snapshot(),
             origin: self.origin.snapshot(),
@@ -149,12 +180,22 @@ impl MetricsReader {
                 .as_ref()
                 .map(Hooks::snapshots)
                 .unwrap_or_default(),
+            retained_payload_bytes: retention.iter().map(|(_, depth)| depth.memory_bytes).sum(),
+            retained_disk_bytes: retention.iter().map(|(_, depth)| depth.disk_bytes).sum(),
+            retention_memory_capacity: retention
+                .iter()
+                .map(|(_, depth)| depth.memory_capacity)
+                .sum(),
+            retention_disk_capacity: retention.iter().map(|(_, depth)| depth.disk_capacity).sum(),
+            spill_pending: self.store.disk().map_or(0, |disk| disk.spill_pending()),
+            spills_failed: self.store.disk().map_or(0, |disk| disk.spills_failed()),
+            retention_requested: self.store.limits().retention.retain,
+            retention,
         }
     }
 }
 
-// The three readings that belong to the node itself rather than to any one
-// component's counters.
+// Node-wide gauges that are not one component's counter bank.
 series! {
     MetricsSnapshot {
         Gauge("rushls_active_sessions", "Publishing sessions currently active.")
@@ -163,6 +204,21 @@ series! {
             = |snapshot: &MetricsSnapshot| snapshot.published_streams,
         Gauge("rushls_idle_streams", "Retained streams waiting for a publisher to return.")
             = |snapshot: &MetricsSnapshot| snapshot.idle_streams,
+        Gauge("rushls_retained_payload_bytes",
+            "Media payload bytes currently retained for viewers in the memory tier.")
+            = |snapshot: &MetricsSnapshot| snapshot.retained_payload_bytes,
+        Gauge("rushls_retained_disk_bytes",
+            "Media payload bytes currently retained for viewers in the disk tier.")
+            = |snapshot: &MetricsSnapshot| snapshot.retained_disk_bytes,
+        Gauge("rushls_retention_requested_seconds",
+            "Configured retain window in seconds. Per-stream held duration is at /metrics/streams.")
+            = |snapshot: &MetricsSnapshot| snapshot.retention_requested.as_secs_f64(),
+        Gauge("rushls_disk_spill_pending",
+            "Spill jobs accepted and not yet written. At capacity the store sheds instead of spilling.")
+            = |snapshot: &MetricsSnapshot| snapshot.spill_pending,
+        Counter("rushls_disk_spills_failed_total",
+            "Spill writes that failed. Media stayed in memory.")
+            = |snapshot: &MetricsSnapshot| snapshot.spills_failed,
     }
 }
 
@@ -178,6 +234,7 @@ pub fn render(snapshot: &MetricsSnapshot) -> String {
     scalars(&mut output, OriginSnapshot::SERIES, &snapshot.origin);
     scalars(&mut output, HlsSnapshot::SERIES, &snapshot.hls);
     scalars(&mut output, MetricsSnapshot::SERIES, snapshot);
+    render_retention_capacity(&mut output, snapshot);
 
     if !snapshot.hooks.is_empty() {
         render_hooks(&mut output, &snapshot.hooks);
@@ -195,6 +252,29 @@ fn scalars<S>(output: &mut String, series: &[Series<S>], source: &S) {
         writeln!(output, "{} {}", series.name, (series.read)(source))
             .expect("writing to a String cannot fail");
     }
+}
+
+const RETENTION_CAPACITY_BYTES: &str = "rushls_retention_capacity_bytes";
+
+fn render_retention_capacity(output: &mut String, snapshot: &MetricsSnapshot) {
+    metadata(
+        output,
+        RETENTION_CAPACITY_BYTES,
+        "Configured retention cap across currently retained streams, per tier.",
+        MetricKind::Gauge,
+    );
+    writeln!(
+        output,
+        "{RETENTION_CAPACITY_BYTES}{{tier=\"memory\"}} {}",
+        snapshot.retention_memory_capacity
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "{RETENTION_CAPACITY_BYTES}{{tier=\"disk\"}} {}",
+        snapshot.retention_disk_capacity
+    )
+    .expect("writing to a String cannot fail");
 }
 
 /// One counter per hook, labelled by the name the operator configured.
@@ -286,6 +366,68 @@ fn session_labels(session: &SessionSnapshot) -> String {
     )
 }
 
+series! {
+    STREAM_RETENTION_SERIES: RetentionDepth {
+        Gauge("rushls_stream_retention_requested_seconds",
+            "Configured retain for this stream, in seconds.")
+            = |depth: &RetentionDepth| depth.requested.as_secs_f64(),
+        Gauge("rushls_stream_retention_held_seconds",
+            "Advertised playlist duration currently named for this stream, in seconds.")
+            = |depth: &RetentionDepth| depth.held.as_secs_f64(),
+    }
+}
+
+const STREAM_RETAINED_BYTES: &str = "rushls_stream_retained_bytes";
+const STREAM_RETENTION_CAPACITY_BYTES: &str = "rushls_stream_retention_capacity_bytes";
+
+/// Per-stream retention at `/metrics/streams`.
+fn render_retention(snapshot: &MetricsSnapshot) -> String {
+    let mut output = String::with_capacity(512 + snapshot.retention.len() * 256);
+    for series in STREAM_RETENTION_SERIES {
+        metadata(&mut output, series.name, series.help, series.kind);
+        for (stream, depth) in &snapshot.retention {
+            writeln!(
+                output,
+                "{}{{stream=\"{}\"}} {}",
+                series.name,
+                escape_label(stream.as_str()),
+                (series.read)(depth)
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    metadata(
+        &mut output,
+        STREAM_RETAINED_BYTES,
+        "Payload bytes this stream holds in one retention tier.",
+        MetricKind::Gauge,
+    );
+    metadata(
+        &mut output,
+        STREAM_RETENTION_CAPACITY_BYTES,
+        "Configured cap for one retention tier of this stream.",
+        MetricKind::Gauge,
+    );
+    for (stream, depth) in &snapshot.retention {
+        let stream = escape_label(stream.as_str());
+        for tier in depth.tiers() {
+            writeln!(
+                output,
+                "{STREAM_RETAINED_BYTES}{{stream=\"{stream}\",tier=\"{}\"}} {}",
+                tier.name, tier.bytes
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                output,
+                "{STREAM_RETENTION_CAPACITY_BYTES}{{stream=\"{stream}\",tier=\"{}\"}} {}",
+                tier.name, tier.capacity
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -357,6 +499,12 @@ mod tests {
         assert!(terse.streams.is_empty());
         assert_eq!(terse.process.sessions_started, 1);
         assert_eq!(terse.process.bytes_received, 512);
+        assert_eq!(terse.retention.len(), 1, "idle streams still occupy retain");
+        assert_eq!(terse.retention[0].0.as_str(), "live/camera");
+        assert_eq!(
+            terse.retention_requested, terse.retention[0].1.requested,
+            "the process total is the same request each stream was given"
+        );
     }
 
     #[test]
@@ -394,6 +542,14 @@ mod tests {
             idle_streams: 4,
             streams: Vec::new(),
             hooks: Vec::new(),
+            retained_payload_bytes: 0,
+            retained_disk_bytes: 0,
+            retention_memory_capacity: 0,
+            retention_disk_capacity: 0,
+            spill_pending: 0,
+            spills_failed: 0,
+            retention_requested: Duration::ZERO,
+            retention: Vec::new(),
         });
 
         assert!(output.contains("# TYPE rushls_sessions_started_total counter\n"));
@@ -401,6 +557,18 @@ mod tests {
         assert!(output.contains("rushls_bytes_received_total 1024\n"));
         assert!(output.contains("# TYPE rushls_active_sessions gauge\n"));
         assert!(output.contains("rushls_active_sessions 2\n"));
+        assert!(output.contains("rushls_retained_payload_bytes 0\n"));
+        assert!(output.contains("rushls_retained_disk_bytes 0\n"));
+        assert!(output.contains("rushls_retention_requested_seconds 0\n"));
+        assert!(output.contains("rushls_disk_spill_pending 0\n"));
+        assert!(output.contains("# TYPE rushls_disk_spills_failed_total counter\n"));
+        assert!(output.contains("rushls_disk_spills_failed_total 0\n"));
+        assert!(output.contains("rushls_retention_capacity_bytes{tier=\"memory\"} 0\n"));
+        assert!(output.contains("rushls_retention_capacity_bytes{tier=\"disk\"} 0\n"));
+        assert!(
+            !output.contains("rushls_stream_retention_"),
+            "per-stream retention belongs on /metrics/streams"
+        );
         assert!(
             !output.contains("rushls_hook_"),
             "a node with no hooks exports no hook series at all, rather than \
@@ -475,6 +643,14 @@ mod tests {
                 ),
                 (Arc::from("audit"), HookSnapshot::default()),
             ],
+            retained_payload_bytes: 0,
+            retained_disk_bytes: 0,
+            retention_memory_capacity: 0,
+            retention_disk_capacity: 0,
+            spill_pending: 0,
+            spills_failed: 0,
+            retention_requested: Duration::ZERO,
+            retention: Vec::new(),
         });
 
         assert!(output.contains("# TYPE rushls_hook_deliveries_total counter\n"));
@@ -504,6 +680,124 @@ mod tests {
                 .count(),
             1,
             "one HELP and TYPE per metric, with hooks as labels beneath it"
+        );
+    }
+
+    #[test]
+    fn stream_retention_is_labelled_and_tiered() {
+        let output = render_retention(&MetricsSnapshot {
+            process: ProcessSnapshot::default(),
+            origin: OriginSnapshot::default(),
+            hls: HlsSnapshot::default(),
+            active_sessions: 0,
+            published_streams: 0,
+            idle_streams: 1,
+            streams: Vec::new(),
+            hooks: Vec::new(),
+            retained_payload_bytes: 4_096,
+            retained_disk_bytes: 0,
+            retention_memory_capacity: 256 * 1024 * 1024,
+            retention_disk_capacity: 0,
+            spill_pending: 0,
+            spills_failed: 0,
+            retention_requested: Duration::from_mins(2),
+            retention: vec![(
+                StreamId::new("live/camera"),
+                RetentionDepth {
+                    requested: Duration::from_mins(2),
+                    held: Duration::from_secs(42),
+                    memory_bytes: 4_096,
+                    memory_capacity: 256 * 1024 * 1024,
+                    disk_bytes: 0,
+                    disk_capacity: 0,
+                },
+            )],
+        });
+
+        assert!(
+            output.contains(
+                "rushls_stream_retention_requested_seconds{stream=\"live/camera\"} 120\n"
+            )
+        );
+        assert!(
+            output.contains("rushls_stream_retention_held_seconds{stream=\"live/camera\"} 42\n")
+        );
+        assert!(output.contains(
+            "rushls_stream_retained_bytes{stream=\"live/camera\",tier=\"memory\"} 4096\n"
+        ));
+        assert!(output.contains(
+            "rushls_stream_retention_capacity_bytes{stream=\"live/camera\",tier=\"memory\"} 268435456\n"
+        ));
+        assert!(
+            output
+                .contains("rushls_stream_retained_bytes{stream=\"live/camera\",tier=\"disk\"} 0\n")
+        );
+        assert!(output.contains(
+            "rushls_stream_retention_capacity_bytes{stream=\"live/camera\",tier=\"disk\"} 0\n"
+        ));
+        assert!(
+            !output.contains("rushls_active_sessions"),
+            "/metrics/streams is retention, not process totals"
+        );
+    }
+
+    #[test]
+    fn process_dvr_gauges_are_labelled_by_tier() {
+        let output = render(&MetricsSnapshot {
+            process: ProcessSnapshot::default(),
+            origin: OriginSnapshot::default(),
+            hls: HlsSnapshot::default(),
+            active_sessions: 0,
+            published_streams: 0,
+            idle_streams: 1,
+            streams: Vec::new(),
+            hooks: Vec::new(),
+            retained_payload_bytes: 4_096,
+            retained_disk_bytes: 512,
+            retention_memory_capacity: 256 * 1024 * 1024,
+            retention_disk_capacity: 8 * 1024 * 1024 * 1024,
+            spill_pending: 3,
+            spills_failed: 4,
+            retention_requested: Duration::from_mins(2),
+            retention: Vec::new(),
+        });
+
+        assert!(output.contains("rushls_disk_spill_pending 3\n"));
+        assert!(output.contains("rushls_disk_spills_failed_total 4\n"));
+        assert!(output.contains("rushls_retention_capacity_bytes{tier=\"memory\"} 268435456\n"));
+        assert!(output.contains("rushls_retention_capacity_bytes{tier=\"disk\"} 8589934592\n"));
+        assert!(
+            !output.contains("rushls_stream_retained_bytes"),
+            "per-stream series stay on /metrics/streams"
+        );
+    }
+
+    #[test]
+    fn an_empty_store_still_describes_the_retention_series() {
+        let output = render_retention(&MetricsSnapshot {
+            process: ProcessSnapshot::default(),
+            origin: OriginSnapshot::default(),
+            hls: HlsSnapshot::default(),
+            active_sessions: 0,
+            published_streams: 0,
+            idle_streams: 0,
+            streams: Vec::new(),
+            hooks: Vec::new(),
+            retained_payload_bytes: 0,
+            retained_disk_bytes: 0,
+            retention_memory_capacity: 0,
+            retention_disk_capacity: 0,
+            spill_pending: 0,
+            spills_failed: 0,
+            retention_requested: Duration::from_mins(1),
+            retention: Vec::new(),
+        });
+
+        assert!(output.contains("# TYPE rushls_stream_retention_held_seconds gauge\n"));
+        assert!(output.contains("# TYPE rushls_stream_retained_bytes gauge\n"));
+        assert!(
+            !output.contains("{stream="),
+            "no samples until a stream is retained"
         );
     }
 }

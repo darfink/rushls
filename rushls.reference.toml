@@ -126,7 +126,7 @@ memory_per_stream = "256MiB"             # retained parts and segments; worst-ca
                                          # compiled per-publisher ceiling, reported per session
                                          # as rushls_session_pipeline_bytes
 # disk_per_stream = "8GiB"               # older media spills here; omit to stay in memory
-# dir             = "/var/lib/rushls"    # required with disk_per_stream; startup fails without it
+# dir             = "/var/lib/rushls"    # optional; default is the platform cache (.../rushls/dvr)
 
 # Write a copy of every segment to a filesystem. Outlives the stream and is
 # never served by this origin, so it is unrelated to retain. For sending

@@ -1,11 +1,11 @@
 # RFC companion: what the configuration asks the application to become
 
 > **Status: largely implemented.** Outstanding, in the order they are least
-> to most self-contained: effective retention-depth reporting,
-> moderate timestamp jumps becoming discontinuities,
-> payload-carrying hooks, `[record]`, delta playlists, the disk tier,
-> playback authorization, and enforcing
-> `memory_per_publisher`. Every key belonging to an unbuilt feature is refused
+> to most self-contained: moderate timestamp jumps becoming discontinuities,
+> payload-carrying hooks, `[record]`, playback authorization,
+> and enforcing `memory_per_publisher`. Playlist Delta Updates and
+> effective retention-depth reporting have landed, including the disk tier.
+> Every key belonging to an unbuilt feature is refused
 > at startup by name, so nothing here silently does nothing. Everything else
 > has landed.
 >
@@ -278,14 +278,17 @@ see, and no legitimate encoder approaches them.
 bitrate it has no fixed byte meaning, so it would be a second, weaker way of writing
 `retain`. `retain` stays the time promise, the tiers stay the spend.
 
-**A disk tier.** The store has no filesystem path anywhere today, so this is a
-real subsystem: write path, crash recovery, orphan reaping, and a read path
-that is slower than memory without stalling the live edge.
+**A disk tier.** Spilled payloads live under `{dir}/{generation}/streams/...`.
+When `dir` is omitted, that is the platform cache directory (`.../rushls/dvr`).
+The catalog is not rehydrated after restart: this is process-lifetime overflow
+of `retain`, not DVR that survives reboot. `held` clips when both tiers (or
+the HLS floor) cannot cover `retain`, including when the spill queue is too
+deep to accept more work. Gzip sidecars count toward `disk_per_stream`.
 
 **Effective-depth reporting, per stream and per tier.** Configured retention is
 a request; what a stream actually holds depends on its bitrate. Without this,
 an administrator who asked for two hours and received seven minutes has no way
-to find out.
+to find out. Memory and disk both appear on the same `tier` label.
 
 ## Delivery
 

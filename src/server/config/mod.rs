@@ -30,7 +30,7 @@ use crate::{
         OpenStreamAuthenticator, Pace, Resolution, StreamPolicy, TakeoverPolicy,
     },
     delivery::hls::uri::UriBase,
-    delivery::store::{DurationRule, TargetDurationMultiple},
+    delivery::store::{DiskLimits, DurationRule, TargetDurationMultiple},
     domain::{Codec, FrameRate},
     hooks::{HookConfig, HooksConfig},
     observe::lifecycle::Kind,
@@ -1023,6 +1023,12 @@ pub struct CapacityAppConfig {
         serde(use_value_parser)
     )]
     memory_per_stream: ByteSize,
+    /// Overflow of the same retain window. Omit to stay in memory.
+    #[conf(parameter, long, env, serde(use_value_parser))]
+    disk_per_stream: Option<ByteSize>,
+    /// Generation directory for spilled media. Defaults to the platform cache.
+    #[conf(parameter, long, env)]
+    dir: Option<PathBuf>,
 }
 
 impl CapacityAppConfig {
@@ -1037,6 +1043,25 @@ impl CapacityAppConfig {
         node.store.maximum_streams = self.streams;
         node.store.retention.maximum_payload_bytes =
             nonzero_bytes("capacity.memory_per_stream", self.memory_per_stream)?;
+        node.store.disk = match (&self.disk_per_stream, &self.dir) {
+            (None, None) => None,
+            (Some(bytes), directory) => Some(DiskLimits {
+                directory: match directory {
+                    Some(directory) => directory.clone(),
+                    None => paths::default_disk_directory().ok_or_else(|| {
+                        invalid(
+                            "could not determine a cache directory for disk overflow; set capacity.dir",
+                        )
+                    })?,
+                },
+                maximum_payload_bytes: nonzero_bytes("capacity.disk_per_stream", *bytes)?,
+            }),
+            (None, Some(_)) => {
+                return Err(invalid(
+                    "capacity.disk_per_stream is required when dir is set",
+                ));
+            }
+        };
         Ok(())
     }
 }

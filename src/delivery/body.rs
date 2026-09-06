@@ -9,7 +9,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::{
-    delivery::store::{SegmentBody, StoredPart, StoredSegment, StoredSegmentKind},
+    delivery::store::{HeldBytes, SegmentBody, StoredPart, StoredSegment, StoredSegmentKind},
     domain::Payload,
 };
 
@@ -46,18 +46,32 @@ impl MediaBody {
         }
     }
 
-    pub fn from_segment(segment: &StoredSegment) -> Self {
+    pub(crate) fn from_payloads(frames: Vec<Payload>) -> Self {
+        Self::ranged(frames)
+    }
+
+    /// Builds a body over in-memory frames only.
+    ///
+    /// `None` when any payload lives on disk: those bytes are not in these
+    /// buffers, and a later range clip must not skip them. The origin loads
+    /// disk frames into memory first.
+    pub fn from_segment(segment: &StoredSegment) -> Option<Self> {
         match &segment.kind {
-            StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) => {
-                Self::single(payload.clone())
+            StoredSegmentKind::Media(SegmentBody::Contiguous(HeldBytes::Memory(payload))) => {
+                Some(Self::single(payload.clone()))
             }
-            StoredSegmentKind::Media(SegmentBody::Chunked(parts)) => Self {
-                frames: MediaFrames::Chunked(Arc::clone(parts)),
-                length: parts.iter().map(|part| part.payload.len() as u64).sum(),
-            },
-            // A gap has no bytes by construction; it exists to keep a media
-            // sequence number from vanishing, not to be fetched.
-            StoredSegmentKind::Gap => Self::default(),
+            StoredSegmentKind::Media(SegmentBody::Chunked(parts))
+                if parts.iter().all(|part| part.payload.is_memory()) =>
+            {
+                Some(Self {
+                    frames: MediaFrames::Chunked(Arc::clone(parts)),
+                    length: parts.iter().map(|part| part.payload.len() as u64).sum(),
+                })
+            }
+            StoredSegmentKind::Media(
+                SegmentBody::Contiguous(HeldBytes::Disk(_)) | SegmentBody::Chunked(_),
+            )
+            | StoredSegmentKind::Gap => None,
         }
     }
 
@@ -80,17 +94,24 @@ impl MediaBody {
 
     /// Clips to an inclusive byte range, splitting refcounted frames where the
     /// range falls inside one.
+    ///
+    /// `None` if a chunked frame is not in memory. Skipping it would shift
+    /// every later offset while HTTP still advertised the full length.
     #[must_use]
-    pub fn range(&self, start: u64, end: u64) -> Self {
+    pub fn range(&self, start: u64, end: u64) -> Option<Self> {
         let frames = match &self.frames {
             MediaFrames::Empty => Vec::new(),
             MediaFrames::Single(payload) => clip_range(std::iter::once(payload), start, end),
             MediaFrames::Chunked(parts) => {
-                clip_range(parts.iter().map(|part| &part.payload), start, end)
+                let payloads = parts
+                    .iter()
+                    .map(|part| part.payload.as_memory())
+                    .collect::<Option<Vec<_>>>()?;
+                clip_range(payloads.into_iter(), start, end)
             }
             MediaFrames::Ranged(frames) => clip_range(frames.iter(), start, end),
         };
-        Self::ranged(frames)
+        Some(Self::ranged(frames))
     }
 }
 
@@ -137,11 +158,142 @@ impl Iterator for MediaFrameIter {
             Self::Empty => None,
             Self::Single(payload) => payload.take().map(Payload::into_bytes),
             Self::Chunked { parts, index } => {
-                let bytes = parts.get(*index)?.payload.bytes().clone();
+                // Chunked bodies are all-RAM by construction (`from_segment`).
+                let bytes = parts.get(*index)?.payload.as_memory()?.bytes().clone();
                 *index += 1;
                 Some(bytes)
             }
             Self::Ranged(frames) => frames.next().map(Payload::into_bytes),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        delivery::store::{
+            DiskRef, InitializationId, Msn, PartCursor, PartId, PartIndex, SegmentId, StoredPart,
+        },
+        domain::{Payload, Timebase},
+    };
+
+    fn contiguous(payload: HeldBytes) -> StoredSegment {
+        StoredSegment {
+            id: SegmentId(1),
+            msn: Msn(1),
+            publication: 1,
+            initialization: InitializationId(1),
+            media_start: 0,
+            duration: 1,
+            timebase: Timebase::hz90k(),
+            independent: true,
+            discontinuity_before: false,
+            kind: StoredSegmentKind::Media(SegmentBody::Contiguous(payload)),
+            gzip: None,
+        }
+    }
+
+    fn part(id: u64, payload: HeldBytes) -> Arc<StoredPart> {
+        Arc::new(StoredPart {
+            id: PartId(id),
+            cursor: PartCursor {
+                msn: Msn(1),
+                part_index: PartIndex(u32::try_from(id).expect("fixture id")),
+            },
+            publication: 1,
+            initialization: InitializationId(1),
+            media_start: 0,
+            duration: 1,
+            timebase: Timebase::hz90k(),
+            independent: id == 0,
+            payload,
+            gzip: None,
+        })
+    }
+
+    fn chunked(payloads: Vec<HeldBytes>) -> StoredSegment {
+        let parts: Arc<[Arc<StoredPart>]> = payloads
+            .into_iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                part(
+                    u64::try_from(index).expect("fixture part count fits u64"),
+                    payload,
+                )
+            })
+            .collect::<Vec<_>>()
+            .into();
+        StoredSegment {
+            id: SegmentId(1),
+            msn: Msn(1),
+            publication: 1,
+            initialization: InitializationId(1),
+            media_start: 0,
+            duration: 1,
+            timebase: Timebase::hz90k(),
+            independent: true,
+            discontinuity_before: false,
+            kind: StoredSegmentKind::Media(SegmentBody::Chunked(parts)),
+            gzip: None,
+        }
+    }
+
+    fn disk(len: usize) -> HeldBytes {
+        HeldBytes::Disk(DiskRef {
+            path: Arc::new(std::path::PathBuf::from("/nonexistent")),
+            len,
+        })
+    }
+
+    #[test]
+    fn from_segment_refuses_disk_payloads() {
+        assert!(
+            MediaBody::from_segment(&contiguous(HeldBytes::Memory(Payload::from(&b"abcd"[..]))))
+                .is_some()
+        );
+        assert!(MediaBody::from_segment(&contiguous(disk(4))).is_none());
+        assert!(
+            MediaBody::from_segment(&chunked(vec![
+                HeldBytes::Memory(Payload::from(&b"ab"[..])),
+                HeldBytes::Memory(Payload::from(&b"cd"[..])),
+            ]))
+            .is_some()
+        );
+        assert!(
+            MediaBody::from_segment(&chunked(vec![
+                HeldBytes::Memory(Payload::from(&b"ab"[..])),
+                disk(2),
+            ]))
+            .is_none(),
+            "a mixed parent cannot be served as chunked frames"
+        );
+        let mut gap = contiguous(HeldBytes::Memory(Payload::from(&b"x"[..])));
+        gap.kind = StoredSegmentKind::Gap;
+        assert!(MediaBody::from_segment(&gap).is_none());
+    }
+
+    #[test]
+    fn range_of_memory_frames_keeps_offsets() {
+        let chunked = MediaBody::from_segment(&chunked(vec![
+            HeldBytes::Memory(Payload::from(&b"aaaa"[..])),
+            HeldBytes::Memory(Payload::from(&b"bbbb"[..])),
+            HeldBytes::Memory(Payload::from(&b"cccc"[..])),
+        ]))
+        .expect("all-RAM chunked body");
+        let clipped = chunked.range(3, 8).expect("chunked RAM frames clip");
+        let bytes: Vec<u8> = clipped.into_frames().flatten().collect();
+        assert_eq!(bytes, b"abbbbc");
+
+        let reassembled = MediaBody::from_payloads(vec![
+            Payload::from(&b"aaaa"[..]),
+            Payload::from(&b"bbbb"[..]),
+            Payload::from(&b"cccc"[..]),
+        ]);
+        let clipped = reassembled.range(3, 8).expect("reassembled frames clip");
+        let bytes: Vec<u8> = clipped.into_frames().flatten().collect();
+        assert_eq!(bytes, b"abbbbc");
     }
 }

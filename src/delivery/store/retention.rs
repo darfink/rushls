@@ -165,6 +165,57 @@ impl RetentionPolicy {
     }
 }
 
+/// What one stream currently holds against the retention it asked for.
+///
+/// [`RetentionPolicy::retain`] is a request. What a playlist actually names
+/// depends on how much media has been published and on the memory (and later
+/// disk) cap. Reported so an operator who asked for two hours and received
+/// seven minutes can see that, rather than reconstruct it from bitrate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionDepth {
+    /// Configured `retain`.
+    pub requested: Duration,
+    /// Advertised playlist duration: visible completed parents plus any open
+    /// parts. The longest rendition wins, so a shorter sibling does not hide
+    /// how far back video still goes.
+    pub held: Duration,
+    /// Payload bytes in the memory tier, including fetch-grace media the
+    /// playlist no longer names.
+    pub memory_bytes: usize,
+    /// [`RetentionPolicy::maximum_payload_bytes`].
+    pub memory_capacity: usize,
+    /// Payload bytes in the disk overflow tier.
+    pub disk_bytes: usize,
+    /// Configured `disk_per_stream`, or zero when the node is memory-only.
+    pub disk_capacity: usize,
+}
+
+impl RetentionDepth {
+    /// Occupied retention tiers, newest media first.
+    pub const fn tiers(self) -> [RetentionTier; 2] {
+        [
+            RetentionTier {
+                name: "memory",
+                bytes: self.memory_bytes,
+                capacity: self.memory_capacity,
+            },
+            RetentionTier {
+                name: "disk",
+                bytes: self.disk_bytes,
+                capacity: self.disk_capacity,
+            },
+        ]
+    }
+}
+
+/// One retention tier's spend and cap for a stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetentionTier {
+    pub name: &'static str,
+    pub bytes: usize,
+    pub capacity: usize,
+}
+
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {

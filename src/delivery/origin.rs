@@ -13,7 +13,8 @@ use crate::{
     delivery::{
         DeliveryError, MediaBody,
         store::{
-            LiveStream, PartId, PlaylistContract, RenditionLiveEdge, RenditionSnapshot, StreamStore,
+            HeldBytes, LiveStream, PartId, PlaylistContract, RenditionLiveEdge, RenditionSnapshot,
+            SegmentBody, StoredSegment, StoredSegmentKind, StreamStore,
         },
         uri::MediaResource,
     },
@@ -125,16 +126,16 @@ impl Origin {
                     .segment(rendition, segment)
                     .ok_or(DeliveryError::UnknownResource)?;
                 MediaObject {
-                    body: MediaBody::from_segment(&stored),
-                    gzip: stored.gzip.as_ref().map(Payload::bytes).cloned(),
+                    body: self.load_segment(&stored).await?,
+                    gzip: self.load_optional_gzip(stored.gzip.as_ref()).await?,
                     contract,
                 }
             }
             MediaResource::Part(_, part, _) => {
                 if let Some(stored) = live.part(rendition, part) {
                     MediaObject {
-                        body: MediaBody::single(stored.payload.clone()),
-                        gzip: stored.gzip.as_ref().map(Payload::bytes).cloned(),
+                        body: MediaBody::single(self.load_held(&stored.payload).await?),
+                        gzip: self.load_optional_gzip(stored.gzip.as_ref()).await?,
                         contract,
                     }
                 } else {
@@ -155,8 +156,8 @@ impl Origin {
                         .part(rendition, part)
                         .ok_or(DeliveryError::UnknownResource)?;
                     MediaObject {
-                        body: MediaBody::single(stored.payload.clone()),
-                        gzip: stored.gzip.as_ref().map(Payload::bytes).cloned(),
+                        body: MediaBody::single(self.load_held(&stored.payload).await?),
+                        gzip: self.load_optional_gzip(stored.gzip.as_ref()).await?,
                         contract,
                     }
                 }
@@ -207,6 +208,48 @@ impl Origin {
         (rendition.contract.segment_format == resource.format())
             .then_some(rendition)
             .ok_or(DeliveryError::UnknownResource)
+    }
+
+    async fn load_held(&self, held: &HeldBytes) -> Result<Payload, DeliveryError> {
+        match held {
+            HeldBytes::Memory(payload) => Ok(payload.clone()),
+            HeldBytes::Disk(locator) => {
+                let disk = self.store.disk().ok_or(DeliveryError::UnknownResource)?;
+                disk.read(locator)
+                    .await
+                    .map_err(|_| DeliveryError::UnknownResource)
+            }
+        }
+    }
+
+    async fn load_optional_gzip(
+        &self,
+        gzip: Option<&HeldBytes>,
+    ) -> Result<Option<bytes::Bytes>, DeliveryError> {
+        match gzip {
+            None => Ok(None),
+            Some(held) => Ok(Some(self.load_held(held).await?.bytes().clone())),
+        }
+    }
+
+    async fn load_segment(&self, stored: &StoredSegment) -> Result<MediaBody, DeliveryError> {
+        match &stored.kind {
+            StoredSegmentKind::Media(SegmentBody::Contiguous(held)) => {
+                Ok(MediaBody::single(self.load_held(held).await?))
+            }
+            StoredSegmentKind::Media(SegmentBody::Chunked(parts)) => {
+                if let Some(body) = MediaBody::from_segment(stored) {
+                    Ok(body)
+                } else {
+                    let mut frames = Vec::with_capacity(parts.len());
+                    for part in parts.iter() {
+                        frames.push(self.load_held(&part.payload).await?);
+                    }
+                    Ok(MediaBody::from_payloads(frames))
+                }
+            }
+            StoredSegmentKind::Gap => Ok(MediaBody::default()),
+        }
     }
 }
 

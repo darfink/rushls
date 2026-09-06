@@ -1,9 +1,8 @@
 # RFC: the Rushls configuration surface
 
 > **Status: implemented**, apart from the features named as not built below:
-> playback authorization, `[record]`, the disk tier, delta playlists,
-> and payload-carrying hooks. Their keys are refused at startup
-> rather than silently accepted.
+> playback authorization, `[record]`, and payload-carrying
+> hooks. Their keys are refused at startup rather than silently accepted.
 >
 > **The goal was inverted on purpose.** This document does not describe how to
 > configure the internals. It describes the configuration an administrator
@@ -407,8 +406,24 @@ bitrate. At 5 Mbps, 256MiB is roughly seven minutes — so `retain = "2h"` on a
 memory-only node does not deliver two hours. This is reported per stream rather
 than left to arithmetic.
 
-`dir` is required when `disk_per_stream` is set. Startup fails otherwise,
-rather than silently falling back to memory-only.
+`dir` is optional. Omit it and spilled media goes under the platform cache
+directory (`~/.cache/rushls/dvr` on Linux). Set it to pin a volume. `dir`
+without `disk_per_stream` is a startup error: a path with no cap does not
+activate the tier. A zero disk cap is refused the same way a zero memory cap is.
+
+The disk window is **process-lifetime**. A restart starts empty; spilled files
+are not rehydrated into the catalog. Writes are still crash-safe (temp, fsync,
+rename) so a new process never serves a torn object. Gzip sidecars count toward
+`disk_per_stream` — omitting them would let a text rendition blow the cap while
+the metric looked healthy.
+
+`dir` is locked exclusively at startup. A second node using the same directory
+fails immediately rather than deleting a live peer's files, so cutover is
+stop-then-start: the draining process keeps the lock until it exits. Two
+instances on one machine therefore need distinct directories — including when
+`dir` is omitted and both would otherwise share the platform cache. Crash
+leftovers are reaped on the next open; a generation whose owner pid is still
+alive is left alone.
 
 ## Concurrency budgets
 
@@ -797,6 +812,16 @@ configuration.
 Two scrape paths either way: `/metrics` for totals, `/metrics/streams` for
 per-stream series. The scraper chooses, so unbounded cardinality is the
 caller's decision rather than a node-side flag.
+
+Retention depth is that per-stream scrape: configured `retain` versus the
+playlist duration actually named, plus bytes and cap per tier (`tier="memory"`
+then `tier="disk"`). Totals on `/metrics` include `rushls_retained_payload_bytes`,
+`rushls_retained_disk_bytes`, `rushls_retention_capacity_bytes` (same `tier`
+labels), `rushls_disk_spill_pending`, `rushls_disk_spills_failed_total`, and
+`rushls_retention_requested_seconds`. Idle streams still within `retain` are
+counted; a publisher leaving does not hide what viewers can still fetch.
+A full spill queue is when pending hits 32: the store sheds instead of
+spilling. Failed spills leave media in RAM.
 
 ## Secrets
 

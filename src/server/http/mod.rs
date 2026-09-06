@@ -178,7 +178,9 @@ fn router<P: Application>(
     // Left to the catch-all when disabled, so `/metrics` is an ordinary
     // unknown resource rather than a route that exists and refuses.
     if metrics.is_some() {
-        operator = operator.route("/metrics", any(metrics_probe::<P>));
+        operator = operator
+            .route("/metrics", any(metrics_totals::<P>))
+            .route("/metrics/streams", any(metrics_streams::<P>));
     }
 
     operator.merge(viewer).with_state(HttpState {
@@ -290,15 +292,32 @@ async fn readiness_probe<P: Application>(
     health_response(&method, service.readiness.is_ready())
 }
 
-async fn metrics_probe<P: Application>(
+async fn metrics_totals<P: Application>(
     State(service): State<HttpState<P>>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
+    metrics_probe(&service, &method, &headers, MetricsEndpoint::render)
+}
+
+async fn metrics_streams<P: Application>(
+    State(service): State<HttpState<P>>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    metrics_probe(&service, &method, &headers, MetricsEndpoint::render_streams)
+}
+
+fn metrics_probe(
+    service: &HttpState<impl Application>,
+    method: &Method,
+    headers: &HeaderMap,
+    body: fn(&MetricsEndpoint) -> String,
+) -> Response {
     match &service.metrics {
         // Unreachable: the route only exists when the endpoint does.
         None => StatusCode::NOT_FOUND.into_response(),
-        Some(metrics) => metrics_response(metrics, &method, &headers),
+        Some(metrics) => metrics_response(metrics, method, headers, body),
     }
 }
 
@@ -330,7 +349,12 @@ fn health_response(method: &Method, healthy: bool) -> Response {
         .into_response()
 }
 
-fn metrics_response(metrics: &MetricsEndpoint, method: &Method, headers: &HeaderMap) -> Response {
+fn metrics_response(
+    metrics: &MetricsEndpoint,
+    method: &Method,
+    headers: &HeaderMap,
+    body: fn(&MetricsEndpoint) -> String,
+) -> Response {
     if !matches!(*method, Method::GET | Method::HEAD) {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
@@ -359,7 +383,7 @@ fn metrics_response(metrics: &MetricsEndpoint, method: &Method, headers: &Header
             ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
-        metrics.render(),
+        body(metrics),
     )
         .into_response()
 }
@@ -505,7 +529,11 @@ fn into_http(
                 )),
                 RangeOutcome::Unsatisfiable => Err(StatusCode::RANGE_NOT_SATISFIABLE),
                 RangeOutcome::Satisfiable(range) => {
-                    let clipped = media.range(range.start, range.end);
+                    // Disk frames never belong in a Chunked body; the origin
+                    // loads them first. Failing closed beats a shifted 206.
+                    let clipped = media
+                        .range(range.start, range.end)
+                        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
                     Ok(with_vary(
                         with_etag(
                             media_response(

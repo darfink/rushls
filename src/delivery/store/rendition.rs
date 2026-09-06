@@ -13,7 +13,7 @@
 //! [`RetentionPolicy`] resolves all three; nothing here invents a deadline.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -34,8 +34,18 @@ use super::{
     RenditionView, RetentionPolicy, SegmentBody, SegmentId, StoreWriteError, StoredInitialization,
     StoredPart, StoredSegment, StoredSegmentKind,
     bitrate::BitrateTracker,
-    media::{segment_byte_len, segment_resource_bytes},
+    disk::{HeldBytes, SpillKind, SpillObject, SpillOutcome},
+    media::{segment_byte_len, segment_disk_bytes, segment_resource_bytes},
 };
+
+/// Whether parts of a released parent keep fetch grace or leave with it.
+#[derive(Clone, Copy)]
+enum PartFate {
+    /// Time-based `retain` trim: the URI stays fetchable until part grace.
+    Grace,
+    /// Byte/object pressure: the cap is only real if the payload leaves now.
+    Immediate,
+}
 
 /// A committed live edge and the channel that should announce it.
 ///
@@ -165,10 +175,21 @@ pub struct RenditionState {
     /// Downloadable segment resources, including entries no longer visible
     /// whose HLS availability deadline has not elapsed.
     segment_resources: HashMap<SegmentId, SegmentResource>,
-    /// Durable part-resource order. Hidden tags remain here while their
-    /// standalone grace period or parent segment still needs their payload.
+    /// Playlist-visible part ids, oldest first. Hidden tags leave this deque
+    /// so `hide_old_parts` never rescans them; their payloads stay on the
+    /// parent and in `part_resources` until the parent is released.
     part_order: VecDeque<PartId>,
+    /// Parts whose parent is gone, still fetchable until their own grace.
+    orphaned_parts: VecDeque<PartId>,
+    /// Hidden parents still mapped until time-based fetch grace elapses.
+    retired_segments: VecDeque<SegmentId>,
     part_resources: HashMap<PartId, PartResource>,
+    /// How many retained objects still name each publication.
+    ///
+    /// A set would drop the id when the first sibling was released; a count
+    /// keeps the anchor until the last one goes.
+    publication_refs: HashMap<u64, usize>,
+    spilling: HashSet<SegmentId>,
     /// At most one progressively published packaging segment per rendition.
     open_segment: Option<OpenSegment>,
     /// Payload bytes this rendition currently retains, kept incrementally so
@@ -179,6 +200,7 @@ pub struct RenditionState {
     /// bytes are already charged to the parts that compose it, so completing
     /// it changes nothing.
     retained_payload_bytes: usize,
+    retained_disk_bytes: usize,
     /// HLS numbering is independent from publisher-local packaging IDs and is
     /// never reset when a publisher reconnects.
     next_msn: u64,
@@ -240,9 +262,14 @@ impl RenditionState {
             published_segments: Arc::from([]),
             segment_resources: HashMap::new(),
             part_order: VecDeque::new(),
+            orphaned_parts: VecDeque::new(),
+            retired_segments: VecDeque::new(),
             part_resources: HashMap::new(),
+            publication_refs: HashMap::new(),
+            spilling: HashSet::new(),
             open_segment: None,
             retained_payload_bytes: 0,
+            retained_disk_bytes: 0,
             next_msn: 0,
             media_sequence: 0,
             discontinuity_sequence: 0,
@@ -270,14 +297,6 @@ impl RenditionState {
         self.edge_updates.subscribe()
     }
 
-    pub fn retained_parts(&self) -> usize {
-        self.part_resources.len()
-    }
-
-    pub fn retained_segments(&self) -> usize {
-        self.segment_resources.len()
-    }
-
     /// Fetches one retained segment resource, or `None` past its deadline.
     pub fn segment(&self, segment_id: SegmentId, now: Instant) -> Option<Arc<StoredSegment>> {
         fetchable(self.segment_resources.get(&segment_id), now)
@@ -293,13 +312,9 @@ impl RenditionState {
             .as_ref()
             .is_some_and(|open| open.publication == publication)
             || self
-                .segment_resources
-                .values()
-                .any(|resource| resource.segment.publication == publication)
-            || self
-                .part_resources
-                .values()
-                .any(|resource| resource.part.publication == publication)
+                .publication_refs
+                .get(&publication)
+                .is_some_and(|count| *count > 0)
     }
 
     fn snapshot(&self) -> RenditionSnapshot {
@@ -310,9 +325,8 @@ impl RenditionState {
         };
         let parts_visible_from = self
             .part_order
-            .iter()
-            .filter_map(|id| self.part_resources.get(id))
-            .find(|resource| resource.playlist_visible)
+            .front()
+            .and_then(|id| self.part_resources.get(id))
             .map(|resource| resource.part.cursor.msn);
         let open_segment = self.open_segment.as_ref().map(|open| {
             let mut open = open.clone();
@@ -366,18 +380,22 @@ impl RenditionState {
         )
     }
 
-    pub fn additional_bytes_for(&self, media: &PackagedMedia) -> Result<usize, StoreWriteError> {
+    pub fn additional_bytes_for(
+        &self,
+        media: &PackagedMedia,
+        gzip: Option<&Payload>,
+    ) -> Result<usize, StoreWriteError> {
         self.validate(media)?;
         Ok(match media {
             PackagedMedia::Initialization(segment) => {
                 if self.holds_current_initialization(segment) {
                     0
                 } else {
-                    segment.payload.len()
+                    memory_len(segment.payload.len(), gzip)
                 }
             }
-            PackagedMedia::Chunk(chunk) => chunk.payload.len(),
-            PackagedMedia::Segment(segment) => segment.payload.len(),
+            PackagedMedia::Chunk(chunk) => memory_len(chunk.payload.len(), gzip),
+            PackagedMedia::Segment(segment) => memory_len(segment.payload.len(), gzip),
             PackagedMedia::SegmentCompleted(_) => 0,
         })
     }
@@ -614,7 +632,7 @@ impl RenditionState {
         if self.holds_current_initialization(&segment) {
             return;
         }
-        let payload_bytes = segment.payload.len();
+        let payload_bytes = memory_len(segment.payload.len(), gzip.as_ref());
         self.issued_initializations = self.issued_initializations.saturating_add(1);
         let id = InitializationId(self.issued_initializations);
         self.current_initialization = Some(id);
@@ -638,7 +656,7 @@ impl RenditionState {
         retention: RetentionPolicy,
     ) {
         let config = self.require_config().expect("validated configuration");
-        let payload_bytes = chunk.payload.len();
+        let payload_bytes = memory_len(chunk.payload.len(), gzip.as_ref());
         let initialization = self
             .current_initialization
             .expect("validated initialization");
@@ -675,8 +693,8 @@ impl RenditionState {
             duration: chunk.duration,
             timebase: config.timebase,
             independent: chunk.independent,
-            payload: chunk.payload,
-            gzip,
+            payload: chunk.payload.into(),
+            gzip: gzip.map(Into::into),
         });
         open.duration = open.duration.saturating_add(chunk.duration);
         open.parts.push(Arc::clone(&part));
@@ -698,6 +716,7 @@ impl RenditionState {
                 parent_retained: false,
             },
         );
+        self.retain_publication(publication);
         self.retained_payload_bytes = self.retained_payload_bytes.saturating_add(payload_bytes);
         self.hide_old_parts(now, retention);
     }
@@ -765,8 +784,8 @@ impl RenditionState {
             timebase: config.timebase,
             independent: packaged.independent,
             discontinuity_before: self.opens_discontinuity(publication),
-            kind: StoredSegmentKind::Media(SegmentBody::Contiguous(packaged.payload)),
-            gzip,
+            kind: StoredSegmentKind::Media(SegmentBody::Contiguous(packaged.payload.into())),
+            gzip: gzip.map(Into::into),
         };
         self.last_parent_publication = Some(publication);
         self.commit_segment(
@@ -820,6 +839,7 @@ impl RenditionState {
 
     fn insert_segment(&mut self, segment: StoredSegment, now: Instant, retention: RetentionPolicy) {
         let id = segment.id;
+        let publication = segment.publication;
         let payload_bytes = segment_resource_bytes(&segment);
         self.visible_segments.push_back(id);
         self.segment_resources.insert(
@@ -833,6 +853,7 @@ impl RenditionState {
             },
         );
         self.retained_payload_bytes = self.retained_payload_bytes.saturating_add(payload_bytes);
+        self.retain_publication(publication);
 
         let segment_target = self.advertised_config.map_or(Duration::MAX, |config| {
             config
@@ -873,6 +894,7 @@ impl RenditionState {
             resource.visible = false;
             resource.expires_at =
                 retention.segment_fetch_deadline(resource.first_published_at, now, segment_target);
+            self.retired_segments.push_back(removed);
         }
         for id in &self.visible_segments {
             if let Some(resource) = self.segment_resources.get_mut(id) {
@@ -883,13 +905,7 @@ impl RenditionState {
         self.refresh_media_sequence();
         self.hide_old_parts(now, retention);
         self.sweep_expired(now);
-        self.published_segments = self
-            .visible_segments
-            .iter()
-            .filter_map(|id| self.segment_resources.get(id))
-            .map(|resource| Arc::clone(&resource.segment))
-            .collect::<Vec<_>>()
-            .into();
+        self.refresh_published_segments();
     }
 
     /// Whether a parent segment created for `publication` follows a splice.
@@ -929,11 +945,15 @@ impl RenditionState {
             return;
         };
         self.bitrate.break_contiguity();
+        let msn = open.msn;
+        self.unpick_visible_parts_from_back(msn);
         for part in &open.parts {
             if let Some(resource) = self.part_resources.get_mut(&part.id) {
                 resource.playlist_visible = false;
+                resource.parent_retained = false;
                 resource.expires_at = retention.part_fetch_deadline(now, resource.segment_target);
             }
+            self.orphaned_parts.push_back(part.id);
         }
         let duration = config.segment_target.get();
         let segment = StoredSegment {
@@ -959,157 +979,294 @@ impl RenditionState {
 
     fn hide_old_parts(&mut self, now: Instant, retention: RetentionPolicy) {
         let live_position = self.current_live_position();
+        let open_msn = self.open_segment.as_ref().map(|open| open.msn);
 
-        // A completed segment's PART tags are one description of that parent:
-        // hiding a prefix makes its advertised start and duration contradict
-        // EXTINF. Age the parent from its last part so the whole description
-        // enters and leaves the playlist atomically.
-        let hide_through = {
-            let expired = |last_part: PartId| {
-                let resource = self
-                    .part_resources
-                    .get(&last_part)
-                    .expect("visible part was read from this map");
-                let maximum_age = retention.part_tag_retention_for(resource.segment_target);
-                live_position.saturating_sub(resource.playlist_end) > maximum_age
-            };
-            let mut current = None::<(Msn, PartId)>;
-            let mut hidden = None;
-            for id in &self.part_order {
-                let Some(resource) = self
-                    .part_resources
-                    .get(id)
-                    .filter(|resource| resource.playlist_visible)
-                else {
-                    continue;
-                };
-                let msn = resource.part.cursor.msn;
-                if let Some((previous, last_part)) = current
-                    && previous != msn
-                {
-                    if !expired(last_part) {
-                        current = None;
-                        break;
-                    }
-                    hidden = Some(previous);
-                }
-                current = Some((msn, *id));
-            }
-            if let Some((msn, last_part)) = current
-                && expired(last_part)
-            {
-                hidden = Some(msn);
-            }
-            hidden
-        };
-
-        let Some(hide_through) = hide_through else {
-            return;
-        };
-        for id in &self.part_order {
-            let Some(resource) = self.part_resources.get_mut(id) else {
+        // `part_order` is only playlist-visible tags. Age whole completed
+        // parents from the front; stop at the open segment or the first parent
+        // still inside the part-tag window. Already-hidden tags are not here.
+        while let Some(front_id) = self.part_order.front().copied() {
+            let Some(front) = self.part_resources.get(&front_id) else {
+                self.part_order.pop_front();
                 continue;
             };
-            if resource.part.cursor.msn > hide_through {
+            if open_msn == Some(front.part.cursor.msn) {
                 break;
             }
-            if !resource.playlist_visible {
-                continue;
+            let msn = front.part.cursor.msn;
+            let mut last_part = front_id;
+            for id in &self.part_order {
+                let Some(resource) = self.part_resources.get(id) else {
+                    continue;
+                };
+                if resource.part.cursor.msn != msn {
+                    break;
+                }
+                last_part = *id;
             }
-            resource.playlist_visible = false;
-            resource.expires_at = retention.part_fetch_deadline(now, resource.segment_target);
+            let last = self
+                .part_resources
+                .get(&last_part)
+                .expect("the prefix part was just read");
+            let maximum_age = retention.part_tag_retention_for(last.segment_target);
+            if live_position.saturating_sub(last.playlist_end) <= maximum_age {
+                break;
+            }
+            while self.part_order.front().is_some_and(|id| {
+                self.part_resources
+                    .get(id)
+                    .is_some_and(|resource| resource.part.cursor.msn == msn)
+            }) {
+                let id = self.part_order.pop_front().expect("front exists");
+                if let Some(resource) = self.part_resources.get_mut(&id) {
+                    resource.playlist_visible = false;
+                    resource.expires_at =
+                        retention.part_fetch_deadline(now, resource.segment_target);
+                }
+            }
         }
     }
 
-    /// When the oldest sheddable segment was published, if there is one.
+    /// When the oldest capacity-evictable segment was published, if there is one.
     ///
-    /// Lets the stream pick the globally oldest across renditions before
-    /// asking any one of them to give something up.
+    /// Retired (already hidden) parents first, then the oldest visible parent
+    /// only when hiding it would still leave a legal live playlist.
     pub fn oldest_shed_candidate(&self) -> Option<Instant> {
-        self.segment_resources
-            .values()
-            .filter(|resource| !resource.visible)
-            .map(|resource| resource.first_published_at)
-            .min()
+        if let Some(id) = self.retired_segments.front() {
+            return self
+                .segment_resources
+                .get(id)
+                .map(|resource| resource.first_published_at);
+        }
+        if self.can_hide_oldest_visible() {
+            return self
+                .visible_segments
+                .front()
+                .and_then(|id| self.segment_resources.get(id))
+                .map(|resource| resource.first_published_at);
+        }
+        None
     }
 
-    /// Retires the oldest invisible segment, releasing whatever it held.
-    ///
-    /// Returns whether anything was reclaimed. Only segments that have already
-    /// left the playlist window are eligible: a visible one is named by a
-    /// playlist a viewer may be holding, and dropping it would produce a 404
-    /// mid-playback rather than a bounded loss of history.
-    ///
-    /// This is what makes a byte or object budget a *retention* bound rather
-    /// than a failure mode. Refusing the write instead — the previous
-    /// behaviour — ended the publisher's session, which at a long `retain` is
-    /// the ordinary case rather than the edge one.
-    pub fn shed_oldest(&mut self) -> bool {
-        let oldest = self
-            .segment_resources
-            .iter()
-            .filter(|(_, resource)| !resource.visible)
-            .min_by_key(|(id, resource)| (resource.first_published_at, **id))
-            .map(|(id, _)| *id);
-        let Some(oldest) = oldest else {
+    fn can_hide_oldest_visible(&self) -> bool {
+        if self.visible_segments.len() <= MINIMUM_PLAYLIST_SEGMENTS {
+            return false;
+        }
+        let Some(front) = self.visible_segments.front() else {
             return false;
         };
-        // Expiring it now routes the release through the one path that knows
-        // how to unpick a chunked segment's parts, rather than duplicating
-        // that accounting here.
-        if let Some(resource) = self.segment_resources.get_mut(&oldest) {
+        let Some(resource) = self.segment_resources.get(front) else {
+            return false;
+        };
+        let removed = resource
+            .segment
+            .timebase
+            .ticks_to_duration(resource.segment.duration);
+        let remaining = self.visible_playlist_duration().saturating_sub(removed);
+        remaining >= self.protocol_playlist_floor()
+    }
+
+    /// Three target durations, the HLS live-playlist floor.
+    ///
+    /// Distinct from [`RetentionPolicy::minimum_playlist_duration_for`], which
+    /// is `retain` itself when that is longer. Capacity eviction must be able
+    /// to shrink *below* `retain`; that method is the time-based trim.
+    fn protocol_playlist_floor(&self) -> Duration {
+        let target = self.advertised_config.map_or(Duration::MAX, |config| {
+            config
+                .timebase
+                .ticks_to_duration(config.segment_target.get())
+        });
+        target.saturating_mul(u32::try_from(MINIMUM_PLAYLIST_SEGMENTS).unwrap_or(3))
+    }
+
+    /// Drops the oldest capacity victim: a retired parent, or a visible one
+    /// above the playlist floor.
+    ///
+    /// Capacity is not `retain` trim. The parent and its parts leave immediately,
+    /// so the byte budget actually falls. Returns whether bytes or object counts
+    /// decreased; a hide that frees nothing is not progress for the shed loop.
+    pub fn shed_oldest(&mut self) -> bool {
+        let before_bytes = self.retained_payload_bytes;
+        let before_disk = self.retained_disk_bytes;
+        let before_parts = self.part_resources.len();
+        let before_segments = self.segment_resources.len();
+
+        let id = if let Some(id) = self.retired_segments.pop_front() {
+            id
+        } else if self.can_hide_oldest_visible() {
+            self.hide_oldest_visible_for_capacity()
+        } else {
+            return false;
+        };
+        self.release_segment(id, PartFate::Immediate);
+        self.forget_unreachable_initializations();
+        self.refresh_published_segments();
+
+        self.retained_payload_bytes < before_bytes
+            || self.retained_disk_bytes < before_disk
+            || self.part_resources.len() < before_parts
+            || self.segment_resources.len() < before_segments
+    }
+
+    fn hide_oldest_visible_for_capacity(&mut self) -> SegmentId {
+        let id = self
+            .visible_segments
+            .pop_front()
+            .expect("can_hide_oldest_visible requires a visible parent");
+        if let Some(resource) = self.segment_resources.get_mut(&id) {
+            if resource.segment.discontinuity_before {
+                self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
+            }
+            resource.visible = false;
             resource.expires_at = Some(Instant::now());
         }
-        self.sweep_expired(Instant::now());
-        self.forget_unreachable_initializations();
-        true
+        self.refresh_media_sequence();
+        id
     }
 
     pub fn sweep_expired(&mut self, now: Instant) {
-        let part_resources = &mut self.part_resources;
-        self.segment_resources.retain(|_, resource| {
-            let expired = !resource.visible
-                && resource
-                    .expires_at
-                    .is_some_and(|expires_at| now >= expires_at);
-            if expired {
-                // A chunked segment's bytes belong to its parts and are
-                // released with them; only a contiguous segment holds bytes
-                // of its own.
-                self.retained_payload_bytes = self
-                    .retained_payload_bytes
-                    .saturating_sub(segment_resource_bytes(&resource.segment));
-                if let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) =
-                    &resource.segment.kind
-                {
-                    for part in parts.iter() {
-                        if let Some(part_resource) = part_resources.get_mut(&part.id) {
-                            part_resource.parent_retained = false;
-                        }
-                    }
+        while let Some(id) = self.retired_segments.front().copied() {
+            let Some(resource) = self.segment_resources.get(&id) else {
+                self.retired_segments.pop_front();
+                continue;
+            };
+            if resource
+                .expires_at
+                .is_none_or(|expires_at| now < expires_at)
+            {
+                break;
+            }
+            self.retired_segments.pop_front();
+            self.release_segment(id, PartFate::Grace);
+        }
+
+        while let Some(id) = self.orphaned_parts.front().copied() {
+            let Some(resource) = self.part_resources.get(&id) else {
+                self.orphaned_parts.pop_front();
+                continue;
+            };
+            if resource
+                .expires_at
+                .is_none_or(|expires_at| now < expires_at)
+            {
+                break;
+            }
+            self.orphaned_parts.pop_front();
+            self.drop_part(id);
+        }
+    }
+
+    fn refresh_published_segments(&mut self) {
+        self.published_segments = self
+            .visible_segments
+            .iter()
+            .filter_map(|id| self.segment_resources.get(id))
+            .map(|resource| Arc::clone(&resource.segment))
+            .collect::<Vec<_>>()
+            .into();
+    }
+
+    fn retain_publication(&mut self, publication: u64) {
+        self.publication_refs
+            .entry(publication)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+    }
+
+    fn release_publication(&mut self, publication: u64) {
+        let Some(count) = self.publication_refs.get_mut(&publication) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.publication_refs.remove(&publication);
+        }
+    }
+
+    fn unpick_visible_parts(&mut self, msn: Msn) {
+        while self.part_order.front().is_some_and(|id| {
+            self.part_resources
+                .get(id)
+                .is_some_and(|resource| resource.part.cursor.msn == msn)
+        }) {
+            self.part_order.pop_front();
+        }
+    }
+
+    fn unpick_visible_parts_from_back(&mut self, msn: Msn) {
+        while self.part_order.back().is_some_and(|id| {
+            self.part_resources
+                .get(id)
+                .is_some_and(|resource| resource.part.cursor.msn == msn)
+        }) {
+            self.part_order.pop_back();
+        }
+    }
+
+    fn release_segment(&mut self, id: SegmentId, parts: PartFate) {
+        let Some(resource) = self.segment_resources.remove(&id) else {
+            return;
+        };
+        self.retained_payload_bytes = self
+            .retained_payload_bytes
+            .saturating_sub(segment_resource_bytes(&resource.segment));
+        self.retained_disk_bytes = self
+            .retained_disk_bytes
+            .saturating_sub(segment_disk_bytes(&resource.segment));
+        unlink_segment_files(&resource.segment);
+        self.spilling.remove(&id);
+        self.release_publication(resource.segment.publication);
+        self.unpick_visible_parts(resource.segment.msn);
+        if let StoredSegmentKind::Media(SegmentBody::Chunked(chunk_parts)) = &resource.segment.kind
+        {
+            for part in chunk_parts.iter() {
+                match parts {
+                    PartFate::Immediate => self.drop_part(part.id),
+                    PartFate::Grace => self.orphan_part(part.id),
                 }
             }
-            !expired
-        });
+        }
+    }
 
-        self.part_order.retain(|id| {
-            let remove = self.part_resources.get(id).is_some_and(|resource| {
-                !resource.parent_retained
-                    && resource
-                        .expires_at
-                        .is_some_and(|expires_at| now >= expires_at)
-            });
-            if remove {
-                let resource = self
-                    .part_resources
-                    .remove(id)
-                    .expect("the part was inspected above");
-                self.retained_payload_bytes = self
-                    .retained_payload_bytes
-                    .saturating_sub(resource.part.payload.len());
+    fn orphan_part(&mut self, id: PartId) {
+        {
+            let Some(resource) = self.part_resources.get_mut(&id) else {
+                return;
+            };
+            resource.parent_retained = false;
+            resource.playlist_visible = false;
+            if resource.expires_at.is_none() {
+                resource.expires_at = Some(Instant::now());
             }
-            !remove
-        });
+        }
+        self.orphaned_parts.push_back(id);
+    }
+
+    fn drop_part(&mut self, id: PartId) {
+        let Some(resource) = self.part_resources.remove(&id) else {
+            return;
+        };
+        self.retained_payload_bytes = self.retained_payload_bytes.saturating_sub(
+            resource.part.payload.memory_bytes().saturating_add(
+                resource
+                    .part
+                    .gzip
+                    .as_ref()
+                    .map_or(0, HeldBytes::memory_bytes),
+            ),
+        );
+        self.retained_disk_bytes = self.retained_disk_bytes.saturating_sub(
+            resource
+                .part
+                .payload
+                .disk_bytes()
+                .saturating_add(resource.part.gzip.as_ref().map_or(0, HeldBytes::disk_bytes)),
+        );
+        resource.part.payload.unlink_disk();
+        if let Some(gzip) = &resource.part.gzip {
+            gzip.unlink_disk();
+        }
+        self.release_publication(resource.part.publication);
     }
 
     fn visible_playlist_duration(&self) -> Duration {
@@ -1142,6 +1299,24 @@ impl RenditionState {
         self.retained_payload_bytes
     }
 
+    pub fn retained_disk_bytes(&self) -> usize {
+        self.retained_disk_bytes
+    }
+
+    pub fn memory_resident_parts(&self) -> usize {
+        self.part_resources
+            .values()
+            .filter(|resource| resource.part.payload.is_memory())
+            .count()
+    }
+
+    pub fn memory_resident_segments(&self) -> usize {
+        self.segment_resources
+            .values()
+            .filter(|resource| segment_holds_memory(&resource.segment))
+            .count()
+    }
+
     pub fn forget_unreachable_initializations(&mut self) {
         // A replaced initialization can disappear only after every segment,
         // standalone part, and open segment that names it has gone. The
@@ -1158,7 +1333,7 @@ impl RenditionState {
             .initializations
             .iter()
             .filter(|held| !self.initialization_is_reachable(held.id))
-            .map(|held| held.payload.len())
+            .map(|held| memory_len(held.payload.len(), held.gzip.as_ref()))
             .sum();
         let retained: Vec<_> = self
             .initializations
@@ -1168,6 +1343,150 @@ impl RenditionState {
             .collect();
         self.initializations = retained.into();
         self.retained_payload_bytes = self.retained_payload_bytes.saturating_sub(removed_bytes);
+    }
+
+    pub fn oldest_memory_spill_candidate(&self) -> Option<Instant> {
+        self.retired_segments
+            .iter()
+            .chain(self.visible_segments.iter())
+            .filter(|id| !self.spilling.contains(id))
+            .find_map(|id| {
+                let resource = self.segment_resources.get(id)?;
+                segment_holds_memory(&resource.segment).then_some(resource.first_published_at)
+            })
+    }
+
+    pub fn prepare_spill(&mut self) -> Option<(SegmentId, Vec<SpillObject>)> {
+        let id = *self
+            .retired_segments
+            .iter()
+            .chain(self.visible_segments.iter())
+            .find(|id| {
+                !self.spilling.contains(id)
+                    && self
+                        .segment_resources
+                        .get(*id)
+                        .is_some_and(|resource| segment_holds_memory(&resource.segment))
+            })?;
+        let resource = self.segment_resources.get(&id)?;
+        let mut objects = Vec::new();
+        match &resource.segment.kind {
+            StoredSegmentKind::Media(SegmentBody::Contiguous(HeldBytes::Memory(payload))) => {
+                objects.push(SpillObject {
+                    kind: SpillKind::Segment,
+                    payload: payload.clone(),
+                    gzip: resource
+                        .segment
+                        .gzip
+                        .as_ref()
+                        .and_then(HeldBytes::as_memory)
+                        .cloned(),
+                });
+            }
+            StoredSegmentKind::Media(SegmentBody::Chunked(parts)) => {
+                for part in parts.iter() {
+                    let Some(payload) = part.payload.as_memory() else {
+                        continue;
+                    };
+                    objects.push(SpillObject {
+                        kind: SpillKind::Part(part.id),
+                        payload: payload.clone(),
+                        gzip: part.gzip.as_ref().and_then(HeldBytes::as_memory).cloned(),
+                    });
+                }
+            }
+            StoredSegmentKind::Media(SegmentBody::Contiguous(HeldBytes::Disk(_)))
+            | StoredSegmentKind::Gap => return None,
+        }
+        if objects.is_empty() {
+            return None;
+        }
+        self.spilling.insert(id);
+        Some((id, objects))
+    }
+
+    pub fn abort_spill(&mut self, segment: SegmentId) {
+        self.spilling.remove(&segment);
+    }
+
+    pub fn finish_spill(&mut self, outcome: &SpillOutcome) -> bool {
+        if !self.spilling.remove(&outcome.segment) {
+            return false;
+        }
+        if !self.segment_resources.contains_key(&outcome.segment) {
+            return false;
+        }
+        for object in &outcome.objects {
+            match object.kind {
+                SpillKind::Segment => self.spill_contiguous(outcome.segment, object),
+                SpillKind::Part(id) => self.spill_part(id, object),
+            }
+        }
+        self.relink_chunked_parent(outcome.segment);
+        self.refresh_published_segments();
+        true
+    }
+
+    fn spill_contiguous(&mut self, segment: SegmentId, object: &super::disk::SpilledObject) {
+        let Some(resource) = self.segment_resources.get_mut(&segment) else {
+            return;
+        };
+        let mut stored = (*resource.segment).clone();
+        if let StoredSegmentKind::Media(SegmentBody::Contiguous(held)) = &mut stored.kind {
+            let memory = held.memory_bytes();
+            self.retained_payload_bytes = self.retained_payload_bytes.saturating_sub(memory);
+            self.retained_disk_bytes = self.retained_disk_bytes.saturating_add(object.payload.len);
+            *held = HeldBytes::Disk(object.payload.clone());
+        }
+        if let Some(gzip) = &object.gzip {
+            let prior = stored.gzip.as_ref().map_or(0, HeldBytes::memory_bytes);
+            self.retained_payload_bytes = self.retained_payload_bytes.saturating_sub(prior);
+            self.retained_disk_bytes = self.retained_disk_bytes.saturating_add(gzip.len);
+            stored.gzip = Some(HeldBytes::Disk(gzip.clone()));
+        }
+        resource.segment = Arc::new(stored);
+    }
+
+    fn spill_part(&mut self, id: PartId, object: &super::disk::SpilledObject) {
+        let Some(part_resource) = self.part_resources.get_mut(&id) else {
+            return;
+        };
+        let mut part = (*part_resource.part).clone();
+        let memory = part
+            .payload
+            .memory_bytes()
+            .saturating_add(part.gzip.as_ref().map_or(0, HeldBytes::memory_bytes));
+        self.retained_payload_bytes = self.retained_payload_bytes.saturating_sub(memory);
+        self.retained_disk_bytes = self
+            .retained_disk_bytes
+            .saturating_add(object.payload.len + object.gzip.as_ref().map_or(0, |gzip| gzip.len));
+        part.payload = HeldBytes::Disk(object.payload.clone());
+        part.gzip = object.gzip.clone().map(HeldBytes::Disk);
+        part_resource.part = Arc::new(part);
+    }
+
+    fn relink_chunked_parent(&mut self, id: SegmentId) {
+        let Some(resource) = self.segment_resources.get(&id) else {
+            return;
+        };
+        let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) = &resource.segment.kind else {
+            return;
+        };
+        let part_ids: Vec<_> = parts.iter().map(|part| part.id).collect();
+        let parts: Vec<_> = part_ids
+            .into_iter()
+            .filter_map(|part_id| {
+                self.part_resources
+                    .get(&part_id)
+                    .map(|resource| Arc::clone(&resource.part))
+            })
+            .collect();
+        let Some(resource) = self.segment_resources.get_mut(&id) else {
+            return;
+        };
+        let mut stored = (*resource.segment).clone();
+        stored.kind = StoredSegmentKind::Media(SegmentBody::Chunked(parts.into()));
+        resource.segment = Arc::new(stored);
     }
 
     fn initialization_is_reachable(&self, id: InitializationId) -> bool {
@@ -1192,16 +1511,11 @@ impl RenditionState {
             .back()
             .and_then(|id| self.segment_resources.get(id))
             .map(|resource| (resource.segment.msn, resource.segment.id));
-        let last_part = self
-            .part_order
-            .iter()
-            .rev()
-            .find_map(|id| {
-                self.part_resources
-                    .get(id)
-                    .filter(|resource| resource.playlist_visible)
-            })
-            .map(|resource| (resource.part.cursor, resource.part.id));
+        let last_part = self.part_order.back().and_then(|id| {
+            self.part_resources
+                .get(id)
+                .map(|resource| (resource.part.cursor, resource.part.id))
+        });
         let next_part_id = (!ended)
             .then_some(self.active_config)
             .flatten()
@@ -1216,5 +1530,29 @@ impl RenditionState {
         };
         self.live_edge = next;
         next
+    }
+}
+
+fn memory_len(payload_len: usize, gzip: Option<&Payload>) -> usize {
+    payload_len.saturating_add(gzip.map_or(0, Payload::len))
+}
+
+fn segment_holds_memory(segment: &StoredSegment) -> bool {
+    match &segment.kind {
+        StoredSegmentKind::Media(SegmentBody::Contiguous(held)) => held.is_memory(),
+        StoredSegmentKind::Media(SegmentBody::Chunked(parts)) => {
+            parts.iter().any(|part| part.payload.is_memory())
+        }
+        StoredSegmentKind::Gap => false,
+    }
+}
+
+fn unlink_segment_files(segment: &StoredSegment) {
+    match &segment.kind {
+        StoredSegmentKind::Media(SegmentBody::Contiguous(held)) => held.unlink_disk(),
+        StoredSegmentKind::Media(SegmentBody::Chunked(_)) | StoredSegmentKind::Gap => {}
+    }
+    if let Some(gzip) = &segment.gzip {
+        gzip.unlink_disk();
     }
 }

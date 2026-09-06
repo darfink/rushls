@@ -43,6 +43,7 @@ use crate::{
 mod bitrate;
 mod catalog;
 mod contract;
+mod disk;
 mod error;
 mod ids;
 mod media;
@@ -54,12 +55,14 @@ mod stream;
 mod tests;
 
 use catalog::RenditionView;
+use disk::DiskTier;
 
 pub use catalog::{
     PublicationAnchor, RenditionCatalogEntry, ResolvedPresentation, ResolvedRenditionGroup,
     StreamSnapshot,
 };
 pub use contract::PlaylistContract;
+pub use disk::{DiskError, DiskLimits, DiskRef, HeldBytes};
 pub use error::{StoreFull, StoreWriteError};
 pub use ids::{InitializationId, Msn, PartCursor, PartId, PartIndex, SegmentId};
 pub use media::{
@@ -68,16 +71,19 @@ pub use media::{
     StoredSegment, StoredSegmentKind,
 };
 pub use retention::{
-    DurationRule, MINIMUM_PLAYLIST_SEGMENTS, RetentionPolicy, TargetDurationMultiple,
+    DurationRule, MINIMUM_PLAYLIST_SEGMENTS, RetentionDepth, RetentionPolicy, RetentionTier,
+    TargetDurationMultiple,
 };
 pub use stream::LiveStream;
 
 /// Process-wide bounds and lifecycle policy for [`StreamStore`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreLimits {
     pub maximum_streams: usize,
     /// Cohesive HLS retention and capacity policy applied to each stream.
     pub retention: RetentionPolicy,
+    /// Overflow directory and per-stream byte cap, or memory-only.
+    pub disk: Option<DiskLimits>,
 }
 
 impl StoreLimits {
@@ -98,6 +104,7 @@ impl Default for StoreLimits {
         Self {
             maximum_streams: 1_024,
             retention: RetentionPolicy::default(),
+            disk: None,
         }
     }
 }
@@ -120,6 +127,7 @@ pub struct StreamStore {
     streams: Arc<ArcSwap<HashMap<StreamId, Arc<LiveStream>>>>,
     mutations: Arc<Mutex<()>>,
     limits: StoreLimits,
+    disk: Option<Arc<DiskTier>>,
 }
 
 impl fmt::Debug for StreamStore {
@@ -139,15 +147,28 @@ impl Default for StreamStore {
 
 impl StreamStore {
     pub fn new(limits: StoreLimits) -> Self {
-        Self {
+        Self::try_new(limits).expect("disk tier is only opened when configured")
+    }
+
+    pub fn try_new(limits: StoreLimits) -> Result<Self, DiskError> {
+        let disk = match &limits.disk {
+            Some(disk) => Some(DiskTier::open(disk)?),
+            None => None,
+        };
+        Ok(Self {
             streams: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             mutations: Arc::new(Mutex::new(())),
             limits,
-        }
+            disk,
+        })
     }
 
-    pub fn limits(&self) -> StoreLimits {
-        self.limits
+    pub(crate) fn disk(&self) -> Option<&Arc<DiskTier>> {
+        self.disk.as_ref()
+    }
+
+    pub fn limits(&self) -> &StoreLimits {
+        &self.limits
     }
 
     /// Takes the write lease on a stream, creating it if nobody has yet.
@@ -177,7 +198,12 @@ impl StreamStore {
                     maximum: self.limits.maximum_streams,
                 });
             }
-            let live = Arc::new(LiveStream::new(self.limits.retention));
+            let live = Arc::new(LiveStream::new(
+                stream.clone(),
+                self.limits.retention,
+                self.disk.clone(),
+            ));
+            live.attach_handle(Arc::downgrade(&live));
             let mut next = (*current).clone();
             next.insert(stream.clone(), Arc::clone(&live));
             self.streams.store(Arc::new(next));
@@ -239,6 +265,18 @@ impl StreamStore {
             .count()
     }
 
+    /// Every retained stream, including idle ones still within `retain`.
+    ///
+    /// Idle streams are what a viewer can still fetch after the publisher
+    /// left, so retention depth has to count them.
+    pub fn live_streams(&self) -> Vec<(StreamId, Arc<LiveStream>)> {
+        self.streams
+            .load()
+            .iter()
+            .map(|(id, live)| (id.clone(), Arc::clone(live)))
+            .collect()
+    }
+
     /// Performs the store's periodic expiry and retirement work.
     ///
     /// The server should call this from one maintenance task. Cleanup is not
@@ -262,6 +300,9 @@ impl StreamStore {
                 // that never served anything was never available to lose.
                 if live.was_announced() {
                     changed.retired.push(stream.clone());
+                }
+                if let Some(disk) = &self.disk {
+                    disk.remove_stream(stream, live.disk_epoch());
                 }
                 next.get_or_insert_with(|| (*current).clone())
                     .remove(stream);

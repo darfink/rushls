@@ -705,14 +705,59 @@ fn keys_for_unbuilt_features_are_refused_by_name() -> Result<(), Box<dyn Error>>
     for configuration in [
         // Playback authorization.
         "[auth.playback]\nsecret = \"shh\"\n",
-        // The disk tier.
-        "[capacity]\ndisk_per_stream = \"8GiB\"\n",
         // Mutual TLS to the admission service.
         "[auth.publish]\nurl = \"http://auth\"\nclient_certificate = \"/x.pem\"\n",
         // Payload-carrying hooks.
         "[hook.archive]\nurl = \"http://archive\"\nevents = [\"session.started\"]\npayload = true\n",
         // The local archive.
         "[record]\ndir = \"/archive\"\n",
+    ] {
+        assert!(
+            resolve_toml(configuration)?.is_err(),
+            "expected a startup error for:\n{configuration}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn disk_tier_defaults_the_directory_and_refuses_a_path_without_a_cap() -> Result<(), Box<dyn Error>>
+{
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/rushls-disk-config-test");
+    let both = format!(
+        "[capacity]\ndisk_per_stream = \"8GiB\"\ndir = \"{}\"\n",
+        dir.display()
+    );
+    let config = resolve_toml(&both)??;
+    let disk = config
+        .node
+        .store
+        .disk
+        .as_ref()
+        .ok_or("disk tier should be configured")?;
+    assert_eq!(disk.maximum_payload_bytes, 8 * 1024 * 1024 * 1024_usize);
+    assert_eq!(disk.directory, dir);
+
+    let defaulted = resolve_toml("[capacity]\ndisk_per_stream = \"8GiB\"\n")??;
+    let defaulted = defaulted
+        .node
+        .store
+        .disk
+        .as_ref()
+        .ok_or("disk_per_stream alone should use the cache directory")?;
+    assert_eq!(
+        defaulted.maximum_payload_bytes,
+        8 * 1024 * 1024 * 1024_usize
+    );
+    assert!(
+        super::paths::is_under_cache_dir(&defaulted.directory),
+        "default overflow is the platform cache, not a required dir key: {}",
+        defaulted.directory.display()
+    );
+
+    for configuration in [
+        "[capacity]\ndir = \"/var/lib/rushls\"\n",
+        "[capacity]\ndisk_per_stream = \"0\"\ndir = \"/var/lib/rushls\"\n",
     ] {
         assert!(
             resolve_toml(configuration)?.is_err(),

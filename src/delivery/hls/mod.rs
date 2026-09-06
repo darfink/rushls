@@ -14,9 +14,9 @@ pub use crate::delivery::store::{
     DurationRule, InitializationId, LiveStream, Msn, OpenSegment, PartCursor, PartId, PartIndex,
     PlaylistContract, PublicationAnchor, RenditionBandwidth, RenditionBitrateStatistics,
     RenditionCatalogEntry, RenditionLiveEdge, RenditionSnapshot, ResolvedPresentation,
-    ResolvedRenditionGroup, RetentionPolicy, SegmentBody, SegmentId, StoreFull, StoreLimits,
-    StoreWriteError, StoredInitialization, StoredPart, StoredSegment, StoredSegmentKind,
-    StreamLease, StreamSnapshot, StreamStore, TargetDurationMultiple,
+    ResolvedRenditionGroup, RetentionDepth, RetentionPolicy, RetentionTier, SegmentBody, SegmentId,
+    StoreFull, StoreLimits, StoreWriteError, StoredInitialization, StoredPart, StoredSegment,
+    StoredSegmentKind, StreamLease, StreamSnapshot, StreamStore, TargetDurationMultiple,
 };
 pub use publisher::{
     HlsError, HlsPublisher, PublishOutcome, PublisherFactory, StorePublisherFactory,
