@@ -36,8 +36,8 @@ use crate::{
 };
 
 use super::{
-    AtCapacity, ExecutionError, HealthPolicy, PendingPermit, PendingPublishers,
-    Registry, RegistryError, Services, SessionConfig, SessionError, SessionOutcome, StopReason,
+    AtCapacity, ExecutionError, HealthPolicy, PendingPermit, PendingPublishers, Registry,
+    RegistryError, Services, SessionConfig, SessionError, SessionOutcome, StopReason,
     SupervisionError, SupervisionPolicy, run_session,
 };
 

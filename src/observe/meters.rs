@@ -423,8 +423,8 @@ impl LivenessMark {
     /// The stored value is biased by one so that zero — the initial state —
     /// unambiguously means never, without needing a second flag to say so.
     fn mark(&self, active_elapsed: Duration) {
-        let nanos =
-            u64::try_from(active_elapsed.as_nanos().min(u128::from(u64::MAX - 1))).unwrap_or(u64::MAX);
+        let nanos = u64::try_from(active_elapsed.as_nanos().min(u128::from(u64::MAX - 1)))
+            .unwrap_or(u64::MAX);
         self.0.store(nanos + 1, Ordering::Relaxed);
     }
 
@@ -520,7 +520,8 @@ impl DeliveryMeters for SessionCounters {
         add(&self.process.counters.parts_published, parts);
         add(&self.process.counters.segments_published, segments);
         if parts > 0 || segments > 0 {
-            self.publication_seen.mark(self.active_elapsed(Instant::now()));
+            self.publication_seen
+                .mark(self.active_elapsed(Instant::now()));
         }
     }
 }

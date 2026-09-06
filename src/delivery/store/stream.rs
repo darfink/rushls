@@ -675,7 +675,9 @@ impl StreamState {
             .renditions
             .iter()
             .enumerate()
-            .filter_map(|(index, rendition)| rendition.oldest_shed_candidate().map(|at| (at, index)))
+            .filter_map(|(index, rendition)| {
+                rendition.oldest_shed_candidate().map(|at| (at, index))
+            })
             .min()
             .map(|(_, index)| index)
         else {

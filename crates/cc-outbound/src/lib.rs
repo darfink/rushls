@@ -27,8 +27,8 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use rustls::pki_types::CertificateDer;
 use rustls::client::ResolvesClientCert;
+use rustls::pki_types::CertificateDer;
 use thiserror::Error;
 
 /// A validated destination.
@@ -274,7 +274,6 @@ impl HttpClient {
             config,
         })
     }
-
 
     /// Builds a client trusting the platform's certificate store.
     ///

@@ -511,14 +511,14 @@ impl Node {
         // the log immediately above the certificate error that stopped the
         // process from ever serving.
         if let Some(listener) = https_listener {
-            let settings = self
-                .config
-                .http
-                .tls
-                .clone()
-                .ok_or(RuntimeError::InvalidConfiguration(
-                    "an HTTPS listener needs a certificate and key",
-                ))?;
+            let settings =
+                self.config
+                    .http
+                    .tls
+                    .clone()
+                    .ok_or(RuntimeError::InvalidConfiguration(
+                        "an HTTPS listener needs a certificate and key",
+                    ))?;
             let listener = http::bind_tls(
                 listener,
                 settings,

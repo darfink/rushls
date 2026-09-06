@@ -17,11 +17,11 @@ pub mod avformat;
 pub mod transport;
 
 pub use caption::{CaptionObservation, H264CaptionDetector};
-pub use memory::PipelineMemory;
 pub use limits::{
     BatchUnit, BoundedBatch, BoundedPacketBatch, DensityUnit, InputLimits, LimitError,
     PacketBatchStats,
 };
+pub use memory::PipelineMemory;
 pub use packet::{
     DiscoveryLimits, DiscoveryProblem, DiscoveryReport, InputState, Packet, PacketSource,
     SourceError,

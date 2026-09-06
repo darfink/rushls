@@ -84,17 +84,18 @@ impl HttpAuthenticator {
         if allowed.stream_id.trim().is_empty() {
             return Err(service("the response named an empty stream"));
         }
-        let policy = match allowed.policy.as_deref() {
-            // Naming nothing is the common case and takes `[accept]` itself.
-            None => &self.config.default,
-            // Fails closed rather than falling back to the default: a service
-            // naming a policy this node does not have is either misconfigured
-            // or looking at a different version of the configuration, and
-            // quietly substituting a policy would apply limits nobody chose.
-            Some(name) => self.config.policies.get(name).ok_or_else(|| {
-                service(format!("the response named unknown policy `{name}`"))
-            })?,
-        };
+        let policy =
+            match allowed.policy.as_deref() {
+                // Naming nothing is the common case and takes `[accept]` itself.
+                None => &self.config.default,
+                // Fails closed rather than falling back to the default: a service
+                // naming a policy this node does not have is either misconfigured
+                // or looking at a different version of the configuration, and
+                // quietly substituting a policy would apply limits nobody chose.
+                Some(name) => self.config.policies.get(name).ok_or_else(|| {
+                    service(format!("the response named unknown policy `{name}`"))
+                })?,
+            };
 
         Ok(PublishGrant {
             stream_id: StreamId::new(allowed.stream_id),

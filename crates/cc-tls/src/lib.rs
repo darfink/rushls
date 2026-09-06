@@ -30,9 +30,9 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use rustls::{
     ServerConfig,
+    client::ResolvesClientCert,
     crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
-    client::ResolvesClientCert,
     server::{ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
 };
@@ -238,12 +238,7 @@ impl ClientIdentity {
         )?)));
         observer.certificate_loaded(&settings.certificate);
 
-        let watcher = CertificateWatch::start(
-            settings,
-            Arc::clone(&resolver),
-            provider,
-            observer,
-        )?;
+        let watcher = CertificateWatch::start(settings, Arc::clone(&resolver), provider, observer)?;
         Ok(Self {
             resolver,
             _watcher: watcher,
@@ -279,7 +274,6 @@ pub fn load_roots(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError>
     }
     Ok(roots)
 }
-
 
 /// A bound TLS listener plus the watch that keeps its certificate current.
 ///
@@ -715,5 +709,4 @@ mod tests {
              leaving an empty trust store that refuses every endpoint"
         );
     }
-
 }

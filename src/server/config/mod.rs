@@ -19,16 +19,15 @@ use std::{
 use bytesize::ByteSize;
 use cc_rtmp::ServerSessionTimeouts;
 use cc_tls::{ClientIdentity, load_roots};
-use rustls::pki_types::CertificateDer;
 use conf::{Conf, find_parameter, introspection::ProgramOptionMeta};
+use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
     admission::{
-        Authenticator, Bounds, Ceiling, Codecs, Floor, FrameBox, HttpAuthConfig,
-        HttpAuthenticator, OpenStreamAuthenticator, Pace, Resolution, StreamPolicy,
-        TakeoverPolicy,
+        Authenticator, Bounds, Ceiling, Codecs, Floor, FrameBox, HttpAuthConfig, HttpAuthenticator,
+        OpenStreamAuthenticator, Pace, Resolution, StreamPolicy, TakeoverPolicy,
     },
     delivery::hls::uri::UriBase,
     delivery::store::{DurationRule, TargetDurationMultiple},
@@ -316,7 +315,6 @@ impl AppConfig {
         })
     }
 
-
     /// `RUSHLS_`-prefixed environment variables that no option reads.
     ///
     /// An override that misses its name by a typo falls back to the compiled
@@ -393,13 +391,7 @@ impl AuthAppConfig {
     ) -> Result<Arc<dyn Authenticator>, ConfigError> {
         if let Some(publish) = self.publish {
             publish
-                .resolve(
-                    default,
-                    policies,
-                    admission_deadline,
-                    client,
-                    outbound_tls,
-                )
+                .resolve(default, policies, admission_deadline, client, outbound_tls)
                 .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
         } else {
             Ok(Arc::new(OpenStreamAuthenticator::new(default)))
@@ -736,9 +728,7 @@ impl OutboundTlsAppConfig {
                     key.clone(),
                     Arc::new(cc_tls::IgnoreTlsEvents),
                 )
-                .map_err(|error| {
-                    invalid(format!("{label}: {error}"))
-                })?,
+                .map_err(|error| invalid(format!("{label}: {error}")))?,
             ),
             (None, None) => None,
             (Some(_), None) => {
@@ -818,7 +808,6 @@ impl LazyHttpClient {
         };
         Ok(shared.with_limits(request_timeout, maximum_response_bytes))
     }
-
 }
 
 /// Resolves the one stall deadline against the cadence it may be relative to.
@@ -932,7 +921,13 @@ impl AcceptAppConfig {
     fn resolve(&self) -> Result<(StreamPolicy, BTreeMap<String, StreamPolicy>), ConfigError> {
         let default = self.base()?;
         let mut policies = BTreeMap::new();
-        for (name, configured) in self.policy.as_ref().map(|table| &table.0).into_iter().flatten() {
+        for (name, configured) in self
+            .policy
+            .as_ref()
+            .map(|table| &table.0)
+            .into_iter()
+            .flatten()
+        {
             if name.trim().is_empty() {
                 return Err(invalid("an accept policy name must not be empty"));
             }
@@ -974,7 +969,13 @@ pub struct CapacityAppConfig {
     ///
     /// Bounds retained media only. A publisher also holds a fixed pipeline
     /// cost while ingesting, reported as `rushls_session_pipeline_bytes`.
-    #[conf(parameter, long, env, default_value = "512MiB", serde(use_value_parser))]
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "512MiB",
+        serde(use_value_parser)
+    )]
     memory_per_stream: ByteSize,
 }
 
@@ -1107,8 +1108,12 @@ impl FrameBoxValue {
                 "8k" | "4320p" => Ok(FrameBox::new(7680, 4320)),
                 other => match other.split_once('x') {
                     Some((width, height)) => Ok(FrameBox::new(
-                        width.parse().map_err(|_| format!("`{other}` is not a size"))?,
-                        height.parse().map_err(|_| format!("`{other}` is not a size"))?,
+                        width
+                            .parse()
+                            .map_err(|_| format!("`{other}` is not a size"))?,
+                        height
+                            .parse()
+                            .map_err(|_| format!("`{other}` is not a size"))?,
                     )),
                     None => Err(format!("unknown resolution `{other}`")),
                 },
@@ -1340,8 +1345,8 @@ impl PolicyValue {
                 policy.video.resolution = resolution.resolve().map_err(where_)?;
             }
             if let Some(frame_rate) = &video.frame_rate {
-                policy.video.frame_rate = resolve_bounds(frame_rate.clone(), RateValue::resolve)
-                    .map_err(where_)?;
+                policy.video.frame_rate =
+                    resolve_bounds(frame_rate.clone(), RateValue::resolve).map_err(where_)?;
             }
             if let Some(tracks) = &video.tracks {
                 policy.video.tracks = tracks.clone().resolve(|value| value);
@@ -1363,8 +1368,7 @@ impl PolicyValue {
             }
             if let Some(channels) = &audio.channels {
                 policy.audio.channels = resolve_bounds(channels.clone(), |value| {
-                    NonZeroU16::new(*value)
-                        .ok_or_else(|| "channels must be positive".to_owned())
+                    NonZeroU16::new(*value).ok_or_else(|| "channels must be positive".to_owned())
                 })
                 .map_err(where_)?;
             }
@@ -1396,19 +1400,15 @@ fn resolve_bounds<T, U>(
 ) -> Result<Bounds<U>, String> {
     Ok(match bounds {
         BoundsValue::Exact(value) => Bounds::Exact(convert(&value)?),
-        BoundsValue::OneOf(values) => Bounds::OneOf(
-            values
-                .iter()
-                .map(&convert)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
+        BoundsValue::OneOf(values) => {
+            Bounds::OneOf(values.iter().map(&convert).collect::<Result<Vec<_>, _>>()?)
+        }
         BoundsValue::Range(range) => Bounds::Range {
             min: range.min.as_ref().map(&convert).transpose()?,
             max: range.max.as_ref().map(&convert).transpose()?,
         },
     })
 }
-
 
 #[derive(Conf)]
 #[conf(serde)]
@@ -1714,8 +1714,7 @@ impl HlsAppConfig {
                 "HLS playlist window must be at least three times the segment duration",
             ));
         }
-        node.session.segmentation =
-            SegmentationPolicy::latency_first(self.segment, self.part);
+        node.session.segmentation = SegmentationPolicy::latency_first(self.segment, self.part);
         // Interim mapping: the advertised window and the retention window are
         // one quantity now, so the old playlist knob resolves straight into
         // it. `[hls] retain` replaces this when the file is rewritten.
@@ -2174,7 +2173,6 @@ fn env_value<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsSt
         .find(|(key, _)| key == name)
         .map(|(_, value)| value.as_os_str())
 }
-
 
 fn resolve_optional_text_secret(
     label: &str,

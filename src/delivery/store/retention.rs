@@ -210,7 +210,10 @@ mod tests {
             .segment_fetch_deadline(published_at, published_at, Duration::from_secs(6))
             .expect("the deadline fits");
 
-        assert_eq!(deadline.duration_since(published_at), Duration::from_hours(2));
+        assert_eq!(
+            deadline.duration_since(published_at),
+            Duration::from_hours(2)
+        );
     }
 
     #[test]

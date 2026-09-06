@@ -9,13 +9,16 @@ use std::{
 
 use crate::{
     admission::{
-        ClientInfo, IngestProtocol, PresentedCredential, Principal,
-        PublishRequest, PublishResource, StreamPolicy, TakeoverPolicy,
+        ClientInfo, IngestProtocol, PresentedCredential, Principal, PublishRequest,
+        PublishResource, StreamPolicy, TakeoverPolicy,
     },
     delivery::store::{DurationRule, TargetDurationMultiple},
     domain::{Codec, StreamId},
     observe::lifecycle::Kind,
-    server::{AllowedOrigins, ResolvedAppConfig, http::fixtures::{scratch, write_pair}},
+    server::{
+        AllowedOrigins, ResolvedAppConfig,
+        http::fixtures::{scratch, write_pair},
+    },
 };
 
 use super::{AppConfig, ConfigError, decimal_fraction, parse_playlist_window};
@@ -37,8 +40,8 @@ fn load_shipped(name: &str) -> Result<ResolvedAppConfig, Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults()
--> Result<(), Box<dyn Error>> {
+async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults() -> Result<(), Box<dyn Error>>
+{
     // The local starter narrows the listeners and nothing else, so anything
     // that drifts away from a compiled default here is an accident.
     let config = load_shipped("rushls.toml")?;
@@ -52,7 +55,10 @@ async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults()
         Some("127.0.0.1:8080".parse().expect("constant is valid"))
     );
     assert_eq!(config.node.https_address, None);
-    assert_eq!(config.node.metrics.listen, None, "metrics are off by default");
+    assert_eq!(
+        config.node.metrics.listen, None,
+        "metrics are off by default"
+    );
 
     let grant = config
         .authenticator
@@ -72,8 +78,7 @@ async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults()
 }
 
 #[tokio::test]
-async fn the_reference_file_resolves_to_the_hardened_configuration()
--> Result<(), Box<dyn Error>> {
+async fn the_reference_file_resolves_to_the_hardened_configuration() -> Result<(), Box<dyn Error>> {
     // This replaces a test that read the library defaults back out and
     // asserted the file matched them, which asserts nothing once the file and
     // the code are independent. Every value below is written in the file, so
@@ -110,7 +115,10 @@ async fn the_reference_file_resolves_to_the_hardened_configuration()
         config.node.session.segmentation.desired_segment_duration,
         Duration::from_secs(6)
     );
-    assert_eq!(config.node.session.supervision.health.stall, Duration::from_secs(12));
+    assert_eq!(
+        config.node.session.supervision.health.stall,
+        Duration::from_secs(12)
+    );
 
     // The reference configures an admission service, so the node is closed.
     assert!(
@@ -446,7 +454,6 @@ fn interpolation_composes_with_an_environment_override() -> Result<(), Box<dyn E
     Ok(())
 }
 
-
 #[tokio::test]
 async fn mutual_tls_material_resolves_for_the_admission_service() -> Result<(), Box<dyn Error>> {
     // The admission service may widen what this node accepts, so on an
@@ -487,8 +494,17 @@ async fn half_a_client_certificate_pair_is_refused() -> Result<(), Box<dyn Error
     let (settings, _) = write_pair(&directory, "origin.internal");
 
     for (line, missing) in [
-        (format!("client_certificate = \"{}\"", settings.certificate.display()), "client_key"),
-        (format!("client_key = \"{}\"", settings.key.display()), "client_certificate"),
+        (
+            format!(
+                "client_certificate = \"{}\"",
+                settings.certificate.display()
+            ),
+            "client_key",
+        ),
+        (
+            format!("client_key = \"{}\"", settings.key.display()),
+            "client_certificate",
+        ),
     ] {
         let error = resolve_toml(&format!(
             "[auth.publish]\nurl = \"https://auth.internal/admit\"\n{line}\n"
@@ -560,8 +576,7 @@ ca = "{}"
 }
 
 #[tokio::test]
-async fn a_hook_without_tls_material_shares_the_process_client()
--> Result<(), Box<dyn Error>> {
+async fn a_hook_without_tls_material_shares_the_process_client() -> Result<(), Box<dyn Error>> {
     let resolved = resolve_toml(
         r#"
 [hook.automation]
@@ -580,8 +595,7 @@ events = ["session.started"]
 }
 
 #[tokio::test]
-async fn half_a_client_certificate_pair_is_refused_for_a_hook_too()
--> Result<(), Box<dyn Error>> {
+async fn half_a_client_certificate_pair_is_refused_for_a_hook_too() -> Result<(), Box<dyn Error>> {
     // Named by hook, so an operator running several knows which to fix.
     let directory = scratch("hook-mtls-half");
     let (settings, _) = write_pair(&directory, "origin.internal");
@@ -1151,7 +1165,12 @@ hold_back = "4x"
 "#,
     )??;
     assert_eq!(
-        relative.node.hls.timing.part_hold_back.resolve(Duration::from_secs(1)),
+        relative
+            .node
+            .hls
+            .timing
+            .part_hold_back
+            .resolve(Duration::from_secs(1)),
         Duration::from_secs(4)
     );
 
@@ -1163,7 +1182,12 @@ hold_back = "2500ms"
 "#,
     )??;
     assert_eq!(
-        absolute.node.hls.timing.part_hold_back.resolve(Duration::from_secs(1)),
+        absolute
+            .node
+            .hls
+            .timing
+            .part_hold_back
+            .resolve(Duration::from_secs(1)),
         Duration::from_millis(2_500)
     );
 
@@ -1198,7 +1222,12 @@ hold_back = "2s"
     )??;
 
     assert_eq!(
-        resolved.node.hls.timing.part_hold_back.resolve(Duration::from_secs(1)),
+        resolved
+            .node
+            .hls
+            .timing
+            .part_hold_back
+            .resolve(Duration::from_secs(1)),
         Duration::from_secs(2),
         "the operator's value is honoured, not raised to the recommendation"
     );

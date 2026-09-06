@@ -189,8 +189,7 @@ impl Resolution {
             Self::Any => true,
             Self::AtMost(limit) => candidate.fits_within(*limit),
             Self::Exact(size) => {
-                candidate == *size
-                    || candidate == FrameBox::new(size.height, size.width)
+                candidate == *size || candidate == FrameBox::new(size.height, size.width)
             }
         }
     }

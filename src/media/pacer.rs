@@ -463,11 +463,7 @@ mod tests {
         }
     }
 
-    fn pacer(
-        ceiling: Option<Ceiling>,
-        floor: Option<Floor>,
-        meters: &SessionMeters,
-    ) -> MediaPacer {
+    fn pacer(ceiling: Option<Ceiling>, floor: Option<Floor>, meters: &SessionMeters) -> MediaPacer {
         MediaPacer::after_preroll(
             ceiling,
             floor,
@@ -490,9 +486,15 @@ mod tests {
         let mut pacer = pacer(Some(ceiling(10)), None, &meters);
         let started = Instant::now();
 
-        pacer.pace(&sample(3), &events).await.expect("three seconds fit");
+        pacer
+            .pace(&sample(3), &events)
+            .await
+            .expect("three seconds fit");
 
-        assert_eq!(Instant::now().saturating_duration_since(started), Duration::ZERO);
+        assert_eq!(
+            Instant::now().saturating_duration_since(started),
+            Duration::ZERO
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -504,7 +506,10 @@ mod tests {
         let mut pacer = pacer(Some(ceiling(2)), None, &meters);
         let started = Instant::now();
 
-        pacer.pace(&sample(3), &events).await.expect("the shortfall is slept");
+        pacer
+            .pace(&sample(3), &events)
+            .await
+            .expect("the shortfall is slept");
 
         assert_eq!(
             Instant::now().saturating_duration_since(started),
@@ -537,7 +542,10 @@ mod tests {
         let started = Instant::now();
         // A minute of media offered at once: only the five-second burst is
         // available, so the remaining 55s must be earned in real time.
-        pacer.pace(&sample(60), &events).await.expect("the excess is slept");
+        pacer
+            .pace(&sample(60), &events)
+            .await
+            .expect("the excess is slept");
 
         assert_eq!(
             Instant::now().saturating_duration_since(started),
@@ -562,7 +570,10 @@ mod tests {
 
         // Ten seconds of media, two earned by the burst; the remaining eight
         // arrive at 2x and so cost four seconds of wall clock.
-        pacer.pace(&sample(10), &events).await.expect("the shortfall is slept at 2x");
+        pacer
+            .pace(&sample(10), &events)
+            .await
+            .expect("the shortfall is slept at 2x");
 
         assert_eq!(
             Instant::now().saturating_duration_since(started),
@@ -586,7 +597,10 @@ mod tests {
                 .expect("an unthrottled publisher is never delayed");
         }
 
-        assert_eq!(Instant::now().saturating_duration_since(started), Duration::ZERO);
+        assert_eq!(
+            Instant::now().saturating_duration_since(started),
+            Duration::ZERO
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -767,7 +781,10 @@ mod tests {
         for _ in 0..60 {
             tokio::time::advance(Duration::from_secs(2)).await;
             media += 1;
-            pacer.pace(&sample(media), &events).await.expect("half speed");
+            pacer
+                .pace(&sample(media), &events)
+                .await
+                .expect("half speed");
         }
         for _ in 0..120 {
             tokio::time::advance(Duration::from_secs(1)).await;

@@ -591,11 +591,8 @@ where
                         additional_properties,
                         ..
                     } => {
-                        EnhancedCapabilities::parse(
-                            &additional_properties,
-                            ENHANCED_VALIDATION,
-                        )
-                        .map_err(String::into_boxed_str)?;
+                        EnhancedCapabilities::parse(&additional_properties, ENHANCED_VALIDATION)
+                            .map_err(String::into_boxed_str)?;
                         follow_up.extend(
                             session
                                 .accept_request_with_properties(

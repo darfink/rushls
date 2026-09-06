@@ -37,7 +37,9 @@ impl Environment {
         Self(
             variables
                 .into_iter()
-                .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+                .filter_map(|(key, value)| {
+                    Some((key.into_string().ok()?, value.into_string().ok()?))
+                })
                 .collect(),
         )
     }
@@ -117,9 +119,9 @@ impl Environment {
             // Substituting `""` into a token would silently disable the check
             // it was protecting, which is the worst way to learn a variable was
             // missing. Where empty is genuinely wanted, `${VAR:-}` says so.
-            None => fallback.map(ToOwned::to_owned).ok_or_else(|| {
-                InterpolationError::Undefined(name.to_owned())
-            }),
+            None => fallback
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| InterpolationError::Undefined(name.to_owned())),
         }
     }
 }
@@ -142,7 +144,10 @@ mod tests {
 
     #[test]
     fn a_variable_is_replaced_by_its_value() {
-        assert_eq!(expand("${NAME}", &[("NAME", "studio")]), Ok("studio".into()));
+        assert_eq!(
+            expand("${NAME}", &[("NAME", "studio")]),
+            Ok("studio".into())
+        );
     }
 
     #[test]

@@ -29,11 +29,10 @@ use crate::{
 };
 
 use super::{
-    InitializationId, Msn, OpenSegment, PartCursor, PartId, PartIndex, PlaylistContract,
-    PublishedSegments, RenditionBitrateStatistics, RenditionSnapshot, RenditionView,
-    MINIMUM_PLAYLIST_SEGMENTS, RetentionPolicy, SegmentBody, SegmentId, StoreWriteError,
-    StoredInitialization, StoredPart,
-    StoredSegment, StoredSegmentKind,
+    InitializationId, MINIMUM_PLAYLIST_SEGMENTS, Msn, OpenSegment, PartCursor, PartId, PartIndex,
+    PlaylistContract, PublishedSegments, RenditionBitrateStatistics, RenditionSnapshot,
+    RenditionView, RetentionPolicy, SegmentBody, SegmentId, StoreWriteError, StoredInitialization,
+    StoredPart, StoredSegment, StoredSegmentKind,
     bitrate::BitrateTracker,
     media::{segment_byte_len, segment_resource_bytes},
 };
@@ -872,11 +871,8 @@ impl RenditionState {
                 self.discontinuity_sequence = self.discontinuity_sequence.saturating_add(1);
             }
             resource.visible = false;
-            resource.expires_at = retention.segment_fetch_deadline(
-                resource.first_published_at,
-                now,
-                segment_target,
-            );
+            resource.expires_at =
+                retention.segment_fetch_deadline(resource.first_published_at, now, segment_target);
         }
         for id in &self.visible_segments {
             if let Some(resource) = self.segment_resources.get_mut(id) {

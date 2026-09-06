@@ -110,7 +110,6 @@ pub fn evaluate(
     HealthEvaluation::Healthy
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::observe::ProcessMeters;
@@ -233,4 +232,3 @@ mod tests {
         );
     }
 }
-
