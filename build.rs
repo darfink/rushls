@@ -1,40 +1,7 @@
 use std::{fs, process::Command};
 
 fn main() {
-    println!("cargo:rerun-if-changed=src/source/transport/srt/native.c");
-    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
-
     emit_git_sha();
-
-    let library = pkg_config::Config::new()
-        .atleast_version("1.5.5")
-        .statik(true)
-        .cargo_metadata(false)
-        .probe("srt")
-        .expect("libSRT 1.5.5 or newer must be discoverable through pkg-config");
-
-    let mut shim = cc::Build::new();
-    shim.file("src/source/transport/srt/native.c")
-        .warnings(true);
-    for include in &library.include_paths {
-        shim.include(include);
-    }
-    shim.compile("rushls_srt_native");
-
-    for path in &library.link_paths {
-        println!("cargo:rustc-link-search=native={}", path.display());
-    }
-    for framework in &library.frameworks {
-        println!("cargo:rustc-link-lib=framework={framework}");
-    }
-    for path in &library.framework_paths {
-        println!("cargo:rustc-link-search=framework={}", path.display());
-    }
-
-    println!("cargo:rustc-link-lib=static=srt");
-    for dependency in library.libs.iter().filter(|name| name.as_str() != "srt") {
-        println!("cargo:rustc-link-lib=dylib={dependency}");
-    }
 }
 
 /// Bake the commit this binary was built from into `GIT_SHA` for `env!`.

@@ -57,15 +57,17 @@ async fn srt_h264_aac() -> TestResult {
     };
 
     let config = SrtConfig::default();
-    let mut listener = SrtListener::bind("127.0.0.1:0".parse()?, config.clone(), 4)?;
+    let mut listener = SrtListener::bind("127.0.0.1:0".parse()?, config.clone(), 4).await?;
     let address = listener.local_address();
-    let caller = std::thread::spawn(move || -> Result<SrtCaller, String> {
+    let caller = tokio::spawn(async move {
         let caller = SrtCaller::connect(address, &config, "publish:live/camera:secret")
+            .await
             .map_err(|error| error.to_string())?;
         caller
             .send_mpegts(H264_AAC_TS)
+            .await
             .map_err(|error| error.to_string())?;
-        Ok(caller)
+        Ok::<_, String>(caller)
     });
 
     let pending = listener
@@ -77,7 +79,7 @@ async fn srt_h264_aac() -> TestResult {
     // races the demuxer and looks like a non-MPEG-TS input.
     let session = origin.spawn_session(publish::labeled(Box::new(pending)));
     origin.validate_playlist()?;
-    drop(caller.join().map_err(|_| "SRT caller panicked")??);
+    drop(caller.await.map_err(|_| "SRT caller panicked")??);
     match session.await? {
         Ok(
             rushls::session::SessionOutcome::Ended

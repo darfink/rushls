@@ -96,7 +96,7 @@ async fn the_reference_file_resolves_to_the_hardened_configuration() -> Result<(
     );
     assert_eq!(
         config.node.srt_address,
-        "[::]:9000".parse().expect("constant is valid")
+        "0.0.0.0:9000".parse().expect("constant is valid")
     );
     assert_eq!(
         config.node.http_address,

@@ -118,7 +118,7 @@ impl Default for NodeConfig {
             name: node_name(),
             shutdown: Duration::from_secs(10),
             rtmp_address: "0.0.0.0:1935".parse().expect("constant address is valid"),
-            srt_address: "[::]:9000".parse().expect("constant address is valid"),
+            srt_address: "0.0.0.0:9000".parse().expect("constant address is valid"),
             http_address: Some("0.0.0.0:8080".parse().expect("constant address is valid")),
             https_address: None,
             maintenance_interval: Duration::from_secs(1),
@@ -393,6 +393,7 @@ impl Node {
             self.config.srt.clone(),
             self.config.maximum_sessions,
         )
+        .await
         .map_err(|source| RuntimeError::BindSrt {
             address: self.config.srt_address,
             source,
@@ -658,7 +659,7 @@ impl IngestListener for SrtListener {
         }
     }
 
-    /// Already negotiated: libSRT completes its handshake inside `accept`.
+    /// Already negotiated: rsrt completes its handshake inside `accept`.
     async fn handshake(
         connection: Self::Connection,
     ) -> Result<Box<dyn PendingPublish>, TransportError> {

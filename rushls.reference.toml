@@ -21,7 +21,7 @@ timeout = "10s"                          # idle limit for an established publish
                                          # tighter one. "off" on a trusted link only
 
 [srt]
-listen  = "[::]:9000"
+listen  = "0.0.0.0:9000"                 # IPv4; rsrt has no IPv6 listener yet
 latency = "120ms"                        # raise on lossy or long-haul links
 timeout = "5s"                           # idle limit for a peer; must exceed latency
 # passphrase_file = "/run/secrets/rushls-srt-passphrase"

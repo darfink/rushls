@@ -1717,7 +1717,7 @@ fn parse_optional_duration(value: &str) -> Result<OptionalDuration, String> {
 #[conf(serde)]
 pub struct SrtAppConfig {
     /// Address receiving SRT publishers.
-    #[conf(parameter, long, env, default_value = "[::]:9000")]
+    #[conf(parameter, long, env, default_value = "0.0.0.0:9000")]
     pub listen: SocketAddr,
     /// SRT receive latency; increase for unstable or long-distance networks.
     #[conf(

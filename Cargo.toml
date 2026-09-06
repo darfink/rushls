@@ -30,11 +30,13 @@ notify = "8"
 notify-debouncer-full = "0.7"
 nz = "0.4"
 parking_lot = "0.12"
-# `ring` rather than the default `aws-lc-rs`: the latter wants cmake and nasm,
-# and this build already carries as much C toolchain dependency as it should.
+# Live SRT ingest. Pure Rust; IPv4-only until rsrt grows a dual-stack listener.
+rsrt = "0.3.4"
+# `ring` rather than the default `aws-lc-rs`: the latter wants cmake and nasm.
+# ring still compiles a small C/asm kernel at build time; it does not link a
+# system crypto library.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
-socket2 = "0.6"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 toml = "1"
@@ -57,10 +59,6 @@ scuffle-h265 = "0.2.2"
 scuffle-av1 = "0.1.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "std", "time"] }
-
-[build-dependencies]
-cc = "1"
-pkg-config = "0.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

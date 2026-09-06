@@ -63,7 +63,9 @@ order the pipeline runs in.
 
 ## Listeners
 
-All binds default to dual-stack `[::]`. `public_url` only shapes playlist URLs:
+RTMP and HTTP binds default to dual-stack `[::]`. SRT is IPv4-only
+(`0.0.0.0`) because ingest uses `rsrt`, which has no IPv6 listener yet.
+`public_url` only shapes playlist URLs:
 empty means relative, which is right behind a proxy or CDN; a trailing slash
 is insignificant. Certificates reload in place on rotation, with secure TLS
 defaults and no cipher knobs. The usual proxy posture is cleartext on loopback

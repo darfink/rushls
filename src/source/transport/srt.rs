@@ -1,9 +1,13 @@
-//! Native SRT listener and MPEG-TS packet source.
+//! SRT listener and MPEG-TS packet source.
 //!
 //! SRT message boundaries are transport details. The accepted socket is read
 //! as one ordered byte stream and demultiplexed as MPEG-TS. Other containers
 //! (Matroska, FLV, …) are refused at discovery. SRT delivery timestamps are
 //! intentionally ignored; embedded PES timestamps remain the media clock.
+//!
+//! The transport is [`rsrt`]: live mode, TSBPD, and HaiCrypt. That crate is
+//! IPv4-only, so the listener refuses IPv6 bind addresses rather than silently
+//! narrowing `[::]` to IPv4.
 //!
 //! Callers normally use `publish:<namespace/name>:<credential>`, or
 //! `publish:<credential>` when one key identifies both the presented resource
@@ -12,17 +16,14 @@
 //! Transport encryption is configured separately and is never admission.
 
 use std::{
-    net::SocketAddr,
+    net::{SocketAddr, SocketAddrV4},
     num::NonZeroUsize,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::JoinHandle,
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
-use tokio::sync::mpsc;
+use bytes::Bytes;
+use rsrt::{CloseReason, SrtOptions};
 
 use crate::{
     admission::{ClientInfo, IngestProtocol, PublishGrant, PublishRequest},
@@ -34,14 +35,12 @@ use crate::{
     },
 };
 
-mod native;
 mod stream_id;
 
-const LIBSRT_MINIMUM_VERSION: u32 = 0x01_05_05;
-const PEER_MINIMUM_VERSION: i32 = 0x01_03_00;
 const SRT_MAXIMUM_LIVE_PAYLOAD_BYTES: usize = 1_456;
 const SRT_MAXIMUM_STREAM_ID_BYTES: usize = 512;
-const LOSS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// IPv4 header + UDP header + SRT header subtracted from MSS to get payload.
+const SRT_IPV4_UDP_SRT_HEADER_BYTES: usize = 44;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SrtKeyLength {
@@ -50,12 +49,12 @@ pub enum SrtKeyLength {
     Aes256,
 }
 
-impl SrtKeyLength {
-    const fn bytes(self) -> i32 {
-        match self {
-            Self::Aes128 => 16,
-            Self::Aes192 => 24,
-            Self::Aes256 => 32,
+impl From<SrtKeyLength> for rsrt::KeyLength {
+    fn from(value: SrtKeyLength) -> Self {
+        match value {
+            SrtKeyLength::Aes128 => Self::Aes128,
+            SrtKeyLength::Aes192 => Self::Aes192,
+            SrtKeyLength::Aes256 => Self::Aes256,
         }
     }
 }
@@ -92,7 +91,7 @@ pub struct SrtConfig {
     /// Receiver latency used by SRT's timestamp-based packet delivery.
     pub latency: Duration,
     pub peer_idle_timeout: Duration,
-    /// Polling interval used by native I/O to observe demux cancellation.
+    /// Polling interval used by the demux worker to observe cancellation.
     pub receive_poll_interval: Duration,
     pub receive_buffer_bytes: NonZeroUsize,
     /// Largest complete SRT live message accepted from one caller.
@@ -121,9 +120,6 @@ impl Default for SrtConfig {
 
 impl SrtConfig {
     fn validate(&self) -> Result<(), TransportError> {
-        if native::version() < LIBSRT_MINIMUM_VERSION {
-            return Err(invalid_request("libSRT 1.5.5 or newer is required"));
-        }
         if self.latency.is_zero()
             || self.peer_idle_timeout.is_zero()
             || self.receive_poll_interval.is_zero()
@@ -145,44 +141,48 @@ impl SrtConfig {
                 "the SRT receive buffer must fit one maximum-sized message",
             ));
         }
-        self.native_options().map(|_| ())
+        Ok(())
     }
 
-    fn native_options(&self) -> Result<native::NativeOptions<'_>, TransportError> {
-        let (passphrase, key_length) =
-            self.encryption
-                .as_ref()
-                .map_or((None, SrtKeyLength::Aes128.bytes()), |encryption| {
-                    (
-                        Some(encryption.passphrase.as_bytes()),
-                        encryption.key_length.bytes(),
-                    )
-                });
-        Ok(native::NativeOptions {
-            latency_ms: duration_millis(self.latency, "SRT latency")?,
-            peer_idle_timeout_ms: duration_millis(self.peer_idle_timeout, "SRT peer idle timeout")?,
-            receive_buffer_bytes: i32::try_from(self.receive_buffer_bytes.get())
-                .map_err(|_| invalid_request("the SRT receive buffer is too large"))?,
-            payload_size: i32::try_from(self.maximum_message_bytes.get())
-                .expect("validated SRT payload fits i32"),
-            minimum_peer_version: PEER_MINIMUM_VERSION,
-            passphrase,
-            key_length,
-        })
+    fn rsrt_options(&self, stream_id: Option<&str>) -> Result<SrtOptions, TransportError> {
+        self.validate()?;
+        let mut options = SrtOptions {
+            latency: self.latency,
+            peer_idle_timeout: self.peer_idle_timeout,
+            mss: u32::try_from(
+                self.maximum_message_bytes
+                    .get()
+                    .saturating_add(SRT_IPV4_UDP_SRT_HEADER_BYTES),
+            )
+            .map_err(|_| invalid_request("the SRT message size is too large"))?,
+            recv_buffer_pkts: self
+                .receive_buffer_bytes
+                .get()
+                .div_ceil(self.maximum_message_bytes.get())
+                .max(1),
+            udp_recv_buffer: Some(self.receive_buffer_bytes.get()),
+            ..SrtOptions::default()
+        };
+        if let Some(encryption) = &self.encryption {
+            options = options
+                .passphrase(encryption.passphrase.to_string())
+                .pbkeylen(encryption.key_length.into());
+        }
+        if let Some(stream_id) = stream_id {
+            options = options.streamid(stream_id);
+        }
+        Ok(options)
     }
 }
 
-/// A process listener whose blocking native accept runs outside Tokio.
+/// A process listener whose accept loop runs on the Tokio runtime.
 pub struct SrtListener {
-    local_address: SocketAddr,
-    incoming: mpsc::Receiver<Result<SrtPendingPublish, TransportError>>,
-    socket: Arc<native::Socket>,
-    stopping: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    inner: rsrt::SrtListener,
+    config: SrtConfig,
 }
 
 impl SrtListener {
-    pub fn bind(
+    pub async fn bind(
         address: SocketAddr,
         config: SrtConfig,
         backlog: usize,
@@ -191,101 +191,47 @@ impl SrtListener {
         if backlog == 0 {
             return Err(invalid_request("the SRT listener backlog must be nonzero"));
         }
+        // rsrt's accept queue is a compiled constant (64). A zero from the
+        // runtime is still a programming error and is refused above.
 
-        let listener = native::open_listener(address, &config.native_options()?, backlog)
+        let inner = rsrt::SrtListener::bind(ipv4_address(address)?, config.rsrt_options(None)?)
+            .await
             .map_err(|error| TransportError::Handshake(error.to_string().into()))?;
-        let local_address = listener.local_address;
-        let socket = listener.socket;
-        let poll = listener.poll;
-        let stopping = Arc::new(AtomicBool::new(false));
-        let (sender, incoming) = mpsc::channel(backlog);
-        let thread_socket = Arc::clone(&socket);
-        let thread_poll = Arc::clone(&poll);
-        let thread_stopping = Arc::clone(&stopping);
-        let thread = std::thread::Builder::new()
-            .name("rushls-srt-listener".into())
-            .spawn(move || {
-                while !thread_stopping.load(Ordering::Acquire) {
-                    match native::wait(&thread_poll, config.receive_poll_interval) {
-                        Ok(native::Wait::Timeout) => {}
-                        Ok(native::Wait::Ready) => {
-                            let connection = match native::accept(&thread_socket) {
-                                Ok(connection) => connection,
-                                Err(error) => {
-                                    if sender
-                                        .blocking_send(Err(TransportError::Handshake(
-                                            error.to_string().into(),
-                                        )))
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                    continue;
-                                }
-                            };
-                            let pending = SrtPendingPublish::new(connection, config.clone());
-                            if sender.blocking_send(pending).is_err() {
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            if sender
-                                .blocking_send(Err(TransportError::Handshake(
-                                    error.to_string().into(),
-                                )))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
-            .map_err(|error| {
-                socket.close();
-                TransportError::Handshake(
-                    format!("could not start the SRT listener thread: {error}").into(),
-                )
-            })?;
-
-        Ok(Self {
-            local_address,
-            incoming,
-            socket,
-            stopping,
-            thread: Some(thread),
-        })
+        Ok(Self { inner, config })
     }
 
     pub fn local_address(&self) -> SocketAddr {
-        self.local_address
+        SocketAddr::V4(self.inner.local_addr())
     }
 
     pub async fn accept(&mut self) -> Option<Result<SrtPendingPublish, TransportError>> {
-        self.incoming.recv().await
-    }
-}
-
-impl Drop for SrtListener {
-    fn drop(&mut self) {
-        self.stopping.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        match self.inner.accept().await {
+            Ok((socket, peer)) => Some(SrtPendingPublish::new(
+                socket,
+                SocketAddr::V4(peer),
+                self.config.clone(),
+            )),
+            Err(rsrt::SrtError::Closed(CloseReason::Local)) => None,
+            Err(error) => Some(Err(TransportError::Handshake(error.to_string().into()))),
         }
-        self.socket.close();
     }
 }
 
 /// An established SRT connection awaiting application admission.
 pub struct SrtPendingPublish {
     request: PublishRequest,
-    socket: Arc<native::Socket>,
+    socket: rsrt::SrtSocket,
     config: SrtConfig,
 }
 
 impl SrtPendingPublish {
-    fn new(connection: native::Connection, config: SrtConfig) -> Result<Self, TransportError> {
-        let parsed = stream_id::parse(&connection.stream_id, config.maximum_stream_id_bytes.get())
+    fn new(
+        socket: rsrt::SrtSocket,
+        remote_address: SocketAddr,
+        config: SrtConfig,
+    ) -> Result<Self, TransportError> {
+        let stream_id = socket.streamid().unwrap_or_default();
+        let parsed = stream_id::parse(&stream_id, config.maximum_stream_id_bytes.get())
             .map_err(TransportError::InvalidPublishRequest)?;
         Ok(Self {
             request: PublishRequest {
@@ -293,12 +239,12 @@ impl SrtPendingPublish {
                 resource: parsed.resource,
                 credential: parsed.credential,
                 client: ClientInfo {
-                    remote_address: connection.remote_address,
+                    remote_address,
                     encoder: None,
-                    protocol_version: Some(format_version(connection.protocol_version)),
+                    protocol_version: None,
                 },
             },
-            socket: connection.socket,
+            socket,
             config,
         })
     }
@@ -316,12 +262,7 @@ impl PendingPublish for SrtPendingPublish {
     ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
         Box::pin(async move {
             let Self { socket, config, .. } = *self;
-            let input = SrtInput::new(
-                socket,
-                config.maximum_message_bytes.get(),
-                config.receive_poll_interval,
-                Arc::clone(&meters),
-            );
+            let input = SrtInput::new(socket, config.receive_poll_interval);
             let source = MpegTsPacketSource::new(
                 Box::new(input),
                 config.mpegts,
@@ -341,68 +282,36 @@ impl PendingPublish for SrtPendingPublish {
         _rejection: PublishRejection,
     ) -> BoxFuture<'static, Result<(), TransportError>> {
         Box::pin(async move {
-            self.socket.close();
+            drop(self.socket);
             Ok(())
         })
     }
 }
 
 struct SrtInput {
-    socket: Arc<native::Socket>,
-    scratch: Vec<u8>,
+    socket: rsrt::SrtSocket,
+    runtime: tokio::runtime::Handle,
+    pending: Bytes,
     poll_interval: Duration,
-    pending_start: usize,
-    pending_end: usize,
-    meters: Arc<dyn SourceMeters>,
-    last_loss_total: u64,
-    next_loss_sample: Instant,
 }
 
 impl SrtInput {
-    fn new(
-        socket: Arc<native::Socket>,
-        maximum_message_bytes: usize,
-        poll_interval: Duration,
-        meters: Arc<dyn SourceMeters>,
-    ) -> Self {
-        let last_loss_total = native::receive_loss_total(&socket).unwrap_or(0);
+    fn new(socket: rsrt::SrtSocket, poll_interval: Duration) -> Self {
         Self {
             socket,
-            scratch: vec![0; maximum_message_bytes],
+            // Captured on the runtime that owns the rsrt UDP driver. The MPEG-TS
+            // worker is a dedicated thread; it parks here so recv can run there.
+            runtime: tokio::runtime::Handle::current(),
+            pending: Bytes::new(),
             poll_interval,
-            pending_start: 0,
-            pending_end: 0,
-            meters,
-            last_loss_total,
-            next_loss_sample: Instant::now() + LOSS_SAMPLE_INTERVAL,
         }
     }
 
     fn copy_pending(&mut self, output: &mut [u8]) -> usize {
-        let available = self.pending_end - self.pending_start;
-        let copied = available.min(output.len());
-        output[..copied]
-            .copy_from_slice(&self.scratch[self.pending_start..self.pending_start + copied]);
-        self.pending_start += copied;
-        if self.pending_start == self.pending_end {
-            self.pending_start = 0;
-            self.pending_end = 0;
-        }
+        let copied = self.pending.len().min(output.len());
+        output[..copied].copy_from_slice(&self.pending[..copied]);
+        let _ = self.pending.split_to(copied);
         copied
-    }
-
-    fn record_transport_loss(&mut self, force: bool) {
-        if !force && Instant::now() < self.next_loss_sample {
-            return;
-        }
-        if let Some(total) = native::receive_loss_total(&self.socket) {
-            let lost = total.saturating_sub(self.last_loss_total);
-            self.last_loss_total = total;
-            if lost > 0 {
-                self.meters.source_progress(0, 0, lost);
-            }
-        }
-        self.next_loss_sample = Instant::now() + LOSS_SAMPLE_INTERVAL;
     }
 }
 
@@ -418,7 +327,7 @@ impl ByteInput for SrtInput {
         if interrupt.interrupted() {
             return Err(ByteInputError::End(InputState::Interrupted));
         }
-        if self.pending_start != self.pending_end {
+        if !self.pending.is_empty() {
             return Ok(self.copy_pending(output));
         }
 
@@ -427,72 +336,40 @@ impl ByteInput for SrtInput {
                 return Err(ByteInputError::End(InputState::Interrupted));
             }
 
-            let receive_into_output = output.len() >= self.scratch.len();
-            let result = if receive_into_output {
-                let maximum = self.scratch.len();
-                native::receive(&self.socket, &mut output[..maximum])
-            } else {
-                native::receive(&self.socket, &mut self.scratch)
-            };
+            let result = self.runtime.block_on(async {
+                tokio::time::timeout(self.poll_interval, self.socket.recv()).await
+            });
             match result {
-                Ok(native::Receive::Data(received)) => {
-                    self.record_transport_loss(false);
-                    if receive_into_output {
-                        return Ok(received);
-                    }
-                    self.pending_end = received;
+                Ok(Ok(Some(payload))) if payload.is_empty() => {}
+                Ok(Ok(Some(payload))) => {
+                    self.pending = payload;
                     return Ok(self.copy_pending(output));
                 }
-                Ok(native::Receive::Retry) => {
-                    self.record_transport_loss(false);
-                    std::thread::sleep(self.poll_interval);
-                }
-                Ok(native::Receive::End) => {
-                    self.record_transport_loss(true);
-                    return Err(ByteInputError::End(InputState::Closed));
-                }
-                // The detail is dropped deliberately: a peer that closed
-                // cleanly did not fail, whatever the receive call reported.
-                Err(_error) if native::ended_cleanly(&self.socket) => {
-                    self.record_transport_loss(true);
-                    return Err(ByteInputError::End(InputState::Closed));
-                }
-                Err(_error) if native::is_broken(&self.socket) => {
-                    self.record_transport_loss(true);
-                    return Err(ByteInputError::End(InputState::Interrupted));
-                }
-                Err(error) => {
-                    self.record_transport_loss(true);
-                    return Err(ByteInputError::Failed(error.to_string().into()));
-                }
+                Ok(Ok(None)) => return Err(ByteInputError::End(InputState::Closed)),
+                Ok(Err(error)) => return Err(byte_input_error(error)),
+                Err(_elapsed) => {}
             }
         }
     }
 }
 
-impl Drop for SrtInput {
-    fn drop(&mut self) {
-        self.socket.close();
+fn byte_input_error(error: rsrt::SrtError) -> ByteInputError {
+    match error {
+        rsrt::SrtError::Closed(CloseReason::Shutdown | CloseReason::Local) => {
+            ByteInputError::End(InputState::Closed)
+        }
+        rsrt::SrtError::Closed(_) => ByteInputError::End(InputState::Interrupted),
+        other => ByteInputError::Failed(other.to_string().into()),
     }
 }
 
-fn duration_millis(duration: Duration, field: &'static str) -> Result<i32, TransportError> {
-    let milliseconds = duration.as_nanos().div_ceil(1_000_000);
-    i32::try_from(milliseconds)
-        .ok()
-        .filter(|milliseconds| *milliseconds > 0)
-        .ok_or_else(|| {
-            TransportError::InvalidPublishRequest(format!("{field} is out of range").into())
-        })
-}
-
-fn format_version(version: u32) -> String {
-    format!(
-        "{}.{}.{}",
-        (version >> 16) & 0xff,
-        (version >> 8) & 0xff,
-        version & 0xff
-    )
+fn ipv4_address(address: SocketAddr) -> Result<SocketAddrV4, TransportError> {
+    match address {
+        SocketAddr::V4(address) => Ok(address),
+        SocketAddr::V6(_) => Err(invalid_request(
+            "SRT ingest is IPv4-only; bind an IPv4 address such as 0.0.0.0:9000",
+        )),
+    }
 }
 
 fn invalid_request(message: &'static str) -> TransportError {
@@ -502,48 +379,47 @@ fn invalid_request(message: &'static str) -> TransportError {
 /// An SRT caller that injects MPEG-TS into a local listener.
 ///
 /// Production publishers are remote encoders. Tests need a same-process peer
-/// that speaks the native stack, so this wrapper is part of the crate rather
+/// that speaks the same stack, so this wrapper is part of the crate rather
 /// than `cfg(test)`-only: integration tests compile the library without test
 /// cfg and still have to drive a real `SrtListener`.
 pub struct SrtCaller {
-    socket: Arc<native::Socket>,
+    socket: rsrt::SrtSocket,
 }
 
 impl SrtCaller {
-    pub fn connect(
+    pub async fn connect(
         address: SocketAddr,
         config: &SrtConfig,
         stream_id: &str,
     ) -> Result<Self, TransportError> {
-        let options = config.native_options()?;
-        let socket = native::test_connect(address, &options, stream_id)
-            .map_err(|error| TransportError::Handshake(error.to_string().into()))?;
+        let socket = rsrt::SrtSocket::connect(
+            ipv4_address(address)?,
+            config.rsrt_options(Some(stream_id))?,
+        )
+        .await
+        .map_err(|error| TransportError::Handshake(error.to_string().into()))?;
         Ok(Self { socket })
     }
 
-    pub fn send(&self, bytes: &[u8]) -> Result<(), TransportError> {
-        native::test_send(&self.socket, bytes)
+    pub async fn send(&self, bytes: &[u8]) -> Result<(), TransportError> {
+        self.socket
+            .send(bytes)
+            .await
             .map_err(|error| TransportError::Accept(error.to_string().into()))
     }
 
     /// Sends MPEG-TS in live-message chunks of 1_316 bytes.
-    pub fn send_mpegts(&self, bytes: &[u8]) -> Result<(), TransportError> {
+    pub async fn send_mpegts(&self, bytes: &[u8]) -> Result<(), TransportError> {
         for chunk in bytes.chunks(1_316) {
-            self.send(chunk)?;
+            self.send(chunk).await?;
         }
         Ok(())
     }
 }
 
-impl Drop for SrtCaller {
-    fn drop(&mut self) {
-        self.socket.close();
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::{
         admission::{Principal, PublishGrant, StreamPolicy},
@@ -570,6 +446,10 @@ mod tests {
         }
     }
 
+    async fn bind_loopback(config: SrtConfig) -> Result<SrtListener, TransportError> {
+        SrtListener::bind("127.0.0.1:0".parse().expect("constant is valid"), config, 4).await
+    }
+
     #[test]
     fn invalid_transport_limits_are_rejected_before_binding() {
         let config = SrtConfig {
@@ -588,6 +468,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ipv6_listen_address_is_refused() {
+        let error = match SrtListener::bind(
+            "[::]:0".parse().expect("constant is valid"),
+            SrtConfig::default(),
+            1,
+        )
+        .await
+        {
+            Ok(_listener) => panic!("IPv6 is unsupported"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("IPv4-only"),
+            "refusal names the IPv4 restriction: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_live_message_survives_partial_demux_reads() {
         let config = SrtConfig {
             encryption: Some(
@@ -596,96 +494,52 @@ mod tests {
             ),
             ..SrtConfig::default()
         };
-        let mut listener = SrtListener::bind(
-            "127.0.0.1:0".parse().expect("constant is valid"),
-            config.clone(),
-            4,
-        )
-        .expect("listener binds");
+        let poll_interval = config.receive_poll_interval;
+        let mut listener = bind_loopback(config.clone()).await.expect("listener binds");
         let address = listener.local_address();
-        let caller_config = config.clone();
-        let caller = std::thread::spawn(move || {
-            let options = caller_config.native_options().expect("options are valid");
-            let socket =
-                native::test_connect(address, &options, "secret").expect("test caller connects");
-            native::test_send(&socket, b"abcdefg").expect("message sends");
-            socket
+        let caller = tokio::spawn(async move {
+            let caller = SrtCaller::connect(address, &config, "secret")
+                .await
+                .expect("test caller connects");
+            caller.send(b"abcdefg").await.expect("message sends");
+            caller
         });
         let pending = listener
             .accept()
             .await
             .expect("listener remains open")
             .expect("connection is accepted");
-        let meters = SessionMeters::new(ProcessMeters::default());
-        let mut input = SrtInput::new(
-            pending.socket,
-            1_456,
-            config.receive_poll_interval,
-            meters.source_view(),
-        );
-        let interrupt = NeverInterrupt(AtomicBool::new(false));
-        let mut first = [0; 3];
-        let mut second = [0; 4];
-
-        assert_eq!(input.read(&mut first, &interrupt), Ok(3));
-        assert_eq!(input.read(&mut second, &interrupt), Ok(4));
+        let caller = caller.await.expect("caller did not panic");
+        let mut input = SrtInput::new(pending.socket, poll_interval);
+        let (first, second) = tokio::task::spawn_blocking(move || {
+            let interrupt = NeverInterrupt(AtomicBool::new(false));
+            let mut first = [0; 3];
+            let mut second = [0; 4];
+            assert_eq!(input.read(&mut first, &interrupt), Ok(3));
+            assert_eq!(input.read(&mut second, &interrupt), Ok(4));
+            (first, second)
+        })
+        .await
+        .expect("demux thread did not panic");
         assert_eq!(&first, b"abc");
         assert_eq!(&second, b"defg");
-
-        caller.join().expect("caller did not panic").close();
-    }
-
-    #[tokio::test]
-    async fn an_ipv6_wildcard_listener_accepts_ipv4_callers() {
-        let config = SrtConfig::default();
-        let mut listener = SrtListener::bind(
-            "[::]:0".parse().expect("constant is valid"),
-            config.clone(),
-            1,
-        )
-        .expect("dual-stack listener binds");
-        let address = SocketAddr::from(([127, 0, 0, 1], listener.local_address().port()));
-        let caller = std::thread::spawn(move || {
-            let options = config.native_options().expect("options are valid");
-            native::test_connect(address, &options, "secret").expect("IPv4 caller connects")
-        });
-
-        let pending = listener
-            .accept()
-            .await
-            .expect("listener remains open")
-            .expect("connection is accepted");
-
-        assert_eq!(
-            pending
-                .publish_request()
-                .expect("request is valid")
-                .resource
-                .name,
-            "secret"
-        );
-        caller.join().expect("caller did not panic").close();
+        drop(caller);
     }
 
     #[tokio::test]
     async fn mpeg_ts_over_srt_is_discovered_by_the_streaming_demuxer() {
         let config = SrtConfig::default();
-        let mut listener = SrtListener::bind(
-            "127.0.0.1:0".parse().expect("constant is valid"),
-            config.clone(),
-            4,
-        )
-        .expect("listener binds");
+        let mut listener = bind_loopback(config.clone()).await.expect("listener binds");
         let address = listener.local_address();
-        let caller = std::thread::spawn(move || {
-            let options = config.native_options().expect("options are valid");
-            let socket = native::test_connect(address, &options, "publish:live/camera:secret")
+        let caller = tokio::spawn(async move {
+            let caller = SrtCaller::connect(address, &config, "publish:live/camera:secret")
+                .await
                 .expect("test caller connects");
-            let fixture = crate::source::fixtures::h264_adts_aac_mpeg_ts();
-            for message in fixture.chunks(1_316) {
-                native::test_send(&socket, message).expect("fixture message sends");
-            }
-            socket
+            caller
+                .send_mpegts(&crate::source::fixtures::h264_adts_aac_mpeg_ts())
+                .await
+                .expect("fixture message sends");
+            caller
         });
 
         let pending = listener
@@ -704,7 +558,7 @@ mod tests {
             .accept(grant(), meters.source_view())
             .await
             .expect("publication is accepted");
-        let caller = caller.join().expect("caller did not panic");
+        let caller = caller.await.expect("caller did not panic");
         let discovery = accepted
             .source
             .discover(DiscoveryLimits {
@@ -728,7 +582,7 @@ mod tests {
                 .iter()
                 .any(|track| track.codec == Codec::H264 && track.kind() == MediaKind::Video)
         );
-        caller.close();
+        drop(caller);
 
         let mut packets = Vec::new();
         while accepted
@@ -744,22 +598,17 @@ mod tests {
     #[tokio::test]
     async fn matroska_over_srt_is_refused() {
         let config = SrtConfig::default();
-        let mut listener = SrtListener::bind(
-            "127.0.0.1:0".parse().expect("constant is valid"),
-            config.clone(),
-            4,
-        )
-        .expect("listener binds");
+        let mut listener = bind_loopback(config.clone()).await.expect("listener binds");
         let address = listener.local_address();
-        let caller = std::thread::spawn(move || {
-            let options = config.native_options().expect("options are valid");
-            let socket = native::test_connect(address, &options, "publish:live/camera:secret")
+        let caller = tokio::spawn(async move {
+            let caller = SrtCaller::connect(address, &config, "publish:live/camera:secret")
+                .await
                 .expect("test caller connects");
-            let fixture = crate::source::fixtures::ebml_header();
-            for message in fixture.chunks(1_316) {
-                native::test_send(&socket, message).expect("fixture message sends");
-            }
-            socket
+            caller
+                .send_mpegts(&crate::source::fixtures::ebml_header())
+                .await
+                .expect("fixture message sends");
+            caller
         });
 
         let pending = listener
@@ -772,7 +621,7 @@ mod tests {
             .accept(grant(), meters.source_view())
             .await
             .expect("publication is accepted");
-        let caller = caller.join().expect("caller did not panic");
+        let caller = caller.await.expect("caller did not panic");
         let error = accepted
             .source
             .discover(DiscoveryLimits {
@@ -785,6 +634,6 @@ mod tests {
             error.to_string().contains("MPEG-TS"),
             "refusal names the required container: {error}"
         );
-        caller.close();
+        drop(caller);
     }
 }

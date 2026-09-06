@@ -13,7 +13,7 @@ or HTTP proof), **gap** (dropped or refused), **untested**.
 | Feature | Status | Notes |
 |---|---|---|
 | RTMP / Enhanced RTMP, one video + one audio | **done** | Native `cc-rtmp` → `Packet`. Live `mediastreamvalidator` on H.264 + AAC-LC. |
-| SRT MPEG-TS | **done** | `StreamingTsDemux`. Unit fixture is H.264 + ADTS AAC. |
+| SRT MPEG-TS | **done** | `rsrt` (pure Rust, IPv4) into `StreamingTsDemux`. Unit fixture is H.264 + ADTS AAC. |
 | SRT Matroska / WebM | **gap** | EBML magic refused on purpose. |
 | SRT FLV, MP4/fMP4, anything else avformat probed | **gap** | MPEG-TS only. |
 | Enhanced RTMP extra A/V tracks | **done** | OneTrack and packed `ManyTracks` become distinct catalog entries keyed by `audio/{id}` / `video/{id}`. Legacy default track stays `audio` / `video`. Identical sequence headers are ignored. Changed codec configurations fail the publish; a new id after freeze is `TrackSetChanged`. HTTP e2e: two OneTrack AAC → two `STREAM-INF` audio variants. |
@@ -71,7 +71,7 @@ Delayed start and encoder priming are not the same edit list.
 
 | Publish | Result |
 |---|---|
-| `ffmpeg -re -c copy -f flv` H.264 High@L4 1080p24 GOP 2s, AAC-LC 48 kHz stereo → RTMP | Playable LL-HLS. `mediastreamvalidator -t 30`: HTTP/2 only once `--http-public-url` is set. |
+| `ff qmpeg -re -c copy -f flv` H.264 High@L4 1080p24 GOP 2s, AAC-LC 48 kHz stereo → RTMP | Playable LL-HLS. `mediastreamvalidator -t 30`: HTTP/2 only once `--http-public-url` is set. |
 | HEVC / AV1 / Opus live | Apple matrix passes for HEVC RTMP and MPEG-TS. AV1 and Opus have independent file decoding, but no live player proof. |
 | Enhanced RTMP second audio/video | HTTP e2e: two OneTrack AAC-LC variants. Apple HLS HTTPS: `rtmp_multitrack_h264_two_aac`. |
 | SRT MPEG-TS live | Apple HLS HTTPS: `srt_h264_aac` (one H.264 + one AAC). Dual-audio TS is the in-process MPEG-TS case, not a second SRT matrix row. |
