@@ -23,6 +23,10 @@
 //!
 //! The key is therefore the media-catalog revision plus the stream's exact
 //! media epoch, which advances after any rendition snapshot is published.
+//! Full and delta updates of that epoch are different bytes, so they occupy
+//! sibling slots rather than evicting each other. A sibling part still
+//! advances the epoch and invalidates every slot, because
+//! `EXT-X-RENDITION-REPORT` is in both.
 
 use std::sync::Arc;
 
@@ -32,7 +36,7 @@ use parking_lot::Mutex;
 
 use crate::domain::RenditionId;
 
-use super::{StreamSnapshot, gzip::gzip, uri::PlaylistUris};
+use super::{StreamSnapshot, gzip::gzip, project::PlaylistDelta, uri::PlaylistUris};
 
 /// Render attempts before a chasing epoch is served as-is instead.
 ///
@@ -50,6 +54,8 @@ pub struct PlaylistKey {
     catalog_revision: u64,
     /// Changes after any rendition snapshot that can affect a media playlist.
     media_revision: u64,
+    /// Full and delta of one epoch are different playlists of the same inputs.
+    skip: PlaylistDelta,
 }
 
 impl PlaylistKey {
@@ -58,20 +64,37 @@ impl PlaylistKey {
     /// Bitrate and topology updates already advance the catalog revision.
     /// Including media edges here would rebuild the multivariant playlist for
     /// every part even though none of its rendered attributes changed.
+    /// Directives such as `_HLS_skip` do not apply to the index.
     pub fn multivariant(stream: &StreamSnapshot) -> Self {
         Self {
             catalog_revision: stream.revision,
             media_revision: 0,
+            skip: PlaylistDelta::Full,
         }
     }
 
     /// Reads the current key for one media playlist of a stream.
-    pub fn media(stream: &StreamSnapshot, media_revision: u64) -> Self {
+    pub fn media(stream: &StreamSnapshot, media_revision: u64, skip: PlaylistDelta) -> Self {
         Self {
             catalog_revision: stream.media_catalog_revision,
             media_revision,
+            skip,
         }
     }
+
+    fn epoch(self) -> PlaylistEpoch {
+        PlaylistEpoch {
+            catalog_revision: self.catalog_revision,
+            media_revision: self.media_revision,
+        }
+    }
+}
+
+/// Catalog plus media epoch, shared by every skip form of one playlist.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PlaylistEpoch {
+    catalog_revision: u64,
+    media_revision: u64,
 }
 
 /// Playlist bytes in both encodings, and whether producing them cost a render.
@@ -87,12 +110,63 @@ pub struct Rendered {
     pub freshly_rendered: bool,
 }
 
-/// A rendered playlist and the inputs it was rendered from.
-#[derive(Clone, Debug, Default)]
-struct Cached {
-    key: PlaylistKey,
+/// Gzipped and plain bytes of one skip form.
+#[derive(Clone, Debug)]
+struct Encoded {
     rendered: Bytes,
     gzip: Bytes,
+}
+
+/// Every skip form rendered from one media epoch.
+///
+/// A single `latest` would let a full request evict a delta of the same
+/// epoch, and mixed traffic would re-render both. Sibling slots share the
+/// epoch so a part on another rendition still busts all of them.
+#[derive(Clone, Debug, Default)]
+struct Cached {
+    epoch: PlaylistEpoch,
+    full: Option<Encoded>,
+    skip: Option<Encoded>,
+    skip_v2: Option<Encoded>,
+}
+
+impl Cached {
+    fn get(&self, key: &PlaylistKey) -> Option<Rendered> {
+        if self.epoch != key.epoch() {
+            return None;
+        }
+        self.slot(key.skip).map(|encoded| Rendered {
+            bytes: encoded.rendered.clone(),
+            gzip: encoded.gzip.clone(),
+            freshly_rendered: false,
+        })
+    }
+
+    fn store(&mut self, key: PlaylistKey, encoded: Encoded) {
+        if self.epoch != key.epoch() {
+            *self = Self {
+                epoch: key.epoch(),
+                ..Self::default()
+            };
+        }
+        *self.slot_mut(key.skip) = Some(encoded);
+    }
+
+    fn slot(&self, skip: PlaylistDelta) -> Option<&Encoded> {
+        match skip {
+            PlaylistDelta::Full => self.full.as_ref(),
+            PlaylistDelta::Skip => self.skip.as_ref(),
+            PlaylistDelta::SkipV2 => self.skip_v2.as_ref(),
+        }
+    }
+
+    fn slot_mut(&mut self, skip: PlaylistDelta) -> &mut Option<Encoded> {
+        match skip {
+            PlaylistDelta::Full => &mut self.full,
+            PlaylistDelta::Skip => &mut self.skip,
+            PlaylistDelta::SkipV2 => &mut self.skip_v2,
+        }
+    }
 }
 
 /// One rendition's cached playlist text.
@@ -122,12 +196,7 @@ impl PlaylistCache {
             .load()
             .as_ref()
             .as_ref()
-            .filter(|cached| &cached.key == key)
-            .map(|cached| Rendered {
-                bytes: cached.rendered.clone(),
-                gzip: cached.gzip.clone(),
-                freshly_rendered: false,
-            })
+            .and_then(|cached| cached.get(key))
     }
 
     /// Returns the cached text, rendering it with `render` if it is stale.
@@ -196,11 +265,15 @@ impl PlaylistCache {
             // each. Every viewer after that is handed a refcount whichever
             // encoding they asked for.
             let gzip = gzip(&bytes);
-            self.latest.store(Arc::new(Some(Cached {
+            let mut next = self.latest.load().as_ref().clone().unwrap_or_default();
+            next.store(
                 key,
-                rendered: bytes.clone(),
-                gzip: gzip.clone(),
-            })));
+                Encoded {
+                    rendered: bytes.clone(),
+                    gzip: gzip.clone(),
+                },
+            );
+            self.latest.store(Arc::new(Some(next)));
             return Ok(Rendered {
                 bytes,
                 gzip,
@@ -253,6 +326,7 @@ mod tests {
         delivery::hls::{
             StreamStore,
             fixtures::{audio, chunk, initialization, lease, video, write, write_segment},
+            project::PlaylistDelta,
         },
         domain::RenditionId,
     };
@@ -288,6 +362,7 @@ mod tests {
                     PlaylistKey {
                         catalog_revision: 1,
                         media_revision: revision.get(),
+                        skip: PlaylistDelta::Full,
                     },
                     (),
                 ))
@@ -311,6 +386,7 @@ mod tests {
                 .get(&PlaylistKey {
                     catalog_revision: 1,
                     media_revision: 0,
+                    skip: PlaylistDelta::Full,
                 })
                 .is_none(),
             "bytes observed across a revision change are never cached"
@@ -327,12 +403,20 @@ mod tests {
             write_segment(&lease, local, 0, 0);
         }
 
-        let before = PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision());
+        let before = PlaylistKey::media(
+            &lease.live().snapshot(),
+            lease.live().media_revision(),
+            PlaylistDelta::Full,
+        );
 
         // Only the *audio* rendition advances. The video playlist's own edge is
         // untouched, but its EXT-X-RENDITION-REPORT for audio is now wrong.
         write(&lease, chunk(1, 1, 0, 6));
-        let after = PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision());
+        let after = PlaylistKey::media(
+            &lease.live().snapshot(),
+            lease.live().media_revision(),
+            PlaylistDelta::Full,
+        );
 
         assert_ne!(
             before, after,
@@ -358,11 +442,19 @@ mod tests {
         write(&lease, initialization(0, 1));
         write_segment(&lease, 0, 0, 0);
 
-        let key = PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision());
+        let key = PlaylistKey::media(
+            &lease.live().snapshot(),
+            lease.live().media_revision(),
+            PlaylistDelta::Full,
+        );
         let cache = PlaylistCache::new();
         let first = cache.get_or_render::<()>(key, || Ok("#EXTM3U\n".to_owned()))?;
         let second = cache.get_or_render::<()>(
-            PlaylistKey::media(&lease.live().snapshot(), lease.live().media_revision()),
+            PlaylistKey::media(
+                &lease.live().snapshot(),
+                lease.live().media_revision(),
+                PlaylistDelta::Full,
+            ),
             || panic!("nothing changed, so nothing should be re-rendered"),
         )?;
 
@@ -383,7 +475,8 @@ mod tests {
 
         let before = lease.live().snapshot();
         let multivariant_before = PlaylistKey::multivariant(&before);
-        let media_before = PlaylistKey::media(&before, lease.live().media_revision());
+        let media_before =
+            PlaylistKey::media(&before, lease.live().media_revision(), PlaylistDelta::Full);
 
         write(&lease, chunk(0, 1, 0, 6));
         let after = lease.live().snapshot();
@@ -395,7 +488,7 @@ mod tests {
         );
         assert_ne!(
             media_before,
-            PlaylistKey::media(&after, lease.live().media_revision()),
+            PlaylistKey::media(&after, lease.live().media_revision(), PlaylistDelta::Full),
             "the media playlist gained a part and a new live edge"
         );
     }
@@ -410,5 +503,76 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &again));
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn full_and_delta_of_one_epoch_occupy_sibling_slots() -> Result<(), ()> {
+        let cache = PlaylistCache::new();
+        let epoch = PlaylistKey::default();
+        let full = PlaylistKey {
+            skip: PlaylistDelta::Full,
+            ..epoch
+        };
+        let delta = PlaylistKey {
+            skip: PlaylistDelta::Skip,
+            ..epoch
+        };
+        let mut renders = 0;
+
+        cache.get_or_render::<()>(full, || {
+            renders += 1;
+            Ok("full".to_owned())
+        })?;
+        cache.get_or_render::<()>(delta, || {
+            renders += 1;
+            Ok("delta".to_owned())
+        })?;
+        let again_full =
+            cache.get_or_render::<()>(full, || panic!("full of this epoch is already cached"))?;
+        let again_delta =
+            cache.get_or_render::<()>(delta, || panic!("delta of this epoch is already cached"))?;
+
+        assert_eq!(renders, 2);
+        assert_eq!(again_full.bytes.as_ref(), b"full");
+        assert_eq!(again_delta.bytes.as_ref(), b"delta");
+        Ok(())
+    }
+
+    #[test]
+    fn a_siblings_advance_invalidates_every_skip_form() -> Result<(), ()> {
+        let store = StreamStore::default();
+        let lease = lease(&store, vec![video(0), audio(1)]);
+        for local in [0, 1] {
+            write(&lease, initialization(local, 1));
+            write_segment(&lease, local, 0, 0);
+        }
+
+        let revision = lease.live().media_revision();
+        let snapshot = lease.live().snapshot();
+        let full = PlaylistKey::media(&snapshot, revision, PlaylistDelta::Full);
+        let delta = PlaylistKey::media(&snapshot, revision, PlaylistDelta::Skip);
+        let cache = PlaylistCache::new();
+        cache.get_or_render::<()>(full, || Ok("full".to_owned()))?;
+        cache.get_or_render::<()>(delta, || Ok("delta".to_owned()))?;
+
+        write(&lease, chunk(1, 1, 0, 6));
+        let after_full = PlaylistKey::media(
+            &lease.live().snapshot(),
+            lease.live().media_revision(),
+            PlaylistDelta::Full,
+        );
+        let after_delta = PlaylistKey {
+            skip: PlaylistDelta::Skip,
+            ..after_full
+        };
+        cache.get_or_render::<()>(after_full, || Ok("new-full".to_owned()))?;
+
+        assert_eq!(cache.get(&after_full).as_deref(), Some(&b"new-full"[..]));
+        assert!(
+            cache.get(&after_delta).is_none(),
+            "storing one skip form of the new epoch must not keep the other \
+             form from the previous epoch"
+        );
+        Ok(())
     }
 }

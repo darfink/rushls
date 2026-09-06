@@ -7,7 +7,11 @@
 //! to, so they have to be emitted before its first `EXT-X-PART` — long before
 //! the segment itself completes.
 
-use std::num::NonZeroU8;
+use std::{
+    num::{NonZeroU8, NonZeroU64},
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::{
     delivery::hls::{
@@ -22,12 +26,19 @@ use crate::{
     domain::{RenditionId, TickTimestamp, Timebase},
 };
 
-use super::{PlaylistPolicy, ProgramDateTimePolicy, ProjectionError, timing::program_date_time};
+use super::{
+    PlaylistDelta, PlaylistPolicy, ProgramDateTimePolicy, ProjectionError,
+    timing::program_date_time,
+};
 
 /// Version 6 is the floor for `EXT-X-MAP` in a playlist of media segments.
 const VERSION_WITH_MAP: u8 = 6;
 /// Version 9 is the floor for partial segments and everything built on them.
 const VERSION_WITH_PARTS: u8 = 9;
+/// Version 9 is also the floor for `EXT-X-SKIP`.
+const VERSION_WITH_SKIP: u8 = 9;
+/// Version 10 is the floor for `RECENTLY-REMOVED-DATERANGES` on that tag.
+const VERSION_WITH_SKIP_DATERANGES: u8 = 10;
 
 /// Renders one rendition's media playlist.
 ///
@@ -40,6 +51,7 @@ pub fn media_playlist(
     server_control: Option<ServerControl>,
     policy: &PlaylistPolicy,
     uris: &PlaylistUris,
+    delta: PlaylistDelta,
 ) -> Result<String, ProjectionError> {
     let contract = rendition.contract;
     let names = uris.within(rendition.rendition_id, contract.segment_format);
@@ -50,9 +62,13 @@ pub fn media_playlist(
         })?
         .timebase;
 
+    let skip_count = skipped_parents(rendition, server_control, delta, timebase);
     let mut out = String::with_capacity(estimated_size(rendition));
     let mut writer = MediaPlaylistWriter::new(&mut out)?;
-    writer.version(version(contract.is_chunked()))?;
+    writer.version(version(
+        contract.is_chunked(),
+        (skip_count > 0).then_some(delta),
+    ))?;
     writer.target_duration(contract.target_duration)?;
     if let Some(control) = server_control {
         writer.server_control(control)?;
@@ -60,6 +76,8 @@ pub fn media_playlist(
     if let Some(part_target) = contract.part_target {
         writer.part_information(part_target)?;
     }
+    // MEDIA-SEQUENCE is the window head, including skipped parents.
+    // SKIPPED-SEGMENTS is how a client reconstructs that prefix.
     writer.media_sequence(rendition.media_sequence)?;
     if rendition.discontinuity_sequence > 0 {
         writer.discontinuity_sequence(rendition.discontinuity_sequence)?;
@@ -70,7 +88,20 @@ pub fn media_playlist(
     // segment unless asked for.
     let mut state = Emitted::default();
     let mut uri = String::new();
-    for segment in rendition.segments.iter() {
+    let parents: &[Arc<StoredSegment>] = &rendition.segments;
+    let (skipped, remaining) = parents.split_at(skip_count);
+    // Walk the omitted prefix so discontinuity / PDT / in-effect MAP match the
+    // full playlist. The first survivor is not the playlist head.
+    for segment in skipped {
+        observe_parent(&mut state, segment, names.has_initialization());
+    }
+    if let Some(count) = NonZeroU64::new(u64::try_from(skip_count).unwrap_or(0)) {
+        writer.skipped_segments(count, delta.recently_removed_dateranges())?;
+        // Re-emit the MAP in effect. A tail cut that omits it is merge-correct
+        // (the MAP sat on skipped parents) and validator-hostile.
+        state.initialization = None;
+    }
+    for segment in remaining {
         write_parent_tags(
             &mut writer,
             &mut state,
@@ -172,6 +203,64 @@ impl From<&OpenSegment> for ParentSegment {
 struct Emitted {
     initialization: Option<InitializationId>,
     any_segment: bool,
+}
+
+/// Records a parent that will not be written, so later tags see the same
+/// in-effect MAP and PDT state the full playlist would have.
+fn observe_parent(state: &mut Emitted, segment: &StoredSegment, has_initialization: bool) {
+    if has_initialization {
+        state.initialization = Some(segment.initialization);
+    }
+    state.any_segment = true;
+}
+
+/// How many completed parents a delta may replace with `EXT-X-SKIP`.
+///
+/// Skip is refused on a terminal playlist, when nothing was advertised, and
+/// when the client did not ask for a delta. A short live window still
+/// advertises `CAN-SKIP-UNTIL` and produces a no-op (no `EXT-X-SKIP`).
+fn skipped_parents(
+    rendition: &RenditionSnapshot,
+    server_control: Option<ServerControl>,
+    delta: PlaylistDelta,
+    timebase: Timebase,
+) -> usize {
+    if matches!(delta, PlaylistDelta::Full) || rendition.live_edge.ended {
+        return 0;
+    }
+    let Some(until) = server_control.and_then(|control| control.can_skip_until) else {
+        return 0;
+    };
+    skipped_parent_count(&rendition.segments, until, timebase)
+}
+
+/// Parents whose end is further than `can_skip_until` from the last completed
+/// parent's end.
+///
+/// Distance is playlist time (`EXTINF`), not the LL-HLS live edge: open parts
+/// are not a Media Segment. The last parent is never skipped, and a parent
+/// whose end lands exactly on the boundary stays — the spec replaces only
+/// what is further than the advertised skip. Parts are not segments.
+fn skipped_parent_count(
+    segments: &[Arc<StoredSegment>],
+    can_skip_until: Duration,
+    timebase: Timebase,
+) -> usize {
+    let mut parents = segments.iter().rev();
+    let Some(mut closer) = parents.next() else {
+        return 0;
+    };
+    let mut distance = Duration::ZERO;
+    let mut kept = 1;
+    for parent in parents {
+        distance = distance.saturating_add(timebase.ticks_to_duration(closer.duration));
+        if distance > can_skip_until {
+            break;
+        }
+        kept += 1;
+        closer = parent;
+    }
+    segments.len().saturating_sub(kept)
 }
 
 /// Writes the tags that describe a parent segment rather than its media.
@@ -281,12 +370,17 @@ fn write_rendition_reports(
     Ok(())
 }
 
-fn version(chunked: bool) -> NonZeroU8 {
-    let version = if chunked {
+fn version(chunked: bool, skip: Option<PlaylistDelta>) -> NonZeroU8 {
+    let mut version = if chunked {
         VERSION_WITH_PARTS
     } else {
         VERSION_WITH_MAP
     };
+    match skip {
+        Some(PlaylistDelta::Skip) => version = version.max(VERSION_WITH_SKIP),
+        Some(PlaylistDelta::SkipV2) => version = version.max(VERSION_WITH_SKIP_DATERANGES),
+        None | Some(PlaylistDelta::Full) => {}
+    }
     NonZeroU8::new(version).unwrap_or(NonZeroU8::MIN)
 }
 

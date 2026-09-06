@@ -9,7 +9,9 @@
 use std::time::{Duration, SystemTime};
 
 use crate::{
-    delivery::hls::{DurationRule, PlaylistContract, TargetDurationMultiple, manifest::ServerControl},
+    delivery::hls::{
+        DurationRule, PlaylistContract, TargetDurationMultiple, manifest::ServerControl,
+    },
     domain::{TickTimestamp, Timebase},
 };
 
@@ -56,10 +58,11 @@ impl Default for DeliveryTimingPolicy {
 /// though each value was individually reasonable, so the widest cadence present
 /// sets the value for all of them.
 ///
-/// `CAN-SKIP-UNTIL` is deliberately absent: advertising a skip boundary commits
-/// the origin to rendering Playlist Delta Updates, and until that exists the
-/// honest advertisement is silence rather than a promise keyed on how much
-/// happens to be retained.
+/// `CAN-SKIP-UNTIL` is six times the widest target duration — the protocol
+/// floor — and is derived from `segment` the same way hold-back is. Advertising
+/// it commits the origin to rendering `EXT-X-SKIP`; that rendering ships with
+/// this value. `CAN-SKIP-DATERANGES` stays off (omitted): `NO` is not a spec
+/// value, and well-behaved clients will not send `_HLS_skip=v2` without `YES`.
 pub fn server_control(
     contracts: impl IntoIterator<Item = PlaylistContract>,
     policy: DeliveryTimingPolicy,
@@ -78,11 +81,12 @@ pub fn server_control(
         }
     }
 
+    let longest_target = longest_target?;
     Some(ServerControl {
-        hold_back: Some(policy.hold_back.apply(longest_target?)),
+        hold_back: Some(policy.hold_back.apply(longest_target)),
         part_hold_back: longest_part_target.map(|target| policy.part_hold_back.resolve(target)),
         can_block_reload: policy.can_block_reload,
-        can_skip_until: None,
+        can_skip_until: Some(TargetDurationMultiple::integer(6).apply(longest_target)),
         can_skip_dateranges: false,
     })
 }
@@ -164,8 +168,13 @@ mod tests {
         assert_eq!(control.part_hold_back, Some(Duration::from_secs(6)));
         assert!(control.can_block_reload);
         assert_eq!(
-            control.can_skip_until, None,
-            "a skip boundary is a promise to render delta updates"
+            control.can_skip_until,
+            Some(Duration::from_secs(36)),
+            "six times the widest target, the protocol floor for a skip boundary"
+        );
+        assert!(
+            !control.can_skip_dateranges,
+            "an explicit CAN-SKIP-DATERANGES=NO is not a spec value"
         );
     }
 

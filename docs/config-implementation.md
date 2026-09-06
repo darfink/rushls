@@ -328,12 +328,12 @@ at no less than six target durations, and it bounds what one delta response may
 omit, not what the playlist advertises — a client without a prior copy still
 gets the full window. It is derived from `segment`.
 
-Delta playlists stay withheld until they can ship whole: advertising a skip
+Delta playlists ship advertisement and rendering together: advertising a skip
 boundary commits the origin to rendering skipped playlists, and `EXT-X-SKIP`
-requires `EXT-X-VERSION` 9. Collapsing the two windows into `retain` is
-independent of that work and can land first; what depends on deltas is whether
-a *deep* `retain` is affordable to advertise, which is a performance property
-rather than a correctness one.
+requires `EXT-X-VERSION` 9 (10 when `RECENTLY-REMOVED-DATERANGES` is present).
+Collapsing the two windows into `retain` is independent of that work; what
+depends on deltas is whether a *deep* `retain` is affordable to advertise,
+which is a performance property rather than a correctness one.
 
 The one thing that must not be lost is the grace period for a segment that has
 just left the window while a client is still fetching it. That is seconds,

@@ -21,6 +21,8 @@
 //! because the directive is part of the URL: `_HLS_msn=7` names one exact
 //! playlist state, so the bytes answering it can never become wrong, while a
 //! bare playlist URL means "the live edge" and is stale as it is written.
+//! `_HLS_skip` does not change that: skip-only is still the live edge, and
+//! skip combined with `_HLS_msn` / `_HLS_part` names one state.
 
 use std::time::Duration;
 

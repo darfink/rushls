@@ -1,18 +1,19 @@
 //! Projection tests, driven through a real store rather than hand-built
 //! snapshots.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::{
     delivery::hls::{
-        RenditionSnapshot, StreamLease, StreamSnapshot, StreamStore,
+        RenditionSnapshot, RetentionPolicy, StoreLimits, StreamLease, StreamSnapshot, StreamStore,
         fixtures::{
             audio, chunk, initialization, lease, stream_id, subtitle, subtitle_with_parts, video,
             write, write_direct, write_segment,
         },
         project::{
-            DeliveryTimingPolicy, PlaylistPolicy, ProgramDateTimePolicy, media::media_playlist,
-            multivariant::multivariant_playlist, presentation_server_control,
+            DeliveryTimingPolicy, PlaylistDelta, PlaylistPolicy, ProgramDateTimePolicy,
+            media::media_playlist, multivariant::multivariant_playlist,
+            presentation_server_control,
         },
         uri::{PlaylistUris, UriBase},
     },
@@ -48,7 +49,32 @@ fn render(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let (stream, media) = snapshots(lease, rendition)?;
     let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
-    Ok(media_playlist(&stream, &media, control, policy, &uris())?)
+    Ok(media_playlist(
+        &stream,
+        &media,
+        control,
+        policy,
+        &uris(),
+        PlaylistDelta::Full,
+    )?)
+}
+
+fn render_delta(
+    lease: &StreamLease,
+    rendition: u32,
+    policy: &PlaylistPolicy,
+    delta: PlaylistDelta,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let (stream, media) = snapshots(lease, rendition)?;
+    let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
+    Ok(media_playlist(
+        &stream,
+        &media,
+        control,
+        policy,
+        &uris(),
+        delta,
+    )?)
 }
 
 #[test]
@@ -70,12 +96,16 @@ fn a_live_playlist_states_its_terms_before_any_media() -> Result<(), Box<dyn std
             "#EXTM3U",
             "#EXT-X-VERSION:9",
             "#EXT-X-TARGETDURATION:6",
-            "#EXT-X-SERVER-CONTROL:HOLD-BACK=18,PART-HOLD-BACK=3,CAN-BLOCK-RELOAD=YES",
+            "#EXT-X-SERVER-CONTROL:HOLD-BACK=18,PART-HOLD-BACK=3,CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=36",
             "#EXT-X-PART-INF:PART-TARGET=1",
             "#EXT-X-MEDIA-SEQUENCE:0",
         ],
         "the target, the part target, and the hold-backs all come from the \
          locked plan, so they are known before a single segment exists"
+    );
+    assert!(
+        !rendered.contains("CAN-SKIP-DATERANGES"),
+        "CAN-SKIP-DATERANGES=NO is not a spec value; omit it"
     );
     Ok(())
 }
@@ -273,7 +303,14 @@ fn a_configured_base_makes_every_name_absolute() -> Result<(), Box<dyn std::erro
     let (stream, media) = snapshots(&lease, 0)?;
     let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
     let uris = UriBase::new("https://cdn.example.com/hls").uris(&stream_id());
-    let rendered = media_playlist(&stream, &media, control, &policy(), &uris)?;
+    let rendered = media_playlist(
+        &stream,
+        &media,
+        control,
+        &policy(),
+        &uris,
+        PlaylistDelta::Full,
+    )?;
     let multivariant = multivariant_playlist(&stream, &policy(), &uris)?
         .ok_or_else(|| std::io::Error::other("an attached publication has a topology"))?;
 
@@ -604,5 +641,359 @@ fn a_stream_nobody_has_published_to_has_no_presentation() -> Result<(), Box<dyn 
     let lease = store.lease_without_presentation(stream_id())?;
 
     assert!(multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?.is_none());
+    Ok(())
+}
+
+fn long_window() -> StreamStore {
+    StreamStore::new(StoreLimits {
+        retention: RetentionPolicy {
+            retain: Duration::from_hours(2),
+            ..RetentionPolicy::default()
+        },
+        ..StoreLimits::default()
+    })
+}
+
+fn publish_parents(lease: &StreamLease, local: u32, count: u64) {
+    write(lease, initialization(local, 1));
+    for id in 0..count {
+        write_segment(
+            lease,
+            local,
+            id,
+            i64::try_from(id).expect("fixture id fits i64") * 6,
+        );
+    }
+}
+
+fn playlist_version(playlist: &str) -> Option<u8> {
+    playlist.lines().find_map(|line| {
+        line.strip_prefix("#EXT-X-VERSION:")
+            .and_then(|value| value.parse().ok())
+    })
+}
+
+fn playlist_media_sequence(playlist: &str) -> Option<u64> {
+    playlist.lines().find_map(|line| {
+        line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:")
+            .and_then(|value| value.parse().ok())
+    })
+}
+
+fn skipped_segment_count(playlist: &str) -> Option<u64> {
+    playlist.lines().find_map(|line| {
+        line.strip_prefix("#EXT-X-SKIP:")
+            .and_then(|rest| {
+                rest.split(',')
+                    .find_map(|attribute| attribute.strip_prefix("SKIPPED-SEGMENTS="))
+            })
+            .and_then(|value| value.parse().ok())
+    })
+}
+
+fn media_uris(playlist: &str) -> Vec<&str> {
+    playlist
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .collect()
+}
+
+#[test]
+fn a_short_window_still_advertises_skip_and_serves_a_noop_delta()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+
+    let full = render(&lease, 0, &policy())?;
+    let delta = render_delta(&lease, 0, &policy(), PlaylistDelta::Skip)?;
+
+    assert!(full.contains("CAN-SKIP-UNTIL=36"));
+    assert!(!full.contains("#EXT-X-SKIP"));
+    assert_eq!(
+        delta, full,
+        "a window shorter than the skip boundary is a full playlist with no \
+         EXT-X-SKIP, which is what a client that asked to skip still receives"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_delta_keeps_media_sequence_skips_parents_and_reemits_the_map()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = long_window();
+    let lease = lease(&store, vec![video(0)]);
+    publish_parents(&lease, 0, 10);
+
+    let full = render(&lease, 0, &policy())?;
+    let delta = render_delta(&lease, 0, &policy(), PlaylistDelta::Skip)?;
+
+    assert_eq!(playlist_media_sequence(&full), Some(0));
+    assert_eq!(
+        playlist_media_sequence(&delta),
+        playlist_media_sequence(&full),
+        "MEDIA-SEQUENCE is the window head, including skipped parents"
+    );
+    assert_eq!(
+        skipped_segment_count(&delta),
+        Some(3),
+        "ten 6s parents, skip 36s from the last end, equal-to-boundary stays: {delta}"
+    );
+    assert_eq!(playlist_version(&delta), Some(9));
+    assert!(
+        !delta.contains("CAN-SKIP-DATERANGES"),
+        "an explicit NO is not a spec value: {delta}"
+    );
+
+    let skipped = usize::try_from(skipped_segment_count(&delta).expect("delta skips"))?;
+    assert_eq!(&media_uris(&delta)[..], &media_uris(&full)[skipped..]);
+    assert!(
+        !delta.contains("segment/1.m4s"),
+        "skipped parents and their parts are omitted: {delta}"
+    );
+    assert!(
+        delta.contains("segment/4.m4s"),
+        "the first survivor remains: {delta}"
+    );
+
+    let after_skip = delta
+        .split_once("#EXT-X-SKIP:")
+        .ok_or_else(|| std::io::Error::other("delta contains EXT-X-SKIP"))?
+        .1;
+    assert!(
+        after_skip.contains("#EXT-X-MAP:URI=\"init/1.mp4\""),
+        "re-emit the MAP in effect on the first unskipped parent: {delta}"
+    );
+    assert_eq!(
+        delta.matches("#EXT-X-PROGRAM-DATE-TIME").count(),
+        0,
+        "the first survivor is not the playlist head, so PDT stays where the \
+         full playlist put it — on the skipped first parent: {delta}"
+    );
+    assert_eq!(full.matches("#EXT-X-PROGRAM-DATE-TIME").count(), 1);
+    let dense = PlaylistPolicy {
+        program_date_time: ProgramDateTimePolicy::EverySegment,
+        ..policy()
+    };
+    let dense_full = render(&lease, 0, &dense)?;
+    let dense_delta = render_delta(&lease, 0, &dense, PlaylistDelta::Skip)?;
+    let dense_skipped = usize::try_from(skipped_segment_count(&dense_delta).expect("skips"))?;
+    assert_eq!(
+        dense_delta.matches("#EXT-X-PROGRAM-DATE-TIME").count(),
+        dense_full.matches("#EXT-X-PROGRAM-DATE-TIME").count() - dense_skipped,
+        "PDT on remaining parents matches the full playlist's tags"
+    );
+    assert!(
+        !delta.contains("#EXT-X-DISCONTINUITY\n"),
+        "discontinuity on the first survivor only if that parent had it"
+    );
+    Ok(())
+}
+
+#[test]
+fn skipped_segments_counts_parents_not_parts() -> Result<(), Box<dyn std::error::Error>> {
+    let store = long_window();
+    let lease = lease(&store, vec![video(0)]);
+    publish_parents(&lease, 0, 10);
+    write(&lease, chunk(0, 10, 0, 60));
+
+    let delta = render_delta(&lease, 0, &policy(), PlaylistDelta::Skip)?;
+
+    assert_eq!(skipped_segment_count(&delta), Some(3));
+    assert!(
+        delta.contains("#EXT-X-PART:DURATION=1,URI=\"part/61.m4s\",INDEPENDENT=YES\n"),
+        "open parts always stay: {delta}"
+    );
+    assert!(
+        delta.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part/62.m4s\"\n"),
+        "preload hints always stay: {delta}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_segment_only_delta_is_version_9() -> Result<(), Box<dyn std::error::Error>> {
+    let store = long_window();
+    let lease = lease(&store, vec![video(0), subtitle(1)]);
+    write(&lease, initialization(1, 1));
+    for id in 0..10 {
+        write_direct(
+            &lease,
+            1,
+            id,
+            i64::try_from(id).expect("fixture id fits i64") * 6,
+        );
+    }
+
+    let full = render(&lease, 1, &policy())?;
+    let delta = render_delta(&lease, 1, &policy(), PlaylistDelta::Skip)?;
+
+    assert_eq!(playlist_version(&full), Some(6));
+    assert_eq!(
+        playlist_version(&delta),
+        Some(9),
+        "EXT-X-SKIP requires version 9 even on a segment-only playlist: {delta}"
+    );
+    assert_eq!(skipped_segment_count(&delta), Some(3));
+    Ok(())
+}
+
+#[test]
+fn a_v2_delta_carries_empty_dateranges_and_is_version_10() -> Result<(), Box<dyn std::error::Error>>
+{
+    let store = long_window();
+    let lease = lease(&store, vec![video(0)]);
+    publish_parents(&lease, 0, 10);
+
+    let delta = render_delta(&lease, 0, &policy(), PlaylistDelta::SkipV2)?;
+
+    assert_eq!(playlist_version(&delta), Some(10));
+    assert!(
+        delta.contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=3,RECENTLY-REMOVED-DATERANGES=\"\"\n"),
+        "v2 must carry the attribute even when no date ranges were removed: {delta}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_terminal_playlist_ignores_skip() -> Result<(), Box<dyn std::error::Error>> {
+    let store = long_window();
+    let lease = lease(&store, vec![video(0)]);
+    publish_parents(&lease, 0, 10);
+    lease.end();
+
+    let full = render(&lease, 0, &policy())?;
+    let delta = render_delta(&lease, 0, &policy(), PlaylistDelta::Skip)?;
+
+    assert!(full.contains("#EXT-X-ENDLIST"));
+    assert_eq!(delta, full);
+    assert!(!delta.contains("#EXT-X-SKIP"));
+    Ok(())
+}
+
+#[test]
+fn successive_deltas_name_the_same_tail_as_the_full_playlist()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = long_window();
+    let lease = lease(&store, vec![video(0)]);
+    publish_parents(&lease, 0, 10);
+
+    let first_full = render(&lease, 0, &policy())?;
+    let first_delta = render_delta(&lease, 0, &policy(), PlaylistDelta::Skip)?;
+    let first_skipped = usize::try_from(skipped_segment_count(&first_delta).expect("skips"))?;
+    assert_eq!(
+        &media_uris(&first_delta)[..],
+        &media_uris(&first_full)[first_skipped..]
+    );
+
+    write_segment(&lease, 0, 10, 60);
+    write_segment(&lease, 0, 11, 66);
+
+    let second_full = render(&lease, 0, &policy())?;
+    let second_delta = render_delta(&lease, 0, &policy(), PlaylistDelta::Skip)?;
+    let second_skipped = usize::try_from(skipped_segment_count(&second_delta).expect("skips"))?;
+    assert_eq!(
+        &media_uris(&second_delta)[..],
+        &media_uris(&second_full)[second_skipped..],
+        "a merge of the skipped prefix from the previous full playlist with \
+         this delta's tail is the full playlist at this epoch"
+    );
+    assert_eq!(
+        playlist_media_sequence(&second_full),
+        playlist_media_sequence(&second_delta)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_skipped_discontinuity_does_not_move_the_sequence_number()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = long_window();
+    let first = lease(&store, vec![video(0)]);
+    write(&first, initialization(0, 1));
+    write_segment(&first, 0, 0, 0);
+
+    let second = lease(&store, vec![video(0)]);
+    write(&second, initialization(0, 2));
+    for id in 0..10 {
+        write_segment(
+            &second,
+            0,
+            id,
+            i64::try_from(id).expect("fixture id fits i64") * 6,
+        );
+    }
+
+    let full = render(&second, 0, &policy())?;
+    let delta = render_delta(&second, 0, &policy(), PlaylistDelta::Skip)?;
+
+    assert!(full.contains("#EXT-X-DISCONTINUITY\n"));
+    assert!(
+        !full.contains("#EXT-X-DISCONTINUITY-SEQUENCE"),
+        "the discontinuity is still in the window"
+    );
+    assert_eq!(
+        playlist_media_sequence(&full),
+        playlist_media_sequence(&delta)
+    );
+    assert!(
+        !delta.contains("#EXT-X-DISCONTINUITY-SEQUENCE"),
+        "skipping a discontinuity does not count it as departed: {delta}"
+    );
+    Ok(())
+}
+
+#[test]
+fn discontinuity_on_the_first_survivor_stays_on_that_parent()
+-> Result<(), Box<dyn std::error::Error>> {
+    // Eight 6s parents: skip 1, keep 7. The takeover's first segment is the
+    // survivor, so its EXT-X-DISCONTINUITY must still be written after SKIP.
+    let store = long_window();
+    let first = lease(&store, vec![video(0)]);
+    write(&first, initialization(0, 1));
+    write_segment(&first, 0, 0, 0);
+
+    let second = lease(&store, vec![video(0)]);
+    write(&second, initialization(0, 2));
+    for id in 0..7 {
+        write_segment(
+            &second,
+            0,
+            id,
+            i64::try_from(id).expect("fixture id fits i64") * 6,
+        );
+    }
+
+    let full = render(&second, 0, &policy())?;
+    let delta = render_delta(&second, 0, &policy(), PlaylistDelta::Skip)?;
+
+    assert_eq!(skipped_segment_count(&delta), Some(1), "{delta}");
+    assert!(full.contains("#EXT-X-DISCONTINUITY\n"));
+    let after_skip = delta
+        .split_once("#EXT-X-SKIP:")
+        .ok_or_else(|| std::io::Error::other("delta contains EXT-X-SKIP"))?
+        .1;
+    assert!(
+        after_skip.contains("#EXT-X-DISCONTINUITY\n"),
+        "the first survivor had a discontinuity in the full playlist: {delta}"
+    );
+    Ok(())
+}
+
+#[test]
+fn siblings_are_still_reported_on_a_delta() -> Result<(), Box<dyn std::error::Error>> {
+    let store = long_window();
+    let lease = lease(&store, vec![video(0), audio(1)]);
+    publish_parents(&lease, 0, 10);
+    write(&lease, initialization(1, 1));
+    write_segment(&lease, 1, 0, 0);
+
+    let delta = render_delta(&lease, 0, &policy(), PlaylistDelta::Skip)?;
+
+    assert!(
+        delta.contains("#EXT-X-RENDITION-REPORT:URI=\"../1/audio.m3u8\""),
+        "rendition reports are playlist-global and always stay: {delta}"
+    );
     Ok(())
 }

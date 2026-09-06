@@ -1013,6 +1013,16 @@ async fn unknown_resources_and_bad_directives_are_told_apart() {
             404,
             "public, max-age=24",
         ),
+        (
+            "/live/camera/9/video.m3u8?_HLS_skip=YES",
+            404,
+            "public, max-age=6",
+        ),
+        (
+            "/live/camera/9/video.m3u8?_HLS_skip=YES&_HLS_msn=1",
+            404,
+            "public, max-age=24",
+        ),
         ("/live/camera/0/video.m3u8?_HLS_part=2", 400, "no-cache"),
         ("/live/camera/0/video.m3u8?_HLS_msn=9999", 400, "no-cache"),
     ] {
@@ -1020,6 +1030,20 @@ async fn unknown_resources_and_bad_directives_are_told_apart() {
         assert_eq!(reply.status, expected, "{target}");
         assert_eq!(reply.header("cache-control"), Some(caching), "{target}");
     }
+
+    let unknown_skip = request(
+        harness.address,
+        "GET",
+        "/live/camera/0/video.m3u8?_HLS_skip=nope",
+        &[],
+    )
+    .await;
+    assert_eq!(unknown_skip.status, 200, "unknown skip is a full playlist");
+    assert!(
+        !String::from_utf8(unknown_skip.body)
+            .expect("a playlist is text")
+            .contains("#EXT-X-SKIP")
+    );
 
     let rejected = request(harness.address, "POST", "/live/camera/index.m3u8", &[]).await;
     assert_eq!(rejected.status, 405);
@@ -1263,6 +1287,56 @@ mod end_to_end {
         (node, session)
     }
 
+    fn media_uris(playlist: &str) -> Vec<&str> {
+        playlist
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect()
+    }
+
+    fn assert_delta_matches_full(full: &str, delta: &str) {
+        if let Some(count) = delta.lines().find_map(|line| {
+            line.strip_prefix("#EXT-X-SKIP:SKIPPED-SEGMENTS=")
+                .and_then(|rest| rest.split(',').next()?.parse().ok())
+        }) {
+            assert_eq!(media_uris(delta), media_uris(full)[count..]);
+        } else {
+            assert_eq!(
+                delta, full,
+                "a window that cannot skip answers YES with the full playlist"
+            );
+        }
+    }
+
+    async fn fetch_media_and_delta(address: std::net::SocketAddr) -> String {
+        let media = request(address, "GET", "/live/camera/0/audio.m3u8", &[]).await;
+        assert_eq!(media.status, 200);
+        let media = String::from_utf8(media.body).expect("media playlist is text");
+        assert!(media.contains("#EXT-X-MAP:"));
+        assert!(media.contains("segment/"));
+        assert!(
+            media.contains("CAN-SKIP-UNTIL="),
+            "skip is advertised once rendering exists: {media}"
+        );
+        assert!(
+            !media.contains("#EXT-X-SKIP"),
+            "a non-skip client fetches the full URL: {media}"
+        );
+        let skipped = request(
+            address,
+            "GET",
+            "/live/camera/0/audio.m3u8?_HLS_skip=YES",
+            &[],
+        )
+        .await;
+        assert_eq!(skipped.status, 200);
+        assert_delta_matches_full(
+            &media,
+            &String::from_utf8(skipped.body).expect("delta playlist is text"),
+        );
+        media
+    }
+
     #[tokio::test]
     async fn avformat_through_normalization_cmaf_hls_and_http_is_playable() {
         let (node, session) = node();
@@ -1300,11 +1374,7 @@ mod end_to_end {
                 // so without anyone having to resolve rendition 0 first.
                 .contains("\n0/audio.m3u8\n")
         );
-        let media = request(address, "GET", "/live/camera/0/audio.m3u8", &[]).await;
-        assert_eq!(media.status, 200);
-        let media = String::from_utf8(media.body).expect("media playlist is text");
-        assert!(media.contains("#EXT-X-MAP:"));
-        assert!(media.contains("segment/"));
+        let media = fetch_media_and_delta(address).await;
         let initialization = media
             .lines()
             .find_map(|line| {

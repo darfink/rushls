@@ -37,6 +37,32 @@ mod tests;
 
 pub use timing::DeliveryTimingPolicy;
 
+/// Which Media Playlist form a client asked this origin to render.
+///
+/// `_HLS_skip=YES` and `_HLS_skip=v2` select a Playlist Delta Update; anything
+/// else — including an absent or unknown value — is the full window. Unknown
+/// values are not errors: they are forward-compatible protocol extensions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PlaylistDelta {
+    #[default]
+    Full,
+    /// Omit completed parents further than `CAN-SKIP-UNTIL` from the last one.
+    Skip,
+    /// The same skip, plus empty `RECENTLY-REMOVED-DATERANGES` (version 10).
+    SkipV2,
+}
+
+impl PlaylistDelta {
+    /// Present only on a `v2` delta, and empty until this origin tracks
+    /// date-range identity. The attribute is what requires version 10.
+    pub fn recently_removed_dateranges(self) -> Option<&'static str> {
+        match self {
+            Self::SkipV2 => Some(""),
+            Self::Full | Self::Skip => None,
+        }
+    }
+}
+
 /// When a playlist restates the wall-clock time of its media.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ProgramDateTimePolicy {

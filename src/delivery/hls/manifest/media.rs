@@ -119,8 +119,15 @@ impl<'a> MediaPlaylistWriter<'a> {
         Ok(self)
     }
 
-    pub fn skipped_segments(&mut self, count: NonZeroU64) -> ManifestWriteResult<&mut Self> {
-        writeln!(self.out, "#EXT-X-SKIP:SKIPPED-SEGMENTS={count}")?;
+    pub fn skipped_segments(
+        &mut self,
+        count: NonZeroU64,
+        recently_removed_dateranges: Option<&str>,
+    ) -> ManifestWriteResult<&mut Self> {
+        let mut attributes = AttributeList::new(self.out, "EXT-X-SKIP");
+        attributes.plain("SKIPPED-SEGMENTS", count)?;
+        attributes.optional_quoted("RECENTLY-REMOVED-DATERANGES", recently_removed_dateranges)?;
+        attributes.end()?;
         Ok(self)
     }
 
@@ -170,6 +177,7 @@ pub struct ServerControl {
     pub part_hold_back: Option<Duration>,
     pub can_block_reload: bool,
     pub can_skip_until: Option<Duration>,
+    /// Written only as `YES`. Absence already means no; `NO` is not a spec value.
     pub can_skip_dateranges: bool,
 }
 
@@ -313,6 +321,24 @@ mod tests {
             concat!(
                 "#EXTM3U\n",
                 "#EXT-X-PROGRAM-DATE-TIME:2023-11-14T22:13:20.123456789Z\n",
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn renders_a_skip_tag_and_an_empty_daterange_attribute() -> Result<(), ManifestWriteError> {
+        let mut rendered = String::new();
+        let mut writer = MediaPlaylistWriter::new(&mut rendered)?;
+        writer.skipped_segments(nz::u64!(4), None)?;
+        writer.skipped_segments(nz::u64!(4), Some(""))?;
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "#EXTM3U\n",
+                "#EXT-X-SKIP:SKIPPED-SEGMENTS=4\n",
+                "#EXT-X-SKIP:SKIPPED-SEGMENTS=4,RECENTLY-REMOVED-DATERANGES=\"\"\n",
             )
         );
         Ok(())

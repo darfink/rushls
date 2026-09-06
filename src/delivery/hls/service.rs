@@ -26,8 +26,9 @@ use crate::{
         cache::{PlaylistKey, StreamPlaylistCache},
         cache_control::CacheControlPolicy,
         project::{
-            self, DeliveryTimingPolicy, PlaylistPolicy, ProjectionError, media::media_playlist,
-            multivariant::multivariant_playlist, timing::blocking_reload_deadline,
+            self, DeliveryTimingPolicy, PlaylistDelta, PlaylistPolicy, ProjectionError,
+            media::media_playlist, multivariant::multivariant_playlist,
+            timing::blocking_reload_deadline,
         },
         uri::{Resource, UriBase, parse_path},
     },
@@ -145,11 +146,23 @@ pub struct Request {
     pub resource: Resource,
     /// The playlist-reload directive carried by this manifest request.
     pub blocking: Option<BlockingReload>,
+    /// Playlist Delta Update request. Ignored on the multivariant playlist.
+    pub skip: PlaylistDelta,
 }
 
 impl Request {
     pub fn new(resource: Resource, blocking: Option<BlockingReload>) -> Self {
-        Self { resource, blocking }
+        Self {
+            resource,
+            blocking,
+            skip: PlaylistDelta::Full,
+        }
+    }
+
+    #[must_use]
+    pub fn with_skip(mut self, skip: PlaylistDelta) -> Self {
+        self.skip = skip;
+        self
     }
 }
 
@@ -223,12 +236,15 @@ impl Service {
         let Ok(named) = parse_path(path) else {
             return Err(self.unrouted(DeliveryError::UnknownResource));
         };
-        let blocking = match parse_directives(query) {
-            Ok(blocking) => blocking,
+        let directives = match parse_directives(query) {
+            Ok(directives) => directives,
             Err(error) => return Err(self.unrouted(error)),
         };
-        self.serve(&named.stream, Request::new(named.resource, blocking))
-            .await
+        self.serve(
+            &named.stream,
+            Request::new(named.resource, directives.blocking).with_skip(directives.skip),
+        )
+        .await
     }
 
     /// Drops cached manifests for streams the store just retired.
@@ -295,6 +311,7 @@ impl Service {
                 let (target, blocking) = request.map_or((None, false), |(stream, request)| {
                     (
                         self.target_duration(stream, request.resource),
+                        // Skip-only names the live edge, not one playlist state.
                         request.blocking.is_some(),
                     )
                 });
@@ -332,8 +349,7 @@ impl Service {
         match request.resource {
             Resource::Multivariant => self.multivariant(stream, &live),
             Resource::MediaPlaylist(rendition, _) => {
-                self.media_playlist(stream, &live, rendition, request.resource, request.blocking)
-                    .await
+                self.media_playlist(stream, &live, rendition, request).await
             }
         }
     }
@@ -376,11 +392,11 @@ impl Service {
         stream_id: &StreamId,
         live: &Arc<LiveStream>,
         rendition: RenditionId,
-        resource: Resource,
-        blocking: Option<BlockingReload>,
+        request: Request,
     ) -> Result<Response, DeliveryError> {
-        let snapshot = Self::rendition_for(live, resource)?;
+        let snapshot = Self::rendition_for(live, request.resource)?;
         let deadline = blocking_reload_deadline(snapshot.contract, self.config.timing);
+        let blocking = request.blocking;
 
         if let Some(blocking) = blocking {
             // A terminal playlist will never advance, so a directive naming
@@ -415,13 +431,14 @@ impl Service {
         }
 
         let caches = self.cache_for(stream_id);
+        let skip = request.skip;
         let rendered = caches.rendition(rendition).get_or_render_stable(
             || -> Result<_, DeliveryError> {
                 let media_revision = live.media_revision();
                 let stream = live.snapshot();
-                let snapshot = rendition_for_stream(&stream, resource)?;
+                let snapshot = rendition_for_stream(&stream, request.resource)?;
                 Ok((
-                    PlaylistKey::media(&stream, media_revision),
+                    PlaylistKey::media(&stream, media_revision, skip),
                     (stream, snapshot),
                 ))
             },
@@ -433,6 +450,7 @@ impl Service {
                     control,
                     &self.config.playlist,
                     caches.uris(),
+                    skip,
                 )?)
             },
         )?;
@@ -443,6 +461,8 @@ impl Service {
             HLS_CONTENT_TYPE,
             self.config.cache_control.playlist(
                 Some(target_duration_of(snapshot.contract)),
+                // Skip-only is still the live edge. Skip plus `_HLS_msn` /
+                // `_HLS_part` names one playlist state.
                 blocking.is_some(),
             ),
         ))
@@ -510,12 +530,13 @@ impl Service {
     }
 }
 
-fn parse_directives(query: Option<&str>) -> Result<Option<BlockingReload>, DeliveryError> {
+fn parse_directives(query: Option<&str>) -> Result<PlaylistQuery, DeliveryError> {
     let Some(query) = query else {
-        return Ok(None);
+        return Ok(PlaylistQuery::default());
     };
     let mut msn = None;
     let mut part = None;
+    let mut skip = PlaylistDelta::Full;
     for pair in query.split('&').filter(|pair| !pair.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         match key {
@@ -531,12 +552,29 @@ fn parse_directives(query: Option<&str>) -> Result<Option<BlockingReload>, Deliv
                         DeliveryError::InvalidDirective("_HLS_part must be a number")
                     })?);
             }
+            "_HLS_skip" => {
+                skip = match value {
+                    "YES" => PlaylistDelta::Skip,
+                    "v2" => PlaylistDelta::SkipV2,
+                    // Unknown skip values are full playlists, not 400.
+                    _ => PlaylistDelta::Full,
+                };
+            }
             // Unknown directives are forward-compatible protocol extensions,
             // not malformed requests.
             _ => {}
         }
     }
-    BlockingReload::from_directives(msn, part)
+    Ok(PlaylistQuery {
+        blocking: BlockingReload::from_directives(msn, part)?,
+        skip,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PlaylistQuery {
+    blocking: Option<BlockingReload>,
+    skip: PlaylistDelta,
 }
 
 fn rendition_for_stream(
@@ -942,6 +980,189 @@ mod tests {
              answer to it while a bare playlist URL means the moving edge"
         );
     }
+
+    #[test]
+    fn skip_query_values_are_yes_v2_or_the_full_playlist() {
+        assert_eq!(
+            parse_directives(Some("_HLS_skip=YES"))
+                .expect("YES is well formed")
+                .skip,
+            PlaylistDelta::Skip
+        );
+        assert_eq!(
+            parse_directives(Some("_HLS_skip=v2"))
+                .expect("v2 is well formed")
+                .skip,
+            PlaylistDelta::SkipV2
+        );
+        assert_eq!(
+            parse_directives(Some("_HLS_skip=NO"))
+                .expect("unknown skip is not an error")
+                .skip,
+            PlaylistDelta::Full
+        );
+        assert_eq!(
+            parse_directives(Some("_HLS_skip=yes"))
+                .expect("the spec value is YES, not yes")
+                .skip,
+            PlaylistDelta::Full
+        );
+        let both = parse_directives(Some("_HLS_msn=1&_HLS_skip=YES")).expect("combined");
+        assert_eq!(both.skip, PlaylistDelta::Skip);
+        assert_eq!(both.blocking.map(|blocking| blocking.msn.0), Some(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unknown_skip_is_the_full_playlist_not_a_refusal() {
+        let store = StreamStore::default();
+        let origin = origin(&store);
+        let lease = lease(&store, vec![video(0)]);
+        write(&lease, initialization(0, 1));
+        write_segment(&lease, 0, 0, 0);
+
+        let full = origin
+            .serve(&stream_id(), video_playlist(None))
+            .await
+            .expect("the playlist names media");
+        let unknown = origin
+            .serve(
+                &stream_id(),
+                video_playlist(None).with_skip(PlaylistDelta::Full),
+            )
+            .await
+            .expect("an unknown skip value is a full playlist");
+        let via_query = origin
+            .serve_path("/live/camera/0/video.m3u8", Some("_HLS_skip=nope"))
+            .await
+            .expect("unknown skip must not 400");
+
+        assert_eq!(playlist(&full), playlist(&unknown));
+        assert_eq!(playlist(&full), playlist(&via_query));
+        assert!(!playlist(&via_query).contains("#EXT-X-SKIP"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skip_only_is_the_live_edge_and_skip_plus_msn_names_one_state() {
+        let store = StreamStore::default();
+        let origin = origin(&store);
+        let lease = lease(&store, vec![video(0)]);
+        write(&lease, initialization(0, 1));
+        write_segment(&lease, 0, 0, 0);
+        let policy = CacheControlPolicy::default();
+
+        let skip_only = origin
+            .serve(
+                &stream_id(),
+                video_playlist(None).with_skip(PlaylistDelta::Skip),
+            )
+            .await
+            .expect("a skip request is answerable");
+        let skip_and_block = origin
+            .serve(
+                &stream_id(),
+                video_playlist(BlockingReload::from_directives(Some(0), None).unwrap())
+                    .with_skip(PlaylistDelta::Skip),
+            )
+            .await
+            .expect("blocking is waited first, then the delta is rendered");
+
+        assert_eq!(
+            skip_only.reuse,
+            policy.playlist(Some(Duration::from_secs(6)), false)
+        );
+        assert_eq!(
+            skip_and_block.reuse,
+            policy.playlist(Some(Duration::from_secs(6)), true)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skip_only_absence_is_not_cached_as_a_blocking_miss() {
+        let store = StreamStore::default();
+        let origin = origin(&store);
+        let _lease = lease(&store, vec![video(0)]);
+        let policy = CacheControlPolicy::default();
+
+        let skip_only = origin
+            .serve_path("/live/camera/9/video.m3u8", Some("_HLS_skip=YES"))
+            .await
+            .expect_err("no such rendition");
+        let skip_and_block = origin
+            .serve_path(
+                "/live/camera/9/video.m3u8",
+                Some("_HLS_skip=YES&_HLS_msn=1"),
+            )
+            .await
+            .expect_err("no such rendition");
+
+        assert_eq!(skip_only.error, DeliveryError::UnknownRendition);
+        assert_eq!(
+            skip_only.reuse,
+            policy.missing(Some(Duration::from_secs(6)), false),
+            "skip-only is the live edge, so a miss stays the short lifetime"
+        );
+        assert_eq!(
+            skip_and_block.reuse,
+            policy.missing(Some(Duration::from_secs(6)), true)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_multivariant_playlist_ignores_skip() {
+        let store = StreamStore::default();
+        let origin = origin(&store);
+        let _lease = lease(&store, vec![video(0)]);
+
+        let index = origin
+            .serve(
+                &stream_id(),
+                fetch(Resource::Multivariant).with_skip(PlaylistDelta::Skip),
+            )
+            .await
+            .expect("a presentation with a topology is servable");
+
+        assert!(!playlist(&index).contains("#EXT-X-SKIP"));
+        assert!(!playlist(&index).contains("CAN-SKIP-UNTIL"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_skip_request_renders_a_delta_once_the_window_is_wide_enough() {
+        let store = StreamStore::new(crate::delivery::hls::StoreLimits {
+            retention: crate::delivery::hls::RetentionPolicy {
+                retain: Duration::from_hours(2),
+                ..crate::delivery::hls::RetentionPolicy::default()
+            },
+            ..crate::delivery::hls::StoreLimits::default()
+        });
+        let origin = origin(&store);
+        let lease = lease(&store, vec![video(0)]);
+        write(&lease, initialization(0, 1));
+        for id in 0..10 {
+            write_segment(
+                &lease,
+                0,
+                id,
+                i64::try_from(id).expect("fixture id fits i64") * 6,
+            );
+        }
+
+        let full = origin
+            .serve(&stream_id(), video_playlist(None))
+            .await
+            .expect("the full playlist is servable");
+        let delta = origin
+            .serve(
+                &stream_id(),
+                video_playlist(None).with_skip(PlaylistDelta::Skip),
+            )
+            .await
+            .expect("the delta is servable");
+
+        assert!(!playlist(&full).contains("#EXT-X-SKIP"));
+        assert!(playlist(&delta).contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=3"));
+        assert!(playlist(&full).contains("#EXT-X-MEDIA-SEQUENCE:0"));
+        assert!(playlist(&delta).contains("#EXT-X-MEDIA-SEQUENCE:0"));
+    }
 }
 
 #[cfg(test)]
@@ -998,6 +1219,54 @@ mod cache_tests {
 
         let after = origin.meters().snapshot();
         assert_eq!(after.playlists_rendered, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_and_delta_viewers_do_not_re_render_each_others_variant() {
+        let store = StreamStore::default();
+        let origin = Service::new(Arc::new(Origin::new(store.clone())), Config::default());
+        let lease = lease(&store, vec![video(0)]);
+        write(&lease, initialization(0, 1));
+        write_segment(&lease, 0, 0, 0);
+
+        let full = Request::new(
+            Resource::MediaPlaylist(RenditionId(0), MediaKind::Video),
+            None,
+        );
+        let delta = full.with_skip(PlaylistDelta::Skip);
+        for _ in 0..3 {
+            origin
+                .serve(&stream_id(), full)
+                .await
+                .expect("the playlist is servable");
+            origin
+                .serve(&stream_id(), delta)
+                .await
+                .expect("the playlist is servable");
+        }
+
+        let before = origin.meters().snapshot();
+        assert_eq!(
+            before.playlists_rendered, 2,
+            "full and delta of one epoch occupy sibling slots"
+        );
+
+        write(&lease, chunk(0, 1, 0, 6));
+        origin
+            .serve(&stream_id(), full)
+            .await
+            .expect("the playlist is servable");
+        origin
+            .serve(&stream_id(), delta)
+            .await
+            .expect("the playlist is servable");
+
+        let after = origin.meters().snapshot();
+        assert_eq!(
+            after.playlists_rendered, 4,
+            "a live-edge advance invalidates both variants because each \
+             carries EXT-X-RENDITION-REPORT"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -6,9 +6,8 @@
 - Warn instead of prevent non-HLS compliant settings?
 - Input tracks may in theory have PTS belonging to different epochs
 - What's the status of B-frames?
-- Delta playlists: `CAN-SKIP-UNTIL` is deliberately never advertised, since
-  advertising it commits the origin to rendering `EXT-X-SKIP`. Implement both
-  together or neither.
+- Delta playlists: advertised as `CAN-SKIP-UNTIL` (6× the widest target) and
+  rendered as `EXT-X-SKIP`. No operator knob; `retain` is the window.
 - Confirm `EXT-X-MAP` on a WebVTT media playlist against mediastreamvalidator.
   It is spec-legal and is how the pass-through muxer separates the `WEBVTT`
   header from cue-only segments, but it is a less-travelled path in players.
@@ -28,7 +27,6 @@
   validation are covered.
 - Support discontinuities when muxing? PaceToRealtime "maximum_timestamp_jump" doesn't make sense?
 - Add policy & allow connect-params to specify if CLOSED-CAPTIONS are present?
-- Delta playlists
 - Do we want enriched content-types? E.g. codecs, charset etc
 - Maybe re-use/ffmpeg refcounter buffers with cmaf muxer?
 - Add h264 profile/level to accepted codecs logic?
