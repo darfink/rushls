@@ -249,6 +249,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Initialize before configuration so startup failures also carry timestamps.
     init_tracing();
     let resolved = AppConfig::load_and_resolve().unwrap_or_else(|error| error.exit());
+    if let Some(path) = &resolved.config_file {
+        info!(path = %path.display(), "loaded configuration");
+    } else {
+        info!("no configuration file; using compiled defaults");
+    }
     // Before anything is served. A publication admitted against an older
     // FFmpeg would lose caption and multitrack ingest silently, so refusing to
     // start is more honest than accepting publishers this build cannot package

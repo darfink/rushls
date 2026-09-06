@@ -844,10 +844,21 @@ and demotes the name from the heading to a line inside the block, which reads
 worse in a file built to be skimmed. Unknown keys *within* one of these tables
 still refuse.
 
-Precedence is file, then environment, then command line; later wins. Environment
-uses the existing `RUSHLS_` names, so containers can inject secrets without
-rewriting the file. Interpolation runs on file values before overrides apply, so
-`${VAR}` in the file and a `RUSHLS_` override compose rather than compete.
+Precedence of **values** is file, then environment, then command line; later
+wins. Environment uses the existing `RUSHLS_` names, so containers can inject
+secrets without rewriting the file. Interpolation runs on file values before
+overrides apply, so `${VAR}` in the file and a `RUSHLS_` override compose
+rather than compete.
+
+Which **file** is loaded is a separate walk, first match wins:
+
+1. `--config` (fails if the path is missing)
+2. `RUSHLS_CONFIG` (same)
+3. `./rushls.toml` in the working directory
+4. the platform local config directory (`rushls.toml`)
+5. the platform config directory (`rushls.toml`)
+
+The process logs the path it used, or that it used compiled defaults.
 
 An environment value is **a TOML fragment**, not a second grammar. A scalar
 needs no ceremony, because a bare scalar is already valid TOML on the

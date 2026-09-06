@@ -25,18 +25,18 @@ use super::{AppConfig, ConfigError, decimal_fraction, parse_playlist_window};
 
 const BASE_CONFIG: &str = "";
 
-/// Loads one shipped file exactly as the binary would.
+/// Loads one shipped file exactly as the binary would, without searching
+/// well-known paths.
 fn load_shipped(name: &str) -> Result<ResolvedAppConfig, Box<dyn Error>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(name);
-    Ok(AppConfig::load_from(
+    Ok(AppConfig::load_and_resolve_from(
         os([
             "rushls",
             "--config",
             path.to_str().ok_or("workspace path is not UTF-8")?,
         ]),
         std::iter::empty(),
-    )?
-    .resolve_from(std::iter::empty())?)
+    )?)
 }
 
 #[tokio::test]
@@ -45,6 +45,10 @@ async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults() -> Resul
     // The local starter narrows the listeners and nothing else, so anything
     // that drifts away from a compiled default here is an accident.
     let config = load_shipped("rushls.toml")?;
+    assert_eq!(
+        config.config_file,
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rushls.toml"))
+    );
 
     assert_eq!(
         config.node.rtmp_address,
@@ -165,6 +169,81 @@ publishers = 10
     )??;
 
     assert_eq!(config.node.maximum_sessions, 30);
+    Ok(())
+}
+
+#[test]
+fn an_explicit_config_path_is_recorded() -> Result<(), Box<dyn Error>> {
+    let file = TempConfig::new("[capacity]\npublishers = 11\n")?;
+    let resolved = AppConfig::load_and_resolve_from(
+        os([
+            "rushls",
+            "--config",
+            file.path.to_str().ok_or("temp path is not UTF-8")?,
+        ]),
+        std::iter::empty(),
+    )?;
+    assert_eq!(resolved.config_file.as_deref(), Some(file.path.as_path()));
+    assert_eq!(resolved.node.maximum_sessions, 11);
+    Ok(())
+}
+
+#[test]
+fn rushls_config_is_used_when_the_cli_omits_the_file() -> Result<(), Box<dyn Error>> {
+    let file = TempConfig::new("[capacity]\npublishers = 12\n")?;
+    let resolved = AppConfig::load_and_resolve_from(
+        os(["rushls"]),
+        [(
+            OsString::from("RUSHLS_CONFIG"),
+            file.path.clone().into_os_string(),
+        )],
+    )?;
+    assert_eq!(resolved.config_file.as_deref(), Some(file.path.as_path()));
+    assert_eq!(resolved.node.maximum_sessions, 12);
+    Ok(())
+}
+
+#[test]
+fn a_cli_config_path_wins_over_rushls_config() -> Result<(), Box<dyn Error>> {
+    let cli = TempConfig::new("[capacity]\npublishers = 13\n")?;
+    let env = TempConfig::new("[capacity]\npublishers = 14\n")?;
+    let resolved = AppConfig::load_and_resolve_from(
+        os([
+            "rushls",
+            "--config",
+            cli.path.to_str().ok_or("temp path is not UTF-8")?,
+        ]),
+        [(
+            OsString::from("RUSHLS_CONFIG"),
+            env.path.clone().into_os_string(),
+        )],
+    )?;
+    assert_eq!(resolved.config_file.as_deref(), Some(cli.path.as_path()));
+    assert_eq!(resolved.node.maximum_sessions, 13);
+    Ok(())
+}
+
+#[test]
+fn a_missing_config_file_is_an_error() -> Result<(), Box<dyn Error>> {
+    let missing = std::env::temp_dir().join("rushls-config-does-not-exist.toml");
+    let mut args = os(["rushls", "--config"]).collect::<Vec<_>>();
+    args.push(missing.clone().into_os_string());
+    let error = AppConfig::load_from(args, std::iter::empty())
+        .err()
+        .ok_or("a missing --config path must fail")?;
+    assert!(
+        matches!(error, ConfigError::Read { ref path, .. } if *path == missing),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn compiled_defaults_do_not_search_well_known_files() -> Result<(), Box<dyn Error>> {
+    // The crate tree has a rushls.toml. A fixture that asked for compiled
+    // defaults must not pick it up.
+    let resolved = AppConfig::load_and_resolve_from(os(["rushls"]), std::iter::empty())?;
+    assert_eq!(resolved.config_file, None);
     Ok(())
 }
 

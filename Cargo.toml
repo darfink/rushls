@@ -17,6 +17,7 @@ derive_more = { version = "2", features = ["debug", "deref", "display"] }
 bytes = "1.12.1"
 bytesize = "2"
 conf = "0.4"
+directories = "6"
 ffmpeg-sys-next = { version = "8.1.0", default-features = false, features = ["avformat"] }
 humantime = "2"
 isolang = { version = "2.4.0", default-features = false }

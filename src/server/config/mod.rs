@@ -62,6 +62,12 @@ pub struct ResolvedAppConfig {
     /// whatever certificate it started with until the process restarted --
     /// which is the failure the watch exists to prevent, and a silent one.
     pub outbound_tls: Vec<OutboundTls>,
+    /// File this process actually loaded, if any.
+    ///
+    /// Chosen before values overlay. CLI `--config` and `RUSHLS_CONFIG` win;
+    /// otherwise the first existing well-known path is used. `None` means
+    /// compiled defaults plus environment and CLI flags.
+    pub config_file: Option<PathBuf>,
 }
 
 /// Hooks and the client they deliver with, which carries their own deadline.
@@ -169,37 +175,75 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// Loads process arguments, environment, and an optional TOML document.
+    /// Loads process arguments, environment, and a configuration file.
+    ///
+    /// File discovery walks `--config`, `RUSHLS_CONFIG`, then well-known
+    /// locations. Tests that must not see a `rushls.toml` in the working
+    /// directory use [`Self::load_from`].
     pub fn load() -> Result<Self, ConfigError> {
-        Self::load_from(std::env::args_os(), std::env::vars_os())
+        Self::load_from_with(
+            std::env::args_os(),
+            std::env::vars_os(),
+            paths::ConfigSearch::WellKnown,
+        )
+        .map(|(config, _)| config)
     }
 
-    /// Loads and resolves process arguments, environment, and an optional TOML
-    /// document from one consistent source snapshot.
+    /// Loads and resolves process arguments, environment, and a configuration
+    /// file from the live process snapshot, including well-known search paths.
     pub fn load_and_resolve() -> Result<ResolvedAppConfig, ConfigError> {
-        Self::load_and_resolve_from(std::env::args_os(), std::env::vars_os())
+        Self::load_and_resolve_from_with(
+            std::env::args_os(),
+            std::env::vars_os(),
+            paths::ConfigSearch::WellKnown,
+        )
     }
 
     /// As [`Self::load_and_resolve`], over explicit source snapshots.
+    ///
+    /// Does not search well-known paths: a test that asked for compiled
+    /// defaults must not pick up a `rushls.toml` sitting in the crate tree.
     pub fn load_and_resolve_from(
         args: impl IntoIterator<Item = OsString>,
         env: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> Result<ResolvedAppConfig, ConfigError> {
+        Self::load_and_resolve_from_with(args, env, paths::ConfigSearch::ExplicitOnly)
+    }
+
+    fn load_and_resolve_from_with(
+        args: impl IntoIterator<Item = OsString>,
+        env: impl IntoIterator<Item = (OsString, OsString)>,
+        search: paths::ConfigSearch,
+    ) -> Result<ResolvedAppConfig, ConfigError> {
         let env: Vec<(OsString, OsString)> = env.into_iter().collect();
-        Self::load_from(args, env.iter().cloned())?.resolve_from(env)
+        let (config, config_file) = Self::load_from_with(args, env.iter().cloned(), search)?;
+        let mut resolved = config.resolve_from(env)?;
+        resolved.config_file = config_file;
+        Ok(resolved)
     }
 
     /// Loads from explicit source snapshots, keeping configuration tests free
-    /// from process-global environment mutation.
+    /// from process-global environment mutation and from well-known files.
     pub fn load_from(
         args: impl IntoIterator<Item = OsString>,
         env: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> Result<Self, ConfigError> {
+        Self::load_from_with(args, env, paths::ConfigSearch::ExplicitOnly).map(|(config, _)| config)
+    }
+
+    fn load_from_with(
+        args: impl IntoIterator<Item = OsString>,
+        env: impl IntoIterator<Item = (OsString, OsString)>,
+        search: paths::ConfigSearch,
+    ) -> Result<(Self, Option<PathBuf>), ConfigError> {
         let args: Vec<OsString> = args.into_iter().collect();
         let env: Vec<(OsString, OsString)> = env.into_iter().collect();
-        let path = find_parameter("config", args.clone())
-            .map(PathBuf::from)
-            .or_else(|| env_value(&env, "RUSHLS_CONFIG").map(PathBuf::from));
+        let path = explicit_config_path(&args, &env).or_else(|| match search {
+            paths::ConfigSearch::ExplicitOnly => None,
+            paths::ConfigSearch::WellKnown => {
+                paths::first_existing_file(paths::well_known_config_paths())
+            }
+        });
         let builder = Self::conf_builder().args(args).env(env.clone());
 
         match path {
@@ -223,12 +267,13 @@ impl AppConfig {
                         path: path.clone(),
                         source,
                     })?;
-                builder
+                let config = builder
                     .doc(path.display().to_string(), document)
                     .try_parse()
-                    .map_err(Into::into)
+                    .map_err(ConfigError::from)?;
+                Ok((config, Some(path)))
             }
-            None => builder.try_parse().map_err(Into::into),
+            None => Ok((builder.try_parse().map_err(ConfigError::from)?, None)),
         }
     }
 
@@ -312,6 +357,7 @@ impl AppConfig {
             hooks,
             warnings,
             outbound_tls,
+            config_file: None,
         })
     }
 
@@ -2174,6 +2220,12 @@ fn env_value<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsSt
         .map(|(_, value)| value.as_os_str())
 }
 
+fn explicit_config_path(args: &[OsString], env: &[(OsString, OsString)]) -> Option<PathBuf> {
+    find_parameter("config", args.iter().cloned())
+        .map(PathBuf::from)
+        .or_else(|| env_value(env, "RUSHLS_CONFIG").map(PathBuf::from))
+}
+
 fn resolve_optional_text_secret(
     label: &str,
     inline: Option<&String>,
@@ -2251,6 +2303,7 @@ fn invalid(message: impl Into<String>) -> ConfigError {
 }
 
 mod interpolate;
+mod paths;
 
 #[cfg(test)]
 mod tests;
