@@ -80,7 +80,7 @@ url = "http://auth.example.internal/v1/publish/admit"
 # tier = "premium"
 
 [accept]
-ceiling  = { pace = "1x", burst = "10s" }     # throttle: at most realtime, with a ten-second head start; omit for no cap
+ceiling  = { pace = "1x", burst = "10s" }     # throttle: at most realtime, with a ten-second head start; omit burst for no head start, omit the table for no cap
 # floor    = { pace = "0.5x", window = "30s" }  # disconnect: below half realtime across any 30s window; omit for no floor
 stall    = "12s"                                # disconnect: nothing usable arrived for this long; "off" = no idle cap
 takeover = false                                # true lets a new publisher replace the current one; the old session is closed

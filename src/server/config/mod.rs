@@ -927,13 +927,14 @@ fn startup_warnings(node: &NodeConfig, open_admission: bool) -> Vec<String> {
 pub struct AcceptAppConfig {
     /// Throttle applied to a publisher offering media faster than `pace`.
     ///
-    /// Omit for no ceiling, which is the compiled default: a publisher pushing
-    /// as fast as its link allows is taken to be asking for exactly that.
-    #[conf(parameter, value_parser = TomlValue::<CeilingValue>::from_str)]
-    ceiling: Option<TomlValue<CeilingValue>>,
-    /// Minimum rate a publisher must sustain. Omit for no floor.
-    #[conf(parameter, value_parser = TomlValue::<FloorValue>::from_str)]
-    floor: Option<TomlValue<FloorValue>>,
+    /// Omit the table for no ceiling, which is the compiled default: a
+    /// publisher pushing as fast as its link allows is taken to be asking for
+    /// exactly that.
+    #[conf(flatten, prefix)]
+    ceiling: Option<CeilingAppConfig>,
+    /// Minimum rate a publisher must sustain. Omit the table for no floor.
+    #[conf(flatten, prefix)]
+    floor: Option<FloorAppConfig>,
     /// How long nothing usable may arrive before the publisher is dropped.
     #[conf(
         parameter,
@@ -987,8 +988,8 @@ impl AcceptAppConfig {
 
     fn base(&self) -> Result<StreamPolicy, ConfigError> {
         let policy = PolicyValue {
-            ceiling: self.ceiling.as_ref().map(|value| value.0.clone()),
-            floor: self.floor.as_ref().map(|value| value.0.clone()),
+            ceiling: self.ceiling.as_ref().map(CeilingValue::from),
+            floor: self.floor.as_ref().map(FloorValue::from),
             takeover: Some(self.takeover),
             video: self.video.as_ref().map(|value| value.0.clone()),
             audio: self.audio.as_ref().map(|value| value.0.clone()),
@@ -1096,11 +1097,12 @@ struct Wrapper<T> {
 #[serde(try_from = "String")]
 struct PaceValue(Pace);
 
-impl TryFrom<String> for PaceValue {
-    type Error = String;
+impl FromStr for PaceValue {
+    type Err = String;
 
-    fn try_from(value: String) -> Result<Self, Self::Error> {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         let multiple = value
+            .trim()
             .strip_suffix('x')
             .ok_or_else(|| format!("a pace must end in `x`, as in 1x; got `{value}`"))?;
         let (numerator, denominator) = decimal_fraction(multiple)?;
@@ -1112,6 +1114,49 @@ impl TryFrom<String> for PaceValue {
     }
 }
 
+impl TryFrom<String> for PaceValue {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::from_str(&value)
+    }
+}
+
+fn parse_pace(value: &str) -> Result<PaceValue, String> {
+    PaceValue::from_str(value)
+}
+
+/// Flattened `[accept.ceiling]`, so `--accept-ceiling-pace` and
+/// `--accept-ceiling-burst` exist as ordinary flags.
+///
+/// `pace` is required once this table is present. `burst` is not: omitted
+/// means an empty bucket, which is still realtime at `pace`.
+#[derive(Clone, Copy, Conf)]
+#[conf(serde)]
+pub struct CeilingAppConfig {
+    /// Long-run rate the bucket refills at, as a multiple of wall clock.
+    #[conf(
+        parameter,
+        long,
+        env,
+        value_parser = parse_pace,
+        serde(use_value_parser)
+    )]
+    pace: PaceValue,
+    /// Head start, and the most media time the bucket may hold.
+    ///
+    /// Omit or `"0s"` for no head start: a publisher may not run ahead of
+    /// wall clock. Idle time still cannot bank more than this.
+    #[conf(
+        parameter,
+        long,
+        env,
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    burst: Option<Duration>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CeilingValue {
@@ -1120,11 +1165,59 @@ struct CeilingValue {
     burst: Option<String>,
 }
 
+impl From<&CeilingAppConfig> for CeilingValue {
+    fn from(value: &CeilingAppConfig) -> Self {
+        Self {
+            pace: value.pace,
+            burst: value
+                .burst
+                .map(|duration| humantime::format_duration(duration).to_string()),
+        }
+    }
+}
+
+/// Flattened `[accept.floor]`, so `--accept-floor-pace` and
+/// `--accept-floor-window` exist as ordinary flags.
+///
+/// Both fields are required once this table is present: a rate without a
+/// window cannot be judged, and a window without a rate has nothing to judge.
+#[derive(Clone, Copy, Conf)]
+#[conf(serde)]
+pub struct FloorAppConfig {
+    /// Minimum media-time progress against wall-time, averaged over `window`.
+    #[conf(
+        parameter,
+        long,
+        env,
+        value_parser = parse_pace,
+        serde(use_value_parser)
+    )]
+    pace: PaceValue,
+    /// Averaging window. The first one is startup grace.
+    #[conf(
+        parameter,
+        long,
+        env,
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    window: Duration,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FloorValue {
     pace: PaceValue,
     window: String,
+}
+
+impl From<&FloorAppConfig> for FloorValue {
+    fn from(value: &FloorAppConfig) -> Self {
+        Self {
+            pace: value.pace,
+            window: humantime::format_duration(value.window).to_string(),
+        }
+    }
 }
 
 /// A media predicate: exact, one of a set, or an inclusive range.
@@ -1365,7 +1458,8 @@ impl PolicyValue {
             let burst = match &ceiling.burst {
                 Some(value) => humantime::parse_duration(value)
                     .map_err(|error| where_(format!("ceiling.burst {error}")))?,
-                None => Duration::from_secs(10),
+                // No head start: `pace` is permission to continue, not to lead.
+                None => Duration::ZERO,
             };
             policy.ceiling = Some(Ceiling {
                 pace: ceiling.pace.0,

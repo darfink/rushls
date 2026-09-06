@@ -9,8 +9,8 @@ use std::{
 
 use crate::{
     admission::{
-        ClientInfo, IngestProtocol, PresentedCredential, Principal, PublishRequest,
-        PublishResource, StreamPolicy, TakeoverPolicy,
+        Ceiling, ClientInfo, Floor, IngestProtocol, Pace, PresentedCredential, Principal,
+        PublishRequest, PublishResource, StreamPolicy, TakeoverPolicy,
     },
     delivery::store::{DurationRule, TargetDurationMultiple},
     domain::{Codec, StreamId},
@@ -353,6 +353,107 @@ takeover = false
     assert_eq!(grant.stream_id, StreamId::new("live/presented-key"));
     assert_eq!(grant.principal, Principal("anonymous".into()));
     assert_eq!(grant.policy.takeovers, TakeoverPolicy::Deny);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_ceiling_pace_alone_is_realtime_with_no_head_start() -> Result<(), Box<dyn Error>> {
+    let from_file = resolve_toml(
+        r#"
+[accept]
+ceiling = { pace = "1x" }
+"#,
+    )??;
+    assert_eq!(
+        default_policy(&from_file).await?.ceiling,
+        Some(Ceiling {
+            pace: Pace::realtime(),
+            burst: Duration::ZERO,
+        })
+    );
+
+    let from_flag = resolve_with("", &["--accept-ceiling-pace", "1x"], &[])??;
+    assert_eq!(
+        default_policy(&from_flag).await?.ceiling,
+        Some(Ceiling {
+            pace: Pace::realtime(),
+            burst: Duration::ZERO,
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ceiling_pace_and_burst_flatten_to_cli_flags() -> Result<(), Box<dyn Error>> {
+    let config = resolve_with(
+        "",
+        &[
+            "--accept-ceiling-pace",
+            "1x",
+            "--accept-ceiling-burst",
+            "10s",
+        ],
+        &[],
+    )??;
+    assert_eq!(
+        default_policy(&config).await?.ceiling,
+        Some(Ceiling {
+            pace: Pace::realtime(),
+            burst: Duration::from_secs(10),
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn a_ceiling_burst_without_pace_is_refused() -> Result<(), Box<dyn Error>> {
+    let error = resolve_with("", &["--accept-ceiling-burst", "10s"], &[])?
+        .err()
+        .ok_or("burst without pace must fail")?;
+    assert!(
+        error.to_string().contains("pace"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn floor_pace_and_window_flatten_to_cli_flags() -> Result<(), Box<dyn Error>> {
+    let from_file = resolve_toml(
+        r#"
+[accept]
+floor = { pace = "0.5x", window = "30s" }
+"#,
+    )??;
+    let expected = Floor {
+        pace: Pace::new(nz::u32!(1), nz::u32!(2)),
+        window: Duration::from_secs(30),
+    };
+    assert_eq!(default_policy(&from_file).await?.floor, Some(expected));
+
+    let from_flag = resolve_with(
+        "",
+        &[
+            "--accept-floor-pace",
+            "0.5x",
+            "--accept-floor-window",
+            "30s",
+        ],
+        &[],
+    )??;
+    assert_eq!(default_policy(&from_flag).await?.floor, Some(expected));
+    Ok(())
+}
+
+#[test]
+fn a_floor_pace_without_a_window_is_refused() -> Result<(), Box<dyn Error>> {
+    let error = resolve_with("", &["--accept-floor-pace", "0.5x"], &[])?
+        .err()
+        .ok_or("pace without window must fail")?;
+    assert!(
+        error.to_string().contains("window"),
+        "unexpected error: {error}"
+    );
     Ok(())
 }
 
@@ -1256,6 +1357,14 @@ fn resolve_toml(
     configuration: &str,
 ) -> Result<Result<ResolvedAppConfig, ConfigError>, Box<dyn Error>> {
     resolve_with(configuration, &[], &[])
+}
+
+async fn default_policy(config: &ResolvedAppConfig) -> Result<StreamPolicy, Box<dyn Error>> {
+    Ok(config
+        .authenticator
+        .authenticate(&request("ignored"))
+        .await?
+        .policy)
 }
 
 /// Resolves environment overrides against a minimal node.

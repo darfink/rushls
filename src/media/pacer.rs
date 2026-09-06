@@ -13,16 +13,18 @@ use super::{NormalizedSample, TimelineCalibration};
 
 struct PacingWait<'a> {
     meters: &'a dyn MediaMeters,
+    drift: &'a mut DriftMonitor,
     started: Instant,
     lead: Duration,
     completed: bool,
 }
 
 impl<'a> PacingWait<'a> {
-    fn new(meters: &'a dyn MediaMeters, lead: Duration) -> Self {
+    fn new(meters: &'a dyn MediaMeters, drift: &'a mut DriftMonitor, lead: Duration) -> Self {
         meters.pacing_observation(lead, Duration::ZERO, true);
         Self {
             meters,
+            drift,
             started: Instant::now(),
             lead,
             completed: false,
@@ -32,6 +34,7 @@ impl<'a> PacingWait<'a> {
     fn complete(&mut self, media_lead: Duration) {
         let elapsed = Instant::now().saturating_duration_since(self.started);
         self.meters.pacing_observation(media_lead, elapsed, false);
+        self.drift.withhold(elapsed);
         self.completed = true;
     }
 }
@@ -42,6 +45,7 @@ impl Drop for PacingWait<'_> {
             let elapsed = Instant::now().saturating_duration_since(self.started);
             self.meters
                 .pacing_observation(self.lead.saturating_sub(elapsed), elapsed, true);
+            self.drift.withhold(elapsed);
         }
     }
 }
@@ -129,66 +133,55 @@ pub enum PacingError {
     },
 }
 
-/// Enforces a [`Ceiling`]: consumable permission to run ahead of wall clock.
+/// Schedules media against wall-clock deadlines after the startup burst.
 ///
-/// Charged in *media time*: advancing the timeline by one second spends one
-/// second, however many samples carried it. That is what lets a forward jump
-/// later be treated as elapsed media rather than as free progress, and it
-/// keeps the arithmetic independent of access-unit size.
-///
-/// Replaces a standing lead allowance, which a publisher could sit inside
-/// indefinitely and which — because it was measured against an anchor fixed at
-/// pre-roll — let a slow publisher accrue unbounded credit and then spend it
-/// in one burst.
-///
-/// Named for the bound it enforces rather than for the token bucket it is,
-/// so it reads beside [`FloorWindow`]: one type per configured bound, each
-/// naming the bound first and its mechanism second.
-struct CeilingBucket {
+/// Deadlines advance with media, not with the completion of each sleep. Time
+/// spent muxing, storing, reading input, or servicing supervision therefore
+/// reduces the next wait instead of making the stream progressively slower.
+#[derive(Clone, Copy)]
+struct CeilingClock {
     ceiling: Ceiling,
-    /// Media time available to spend without waiting.
-    available: Duration,
-    /// When `available` was last brought up to date.
-    refilled_at: Instant,
+    started_at: Instant,
+    /// Virtual media position. Rebased after lateness so a stalled publisher
+    /// can resume but cannot bank the entire stall as a catch-up allowance.
+    scheduled: Duration,
 }
 
-impl CeilingBucket {
+impl CeilingClock {
     fn new(ceiling: Ceiling, now: Instant) -> Self {
         Self {
             ceiling,
-            // Full at the start: the burst is the head start.
-            available: ceiling.burst,
-            refilled_at: now,
+            started_at: now,
+            scheduled: Duration::ZERO,
         }
     }
 
-    /// Credits elapsed wall clock, saturating at `burst`.
-    ///
-    /// The cap is what stops idle time becoming savings; without it a
-    /// publisher that paused could bank the whole pause and replay it at any
-    /// speed afterwards.
-    fn refill(&mut self, now: Instant) {
-        let elapsed = now.saturating_duration_since(self.refilled_at);
-        self.refilled_at = now;
-        self.available = self
-            .available
-            .saturating_add(self.ceiling.pace.media_for(elapsed))
-            .min(self.ceiling.burst);
+    /// Plans against a copy; a cancelled wait must not spend media twice.
+    fn schedule(mut self, media: Duration, now: Instant) -> Option<(Self, Instant)> {
+        let wall_media = self
+            .ceiling
+            .pace
+            .media_for(now.saturating_duration_since(self.started_at));
+        // Admit an overdue sample immediately, then retain at most `burst`
+        // for the following samples. With no burst, the next advance is due
+        // one media interval later, however long the preceding stall lasted.
+        self.scheduled = self.scheduled.checked_add(media)?.max(wall_media);
+        let wall_due = self
+            .ceiling
+            .pace
+            .wall_for(self.scheduled.saturating_sub(self.ceiling.burst));
+        let due = self.started_at.checked_add(wall_due)?;
+        Some((self, due))
     }
 
-    /// How long to wait before `media` may be spent, and spends it.
-    fn take(&mut self, media: Duration, now: Instant) -> Duration {
-        self.refill(now);
-        if let Some(remaining) = self.available.checked_sub(media) {
-            self.available = remaining;
-            return Duration::ZERO;
-        }
-        // Wait for exactly the shortfall, then spend the bucket down to empty:
-        // the wait is what earns the difference.
-        let shortfall = media.saturating_sub(self.available);
-        self.available = Duration::ZERO;
-        self.refilled_at = now;
-        self.ceiling.pace.wall_for(shortfall)
+    fn available(self, now: Instant) -> Duration {
+        let wall_media = self
+            .ceiling
+            .pace
+            .media_for(now.saturating_duration_since(self.started_at));
+        self.ceiling
+            .burst
+            .saturating_sub(self.scheduled.saturating_sub(wall_media))
     }
 }
 
@@ -237,17 +230,22 @@ impl FloorWindow {
 
 /// Reports whether media time is keeping up with wall clock.
 ///
-/// Deliberately toothless, and deliberately unconditional. A publisher falling
-/// behind realtime is ended by `floor` or by nothing at all — that is the
-/// division the deleted publication deadline violated — but an operator who
-/// configured no floor still wants to hear that their live stream is drifting.
-/// So this only ever emits, and it emits whether or not either bound is set.
+/// Deliberately toothless. A publisher falling behind realtime is ended by
+/// `floor` or by nothing at all — that is the division the deleted publication
+/// deadline violated — but an operator who configured no floor still wants to
+/// hear that their live stream is drifting. So this only ever emits.
+///
+/// Time this node spent holding the publisher at a ceiling is withheld from
+/// the clock. Otherwise a 1x ceiling plus ordinary mux work reads as a slow
+/// encoder, which is the publisher being blamed for an instruction it obeyed.
 ///
 /// The same fixed-window shape as [`FloorWindow`], for the same reason: one
 /// accumulator, judged once per window, with the first window as grace.
 struct DriftMonitor {
     started_at: Instant,
     media: Duration,
+    /// Wall time already spent in ceiling waits during this window.
+    withheld: Duration,
     /// Whether the last judged window was reported as behind, so each
     /// transition is announced once rather than every window. Without this a
     /// publisher that stays behind logs on a timer forever.
@@ -274,20 +272,30 @@ impl DriftMonitor {
         Self {
             started_at: now,
             media: Duration::ZERO,
+            withheld: Duration::ZERO,
             behind: false,
         }
+    }
+
+    /// Credits wall time this node spent holding the publisher at its ceiling.
+    fn withhold(&mut self, waited: Duration) {
+        self.withheld = self.withheld.saturating_add(waited);
     }
 
     /// Adds media-time progress and reports a change of state, if any.
     fn observe(&mut self, media: Duration, now: Instant, events: &EventSink) {
         self.media = self.media.saturating_add(media);
-        let elapsed = now.saturating_duration_since(self.started_at);
-        if elapsed < Self::WINDOW {
+        let wall = now.saturating_duration_since(self.started_at);
+        if wall < Self::WINDOW {
             return;
         }
+        // Judged against the clock the publisher was allowed to use, not the
+        // one this node paused.
+        let elapsed = wall.saturating_sub(self.withheld);
         let observed = self.media;
         self.started_at = now;
         self.media = Duration::ZERO;
+        self.withheld = Duration::ZERO;
 
         if self.behind {
             if observed >= Self::RECOVERED.media_for(elapsed) {
@@ -307,7 +315,7 @@ impl DriftMonitor {
 /// Maps normalized media time onto a monotonic wall clock without rewriting it.
 pub struct MediaPacer {
     /// Absent means unthrottled: media is admitted as fast as it arrives.
-    ceiling: Option<CeilingBucket>,
+    ceiling: Option<CeilingClock>,
     /// Absent means no minimum rate is required.
     floor: Option<FloorWindow>,
     /// Always present: drift is reported whether or not a bound is set.
@@ -335,7 +343,7 @@ impl MediaPacer {
         }
         let now = Instant::now();
         Ok(Self {
-            ceiling: ceiling.map(|ceiling| CeilingBucket::new(ceiling, now)),
+            ceiling: ceiling.map(|ceiling| CeilingClock::new(ceiling, now)),
             floor: floor.map(|floor| FloorWindow::new(floor, now)),
             drift: DriftMonitor::new(now),
             maximum_timestamp_jump,
@@ -370,8 +378,8 @@ impl MediaPacer {
 
         // How far this sample advances the timeline. The first advancing
         // sample after pre-roll has nothing to measure from and so costs
-        // nothing, which is what makes the bucket's initial fill the head
-        // start rather than a second one.
+        // nothing, which keeps the configured burst as the only additional head
+        // start beyond pre-roll.
         let advance = match previous {
             Some(previous) => current.elapsed_since(previous)?,
             None => Duration::ZERO,
@@ -389,30 +397,32 @@ impl MediaPacer {
         }
 
         let now = Instant::now();
+        if let Some(ceiling) = self.ceiling {
+            let (next, due) = ceiling
+                .schedule(advance, now)
+                .ok_or(PacingError::TimestampOverflow(current.track_id))?;
+            let delay = due.saturating_duration_since(now);
+            if delay.is_zero() {
+                self.meters
+                    .pacing_observation(next.available(now), Duration::ZERO, false);
+            } else {
+                let mut wait = PacingWait::new(self.meters.as_ref(), &mut self.drift, delay);
+                tokio::time::sleep_until(due).await;
+                wait.complete(next.available(Instant::now()));
+            }
+            self.ceiling = Some(next);
+        } else {
+            self.meters
+                .pacing_observation(Duration::ZERO, Duration::ZERO, false);
+        }
+        // Only admitted samples advance monitoring. Supervision may cancel a
+        // sleep many times, but those retries must not invent media progress.
+        let now = Instant::now();
         if let Some(floor) = &mut self.floor {
             floor.observe(advance, now)?;
         }
-        // After the floor, so a publisher failing one is disconnected rather
-        // than first told it is slow.
+        // A floor failure disconnects before the informational drift warning.
         self.drift.observe(advance, now, events);
-
-        match &mut self.ceiling {
-            None => {
-                self.meters
-                    .pacing_observation(Duration::ZERO, Duration::ZERO, false);
-            }
-            Some(ceiling) => {
-                let delay = ceiling.take(advance, now);
-                if delay.is_zero() {
-                    self.meters
-                        .pacing_observation(ceiling.available, Duration::ZERO, false);
-                } else {
-                    let mut wait = PacingWait::new(self.meters.as_ref(), delay);
-                    tokio::time::sleep(delay).await;
-                    wait.complete(Duration::ZERO);
-                }
-            }
-        }
         self.watermark = next_watermark;
         Ok(())
     }
@@ -518,11 +528,32 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_zero_burst_still_paces_at_realtime() {
+        // Burst is a head start, not permission to run at `pace`. An empty
+        // clock schedules each advance, so a two-second jump still lands at
+        // 1x rather than being refused or needing a one-second burst.
+        let meters = meters();
+        let events = discard();
+        let mut pacer = pacer(Some(ceiling(0)), None, &meters);
+        let started = Instant::now();
+
+        pacer
+            .pace(&sample(2), &events)
+            .await
+            .expect("unearned media is slept, not refused");
+
+        assert_eq!(
+            Instant::now().saturating_duration_since(started),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_slow_publisher_cannot_bank_unlimited_credit_and_burst() {
         // The bug the standing lead allowance had: its anchor was fixed at
         // pre-roll, so running slow accrued credit without bound and a
-        // publisher could then replay a backlog at any speed. The bucket caps
-        // what idling is worth at exactly `burst`.
+        // publisher could then replay a backlog at any speed. The clock limits
+        // catch-up after the first resumed sample to `burst`.
         let meters = meters();
         let events = discard();
         let mut pacer = MediaPacer::after_preroll(
@@ -539,13 +570,19 @@ mod tests {
         // Sit idle far longer than the burst, advancing no media at all.
         tokio::time::advance(Duration::from_mins(10)).await;
 
-        let started = Instant::now();
-        // A minute of media offered at once: only the five-second burst is
-        // available, so the remaining 55s must be earned in real time.
+        // The first overdue sample resumes immediately. Subsequent samples
+        // can use the configured burst, but not ten minutes of idle credit.
         pacer
-            .pace(&sample(60), &events)
+            .pace(&sample(1), &events)
             .await
-            .expect("the excess is slept");
+            .expect("resume after idle");
+        let started = Instant::now();
+        for second in 2..=61 {
+            pacer
+                .pace(&sample(second), &events)
+                .await
+                .expect("bounded catch-up");
+        }
 
         assert_eq!(
             Instant::now().saturating_duration_since(started),
@@ -699,19 +736,28 @@ mod tests {
         let mut pacer = pacer(Some(ceiling(1)), None, &meters);
         let ahead = sample(3);
 
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(1)) => {}
-            result = pacer.pace(&ahead, &events) => {
-                panic!("the two-second pacing wait completed early: {result:?}");
+        let started = Instant::now();
+        for _ in 0..3 {
+            tokio::select! {
+                biased;
+                result = pacer.pace(&ahead, &events) => {
+                    panic!("the two-second deadline completed early: {result:?}");
+                }
+                () = tokio::time::sleep(Duration::from_millis(250)) => {}
             }
+            assert!(meters.snapshot().publisher_backpressured);
         }
-
-        assert!(meters.snapshot().publisher_backpressured);
-
         pacer
             .pace(&ahead, &events)
             .await
-            .expect("the retry waits only for the remaining shortfall");
+            .expect("retry preserves the original deadline");
+        assert_eq!(Instant::now() - started, Duration::from_secs(2));
+        assert_eq!(meters.snapshot().pacing_delay, Duration::from_secs(2));
+        assert_eq!(
+            pacer.drift.media,
+            Duration::from_secs(3),
+            "retries cannot invent media progress"
+        );
         assert!(!meters.snapshot().publisher_backpressured);
     }
 
@@ -766,6 +812,100 @@ mod tests {
              drifting, it is complying: {:?}",
             recorded.0.lock()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_after_a_ceiling_wait_is_not_reported_as_a_slow_publisher() {
+        // The live loop muxes and publishes after `pace` returns. That wall
+        // time used to sit inside the drift window on top of the 1x sleep, so
+        // a file held at realtime logged as 0.90x and blamed the publisher.
+        let meters = meters();
+        let (recorded, events) = recorder();
+        let mut pacer = pacer(Some(ceiling(0)), None, &meters);
+
+        for second in 1..=30 {
+            pacer
+                .pace(&sample(second), &events)
+                .await
+                .expect("a throttled publisher keeps running");
+            tokio::time::advance(Duration::from_millis(200)).await;
+        }
+
+        assert!(
+            recorded.0.lock().is_empty(),
+            "mux work stacked on a ceiling wait is this node's time, not drift: {:?}",
+            recorded.0.lock()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn processing_time_does_not_accumulate_as_output_drift() -> Result<(), PacingError> {
+        for pace in [
+            Pace::realtime(),
+            Pace::new(nz::u32!(2), nz::u32!(1)),
+            Pace::new(nz::u32!(1), nz::u32!(2)),
+        ] {
+            for burst in [Duration::ZERO, Duration::from_secs(2)] {
+                let meters = meters();
+                let events = discard();
+                let mut pacer = pacer(Some(Ceiling { pace, burst }), None, &meters);
+                let started = Instant::now();
+                for second in 1_u32..=120 {
+                    pacer.pace(&sample(i64::from(second)), &events).await?;
+                    if second > 10 {
+                        assert_eq!(
+                            Instant::now() - started,
+                            pace.wall_for(
+                                Duration::from_secs(u64::from(second)).saturating_sub(burst)
+                            ),
+                            "every sample keeps its deadline after startup"
+                        );
+                    }
+                    // Variable mux/storage work, always below one media interval.
+                    tokio::time::advance(Duration::from_millis(if second % 3 == 0 {
+                        200
+                    } else {
+                        75
+                    }))
+                    .await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_realtime_source_does_not_get_paced_a_second_time() -> Result<(), PacingError> {
+        let meters = meters();
+        let events = discard();
+        let mut pacer = pacer(Some(ceiling(0)), None, &meters);
+        let started = Instant::now();
+        for second in 1_u32..=120 {
+            tokio::time::sleep_until(started + Duration::from_secs(u64::from(second))).await;
+            pacer.pace(&sample(i64::from(second)), &events).await?;
+            assert_eq!(
+                Instant::now() - started,
+                Duration::from_secs(u64::from(second))
+            );
+        }
+        assert_eq!(meters.snapshot().pacing_delay, Duration::ZERO);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_burst_does_not_credit_its_own_sleep() -> Result<(), PacingError> {
+        let meters = meters();
+        let events = discard();
+        let mut pacer = pacer(Some(ceiling(2)), None, &meters);
+        let started = Instant::now();
+        for second in 1_u32..=120 {
+            pacer.pace(&sample(i64::from(second)), &events).await?;
+            assert_eq!(
+                Instant::now() - started,
+                Duration::from_secs(u64::from(second.saturating_sub(2)))
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

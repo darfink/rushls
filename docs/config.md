@@ -238,6 +238,20 @@ stall   = "12s"                                # nothing usable for 12s: dropped
 # floor  = { pace = "0.5x", window = "30s" }  # below half realtime across 30s: dropped
 ```
 
+`burst` permits media to run ahead of wall clock. With `--accept-ceiling-pace 1x`,
+omitting `--accept-ceiling-burst` gives no additional head start after pre-roll.
+Pre-roll still collects the media needed for timeline calibration and segmentation.
+A live 1x encoder does not need a burst.
+
+The ceiling uses media deadlines. Time spent processing media reduces the next
+wait, including when `burst = "0s"`. At 1x, a healthy source produces approximately
+one second of output media per second, provided the node can process it fast enough.
+This controls timeline progress; individual parts can still have scheduling jitter.
+
+After a stall, the first overdue sample is admitted immediately. Following samples
+can catch up by at most `burst`. The publisher cannot save the entire idle period
+and use it to send an unlimited backlog.
+
 Exceeding the ceiling **waits**. Transport backpressure is the entire
 enforcement: a publisher cannot dump unbounded media into the process, and a
 file pushed at 100x still plays, slowed to live — *when a ceiling is set*.
@@ -254,10 +268,11 @@ ceiling masks the signal downstream. Reserved name: `cutoff`.
 `floor` is `{ pace, window }`: the minimum media-time progress against
 wall-time, averaged over the window. Where `stall` asks did anything usable
 arrive, `floor` asks did enough of it arrive — a publisher averaging below
-`pace` across any `window` is disconnected. Omitted means no floor, which is
-the compiled default. The first window is startup grace, and discontinuities
-neither credit nor reset progress; only discontinuity-corrected media-time
-counts.
+`pace` across any `window` is disconnected. Both fields are required once a
+floor is set, including on the command line (`--accept-floor-pace` and
+`--accept-floor-window`). Omitted means no floor, which is the compiled
+default. The first window is startup grace, and discontinuities neither credit
+nor reset progress; only discontinuity-corrected media-time counts.
 
 Omitting `floor` means nothing *ends* a slow session — it does not mean
 nothing notices. A publisher whose media time falls below 90% of wall clock is

@@ -149,17 +149,15 @@ impl Pace {
 
 /// The throttle applied to a publisher offering media faster than `pace`.
 ///
-/// Enforcement is backpressure only: exceeding the bucket sleeps, and nothing
+/// Enforcement is backpressure only: media ahead of its deadline waits, and nothing
 /// here ever ends a session. A publisher that is merely fast is not a fault.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ceiling {
-    /// Long-run rate the bucket refills at.
+    /// Long-run media rate used to calculate admission deadlines.
     pub pace: Pace,
-    /// Media time the bucket may hold, which is the head start a publisher
-    /// gets and the size of any burst it may take after running slow.
-    ///
-    /// Consumable, unlike the standing allowance it replaces: a publisher that
-    /// spends it must earn it back at `pace` before bursting again.
+    /// Media-time head start after pre-roll, and bounded catch-up allowance
+    /// after a stalled publisher resumes. Zero still credits processing time
+    /// toward the next deadline; it does not add a full interval of sleep.
     pub burst: Duration,
 }
 
