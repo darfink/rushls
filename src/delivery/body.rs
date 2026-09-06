@@ -243,6 +243,7 @@ mod tests {
 
     fn disk(len: usize) -> HeldBytes {
         HeldBytes::Disk(DiskRef {
+            offset: 0,
             path: Arc::new(std::path::PathBuf::from("/nonexistent")),
             len,
         })

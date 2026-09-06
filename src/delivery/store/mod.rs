@@ -352,6 +352,12 @@ impl StreamLease {
         self.publication
     }
 
+    /// Wait before producing the next bounded mux batch. Writes remain
+    /// synchronous so cancellation can still flush already accepted media.
+    pub async fn ready(&self) -> Result<(), StoreWriteError> {
+        self.live.ready(self.publication).await
+    }
+
     /// Publishes one event, returning `false` if takeover revoked this lease.
     ///
     /// Revoked media is discarded rather than appended, so an incumbent

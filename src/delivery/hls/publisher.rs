@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use thiserror::Error;
 
 use crate::{
-    domain::{Payload, StreamId},
+    domain::{BoxFuture, Payload, StreamId},
     mux::{
         ClosedCaptionService, FinishReason, PackagedMedia, PackagedPresentation,
         PackagingRenditionId,
@@ -41,6 +41,17 @@ pub enum PublishOutcome {
 
 /// Accepts packaged media on behalf of one stream and makes it fetchable.
 pub trait HlsPublisher: Send {
+    /// Fast path avoids allocating a wait future when the publisher is ready.
+    fn is_backpressured(&self) -> bool {
+        false
+    }
+
+    /// Waits for retention I/O before accepting another bounded mux batch.
+    /// Cancellation leaves all accepted media in the store.
+    fn ready(&mut self) -> BoxFuture<'_, Result<(), HlsError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError>;
 
     /// Advertises the in-band caption services this publication carries.
@@ -168,6 +179,14 @@ impl StorePublisher {
 }
 
 impl HlsPublisher for StorePublisher {
+    fn is_backpressured(&self) -> bool {
+        self.lease.live().is_backpressured()
+    }
+
+    fn ready(&mut self) -> BoxFuture<'_, Result<(), HlsError>> {
+        Box::pin(async { self.lease.ready().await.map_err(Into::into) })
+    }
+
     fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
         let gzip = self.encoding(&media);
         if self.lease.write_encoded(media, gzip)? {

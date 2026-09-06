@@ -13,7 +13,7 @@
 //! [`RetentionPolicy`] resolves all three; nothing here invents a deadline.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -189,7 +189,9 @@ pub struct RenditionState {
     /// A set would drop the id when the first sibling was released; a count
     /// keeps the anchor until the last one goes.
     publication_refs: HashMap<u64, usize>,
-    spilling: HashSet<SegmentId>,
+    spilling: HashMap<SegmentId, usize>,
+    /// Disk parents awaiting the end of standalone-part fetch grace.
+    chunked_spills: VecDeque<SegmentId>,
     /// At most one progressively published packaging segment per rendition.
     open_segment: Option<OpenSegment>,
     /// Payload bytes this rendition currently retains, kept incrementally so
@@ -266,7 +268,8 @@ impl RenditionState {
             retired_segments: VecDeque::new(),
             part_resources: HashMap::new(),
             publication_refs: HashMap::new(),
-            spilling: HashSet::new(),
+            spilling: HashMap::new(),
+            chunked_spills: VecDeque::new(),
             open_segment: None,
             retained_payload_bytes: 0,
             retained_disk_bytes: 0,
@@ -1032,12 +1035,22 @@ impl RenditionState {
     /// only when hiding it would still leave a legal live playlist.
     pub fn oldest_shed_candidate(&self) -> Option<Instant> {
         if let Some(id) = self.retired_segments.front() {
+            if self.spilling.contains_key(id) {
+                return None;
+            }
             return self
                 .segment_resources
                 .get(id)
                 .map(|resource| resource.first_published_at);
         }
         if self.can_hide_oldest_visible() {
+            if self
+                .visible_segments
+                .front()
+                .is_some_and(|id| self.spilling.contains_key(id))
+            {
+                return None;
+            }
             return self
                 .visible_segments
                 .front()
@@ -1125,6 +1138,7 @@ impl RenditionState {
     }
 
     pub fn sweep_expired(&mut self, now: Instant) {
+        self.compact_spilled_segments(now);
         while let Some(id) = self.retired_segments.front().copied() {
             let Some(resource) = self.segment_resources.get(&id) else {
                 self.retired_segments.pop_front();
@@ -1262,11 +1276,105 @@ impl RenditionState {
                 .disk_bytes()
                 .saturating_add(resource.part.gzip.as_ref().map_or(0, HeldBytes::disk_bytes)),
         );
-        resource.part.payload.unlink_disk();
+        self.unlink_unreferenced(&resource.part.payload);
         if let Some(gzip) = &resource.part.gzip {
-            gzip.unlink_disk();
+            self.unlink_unreferenced(gzip);
         }
         self.release_publication(resource.part.publication);
+    }
+
+    /// Parts share their parent's file, including while orphaned for fetch grace.
+    fn unlink_unreferenced(&self, held: &HeldBytes) {
+        let HeldBytes::Disk(disk) = held else {
+            return;
+        };
+        let same =
+            |held: &HeldBytes| matches!(held, HeldBytes::Disk(other) if other.path == disk.path);
+        let retained = self.part_resources.values().any(|resource| {
+            same(&resource.part.payload) || resource.part.gzip.as_ref().is_some_and(same)
+        }) || self.segment_resources.values().any(|resource| {
+            matches!(&resource.segment.kind, StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) if same(payload))
+                || resource.segment.gzip.as_ref().is_some_and(same)
+        });
+        if !retained {
+            held.unlink_disk();
+        }
+    }
+
+    /// Once every part URI has expired, one locator replaces the part graph.
+    fn compact_spilled_segments(&mut self, now: Instant) {
+        let candidates: Vec<_> = self
+            .chunked_spills
+            .iter()
+            .filter_map(|id| {
+                let resource = self.segment_resources.get(id)?;
+                let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) = &resource.segment.kind
+                else {
+                    return None;
+                };
+                let first = parts.first()?;
+                let HeldBytes::Disk(first_disk) = &first.payload else {
+                    return None;
+                };
+                let eligible = parts.iter().all(|part| {
+                    matches!(&part.payload, HeldBytes::Disk(disk) if disk.path == first_disk.path)
+                        && self.part_resources.get(&part.id).is_some_and(|resource| {
+                            !resource.playlist_visible
+                                && resource.expires_at.is_some_and(|deadline| now >= deadline)
+                        })
+                });
+                eligible.then_some(*id)
+            })
+            .collect();
+        let changed = !candidates.is_empty();
+        for id in candidates {
+            let resource = self
+                .segment_resources
+                .get_mut(&id)
+                .expect("candidate exists");
+            let mut segment = (*resource.segment).clone();
+            let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) = &segment.kind else {
+                continue;
+            };
+            let parts = Arc::clone(parts);
+            let HeldBytes::Disk(first) = &parts[0].payload else {
+                continue;
+            };
+            let mut payload = first.clone();
+            payload.len = parts.iter().map(|part| part.payload.len()).sum();
+            // Concatenated gzip members preserve the full segment encoding.
+            segment.gzip = parts
+                .iter()
+                .map(|part| match &part.gzip {
+                    Some(HeldBytes::Disk(disk)) => Some(disk),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|members| {
+                    let mut gzip = members[0].clone();
+                    gzip.len = members.iter().map(|member| member.len).sum();
+                    HeldBytes::Disk(gzip)
+                });
+            segment.kind =
+                StoredSegmentKind::Media(SegmentBody::Contiguous(HeldBytes::Disk(payload)));
+            let bytes = segment_disk_bytes(&segment);
+            resource.segment = Arc::new(segment);
+            for part in parts.iter() {
+                self.drop_part(part.id);
+            }
+            self.retained_disk_bytes = self.retained_disk_bytes.saturating_add(bytes);
+        }
+        self.chunked_spills.retain(|id| {
+            self.segment_resources.get(id).is_some_and(|resource| {
+                matches!(
+                    resource.segment.kind,
+                    StoredSegmentKind::Media(SegmentBody::Chunked(_))
+                )
+            })
+        });
+        if changed {
+            self.refresh_published_segments();
+        }
     }
 
     fn visible_playlist_duration(&self) -> Duration {
@@ -1345,14 +1453,36 @@ impl RenditionState {
         self.retained_payload_bytes = self.retained_payload_bytes.saturating_sub(removed_bytes);
     }
 
+    /// Scheduled bytes still count as real RAM, but must not be scheduled twice.
+    pub fn pending_spill_bytes(&self) -> usize {
+        self.spilling.values().sum()
+    }
+
+    fn can_spill(&self, segment: &StoredSegment) -> bool {
+        if !segment_holds_memory(segment) {
+            return false;
+        }
+        match &segment.kind {
+            // Keep advertised low-latency parts hot. Hidden part URIs can be
+            // served from byte ranges in the segment during their fetch grace.
+            StoredSegmentKind::Media(SegmentBody::Chunked(parts)) => parts.iter().all(|part| {
+                self.part_resources
+                    .get(&part.id)
+                    .is_none_or(|resource| !resource.playlist_visible)
+            }),
+            _ => true,
+        }
+    }
+
     pub fn oldest_memory_spill_candidate(&self) -> Option<Instant> {
         self.retired_segments
             .iter()
             .chain(self.visible_segments.iter())
-            .filter(|id| !self.spilling.contains(id))
+            .filter(|id| !self.spilling.contains_key(id))
             .find_map(|id| {
                 let resource = self.segment_resources.get(id)?;
-                segment_holds_memory(&resource.segment).then_some(resource.first_published_at)
+                self.can_spill(&resource.segment)
+                    .then_some(resource.first_published_at)
             })
     }
 
@@ -1362,11 +1492,11 @@ impl RenditionState {
             .iter()
             .chain(self.visible_segments.iter())
             .find(|id| {
-                !self.spilling.contains(id)
+                !self.spilling.contains_key(id)
                     && self
                         .segment_resources
                         .get(*id)
-                        .is_some_and(|resource| segment_holds_memory(&resource.segment))
+                        .is_some_and(|resource| self.can_spill(&resource.segment))
             })?;
         let resource = self.segment_resources.get(&id)?;
         let mut objects = Vec::new();
@@ -1401,7 +1531,11 @@ impl RenditionState {
         if objects.is_empty() {
             return None;
         }
-        self.spilling.insert(id);
+        let bytes = objects
+            .iter()
+            .map(|object| memory_len(object.payload.len(), object.gzip.as_ref()))
+            .sum();
+        self.spilling.insert(id, bytes);
         Some((id, objects))
     }
 
@@ -1410,7 +1544,7 @@ impl RenditionState {
     }
 
     pub fn finish_spill(&mut self, outcome: &SpillOutcome) -> bool {
-        if !self.spilling.remove(&outcome.segment) {
+        if self.spilling.remove(&outcome.segment).is_none() {
             return false;
         }
         if !self.segment_resources.contains_key(&outcome.segment) {
@@ -1423,6 +1557,18 @@ impl RenditionState {
             }
         }
         self.relink_chunked_parent(outcome.segment);
+        if self
+            .segment_resources
+            .get(&outcome.segment)
+            .is_some_and(|resource| {
+                matches!(
+                    resource.segment.kind,
+                    StoredSegmentKind::Media(SegmentBody::Chunked(_))
+                )
+            })
+        {
+            self.chunked_spills.push_back(outcome.segment);
+        }
         self.refresh_published_segments();
         true
     }

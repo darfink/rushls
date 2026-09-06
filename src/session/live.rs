@@ -223,6 +223,13 @@ impl MediaTail {
         }
     }
 
+    async fn ready(&mut self) -> Result<(), ExecutionError> {
+        if self.publisher.is_backpressured() {
+            self.publisher.ready().await?;
+        }
+        Ok(())
+    }
+
     fn write_all(
         &mut self,
         samples: &mut VecDeque<NormalizedSample>,
@@ -425,7 +432,6 @@ impl LiveSession {
     /// processed read.
     pub async fn pump(&mut self, events: &EventSink) -> Result<InputState, ExecutionError> {
         if !self.replayed {
-            self.replayed = true;
             // Pre-roll drove the same `MediaHead`, so its access units have
             // already been inspected and may have queued a declaration. It has
             // to be applied *before* the buffered media is written: the first
@@ -433,10 +439,16 @@ impl LiveSession {
             // and for an input that ended during pre-roll there is no later
             // pump to apply it at all.
             self.publish_captions(events);
-            self.tail.write_all(&mut self.samples)?;
+            while !self.samples.is_empty() {
+                self.tail.ready().await?;
+                let sample = self.samples.pop_front().expect("queued replay sample");
+                self.tail.write_one(sample)?;
+            }
+            self.replayed = true;
             self.drained = !self.input_state.is_open();
             return Ok(self.input_state);
         }
+        self.tail.ready().await?;
         if self.drained {
             return Ok(InputState::Closed);
         }
@@ -456,6 +468,7 @@ impl LiveSession {
         // cancel this future without losing the batch or accidentally treating
         // its next sample as already paced.
         while let Some(sample) = self.samples.front() {
+            self.tail.ready().await?;
             self.pacer.pace(sample, events).await?;
             let sample = self
                 .samples

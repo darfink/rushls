@@ -22,6 +22,10 @@ pub struct StoreFull {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum StoreWriteError {
+    #[error(
+        "disk spill failed; retained media remains readable, but publishing cannot continue within the memory budget"
+    )]
+    DiskSpillFailed,
     #[error("media references unknown {rendition_id}")]
     UnknownPackagingRendition { rendition_id: PackagingRenditionId },
     #[error("{rendition_id} is not active in the current publication")]

@@ -109,6 +109,7 @@ pub struct StreamState {
     idle_since: Option<Instant>,
     retained_payload_bytes: usize,
     retained_disk_bytes: usize,
+    spill_failed: bool,
 }
 
 impl LiveStream {
@@ -142,6 +143,7 @@ impl LiveStream {
                 idle_since: Some(Instant::now()),
                 retained_payload_bytes: 0,
                 retained_disk_bytes: 0,
+                spill_failed: false,
             }),
             snapshot: ArcSwap::from_pointee(snapshot),
             media_revision: AtomicU64::new(0),
@@ -626,7 +628,7 @@ impl LiveStream {
         let over_disk = |state: &StreamState| {
             self.disk_capacity > 0 && state.retained_disk_bytes > self.disk_capacity
         };
-        let spill_blocked = self.disk.as_ref().is_none_or(|disk| disk.queue_is_full());
+        let spill_blocked = self.disk.is_none();
         if over_objects(&state) || over_disk(&state) || (over_memory(&state) && spill_blocked) {
             let mut reclaimed = state.sweep_expired(now);
             while (over_objects(&state)
@@ -678,34 +680,97 @@ impl LiveStream {
                 });
     }
 
-    fn maybe_spill(&self) {
-        let Some(disk) = self.disk.clone() else {
+    pub fn is_backpressured(&self) -> bool {
+        if self.disk.is_none() {
+            return false;
+        }
+        let state = self.state.read();
+        state.spill_failed || state.retained_payload_bytes > self.limits.maximum_payload_bytes
+    }
+
+    /// Waits outside all store locks. The session calls this before consuming
+    /// another sample, so RAM can overshoot by one bounded mux output batch.
+    pub async fn ready(&self, publication: u64) -> Result<(), StoreWriteError> {
+        let Some(disk) = &self.disk else {
+            return Ok(());
+        };
+        loop {
+            let notified = disk.progress().notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            self.maybe_spill();
+            {
+                let state = self.state.read();
+                if state.publication != publication {
+                    return Ok(());
+                }
+                if state.spill_failed {
+                    return Err(StoreWriteError::DiskSpillFailed);
+                }
+                if state.retained_payload_bytes <= self.limits.maximum_payload_bytes {
+                    return Ok(());
+                }
+                // An undersized cap cannot prevent the open/advertised part
+                // window from advancing. With no spillable history or worker
+                // progress to await, allow that bounded live window to grow.
+                let pending = state.pending_spill_bytes();
+                let candidate = state
+                    .renditions
+                    .iter()
+                    .any(|rendition| rendition.oldest_memory_spill_candidate().is_some());
+                if pending == 0 && (!candidate || disk.spill_pending() == 0) {
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
+    pub fn maybe_spill(&self) {
+        let Some(disk) = &self.disk else {
             return;
         };
-        let Some(weak) = self.this.get().cloned() else {
+        let Some(weak) = self.this.get() else {
             return;
         };
         loop {
-            if disk.queue_is_full() {
-                self.shed_until_memory_fits();
-                return;
-            }
             let mut state = self.state.write();
-            if state.retained_payload_bytes <= self.limits.maximum_payload_bytes {
+            if state.spill_failed || disk.queue_is_full() {
                 return;
             }
-            if self.disk_capacity > 0 && state.retained_disk_bytes > self.disk_capacity {
-                drop(state);
-                self.shed_until_memory_fits();
+            let pending = state.pending_spill_bytes();
+            if state.retained_payload_bytes.saturating_sub(pending)
+                <= self.limits.maximum_payload_bytes
+            {
                 return;
             }
-            // In-flight spills still occupy RAM. Leaving them mapped is the
-            // bounded over-cap window; shedding here would drop media disk is
-            // already writing.
             let Some((rendition, segment, objects)) = state.take_spill_candidate() else {
                 return;
             };
-            drop(state);
+            let bytes: usize = objects
+                .iter()
+                .map(|object| object.payload.len() + object.gzip.as_ref().map_or(0, Payload::len))
+                .sum();
+            // Reserve disk space before submitting; worker lag must not make
+            // several jobs all believe they own the same remaining capacity.
+            if state
+                .retained_disk_bytes
+                .saturating_add(pending)
+                .saturating_add(bytes)
+                > self.disk_capacity
+            {
+                state
+                    .renditions
+                    .iter_mut()
+                    .find(|item| item.rendition_id == rendition)
+                    .expect("candidate rendition")
+                    .abort_spill(segment);
+                if state.shed_oldest() {
+                    self.advance_media_revision();
+                    continue;
+                }
+                return;
+            }
             let job = SpillJob {
                 live: weak.clone(),
                 stream: self.id.clone(),
@@ -714,32 +779,17 @@ impl LiveStream {
                 segment,
                 objects,
             };
+            // try_enqueue never waits, so the reservation and enqueue remain
+            // atomic with respect to other writers and worker completions.
             if !disk.try_enqueue(job) {
-                let mut state = self.state.write();
-                if let Some(rendition) = state
+                state
                     .renditions
                     .iter_mut()
                     .find(|item| item.rendition_id == rendition)
-                {
-                    rendition.abort_spill(segment);
-                }
-                drop(state);
-                self.shed_until_memory_fits();
+                    .expect("candidate rendition")
+                    .abort_spill(segment);
                 return;
             }
-        }
-    }
-
-    fn shed_until_memory_fits(&self) {
-        let mut state = self.state.write();
-        let mut changed = false;
-        while state.retained_payload_bytes > self.limits.maximum_payload_bytes
-            && state.shed_oldest()
-        {
-            changed = true;
-        }
-        if changed {
-            self.advance_media_revision();
         }
     }
 
@@ -769,6 +819,11 @@ impl LiveStream {
         } else {
             super::disk::forget_spilled(&outcome.objects);
         }
+    }
+
+    pub fn fail_spill(&self, rendition: RenditionId, segment: SegmentId) {
+        self.abort_spill(rendition, segment);
+        self.state.write().spill_failed = true;
     }
 
     pub fn abort_spill(&self, rendition: RenditionId, segment: SegmentId) {
@@ -913,6 +968,13 @@ impl StreamState {
         self.renditions
             .iter()
             .map(RenditionState::memory_resident_segments)
+            .sum()
+    }
+
+    fn pending_spill_bytes(&self) -> usize {
+        self.renditions
+            .iter()
+            .map(RenditionState::pending_spill_bytes)
             .sum()
     }
 

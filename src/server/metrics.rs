@@ -202,7 +202,7 @@ series! {
             "Configured retain window in seconds. Per-stream held duration is at /metrics/streams.")
             = |snapshot: &MetricsSnapshot| snapshot.retention_requested.as_secs_f64(),
         Gauge("rushls_disk_spill_pending",
-            "Spill jobs accepted and not yet written. At capacity the store sheds instead of spilling.")
+            "Spill jobs accepted and not yet written. At capacity publishers wait for disk progress.")
             = |snapshot: &MetricsSnapshot| snapshot.spill_pending,
         Counter("rushls_disk_spills_failed_total",
             "Spill writes that failed. Media stayed in memory.")

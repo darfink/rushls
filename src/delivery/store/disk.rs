@@ -13,7 +13,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -25,13 +25,13 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::domain::{Payload, RenditionId, StreamId};
 
 use super::{PartId, SegmentId};
 
-/// How many spill jobs may sit unwritten before the store treats disk as full.
+/// Maximum queued writes; publishers wait when this worker is saturated.
 const SPILL_QUEUE_BOUND: usize = 32;
 /// Concurrent DVR reads, in bytes, so seek traffic cannot allocate unbounded RAM.
 #[cfg(not(test))]
@@ -50,6 +50,8 @@ pub struct DiskLimits {
 /// A payload that has been written and is addressable by path and length.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiskRef {
+    /// Byte offset inside a completed segment file (zero for whole files).
+    pub offset: u64,
     pub path: Arc<PathBuf>,
     pub len: usize,
 }
@@ -137,6 +139,9 @@ struct DiskShared {
     generation: PathBuf,
     maximum_payload_bytes: usize,
     pending: AtomicUsize,
+    progress: Notify,
+    #[cfg(test)]
+    write_gate: Mutex<()>,
     spills_failed: AtomicU64,
     /// In-flight and retired epochs. A successor may reuse the public stream
     /// id, so retirement deletes one epoch and waits for its jobs first.
@@ -230,6 +235,9 @@ impl DiskTier {
             generation: generation.clone(),
             maximum_payload_bytes: limits.maximum_payload_bytes,
             pending: AtomicUsize::new(0),
+            progress: Notify::new(),
+            #[cfg(test)]
+            write_gate: Mutex::new(()),
             spills_failed: AtomicU64::new(0),
             epochs: Mutex::new(HashMap::new()),
             read_bytes: Arc::new(Semaphore::new(MAX_IN_FLIGHT_READ_BYTES as usize)),
@@ -248,6 +256,16 @@ impl DiskTier {
             jobs: Some(jobs),
             worker: Some(worker),
         }))
+    }
+
+    /// Register before checking capacity so a completion cannot be missed.
+    pub fn progress(&self) -> &Notify {
+        &self.shared.progress
+    }
+
+    #[cfg(test)]
+    pub fn pause_writes(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.shared.write_gate.lock()
     }
 
     pub fn maximum_payload_bytes(&self) -> usize {
@@ -304,16 +322,26 @@ impl DiskTier {
                 source: io::Error::other("disk read semaphore closed"),
             })?;
         let path = Arc::clone(&disk.path);
-        let result = tokio::task::spawn_blocking(move || fs::read(&*path))
-            .await
-            .map_err(|source| DiskError::Read {
-                path: (*disk.path).clone(),
-                source: io::Error::other(source),
-            })?
-            .map_err(|source| DiskError::Read {
-                path: (*disk.path).clone(),
-                source,
-            })?;
+        let offset = disk.offset;
+        let len = disk.len;
+        let result = tokio::task::spawn_blocking(move || {
+            let mut file = File::open(&*path)?;
+            if offset != 0 {
+                file.seek(SeekFrom::Start(offset))?;
+            }
+            let mut bytes = vec![0; len];
+            file.read_exact(&mut bytes)?;
+            Ok::<_, io::Error>(bytes)
+        })
+        .await
+        .map_err(|source| DiskError::Read {
+            path: (*disk.path).clone(),
+            source: io::Error::other(source),
+        })?
+        .map_err(|source| DiskError::Read {
+            path: (*disk.path).clone(),
+            source,
+        })?;
         drop(permit);
         Ok(Payload::from(result))
     }
@@ -352,7 +380,8 @@ fn spill_loop(shared: &DiskShared, rx: &Receiver<SpillJob>) {
     while let Ok(job) = rx.recv() {
         // Upgrade before any write: a retired stream's public id may already
         // belong to a new LiveStream, and those paths must not be reused.
-        if let Some(live) = job.live.upgrade() {
+        let live = job.live.upgrade();
+        if let Some(live) = &live {
             if shared.is_reaping(&job.stream, job.epoch) {
                 live.abort_spill(job.rendition, job.segment);
             } else {
@@ -365,66 +394,83 @@ fn spill_loop(shared: &DiskShared, rx: &Receiver<SpillJob>) {
                             error = %error,
                             "disk spill failed; media stays in memory"
                         );
-                        live.abort_spill(job.rendition, job.segment);
+                        live.fail_spill(job.rendition, job.segment);
                     }
                 }
             }
         }
         shared.pending.fetch_sub(1, Ordering::Relaxed);
         shared.note_finished(&job.stream, job.epoch);
+        // Release payload references before admitting more publisher bytes.
+        drop(job);
+        if let Some(live) = live {
+            live.maybe_spill();
+        }
+        shared.progress.notify_waiters();
     }
 }
 
 fn write_job(shared: &DiskShared, job: &SpillJob) -> Result<SpillOutcome, DiskError> {
-    let mut objects = Vec::with_capacity(job.objects.len());
-    for object in &job.objects {
-        match spill_object(shared, job, object) {
-            Ok(spilled) => objects.push(spilled),
-            Err(error) => {
-                forget_spilled(&objects);
-                return Err(error);
-            }
-        }
+    #[cfg(test)]
+    let _gate = shared.write_gate.lock();
+    let path = shared.object_path(
+        &job.stream,
+        job.epoch,
+        job.rendition,
+        &format!("segment-{}.bin", job.segment.0),
+    )?;
+    // Sequential slices avoid allocating a second, segment-sized buffer.
+    write_atomic_slices(
+        &path,
+        job.objects.iter().map(|object| object.payload.as_bytes()),
+    )?;
+    let gzip_path = path.with_extension("bin.gz");
+    let has_gzip = job.objects.iter().any(|object| object.gzip.is_some());
+    if has_gzip
+        && let Err(error) = write_atomic_slices(
+            &gzip_path,
+            job.objects
+                .iter()
+                .filter_map(|object| object.gzip.as_ref().map(Payload::as_bytes)),
+        )
+    {
+        let _ = fs::remove_file(&path);
+        return Err(error);
     }
+    let path = Arc::new(path);
+    let gzip_path = Arc::new(gzip_path);
+    let mut offset = 0;
+    let mut gzip_offset = 0;
+    let objects = job
+        .objects
+        .iter()
+        .map(|object| {
+            let payload = DiskRef {
+                path: Arc::clone(&path),
+                offset,
+                len: object.payload.len(),
+            };
+            offset += object.payload.len() as u64;
+            let gzip = object.gzip.as_ref().map(|gzip| {
+                let locator = DiskRef {
+                    path: Arc::clone(&gzip_path),
+                    offset: gzip_offset,
+                    len: gzip.len(),
+                };
+                gzip_offset += gzip.len() as u64;
+                locator
+            });
+            SpilledObject {
+                kind: object.kind,
+                payload,
+                gzip,
+            }
+        })
+        .collect();
     Ok(SpillOutcome {
         rendition: job.rendition,
         segment: job.segment,
         objects,
-    })
-}
-
-fn spill_object(
-    shared: &DiskShared,
-    job: &SpillJob,
-    object: &SpillObject,
-) -> Result<SpilledObject, DiskError> {
-    let name = match object.kind {
-        SpillKind::Segment => format!("segment-{}.bin", job.segment.0),
-        SpillKind::Part(id) => format!("part-{}.bin", id.0),
-    };
-    let path = shared.object_path(&job.stream, job.epoch, job.rendition, &name)?;
-    write_atomic(&path, object.payload.as_bytes())?;
-    let payload = DiskRef {
-        len: object.payload.len(),
-        path: Arc::new(path.clone()),
-    };
-    let gzip = if let Some(gzip) = &object.gzip {
-        let gzip_path = path.with_extension("bin.gz");
-        if let Err(error) = write_atomic(&gzip_path, gzip.as_bytes()) {
-            let _ = fs::remove_file(&path);
-            return Err(error);
-        }
-        Some(DiskRef {
-            len: gzip.len(),
-            path: Arc::new(gzip_path),
-        })
-    } else {
-        None
-    };
-    Ok(SpilledObject {
-        kind: object.kind,
-        payload,
-        gzip,
     })
 }
 
@@ -505,9 +551,12 @@ impl DiskShared {
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), DiskError> {
+fn write_atomic_slices<'a>(
+    path: &Path,
+    slices: impl Iterator<Item = &'a [u8]>,
+) -> Result<(), DiskError> {
     let tmp = path.with_extension("tmp");
-    let result = write_atomic_inner(path, &tmp, bytes);
+    let result = write_atomic_inner(path, &tmp, slices);
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
         let _ = fs::remove_file(path);
@@ -515,7 +564,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), DiskError> {
     result
 }
 
-fn write_atomic_inner(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), DiskError> {
+fn write_atomic_inner<'a>(
+    path: &Path,
+    tmp: &Path,
+    slices: impl Iterator<Item = &'a [u8]>,
+) -> Result<(), DiskError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
@@ -526,10 +579,12 @@ fn write_atomic_inner(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), DiskE
             path: tmp.to_path_buf(),
             source,
         })?;
-    file.write_all(bytes).map_err(|source| DiskError::Write {
-        path: tmp.to_path_buf(),
-        source,
-    })?;
+    for bytes in slices {
+        file.write_all(bytes).map_err(|source| DiskError::Write {
+            path: tmp.to_path_buf(),
+            source,
+        })?;
+    }
     file.sync_all().map_err(|source| DiskError::Write {
         path: tmp.to_path_buf(),
         source,
@@ -857,8 +912,8 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn a_failed_spill_write_is_counted() {
+    #[tokio::test]
+    async fn a_failed_spill_write_is_counted() {
         let root = scratch("spill-fail");
         let tier = DiskTier::open(&DiskLimits {
             directory: root.clone(),
@@ -896,6 +951,10 @@ mod tests {
             1,
             "a write that cannot create its epoch directory is a failed spill"
         );
+        assert_eq!(
+            live.ready(0).await,
+            Err(crate::delivery::store::StoreWriteError::DiskSpillFailed)
+        );
         drop(live);
         drop(tier);
         let _ = fs::remove_dir_all(root);
@@ -914,14 +973,17 @@ mod tests {
         let path_b = fifo(&root, "b");
         let path_c = fifo(&root, "c");
         let read_a = DiskRef {
+            offset: 0,
             path: Arc::new(path_a.clone()),
             len: 16,
         };
         let read_b = DiskRef {
+            offset: 0,
             path: Arc::new(path_b.clone()),
             len: 16,
         };
         let read_c = DiskRef {
+            offset: 0,
             path: Arc::new(path_c.clone()),
             len: 16,
         };

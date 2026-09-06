@@ -2018,3 +2018,181 @@ async fn a_range_of_a_spilled_chunked_parent_keeps_byte_offsets() {
     drop(store);
     let _ = std::fs::remove_dir_all(directory);
 }
+
+#[tokio::test]
+async fn burst_spill_waits_without_discarding_history() -> Result<(), Box<dyn std::error::Error>> {
+    for (count, queued) in [(80, 16), (120, 32)] {
+        let directory = scratch_disk("burst-spill");
+        let mut limits = limits();
+        limits.retention.retain = Duration::from_mins(15);
+        limits.retention.maximum_payload_bytes = 641;
+        limits.disk = Some(DiskLimits {
+            directory: directory.clone(),
+            maximum_payload_bytes: 10_000,
+        });
+        let store = StreamStore::new(limits);
+        let lease = lease(&store, &[(0, false)]);
+        configure(&lease, 0, false);
+        let disk = store.disk().expect("disk configured");
+        let mut ready = Box::pin(lease.ready());
+        let (pending, retained, blocked) = {
+            let _pause = disk.pause_writes();
+            // Model a bounded batch already accepted by the publisher. A slow
+            // worker must neither schedule all history nor evict queued data.
+            for id in 0..count {
+                write(&lease, direct(0, id, i64::try_from(id)? * 6, 6, 10));
+            }
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            let blocked = std::future::Future::poll(ready.as_mut(), &mut context).is_pending();
+            (
+                disk.spill_pending(),
+                lease
+                    .live()
+                    .rendition(RenditionId(0))
+                    .expect("rendition")
+                    .segments
+                    .len(),
+                blocked,
+            )
+        };
+        assert_eq!(
+            pending, queued,
+            "reserve only the overflow, bounded by queue slots"
+        );
+        assert_eq!(retained, usize::try_from(count)?);
+        assert!(
+            blocked,
+            "publisher waits while pending bytes still occupy RAM"
+        );
+        tokio::time::timeout(Duration::from_secs(5), ready).await??;
+        assert!(lease.live().retained_payload_bytes() <= 641);
+        let snapshot = lease.live().rendition(RenditionId(0)).expect("rendition");
+        assert_eq!(snapshot.segments.len(), usize::try_from(count)?);
+        assert_eq!(
+            lease.live().retention_depth().held,
+            Duration::from_secs(count * 6)
+        );
+        assert_eq!(snapshot.segments[0].msn, Msn(0));
+        drop(lease);
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+    Ok(())
+}
+
+fn write_distinct_parts(lease: &StreamLease, id: u64) -> Result<(), Box<dyn std::error::Error>> {
+    for index in 0..6 {
+        let mut media = chunk(
+            0,
+            id,
+            index,
+            i64::try_from(id)? * 6 + i64::from(index),
+            1,
+            10,
+        );
+        if let PackagedMedia::Chunk(chunk) = &mut media {
+            chunk.payload = Payload::from(vec![u8::try_from(index)?; 10]);
+        }
+        write(lease, media);
+    }
+    write(lease, completion(0, id, i64::try_from(id)? * 6, 6));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn spilled_parts_share_a_segment_file_until_fetch_grace_expires()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = scratch_disk("segment-file");
+    let mut limits = limits();
+    limits.retention.retain = Duration::from_mins(15);
+    limits.retention.maximum_payload_bytes = 301;
+    limits.disk = Some(DiskLimits {
+        directory: directory.clone(),
+        maximum_payload_bytes: 10_000,
+    });
+    let store = StreamStore::new(limits);
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    for id in 0..8 {
+        write_distinct_parts(&lease, id)?;
+    }
+    wait_until("segment spill finishes", || {
+        lease.live().retained_payload_bytes() <= 301
+    });
+    let first = lease
+        .live()
+        .segment(RenditionId(0), SegmentId(1))
+        .expect("oldest retained");
+    let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) = &first.kind else {
+        panic!("parts still in grace");
+    };
+    let HeldBytes::Disk(locator) = &parts[0].payload else {
+        panic!("oldest on disk");
+    };
+    let path = locator.path.clone();
+    assert_eq!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("segment-1.bin")
+    );
+    assert_eq!(
+        std::fs::read(&*path)?,
+        (0..6_u8).flat_map(|value| [value; 10]).collect::<Vec<_>>()
+    );
+    for (index, part) in parts.iter().enumerate() {
+        let HeldBytes::Disk(disk) = &part.payload else {
+            panic!("part range on disk");
+        };
+        assert_eq!(disk.path, path);
+        assert_eq!(disk.offset, u64::try_from(index * 10)?);
+        assert_eq!(
+            store.disk().expect("disk").read(disk).await?.as_bytes(),
+            &[u8::try_from(index)?; 10]
+        );
+        assert!(lease.live().part(RenditionId(0), part.id).is_some());
+    }
+    let part_ids: Vec<_> = parts.iter().map(|part| part.id).collect();
+    let disk_bytes = lease.live().retained_disk_bytes();
+    tokio::time::advance(Duration::from_secs(19)).await;
+    lease.live().sweep_expired();
+    for id in part_ids {
+        assert!(lease.live().part(RenditionId(0), id).is_none());
+    }
+    let first = lease
+        .live()
+        .segment(RenditionId(0), SegmentId(1))
+        .expect("DVR parent remains");
+    assert!(matches!(
+        first.kind,
+        StoredSegmentKind::Media(SegmentBody::Contiguous(HeldBytes::Disk(_)))
+    ));
+    assert_eq!(
+        lease.live().retained_disk_bytes(),
+        disk_bytes,
+        "compaction transfers accounting without duplication"
+    );
+    assert!(
+        path.exists(),
+        "releasing part ranges must not unlink the parent"
+    );
+    let origin = Origin::new(store.clone());
+    let object = origin
+        .media(
+            &stream(),
+            MediaResource::Segment(RenditionId(0), SegmentId(1), MediaSegmentFormat::Cmaf),
+            Duration::ZERO,
+        )
+        .await?;
+    let clipped: Vec<_> = object
+        .body
+        .range(8, 22)
+        .expect("range spans part boundaries")
+        .into_frames()
+        .flatten()
+        .collect();
+    assert_eq!(clipped, vec![0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2]);
+    drop(origin);
+    drop(lease);
+    drop(store);
+    let _ = std::fs::remove_dir_all(directory);
+    Ok(())
+}
