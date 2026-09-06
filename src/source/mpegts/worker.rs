@@ -328,6 +328,7 @@ fn discovery_end_error(control: &Control, saw_mpeg_ts: bool) -> SourceError {
 
 struct CatalogBuilder {
     pending: BTreeMap<u32, DiscoveredTrack>,
+    av1: BTreeMap<u32, (TrackSpec, Option<bool>)>,
     skipped: BTreeSet<u32>,
     order: Vec<u32>,
     prefetch: VecDeque<Packet>,
@@ -341,6 +342,7 @@ impl CatalogBuilder {
     fn new() -> Self {
         Self {
             pending: BTreeMap::new(),
+            av1: BTreeMap::new(),
             skipped: BTreeSet::new(),
             order: Vec::new(),
             prefetch: VecDeque::new(),
@@ -407,6 +409,7 @@ impl CatalogBuilder {
         if self.catalog.is_some() && self.pending.contains_key(&track_id) {
             return Err(SourceError::TrackSetChanged);
         }
+        self.av1.remove(&track_id);
         self.pending.remove(&track_id);
         self.order.retain(|id| *id != track_id);
         self.skipped.insert(track_id);
@@ -414,6 +417,16 @@ impl CatalogBuilder {
     }
 
     fn add_track(&mut self, spec: &TrackSpec) -> Result<(), SourceError> {
+        if super::av1::configuration(spec)?.is_some() {
+            if self.catalog.is_some() && !self.av1.contains_key(&spec.track_id) {
+                return Err(SourceError::TrackSetChanged);
+            }
+            self.av1
+                .entry(spec.track_id)
+                .or_insert_with(|| (spec.clone(), None));
+            return Ok(());
+        }
+
         if self.catalog.is_some() {
             if map::track(spec)?.is_some() && !self.pending.contains_key(&spec.track_id) {
                 return Err(SourceError::TrackSetChanged);
@@ -433,7 +446,19 @@ impl CatalogBuilder {
     }
 
     fn update_track(&mut self, spec: &TrackSpec) -> Result<(), SourceError> {
-        let Some(mapped) = map::track(spec)? else {
+        if let Some((existing, _)) = self.av1.get(&spec.track_id) {
+            if super::av1::configuration(existing)?
+                .map(|config| broadcast_common::Serialize::to_bytes(&config))
+                != super::av1::configuration(spec)?
+                    .map(|config| broadcast_common::Serialize::to_bytes(&config))
+            {
+                return Err(SourceError::CodecParametersChanged {
+                    track_id: TrackId(spec.track_id),
+                });
+            }
+            return Ok(());
+        }
+        let Some(mut mapped) = map::track(spec)? else {
             if self.pending.contains_key(&spec.track_id) {
                 return Err(SourceError::TrackSetChanged);
             }
@@ -442,6 +467,17 @@ impl CatalogBuilder {
         };
         match self.pending.get_mut(&spec.track_id) {
             Some(existing) => {
+                // The Opus PMT has no pre-skip. Discovery learns it from the
+                // first PES control header, so repeated PMTs cannot reset it.
+                if existing.codec == crate::domain::Codec::Opus
+                    && let crate::domain::MediaParameters::Audio { timing, .. } =
+                        &existing.parameters
+                    && let crate::domain::MediaParameters::Audio {
+                        timing: updated, ..
+                    } = &mut mapped.parameters
+                {
+                    updated.initial_padding_samples = timing.initial_padding_samples;
+                }
                 if existing.codec != mapped.codec
                     || existing.parameters != mapped.parameters
                     || existing.codec_extradata != mapped.codec_extradata
@@ -463,28 +499,57 @@ impl CatalogBuilder {
     fn push_sample(
         &mut self,
         track_id: u32,
-        sample: transmux::Sample,
+        mut sample: transmux::Sample,
         limits: InputLimits,
     ) -> Result<(), SourceError> {
+        if let Some((spec, reduced)) = self.av1.get_mut(&track_id) {
+            if let Some((track, is_reduced)) = super::av1::track(spec, &sample.data)? {
+                if let Some(existing) = self.pending.get(&track_id) {
+                    if existing.codec_extradata != track.codec_extradata {
+                        return Err(SourceError::CodecParametersChanged { track_id: track.id });
+                    }
+                } else {
+                    self.order.push(track_id);
+                    self.pending.insert(track_id, track);
+                }
+                *reduced = Some(is_reduced);
+            }
+            let Some(reduced) = *reduced else {
+                return Ok(());
+            };
+            sample.flags.is_sync =
+                crate::media::av1::keyframe(&sample.data, reduced).ok_or_else(|| {
+                    SourceError::Demux("AV1G PES has no complete frame header".into())
+                })?;
+        }
         if self.skipped.contains(&track_id) {
             return Ok(());
         }
         let Some(track) = self.pending.get_mut(&track_id) else {
             return Ok(());
         };
-        if track.first_pts.is_none() {
-            track.first_pts = sample.pts.or(sample.dts);
+        if track.codec == crate::domain::Codec::Opus {
+            self.prefetch.extend(super::opus::packets(
+                track,
+                &sample,
+                limits.maximum_payload_bytes_per_packet,
+            )?);
+            return self.try_freeze(false);
         }
-        self.prefetch.push_back(map::packet(
+        let packet = map::packet(
             TrackId(track_id),
             sample,
             limits.maximum_payload_bytes_per_packet,
-        )?);
+        )?;
+        crate::source::record_first_pts(track, &packet)?;
+        self.prefetch.push_back(packet);
         self.try_freeze(false)
     }
 
     fn tracks_have_timestamps(&self) -> bool {
-        !self.pending.is_empty() && self.pending.values().all(|track| track.first_pts.is_some())
+        self.av1.values().all(|(_, reduced)| reduced.is_some())
+            && !self.pending.is_empty()
+            && self.pending.values().all(|track| track.first_pts.is_some())
     }
 
     fn try_freeze(&mut self, finishing: bool) -> Result<(), SourceError> {

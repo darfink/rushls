@@ -1,6 +1,7 @@
 //! Pass-through CMAF packaging.
 
 mod output;
+mod roll;
 
 use std::{num::NonZero, sync::Arc, time::Duration};
 
@@ -1886,7 +1887,7 @@ mod tests {
         ingest_fixture(source).await
     }
 
-    fn packages_as_demuxable_cmaf(fixture: IngestFixture) {
+    fn packages_as_demuxable_cmaf(fixture: IngestFixture) -> Vec<Vec<u8>> {
         let tracks = fixture
             .presentation
             .tracks()
@@ -1947,15 +1948,264 @@ mod tests {
             .expect("CMAF tails finish");
 
         let outputs = collect_rendition_bytes(&media);
-        for (bytes, expected) in outputs
-            .into_iter()
-            .zip([crate::domain::Codec::H264, crate::domain::Codec::Aac])
-        {
+        for (bytes, expected) in outputs.iter().zip(
+            fixture
+                .presentation
+                .tracks()
+                .iter()
+                .map(|track| track.codec),
+        ) {
             assert!(!bytes.is_empty());
-            let demuxed = demux_cmaf(&bytes);
+            let demuxed = demux_cmaf(bytes);
             assert_eq!(cmaf_codec(&demuxed.tracks[0].spec.config), expected);
             assert!(!demuxed.tracks[0].samples.is_empty());
         }
+        outputs
+            .into_iter()
+            .filter(|bytes| !bytes.is_empty())
+            .collect()
+    }
+
+    async fn ts_bytes_fixture(bytes: &[u8]) -> IngestFixture {
+        let session = crate::observe::SessionMeters::new(crate::observe::ProcessMeters::default());
+        let source = MpegTsPacketSource::new(
+            Box::new(ReadInput::closed(Cursor::new(bytes.to_vec()))),
+            MpegTsConfig::default(),
+            InputLimits::permissive(),
+            session.source_view(),
+        )
+        .expect("TS source");
+        ingest_fixture(source).await
+    }
+
+    async fn flv_audio_fixture(bytes: &[u8]) -> IngestFixture {
+        let session = crate::observe::SessionMeters::new(crate::observe::ProcessMeters::default());
+        let (reader, writer) = channel(nz::usize!(64 * 1024));
+        let mut offset = 13;
+        while offset + 11 <= bytes.len() {
+            let size = usize::from(bytes[offset + 1]) * 65_536
+                + usize::from(bytes[offset + 2]) * 256
+                + usize::from(bytes[offset + 3]);
+            let timestamp = u32::from_be_bytes([
+                bytes[offset + 7],
+                bytes[offset + 4],
+                bytes[offset + 5],
+                bytes[offset + 6],
+            ]);
+            let payload = &bytes[offset + 11..offset + 11 + size];
+            if bytes[offset] == 8 {
+                writer
+                    .send(IngressEvent::Audio {
+                        timestamp,
+                        media: cc_rtmp::ValidatedMedia::parse_audio(
+                            bytes::Bytes::copy_from_slice(payload),
+                            cc_rtmp::EnhancedValidationMode::Strict,
+                        )
+                        .expect("AAC FLV tag"),
+                    })
+                    .await
+                    .expect("tag queues");
+            }
+            offset += 11 + size + 4;
+        }
+        writer.finish(InputState::Closed);
+        let source =
+            RtmpPacketSource::new(reader, InputLimits::permissive(), session.source_view())
+                .expect("RTMP source");
+        ingest_fixture(source).await
+    }
+
+    #[tokio::test]
+    async fn real_he_aac_and_hev2_keep_output_rate_and_frame_size() {
+        for bytes in [
+            &include_bytes!("../../../tests/apple_hls/fixtures/he_aac.flv")[..],
+            &include_bytes!("../../../tests/apple_hls/fixtures/hev2_aac.flv")[..],
+        ] {
+            let fixture = flv_audio_fixture(bytes).await;
+            let MediaParameters::Audio {
+                sample_rate,
+                channels,
+                frame_size,
+                ..
+            } = fixture.presentation.tracks()[0].parameters
+            else {
+                panic!("audio")
+            };
+            assert_eq!(
+                (sample_rate.get(), channels.get(), frame_size.unwrap().get()),
+                (48_000, 2, 2_048)
+            );
+            assert!(
+                fixture
+                    .samples
+                    .iter()
+                    .all(|sample| sample.duration() == 2_048)
+            );
+            packages_as_demuxable_cmaf(fixture);
+        }
+    }
+
+    #[tokio::test]
+    async fn h264_and_hevc_preserve_colour_aspect_and_reorder_depth() {
+        for bytes in [
+            &include_bytes!("../../../tests/apple_hls/fixtures/h264_colour.ts")[..],
+            &include_bytes!("../../../tests/apple_hls/fixtures/hevc_hdr.ts")[..],
+        ] {
+            let fixture = ts_bytes_fixture(bytes).await;
+            let MediaParameters::Video { video_delay, .. } =
+                fixture.presentation.tracks()[0].parameters
+            else {
+                panic!("video")
+            };
+            assert!(video_delay > 0);
+            let hevc = fixture.presentation.tracks()[0].codec == crate::domain::Codec::Hevc;
+            let outputs = packages_as_demuxable_cmaf(fixture);
+            if hevc {
+                let offset = outputs[0]
+                    .windows(4)
+                    .position(|v| v == b"clli")
+                    .expect("content light box");
+                assert_eq!(&outputs[0][offset + 4..offset + 8], &[3, 232, 1, 144]);
+                let offset = outputs[0]
+                    .windows(4)
+                    .position(|v| v == b"mdcv")
+                    .expect("mastering display box");
+                assert_eq!(
+                    &outputs[0][offset + 4..offset + 8],
+                    &[0x33, 0xc2, 0x86, 0xc4]
+                );
+            }
+            for (kind, expected) in [
+                (b"pasp", vec![0, 0, 0, 4, 0, 0, 0, 3]),
+                (b"colr", vec![b'n', b'c', b'l', b'x', 0, 9, 0, 16, 0, 9, 0]),
+            ] {
+                let offset = outputs[0]
+                    .windows(4)
+                    .position(|value| value == kind)
+                    .expect("visual property box");
+                assert_eq!(
+                    &outputs[0][offset + 4..offset + 4 + expected.len()],
+                    expected
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn av1g_and_opus_ts_package_as_cmaf() {
+        for bytes in [
+            &include_bytes!("../../../tests/apple_hls/fixtures/av1.ts")[..],
+            &include_bytes!("../../../tests/apple_hls/fixtures/opus.ts")[..],
+        ] {
+            let fixture = ts_bytes_fixture(bytes).await;
+            assert!(!fixture.samples.is_empty());
+            let opus = fixture.presentation.tracks()[0].codec == crate::domain::Codec::Opus;
+            let outputs = packages_as_demuxable_cmaf(fixture);
+            if opus {
+                let media = demux_cmaf(&outputs[0]);
+                let samples = &media.tracks[0].samples;
+                assert_eq!(samples.last().unwrap().duration, Some(312));
+                let duration: u32 = samples.iter().map(|sample| sample.duration.unwrap()).sum();
+                assert_eq!(duration - 312, 19_200);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg executable"]
+    async fn independent_decoder_accepts_native_ts_opus_and_av1g()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("rushls-decode-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory)?;
+        let result = async {
+            for (name, bytes) in [
+                (
+                    "av1",
+                    &include_bytes!("../../../tests/apple_hls/fixtures/av1.ts")[..],
+                ),
+                (
+                    "opus",
+                    &include_bytes!("../../../tests/apple_hls/fixtures/opus.ts")[..],
+                ),
+            ] {
+                let output = packages_as_demuxable_cmaf(ts_bytes_fixture(bytes).await);
+                let path = directory.join(format!("{name}.mp4"));
+                std::fs::write(&path, &output[0])?;
+                let decoded = std::process::Command::new("ffmpeg")
+                    .args(["-v", "error", "-xerror", "-i"])
+                    .arg(&path)
+                    .args(["-f", "null", "-"])
+                    .output()?;
+                assert!(
+                    decoded.status.success(),
+                    "{name}: {}",
+                    String::from_utf8_lossy(&decoded.stderr)
+                );
+            }
+            // Compare the audible prefix with the TS decoder, including startup
+            // alignment. FFmpeg currently retains the 648 padded samples at the
+            // end of fragmented MP4 despite its shortened final trun duration.
+            let decoded = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(directory.join("opus.mp4"))
+                .args(["-f", "s16le", "-ac", "2", "-"])
+                .output()?;
+            assert!(decoded.status.success());
+            let source = directory.join("opus.ts");
+            std::fs::write(
+                &source,
+                include_bytes!("../../../tests/apple_hls/fixtures/opus.ts"),
+            )?;
+            let reference = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(source)
+                .args(["-f", "s16le", "-ac", "2", "-"])
+                .output()?;
+            assert!(reference.status.success());
+            // This TS decoder exposes all encoded samples; apply the control
+            // header's declared trim to obtain the audible reference.
+            assert_eq!(reference.stdout.len() / 4, 20_160);
+            let audible_reference = &reference.stdout[312 * 4..(20_160 - 648) * 4];
+            assert!((19_200..=19_848).contains(&(decoded.stdout.len() / 4)));
+            // Float-to-PCM conversion can round by one least-significant bit.
+            for (actual, expected) in decoded.stdout[..audible_reference.len()]
+                .chunks_exact(2)
+                .zip(audible_reference.chunks_exact(2))
+            {
+                let actual = i16::from_le_bytes([actual[0], actual[1]]);
+                let expected = i16::from_le_bytes([expected[0], expected[1]]);
+                assert!(i32::from(actual).abs_diff(i32::from(expected)) <= 1);
+            }
+            for (name, bytes) in [
+                (
+                    "he",
+                    &include_bytes!("../../../tests/apple_hls/fixtures/he_aac.flv")[..],
+                ),
+                (
+                    "hev2",
+                    &include_bytes!("../../../tests/apple_hls/fixtures/hev2_aac.flv")[..],
+                ),
+            ] {
+                let output = packages_as_demuxable_cmaf(flv_audio_fixture(bytes).await);
+                let path = directory.join(format!("{name}.mp4"));
+                std::fs::write(&path, &output[0])?;
+                let decoded = std::process::Command::new("ffmpeg")
+                    .args(["-v", "error", "-xerror", "-i"])
+                    .arg(&path)
+                    .args(["-f", "null", "-"])
+                    .output()?;
+                assert!(
+                    decoded.status.success(),
+                    "{name}: {}",
+                    String::from_utf8_lossy(&decoded.stderr)
+                );
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        std::fs::remove_dir_all(&directory)?;
+        result
     }
 
     #[tokio::test]
@@ -1991,6 +2241,83 @@ mod tests {
                     .iter()
                     .any(|sample| matches!(sample, NormalizedSample::Audio(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn rtmp_opus_preserves_priming_through_normalization_and_cmaf()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session = crate::observe::SessionMeters::new(crate::observe::ProcessMeters::default());
+        let (reader, writer) = channel(nz::usize!(64 * 1024));
+        // Stereo OpusHead: 312 samples of pre-skip, 44.1 kHz input metadata.
+        // Playback and pre-skip still use 48 kHz.
+        let head = b"OpusHead\x01\x02\x38\x01\x44\xac\x00\x00\x00\x00\x00";
+        for (timestamp, tag, payload) in [
+            (0, 0x90, &head[..]),
+            (0, 0x91, &[0xf8, 0xff, 0xfe][..]),
+            (20, 0x91, &[0xf8, 0xff, 0xfe][..]),
+        ] {
+            let mut raw = vec![tag];
+            raw.extend_from_slice(b"Opus");
+            raw.extend_from_slice(payload);
+            writer
+                .send(IngressEvent::Audio {
+                    timestamp,
+                    media: cc_rtmp::ValidatedMedia::parse_audio(
+                        bytes::Bytes::from(raw),
+                        cc_rtmp::EnhancedValidationMode::Strict,
+                    )?,
+                })
+                .await?;
+        }
+        writer.finish(InputState::Closed);
+        let source =
+            RtmpPacketSource::new(reader, InputLimits::permissive(), session.source_view())?;
+        let fixture = ingest_fixture(source).await;
+        let track = &fixture.presentation.tracks()[0];
+        assert_eq!(track.first_pts, Some(312));
+        assert_eq!(track.timebase, Timebase::new(nz::u32!(1), nz::u32!(48_000)));
+        assert_eq!(fixture.samples.len(), 2);
+        let NormalizedSample::Audio(first) = &fixture.samples[0] else {
+            panic!("audio sample")
+        };
+        assert_eq!(
+            (first.pts, first.duration, first.trim.leading_samples),
+            (0, 960, 312)
+        );
+        let mut cursor = crate::media::PresentedTimingCursor::for_track(track);
+        let presented = cursor.next(&fixture.samples[0])?;
+        assert_eq!((presented.start, presented.duration), (312, 648));
+        let mut output = super::output::CmafOutput::open(track).expect("Opus output opens");
+        for sample in &fixture.samples {
+            output.write(sample, sample.pts() - 312, sample.pts() - 312);
+        }
+        let init = output.flush_fragment().expect("Opus init");
+        assert_eq!(edit_list(&init), [(0, 312)]);
+        let media = output.flush_fragment().expect("Opus media");
+        let mut bytes = init.as_bytes().to_vec();
+        bytes.extend_from_slice(media.as_bytes());
+        let demuxed = demux_cmaf(&bytes);
+        let transmux::CodecConfig::Opus {
+            config,
+            sample_rate,
+            ..
+        } = &demuxed.tracks[0].spec.config
+        else {
+            panic!("Opus config")
+        };
+        assert_eq!(*sample_rate, 48_000);
+        assert_eq!(
+            (
+                config.version,
+                config.output_channel_count,
+                config.pre_skip,
+                config.input_sample_rate
+            ),
+            (0, 2, 312, 44_100)
+        );
+        assert_eq!(demuxed.tracks[0].samples.len(), 2);
+        assert_eq!(demuxed.tracks[0].samples[0].duration, Some(960));
+        Ok(())
     }
 
     #[tokio::test]

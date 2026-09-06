@@ -1,8 +1,8 @@
-//! CMAF-ready access units from validated RTMP media.
+//! Elementary access units from validated RTMP media.
 //!
 //! `scuffle-flv` stays inside this crate. Callers receive length-prefixed video,
 //! raw AAC or Opus, and decoder-configuration records (`avcC` / `hvcC` / `av1C` /
-//! AudioSpecificConfig / `dOps`) without seeing Annex-B, ADTS, or FLV tag layout.
+//! AudioSpecificConfig / OpusHead) without seeing Annex-B, ADTS, or FLV tag layout.
 
 use bytes::Bytes;
 use scuffle_flv::{
@@ -34,9 +34,9 @@ use crate::{
     MediaInterpretation, ParsedAudio, ParsedVideo, ValidatedMedia, media::MediaValidationError,
 };
 
-/// Codecs this ingest path can present as CMAF sample data.
+/// Codecs this ingest path can present as elementary access units.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CmafCodec {
+pub enum ElementaryCodec {
     Avc,
     Hevc,
     Av1,
@@ -44,7 +44,7 @@ pub enum CmafCodec {
     Opus,
 }
 
-impl CmafCodec {
+impl ElementaryCodec {
     pub fn is_video(self) -> bool {
         matches!(self, Self::Avc | Self::Hevc | Self::Av1)
     }
@@ -56,15 +56,15 @@ impl CmafCodec {
 
 /// One validated RTMP message, reduced to decoder config or a coded sample.
 #[derive(Clone, Debug, PartialEq)]
-pub enum CmafUnit {
+pub enum ElementaryUnit {
     Configuration {
-        codec: CmafCodec,
+        codec: ElementaryCodec,
         extradata: Bytes,
         /// Enhanced RTMP track id when the message names one; legacy is `None`.
         track_id: Option<u8>,
     },
     Sample {
-        codec: CmafCodec,
+        codec: ElementaryCodec,
         payload: Bytes,
         keyframe: bool,
         /// Composition offset in milliseconds on the RTMP clock. Audio is 0.
@@ -73,8 +73,8 @@ pub enum CmafUnit {
     },
 }
 
-impl CmafUnit {
-    pub fn codec(&self) -> CmafCodec {
+impl ElementaryUnit {
+    pub fn codec(&self) -> ElementaryCodec {
         match self {
             Self::Configuration { codec, .. } | Self::Sample { codec, .. } => *codec,
         }
@@ -89,13 +89,13 @@ impl CmafUnit {
 }
 
 impl ValidatedMedia<ParsedAudio> {
-    /// Maps a validated audio message onto CMAF units.
+    /// Maps a validated audio message onto elementary units.
     ///
     /// Unmapped codecs (MP3, AC-3, …) and sequence-end / channel-config
     /// signalling yield an empty list so the session can ignore them. One
     /// Enhanced tag may carry several tracks; each mapped track is its own
     /// unit so a packed `ManyTracks` message does not drop siblings.
-    pub fn cmaf_units(&self) -> Result<Vec<CmafUnit>, MediaValidationError> {
+    pub fn elementary_units(&self) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
         match &self.interpretation {
             MediaInterpretation::Opaque { reason } => Err(MediaValidationError::Malformed {
                 kind: "audio",
@@ -103,15 +103,15 @@ impl ValidatedMedia<ParsedAudio> {
             }),
             MediaInterpretation::Parsed(parsed) => match &parsed.body {
                 AudioTagBody::Legacy(LegacyAudioTagBody::Aac(AacAudioData::SequenceHeader(_))) => {
-                    Ok(vec![CmafUnit::Configuration {
-                        codec: CmafCodec::Aac,
+                    Ok(vec![ElementaryUnit::Configuration {
+                        codec: ElementaryCodec::Aac,
                         extradata: slice_after(&self.raw, LEGACY_AAC_HEADER_BYTES, "audio")?,
                         track_id: None,
                     }])
                 }
                 AudioTagBody::Legacy(LegacyAudioTagBody::Aac(AacAudioData::Raw(_))) => {
-                    Ok(vec![CmafUnit::Sample {
-                        codec: CmafCodec::Aac,
+                    Ok(vec![ElementaryUnit::Sample {
+                        codec: ElementaryCodec::Aac,
                         payload: slice_after(&self.raw, LEGACY_AAC_HEADER_BYTES, "audio")?,
                         keyframe: true,
                         composition_time_offset: 0,
@@ -125,16 +125,16 @@ impl ValidatedMedia<ParsedAudio> {
     }
 
     /// The first mapped unit, when the tag carries only one.
-    pub fn cmaf_unit(&self) -> Result<Option<CmafUnit>, MediaValidationError> {
-        Ok(self.cmaf_units()?.into_iter().next())
+    pub fn elementary_unit(&self) -> Result<Option<ElementaryUnit>, MediaValidationError> {
+        Ok(self.elementary_units()?.into_iter().next())
     }
 }
 
 impl ValidatedMedia<ParsedVideo> {
-    /// Maps a validated video message onto CMAF units.
+    /// Maps a validated video message onto elementary units.
     ///
     /// A packed Enhanced `ManyTracks` tag yields one unit per mapped track.
-    pub fn cmaf_units(&self) -> Result<Vec<CmafUnit>, MediaValidationError> {
+    pub fn elementary_units(&self) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
         match &self.interpretation {
             MediaInterpretation::Opaque { reason } => Err(MediaValidationError::Malformed {
                 kind: "video",
@@ -149,8 +149,8 @@ impl ValidatedMedia<ParsedVideo> {
                             LegacyVideoTagHeaderAvcPacket::SequenceHeader,
                         )),
                         _,
-                    ) => Ok(vec![CmafUnit::Configuration {
-                        codec: CmafCodec::Avc,
+                    ) => Ok(vec![ElementaryUnit::Configuration {
+                        codec: ElementaryCodec::Avc,
                         extradata: slice_after(&self.raw, LEGACY_AVC_HEADER_BYTES, "video")?,
                         track_id: None,
                     }]),
@@ -161,8 +161,8 @@ impl ValidatedMedia<ParsedVideo> {
                             },
                         )),
                         VideoTagBody::Legacy(LegacyVideoTagBody::Other { .. }),
-                    ) => Ok(vec![CmafUnit::Sample {
-                        codec: CmafCodec::Avc,
+                    ) => Ok(vec![ElementaryUnit::Sample {
+                        codec: ElementaryCodec::Avc,
                         payload: slice_after(&self.raw, LEGACY_AVC_HEADER_BYTES, "video")?,
                         keyframe,
                         composition_time_offset: signed_cts(*composition_time_offset),
@@ -176,8 +176,8 @@ impl ValidatedMedia<ParsedVideo> {
     }
 
     /// The first mapped unit, when the tag carries only one.
-    pub fn cmaf_unit(&self) -> Result<Option<CmafUnit>, MediaValidationError> {
-        Ok(self.cmaf_units()?.into_iter().next())
+    pub fn elementary_unit(&self) -> Result<Option<ElementaryUnit>, MediaValidationError> {
+        Ok(self.elementary_units()?.into_iter().next())
     }
 }
 
@@ -208,7 +208,7 @@ fn signed_cts(value: u32) -> i32 {
     }
 }
 
-fn enhanced_audio(body: &ExAudioTagBody) -> Result<Vec<CmafUnit>, MediaValidationError> {
+fn enhanced_audio(body: &ExAudioTagBody) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
     match body {
         ExAudioTagBody::NoMultitrack {
             audio_four_cc,
@@ -235,7 +235,7 @@ fn enhanced_audio(body: &ExAudioTagBody) -> Result<Vec<CmafUnit>, MediaValidatio
 fn enhanced_video(
     body: &ExVideoTagBody<'_>,
     keyframe: bool,
-) -> Result<Vec<CmafUnit>, MediaValidationError> {
+) -> Result<Vec<ElementaryUnit>, MediaValidationError> {
     match body {
         ExVideoTagBody::Command => Ok(Vec::new()),
         ExVideoTagBody::NoMultitrack {
@@ -265,19 +265,19 @@ fn audio_packet(
     four_cc: AudioFourCc,
     packet: &AudioPacket,
     track_id: Option<u8>,
-) -> Result<Option<CmafUnit>, MediaValidationError> {
+) -> Result<Option<ElementaryUnit>, MediaValidationError> {
     let codec = match four_cc {
-        AudioFourCc::Aac => CmafCodec::Aac,
-        AudioFourCc::Opus => CmafCodec::Opus,
+        AudioFourCc::Aac => ElementaryCodec::Aac,
+        AudioFourCc::Opus => ElementaryCodec::Opus,
         _ => return Ok(None),
     };
     match packet {
-        AudioPacket::SequenceStart { header_data } => Ok(Some(CmafUnit::Configuration {
+        AudioPacket::SequenceStart { header_data } => Ok(Some(ElementaryUnit::Configuration {
             codec,
             extradata: header_data.clone(),
             track_id,
         })),
-        AudioPacket::CodedFrames { data } => Ok(Some(CmafUnit::Sample {
+        AudioPacket::CodedFrames { data } => Ok(Some(ElementaryUnit::Sample {
             codec,
             payload: data.clone(),
             keyframe: true,
@@ -293,15 +293,15 @@ fn video_packet(
     packet: &VideoPacket<'_>,
     keyframe: bool,
     track_id: Option<u8>,
-) -> Result<Option<CmafUnit>, MediaValidationError> {
+) -> Result<Option<ElementaryUnit>, MediaValidationError> {
     let codec = match four_cc {
-        VideoFourCc::Avc => CmafCodec::Avc,
-        VideoFourCc::Hevc => CmafCodec::Hevc,
-        VideoFourCc::Av1 => CmafCodec::Av1,
+        VideoFourCc::Avc => ElementaryCodec::Avc,
+        VideoFourCc::Hevc => ElementaryCodec::Hevc,
+        VideoFourCc::Av1 => ElementaryCodec::Av1,
         _ => return Ok(None),
     };
     match packet {
-        VideoPacket::SequenceStart(start) => Ok(Some(CmafUnit::Configuration {
+        VideoPacket::SequenceStart(start) => Ok(Some(ElementaryUnit::Configuration {
             codec,
             extradata: sequence_start_bytes(start)?,
             track_id,
@@ -318,7 +318,7 @@ fn video_packet(
                 } => (data.clone(), *composition_time_offset),
                 VideoPacketCodedFrames::Other(data) => (data.clone(), 0),
             };
-            Ok(Some(CmafUnit::Sample {
+            Ok(Some(ElementaryUnit::Sample {
                 codec,
                 payload,
                 keyframe,
@@ -326,7 +326,7 @@ fn video_packet(
                 track_id,
             }))
         }
-        VideoPacket::CodedFramesX { data } => Ok(Some(CmafUnit::Sample {
+        VideoPacket::CodedFramesX { data } => Ok(Some(ElementaryUnit::Sample {
             codec,
             payload: data.clone(),
             keyframe,
@@ -383,9 +383,9 @@ mod tests {
         let raw = Bytes::from_static(&[0xaf, 0x00, 0x11, 0x88]);
         let media =
             ValidatedMedia::parse_audio(raw, EnhancedValidationMode::Strict).expect("legacy AAC");
-        match media.cmaf_unit().expect("maps") {
-            Some(CmafUnit::Configuration {
-                codec: CmafCodec::Aac,
+        match media.elementary_unit().expect("maps") {
+            Some(ElementaryUnit::Configuration {
+                codec: ElementaryCodec::Aac,
                 extradata,
                 track_id: None,
             }) => assert_eq!(extradata.as_ref(), &[0x11, 0x88]),
@@ -398,9 +398,9 @@ mod tests {
         let raw = Bytes::from_static(&[0xaf, 0x01, 0xde, 0x02, 0x00]);
         let media =
             ValidatedMedia::parse_audio(raw, EnhancedValidationMode::Strict).expect("legacy AAC");
-        match media.cmaf_unit().expect("maps") {
-            Some(CmafUnit::Sample {
-                codec: CmafCodec::Aac,
+        match media.elementary_unit().expect("maps") {
+            Some(ElementaryUnit::Sample {
+                codec: ElementaryCodec::Aac,
                 payload,
                 keyframe: true,
                 composition_time_offset: 0,
@@ -416,9 +416,9 @@ mod tests {
         raw.extend_from_slice(&[0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x84, 0x05]);
         let media = ValidatedMedia::parse_video(Bytes::from(raw), EnhancedValidationMode::Strict)
             .expect("legacy AVC");
-        match media.cmaf_unit().expect("maps") {
-            Some(CmafUnit::Sample {
-                codec: CmafCodec::Avc,
+        match media.elementary_unit().expect("maps") {
+            Some(ElementaryUnit::Sample {
+                codec: ElementaryCodec::Avc,
                 payload,
                 keyframe: true,
                 composition_time_offset,
@@ -440,7 +440,7 @@ mod tests {
         let mp3 = Bytes::from_static(&[0x2f, 0xff, 0xfb]);
         let media =
             ValidatedMedia::parse_audio(mp3, EnhancedValidationMode::Strict).expect("legacy MP3");
-        assert!(media.cmaf_unit().expect("skips").is_none());
+        assert!(media.elementary_unit().expect("skips").is_none());
     }
 
     #[test]
@@ -449,9 +449,9 @@ mod tests {
         raw.extend_from_slice(&[0x11, 0x88]);
         let media = ValidatedMedia::parse_audio(Bytes::from(raw), EnhancedValidationMode::Strict)
             .expect("enhanced AAC");
-        match media.cmaf_unit().expect("maps") {
-            Some(CmafUnit::Configuration {
-                codec: CmafCodec::Aac,
+        match media.elementary_unit().expect("maps") {
+            Some(ElementaryUnit::Configuration {
+                codec: ElementaryCodec::Aac,
                 extradata,
                 ..
             }) => assert_eq!(extradata.as_ref(), &[0x11, 0x88]),
@@ -465,9 +465,9 @@ mod tests {
         raw.extend_from_slice(&[0x11, 0x88]);
         let media = ValidatedMedia::parse_audio(Bytes::from(raw), EnhancedValidationMode::Strict)
             .expect("OneTrack AAC");
-        match media.cmaf_unit().expect("maps") {
-            Some(CmafUnit::Configuration {
-                codec: CmafCodec::Aac,
+        match media.elementary_unit().expect("maps") {
+            Some(ElementaryUnit::Configuration {
+                codec: ElementaryCodec::Aac,
                 track_id: Some(2),
                 extradata,
             }) => assert_eq!(extradata.as_ref(), &[0x11, 0x88]),
@@ -485,10 +485,14 @@ mod tests {
         }
         let media = ValidatedMedia::parse_audio(Bytes::from(raw), EnhancedValidationMode::Strict)
             .expect("ManyTracks AAC");
-        let units = media.cmaf_units().expect("maps");
+        let units = media.elementary_units().expect("maps");
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].track_id(), Some(1));
         assert_eq!(units[1].track_id(), Some(3));
-        assert!(units.iter().all(|unit| unit.codec() == CmafCodec::Aac));
+        assert!(
+            units
+                .iter()
+                .all(|unit| unit.codec() == ElementaryCodec::Aac)
+        );
     }
 }

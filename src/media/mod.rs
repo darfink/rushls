@@ -6,15 +6,19 @@
 //! catalog — so a seam would only let tests substitute something that is not
 //! the thing running in production.
 
+pub mod aac;
+pub mod av1;
 mod captions;
 mod density;
 mod normalize;
+pub mod opus;
 mod pacer;
 mod sample;
 mod stream;
 mod timeline;
 mod timing;
 mod validate;
+pub mod video_config;
 
 #[cfg(test)]
 pub mod fixtures;

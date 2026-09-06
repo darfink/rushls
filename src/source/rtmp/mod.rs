@@ -6,6 +6,7 @@
 
 mod caption;
 mod map;
+mod metadata;
 mod queue;
 mod source;
 

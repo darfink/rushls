@@ -1,8 +1,7 @@
 //! Streaming RTMP media behind a bounded `PacketSource`.
 //!
 //! The session task already parsed tags. This adapter waits for decoder
-//! configuration, freezes a catalog, then yields CMAF-ready access units on
-//! the RTMP millisecond clock.
+//! configuration, freezes a catalog, then yields elementary access units.
 
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
@@ -11,7 +10,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use cc_rtmp::{CmafCodec, CmafUnit, EncoderSummary, MediaInterpretation};
+use cc_rtmp::{ElementaryCodec, ElementaryUnit, EncoderSummary, MediaInterpretation};
 
 use crate::{
     domain::{
@@ -42,7 +41,7 @@ pub struct RtmpPacketSource {
 
 #[derive(Clone, Default)]
 struct LiveTracks {
-    by_source: HashMap<SourceTrackKey, TrackId>,
+    by_source: HashMap<SourceTrackKey, DiscoveredTrack>,
     subtitle: Option<TrackId>,
 }
 
@@ -52,21 +51,7 @@ impl RtmpPacketSource {
         limits: InputLimits,
         meters: Arc<dyn SourceMeters>,
     ) -> Result<Self, SourceError> {
-        if limits.maximum_packets_per_batch == 0 {
-            return Err(SourceError::Open(
-                "maximum packets per batch must be nonzero".into(),
-            ));
-        }
-        if limits.maximum_payload_bytes_per_packet == 0 {
-            return Err(SourceError::Open(
-                "maximum packet payload must be nonzero".into(),
-            ));
-        }
-        if limits.maximum_payload_bytes_per_batch < limits.maximum_payload_bytes_per_packet {
-            return Err(SourceError::Open(
-                "maximum batch payload must fit one maximum-sized packet".into(),
-            ));
-        }
+        limits.validate()?;
         Ok(Self {
             ingress: Some(ingress),
             limits,
@@ -132,11 +117,9 @@ impl PacketSource for RtmpPacketSource {
                         return Ok(self.store_discovery(catalog, prefetch));
                     }
                 };
-                probed = probed.saturating_add(event_bytes(&event));
+                probed = probed.saturating_add(event.queued_bytes());
                 if probed > limits.maximum_probe_bytes {
-                    let (catalog, prefetch) =
-                        builder.finish_on_limit(DiscoveryProblem::ProbeLimitExceeded)?;
-                    return Ok(self.store_discovery(catalog, prefetch));
+                    return Err(DiscoveryProblem::ProbeLimitExceeded.into());
                 }
                 match builder.observe(event, self.limits)? {
                     Observe::Continue => {
@@ -148,14 +131,17 @@ impl PacketSource for RtmpPacketSource {
                             // and ignores later script-data, matching captions
                             // that arrive after discovery has already frozen.
                             loop {
+                                if Instant::now() >= deadline {
+                                    let (catalog, prefetch) = builder
+                                        .finish_on_limit(DiscoveryProblem::DeadlineExceeded)?;
+                                    return Ok(self.store_discovery(catalog, prefetch));
+                                }
                                 let Some(queued) = self.next_event(false).await else {
                                     break;
                                 };
-                                probed = probed.saturating_add(event_bytes(&queued));
+                                probed = probed.saturating_add(queued.queued_bytes());
                                 if probed > limits.maximum_probe_bytes {
-                                    let (catalog, prefetch) = builder
-                                        .finish_on_limit(DiscoveryProblem::ProbeLimitExceeded)?;
-                                    return Ok(self.store_discovery(catalog, prefetch));
+                                    return Err(DiscoveryProblem::ProbeLimitExceeded.into());
                                 }
                                 match builder.observe(queued, self.limits)? {
                                     Observe::Continue => {}
@@ -202,6 +188,7 @@ impl PacketSource for RtmpPacketSource {
 
             let mut packets = 0_usize;
             let mut payload_bytes = 0_usize;
+            let mut events = 0_usize;
             loop {
                 let packet = if let Some(packet) = self.pending.pop_front() {
                     packet
@@ -210,6 +197,13 @@ impl PacketSource for RtmpPacketSource {
                 } else if self.terminal.is_some() {
                     break;
                 } else {
+                    if events == self.limits.maximum_packets_per_batch {
+                        // Non-media tags must not monopolize a worker while
+                        // the publisher continuously refills the queue.
+                        tokio::task::yield_now().await;
+                        break;
+                    }
+                    events += 1;
                     match self.next_event(packets == 0).await {
                         Some(IngressEvent::End(state)) => {
                             self.terminal = Some(state);
@@ -252,7 +246,12 @@ impl PacketSource for RtmpPacketSource {
 
             self.meters
                 .source_progress(payload_bytes as u64, packets as u64, 0);
-            Ok(self.terminal.unwrap_or(InputState::Open))
+            // EOF discovered during probing must not hide later prefetch batches.
+            Ok(if self.pending.is_empty() && self.prefetch.is_empty() {
+                self.terminal.unwrap_or(InputState::Open)
+            } else {
+                InputState::Open
+            })
         })
     }
 }
@@ -269,7 +268,7 @@ impl RtmpPacketSource {
                 .tracks()
                 .iter()
                 .filter(|track| track.kind() != MediaKind::Subtitle)
-                .filter_map(|track| Some((track.source_key.clone()?, track.id)))
+                .filter_map(|track| Some((track.source_key.clone()?, track.clone())))
                 .collect(),
             subtitle: catalog
                 .tracks
@@ -296,6 +295,7 @@ struct CatalogBuilder {
     text: Option<DiscoveredTrack>,
     next_id: u32,
     hint: Option<EncoderSummary>,
+    metadata: Option<cc_rtmp::ParsedMetadata>,
     expected_audio: BTreeSet<u8>,
     expected_video: BTreeSet<u8>,
     prefetch: VecDeque<Packet>,
@@ -310,6 +310,7 @@ impl CatalogBuilder {
             text: None,
             next_id: 0,
             hint: None,
+            metadata: None,
             expected_audio: BTreeSet::new(),
             expected_video: BTreeSet::new(),
             prefetch: VecDeque::new(),
@@ -329,14 +330,15 @@ impl CatalogBuilder {
                     self.hint = Some(parsed.encoder_summary());
                     self.expected_audio = numbered_track_ids(parsed.audio_tracks.keys());
                     self.expected_video = numbered_track_ids(parsed.video_tracks.keys());
+                    self.metadata = Some(parsed);
                 }
                 Ok(Observe::Continue)
             }
             IngressEvent::Audio { timestamp, media } => {
-                self.on_units(timestamp, media.cmaf_units().map_err(demux)?, limits)
+                self.on_units(timestamp, media.elementary_units().map_err(demux)?, limits)
             }
             IngressEvent::Video { timestamp, media } => {
-                self.on_units(timestamp, media.cmaf_units().map_err(demux)?, limits)
+                self.on_units(timestamp, media.elementary_units().map_err(demux)?, limits)
             }
             IngressEvent::Script { timestamp, payload } => {
                 self.on_script(timestamp, &payload, limits)
@@ -382,7 +384,7 @@ impl CatalogBuilder {
     fn on_units(
         &mut self,
         timestamp: u32,
-        units: Vec<CmafUnit>,
+        units: Vec<ElementaryUnit>,
         limits: InputLimits,
     ) -> Result<Observe, SourceError> {
         for unit in units {
@@ -394,16 +396,16 @@ impl CatalogBuilder {
     fn on_unit(
         &mut self,
         timestamp: u32,
-        unit: CmafUnit,
+        unit: ElementaryUnit,
         limits: InputLimits,
     ) -> Result<(), SourceError> {
         match unit {
-            CmafUnit::Configuration {
+            ElementaryUnit::Configuration {
                 codec,
                 extradata,
                 track_id,
             } => self.add_track(codec, extradata, track_id),
-            sample @ CmafUnit::Sample {
+            sample @ ElementaryUnit::Sample {
                 codec, track_id, ..
             } => {
                 self.saw_sample = true;
@@ -417,15 +419,13 @@ impl CatalogBuilder {
                             "RTMP coded frames arrived before a sequence header".into(),
                         )
                     })?;
-                if track.first_pts.is_none() {
-                    track.first_pts = Some(i64::from(timestamp));
-                }
                 let packet = map::packet(
                     track.id,
                     timestamp,
                     sample,
                     limits.maximum_payload_bytes_per_packet,
                 )?;
+                crate::source::record_first_pts(track, &packet)?;
                 self.prefetch.push_back(packet);
                 Ok(())
             }
@@ -434,7 +434,7 @@ impl CatalogBuilder {
 
     fn add_track(
         &mut self,
-        codec: CmafCodec,
+        codec: ElementaryCodec,
         extradata: Bytes,
         track_id: Option<u8>,
     ) -> Result<(), SourceError> {
@@ -494,17 +494,17 @@ impl CatalogBuilder {
     }
 
     fn tracks_have_timestamps(&self) -> bool {
-        self.tracks.iter().all(|track| track.first_pts.is_some())
+        !self.tracks.is_empty() && self.tracks.iter().all(|track| track.first_pts.is_some())
     }
 
     fn expected_tracks_present(&self) -> bool {
         self.expected_audio
             .iter()
-            .all(|id| self.has_source(&map::source_key(CmafCodec::Aac, Some(*id))))
+            .all(|id| self.has_source(&map::source_key(ElementaryCodec::Aac, Some(*id))))
             && self
                 .expected_video
                 .iter()
-                .all(|id| self.has_source(&map::source_key(CmafCodec::Avc, Some(*id))))
+                .all(|id| self.has_source(&map::source_key(ElementaryCodec::Avc, Some(*id))))
     }
 
     fn has_source(&self, key: &SourceTrackKey) -> bool {
@@ -519,6 +519,11 @@ impl CatalogBuilder {
 
     fn freeze(&mut self) -> Result<DiscoveryReport, SourceError> {
         let mut tracks = self.tracks.clone();
+        if let Some(metadata) = &self.metadata {
+            for track in &mut tracks {
+                super::metadata::apply(track, metadata);
+            }
+        }
         if let Some(track) = self.text.clone() {
             tracks.push(track);
         }
@@ -545,11 +550,11 @@ impl CatalogBuilder {
         mut self,
         problem: DiscoveryProblem,
     ) -> Result<(DiscoveryReport, VecDeque<Packet>), SourceError> {
-        if self.tracks.is_empty() {
-            Err(problem.into())
-        } else {
+        if self.tracks_have_timestamps() {
             let catalog = self.freeze()?;
             Ok((catalog, std::mem::take(&mut self.prefetch)))
+        } else {
+            Err(problem.into())
         }
     }
 }
@@ -580,13 +585,13 @@ fn live_packets(
         )),
         IngressEvent::Audio { timestamp, media } => live_samples(
             timestamp,
-            media.cmaf_units().map_err(demux)?,
+            media.elementary_units().map_err(demux)?,
             tracks,
             limits,
         ),
         IngressEvent::Video { timestamp, media } => live_samples(
             timestamp,
-            media.cmaf_units().map_err(demux)?,
+            media.elementary_units().map_err(demux)?,
             tracks,
             limits,
         ),
@@ -595,7 +600,7 @@ fn live_packets(
 
 fn live_samples(
     timestamp: u32,
-    units: Vec<CmafUnit>,
+    units: Vec<ElementaryUnit>,
     tracks: &LiveTracks,
     limits: InputLimits,
 ) -> Result<VecDeque<Packet>, SourceError> {
@@ -610,26 +615,36 @@ fn live_samples(
 
 fn live_sample(
     timestamp: u32,
-    unit: CmafUnit,
+    unit: ElementaryUnit,
     tracks: &LiveTracks,
     limits: InputLimits,
 ) -> Result<Option<Packet>, SourceError> {
     let key = map::source_key(unit.codec(), unit.track_id());
     match unit {
-        CmafUnit::Configuration { .. } => {
-            if tracks.by_source.contains_key(&key) {
-                Ok(None)
-            } else {
-                Err(SourceError::TrackSetChanged)
-            }
-        }
-        sample @ CmafUnit::Sample { .. } => {
-            let track_id = *tracks
+        ElementaryUnit::Configuration {
+            codec, extradata, ..
+        } => {
+            let track = tracks
                 .by_source
                 .get(&key)
                 .ok_or(SourceError::TrackSetChanged)?;
+            if map::codec(codec) != track.codec
+                || extradata.as_ref() != track.codec_extradata.as_bytes()
+            {
+                return Err(SourceError::CodecParametersChanged { track_id: track.id });
+            }
+            Ok(None)
+        }
+        sample @ ElementaryUnit::Sample { codec, .. } => {
+            let track = tracks
+                .by_source
+                .get(&key)
+                .ok_or(SourceError::TrackSetChanged)?;
+            if map::codec(codec) != track.codec {
+                return Err(SourceError::CodecParametersChanged { track_id: track.id });
+            }
             map::packet(
-                track_id,
+                track.id,
                 timestamp,
                 sample,
                 limits.maximum_payload_bytes_per_packet,
@@ -641,16 +656,6 @@ fn live_sample(
 
 fn numbered_track_ids<'a>(ids: impl Iterator<Item = &'a u32>) -> BTreeSet<u8> {
     ids.filter_map(|id| u8::try_from(*id).ok()).collect()
-}
-
-fn event_bytes(event: &IngressEvent) -> usize {
-    match event {
-        IngressEvent::Audio { media, .. } => media.raw.len(),
-        IngressEvent::Video { media, .. } => media.raw.len(),
-        IngressEvent::Metadata(metadata) => metadata.raw.len(),
-        IngressEvent::Script { payload, .. } => payload.len(),
-        IngressEvent::End(_) | IngressEvent::Failed(_) => 0,
-    }
 }
 
 fn expects_video(hint: &EncoderSummary) -> bool {
@@ -728,6 +733,57 @@ mod tests {
                 return (packets, state);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn closed_discovery_drains_every_small_batch() -> Result<(), SourceError> {
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let (reader, writer) = channel(nz::usize!(64 * 1024));
+        writer
+            .send(audio(0, 0, crate::mux::fixtures::AAC_EXTRADATA))
+            .await
+            .expect("config queues");
+        for timestamp in [0, 21, 43] {
+            writer
+                .send(audio(timestamp, 1, crate::mux::fixtures::AAC_FRAME))
+                .await
+                .expect("frame queues");
+        }
+        writer.finish(InputState::Closed);
+        let mut limits = InputLimits::permissive();
+        limits.maximum_packets_per_batch = 1;
+        let mut source = RtmpPacketSource::new(reader, limits, meters.source_view())?;
+        source.discover(discovery_limits()).await?;
+        let (packets, state) = drain(&mut source).await;
+        assert_eq!(packets.len(), 3);
+        assert_eq!(state, InputState::Closed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn changed_sequence_header_after_freeze_is_rejected() -> Result<(), SourceError> {
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let (reader, writer) = channel(nz::usize!(64 * 1024));
+        writer
+            .send(audio(0, 0, crate::mux::fixtures::AAC_EXTRADATA))
+            .await
+            .expect("config queues");
+        writer
+            .send(audio(0, 1, crate::mux::fixtures::AAC_FRAME))
+            .await
+            .expect("frame queues");
+        let mut source =
+            RtmpPacketSource::new(reader, InputLimits::permissive(), meters.source_view())?;
+        source.discover(discovery_limits()).await?;
+        writer
+            .send(audio(21, 0, &[0x12, 0x10]))
+            .await
+            .expect("changed config queues");
+        assert!(matches!(
+            source.fill(&mut Vec::new()).await,
+            Err(SourceError::CodecParametersChanged { .. })
+        ));
+        Ok(())
     }
 
     #[tokio::test]

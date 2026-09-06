@@ -1648,6 +1648,8 @@ dependencies = [
  "rcgen",
  "rml_amf0",
  "rustls",
+ "scuffle-av1",
+ "scuffle-h265",
  "serde",
  "serde_json",
  "socket2",

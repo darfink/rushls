@@ -2,10 +2,10 @@
 //!
 //! The sans-I/O session and chunking machinery comes from the hardened,
 //! workspace-vendored RML core. Enhanced RTMP media is inspected with
-//! `scuffle-flv`. Original bytes remain authoritative for forwarding; a CMAF
+//! `scuffle-flv`. Original bytes remain authoritative for forwarding; an elementary-media
 //! view of the same tags is available for ingest that does not wrap FLV.
 
-pub mod cmaf;
+pub mod elementary;
 pub mod enhanced;
 pub mod media;
 pub mod metadata;
@@ -37,7 +37,7 @@ pub mod time {
     pub use rml_rtmp::time::*;
 }
 
-pub use cmaf::{CmafCodec, CmafUnit};
+pub use elementary::{ElementaryCodec, ElementaryUnit};
 pub use enhanced::{EnhancedCapabilities, EnhancedValidationMode};
 pub use media::{
     MediaClassification, MediaInterpretation, ParsedAudio, ParsedVideo, ValidatedMedia,

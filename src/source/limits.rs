@@ -51,6 +51,22 @@ pub struct InputLimits {
 }
 
 impl InputLimits {
+    /// Both native adapters must be able to return one maximum-sized packet.
+    pub fn validate(self) -> Result<(), super::SourceError> {
+        let problem = if self.maximum_packets_per_batch == 0 {
+            Some("maximum packets per batch must be nonzero")
+        } else if self.maximum_payload_bytes_per_packet == 0 {
+            Some("maximum packet payload must be nonzero")
+        } else if self.maximum_payload_bytes_per_batch < self.maximum_payload_bytes_per_packet {
+            Some("maximum batch payload must fit one maximum-sized packet")
+        } else {
+            None
+        };
+        problem.map_or(Ok(()), |message| {
+            Err(super::SourceError::Open(message.into()))
+        })
+    }
+
     /// Generous headroom over any realistic contribution feed.
     ///
     /// 50k packets/s is far above a single 4K contribution encoder, so a

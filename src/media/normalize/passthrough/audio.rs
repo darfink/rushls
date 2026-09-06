@@ -48,7 +48,13 @@ impl AudioNormalizer {
             track_id: track.id,
             codec: track.codec,
             projection,
-            timestamp_tolerance,
+            // Enhanced RTMP Opus uses a 48 kHz clock to preserve pre-skip,
+            // but its transport timestamps still have millisecond precision.
+            timestamp_tolerance: if track.codec == Codec::Opus {
+                timestamp_tolerance.max(48)
+            } else {
+                timestamp_tolerance
+            },
             audible_start: track.first_pts.ok_or_else(|| {
                 invalid_plan(format!("{} has no audible start timestamp", track.id))
             })?,
@@ -81,6 +87,7 @@ impl AudioNormalizer {
             .pts
             .map(|pts| project_timestamp(self.projection, pts, self.track_id, "audio PTS"))
             .transpose()?;
+        let first = self.first;
         let pts = if self.first {
             let audible_start = project_timestamp(
                 self.projection,
@@ -118,6 +125,9 @@ impl AudioNormalizer {
                 .ok_or_else(|| processing(format!("{} audio clock overflows", self.track_id)))?,
         );
         let mut trim = packet.audio_trim;
+        if first && trim.leading_samples == 0 {
+            trim.leading_samples = self.timing.initial_padding_samples;
+        }
         if let Some(inferred) = inferred_trailing {
             trim.trailing_samples = self.terminal_trim(trim.trailing_samples, inferred)?;
         }

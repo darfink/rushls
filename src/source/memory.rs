@@ -13,16 +13,13 @@
 //! whose correct value is unknowable invites tuning that can only break
 //! discovery for multi-rendition contributors.
 //!
-//! What is owed instead is the guarantee and a way to check it. The budget below
-//! is the guarantee; `rushls_session_pipeline_bytes` is the check.
+//! These budgets cover application payload buffers. The native demuxer also
+//! retains per-PID PES/probe buffers, and parsed tags and queue entries add
+//! allocation overhead. The sum is not a strict bound on process memory.
 
 use bytesize::ByteSize;
 
-/// The per-publisher pipeline budget, and how it is divided.
-///
-/// Worst-case node memory is
-/// `capacity.streams * memory_per_stream + capacity.publishers * TOTAL`.
-/// Stated here so capacity planning has the number without gaining a knob.
+/// Application payload budgets per publisher, excluding codec and allocator overhead.
 pub struct PipelineMemory;
 
 impl PipelineMemory {
@@ -43,7 +40,7 @@ impl PipelineMemory {
     /// Container probing before discovery concludes.
     pub const DISCOVERY: usize = 8 * 1024 * 1024;
 
-    /// The most one publisher may hold outside the store.
+    /// Sum of the application payload budgets outside the store.
     pub const TOTAL: usize =
         Self::TRANSPORT + Self::DEMUX_QUEUE + Self::BATCH + Self::PREROLL + Self::DISCOVERY;
 

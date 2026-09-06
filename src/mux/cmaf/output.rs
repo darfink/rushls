@@ -11,8 +11,7 @@ use bytes::Bytes;
 use transmux::{
     AVCDecoderConfigurationRecord, Av1ConfigurationBox, CodecConfig, EditBox, EditListBox,
     EditListEntry, FileTypeBox, FragmentTrackData, HEVCDecoderConfigurationRecord, MovieBox,
-    OpusSpecificBox, Sample, TrackSpec, aac_config_from_asc_bytes, build_init_segment,
-    build_media_segment,
+    Sample, TrackSpec, aac_config_from_asc_bytes, build_init_segment, build_media_segment,
 };
 
 use crate::{
@@ -28,6 +27,10 @@ const TRACK_ID: u32 = 1;
 
 pub(super) struct CmafOutput {
     spec: TrackSpec,
+    codec: Codec,
+    nal_length_bytes: usize,
+    roll: Option<super::roll::RollRecovery>,
+    video: crate::media::video_config::VideoProperties,
     padding_ticks: u64,
     pending: Vec<PendingSample>,
     first_decode: Option<TickTimestamp>,
@@ -49,7 +52,22 @@ impl CmafOutput {
         let timescale = media_timescale(track.timebase)?;
         let config = codec_config(track)?;
         Ok(Self {
+            nal_length_bytes: match &config {
+                CodecConfig::Avc { config, .. } => {
+                    usize::from(config.config.length_size_minus_one + 1)
+                }
+                CodecConfig::Hevc { config, .. } => {
+                    usize::from(config.config.length_size_minus_one + 1)
+                }
+                _ => 0,
+            },
             spec: TrackSpec::new(TRACK_ID, timescale, config),
+            codec: track.codec,
+            roll: (track.codec == Codec::Opus).then(super::roll::RollRecovery::default),
+            video: crate::media::video_config::properties(
+                track.codec,
+                track.codec_extradata.as_bytes(),
+            ),
             padding_ticks: padding_ticks(track)?,
             pending: Vec::new(),
             first_decode: None,
@@ -68,8 +86,28 @@ impl CmafOutput {
         if self.first_decode.is_none() {
             self.first_decode = Some(dts);
             self.first_pts = Some(pts);
+            if let NormalizedSample::Audio(audio) = sample {
+                // Normalized audio uses one tick per decoded sample.
+                self.padding_ticks = self
+                    .padding_ticks
+                    .max(u64::from(audio.trim.leading_samples));
+            }
         }
-        let duration = sample.duration();
+        if !self.initialized {
+            self.video.observe_hdr(
+                self.codec,
+                self.nal_length_bytes,
+                sample_payload(sample).as_bytes(),
+            );
+        }
+        // Opus permits shortening the final sample duration to discard end padding.
+        // Keep startup trim in elst so decode timestamps retain the encoder history.
+        let duration = match sample {
+            NormalizedSample::Audio(audio) if self.codec == Codec::Opus => sample
+                .duration()
+                .saturating_sub(u64::from(audio.trim.trailing_samples)),
+            _ => sample.duration(),
+        };
         self.pending.push(PendingSample {
             dts,
             pts,
@@ -100,7 +138,12 @@ impl CmafOutput {
             self.first_decode.unwrap_or(0),
             self.first_pts.unwrap_or(0),
         );
-        Ok(Payload::from_bytes(with_cmaf_init(&init, elst)?))
+        Ok(Payload::from_bytes(with_cmaf_init(
+            &init,
+            elst,
+            self.roll.is_some(),
+            &self.video,
+        )?))
     }
 
     fn build_media(&mut self) -> Result<Payload, Box<str>> {
@@ -134,6 +177,11 @@ impl CmafOutput {
         let fragment = FragmentTrackData::new(TRACK_ID, tfdt, &samples);
         let bytes =
             build_media_segment(self.sequence, std::slice::from_ref(&fragment)).map_err(mux)?;
+        let bytes = if let Some(roll) = &mut self.roll {
+            roll.fragment(&bytes, &samples)?
+        } else {
+            bytes
+        };
         self.sequence = self
             .sequence
             .checked_add(1)
@@ -203,17 +251,19 @@ fn codec_config(track: &DiscoveredTrack) -> Result<CodecConfig, Box<str>> {
                 timing,
                 ..
             },
-        ) => Ok(CodecConfig::Opus {
-            config: opus_config(
-                extra,
-                channels.get(),
-                sample_rate.get(),
-                timing.initial_padding_samples,
-            )?,
-            channel_count: channels.get(),
-            sample_rate: sample_rate.get(),
-            sample_size: bit_depth.map_or(16, std::num::NonZeroU16::get),
-        }),
+        ) => {
+            let mut config = crate::media::opus::configuration(extra)?;
+            // TS learns priming from PES rather than an OpusHead. Preserve it
+            // in dOps too, for decoders that use this informational field.
+            config.pre_skip = u16::try_from(timing.initial_padding_samples)
+                .map_err(|_| Box::<str>::from("Opus pre-skip exceeds the dOps range"))?;
+            Ok(CodecConfig::Opus {
+                config,
+                channel_count: channels.get(),
+                sample_rate: sample_rate.get(),
+                sample_size: bit_depth.map_or(16, std::num::NonZeroU16::get),
+            })
+        }
         (Codec::MovText | Codec::SubRip | Codec::Text | Codec::WebVtt, _) => {
             Err("subtitle codecs are not supported by the CMAF muxer".into())
         }
@@ -228,88 +278,34 @@ fn codec_config(track: &DiscoveredTrack) -> Result<CodecConfig, Box<str>> {
     }
 }
 
-fn opus_config(
-    extra: &[u8],
-    channels: u16,
-    sample_rate: u32,
-    initial_padding: u32,
-) -> Result<OpusSpecificBox, Box<str>> {
-    let body = record_body(extra, *b"dOps");
-    if let Ok(parsed) = OpusSpecificBox::parse(body) {
-        return Ok(parsed);
-    }
-    if extra.starts_with(b"OpusHead") {
-        return opus_head(extra);
-    }
-    Ok(OpusSpecificBox {
-        version: 0,
-        output_channel_count: u8::try_from(channels)
-            .map_err(|_| Box::<str>::from("Opus channel count exceeds dOps range"))?,
-        pre_skip: u16::try_from(initial_padding.min(u32::from(u16::MAX))).unwrap_or(u16::MAX),
-        input_sample_rate: sample_rate,
-        output_gain: 0,
-        channel_mapping_family: 0,
-        channel_mapping: None,
-    })
-}
-
-fn opus_head(bytes: &[u8]) -> Result<OpusSpecificBox, Box<str>> {
-    let body = bytes
-        .get(8..)
-        .ok_or_else(|| Box::<str>::from("OpusHead is truncated"))?;
-    if body.len() < 11 {
-        return Err("OpusHead is truncated".into());
-    }
-    Ok(OpusSpecificBox {
-        version: body[0],
-        output_channel_count: body[1],
-        pre_skip: u16::from_le_bytes([body[2], body[3]]),
-        input_sample_rate: u32::from_le_bytes([body[4], body[5], body[6], body[7]]),
-        output_gain: i16::from_le_bytes([body[8], body[9]]),
-        channel_mapping_family: body[10],
-        channel_mapping: None,
-    })
-}
-
 fn edit_list(
     padding_ticks: u64,
     first_decode: TickTimestamp,
     first_pts: TickTimestamp,
 ) -> Option<EditListBox> {
-    let entries = if padding_ticks > 0 {
-        vec![EditListEntry {
-            segment_duration: 0,
-            media_time: i64::try_from(padding_ticks).ok()?,
+    // tfdt is rebased by first_decode. Select the first audible/composed
+    // sample in that media clock, then retain its offset on the shared clock.
+    // Priming and a delayed track start can both be present.
+    let audible_start = first_pts.checked_add_unsigned(padding_ticks)?;
+    let media_time = audible_start.checked_sub(first_decode)?;
+    let mut entries = Vec::new();
+    if audible_start > 0 {
+        entries.push(EditListEntry {
+            segment_duration: u64::try_from(audible_start).ok()?,
+            media_time: -1,
             media_rate_integer: 1,
             media_rate_fraction: 0,
-        }]
-    } else if first_decode > 0 {
-        vec![
-            EditListEntry {
-                segment_duration: u64::try_from(first_decode).ok()?,
-                media_time: -1,
-                media_rate_integer: 1,
-                media_rate_fraction: 0,
-            },
-            EditListEntry {
-                segment_duration: 0,
-                media_time: 0,
-                media_rate_integer: 1,
-                media_rate_fraction: 0,
-            },
-        ]
-    } else {
-        let composition = first_pts.saturating_sub(first_decode);
-        if composition <= 0 {
-            return None;
-        }
-        vec![EditListEntry {
-            segment_duration: 0,
-            media_time: composition,
-            media_rate_integer: 1,
-            media_rate_fraction: 0,
-        }]
-    };
+        });
+    }
+    if entries.is_empty() && media_time == 0 {
+        return None;
+    }
+    entries.push(EditListEntry {
+        segment_duration: 0,
+        media_time,
+        media_rate_integer: 1,
+        media_rate_fraction: 0,
+    });
     let version = u8::from(entries.iter().any(|entry| {
         entry.segment_duration > u64::from(u32::MAX)
             || entry.media_time < i64::from(i32::MIN)
@@ -322,7 +318,12 @@ fn edit_list(
     })
 }
 
-fn with_cmaf_init(init: &[u8], elst: Option<EditListBox>) -> Result<Vec<u8>, Box<str>> {
+fn with_cmaf_init(
+    init: &[u8],
+    elst: Option<EditListBox>,
+    opus: bool,
+    video: &crate::media::video_config::VideoProperties,
+) -> Result<Vec<u8>, Box<str>> {
     let (_, moov_bytes) = split_ftyp_moov(init)?;
     let ftyp = FileTypeBox {
         major_brand: *b"iso6",
@@ -339,6 +340,72 @@ fn with_cmaf_init(init: &[u8], elst: Option<EditListBox>) -> Result<Vec<u8>, Box
             elst: Some(elst),
             opaque: Vec::new(),
         });
+    }
+    if let Some(table) = moov
+        .tracks
+        .first_mut()
+        .and_then(|track| track.mdia.as_mut())
+        .and_then(|media| media.minf.as_mut())
+        .and_then(|info| info.stbl.as_mut())
+    {
+        for child in &mut table.children {
+            if let transmux::StblChild::Stsd(description) = child {
+                for entry in &mut description.entries {
+                    let extra = match entry {
+                        transmux::SampleEntryVariant::Avc1(entry) => &mut entry.extra_boxes,
+                        transmux::SampleEntryVariant::Hevc1(entry) => &mut entry.extra_boxes,
+                        _ => continue,
+                    };
+                    for (kind, data) in [
+                        (*b"mdcv", &video.mastering_display),
+                        (*b"clli", &video.content_light),
+                    ] {
+                        if let Some(data) = data {
+                            extra.push(transmux::sample_entries::OpaqueBox {
+                                box_type: kind,
+                                data: data.clone(),
+                            });
+                        }
+                    }
+                    if let Some((width, height)) = video.aspect {
+                        let ratio = transmux::PixelAspectRatioBox {
+                            h_spacing: u32::from(width),
+                            v_spacing: u32::from(height),
+                        };
+                        extra.push(transmux::sample_entries::OpaqueBox {
+                            box_type: *b"pasp",
+                            data: ratio.to_bytes(),
+                        });
+                    }
+                    if let Some((primaries, transfer, matrix, full_range)) = video.colour {
+                        let colour = transmux::ColourInformationBox {
+                            colour_type: *b"nclx",
+                            nclx: Some(transmux::NclxColourInfo {
+                                colour_primaries: u16::from(primaries),
+                                transfer_characteristics: u16::from(transfer),
+                                matrix_coefficients: u16::from(matrix),
+                                full_range_flag: full_range,
+                            }),
+                            icc_profile: Vec::new(),
+                        };
+                        extra.push(transmux::sample_entries::OpaqueBox {
+                            box_type: *b"colr",
+                            data: colour.to_bytes(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    if opus {
+        let table = moov
+            .tracks
+            .first_mut()
+            .and_then(|track| track.mdia.as_mut())
+            .and_then(|media| media.minf.as_mut())
+            .and_then(|info| info.stbl.as_mut())
+            .ok_or("Opus init has no sample table")?;
+        super::roll::RollRecovery::init(table);
     }
     let mut out = Vec::with_capacity(ftyp.serialized_len() + moov.serialized_len());
     out.extend_from_slice(&ftyp.to_bytes());
@@ -443,4 +510,28 @@ fn sample_payload(sample: &NormalizedSample) -> &Payload {
 
 fn mux(error: impl std::fmt::Display) -> Box<str> {
     error.to_string().into_boxed_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delayed_audio_keeps_both_priming_and_movie_offset() {
+        let edits = edit_list(312, 48_000, 48_000).expect("delayed primed audio");
+        assert_eq!(edits.entries.len(), 2);
+        assert_eq!(edits.entries[0].segment_duration, 48_312);
+        assert_eq!(edits.entries[0].media_time, -1);
+        assert_eq!(edits.entries[1].media_time, 312);
+        let edits = edit_list(312, -312, -312).expect("priming before origin");
+        assert_eq!(edits.entries.len(), 1);
+        assert_eq!(edits.entries[0].media_time, 312);
+    }
+
+    #[test]
+    fn delayed_reordered_video_keeps_composition_offset() {
+        let edits = edit_list(0, 900, 1_000).expect("delayed reordered video");
+        assert_eq!(edits.entries[0].segment_duration, 1_000);
+        assert_eq!(edits.entries[1].media_time, 100);
+    }
 }

@@ -22,9 +22,16 @@ use crate::{
 /// `None` so they never enter the catalog. Admission still decides which of
 /// the mapped codecs a stream may publish.
 pub fn track(spec: &TrackSpec) -> Result<Option<DiscoveredTrack>, SourceError> {
-    let Some((codec, parameters, codec_extradata)) = map_config(&spec.config)? else {
+    if let Some(track) = super::opus::track(spec)? {
+        return Ok(Some(track));
+    }
+    let Some((codec, mut parameters, codec_extradata)) = map_config(&spec.config)? else {
         return Ok(None);
     };
+    if let MediaParameters::Video { video_delay, .. } = &mut parameters {
+        *video_delay =
+            crate::media::video_config::properties(codec, codec_extradata.as_bytes()).reorder_depth;
+    }
     let timescale = NonZeroU32::new(spec.timescale).ok_or(DiscoveryProblem::NotPositive {
         field: "MPEG-TS media timescale",
     })?;
@@ -102,27 +109,34 @@ fn map_config(
             let extradata = serialize_record(config, "AV1 decoder configuration")?;
             Ok(Some((Codec::Av1, parameters, extradata)))
         }
-        CodecConfig::Aac {
-            esds,
-            channel_count,
-            sample_rate,
-            sample_size,
-        } => {
+        CodecConfig::Aac { esds, .. } => {
             let extradata = aac_extradata(esds)?;
             Ok(Some((
                 Codec::Aac,
-                audio_parameters(*sample_rate, *channel_count, *sample_size)?,
+                crate::media::aac::parameters(extradata.as_bytes()).map_err(SourceError::Demux)?,
                 extradata,
             )))
         }
         CodecConfig::Opus {
             config,
             channel_count,
-            sample_rate,
             sample_size,
+            ..
         } => Ok(Some((
             Codec::Opus,
-            audio_parameters(*sample_rate, *channel_count, *sample_size)?,
+            MediaParameters::Audio {
+                timing: AudioTiming {
+                    initial_padding_samples: u32::from(config.pre_skip),
+                    seek_preroll_samples: 3_840,
+                    ..AudioTiming::default()
+                },
+                sample_rate: nz::u32!(48_000),
+                channels: NonZeroU16::new(*channel_count).ok_or(DiscoveryProblem::NotPositive {
+                    field: "audio channels",
+                })?,
+                bit_depth: NonZeroU16::new(*sample_size),
+                frame_size: None,
+            },
             serialize_record(config, "Opus decoder configuration")?,
         ))),
         _ => Ok(None),
@@ -166,22 +180,6 @@ fn hevc_frame_rate(record: &transmux::HEVCDecoderConfigurationRecord) -> Option<
     Some(FrameRate::new(scale, units))
 }
 
-fn audio_parameters(
-    sample_rate: u32,
-    channel_count: u16,
-    sample_size: u16,
-) -> Result<MediaParameters, SourceError> {
-    Ok(MediaParameters::Audio {
-        sample_rate: nonzero_u32(sample_rate, "audio sample rate")?,
-        channels: NonZeroU16::new(channel_count).ok_or(DiscoveryProblem::NotPositive {
-            field: "audio channels",
-        })?,
-        frame_size: None,
-        bit_depth: NonZeroU16::new(sample_size),
-        timing: AudioTiming::default(),
-    })
-}
-
 fn aac_extradata(esds: &transmux::EsdsBox) -> Result<Payload, SourceError> {
     let data = esds
         .es_descriptor
@@ -218,7 +216,7 @@ fn nonzero_u32(value: u32, field: &'static str) -> Result<NonZeroU32, SourceErro
 /// HLS `LANGUAGE` is a single tag, so the first three-letter code is the
 /// advertised language. Unknown or truncated descriptors are skipped: a
 /// malformed SI loop must not fail discovery of an otherwise usable PID.
-fn language_from_es_info(descriptors: &[u8]) -> Option<String> {
+pub fn language_from_es_info(descriptors: &[u8]) -> Option<String> {
     const ISO_639_LANGUAGE_DESCRIPTOR_TAG: u8 = 0x0A;
     let mut offset = 0;
     while offset + 2 <= descriptors.len() {

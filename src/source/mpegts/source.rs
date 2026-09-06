@@ -59,21 +59,7 @@ impl MpegTsPacketSource {
         limits: InputLimits,
         meters: Arc<dyn SourceMeters>,
     ) -> Result<Self, SourceError> {
-        if limits.maximum_packets_per_batch == 0 {
-            return Err(SourceError::Open(
-                "maximum packets per batch must be nonzero".into(),
-            ));
-        }
-        if limits.maximum_payload_bytes_per_packet == 0 {
-            return Err(SourceError::Open(
-                "maximum packet payload must be nonzero".into(),
-            ));
-        }
-        if limits.maximum_payload_bytes_per_batch < limits.maximum_payload_bytes_per_packet {
-            return Err(SourceError::Open(
-                "maximum batch payload must fit one maximum-sized packet".into(),
-            ));
-        }
+        limits.validate()?;
         if config.maximum_queued_payload_bytes.get() < limits.maximum_payload_bytes_per_packet {
             return Err(SourceError::Open(
                 "queued payload budget must fit one maximum-sized packet".into(),
@@ -240,6 +226,22 @@ mod tests {
                 return (packets, state);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn discovers_opus_pes_and_preserves_control_header_trim() -> Result<(), SourceError> {
+        let mut source =
+            source(include_bytes!("../../../tests/apple_hls/fixtures/opus.ts").to_vec());
+        let discovery = source.discover(discovery_limits()).await?;
+        let track = &discovery.tracks.tracks()[0];
+        assert_eq!(track.codec, Codec::Opus);
+        let (packets, state) = drain(&mut source).await;
+        assert_eq!(state, InputState::Closed);
+        assert_eq!(packets[0].audio_trim.leading_samples, 312);
+        assert_eq!(track.first_pts, packets[0].pts.map(|pts| pts + 312));
+        assert!(packets.iter().all(|packet| packet.duration == Some(960)));
+        assert!(packets.last().unwrap().audio_trim.trailing_samples > 0);
+        Ok(())
     }
 
     #[tokio::test]

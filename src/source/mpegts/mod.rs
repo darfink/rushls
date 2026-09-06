@@ -6,8 +6,10 @@
 //! contract RTMP uses, including Annex-B → length-prefixed video and ADTS →
 //! raw AAC.
 
+mod av1;
 mod control;
 mod map;
+mod opus;
 mod source;
 mod worker;
 

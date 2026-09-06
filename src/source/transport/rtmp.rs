@@ -325,13 +325,7 @@ struct MediaHandler {
 
 impl MediaHandler {
     async fn send(&mut self, event: IngressEvent) -> Result<(), Box<str>> {
-        let required = match &event {
-            IngressEvent::Audio { media, .. } => media.raw.len(),
-            IngressEvent::Video { media, .. } => media.raw.len(),
-            IngressEvent::Metadata(metadata) => metadata.raw.len(),
-            IngressEvent::Script { payload, .. } => payload.len(),
-            IngressEvent::End(_) | IngressEvent::Failed(_) => 0,
-        };
+        let required = event.queued_bytes();
         if required > self.maximum_message_bytes {
             self.writer.fail(
                 format!(
@@ -962,7 +956,7 @@ mod tests {
 
     #[tokio::test]
     async fn script_data_events_are_queued_for_the_packet_source() {
-        let (mut handler, _attempt, mut reader) = handler(nz::usize!(1024), 512);
+        let (mut handler, _attempt, reader) = handler(nz::usize!(1024), 512);
         handler.active_stream_id = Some(7);
         let payload = crate::source::encode_cue(b"onCaption", b"hello");
         let event = ServerSessionEvent::StreamDataReceived {
