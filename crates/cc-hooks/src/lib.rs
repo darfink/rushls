@@ -160,6 +160,16 @@ pub struct HookConfig<K> {
     pub maximum_attempts: u32,
     #[debug(skip)]
     pub bearer: Option<BearerToken>,
+    /// A client of this destination's own, or `None` to use the shared one.
+    ///
+    /// Present only when a destination asked for something a shared pool
+    /// cannot give it: a client certificate, or an authority pinned in place
+    /// of the platform store. Both belong to *this* endpoint, and a pooled
+    /// connection reused across endpoints would present one service's identity
+    /// to another — so asking for either costs a pool, and only the endpoints
+    /// that ask pay for one.
+    #[debug(skip)]
+    pub client: Option<HttpClient>,
 }
 
 /// Process-wide hook settings.

@@ -150,6 +150,13 @@ listen = "127.0.0.1:9090"
 # events     = ["publisher.start", "stream.ready", "stream.gone", "publisher.stop"]
 # token_file = "/run/secrets/rushls-webhook-token"
 # token      = "${WEBHOOK_TOKEN}"        # inline form; prefer token_file
+# On an untrusted network, prove this origin to the endpoint and pin the
+# issuer in return. Same three fields as [auth.publish], and the same reload
+# behaviour: certificates rotate in place. A hook setting any of these gets a
+# connection pool of its own, so only the ones that ask pay for it.
+# client_certificate = "/etc/rushls/hooks/client.pem"
+# client_key         = "/etc/rushls/hooks/client-key.pem"
+# ca                 = "/etc/rushls/hooks/ca.pem"
 
 # [hook.billing]
 # url    = "http://billing.example.internal/rushls"

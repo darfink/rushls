@@ -304,7 +304,7 @@ impl AppConfig {
                  remove it rather than run a node that writes no archive",
             ));
         }
-        let hooks = resolve_hooks(self.hook, &node, &mut client)?;
+        let hooks = resolve_hooks(self.hook, &node, &mut client, &mut outbound_tls)?;
         warnings.extend(startup_warnings(&node, open_admission));
 
         Ok(ResolvedAppConfig {
@@ -520,6 +520,7 @@ fn resolve_hooks(
     endpoints: Option<TomlTable<HookEndpointAppConfig>>,
     node: &NodeConfig,
     client: &mut LazyHttpClient,
+    outbound_tls: &mut Vec<OutboundTls>,
 ) -> Result<Option<ResolvedHooks>, ConfigError> {
     let endpoints = endpoints.unwrap_or_default();
     if endpoints.0.is_empty() {
@@ -530,7 +531,7 @@ fn resolve_hooks(
 
     let mut hooks = Vec::with_capacity(endpoints.0.len());
     for (name, endpoint) in endpoints.0 {
-        hooks.push(endpoint.resolve(&name)?);
+        hooks.push(endpoint.resolve(&name, client, outbound_tls)?);
     }
 
     Ok(Some(ResolvedHooks {
@@ -542,8 +543,9 @@ fn resolve_hooks(
             hooks,
             ..HooksConfig::new(node.name.to_string())
         },
-        // A hook may wait far longer than admission may, which is why the
-        // limits are per-request rather than baked into a shared client.
+        // The pool every destination that configured no identity of its own
+        // uses. A hook may wait far longer than admission may, which is why
+        // the limits are per-request rather than baked into a shared client.
         client: client.with_limits(HOOK_REQUEST_TIMEOUT, HOOK_MAXIMUM_RESPONSE_BYTES)?,
     }))
 }
@@ -598,6 +600,12 @@ pub struct HookEndpointAppConfig {
     token: Option<String>,
     /// Reads the bearer credential from a mounted secret instead.
     token_file: Option<PathBuf>,
+    /// PEM certificate chain this node presents to this endpoint.
+    client_certificate: Option<PathBuf>,
+    /// PEM private key for that chain.
+    client_key: Option<PathBuf>,
+    /// PEM authority to trust instead of the platform store.
+    ca: Option<PathBuf>,
 }
 
 fn default_queue_capacity() -> usize {
@@ -613,7 +621,12 @@ fn default_maximum_attempts() -> u32 {
 }
 
 impl HookEndpointAppConfig {
-    fn resolve(self, name: &str) -> Result<HookConfig, ConfigError> {
+    fn resolve(
+        self,
+        name: &str,
+        client: &mut LazyHttpClient,
+        outbound_tls: &mut Vec<OutboundTls>,
+    ) -> Result<HookConfig, ConfigError> {
         if self.events.is_empty() {
             return Err(invalid(format!(
                 "hook `{name}` subscribes to no events, so it would never be called"
@@ -645,6 +658,27 @@ impl HookEndpointAppConfig {
             self.token_file.as_ref(),
         )?;
 
+        // Only a destination that asked for an identity or a pinned authority
+        // gets a client of its own; everything else shares the process pool.
+        // The material is held in `outbound_tls` for the same reason
+        // admission's is: dropping it stops rotations being noticed.
+        let tls = OutboundTlsAppConfig {
+            certificate: self.client_certificate.clone(),
+            key: self.client_key.clone(),
+            ca: self.ca.clone(),
+        };
+        let client = if tls.is_configured() {
+            let tls = tls.resolve(&format!("hook `{name}`"))?;
+            let built = tls.client(HOOK_REQUEST_TIMEOUT, HOOK_MAXIMUM_RESPONSE_BYTES)?;
+            outbound_tls.push(tls);
+            Some(built)
+        } else {
+            // Built now rather than at the first delivery, so a trust store
+            // this node cannot read fails startup instead of an event.
+            client.with_limits(HOOK_REQUEST_TIMEOUT, HOOK_MAXIMUM_RESPONSE_BYTES)?;
+            None
+        };
+
         Ok(HookConfig {
             name: Arc::from(name),
             endpoint: Endpoint::parse(&self.url).map_err(|error| invalid(error.to_string()))?,
@@ -656,6 +690,7 @@ impl HookEndpointAppConfig {
                 .map(|token| BearerToken::new(&token))
                 .transpose()
                 .map_err(|error| invalid(error.to_string()))?,
+            client,
         })
     }
 }

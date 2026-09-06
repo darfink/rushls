@@ -1,8 +1,8 @@
 # RFC companion: what the configuration asks the application to become
 
 > **Status: largely implemented.** Outstanding, in the order they are least
-> to most self-contained: effective retention-depth reporting, mutual TLS on
-> hook destinations, moderate timestamp jumps becoming discontinuities,
+> to most self-contained: effective retention-depth reporting,
+> moderate timestamp jumps becoming discontinuities,
 > payload-carrying hooks, `[record]`, delta playlists, the disk tier,
 > playback authorization, and enforcing
 > `memory_per_publisher`. Every key belonging to an unbuilt feature is refused
@@ -386,9 +386,22 @@ A destination configuring any of this gets its own connection pool. Pooling
 across destinations would mean presenting one service's certificate to another,
 so the cost of asking for mutual TLS is one pool per destination that asks.
 
-**Still outstanding for hooks.** `cc-hooks` holds one client for every
-destination, so per-hook identity is a change to that dispatcher rather than a
-configuration field. The keys are refused there until it lands.
+**The same three fields on hook destinations.** A hook endpoint is as much an
+operator-run service as the admission one, reached over the same networks, so
+the shape is identical rather than merely similar.
+
+What made this a dispatcher change rather than a configuration field is that
+`cc-hooks` held *one* client for every destination. `HookConfig` now carries an
+optional client of its own, and the dispatcher prefers it over the shared one.
+Optional rather than required because the default is worth keeping: a node with
+four plain endpoints reads the platform trust store once and shares one
+connection cache, and only a destination that asks for an identity or a pinned
+authority pays for a pool. That also keeps the property from admission — a
+pooled connection reused across destinations would present one service's
+certificate to another.
+
+Loading is fatal at startup for hooks too, and errors name the hook, so an
+operator running several knows which one to fix.
 
 **An NTSC alias table in frame-rate parsing.** Four decimal spellings map to
 their true rationals before any comparison. Parsing only — `FrameRate::exceeds`

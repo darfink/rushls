@@ -173,6 +173,7 @@ fn hook(address: SocketAddr, events: &[Happening]) -> HookConfig<Happening> {
         maximum_in_flight: 4,
         maximum_attempts: 3,
         bearer: None,
+        client: None,
     }
 }
 

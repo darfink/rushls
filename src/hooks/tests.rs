@@ -83,6 +83,8 @@ fn hook(address: SocketAddr, events: &[lifecycle::Kind]) -> HookConfig {
         maximum_in_flight: 4,
         maximum_attempts: 3,
         bearer: None,
+        // Nothing to authenticate over loopback, so the shared pool serves.
+        client: None,
     }
 }
 

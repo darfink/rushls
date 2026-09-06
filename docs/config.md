@@ -2,7 +2,7 @@
 
 > **Status: implemented**, apart from the features named as not built below:
 > playback authorization, `[record]`, the disk tier, delta playlists,
-> payload-carrying hooks, and mutual TLS. Their keys are refused at startup
+> and payload-carrying hooks. Their keys are refused at startup
 > rather than silently accepted.
 >
 > **The goal was inverted on purpose.** This document does not describe how to
@@ -643,6 +643,19 @@ milliseconds), and `ce-datacontenttype` must be absent in binary mode because
 The two modes are not symmetric and should not pretend to be. Structured is the
 complete event; binary is the media plus enough identity to file it.
 
+A hook destination takes the same `client_certificate`, `client_key`, and `ca`
+fields as `[auth.publish]`, with the same meaning and the same in-place
+rotation. Nothing about them is specific to admission: both are operator-run
+services reached over a network the operator may not consider private, and
+proving this origin to one while pinning its issuer in return is the same
+question in both places.
+
+Only a destination that sets one of them gets a connection pool of its own.
+That is not an optimisation detail — a pooled connection shared across
+destinations would present one service's certificate to another — but it does
+mean the common case of several plain endpoints still reads the trust store
+once and shares one cache.
+
 ## Auth
 
 Two independent questions, two tables. `[auth.publish]` decides who may send
@@ -906,13 +919,6 @@ Additive, no reorganization needed: a `[dash]` sibling to `[hls]`, stream-key
 auth as `[auth] key_file`, further ingest protocols as new top-level tables,
 and `EVENT`-type playlists, which would arrive as a new `[hls]` field naming
 the playlist type rather than as a second retention window.
-
-**Mutual TLS to a hook destination.** The three fields exist under
-`[auth.publish]` and are built there; the same spelling applies unchanged to a
-hook, which is why they are not named for admission. What is missing is the
-plumbing: the hook dispatcher holds one client for every destination, so
-per-hook identity is a change to that layer rather than a configuration field,
-and the keys are refused there until it lands.
 
 Structural, and honestly not designed for: **transcoding**. A rendition ladder
 needs named variants and per-variant constraints, which is a new top-level

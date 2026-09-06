@@ -522,6 +522,87 @@ client_key = "{}"
     Ok(())
 }
 
+#[tokio::test]
+async fn a_hook_may_present_its_own_identity() -> Result<(), Box<dyn Error>> {
+    // A hook endpoint is as much an operator-run service as the admission one,
+    // reached over the same networks, so it gets the same three fields. The
+    // difference is that hooks share one client by default: only a destination
+    // configuring material of its own is given a pool of its own, because a
+    // pooled connection would present one service's certificate to another.
+    let directory = scratch("hook-mtls");
+    let (settings, _) = write_pair(&directory, "origin.internal");
+
+    let resolved = resolve_toml(&format!(
+        r#"
+[hook.archive]
+url = "https://archive.internal/rushls"
+events = ["session.started"]
+client_certificate = "{}"
+client_key = "{}"
+ca = "{}"
+"#,
+        settings.certificate.display(),
+        settings.key.display(),
+        settings.certificate.display(),
+    ))??;
+
+    assert_eq!(
+        resolved.outbound_tls.len(),
+        1,
+        "held for its rotation watch, exactly as the admission material is"
+    );
+    let hooks = resolved.hooks.ok_or("the hook resolves")?;
+    assert!(
+        hooks.config.hooks[0].client.is_some(),
+        "a destination that asked for an identity gets its own pool"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hook_without_tls_material_shares_the_process_client()
+-> Result<(), Box<dyn Error>> {
+    let resolved = resolve_toml(
+        r#"
+[hook.automation]
+url = "http://automation.internal/rushls"
+events = ["session.started"]
+"#,
+    )??;
+
+    let hooks = resolved.hooks.ok_or("the hook resolves")?;
+    assert!(
+        hooks.config.hooks[0].client.is_none(),
+        "the ordinary case pays for one TLS setup and one connection cache"
+    );
+    assert!(resolved.outbound_tls.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn half_a_client_certificate_pair_is_refused_for_a_hook_too()
+-> Result<(), Box<dyn Error>> {
+    // Named by hook, so an operator running several knows which to fix.
+    let directory = scratch("hook-mtls-half");
+    let (settings, _) = write_pair(&directory, "origin.internal");
+
+    let error = resolve_toml(&format!(
+        r#"
+[hook.archive]
+url = "https://archive.internal/rushls"
+events = ["session.started"]
+client_certificate = "{}"
+"#,
+        settings.certificate.display(),
+    ))?
+    .err()
+    .ok_or("half a pair is refused")?
+    .to_string();
+
+    assert!(error.contains("archive"), "{error}");
+    assert!(error.contains("client_key"), "{error}");
+    Ok(())
+}
 
 #[test]
 fn keys_for_unbuilt_features_are_refused_by_name() -> Result<(), Box<dyn Error>> {
@@ -1250,4 +1331,3 @@ video = { codecs = ["text"] }
     assert!(matches!(wrong_kind, Err(ConfigError::Invalid(_))));
     Ok(())
 }
-

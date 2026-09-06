@@ -33,9 +33,19 @@ impl<E: Occurrence> Dispatchers<E> {
     pub async fn run(self, mut stop: watch::Receiver<bool>) {
         let mut hooks = JoinSet::new();
         for dispatcher in self.hooks {
+            // A destination that configured its own identity or trust roots
+            // brought its own client; everything else shares the process pool,
+            // which is what keeps one TLS setup and one connection cache for
+            // the ordinary case.
+            let client = dispatcher
+                .shared
+                .config
+                .client
+                .clone()
+                .unwrap_or_else(|| self.client.clone());
             hooks.spawn(run_hook(
                 dispatcher,
-                self.client.clone(),
+                client,
                 self.drain_timeout,
                 Arc::clone(&self.observer),
                 stop.clone(),
