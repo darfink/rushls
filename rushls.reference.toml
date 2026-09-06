@@ -143,7 +143,7 @@ memory_per_stream = "256MiB"             # retained parts and segments; worst-ca
 listen = "127.0.0.1:9090"
 # token_file = "/run/secrets/rushls-metrics-token"
 # token      = "${METRICS_TOKEN}"        # inline form; prefer token_file
-# Totals at /metrics. Per-stream series at /metrics/streams. The scraper picks.
+# Totals at /metrics. Sessions and per-stream retention at /metrics/streams.
 
 # [hook.automation]
 # url        = "http://automation.example.internal/rushls"

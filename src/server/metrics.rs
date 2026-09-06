@@ -15,15 +15,6 @@ use crate::{
 
 pub use cc_metrics::MetricsToken;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ExportPolicy {
-    /// Whether per-stream series are exported alongside process totals.
-    ///
-    /// Off by default: stream identity is unbounded cardinality, which is a
-    /// good way to take down a metrics backend.
-    pub per_stream: bool,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MetricsConfig {
     /// Where metrics are served, or `None` to export nothing.
@@ -39,7 +30,6 @@ pub struct MetricsConfig {
     pub listen: Option<SocketAddr>,
     /// When present, scrapes must authenticate with this bearer token.
     pub token: Option<MetricsToken>,
-    pub export: ExportPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -52,7 +42,6 @@ pub struct MetricsSnapshot {
     pub published_streams: usize,
     /// Streams still fetchable but waiting for a publisher to return.
     pub idle_streams: usize,
-    pub streams: Vec<SessionSnapshot>,
     /// Delivery counters per configured hook.
     pub hooks: Vec<(Arc<str>, HookSnapshot)>,
     /// Payload bytes currently held for viewers, memory tier.
@@ -97,12 +86,16 @@ impl MetricsEndpoint {
         render(&self.reader.snapshot())
     }
 
-    /// Per-stream retention, including idle streams still within `retain`.
+    /// Live sessions and per-stream retention, including idle streams still
+    /// within `retain`.
     ///
     /// Served at `/metrics/streams` so the scraper chooses the unbounded
     /// cardinality, rather than a node-side flag.
     pub fn render_streams(&self) -> String {
-        render_retention(&self.reader.snapshot())
+        render_labelled(
+            &self.reader.sessions.snapshot(),
+            &self.reader.retention_depths(),
+        )
     }
 }
 
@@ -121,7 +114,6 @@ pub struct MetricsReader {
     /// Absent unless hooks are configured, which is also when they have
     /// anything to report.
     hooks: Option<Hooks>,
-    policy: ExportPolicy,
 }
 
 impl MetricsReader {
@@ -131,7 +123,6 @@ impl MetricsReader {
         hls: HlsMeters,
         sessions: Registry,
         store: StreamStore,
-        policy: ExportPolicy,
     ) -> Self {
         Self {
             meters,
@@ -140,7 +131,6 @@ impl MetricsReader {
             sessions,
             store,
             hooks: None,
-            policy,
         }
     }
 
@@ -152,29 +142,18 @@ impl MetricsReader {
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let sessions = self.sessions.snapshot();
+        let retention = self.retention_depths();
         let published = self.store.leased();
-        let mut retention = self.store.live_streams();
-        retention.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
-        let retention: Vec<(StreamId, RetentionDepth)> = retention
-            .into_iter()
-            .map(|(id, live)| (id, live.retention_depth()))
-            .collect();
         MetricsSnapshot {
             process: self.meters.snapshot(),
             origin: self.origin.snapshot(),
             hls: self.hls.snapshot(),
-            active_sessions: sessions.len(),
+            // Count only: cloning every session is the `/metrics/streams` scrape.
+            active_sessions: self.sessions.len(),
             published_streams: published,
             idle_streams: self.store.len() - published,
-            streams: if self.policy.per_stream {
-                sessions
-            } else {
-                Vec::new()
-            },
-            // Always exported, unlike per-stream series: the number of hooks is
-            // what an operator configured, so this cannot grow unboundedly the
-            // way stream labels can.
+            // Bounded by what the operator configured, so this cannot grow the
+            // way stream labels can and stays on the process scrape.
             hooks: self
                 .hooks
                 .as_ref()
@@ -192,6 +171,15 @@ impl MetricsReader {
             retention_requested: self.store.limits().retention.retain,
             retention,
         }
+    }
+
+    fn retention_depths(&self) -> Vec<(StreamId, RetentionDepth)> {
+        let mut retention = self.store.live_streams();
+        retention.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        retention
+            .into_iter()
+            .map(|(id, live)| (id, live.retention_depth()))
+            .collect()
     }
 }
 
@@ -228,7 +216,7 @@ series! {
 /// reads, in `observe`. This decides only how to spell them on the wire, which
 /// is why adding a counter no longer means editing this function.
 pub fn render(snapshot: &MetricsSnapshot) -> String {
-    let mut output = String::with_capacity(4_096 + snapshot.streams.len() * 2_048);
+    let mut output = String::with_capacity(4_096);
 
     scalars(&mut output, ProcessSnapshot::SERIES, &snapshot.process);
     scalars(&mut output, OriginSnapshot::SERIES, &snapshot.origin);
@@ -239,9 +227,17 @@ pub fn render(snapshot: &MetricsSnapshot) -> String {
     if !snapshot.hooks.is_empty() {
         render_hooks(&mut output, &snapshot.hooks);
     }
-    if !snapshot.streams.is_empty() {
-        render_sessions(&mut output, &snapshot.streams);
-    }
+    output
+}
+
+/// Sessions and per-stream retention for `/metrics/streams`.
+fn render_labelled(
+    sessions: &[SessionSnapshot],
+    retention: &[(StreamId, RetentionDepth)],
+) -> String {
+    let mut output = String::with_capacity(512 + retention.len() * 256 + sessions.len() * 2_048);
+    render_retention_into(&mut output, retention);
+    render_sessions(&mut output, sessions);
     output
 }
 
@@ -303,7 +299,8 @@ fn metadata(output: &mut String, name: &str, help: &str, kind: MetricKind) {
 ///
 /// Metadata for every series comes first and the readings follow, rather than
 /// interleaving them per session: `# HELP` and `# TYPE` may each appear only
-/// once for a metric, however many label sets it has.
+/// once for a metric, however many label sets it has. Emitted even when no
+/// session is live, so the scrape still describes the series.
 fn render_sessions(output: &mut String, sessions: &[SessionSnapshot]) {
     metadata(
         output,
@@ -380,12 +377,10 @@ series! {
 const STREAM_RETAINED_BYTES: &str = "rushls_stream_retained_bytes";
 const STREAM_RETENTION_CAPACITY_BYTES: &str = "rushls_stream_retention_capacity_bytes";
 
-/// Per-stream retention at `/metrics/streams`.
-fn render_retention(snapshot: &MetricsSnapshot) -> String {
-    let mut output = String::with_capacity(512 + snapshot.retention.len() * 256);
+fn render_retention_into(output: &mut String, retention: &[(StreamId, RetentionDepth)]) {
     for series in STREAM_RETENTION_SERIES {
-        metadata(&mut output, series.name, series.help, series.kind);
-        for (stream, depth) in &snapshot.retention {
+        metadata(output, series.name, series.help, series.kind);
+        for (stream, depth) in retention {
             writeln!(
                 output,
                 "{}{{stream=\"{}\"}} {}",
@@ -397,18 +392,18 @@ fn render_retention(snapshot: &MetricsSnapshot) -> String {
         }
     }
     metadata(
-        &mut output,
+        output,
         STREAM_RETAINED_BYTES,
         "Payload bytes this stream holds in one retention tier.",
         MetricKind::Gauge,
     );
     metadata(
-        &mut output,
+        output,
         STREAM_RETENTION_CAPACITY_BYTES,
         "Configured cap for one retention tier of this stream.",
         MetricKind::Gauge,
     );
-    for (stream, depth) in &snapshot.retention {
+    for (stream, depth) in retention {
         let stream = escape_label(stream.as_str());
         for tier in depth.tiers() {
             writeln!(
@@ -425,7 +420,6 @@ fn render_retention(snapshot: &MetricsSnapshot) -> String {
             .expect("writing to a String cannot fail");
         }
     }
-    output
 }
 
 #[cfg(test)]
@@ -448,7 +442,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn per_stream_series_are_optional_while_totals_are_always_exported() {
+    async fn labelled_series_live_on_the_streams_scrape() {
         let meters = ProcessMeters::default();
         let sessions = Registry::default();
         let store = StreamStore::default();
@@ -463,46 +457,65 @@ mod tests {
             .lease_without_presentation(StreamId::new("live/camera"))
             .expect("the store has room");
 
-        let detailed = MetricsReader::new(
-            meters.clone(),
-            OriginMeters::default(),
-            HlsMeters::default(),
-            sessions.clone(),
-            store.clone(),
-            ExportPolicy { per_stream: true },
-        )
-        .snapshot();
-        assert_eq!(detailed.active_sessions, 1);
-        assert_eq!(detailed.published_streams, 1);
-        assert_eq!(detailed.idle_streams, 0);
-        assert_eq!(detailed.streams.len(), 1);
-        assert_eq!(detailed.streams[0].meters.bytes_received, 512);
+        let endpoint = MetricsEndpoint::new(
+            MetricsReader::new(
+                meters.clone(),
+                OriginMeters::default(),
+                HlsMeters::default(),
+                sessions.clone(),
+                store.clone(),
+            ),
+            None,
+        );
+
+        let totals = endpoint.render();
+        assert!(totals.contains("rushls_active_sessions 1\n"));
+        assert!(
+            !totals.contains("rushls_session_info"),
+            "session identity belongs on /metrics/streams"
+        );
+        assert!(
+            !totals.contains("stream=\"live/camera\""),
+            "stream labels belong on /metrics/streams"
+        );
+
+        let labelled = endpoint.render_streams();
+        assert!(labelled.contains("stream=\"live/camera\""));
+        assert!(labelled.contains("principal=\"publisher\""));
+        assert!(labelled.contains("rushls_session_info{"));
+        assert!(labelled.contains("rushls_session_bytes_received_total{"));
+        assert!(labelled.contains(" 512\n"));
+        assert!(
+            labelled.contains("rushls_stream_retention_requested_seconds{stream=\"live/camera\"}")
+        );
+        assert!(
+            !labelled.contains("rushls_active_sessions"),
+            "/metrics/streams is labelled series, not process totals"
+        );
 
         drop(registration);
         drop(lease);
 
-        let terse = MetricsReader::new(
+        let idle = MetricsReader::new(
             meters,
             OriginMeters::default(),
             HlsMeters::default(),
             sessions,
             store,
-            ExportPolicy::default(),
         )
         .snapshot();
-        assert_eq!(terse.active_sessions, 0);
+        assert_eq!(idle.active_sessions, 0);
         assert_eq!(
-            (terse.published_streams, terse.idle_streams),
+            (idle.published_streams, idle.idle_streams),
             (0, 1),
             "a stream awaiting reconnection is retained but not counted as published"
         );
-        assert!(terse.streams.is_empty());
-        assert_eq!(terse.process.sessions_started, 1);
-        assert_eq!(terse.process.bytes_received, 512);
-        assert_eq!(terse.retention.len(), 1, "idle streams still occupy retain");
-        assert_eq!(terse.retention[0].0.as_str(), "live/camera");
+        assert_eq!(idle.process.sessions_started, 1);
+        assert_eq!(idle.process.bytes_received, 512);
+        assert_eq!(idle.retention.len(), 1, "idle streams still occupy retain");
+        assert_eq!(idle.retention[0].0.as_str(), "live/camera");
         assert_eq!(
-            terse.retention_requested, terse.retention[0].1.requested,
+            idle.retention_requested, idle.retention[0].1.requested,
             "the process total is the same request each stream was given"
         );
     }
@@ -515,7 +528,6 @@ mod tests {
             HlsMeters::default(),
             Registry::default(),
             StreamStore::default(),
-            ExportPolicy::default(),
         );
         let open = MetricsEndpoint::new(reader.clone(), None);
         assert!(open.authorize(None));
@@ -540,7 +552,6 @@ mod tests {
             active_sessions: 2,
             published_streams: 1,
             idle_streams: 4,
-            streams: Vec::new(),
             hooks: Vec::new(),
             retained_payload_bytes: 0,
             retained_disk_bytes: 0,
@@ -570,6 +581,10 @@ mod tests {
             "per-stream retention belongs on /metrics/streams"
         );
         assert!(
+            !output.contains("rushls_session_info"),
+            "session series belong on /metrics/streams"
+        );
+        assert!(
             !output.contains("rushls_hook_"),
             "a node with no hooks exports no hook series at all, rather than \
              zeroes an operator would have to learn to ignore"
@@ -595,7 +610,6 @@ mod tests {
                 hls,
                 Registry::default(),
                 StreamStore::default(),
-                ExportPolicy::default(),
             ),
             None,
         )
@@ -620,7 +634,6 @@ mod tests {
             active_sessions: 0,
             published_streams: 0,
             idle_streams: 0,
-            streams: Vec::new(),
             hooks: vec![
                 (
                     Arc::from("automation"),
@@ -685,23 +698,9 @@ mod tests {
 
     #[test]
     fn stream_retention_is_labelled_and_tiered() {
-        let output = render_retention(&MetricsSnapshot {
-            process: ProcessSnapshot::default(),
-            origin: OriginSnapshot::default(),
-            hls: HlsSnapshot::default(),
-            active_sessions: 0,
-            published_streams: 0,
-            idle_streams: 1,
-            streams: Vec::new(),
-            hooks: Vec::new(),
-            retained_payload_bytes: 4_096,
-            retained_disk_bytes: 0,
-            retention_memory_capacity: 256 * 1024 * 1024,
-            retention_disk_capacity: 0,
-            spill_pending: 0,
-            spills_failed: 0,
-            retention_requested: Duration::from_mins(2),
-            retention: vec![(
+        let output = render_labelled(
+            &[],
+            &[(
                 StreamId::new("live/camera"),
                 RetentionDepth {
                     requested: Duration::from_mins(2),
@@ -712,7 +711,7 @@ mod tests {
                     disk_capacity: 0,
                 },
             )],
-        });
+        );
 
         assert!(
             output.contains(
@@ -737,7 +736,7 @@ mod tests {
         ));
         assert!(
             !output.contains("rushls_active_sessions"),
-            "/metrics/streams is retention, not process totals"
+            "/metrics/streams is labelled series, not process totals"
         );
     }
 
@@ -750,7 +749,6 @@ mod tests {
             active_sessions: 0,
             published_streams: 0,
             idle_streams: 1,
-            streams: Vec::new(),
             hooks: Vec::new(),
             retained_payload_bytes: 4_096,
             retained_disk_bytes: 512,
@@ -773,28 +771,12 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_store_still_describes_the_retention_series() {
-        let output = render_retention(&MetricsSnapshot {
-            process: ProcessSnapshot::default(),
-            origin: OriginSnapshot::default(),
-            hls: HlsSnapshot::default(),
-            active_sessions: 0,
-            published_streams: 0,
-            idle_streams: 0,
-            streams: Vec::new(),
-            hooks: Vec::new(),
-            retained_payload_bytes: 0,
-            retained_disk_bytes: 0,
-            retention_memory_capacity: 0,
-            retention_disk_capacity: 0,
-            spill_pending: 0,
-            spills_failed: 0,
-            retention_requested: Duration::from_mins(1),
-            retention: Vec::new(),
-        });
+    fn an_empty_store_still_describes_the_labelled_series() {
+        let output = render_labelled(&[], &[]);
 
         assert!(output.contains("# TYPE rushls_stream_retention_held_seconds gauge\n"));
         assert!(output.contains("# TYPE rushls_stream_retained_bytes gauge\n"));
+        assert!(output.contains("# TYPE rushls_session_info gauge\n"));
         assert!(
             !output.contains("{stream="),
             "no samples until a stream is retained"

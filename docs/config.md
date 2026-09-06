@@ -804,18 +804,21 @@ Present, metrics get their **own listener**, defaulting to loopback. Prometheus
 series carry stream names, which on a public origin is the list of everything
 currently published — not something the viewer-facing port should offer.
 
-To serve them on the HTTP port instead, set `listen` to the same address as
-`[http]`. That is a deliberate act rather than a magic value, and it makes the
-sharing visible in the file. A token then stops being optional in any public
-configuration.
+To serve them on a viewer port instead, set `listen` to the same address as
+`[http]` or `[http.tls]`. Sharing `[http.tls]` is how scrapes happen over
+HTTPS; a dedicated metrics listener is always cleartext. That is a deliberate
+act rather than a magic value, and it makes the sharing visible in the file.
+A token then stops being optional in any public configuration.
 
-Two scrape paths either way: `/metrics` for totals, `/metrics/streams` for
-per-stream series. The scraper chooses, so unbounded cardinality is the
-caller's decision rather than a node-side flag.
+Two scrape paths: `/metrics` for process totals and hook series,
+`/metrics/streams` for anything labelled by a stream or session. The scraper
+chooses, so unbounded cardinality is a second Prometheus job rather than a
+node-side flag.
 
-Retention depth is that per-stream scrape: configured `retain` versus the
-playlist duration actually named, plus bytes and cap per tier (`tier="memory"`
-then `tier="disk"`). Totals on `/metrics` include `rushls_retained_payload_bytes`,
+`/metrics/streams` is live sessions (`rushls_session_info`, per-session meters)
+and retention depth: configured `retain` versus the playlist duration actually
+named, plus bytes and cap per tier (`tier="memory"` then `tier="disk"`). Totals
+on `/metrics` include `rushls_retained_payload_bytes`,
 `rushls_retained_disk_bytes`, `rushls_retention_capacity_bytes` (same `tier`
 labels), `rushls_disk_spill_pending`, `rushls_disk_spills_failed_total`, and
 `rushls_retention_requested_seconds`. Idle streams still within `retain` are
@@ -851,6 +854,13 @@ into a token would silently disable the check it was protecting. Where an empty
 value is genuinely wanted, `${VAR:-fallback}` says so explicitly.
 
 Setting both forms of one secret is refused rather than resolved by precedence.
+
+The `_file` path is a setting like any other: file, environment, or a
+command-line flag (`--auth-publish-token-file`, `--srt-passphrase-file`,
+`--metrics-token-file`). The secret itself is not a flag. A process listing
+would otherwise show it. Environment and the file remain the two places an
+inline value may appear. Hook tokens stay in `[hook.*]` only: that table is an
+open namespace, and there is no flag for a name chosen at runtime.
 
 ## Configuration mechanics
 
@@ -954,6 +964,10 @@ administrator over a relationship they did not know existed should warn.
 
 ## Deliberately not included
 
+- A metrics `per_stream` flag. `/metrics` versus `/metrics/streams` is the
+  scraper's choice.
+- Simultaneous HTTP and HTTPS metrics. One `listen`, one transport. Share
+  `[http]` or `[http.tls]`, or bind a dedicated cleartext port.
 - Per-path or per-app accept maps — named policies cover it.
 - A disconnect-on-too-fast setting.
 - Classic HLS, or a `low_latency` flag. The origin is low-latency HLS.

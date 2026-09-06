@@ -93,6 +93,23 @@ impl NodeConfig {
     pub fn maximum_pending_publishers_per_listener(&self) -> usize {
         self.maximum_sessions.max(1)
     }
+
+    /// Whether `/metrics` is mounted on the cleartext viewer listener.
+    fn shares_metrics_with_http(&self) -> bool {
+        self.metrics
+            .listen
+            .is_some_and(|listen| Some(listen) == self.http_address)
+    }
+
+    /// Whether `/metrics` is mounted on the HTTPS viewer listener.
+    ///
+    /// That is how scrapes happen over TLS: there is no separate metrics
+    /// certificate. A dedicated metrics port is always cleartext.
+    fn shares_metrics_with_https(&self) -> bool {
+        self.metrics
+            .listen
+            .is_some_and(|listen| Some(listen) == self.https_address)
+    }
 }
 
 impl Default for NodeConfig {
@@ -310,7 +327,6 @@ impl Node {
             hls.meters().clone(),
             sessions,
             store.clone(),
-            config.metrics.export,
         );
 
         Ok(Self {
@@ -484,17 +500,9 @@ impl Node {
         ));
 
         // Metrics are served on a viewer listener only when the operator gave
-        // them that same address; otherwise they get their own and the viewer
-        // ports do not answer for them at all.
-        let shared_metrics = self
-            .config
-            .metrics
-            .listen
-            .filter(|address| {
-                Some(*address) == self.config.http_address
-                    || Some(*address) == self.config.https_address
-            })
-            .and(self.metrics_endpoint());
+        // them that same address. Matching HTTP or HTTPS is one transport, not
+        // both: a scrape on 8443 must not appear on 8080.
+        let metrics = self.metrics_endpoint();
 
         if let Some(listener) = http_listener {
             report_bound(events, Protocol::Http, listener.local_addr());
@@ -502,7 +510,9 @@ impl Node {
                 listener,
                 Arc::clone(&self.application),
                 self.config.http.clone(),
-                shared_metrics.clone(),
+                metrics
+                    .clone()
+                    .filter(|_| self.config.shares_metrics_with_http()),
                 readiness.clone(),
                 stop_rx.clone(),
                 self.config.shutdown,
@@ -533,7 +543,9 @@ impl Node {
                 listener,
                 Arc::clone(&self.application),
                 self.config.http.clone(),
-                shared_metrics,
+                metrics
+                    .clone()
+                    .filter(|_| self.config.shares_metrics_with_https()),
                 readiness.clone(),
                 stop_rx.clone(),
                 self.config.shutdown,
@@ -945,6 +957,35 @@ mod tests {
             }),
             Err(RuntimeError::InvalidConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn metrics_attach_to_the_one_viewer_listener_whose_address_was_given() {
+        let http = "127.0.0.1:8080".parse().expect("constant address is valid");
+        let https = "127.0.0.1:8443".parse().expect("constant address is valid");
+        let dedicated = "127.0.0.1:9090".parse().expect("constant address is valid");
+        let mut config = NodeConfig {
+            http_address: Some(http),
+            https_address: Some(https),
+            ..NodeConfig::default()
+        };
+
+        config.metrics.listen = Some(https);
+        assert!(
+            !config.shares_metrics_with_http(),
+            "sharing HTTPS must not mount /metrics on cleartext"
+        );
+        assert!(config.shares_metrics_with_https());
+
+        config.metrics.listen = Some(http);
+        assert!(config.shares_metrics_with_http());
+        assert!(!config.shares_metrics_with_https());
+
+        config.metrics.listen = Some(dedicated);
+        assert!(
+            !config.shares_metrics_with_http() && !config.shares_metrics_with_https(),
+            "a dedicated scrape port is its own listener, always cleartext"
+        );
     }
 
     #[tokio::test]

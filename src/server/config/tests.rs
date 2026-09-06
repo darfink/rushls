@@ -173,6 +173,43 @@ publishers = 10
 }
 
 #[test]
+fn secret_files_accept_a_cli_path_and_secret_values_do_not() -> Result<(), Box<dyn Error>> {
+    let secret = TempConfig::new("mounted-secret")?;
+    let path = secret.path.to_str().ok_or("temp path is not UTF-8")?;
+
+    let config = resolve_with(
+        r#"
+[auth.publish]
+url = "http://127.0.0.1/admit"
+"#,
+        &[
+            "--auth-publish-token-file",
+            path,
+            "--metrics-token-file",
+            path,
+            "--srt-passphrase-file",
+            path,
+        ],
+        &[],
+    )??;
+    assert!(config.node.metrics.token.is_some());
+    assert!(config.node.srt.encryption.is_some());
+
+    for flag in [
+        "--auth-publish-token",
+        "--metrics-token",
+        "--srt-passphrase",
+    ] {
+        let result = load_with("", &[flag, "inline-secret"], &[])?;
+        assert!(
+            result.is_err(),
+            "{flag} is a secret value and must not be a command-line flag"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn an_explicit_config_path_is_recorded() -> Result<(), Box<dyn Error>> {
     let file = TempConfig::new("[capacity]\npublishers = 11\n")?;
     let resolved = AppConfig::load_and_resolve_from(
@@ -385,12 +422,26 @@ fn metrics_endpoint_and_authentication_resolve_from_configuration() -> Result<()
     let config = resolve_with_env(&[
         ("RUSHLS_METRICS_LISTEN", "127.0.0.1:9090"),
         ("RUSHLS_METRICS_TOKEN", "scrape-secret"),
-        ("RUSHLS_METRICS_PER_STREAM", "true"),
     ])??;
 
     assert!(config.node.metrics.listen.is_some());
     assert!(config.node.metrics.token.is_some());
-    assert!(config.node.metrics.export.per_stream);
+    Ok(())
+}
+
+#[test]
+fn a_metrics_per_stream_flag_is_no_longer_accepted() -> Result<(), Box<dyn Error>> {
+    let result = load_toml(
+        r#"
+[metrics]
+listen = "127.0.0.1:9090"
+per_stream = true
+"#,
+    )?;
+    assert!(
+        result.is_err(),
+        "cardinality is the scraper's choice of /metrics vs /metrics/streams"
+    );
     Ok(())
 }
 

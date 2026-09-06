@@ -444,10 +444,11 @@ is already exact.
 `value_parser` pattern generalised: structured predicates stay overridable and
 the file and environment share one parser.
 
-**A metrics listener of its own.** Metrics are served on the HTTP listener
-today. Needs a third bound address, defaulting to loopback. Configuring it to
-the HTTP address keeps the current shared-port behaviour, which means the
-router must serve metrics on either listener depending on how they resolve.
+**A metrics listener of its own.** Present, metrics bind a dedicated address,
+defaulting to loopback. Set `listen` to the HTTP or HTTPS viewer address to
+share that one port; sharing HTTPS is how scrapes happen over TLS. A dedicated
+metrics listener is always cleartext. Matching one viewer address must not
+mount `/metrics` on the other.
 
 **A derived handshake timeout.** One operator-facing RTMP timeout fans out to
 an established-session limit and a shorter unauthenticated-handshake limit.

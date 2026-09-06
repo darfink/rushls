@@ -39,7 +39,7 @@ use crate::{
     server::{
         NodeConfig,
         http::{AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, TlsSettings},
-        metrics::{ExportPolicy, MetricsConfig, MetricsToken},
+        metrics::{MetricsConfig, MetricsToken},
     },
     source::transport::srt::{SrtEncryption, SrtKeyLength},
 };
@@ -467,16 +467,16 @@ pub struct HttpAuthAppConfig {
     /// Bearer credential presented to the service.
     #[conf(parameter, env, secret)]
     token: Option<String>,
-    /// Reads the bearer credential from a mounted secret instead.
-    #[conf(parameter, env)]
+    /// File containing the bearer credential presented to the service.
+    #[conf(parameter, long, env)]
     token_file: Option<PathBuf>,
-    /// PEM certificate chain this node presents to the service.
+    /// Path to a PEM certificate chain this node presents to the service.
     #[conf(parameter, long, env)]
     client_certificate: Option<PathBuf>,
-    /// PEM private key for that chain.
+    /// Path to the PEM private key for that chain.
     #[conf(parameter, long, env)]
     client_key: Option<PathBuf>,
-    /// PEM authority to trust instead of the platform store.
+    /// Path to a PEM authority to trust instead of the platform store.
     #[conf(parameter, long, env)]
     ca: Option<PathBuf>,
 }
@@ -638,11 +638,11 @@ pub struct HookEndpointAppConfig {
     token: Option<String>,
     /// Reads the bearer credential from a mounted secret instead.
     token_file: Option<PathBuf>,
-    /// PEM certificate chain this node presents to this endpoint.
+    /// Path to a PEM certificate chain this node presents to this endpoint.
     client_certificate: Option<PathBuf>,
-    /// PEM private key for that chain.
+    /// Path to the PEM private key for that chain.
     client_key: Option<PathBuf>,
-    /// PEM authority to trust instead of the platform store.
+    /// Path to a PEM authority to trust instead of the platform store.
     ca: Option<PathBuf>,
 }
 
@@ -741,11 +741,11 @@ impl HookEndpointAppConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutboundTlsAppConfig {
-    /// PEM certificate chain this node presents, leaf first.
+    /// Path to a PEM certificate chain this node presents, leaf first.
     certificate: Option<PathBuf>,
-    /// PEM private key for that chain.
+    /// Path to the PEM private key for that chain.
     key: Option<PathBuf>,
-    /// PEM authority to trust instead of the platform store.
+    /// Path to a PEM authority to trust instead of the platform store.
     ///
     /// Pinning matters as much as presenting: a client certificate proves this
     /// node to the service, and pinning proves the service to this node. An
@@ -1960,10 +1960,10 @@ pub struct TlsAppConfig {
     /// Address serving HTTPS, bound independently of the cleartext listener.
     #[conf(parameter, long, env, default_value = "[::]:8443")]
     listen: SocketAddr,
-    /// PEM certificate chain, leaf first.
+    /// Path to a PEM certificate chain, leaf first.
     #[conf(parameter, long, env)]
     certificate: PathBuf,
-    /// PEM private key.
+    /// Path to a PEM private key.
     #[conf(parameter, long, env)]
     key: PathBuf,
     /// Bounds a connection that completes TCP and then stalls mid-handshake.
@@ -2016,19 +2016,18 @@ pub struct MetricsAppConfig {
     ///
     /// Its own listener, defaulting to loopback where set: per-stream series
     /// name every stream currently published, which the viewer-facing port
-    /// should not offer. Set it to the HTTP address to share that port
-    /// instead, which is then a visible choice rather than a magic value.
+    /// should not offer. Set it to the HTTP or HTTPS address to share that
+    /// port instead, which is then a visible choice rather than a magic value.
+    /// Sharing the HTTPS address is how scrapes happen over TLS; a dedicated
+    /// metrics listener is always cleartext.
     #[conf(parameter, long, env)]
     listen: Option<SocketAddr>,
-    /// Optional bearer token required to scrape `/metrics`.
+    /// Optional bearer token required to scrape `/metrics` and `/metrics/streams`.
     #[conf(parameter, env, secret)]
     token: Option<String>,
     /// File containing the optional metrics bearer token.
     #[conf(parameter, long, env)]
     token_file: Option<PathBuf>,
-    /// Include per-stream series. Avoid this with unbounded stream names.
-    #[conf(parameter, long, env, default_value = "false")]
-    per_stream: bool,
 }
 
 impl MetricsAppConfig {
@@ -2044,9 +2043,6 @@ impl MetricsAppConfig {
         Ok(MetricsConfig {
             listen: self.listen,
             token: token.map(MetricsToken::new),
-            export: ExportPolicy {
-                per_stream: self.per_stream,
-            },
         })
     }
 }

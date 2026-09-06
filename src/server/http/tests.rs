@@ -21,7 +21,7 @@ use crate::delivery::hls::{
 };
 use crate::{
     observe::{HlsMeters, OriginMeters, ProcessMeters},
-    server::metrics::{ExportPolicy, MetricsEndpoint, MetricsReader, MetricsToken},
+    server::metrics::{MetricsEndpoint, MetricsReader, MetricsToken},
     session::Registry,
 };
 
@@ -233,7 +233,6 @@ impl Harness {
                     HlsMeters::default(),
                     Registry::default(),
                     store.clone(),
-                    ExportPolicy::default(),
                 ),
                 token,
             )),
@@ -316,12 +315,17 @@ async fn enabled_metrics_can_be_exposed_without_authentication() {
         !body.contains("rushls_stream_retention_held_seconds{"),
         "per-stream retention is a separate scrape"
     );
+    assert!(
+        !body.contains("rushls_session_info"),
+        "session series are a separate scrape"
+    );
 
     let streams = request(harness.address, "GET", "/metrics/streams", &[]).await;
     assert_eq!(streams.status, 200);
     let streams = String::from_utf8(streams.body).expect("metrics are UTF-8");
     assert!(streams.contains("# TYPE rushls_stream_retention_held_seconds gauge\n"));
     assert!(streams.contains("# TYPE rushls_stream_retained_bytes gauge\n"));
+    assert!(streams.contains("# TYPE rushls_session_info gauge\n"));
     harness.stop().await;
 }
 
@@ -1967,11 +1971,15 @@ mod tls {
             StreamStore,
             fixtures::{lease, video},
         },
-        observe::{NodeEvent, ProcessMeters},
-        server::http::fixtures::{
-            NodeEventRecorder, application, scratch, write_atomically, write_pair,
-            write_projected_pair,
+        observe::{HlsMeters, NodeEvent, OriginMeters, ProcessMeters},
+        server::{
+            http::fixtures::{
+                NodeEventRecorder, application, scratch, write_atomically, write_pair,
+                write_projected_pair,
+            },
+            metrics::{MetricsEndpoint, MetricsReader},
         },
+        session::Registry,
     };
 
     use super::super::{HttpConfig, Readiness, TlsSettings, bind_tls, serve};
@@ -2047,6 +2055,13 @@ mod tls {
 
     impl TlsHarness {
         async fn start(settings: TlsSettings) -> Self {
+            Self::start_with_metrics(settings, None).await
+        }
+
+        async fn start_with_metrics(
+            settings: TlsSettings,
+            metrics: Option<MetricsEndpoint>,
+        ) -> Self {
             let store = StreamStore::default();
             let origin = application(&store);
             let tcp = TcpListener::bind("127.0.0.1:0")
@@ -2062,7 +2077,7 @@ mod tls {
                 listener,
                 origin,
                 config,
-                None,
+                metrics,
                 Readiness::ready(),
                 async {
                     let _ = signal.await;
@@ -2209,6 +2224,34 @@ mod tls {
         // HTTP/2 only this way, and the Low-Latency profile expects it.
         let (_, alpn) = harness.handshake(&[b"h2", b"http/1.1"]).await;
         assert_eq!(alpn.as_deref(), Some(b"h2".as_slice()));
+
+        harness.stop().await;
+    }
+
+    #[tokio::test]
+    async fn metrics_are_served_over_tls() {
+        // Sharing `[http.tls] listen` is how scrapes happen over HTTPS: the
+        // same router, the same certificate, no second metrics listener.
+        let directory = scratch("metrics-https");
+        let (settings, _) = write_pair(&directory, "origin.test");
+        let metrics = MetricsEndpoint::new(
+            MetricsReader::new(
+                ProcessMeters::default(),
+                OriginMeters::default(),
+                HlsMeters::default(),
+                Registry::default(),
+                StreamStore::default(),
+            ),
+            None,
+        );
+        let harness = TlsHarness::start_with_metrics(settings, Some(metrics)).await;
+
+        let response = https_get(&harness, "/metrics").await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "expected metrics over TLS, got: {response}"
+        );
+        assert!(response.contains("rushls_active_sessions"));
 
         harness.stop().await;
     }
