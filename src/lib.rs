@@ -43,7 +43,6 @@
 pub mod admission;
 pub mod delivery;
 pub mod domain;
-mod ffmpeg;
 pub mod hooks;
 pub mod media;
 pub mod mux;
@@ -66,15 +65,4 @@ pub(crate) mod test_fuzz;
 /// Used for `--version` and the startup banner.
 pub fn version() -> &'static str {
     concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_SHA"), ")")
-}
-
-/// The FFmpeg this process resolved at load time, or why it is unusable.
-///
-/// Exposed from the crate root because the check belongs to startup rather than
-/// to any one layer: FFmpeg is linked dynamically, so the build's `pkg-config`
-/// floor describes the machine that compiled the binary and not the host
-/// running it. Failing here turns a silent loss of tracks into a startup error
-/// naming the library and its version.
-pub fn ffmpeg_versions() -> Result<ffmpeg::LinkedVersions, ffmpeg::VersionMismatch> {
-    ffmpeg::linked_versions()
 }

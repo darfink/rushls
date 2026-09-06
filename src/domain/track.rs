@@ -87,7 +87,7 @@ pub enum Codec {
     MovText,
     Opus,
     SubRip,
-    /// Bare UTF-8 cue text with no markup, as FLV script-data captions arrive.
+    /// Bare UTF-8 cue text with no markup, as RTMP script-data captions arrive.
     ///
     /// Carries no end time of its own: the transports that produce it stamp a
     /// cue with the instant it becomes visible and say nothing about when it
@@ -100,7 +100,7 @@ pub enum Codec {
 impl Codec {
     /// Whether a cue of this codec arrives without a duration.
     ///
-    /// FLV `onTextData`/`onCaption` messages are a point on the timeline: the
+    /// RTMP `onTextData`/`onCaption` messages are a point on the timeline: the
     /// cue shows until something replaces it. Every other subtitle codec this
     /// node accepts carries an explicit duration, so this is what tells the
     /// normalizer that a zero duration is the format rather than a fault.

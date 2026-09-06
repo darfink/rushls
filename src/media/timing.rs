@@ -25,7 +25,8 @@ impl PresentedTiming {
 /// FFmpeg attaches the complete leading skip count to one packet, even when
 /// that count spans several decoded access units. Keeping the remainder here
 /// lets timing consumers suppress those later units without rewriting the
-/// packet-local [`crate::domain::AudioTrim`] that the muxer must pass back to FFmpeg.
+/// packet-local [`crate::domain::AudioTrim`] that the muxer must keep so an
+/// edit list can still describe the encoder delay.
 ///
 /// The per-track constants are captured once, at construction. That is what
 /// lets consumers hold a cursor rather than a whole [`DiscoveredTrack`], and it

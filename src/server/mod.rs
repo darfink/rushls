@@ -13,4 +13,4 @@ pub use http::{
     AllowedOrigins, CorsConfig, OriginPattern, OriginPatternError, Readiness, TlsError,
     TlsSettings, WildcardDepth,
 };
-pub use runtime::{Node, NodeConfig, RuntimeError};
+pub use runtime::{Node, NodeConfig, RuntimeError, ViewerApplication};

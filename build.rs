@@ -2,7 +2,6 @@ use std::{fs, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=src/source/transport/srt/native.c");
-    println!("cargo:rerun-if-changed=src/source/avformat/bitstream.c");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
 
     emit_git_sha();
@@ -22,39 +21,6 @@ fn main() {
     }
     shim.compile("rushls_srt_native");
 
-    // ffmpeg-sys-next intentionally binds avcodec.h but not the separate
-    // bitstream-filter header. A tiny C boundary keeps that omitted ABI opaque
-    // rather than reproducing AVBSFContext's layout in Rust.
-    let avcodec = pkg_config::Config::new()
-        // FFmpeg 8 is the floor. Earlier releases demux the FLV script-data
-        // captions and Enhanced RTMP multitrack messages this origin depends
-        // on differently or not at all, and the difference is silent: a stream
-        // simply loses tracks rather than failing to open. libavcodec 62 is
-        // FFmpeg 8.0; there is no separate "8.0" version to ask pkg-config for.
-        .atleast_version("62")
-        .cargo_metadata(false)
-        .probe("libavcodec")
-        .expect("FFmpeg 8 or newer (libavcodec 62+) must be discoverable through pkg-config");
-    let mut bitstream = cc::Build::new();
-    bitstream
-        .file("src/source/avformat/bitstream.c")
-        .warnings(true);
-    for include in &avcodec.include_paths {
-        bitstream.include(include);
-    }
-    bitstream.compile("rushls_avformat_bitstream");
-
-    // Checked even though nothing here compiles against it: libavformat is the
-    // library whose demuxer behaviour this origin actually depends on, and
-    // `ffmpeg-sys-next` links it without asserting a floor of its own. A build
-    // that resolved a matching avcodec but an older avformat would otherwise
-    // only reveal itself as missing tracks at runtime.
-    pkg_config::Config::new()
-        .atleast_version("62")
-        .cargo_metadata(false)
-        .probe("libavformat")
-        .expect("FFmpeg 8 or newer (libavformat 62+) must be discoverable through pkg-config");
-
     for path in &library.link_paths {
         println!("cargo:rustc-link-search=native={}", path.display());
     }
@@ -65,8 +31,6 @@ fn main() {
         println!("cargo:rustc-link-search=framework={}", path.display());
     }
 
-    // Only libSRT is embedded. Its crypto and C++ dependencies stay shared,
-    // which avoids manufacturing a second OpenSSL copy beside FFmpeg.
     println!("cargo:rustc-link-lib=static=srt");
     for dependency in library.libs.iter().filter(|name| name.as_str() != "srt") {
         println!("cargo:rustc-link-lib=dylib={dependency}");

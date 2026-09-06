@@ -187,7 +187,12 @@ pub struct Node {
 /// Runtime is the composition root and therefore the only layer that names
 /// both the HTTP port and a manifest adapter. Shared media bypasses adapters;
 /// only manifest paths are delegated to HLS.
-pub(crate) struct ViewerApplication {
+/// The viewer HTTP application assembled with this node.
+///
+/// Integration tests bind their own TLS listener and hand this to
+/// [`http::serve`](super::http::serve); production wiring does the same inside
+/// [`Node::serve`].
+pub struct ViewerApplication {
     origin: Arc<Origin>,
     hls: Arc<HlsService>,
 }
@@ -362,8 +367,8 @@ impl Node {
         &self.origin
     }
 
-    #[cfg(test)]
-    pub(crate) fn application(&self) -> Arc<ViewerApplication> {
+    /// The viewer application this node's HTTP listeners serve.
+    pub fn application(&self) -> Arc<ViewerApplication> {
         Arc::clone(&self.application)
     }
 

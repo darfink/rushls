@@ -1,12 +1,11 @@
-//! RTMP handshake and FLV packet source.
+//! RTMP handshake and native packet source.
 //!
-//! RTMP media messages already carry FLV tag payloads, including Enhanced RTMP
-//! payloads. This adapter adds only the FLV file header and tag framing, then
-//! lets the existing AVFormat source discover and demultiplex the result.
+//! RTMP media messages are already parsed by `cc-rtmp`. This adapter maps those
+//! tags onto [`crate::source::rtmp::RtmpPacketSource`].
 
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use cc_rtmp::{
     EnhancedCapabilities, EnhancedValidationMode, ServerSessionTimeouts, ValidatedMedia,
     ValidatedMetadata,
@@ -30,17 +29,9 @@ use crate::{
     source::{
         AcceptedPublish, DiscoveryLimits, DiscoveryReport, InputLimits, InputState, Packet,
         PacketSource, PendingPublish, PublishRejection, SourceError, TransportError,
-        avformat::{
-            AvformatByteChannel, AvformatByteChannelWriter, AvformatConfig, AvformatPacketSource,
-        },
+        rtmp::{IngressEvent, IngressReader, IngressSendError, IngressWriter, RtmpPacketSource},
     },
 };
-
-const FLV_HEADER: &[u8] = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00";
-const FLV_TAG_HEADER_BYTES: usize = 11;
-const FLV_PREVIOUS_TAG_SIZE_BYTES: usize = 4;
-const FLV_TAG_OVERHEAD: usize = FLV_TAG_HEADER_BYTES + FLV_PREVIOUS_TAG_SIZE_BYTES;
-const FLV_MAXIMUM_PAYLOAD_BYTES: usize = 0x00ff_ffff;
 
 /// Malformed Enhanced FLV framing refuses the publisher, always.
 ///
@@ -65,11 +56,12 @@ pub struct RtmpConfig {
     /// dribbles one byte per second defeats the first and is caught by the
     /// second.
     pub timeouts: ServerSessionTimeouts,
-    /// Encoded FLV bytes allowed to wait for AVFormat.
-    pub maximum_buffered_flv_bytes: NonZeroUsize,
-    /// Application limit below the FLV format's fixed 24-bit tag-size ceiling.
-    pub maximum_tag_payload_bytes: NonZeroUsize,
-    pub avformat: AvformatConfig,
+    /// Incomplete RTMP messages the chunk deserializer may reassemble.
+    pub maximum_reassembly_bytes: NonZeroUsize,
+    /// Encoded access units allowed to wait between the session and the source.
+    pub maximum_queued_payload_bytes: NonZeroUsize,
+    /// Largest RTMP audio or video message accepted from one publisher.
+    pub maximum_message_bytes: NonZeroUsize,
     pub input_limits: InputLimits,
 }
 
@@ -87,10 +79,13 @@ impl Default for RtmpConfig {
                 session_read: Some(Duration::from_secs(10)),
                 write: Some(Duration::from_secs(10)),
             },
-            maximum_buffered_flv_bytes: NonZeroUsize::new(crate::source::PipelineMemory::TRANSPORT)
+            maximum_reassembly_bytes: NonZeroUsize::new(crate::source::PipelineMemory::TRANSPORT)
                 .expect("the transport budget is nonzero"),
-            maximum_tag_payload_bytes: nz::usize!(8 * 1024 * 1024),
-            avformat: AvformatConfig::default(),
+            maximum_queued_payload_bytes: NonZeroUsize::new(
+                crate::source::PipelineMemory::DEMUX_QUEUE,
+            )
+            .expect("the demux queue budget is nonzero"),
+            maximum_message_bytes: nz::usize!(8 * 1024 * 1024),
             input_limits: InputLimits::permissive(),
         }
     }
@@ -101,19 +96,14 @@ impl RtmpConfig {
         if self.maximum_publish_wait.is_zero() {
             return Err(invalid_request("maximum RTMP publish wait must be nonzero"));
         }
-        if self.maximum_tag_payload_bytes.get() > FLV_MAXIMUM_PAYLOAD_BYTES {
+        if self.maximum_reassembly_bytes.get() < self.maximum_message_bytes.get() {
             return Err(invalid_request(
-                "maximum RTMP tag payload exceeds FLV's 24-bit size field",
+                "the RTMP reassembly budget must fit one maximum-sized message",
             ));
         }
-        let required = self
-            .maximum_tag_payload_bytes
-            .get()
-            .checked_add(FLV_TAG_OVERHEAD)
-            .ok_or_else(|| invalid_request("maximum RTMP tag size overflowed"))?;
-        if self.maximum_buffered_flv_bytes.get() < required {
+        if self.maximum_queued_payload_bytes.get() < self.maximum_message_bytes.get() {
             return Err(invalid_request(
-                "the FLV byte budget must fit one maximum-sized tag",
+                "the RTMP packet queue must fit one maximum-sized message",
             ));
         }
         Ok(self)
@@ -128,7 +118,7 @@ impl RtmpConfig {
 pub struct RtmpPendingPublish {
     request: PublishRequest,
     decision: oneshot::Sender<PublishDecision>,
-    input: AvformatByteChannel,
+    ingress: IngressReader,
     config: RtmpConfig,
     session: JoinHandle<SessionResult>,
 }
@@ -148,16 +138,15 @@ impl RtmpPendingPublish {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let config = config.validate()?;
-        let (input, writer) = AvformatByteChannel::new(config.maximum_buffered_flv_bytes);
+        let (ingress, writer) = crate::source::rtmp::channel(config.maximum_queued_payload_bytes);
         let supervisor = writer.clone();
         let (publish_tx, publish_rx) = oneshot::channel();
-        let handler = FlvHandler {
+        let handler = MediaHandler {
             remote_address,
             publish: Some(publish_tx),
             writer,
             active_stream_id: None,
-            maximum_tag_payload_bytes: config.maximum_tag_payload_bytes.get(),
-            framing: BytesMut::new(),
+            maximum_message_bytes: config.maximum_message_bytes.get(),
         };
         let mut session = tokio::spawn(async move {
             let result = run_server_session(io, handler, config).await;
@@ -190,7 +179,7 @@ impl RtmpPendingPublish {
         Ok(Self {
             request: attempt.request,
             decision: attempt.decision,
-            input,
+            ingress,
             config,
             session,
         })
@@ -220,18 +209,13 @@ impl PendingPublish for RtmpPendingPublish {
         Box::pin(async move {
             let Self {
                 decision,
-                input,
+                ingress,
                 config,
                 session,
                 ..
             } = *self;
-            let source = AvformatPacketSource::new(
-                Box::new(input),
-                config.avformat,
-                config.input_limits,
-                meters,
-            )
-            .map_err(|error| TransportError::Accept(error.to_string().into()))?;
+            let source = RtmpPacketSource::new(ingress, config.input_limits, meters)
+                .map_err(|error| TransportError::Accept(error.to_string().into()))?;
             let (completion_tx, completion_rx) = oneshot::channel();
             decision
                 .send(PublishDecision::Accept(completion_tx))
@@ -249,7 +233,7 @@ impl PendingPublish for RtmpPendingPublish {
                 })?
                 .map_err(TransportError::Accept)?;
             Ok(AcceptedPublish {
-                source: Box::new(RtmpPacketSource {
+                source: Box::new(RtmpSessionSource {
                     source,
                     session: Some(session),
                 }),
@@ -283,12 +267,12 @@ impl PendingPublish for RtmpPendingPublish {
     }
 }
 
-struct RtmpPacketSource {
-    source: AvformatPacketSource,
+struct RtmpSessionSource {
+    source: RtmpPacketSource,
     session: Option<JoinHandle<SessionResult>>,
 }
 
-impl PacketSource for RtmpPacketSource {
+impl PacketSource for RtmpSessionSource {
     fn discover(
         &mut self,
         limits: DiscoveryLimits,
@@ -304,7 +288,7 @@ impl PacketSource for RtmpPacketSource {
     }
 }
 
-impl Drop for RtmpPacketSource {
+impl Drop for RtmpSessionSource {
     fn drop(&mut self) {
         if let Some(session) = self.session.take() {
             session.abort();
@@ -331,69 +315,42 @@ enum PublishOutcome {
     },
 }
 
-struct FlvHandler {
+struct MediaHandler {
     remote_address: SocketAddr,
     publish: Option<oneshot::Sender<PublishAttempt>>,
-    writer: AvformatByteChannelWriter,
+    writer: IngressWriter,
     active_stream_id: Option<u32>,
-    maximum_tag_payload_bytes: usize,
-    /// Scratch space for the FLV tag header and previous-tag-size footer.
-    ///
-    /// The frozen framing `Bytes` handed to the channel shares this buffer's
-    /// allocation, and the next message reuses whatever capacity remains, so
-    /// steady state costs no per-message allocation for framing.
-    framing: BytesMut,
+    maximum_message_bytes: usize,
 }
 
-impl FlvHandler {
-    async fn write_tag(
-        &mut self,
-        tag_type: u8,
-        timestamp: u32,
-        payload: Bytes,
-    ) -> Result<(), Box<str>> {
-        if payload.len() > self.maximum_tag_payload_bytes
-            || payload.len() > FLV_MAXIMUM_PAYLOAD_BYTES
-        {
+impl MediaHandler {
+    async fn send(&mut self, event: IngressEvent) -> Result<(), Box<str>> {
+        let required = match &event {
+            IngressEvent::Audio { media, .. } => media.raw.len(),
+            IngressEvent::Video { media, .. } => media.raw.len(),
+            IngressEvent::Metadata(metadata) => metadata.raw.len(),
+            IngressEvent::Script { payload, .. } => payload.len(),
+            IngressEvent::End(_) | IngressEvent::Failed(_) => 0,
+        };
+        if required > self.maximum_message_bytes {
             self.writer.fail(
                 format!(
-                    "RTMP media message was {} bytes, above the permitted {}",
-                    payload.len(),
-                    self.maximum_tag_payload_bytes
+                    "RTMP media message was {required} bytes, above the permitted {}",
+                    self.maximum_message_bytes
                 )
                 .into_boxed_str(),
             );
-            return Err("RTMP media payload exceeds configured FLV tag limit".into());
+            return Err("RTMP media payload exceeds configured message limit".into());
         }
-
-        // Bounded above by `FLV_MAXIMUM_PAYLOAD_BYTES` (24-bit).
-        let payload_len = u32::try_from(payload.len()).expect("FLV payload fits u32");
-        let header_len = u32::try_from(FLV_TAG_HEADER_BYTES).expect("FLV header fits u32");
-        let mut header = [0_u8; FLV_TAG_HEADER_BYTES];
-        header[0] = tag_type;
-        write_u24_be(&mut header[1..4], payload_len);
-        write_u24_be(&mut header[4..7], timestamp & 0x00ff_ffff);
-        header[7] = u8::try_from(timestamp >> 24).unwrap_or(u8::MAX);
-        // header[8..11] is FLV's always-zero StreamID.
-        let previous_tag_size = (header_len + payload_len).to_be_bytes();
-
-        // Both framing pieces are carved from one per-connection scratch
-        // buffer: each frozen `Bytes` shares its allocation with the next
-        // message's reuse, so steady state costs no allocation for framing.
-        self.framing.clear();
-        self.framing.extend_from_slice(&header);
-        let header = self.framing.split_to(self.framing.len()).freeze();
-        self.framing.clear();
-        self.framing.extend_from_slice(&previous_tag_size);
-        let previous_tag_size = self.framing.split_to(self.framing.len()).freeze();
-
-        self.writer
-            .send_group([header, payload, previous_tag_size])
-            .await
-            .map_err(|error| {
-                self.writer.fail(error.to_string());
-                error.to_string().into_boxed_str()
-            })
+        self.writer.send(event).await.map_err(|error| {
+            self.writer.fail(error.to_string());
+            match error {
+                IngressSendError::TooLarge { .. } => {
+                    "RTMP media payload exceeds the packet queue".into()
+                }
+                other => other.to_string().into_boxed_str(),
+            }
+        })
     }
 
     async fn on_publish(
@@ -435,23 +392,9 @@ impl FlvHandler {
             .map_err(|_| Box::<str>::from("publication admission decision was dropped"))?
         {
             PublishDecision::Accept(completion) => {
-                let result = self
-                    .writer
-                    .send(Bytes::from_static(FLV_HEADER))
-                    .await
-                    .map_err(|error| error.to_string().into_boxed_str());
-                match result {
-                    Ok(()) => {
-                        self.active_stream_id = Some(stream_id);
-                        let _ = completion.send(Ok(()));
-                        Ok(PublishOutcome::Accepted)
-                    }
-                    Err(error) => {
-                        self.writer.fail(error.clone());
-                        let _ = completion.send(Err(error));
-                        Err("could not enqueue FLV header".into())
-                    }
-                }
+                self.active_stream_id = Some(stream_id);
+                let _ = completion.send(Ok(()));
+                Ok(PublishOutcome::Accepted)
             }
             PublishDecision::Reject(rejection, completion) => Ok(PublishOutcome::Rejected {
                 rejection,
@@ -469,29 +412,58 @@ impl FlvHandler {
         Ok(())
     }
 
-    async fn on_data(&mut self, stream_id: u32, data: SessionData) -> Result<(), Box<str>> {
+    async fn on_audio(
+        &mut self,
+        stream_id: u32,
+        timestamp: u32,
+        media: ValidatedMedia<cc_rtmp::ParsedAudio>,
+    ) -> Result<(), Box<str>> {
+        self.require_active(stream_id)?;
+        self.send(IngressEvent::Audio { timestamp, media }).await
+    }
+
+    async fn on_video(
+        &mut self,
+        stream_id: u32,
+        timestamp: u32,
+        media: ValidatedMedia<cc_rtmp::ParsedVideo>,
+    ) -> Result<(), Box<str>> {
+        self.require_active(stream_id)?;
+        self.send(IngressEvent::Video { timestamp, media }).await
+    }
+
+    async fn on_metadata(
+        &mut self,
+        stream_id: u32,
+        metadata: ValidatedMetadata,
+    ) -> Result<(), Box<str>> {
+        self.require_active(stream_id)?;
+        self.send(IngressEvent::Metadata(metadata)).await
+    }
+
+    async fn on_script(
+        &mut self,
+        stream_id: u32,
+        timestamp: u32,
+        payload: Bytes,
+    ) -> Result<(), Box<str>> {
+        self.require_active(stream_id)?;
+        self.send(IngressEvent::Script { timestamp, payload }).await
+    }
+
+    fn require_active(&self, stream_id: u32) -> Result<(), Box<str>> {
         if self.active_stream_id != Some(stream_id) {
             return Err("RTMP media arrived outside the active publication".into());
         }
-        match data {
-            SessionData::Audio { timestamp, data } => self.write_tag(8, timestamp, data).await,
-            SessionData::Video { timestamp, data } => self.write_tag(9, timestamp, data).await,
-            SessionData::Amf0 { timestamp, data } => self.write_tag(18, timestamp, data).await,
-        }
+        Ok(())
     }
-}
-
-enum SessionData {
-    Audio { timestamp: u32, data: Bytes },
-    Video { timestamp: u32, data: Bytes },
-    Amf0 { timestamp: u32, data: Bytes },
 }
 
 type SessionResult = Result<bool, Box<str>>;
 
 async fn run_server_session<S>(
     mut io: S,
-    mut handler: FlvHandler,
+    mut handler: MediaHandler,
     config: RtmpConfig,
 ) -> SessionResult
 where
@@ -529,9 +501,9 @@ where
 
     let mut session_config = ServerSessionConfig::new();
     session_config.window_ack_size = 2_500_000;
-    session_config.chunk_deserializer.maximum_message_size = config.maximum_tag_payload_bytes.get();
+    session_config.chunk_deserializer.maximum_message_size = config.maximum_message_bytes.get();
     session_config.chunk_deserializer.maximum_buffered_bytes =
-        config.maximum_buffered_flv_bytes.get();
+        config.maximum_reassembly_bytes.get();
     let (mut session, initial) = ServerSession::new(session_config)
         .map_err(|error| format!("could not create RTMP session: {error}").into_boxed_str())?;
     debug_assert!(initial.is_empty(), "server must not write before connect");
@@ -569,7 +541,7 @@ where
 async fn process_session_results<S>(
     io: &mut S,
     session: &mut ServerSession,
-    handler: &mut FlvHandler,
+    handler: &mut MediaHandler,
     config: RtmpConfig,
     results: Vec<ServerSessionResult>,
 ) -> Result<bool, Box<str>>
@@ -644,15 +616,7 @@ where
                         let stream_id = handler.active_stream_id.ok_or_else(|| {
                             Box::<str>::from("audio arrived before publish acceptance")
                         })?;
-                        handler
-                            .on_data(
-                                stream_id,
-                                SessionData::Audio {
-                                    timestamp: timestamp.value,
-                                    data: media.raw,
-                                },
-                            )
-                            .await?;
+                        handler.on_audio(stream_id, timestamp.value, media).await?;
                     }
                     ServerSessionEvent::VideoDataReceived {
                         data, timestamp, ..
@@ -662,20 +626,11 @@ where
                         let stream_id = handler.active_stream_id.ok_or_else(|| {
                             Box::<str>::from("video arrived before publish acceptance")
                         })?;
-                        handler
-                            .on_data(
-                                stream_id,
-                                SessionData::Video {
-                                    timestamp: timestamp.value,
-                                    data: media.raw,
-                                },
-                            )
-                            .await?;
+                        handler.on_video(stream_id, timestamp.value, media).await?;
                     }
                     ServerSessionEvent::StreamMetadataChanged {
                         raw_metadata,
                         raw_payload,
-                        timestamp,
                         ..
                     } => {
                         let metadata = ValidatedMetadata::parse(
@@ -687,15 +642,7 @@ where
                         let stream_id = handler.active_stream_id.ok_or_else(|| {
                             Box::<str>::from("metadata arrived before publish acceptance")
                         })?;
-                        handler
-                            .on_data(
-                                stream_id,
-                                SessionData::Amf0 {
-                                    timestamp: timestamp.value,
-                                    data: metadata.raw,
-                                },
-                            )
-                            .await?;
+                        handler.on_metadata(stream_id, metadata).await?;
                     }
                     ServerSessionEvent::StreamDataReceived {
                         raw_payload,
@@ -706,13 +653,7 @@ where
                             Box::<str>::from("script data arrived before publish acceptance")
                         })?;
                         handler
-                            .on_data(
-                                stream_id,
-                                SessionData::Amf0 {
-                                    timestamp: timestamp.value,
-                                    data: raw_payload,
-                                },
-                            )
+                            .on_script(stream_id, timestamp.value, raw_payload)
                             .await?;
                     }
                     ServerSessionEvent::PublishStreamFinished { .. } => {
@@ -853,14 +794,6 @@ where
     }
 }
 
-fn write_u24_be(output: &mut [u8], value: u32) {
-    output.copy_from_slice(&[
-        ((value >> 16) & 0xff) as u8,
-        ((value >> 8) & 0xff) as u8,
-        (value & 0xff) as u8,
-    ]);
-}
-
 fn invalid_request(message: &'static str) -> TransportError {
     TransportError::InvalidPublishRequest(message.into())
 }
@@ -878,32 +811,19 @@ fn session_handshake_error(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
-    use bytes::BytesMut;
-    use cc_rtmp::chunk_io::ChunkDeserializer;
+    use bytes::{Bytes, BytesMut};
+    use cc_rtmp::{EnhancedValidationMode, chunk_io::ChunkDeserializer};
 
     use crate::{
         domain::Codec,
         observe::{ProcessMeters, SessionMeters},
         source::{
             DiscoveryLimits, PacketSource,
-            avformat::{
-                AvformatConfig, AvformatInput, AvformatInputError, AvformatInterrupt,
-                AvformatPacketSource, ReadInput,
-            },
+            rtmp::{IngressEvent, IngressReader, RtmpPacketSource},
         },
     };
 
     use super::*;
-
-    struct NeverInterrupt;
-
-    impl AvformatInterrupt for NeverInterrupt {
-        fn interrupted(&self) -> bool {
-            false
-        }
-    }
 
     #[test]
     fn shared_core_advances_a_new_type_three_message_by_the_previous_delta() {
@@ -962,43 +882,66 @@ mod tests {
 
     fn handler(
         capacity: NonZeroUsize,
-        maximum_tag_payload_bytes: usize,
+        maximum_message_bytes: usize,
     ) -> (
-        FlvHandler,
+        MediaHandler,
         oneshot::Receiver<PublishAttempt>,
-        AvformatByteChannel,
+        IngressReader,
     ) {
-        let (input, writer) = AvformatByteChannel::new(capacity);
+        let (reader, writer) = crate::source::rtmp::channel(capacity);
         let (publish, attempt) = oneshot::channel();
         (
-            FlvHandler {
+            MediaHandler {
                 remote_address: "127.0.0.1:1935".parse().expect("constant is valid"),
                 publish: Some(publish),
                 writer,
                 active_stream_id: None,
-                maximum_tag_payload_bytes,
-                framing: BytesMut::new(),
+                maximum_message_bytes,
             },
             attempt,
-            input,
+            reader,
         )
     }
 
-    fn drain(input: &mut AvformatByteChannel) -> Result<Vec<u8>, AvformatInputError> {
-        let mut output = Vec::new();
-        let mut buffer = [0; 64];
-        loop {
-            match input.read(&mut buffer, &NeverInterrupt) {
-                Ok(read) => output.extend_from_slice(&buffer[..read]),
-                Err(AvformatInputError::End(_)) => return Ok(output),
-                Err(error) => return Err(error),
-            }
-        }
+    async fn accept(
+        mut handler: MediaHandler,
+        attempt: oneshot::Receiver<PublishAttempt>,
+        stream_id: u32,
+        app: &str,
+        name: &str,
+    ) -> MediaHandler {
+        let app = app.to_owned();
+        let name = name.to_owned();
+        let publish = tokio::spawn(async move {
+            let result = handler.on_publish(stream_id, &app, &name).await;
+            (handler, result)
+        });
+        let attempt = attempt.await.expect("publish attempt was delivered");
+        let (completion_tx, completion_rx) = oneshot::channel();
+        attempt
+            .decision
+            .send(PublishDecision::Accept(completion_tx))
+            .expect("handler still awaits decision");
+        completion_rx
+            .await
+            .expect("completion was sent")
+            .expect("acceptance completed");
+        let (handler, result) = publish.await.expect("handler task did not panic");
+        result.expect("publication was accepted");
+        handler
     }
 
     #[tokio::test]
-    async fn admission_gates_flv_header_and_preserves_tag_payloads() {
-        let (mut handler, attempt, mut input) = handler(nz::usize!(1024), 512);
+    async fn admission_gates_media_until_the_publish_is_accepted() {
+        let (handler, attempt, reader) = handler(nz::usize!(1024), 512);
+        let handler = accept(handler, attempt, 7, "live", "camera-key").await;
+        assert_eq!(handler.active_stream_id, Some(7));
+        drop(reader);
+    }
+
+    #[tokio::test]
+    async fn publish_request_keeps_the_stream_key_as_the_credential() {
+        let (mut handler, attempt, _reader) = handler(nz::usize!(1024), 512);
         let publish = tokio::spawn(async move {
             let result = handler.on_publish(7, "live", "camera-key").await;
             (handler, result)
@@ -1008,59 +951,20 @@ mod tests {
         assert_eq!(attempt.request.resource.namespace.as_deref(), Some("live"));
         assert_eq!(attempt.request.resource.name, "camera-key");
         assert_eq!(attempt.request.credential.expose(), b"camera-key");
-
-        let (completion_tx, completion_rx) = oneshot::channel();
+        let (completion_tx, _completion_rx) = oneshot::channel();
         attempt
             .decision
             .send(PublishDecision::Accept(completion_tx))
             .expect("handler still awaits decision");
-        completion_rx
-            .await
-            .expect("completion was sent")
-            .expect("header was queued");
-        let (mut handler, result) = publish.await.expect("handler task did not panic");
+        let (_handler, result) = publish.await.expect("handler task did not panic");
         assert!(result.is_ok());
-
-        let payload = Bytes::from_static(b"\x90av01enhanced");
-        handler
-            .on_data(
-                7,
-                SessionData::Video {
-                    timestamp: 0x1234_5678,
-                    data: payload.clone(),
-                },
-            )
-            .await
-            .expect("tag was queued");
-        handler.on_unpublish(7).expect("clean unpublish");
-
-        let bytes = drain(&mut input).expect("channel ended cleanly");
-        assert_eq!(&bytes[..FLV_HEADER.len()], FLV_HEADER);
-        let tag = &bytes[FLV_HEADER.len()..];
-        assert_eq!(tag[0], 9);
-        assert_eq!(
-            &tag[1..4],
-            &[
-                0,
-                0,
-                u8::try_from(payload.len()).expect("fixture payload fits u8")
-            ]
-        );
-        assert_eq!(&tag[4..8], &[0x34, 0x56, 0x78, 0x12]);
-        assert_eq!(&tag[8..11], &[0, 0, 0]);
-        assert_eq!(&tag[11..11 + payload.len()], payload.as_ref());
-        let previous_tag_size = u32::try_from(FLV_TAG_HEADER_BYTES).expect("header fits u32")
-            + u32::try_from(payload.len()).expect("fixture payload fits u32");
-        assert_eq!(&tag[11 + payload.len()..], &previous_tag_size.to_be_bytes());
     }
 
     #[tokio::test]
-    async fn stream_data_events_preserve_script_payloads_as_flv_tags() {
-        let (mut handler, _attempt, mut input) = handler(nz::usize!(1024), 512);
+    async fn script_data_events_are_queued_for_the_packet_source() {
+        let (mut handler, _attempt, mut reader) = handler(nz::usize!(1024), 512);
         handler.active_stream_id = Some(7);
-        let payload = Bytes::from_static(
-            b"\x02\x00\x09onCaption\x08\x00\x00\x00\x01\x00\x04text\x02\x00\x05hello\x00\x00\x09",
-        );
+        let payload = crate::source::encode_cue(b"onCaption", b"hello");
         let event = ServerSessionEvent::StreamDataReceived {
             app_name: "live".into(),
             stream_key: "camera-key".into(),
@@ -1079,157 +983,102 @@ mod tests {
             vec![ServerSessionResult::RaisedEvent(event)],
         )
         .await
-        .expect("script data event is relayed");
-        handler.on_unpublish(7).expect("clean unpublish");
-
-        let bytes = drain(&mut input).expect("channel ended cleanly");
-        assert_eq!(bytes[0], 18, "script data uses an FLV data tag");
-        assert_eq!(&bytes[4..8], &[0, 4, 210, 0]);
-        assert_eq!(&bytes[11..11 + payload.len()], payload.as_ref());
-    }
-
-    #[tokio::test]
-    async fn oversized_messages_fail_before_exposing_a_partial_tag() {
-        let (mut handler, attempt, mut input) = handler(nz::usize!(64), 4);
-        let publish = tokio::spawn(async move {
-            let result = handler.on_publish(1, "live", "camera").await;
-            (handler, result)
-        });
-        let attempt = attempt.await.expect("publish attempt was delivered");
-        let (completion_tx, completion_rx) = oneshot::channel();
-        attempt
-            .decision
-            .send(PublishDecision::Accept(completion_tx))
-            .expect("handler still awaits decision");
-        completion_rx
-            .await
-            .expect("completion was sent")
-            .expect("header was queued");
-        let (mut handler, _) = publish.await.expect("handler task did not panic");
-
-        assert!(
-            handler
-                .on_data(
-                    1,
-                    SessionData::Audio {
-                        timestamp: 0,
-                        data: Bytes::from_static(b"12345"),
-                    },
-                )
-                .await
-                .is_err()
-        );
-        let error = drain(&mut input).expect_err("oversize ends as a failure");
-        assert!(matches!(error, AvformatInputError::Failed(_)));
-    }
-
-    #[tokio::test]
-    async fn framed_aac_is_discovered_by_the_real_avformat_source() {
-        let meters = SessionMeters::new(ProcessMeters::default());
-        let mut fixture = AvformatPacketSource::new(
-            Box::new(ReadInput::closed(Cursor::new(
-                crate::source::avformat::fixtures::primed_aac_mkv(),
-            ))),
-            AvformatConfig::default(),
-            InputLimits::permissive(),
-            meters.source_view(),
-        )
-        .expect("fixture source opens");
-        let discovery = fixture
-            .discover(DiscoveryLimits {
-                maximum_probe_bytes: 64 * 1024,
-                maximum_wall_time: Duration::from_secs(2),
-            })
-            .await
-            .expect("AAC fixture is discovered");
-        let extradata = discovery.tracks.tracks()[0].codec_extradata.clone();
-        let mut packets = Vec::new();
-        while fixture
-            .fill(&mut packets)
-            .await
-            .expect("AAC fixture demuxes")
-            .is_open()
-        {}
-
-        let (mut handler, attempt, input) = handler(nz::usize!(64 * 1024), 32 * 1024);
-        let publish = tokio::spawn(async move {
-            let result = handler.on_publish(3, "live", "aac").await;
-            (handler, result)
-        });
-        let attempt = attempt.await.expect("publish attempt was delivered");
-        let (completion_tx, completion_rx) = oneshot::channel();
-        attempt
-            .decision
-            .send(PublishDecision::Accept(completion_tx))
-            .expect("handler still awaits decision");
-        completion_rx
-            .await
-            .expect("completion was sent")
-            .expect("header was queued");
-        let (mut handler, result) = publish.await.expect("handler task did not panic");
-        result.expect("publication was accepted");
-
-        let mut sequence = Vec::with_capacity(2 + extradata.len());
-        sequence.extend_from_slice(&[0xaf, 0]);
-        sequence.extend_from_slice(extradata.as_bytes());
-        handler
-            .on_data(
-                3,
-                SessionData::Audio {
-                    timestamp: 0,
-                    data: Bytes::from(sequence),
-                },
-            )
-            .await
-            .expect("AAC sequence header is framed");
-        for (index, packet) in packets.iter().enumerate() {
-            let mut payload = Vec::with_capacity(2 + packet.payload.len());
-            payload.extend_from_slice(&[0xaf, 1]);
-            payload.extend_from_slice(packet.payload.as_bytes());
-            handler
-                .on_data(
-                    3,
-                    SessionData::Audio {
-                        timestamp: u32::try_from(index * 21).expect("fixture is short"),
-                        data: Bytes::from(payload),
-                    },
-                )
-                .await
-                .expect("AAC frame is framed");
+        .expect("script data is queued");
+        let queued = reader.try_recv().expect("script data reached the queue");
+        match queued {
+            crate::source::IngressEvent::Script {
+                timestamp,
+                payload: body,
+            } => {
+                assert_eq!(timestamp, 1_234);
+                assert_eq!(body, payload);
+            }
+            other => panic!("expected script event, got {other:?}"),
         }
+        handler.on_unpublish(7).expect("clean unpublish");
+    }
+
+    #[tokio::test]
+    async fn oversized_messages_fail_before_a_packet_is_queued() {
+        let (mut handler, attempt, mut reader) = handler(nz::usize!(64), 4);
+        handler = accept(handler, attempt, 1, "live", "camera").await;
+
+        let media = ValidatedMedia::parse_audio(
+            Bytes::from_static(&[0xaf, 0x01, b'1', b'2', b'3', b'4', b'5']),
+            EnhancedValidationMode::Strict,
+        )
+        .expect("legacy AAC is valid");
+        assert!(handler.on_audio(1, 0, media).await.is_err());
+        match reader.recv().await {
+            IngressEvent::Failed(_) => {}
+            other => panic!("oversize ends as a failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn framed_aac_is_discovered_by_the_native_packet_source() {
+        let (mut handler, attempt, reader) = handler(nz::usize!(64 * 1024), 32 * 1024);
+        handler = accept(handler, attempt, 3, "live", "aac").await;
+
+        let mut sequence = vec![0xaf, 0];
+        sequence.extend_from_slice(crate::mux::fixtures::AAC_EXTRADATA);
+        let media =
+            ValidatedMedia::parse_audio(Bytes::from(sequence), EnhancedValidationMode::Strict)
+                .expect("AAC sequence header is valid");
+        handler
+            .on_audio(3, 0, media)
+            .await
+            .expect("AAC sequence header is queued");
+
+        let mut frame = vec![0xaf, 1];
+        frame.extend_from_slice(crate::mux::fixtures::AAC_FRAME);
+        let media = ValidatedMedia::parse_audio(Bytes::from(frame), EnhancedValidationMode::Strict)
+            .expect("AAC frame is valid");
+        handler
+            .on_audio(3, 21, media)
+            .await
+            .expect("AAC frame is queued");
         handler.on_unpublish(3).expect("clean unpublish");
 
         let meters = SessionMeters::new(ProcessMeters::default());
-        let mut source = AvformatPacketSource::new(
-            Box::new(input),
-            AvformatConfig::default(),
-            InputLimits::permissive(),
-            meters.source_view(),
-        )
-        .expect("FLV source opens");
+        let mut source =
+            RtmpPacketSource::new(reader, InputLimits::permissive(), meters.source_view())
+                .expect("RTMP source opens");
         let discovery = source
             .discover(DiscoveryLimits {
                 maximum_probe_bytes: 64 * 1024,
                 maximum_wall_time: Duration::from_secs(2),
             })
             .await
-            .expect("framed FLV is discovered");
+            .expect("framed AAC is discovered");
         assert_eq!(discovery.tracks.tracks()[0].codec, Codec::Aac);
+        assert_eq!(
+            discovery.tracks.tracks()[0].codec_extradata.as_bytes(),
+            crate::mux::fixtures::AAC_EXTRADATA
+        );
         let mut recovered = Vec::new();
         while source
             .fill(&mut recovered)
             .await
-            .expect("framed FLV demuxes")
+            .expect("framed AAC demuxes")
             .is_open()
         {}
-        assert_eq!(recovered.len(), packets.len());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].payload.as_bytes(),
+            crate::mux::fixtures::AAC_FRAME
+        );
+        assert!(!matches!(
+            recovered[0].payload.as_bytes(),
+            [0xff, second, ..] if second & 0xf6 == 0xf0
+        ));
     }
 
     #[test]
-    fn configuration_requires_room_for_one_whole_flv_tag() {
+    fn configuration_requires_room_for_one_whole_message() {
         let config = RtmpConfig {
-            maximum_buffered_flv_bytes: nz::usize!(20),
-            maximum_tag_payload_bytes: nz::usize!(10),
+            maximum_queued_payload_bytes: nz::usize!(8),
+            maximum_message_bytes: nz::usize!(16),
             ..RtmpConfig::default()
         };
 
@@ -1240,10 +1089,10 @@ mod tests {
     }
 
     #[test]
-    fn configuration_rejects_a_payload_limit_that_flv_cannot_encode() {
+    fn configuration_requires_reassembly_to_fit_one_message() {
         let config = RtmpConfig {
-            maximum_buffered_flv_bytes: nz::usize!(0x0100_0100),
-            maximum_tag_payload_bytes: nz::usize!(0x0100_0000),
+            maximum_reassembly_bytes: nz::usize!(8),
+            maximum_message_bytes: nz::usize!(16),
             ..RtmpConfig::default()
         };
 

@@ -18,7 +18,11 @@ bytes = "1.12.1"
 bytesize = "2"
 conf = "0.4"
 directories = "6"
-ffmpeg-sys-next = { version = "8.1.0", default-features = false, features = ["avformat"] }
+# Streaming MPEG-TS demux and codec-config records. CENC and playlist
+# spokes stay off: this crate only consumes the TS event source.
+transmux = { version = "0.24", default-features = false, features = ["std"] }
+rml_amf0.workspace = true
+broadcast-common = { version = "9.3", default-features = false, features = ["std"] }
 humantime = "2"
 isolang = { version = "2.4.0", default-features = false }
 libc = "0.2"
@@ -59,7 +63,13 @@ pkg-config = "0.3"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 rcgen = "0.14"
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+cc-rtmp.workspace = true
+bytes = "1.12.1"
+serde_json = "1"
+nz = "0.4"
+libc = "0.2"
+parking_lot = "0.12"
 
 [lints.clippy]
 pedantic = { priority = -1, level = "deny" }

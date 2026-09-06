@@ -11,7 +11,7 @@ use super::{
 
 /// Builds one pass-through rendition per source track.
 ///
-/// Encoded audio and video are routed to FFmpeg CMAF contexts while textual
+/// Encoded audio and video are routed to the CMAF packager while textual
 /// subtitle codecs are packaged directly as WebVTT.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PassThroughMuxerFactory {

@@ -1203,7 +1203,6 @@ async fn shutdown_lets_an_in_flight_blocking_reload_finish() {
 mod end_to_end {
     use std::{
         fs,
-        io::Cursor,
         path::Path,
         process::Command,
         sync::Arc,
@@ -1222,21 +1221,22 @@ mod end_to_end {
         server::{Node, NodeConfig},
         session::{PendingPermit, SessionOutcome, run_session},
         source::{
-            AcceptedPublish, PendingPublish, PublishRejection, TransportError,
-            avformat::{AvformatConfig, AvformatPacketSource, ReadInput},
+            AcceptedPublish, IngressEvent, InputState, PendingPublish, PublishRejection,
+            RtmpPacketSource, TransportError, channel, encode_cue,
         },
     };
 
     use super::{HttpConfig, Readiness, TcpListener, request, serve};
 
-    struct FixturePublish {
+    struct RtmpAacPublish {
         request: PublishRequest,
-        bytes: Vec<u8>,
-        config: AvformatConfig,
+        frames: usize,
         input: crate::source::InputLimits,
+        caption_name: Vec<u8>,
+        captions: Vec<(u32, Vec<u8>)>,
     }
 
-    impl PendingPublish for FixturePublish {
+    impl PendingPublish for RtmpAacPublish {
         fn publish_request(&self) -> Result<PublishRequest, TransportError> {
             Ok(self.request.clone())
         }
@@ -1247,13 +1247,16 @@ mod end_to_end {
             meters: Arc<dyn SourceMeters>,
         ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
             Box::pin(async move {
-                let source = AvformatPacketSource::new(
-                    Box::new(ReadInput::closed(Cursor::new(self.bytes))),
-                    self.config,
-                    self.input,
-                    meters,
-                )
-                .map_err(|error| TransportError::Accept(error.to_string().into()))?;
+                let (reader, writer) = channel(nz::usize!(64 * 1024));
+                for event in rtmp_aac_events(self.frames, &self.caption_name, &self.captions) {
+                    writer
+                        .send(event)
+                        .await
+                        .map_err(|error| TransportError::Accept(error.to_string().into()))?;
+                }
+                writer.finish(InputState::Closed);
+                let source = RtmpPacketSource::new(reader, self.input, meters)
+                    .map_err(|error| TransportError::Accept(error.to_string().into()))?;
                 Ok(AcceptedPublish {
                     source: Box::new(source),
                     grant,
@@ -1269,29 +1272,195 @@ mod end_to_end {
         }
     }
 
-    fn publish(input: crate::source::InputLimits) -> Box<dyn PendingPublish> {
-        publish_bytes(input, repeated_aac_flv(20))
+    fn publish_request() -> PublishRequest {
+        PublishRequest {
+            protocol: IngestProtocol::Rtmp,
+            resource: PublishResource {
+                namespace: Some("live".into()),
+                name: "camera".into(),
+            },
+            credential: PresentedCredential::new("secret"),
+            client: ClientInfo {
+                remote_address: "127.0.0.1:1935".parse().expect("constant is valid"),
+                encoder: Some("checked-in fixture".into()),
+                protocol_version: None,
+            },
+        }
     }
 
-    fn publish_bytes(input: crate::source::InputLimits, bytes: Vec<u8>) -> Box<dyn PendingPublish> {
-        Box::new(FixturePublish {
-            request: PublishRequest {
-                protocol: IngestProtocol::Rtmp,
-                resource: PublishResource {
-                    namespace: Some("live".into()),
-                    name: "camera".into(),
-                },
-                credential: PresentedCredential::new("secret"),
-                client: ClientInfo {
-                    remote_address: "127.0.0.1:1935".parse().expect("constant is valid"),
-                    encoder: Some("checked-in fixture".into()),
-                    protocol_version: None,
-                },
-            },
-            bytes,
-            config: AvformatConfig::default(),
+    fn publish_two_one_track_aac(input: crate::source::InputLimits) -> Box<dyn PendingPublish> {
+        Box::new(RtmpTwoAacPublish {
+            request: publish_request(),
+            frames: 20,
             input,
         })
+    }
+
+    struct RtmpTwoAacPublish {
+        request: PublishRequest,
+        frames: usize,
+        input: crate::source::InputLimits,
+    }
+
+    impl PendingPublish for RtmpTwoAacPublish {
+        fn publish_request(&self) -> Result<PublishRequest, TransportError> {
+            Ok(self.request.clone())
+        }
+
+        fn accept(
+            self: Box<Self>,
+            grant: PublishGrant,
+            meters: Arc<dyn SourceMeters>,
+        ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
+            Box::pin(async move {
+                let (reader, writer) = channel(nz::usize!(64 * 1024));
+                for event in rtmp_two_one_track_aac_events(self.frames) {
+                    writer
+                        .send(event)
+                        .await
+                        .map_err(|error| TransportError::Accept(error.to_string().into()))?;
+                }
+                writer.finish(InputState::Closed);
+                let source = RtmpPacketSource::new(reader, self.input, meters)
+                    .map_err(|error| TransportError::Accept(error.to_string().into()))?;
+                Ok(AcceptedPublish {
+                    source: Box::new(source),
+                    grant,
+                })
+            })
+        }
+
+        fn reject(
+            self: Box<Self>,
+            _rejection: PublishRejection,
+        ) -> BoxFuture<'static, Result<(), TransportError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn rtmp_two_one_track_aac_events(frames: usize) -> Vec<IngressEvent> {
+        use crate::mux::fixtures::{AAC_EXTRADATA, AAC_FRAME, AAC_FRAME_SAMPLES};
+
+        let mut events = Vec::with_capacity(2 + frames * 2);
+        for track_id in [1_u8, 2] {
+            let mut sequence = vec![0x95, 0x00, b'm', b'p', b'4', b'a', track_id];
+            sequence.extend_from_slice(AAC_EXTRADATA);
+            events.push(IngressEvent::Audio {
+                timestamp: 0,
+                media: cc_rtmp::ValidatedMedia::parse_audio(
+                    bytes::Bytes::from(sequence),
+                    cc_rtmp::EnhancedValidationMode::Strict,
+                )
+                .expect("OneTrack AAC sequence header is valid"),
+            });
+        }
+        for frame in 0..frames {
+            let timestamp = u32::try_from(frame as u64 * AAC_FRAME_SAMPLES * 1_000 / 48_000)
+                .expect("test fixture timestamp fits");
+            for track_id in [1_u8, 2] {
+                let mut payload = vec![0x95, 0x01, b'm', b'p', b'4', b'a', track_id];
+                payload.extend_from_slice(AAC_FRAME);
+                events.push(IngressEvent::Audio {
+                    timestamp,
+                    media: cc_rtmp::ValidatedMedia::parse_audio(
+                        bytes::Bytes::from(payload),
+                        cc_rtmp::EnhancedValidationMode::Strict,
+                    )
+                    .expect("OneTrack AAC frame is valid"),
+                });
+            }
+        }
+        events
+    }
+
+    fn publish(input: crate::source::InputLimits) -> Box<dyn PendingPublish> {
+        Box::new(RtmpAacPublish {
+            request: publish_request(),
+            frames: 20,
+            input,
+            caption_name: Vec::new(),
+            captions: Vec::new(),
+        })
+    }
+
+    fn publish_captions(
+        input: crate::source::InputLimits,
+        name: &[u8],
+        cues: &[(u32, &[u8])],
+    ) -> Box<dyn PendingPublish> {
+        Box::new(RtmpAacPublish {
+            request: publish_request(),
+            frames: 20,
+            input,
+            caption_name: name.to_vec(),
+            captions: cues
+                .iter()
+                .map(|(timestamp, text)| (*timestamp, text.to_vec()))
+                .collect(),
+        })
+    }
+
+    fn rtmp_aac_events(
+        frames: usize,
+        caption_name: &[u8],
+        captions: &[(u32, Vec<u8>)],
+    ) -> Vec<IngressEvent> {
+        use crate::mux::fixtures::{AAC_EXTRADATA, AAC_FRAME, AAC_FRAME_SAMPLES};
+
+        let mut audio = Vec::with_capacity(frames + 1);
+        let mut sequence = vec![0xaf, 0];
+        sequence.extend_from_slice(AAC_EXTRADATA);
+        audio.push(IngressEvent::Audio {
+            timestamp: 0,
+            media: cc_rtmp::ValidatedMedia::parse_audio(
+                bytes::Bytes::from(sequence),
+                cc_rtmp::EnhancedValidationMode::Strict,
+            )
+            .expect("AAC sequence header is valid"),
+        });
+        for frame in 0..frames {
+            let mut payload = Vec::with_capacity(2 + AAC_FRAME.len());
+            payload.extend_from_slice(&[0xaf, 1]);
+            payload.extend_from_slice(AAC_FRAME);
+            let timestamp = u32::try_from(frame as u64 * AAC_FRAME_SAMPLES * 1_000 / 48_000)
+                .expect("test fixture timestamp fits");
+            audio.push(IngressEvent::Audio {
+                timestamp,
+                media: cc_rtmp::ValidatedMedia::parse_audio(
+                    bytes::Bytes::from(payload),
+                    cc_rtmp::EnhancedValidationMode::Strict,
+                )
+                .expect("AAC frame is valid"),
+            });
+        }
+        if captions.is_empty() {
+            return audio;
+        }
+
+        let mut events = Vec::with_capacity(audio.len() + captions.len());
+        let mut emitted = 0;
+        for event in audio {
+            let timestamp = match &event {
+                IngressEvent::Audio { timestamp, .. } => *timestamp,
+                _ => 0,
+            };
+            while emitted < captions.len() && captions[emitted].0 <= timestamp {
+                events.push(IngressEvent::Script {
+                    timestamp: captions[emitted].0,
+                    payload: encode_cue(caption_name, &captions[emitted].1),
+                });
+                emitted += 1;
+            }
+            events.push(event);
+        }
+        while emitted < captions.len() {
+            events.push(IngressEvent::Script {
+                timestamp: captions[emitted].0,
+                payload: encode_cue(caption_name, &captions[emitted].1),
+            });
+            emitted += 1;
+        }
+        events
     }
 
     fn node() -> (Node, crate::session::SessionConfig) {
@@ -1367,18 +1536,7 @@ mod end_to_end {
         media
     }
 
-    #[tokio::test]
-    async fn avformat_through_normalization_cmaf_hls_and_http_is_playable() {
-        let (node, session) = node();
-        let outcome = run_session(
-            publish(session.input),
-            node.services(),
-            &session,
-            PendingPermit::unlimited(),
-        )
-        .await;
-        assert_eq!(outcome, Ok(SessionOutcome::Ended));
-
+    async fn assert_published_audio_is_http_playable(node: Node) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("ephemeral HTTP listener binds");
@@ -1432,25 +1590,7 @@ mod end_to_end {
         assert_eq!((initialization.status, segment.status), (200, 200));
         validate_with_ffprobe(&initialization.body, &segment.body);
 
-        if command_exists("mediastreamvalidator") {
-            let url = format!("http://{address}/live/camera/index.m3u8");
-            let report = temporary_path("json");
-            let validation = Command::new("mediastreamvalidator")
-                .args(["--timeout", "10", "--validation-data-path"])
-                .arg(&report)
-                .arg(&url)
-                .output()
-                .expect("Apple validator starts");
-            if report.exists() {
-                fs::remove_file(&report).expect("Apple validation report is removed");
-            }
-            assert!(
-                validation.status.success(),
-                "Apple playlist validation failed:\n{}\n{}",
-                String::from_utf8_lossy(&validation.stdout),
-                String::from_utf8_lossy(&validation.stderr)
-            );
-        }
+        validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"));
 
         let _ = shutdown.send(());
         server
@@ -1460,9 +1600,92 @@ mod end_to_end {
     }
 
     #[tokio::test]
-    async fn flv_script_data_captions_become_a_webvtt_rendition() {
-        // Both names FFmpeg extracts through the same path must produce the
-        // same rendition, so the whole publication runs once for each.
+    async fn rtmp_through_normalization_cmaf_hls_and_http_is_playable() {
+        let (node, session) = node();
+        let outcome = run_session(
+            publish(session.input),
+            node.services(),
+            &session,
+            PendingPermit::unlimited(),
+        )
+        .await;
+        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+        assert_published_audio_is_http_playable(node).await;
+    }
+
+    #[tokio::test]
+    async fn rtmp_one_track_two_aac_are_separate_http_variants() {
+        let (node, session) = node();
+        let outcome = run_session(
+            publish_two_one_track_aac(session.input),
+            node.services(),
+            &session,
+            PendingPermit::unlimited(),
+        )
+        .await;
+        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral HTTP listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve(
+            listener,
+            node.application(),
+            HttpConfig::default(),
+            None,
+            Readiness::ready(),
+            async {
+                let _ = stopped.await;
+            },
+        ));
+
+        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
+        assert_eq!(multivariant.status, 200);
+        let body = String::from_utf8(multivariant.body).expect("the multivariant playlist is text");
+        assert!(
+            body.contains("\n0/audio.m3u8\n"),
+            "first OneTrack AAC is a variant:\n{body}"
+        );
+        assert!(
+            body.contains("\n1/audio.m3u8\n"),
+            "second OneTrack AAC is a variant:\n{body}"
+        );
+        assert!(
+            !body.contains("#EXT-X-MEDIA:TYPE=AUDIO"),
+            "audio-only tracks are STREAM-INF variants, not EXT-X-MEDIA alternates:\n{body}"
+        );
+
+        for rendition in ["0", "1"] {
+            let media = request(
+                address,
+                "GET",
+                &format!("/live/camera/{rendition}/audio.m3u8"),
+                &[],
+            )
+            .await;
+            assert_eq!(media.status, 200, "rendition {rendition}");
+            let playlist = String::from_utf8(media.body).expect("media playlist is text");
+            assert!(
+                playlist.contains("#EXT-X-MAP:"),
+                "rendition {rendition}: {playlist}"
+            );
+        }
+
+        validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"));
+
+        let _ = shutdown.send(());
+        server
+            .await
+            .expect("HTTP task did not panic")
+            .expect("HTTP server stopped cleanly");
+    }
+
+    #[tokio::test]
+    async fn rtmp_script_data_captions_become_a_webvtt_rendition() {
+        // Both names encoders use for AMF0 cue text must produce the same
+        // rendition, so the whole publication runs once for each.
         for name in [b"onTextData".as_slice(), b"onCaption".as_slice()] {
             let body = published_captions(name).await;
             let publisher = String::from_utf8_lossy(name);
@@ -1480,11 +1703,9 @@ mod end_to_end {
         }
     }
 
-    /// Publishes a captioned FLV and returns its whole WebVTT rendition.
+    /// Publishes captioned AAC and returns its whole WebVTT rendition.
     async fn published_captions(name: &[u8]) -> String {
         let mut policy = StreamPolicy::permissive();
-        // Bare cue text arrives from FLV script data, which the permissive
-        // set does not name.
         policy.subtitles.codecs = crate::admission::Codecs::OneOf(vec![
             crate::domain::Codec::WebVtt,
             crate::domain::Codec::SubRip,
@@ -1497,7 +1718,7 @@ mod end_to_end {
             (200, b"third caption"),
         ];
         let outcome = run_session(
-            publish_bytes(session.input, captioned_aac_flv(20, name, &cues)),
+            publish_captions(session.input, name, &cues),
             node.services(),
             &session,
             PendingPermit::unlimited(),
@@ -1616,102 +1837,26 @@ mod end_to_end {
         )
     }
 
-    fn repeated_aac_flv(frames: usize) -> Vec<u8> {
-        use crate::mux::fixtures::{AAC_EXTRADATA, AAC_FRAME, AAC_FRAME_SAMPLES};
-
-        let mut flv = b"FLV\x01\x04\x00\x00\x00\x09\x00\x00\x00\x00".to_vec();
-        let mut sequence = Vec::with_capacity(2 + AAC_EXTRADATA.len());
-        sequence.extend_from_slice(&[0xaf, 0]);
-        sequence.extend_from_slice(AAC_EXTRADATA);
-        push_flv_tag(&mut flv, 8, 0, &sequence);
-        for frame in 0..frames {
-            let mut payload = Vec::with_capacity(2 + AAC_FRAME.len());
-            payload.extend_from_slice(&[0xaf, 1]);
-            payload.extend_from_slice(AAC_FRAME);
-            let timestamp = u32::try_from(frame as u64 * AAC_FRAME_SAMPLES * 1_000 / 48_000)
-                .expect("test fixture timestamp fits");
-            push_flv_tag(&mut flv, 8, timestamp, &payload);
+    fn validate_with_mediastreamvalidator(url: &str) {
+        if !command_exists("mediastreamvalidator") {
+            return;
         }
-        flv
-    }
-
-    fn push_flv_tag(output: &mut Vec<u8>, kind: u8, timestamp: u32, payload: &[u8]) {
-        let length = u32::try_from(payload.len()).expect("test payload fits");
-        output.push(kind);
-        output.extend_from_slice(&u24_be(length));
-        output.extend_from_slice(&u24_be(timestamp));
-        output.push(u8::try_from(timestamp >> 24).unwrap_or(0));
-        output.extend_from_slice(&[0, 0, 0]);
-        output.extend_from_slice(payload);
-        output.extend_from_slice(&(11 + length).to_be_bytes());
-    }
-
-    /// AAC audio interleaved with FLV script-data captions under `name`.
-    ///
-    /// `onTextData` and `onCaption` are the two names FFmpeg's FLV demuxer
-    /// extracts through the same path, so a fixture parameterized on the name
-    /// is what shows they produce the same rendition rather than asserting it.
-    fn captioned_aac_flv(frames: usize, name: &[u8], cues: &[(u32, &[u8])]) -> Vec<u8> {
-        let mut flv = repeated_aac_flv(frames);
-        let mut tagged = flv.split_off(13);
-        let mut out = flv;
-
-        // Script tags are interleaved by timestamp, as a publisher sends them.
-        let mut emitted = 0;
-        let mut cursor = 0;
-        while cursor + 11 <= tagged.len() {
-            let size = usize::from(tagged[cursor + 1]) << 16
-                | usize::from(tagged[cursor + 2]) << 8
-                | usize::from(tagged[cursor + 3]);
-            let timestamp = u32::from(tagged[cursor + 4]) << 16
-                | u32::from(tagged[cursor + 5]) << 8
-                | u32::from(tagged[cursor + 6]);
-            while emitted < cues.len() && cues[emitted].0 <= timestamp {
-                push_flv_tag(
-                    &mut out,
-                    18,
-                    cues[emitted].0,
-                    &script_data(name, cues[emitted].1),
-                );
-                emitted += 1;
-            }
-            let end = cursor + 11 + size + 4;
-            out.extend_from_slice(&tagged[cursor..end]);
-            cursor = end;
+        let report = temporary_path("json");
+        let validation = Command::new("mediastreamvalidator")
+            .args(["--timeout", "10", "--validation-data-path"])
+            .arg(&report)
+            .arg(url)
+            .output()
+            .expect("Apple validator starts");
+        if report.exists() {
+            fs::remove_file(&report).expect("Apple validation report is removed");
         }
-        while emitted < cues.len() {
-            push_flv_tag(
-                &mut out,
-                18,
-                cues[emitted].0,
-                &script_data(name, cues[emitted].1),
-            );
-            emitted += 1;
-        }
-        tagged.clear();
-        out
-    }
-
-    /// One AMF0 script-data body: the message name, then `{text: ...}`.
-    fn script_data(name: &[u8], text: &[u8]) -> Vec<u8> {
-        let mut payload = vec![0x02];
-        payload.extend_from_slice(&u16::try_from(name.len()).expect("name fits").to_be_bytes());
-        payload.extend_from_slice(name);
-        // ECMA array with one property, which is what encoders emit.
-        payload.push(0x08);
-        payload.extend_from_slice(&1_u32.to_be_bytes());
-        payload.extend_from_slice(&4_u16.to_be_bytes());
-        payload.extend_from_slice(b"text");
-        payload.push(0x02);
-        payload.extend_from_slice(&u16::try_from(text.len()).expect("text fits").to_be_bytes());
-        payload.extend_from_slice(text);
-        payload.extend_from_slice(&[0x00, 0x00, 0x09]);
-        payload
-    }
-
-    fn u24_be(value: u32) -> [u8; 3] {
-        let bytes = value.to_be_bytes();
-        [bytes[1], bytes[2], bytes[3]]
+        assert!(
+            validation.status.success(),
+            "Apple playlist validation failed:\n{}\n{}",
+            String::from_utf8_lossy(&validation.stdout),
+            String::from_utf8_lossy(&validation.stderr)
+        );
     }
 
     fn validate_with_ffprobe(initialization: &[u8], segment: &[u8]) {

@@ -1,10 +1,9 @@
-//! Native SRT listener and container-agnostic AVFormat source.
+//! Native SRT listener and MPEG-TS packet source.
 //!
 //! SRT message boundaries are transport details. The accepted socket is read
-//! as one ordered byte stream by the existing blocking AVFormat worker, so
-//! MPEG-TS, Matroska, and any other probed container follow the same source
-//! path. SRT delivery timestamps are intentionally ignored; embedded container
-//! timestamps remain the media clock.
+//! as one ordered byte stream and demultiplexed as MPEG-TS. Other containers
+//! (Matroska, FLV, …) are refused at discovery. SRT delivery timestamps are
+//! intentionally ignored; embedded PES timestamps remain the media clock.
 //!
 //! Callers normally use `publish:<namespace/name>:<credential>`, or
 //! `publish:<credential>` when one key identifies both the presented resource
@@ -30,11 +29,8 @@ use crate::{
     domain::BoxFuture,
     observe::SourceMeters,
     source::{
-        AcceptedPublish, InputLimits, InputState, PendingPublish, PublishRejection, TransportError,
-        avformat::{
-            AvformatConfig, AvformatInput, AvformatInputError, AvformatInterrupt,
-            AvformatPacketSource,
-        },
+        AcceptedPublish, ByteInput, ByteInputError, ByteInterrupt, InputLimits, InputState,
+        MpegTsConfig, MpegTsPacketSource, PendingPublish, PublishRejection, TransportError,
     },
 };
 
@@ -96,14 +92,14 @@ pub struct SrtConfig {
     /// Receiver latency used by SRT's timestamp-based packet delivery.
     pub latency: Duration,
     pub peer_idle_timeout: Duration,
-    /// Polling interval used by native I/O to observe AVFormat cancellation.
+    /// Polling interval used by native I/O to observe demux cancellation.
     pub receive_poll_interval: Duration,
     pub receive_buffer_bytes: NonZeroUsize,
     /// Largest complete SRT live message accepted from one caller.
     pub maximum_message_bytes: NonZeroUsize,
     pub maximum_stream_id_bytes: NonZeroUsize,
     pub encryption: Option<SrtEncryption>,
-    pub avformat: AvformatConfig,
+    pub mpegts: MpegTsConfig,
     pub input_limits: InputLimits,
 }
 
@@ -117,7 +113,7 @@ impl Default for SrtConfig {
             maximum_message_bytes: nz::usize!(SRT_MAXIMUM_LIVE_PAYLOAD_BYTES),
             maximum_stream_id_bytes: nz::usize!(SRT_MAXIMUM_STREAM_ID_BYTES),
             encryption: None,
-            avformat: AvformatConfig::default(),
+            mpegts: MpegTsConfig::default(),
             input_limits: InputLimits::permissive(),
         }
     }
@@ -326,9 +322,9 @@ impl PendingPublish for SrtPendingPublish {
                 config.receive_poll_interval,
                 Arc::clone(&meters),
             );
-            let source = AvformatPacketSource::new(
+            let source = MpegTsPacketSource::new(
                 Box::new(input),
-                config.avformat,
+                config.mpegts,
                 config.input_limits,
                 meters,
             )
@@ -410,17 +406,17 @@ impl SrtInput {
     }
 }
 
-impl AvformatInput for SrtInput {
+impl ByteInput for SrtInput {
     fn read(
         &mut self,
         output: &mut [u8],
-        interrupt: &dyn AvformatInterrupt,
-    ) -> Result<usize, AvformatInputError> {
+        interrupt: &dyn ByteInterrupt,
+    ) -> Result<usize, ByteInputError> {
         if output.is_empty() {
             return Ok(0);
         }
         if interrupt.interrupted() {
-            return Err(AvformatInputError::End(InputState::Interrupted));
+            return Err(ByteInputError::End(InputState::Interrupted));
         }
         if self.pending_start != self.pending_end {
             return Ok(self.copy_pending(output));
@@ -428,7 +424,7 @@ impl AvformatInput for SrtInput {
 
         loop {
             if interrupt.interrupted() {
-                return Err(AvformatInputError::End(InputState::Interrupted));
+                return Err(ByteInputError::End(InputState::Interrupted));
             }
 
             let receive_into_output = output.len() >= self.scratch.len();
@@ -453,21 +449,21 @@ impl AvformatInput for SrtInput {
                 }
                 Ok(native::Receive::End) => {
                     self.record_transport_loss(true);
-                    return Err(AvformatInputError::End(InputState::Closed));
+                    return Err(ByteInputError::End(InputState::Closed));
                 }
                 // The detail is dropped deliberately: a peer that closed
                 // cleanly did not fail, whatever the receive call reported.
                 Err(_error) if native::ended_cleanly(&self.socket) => {
                     self.record_transport_loss(true);
-                    return Err(AvformatInputError::End(InputState::Closed));
+                    return Err(ByteInputError::End(InputState::Closed));
                 }
                 Err(_error) if native::is_broken(&self.socket) => {
                     self.record_transport_loss(true);
-                    return Err(AvformatInputError::End(InputState::Interrupted));
+                    return Err(ByteInputError::End(InputState::Interrupted));
                 }
                 Err(error) => {
                     self.record_transport_loss(true);
-                    return Err(AvformatInputError::Failed(error.to_string().into()));
+                    return Err(ByteInputError::Failed(error.to_string().into()));
                 }
             }
         }
@@ -503,22 +499,64 @@ fn invalid_request(message: &'static str) -> TransportError {
     TransportError::InvalidPublishRequest(message.into())
 }
 
+/// An SRT caller that injects MPEG-TS into a local listener.
+///
+/// Production publishers are remote encoders. Tests need a same-process peer
+/// that speaks the native stack, so this wrapper is part of the crate rather
+/// than `cfg(test)`-only: integration tests compile the library without test
+/// cfg and still have to drive a real `SrtListener`.
+pub struct SrtCaller {
+    socket: Arc<native::Socket>,
+}
+
+impl SrtCaller {
+    pub fn connect(
+        address: SocketAddr,
+        config: &SrtConfig,
+        stream_id: &str,
+    ) -> Result<Self, TransportError> {
+        let options = config.native_options()?;
+        let socket = native::test_connect(address, &options, stream_id)
+            .map_err(|error| TransportError::Handshake(error.to_string().into()))?;
+        Ok(Self { socket })
+    }
+
+    pub fn send(&self, bytes: &[u8]) -> Result<(), TransportError> {
+        native::test_send(&self.socket, bytes)
+            .map_err(|error| TransportError::Accept(error.to_string().into()))
+    }
+
+    /// Sends MPEG-TS in live-message chunks of 1_316 bytes.
+    pub fn send_mpegts(&self, bytes: &[u8]) -> Result<(), TransportError> {
+        for chunk in bytes.chunks(1_316) {
+            self.send(chunk)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SrtCaller {
+    fn drop(&mut self) {
+        self.socket.close();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicBool;
 
     use crate::{
         admission::{Principal, PublishGrant, StreamPolicy},
-        domain::{StreamId, TrackCounts},
+        domain::{Codec, MediaKind, StreamId, TrackCounts},
         observe::{ProcessMeters, SessionMeters},
-        source::DiscoveryLimits,
+        source::{ByteInterrupt, DiscoveryLimits},
     };
 
     use super::*;
 
     struct NeverInterrupt(AtomicBool);
 
-    impl AvformatInterrupt for NeverInterrupt {
+    impl ByteInterrupt for NeverInterrupt {
         fn interrupted(&self) -> bool {
             self.0.load(Ordering::Relaxed)
         }
@@ -550,7 +588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_live_message_survives_partial_avformat_reads() {
+    async fn a_live_message_survives_partial_demux_reads() {
         let config = SrtConfig {
             encryption: Some(
                 SrtEncryption::new("test-secret", SrtKeyLength::Aes256)
@@ -630,7 +668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matroska_over_srt_reuses_the_real_avformat_source() {
+    async fn mpeg_ts_over_srt_is_discovered_by_the_streaming_demuxer() {
         let config = SrtConfig::default();
         let mut listener = SrtListener::bind(
             "127.0.0.1:0".parse().expect("constant is valid"),
@@ -643,7 +681,7 @@ mod tests {
             let options = config.native_options().expect("options are valid");
             let socket = native::test_connect(address, &options, "publish:live/camera:secret")
                 .expect("test caller connects");
-            let fixture = crate::source::avformat::fixtures::primed_aac_mkv();
+            let fixture = crate::source::fixtures::h264_adts_aac_mpeg_ts();
             for message in fixture.chunks(1_316) {
                 native::test_send(&socket, message).expect("fixture message sends");
             }
@@ -674,14 +712,21 @@ mod tests {
                 maximum_wall_time: Duration::from_secs(2),
             })
             .await
-            .expect("Matroska is discovered");
+            .expect("MPEG-TS is discovered");
         assert_eq!(
             discovery.tracks.counts(),
             TrackCounts {
                 audio: 1,
                 subtitle: 0,
-                video: 0,
+                video: 1,
             }
+        );
+        assert!(
+            discovery
+                .tracks
+                .tracks()
+                .iter()
+                .any(|track| track.codec == Codec::H264 && track.kind() == MediaKind::Video)
         );
         caller.close();
 
@@ -690,9 +735,56 @@ mod tests {
             .source
             .fill(&mut packets)
             .await
-            .expect("Matroska packets demux")
+            .expect("MPEG-TS packets demux")
             .is_open()
         {}
         assert!(!packets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn matroska_over_srt_is_refused() {
+        let config = SrtConfig::default();
+        let mut listener = SrtListener::bind(
+            "127.0.0.1:0".parse().expect("constant is valid"),
+            config.clone(),
+            4,
+        )
+        .expect("listener binds");
+        let address = listener.local_address();
+        let caller = std::thread::spawn(move || {
+            let options = config.native_options().expect("options are valid");
+            let socket = native::test_connect(address, &options, "publish:live/camera:secret")
+                .expect("test caller connects");
+            let fixture = crate::source::fixtures::ebml_header();
+            for message in fixture.chunks(1_316) {
+                native::test_send(&socket, message).expect("fixture message sends");
+            }
+            socket
+        });
+
+        let pending = listener
+            .accept()
+            .await
+            .expect("listener remains open")
+            .expect("connection is accepted");
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let mut accepted = Box::new(pending)
+            .accept(grant(), meters.source_view())
+            .await
+            .expect("publication is accepted");
+        let caller = caller.join().expect("caller did not panic");
+        let error = accepted
+            .source
+            .discover(DiscoveryLimits {
+                maximum_probe_bytes: 64 * 1024,
+                maximum_wall_time: Duration::from_secs(2),
+            })
+            .await
+            .expect_err("Matroska is not MPEG-TS");
+        assert!(
+            error.to_string().contains("MPEG-TS"),
+            "refusal names the required container: {error}"
+        );
+        caller.close();
     }
 }

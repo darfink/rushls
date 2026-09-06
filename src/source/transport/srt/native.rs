@@ -376,7 +376,6 @@ pub fn receive_loss_total(socket: &Socket) -> Option<u64> {
     u64::try_from(unsafe { rushls_srt_receive_loss_total(handle) }).ok()
 }
 
-#[cfg(test)]
 pub fn test_connect(
     address: SocketAddr,
     options: &NativeOptions<'_>,
@@ -405,7 +404,6 @@ pub fn test_connect(
     Ok(Arc::new(Socket::new(connected, runtime)))
 }
 
-#[cfg(test)]
 pub fn test_send(socket: &Socket, bytes: &[u8]) -> Result<(), NativeError> {
     let handle = socket.handle()?;
     let length = i32::try_from(bytes.len())
@@ -441,7 +439,6 @@ unsafe extern "C" {
     fn rushls_srt_receive_loss_total(socket: i32) -> i64;
     fn rushls_srt_close(socket: i32) -> c_int;
 
-    #[cfg(test)]
     fn rushls_srt_test_connect(
         address: *const libc::sockaddr,
         address_length: c_int,
@@ -450,6 +447,5 @@ unsafe extern "C" {
         stream_id_length: c_int,
         connected: *mut i32,
     ) -> c_int;
-    #[cfg(test)]
     fn rushls_srt_test_send(socket: i32, buffer: *const u8, length: c_int) -> c_int;
 }

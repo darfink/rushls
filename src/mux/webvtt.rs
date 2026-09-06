@@ -1286,21 +1286,15 @@ mod tests {
             .collect()
     }
 
-    async fn round_trip(
-        codec: Codec,
-        text: &[u8],
-        metadata: WebVttCueMetadata,
-    ) -> crate::source::Packet {
-        use std::{io::Cursor, time::Duration};
+    struct RenderedCue {
+        start_ms: u64,
+        end_ms: u64,
+        payload: String,
+        identifier: Option<String>,
+        settings: Option<String>,
+    }
 
-        use crate::{
-            observe::{ProcessMeters, SessionMeters},
-            source::{
-                DiscoveryLimits, InputLimits, InputState, PacketSource,
-                avformat::{AvformatConfig, AvformatPacketSource, ReadInput},
-            },
-        };
-
+    fn round_trip(codec: Codec, text: &[u8], metadata: WebVttCueMetadata) -> RenderedCue {
         let mut mux = mux(codec, 2);
         let mut output = Vec::new();
         let NormalizedSample::Subtitle(cue) = sample(codec, 0, SECOND, text) else {
@@ -1312,44 +1306,45 @@ mod tests {
             .expect("cue is accepted");
         mux.finish(FinishReason::Final, &mut output)
             .expect("tail flushes");
+        parse_first_cue(&rendered(&output))
+    }
 
-        let mut bytes = Vec::new();
-        for media in &output {
-            match media {
-                PackagedMedia::Initialization(initialization) => {
-                    bytes.extend_from_slice(initialization.payload.as_bytes());
-                }
-                PackagedMedia::Segment(segment) => {
-                    bytes.extend_from_slice(segment.payload.as_bytes());
-                }
-                _ => unreachable!("WebVTT emits only initialization and direct segments"),
-            }
+    fn parse_first_cue(body: &str) -> RenderedCue {
+        let mut lines = body.lines().filter(|line| !line.is_empty());
+        let first = lines.next().expect("rendered WebVTT contains a cue");
+        let (identifier, timing) = if first.contains(" --> ") {
+            (None, first)
+        } else {
+            (
+                Some(first.to_owned()),
+                lines.next().expect("cue timing follows the identifier"),
+            )
+        };
+        let (start, rest) = timing
+            .split_once(" --> ")
+            .expect("cue timing uses a WebVTT arrow");
+        let (end, settings) = match rest.split_once(' ') {
+            Some((end, settings)) => (end, Some(settings.to_owned())),
+            None => (rest, None),
+        };
+        let payload = lines.collect::<Vec<_>>().join("\n");
+        RenderedCue {
+            start_ms: parse_timestamp_ms(start),
+            end_ms: parse_timestamp_ms(end),
+            payload,
+            identifier,
+            settings,
         }
+    }
 
-        let meters = SessionMeters::new(ProcessMeters::default());
-        let mut source = AvformatPacketSource::new(
-            Box::new(ReadInput::closed(Cursor::new(bytes))),
-            AvformatConfig::default(),
-            InputLimits::permissive(),
-            meters.source_view(),
-        )
-        .expect("round-trip source opens");
-        source
-            .discover(DiscoveryLimits {
-                maximum_probe_bytes: 64 * 1024,
-                maximum_wall_time: Duration::from_secs(2),
-            })
-            .await
-            .expect("rendered WebVTT is discovered");
-        let mut packets = Vec::new();
-        loop {
-            let state = source.fill(&mut packets).await.expect("output demuxes");
-            if state != InputState::Open {
-                break;
-            }
-        }
-        assert_eq!(packets.len(), 1);
-        packets.pop().expect("one packet was recovered")
+    fn parse_timestamp_ms(value: &str) -> u64 {
+        let (hours, rest) = value.split_once(':').expect("hours");
+        let (minutes, rest) = rest.split_once(':').expect("minutes");
+        let (seconds, milliseconds) = rest.split_once('.').expect("milliseconds");
+        hours.parse::<u64>().expect("hours") * 3_600_000
+            + minutes.parse::<u64>().expect("minutes") * 60_000
+            + seconds.parse::<u64>().expect("seconds") * 1_000
+            + milliseconds.parse::<u64>().expect("milliseconds")
     }
 
     #[test]
@@ -2019,40 +2014,35 @@ mod tests {
         assert_eq!(output.len(), before);
     }
 
-    #[tokio::test]
-    async fn initialization_plus_segment_round_trips_through_avformat() {
-        let packet = round_trip(
+    #[test]
+    fn initialization_plus_segment_round_trips_cue_text() {
+        let cue = round_trip(
             Codec::WebVtt,
             b"round trip",
             WebVttCueMetadata {
                 identifier: Some(Arc::from("round-trip")),
                 settings: Some(Arc::from("position:25%")),
             },
-        )
-        .await;
+        );
 
-        assert_eq!(packet.pts, Some(0));
-        assert_eq!(packet.duration, Some(1_000));
-        assert_eq!(packet.payload.as_bytes(), b"round trip");
-        assert_eq!(packet.webvtt.identifier.as_deref(), Some("round-trip"));
-        assert_eq!(packet.webvtt.settings.as_deref(), Some("position:25%"));
+        assert_eq!(cue.start_ms, 0);
+        assert_eq!(cue.end_ms, 1_000);
+        assert_eq!(cue.payload, "round trip");
+        assert_eq!(cue.identifier.as_deref(), Some("round-trip"));
+        assert_eq!(cue.settings.as_deref(), Some("position:25%"));
     }
 
-    #[tokio::test]
-    async fn converted_subrip_styling_round_trips_as_webvtt() {
-        let packet = round_trip(
+    #[test]
+    fn converted_subrip_styling_round_trips_as_webvtt() {
+        let cue = round_trip(
             Codec::SubRip,
             b"<B>Hello &amp; <i>world</i></B>",
             WebVttCueMetadata::default(),
-        )
-        .await;
-
-        assert_eq!(packet.pts, Some(0));
-        assert_eq!(packet.duration, Some(1_000));
-        assert_eq!(
-            packet.payload.as_bytes(),
-            b"<b>Hello &amp; <i>world</i></b>"
         );
+
+        assert_eq!(cue.start_ms, 0);
+        assert_eq!(cue.end_ms, 1_000);
+        assert_eq!(cue.payload, "<b>Hello &amp; <i>world</i></b>");
     }
 
     /// The rendered body of every segment, concatenated.

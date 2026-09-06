@@ -2,7 +2,6 @@ use std::{error::Error, sync::Arc};
 
 use rushls::{
     domain::{SessionId, StreamId},
-    ffmpeg_versions,
     hooks::{self, HookObserver},
     observe::{EventObserver, Events, NodeEvent, SessionEnd, SessionEvent, StreamEvent},
     server::{AppConfig, Node, ResolvedHooks},
@@ -267,13 +266,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         info!("no configuration file; using compiled defaults");
     }
-    // Before anything is served. A publication admitted against an older
-    // FFmpeg would lose caption and multitrack ingest silently, so refusing to
-    // start is more honest than accepting publishers this build cannot package
-    // correctly. Reported alongside the banner so a support question about
-    // missing captions can be answered from the first line of the log.
-    let ffmpeg = ffmpeg_versions()?;
-    info!(version = %version(), ffmpeg = %ffmpeg, "rushls started");
+    info!(version = %version(), "rushls started");
     for warning in &resolved.warnings {
         warn!(warning = %warning, "configuration warning");
     }

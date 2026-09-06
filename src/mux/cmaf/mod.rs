@@ -1,12 +1,8 @@
-//! FFmpeg-backed pass-through CMAF packaging.
+//! Pass-through CMAF packaging.
 
-mod ffi;
+mod output;
 
-use std::{
-    num::{NonZero, NonZeroUsize},
-    sync::Arc,
-    time::Duration,
-};
+use std::{num::NonZero, sync::Arc, time::Duration};
 
 use crate::{
     domain::{
@@ -23,7 +19,7 @@ use super::{
     PackagedMedia, PackagedRendition, PackagedSegmentCompletion, PackagingRenditionId,
     PackagingSegmentId, RenditionConfig, RenditionKey, RenditionMedia, TrackPackager,
 };
-use ffi::FormatOutput;
+use output::CmafOutput;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SegmentBoundaryPolicy {
@@ -41,19 +37,9 @@ pub enum SegmentBoundaryPolicy {
     ExtendToRandomAccess { maximum_extension: Duration },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CmafMuxerConfig {
-    pub io_buffer_size: NonZeroUsize,
     pub segment_boundary_policy: SegmentBoundaryPolicy,
-}
-
-impl Default for CmafMuxerConfig {
-    fn default() -> Self {
-        Self {
-            io_buffer_size: nz::usize!(32 * 1024),
-            segment_boundary_policy: SegmentBoundaryPolicy::Strict,
-        }
-    }
 }
 
 pub(super) fn build_track(
@@ -72,8 +58,7 @@ pub(super) fn build_track(
             track.id
         )));
     }
-    let output = FormatOutput::open(track, config.io_buffer_size.get())
-        .map_err(|error| invalid(error.to_string()))?;
+    let output = CmafOutput::open(track).map_err(|error| invalid(error.to_string()))?;
     let rendition = packaged_rendition(rendition_id, track, &plan, config.segment_boundary_policy)?;
     let packager = CmafTrack::new(
         rendition_id,
@@ -177,7 +162,7 @@ struct CmafTrack {
     codec: Codec,
     kind: MediaKind,
     plan: TrackSegmentationPlan,
-    output: FormatOutput,
+    output: CmafOutput,
     policy: SegmentBoundaryPolicy,
     events: EventSink,
     segment: SegmentCursor,
@@ -193,7 +178,7 @@ impl CmafTrack {
         rendition_id: PackagingRenditionId,
         track: &DiscoveredTrack,
         plan: TrackSegmentationPlan,
-        output: FormatOutput,
+        output: CmafOutput,
         policy: SegmentBoundaryPolicy,
         events: EventSink,
     ) -> Result<Self, MuxError> {
@@ -232,11 +217,9 @@ impl CmafTrack {
             })?;
         if presented.duration == 0 {
             // A fully trimmed access unit still carries codec priming into
-            // movenc, but it must not advance delivery-visible chunk timing.
-            return self
-                .output
-                .write(sample, pts, dts)
-                .map_err(|error| mux_error(error.to_string()));
+            // the fragment, but it must not advance delivery-visible chunk timing.
+            self.output.write(sample, pts, dts);
+            return Ok(());
         }
 
         let closes_segment = self.segment_boundary(sample, presented_pts)?;
@@ -274,9 +257,8 @@ impl CmafTrack {
         // Counted after the sample joins the chunk, so the count always
         // describes what the open chunk holds.
         self.segment.part_access_units = self.segment.part_access_units.saturating_add(1);
-        self.output
-            .write(sample, pts, dts)
-            .map_err(|error| mux_error(error.to_string()))
+        self.output.write(sample, pts, dts);
+        Ok(())
     }
 
     fn rebase_sample(
@@ -354,8 +336,8 @@ impl CmafTrack {
 
     /// Closes the delivery interval at the access unit that triggers a cut.
     ///
-    /// Packet timestamps remain untouched in FFmpeg. This only defines the
-    /// delivery-visible interval so consecutive chunks meet at the cut even
+    /// Packet timestamps remain untouched in the fragment. This only defines
+    /// the delivery-visible interval so consecutive chunks meet at the cut even
     /// when sparse or imperfect input timing leaves no access unit covering its
     /// final ticks. PTS reordering is harmless because the end only advances.
     fn close_fragment_at(&mut self, presented_pts: TickTimestamp) {
@@ -462,7 +444,7 @@ impl CmafTrack {
             .map_err(|error| mux_error(error.to_string()))?;
         if !self.initialized {
             if payload.is_empty() {
-                return Err(mux_error("delay_moov produced an empty initialization"));
+                return Err(mux_error("CMAF initialization segment was empty"));
             }
             out.push(PackagedMedia::Initialization(InitializationSegment {
                 rendition_id: self.rendition_id,
@@ -476,7 +458,7 @@ impl CmafTrack {
                 .map_err(|error| mux_error(error.to_string()))?;
         }
         if payload.is_empty() {
-            return Err(mux_error("FFmpeg produced an empty CMAF chunk"));
+            return Err(mux_error("CMAF mux produced an empty chunk"));
         }
         out.push(PackagedMedia::Chunk(PackagedChunk {
             rendition_id: self.rendition_id,
@@ -535,9 +517,8 @@ impl TrackPackager for CmafTrack {
                 }));
             }
         }
-        self.output
-            .finalize()
-            .map_err(|error| mux_error(error.to_string()))
+        self.output.finalize();
+        Ok(())
     }
 }
 
@@ -662,8 +643,8 @@ mod tests {
         observe::SessionEvent,
         segment::{SegmentationPlan, fixtures::PlanBuilder},
         source::{
-            DiscoveryLimits, DiscoveryReport, InputLimits, Packet, PacketSource,
-            avformat::{AvformatConfig, AvformatPacketSource, ReadInput},
+            DiscoveryLimits, IngressEvent, InputLimits, InputState, MpegTsConfig,
+            MpegTsPacketSource, PacketSource, ReadInput, RtmpPacketSource, channel,
         },
     };
 
@@ -727,30 +708,20 @@ mod tests {
         outputs
     }
 
-    async fn demux_cmaf_packets(bytes: Vec<u8>) -> (DiscoveryReport, Vec<Packet>) {
-        let session = crate::observe::SessionMeters::new(crate::observe::ProcessMeters::default());
-        let mut source = AvformatPacketSource::new(
-            Box::new(ReadInput::closed(Cursor::new(bytes))),
-            AvformatConfig::default(),
-            InputLimits::permissive(),
-            session.source_view(),
-        )
-        .expect("CMAF source starts");
-        let discovery = source
-            .discover(DiscoveryLimits {
-                maximum_probe_bytes: 1024 * 1024,
-                maximum_wall_time: Duration::from_secs(2),
-            })
-            .await
-            .expect("CMAF output is discoverable");
-        let mut packets = Vec::new();
-        while source
-            .fill(&mut packets)
-            .await
-            .expect("CMAF packets demux")
-            .is_open()
-        {}
-        (discovery, packets)
+    fn demux_cmaf(bytes: &[u8]) -> transmux::Media {
+        broadcast_common::Unpackage::unpackage(&mut transmux::Fmp4Demux::new(), bytes)
+            .unwrap_or_else(|error| panic!("CMAF output is demuxable: {error}"))
+    }
+
+    fn cmaf_codec(config: &transmux::CodecConfig) -> crate::domain::Codec {
+        match config {
+            transmux::CodecConfig::Avc { .. } => crate::domain::Codec::H264,
+            transmux::CodecConfig::Hevc { .. } => crate::domain::Codec::Hevc,
+            transmux::CodecConfig::Av1 { .. } => crate::domain::Codec::Av1,
+            transmux::CodecConfig::Aac { .. } => crate::domain::Codec::Aac,
+            transmux::CodecConfig::Opus { .. } => crate::domain::Codec::Opus,
+            _ => panic!("unexpected CMAF codec"),
+        }
     }
 
     fn sample(pts: i64, random_access: bool) -> NormalizedSample {
@@ -843,7 +814,6 @@ mod tests {
             .expect("fixture segmentation validates");
         PassThroughMuxerFactory::new(CmafMuxerConfig {
             segment_boundary_policy: policy,
-            ..CmafMuxerConfig::default()
         })
         .start(MuxerStartRequest {
             presentation: &input,
@@ -1055,7 +1025,7 @@ mod tests {
         assert_eq!(chunk.media_start, 0);
         assert_eq!(chunk.duration, FRAME);
 
-        // Frozen output bytes own their allocation independently of FFmpeg.
+        // Frozen output bytes own their allocation independently of the writer.
         let retained = chunk.payload.clone();
         drop(started);
         assert!(!retained.is_empty());
@@ -1508,20 +1478,18 @@ mod tests {
             Some(PackagedMedia::Chunk(chunk))
                 if chunk.media_start == 0 && chunk.duration == 2_048
         ));
-        assert_priming_round_trip(&media).await;
+        assert_priming_round_trip(&media);
     }
 
-    async fn assert_priming_round_trip(media: &[PackagedMedia]) {
+    fn assert_priming_round_trip(media: &[PackagedMedia]) {
         let bytes = concat_cmaf_bytes(media);
-        let (discovery, packets) = demux_cmaf_packets(bytes).await;
-        assert_eq!(discovery.tracks.tracks()[0].first_pts, Some(0));
-        assert_eq!(
-            packets.first().map(|packet| packet.audio_trim),
-            Some(AudioTrim {
-                leading_samples: 1_024,
-                trailing_samples: 0,
-            })
-        );
+        let demuxed = demux_cmaf(&bytes);
+        let sample = demuxed.tracks[0]
+            .samples
+            .first()
+            .expect("primed audio demuxes at least one sample");
+        assert_eq!(sample.dts, Some(0));
+        assert_eq!(sample.pts, Some(0));
     }
 
     #[test]
@@ -1567,7 +1535,7 @@ mod tests {
                 .first()
                 .map(|entry| entry.1),
             Some(2_112),
-            "movenc receives the original whole skip count"
+            "the edit list carries the original whole skip count"
         );
         assert!(matches!(
             media.iter().find(|event| matches!(event, PackagedMedia::Chunk(_))),
@@ -1747,8 +1715,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn emitted_initialization_and_chunks_are_demuxable() {
+    #[test]
+    fn emitted_initialization_and_chunks_are_demuxable() {
         let sink = discarded_events();
         let mut started = start(
             SegmentBoundaryPolicy::Strict,
@@ -1770,83 +1738,32 @@ mod tests {
             .finish(crate::mux::FinishReason::Final, &mut media)
             .expect("output finishes");
 
-        let mut bytes = Vec::new();
-        for event in media {
-            match event {
-                PackagedMedia::Initialization(initialization) => {
-                    bytes.extend_from_slice(initialization.payload.as_bytes());
-                }
-                PackagedMedia::Chunk(chunk) => {
-                    bytes.extend_from_slice(chunk.payload.as_bytes());
-                }
-                PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) => {}
-            }
-        }
-        let process = crate::observe::ProcessMeters::default();
-        let session = crate::observe::SessionMeters::new(process);
-        let mut source = AvformatPacketSource::new(
-            Box::new(ReadInput::closed(Cursor::new(bytes))),
-            AvformatConfig::default(),
-            InputLimits::permissive(),
-            session.source_view(),
-        )
-        .expect("source config validates");
-        let discovery = source
-            .discover(DiscoveryLimits {
-                maximum_probe_bytes: 1024 * 1024,
-                maximum_wall_time: Duration::from_secs(2),
-            })
-            .await
-            .expect("CMAF output is discoverable");
-        assert_eq!(
-            discovery.tracks.tracks()[0].timebase,
-            Timebase::new(nz::u32!(1), nz::u32!(16_384))
-        );
-        let mut packets = Vec::new();
-        // `fill` yields one batch, and where that batch ends depends on how far
-        // the blocking demux worker has run: it waits only for the first packet
-        // and then takes whatever else is already queued. Draining to the end
-        // of input is the only assertion the contract supports — a single call
-        // is a race with the worker thread.
-        while source
-            .fill(&mut packets)
-            .await
-            .expect("CMAF packets demux")
-            .is_open()
-        {}
-        assert_eq!(packets.len(), 4);
-        assert!(packets[0].random_access);
+        let bytes = concat_cmaf_bytes(&media);
+        let demuxed = demux_cmaf(&bytes);
+        assert_eq!(demuxed.tracks.len(), 1);
+        assert_eq!(demuxed.tracks[0].spec.timescale, 16_384);
+        assert_eq!(demuxed.tracks[0].samples.len(), 4);
+        assert!(demuxed.tracks[0].samples[0].flags.is_sync);
     }
 
-    /// The MPEG-TS fixture, demuxed and normalized.
+    /// One ingest path, demuxed and normalized.
     ///
-    /// Shared by the normalization and packaging tests so the fixture is
+    /// Shared by the MPEG-TS and RTMP packaging tests so each fixture is
     /// probed and normalized exactly once per test.
-    struct MpegTsFixture {
+    struct IngestFixture {
         presentation: crate::media::PresentationPlan,
         timeline: crate::media::TimelineCalibration,
         samples: Vec<NormalizedSample>,
     }
 
-    async fn mpeg_ts_fixture() -> MpegTsFixture {
-        let process = crate::observe::ProcessMeters::default();
-        let session = crate::observe::SessionMeters::new(process);
-        let mut source = AvformatPacketSource::new(
-            Box::new(ReadInput::closed(Cursor::new(
-                crate::source::avformat::fixtures::h264_adts_aac_mpeg_ts(),
-            ))),
-            AvformatConfig::default(),
-            InputLimits::permissive(),
-            session.source_view(),
-        )
-        .expect("MPEG-TS source starts");
+    async fn ingest_fixture(mut source: impl PacketSource) -> IngestFixture {
         let discovery = source
             .discover(DiscoveryLimits {
                 maximum_probe_bytes: 1024 * 1024,
                 maximum_wall_time: Duration::from_secs(2),
             })
             .await
-            .expect("MPEG-TS tracks are discoverable");
+            .expect("fixture tracks are discoverable");
         let input = validate(&discovery.tracks, &StreamPolicy::permissive())
             .expect("fixture tracks are admitted");
         let timeline = calibrate(&input).expect("fixture timeline calibrates");
@@ -1858,7 +1775,7 @@ mod tests {
         while source
             .fill(&mut packets)
             .await
-            .expect("MPEG-TS packets demux")
+            .expect("fixture packets demux")
             .is_open()
         {}
         let mut samples = Vec::new();
@@ -1866,37 +1783,110 @@ mod tests {
             normalized
                 .normalizer
                 .push(packet, &mut samples)
-                .expect("MPEG-TS packet normalizes");
+                .expect("fixture packet normalizes");
         }
         normalized
             .normalizer
             .finish(&mut samples)
             .expect("held video timing resolves at end of input");
-        MpegTsFixture {
+        IngestFixture {
             presentation: normalized.presentation,
             timeline: normalized.timeline,
             samples,
         }
     }
 
-    #[tokio::test]
-    async fn mpeg_ts_normalizes_to_audio_and_video() {
-        let fixture = mpeg_ts_fixture().await;
-        assert!(
-            fixture
-                .samples
-                .iter()
-                .any(|sample| matches!(sample, NormalizedSample::Video(_)))
-                && fixture
-                    .samples
-                    .iter()
-                    .any(|sample| matches!(sample, NormalizedSample::Audio(_)))
-        );
+    async fn mpeg_ts_fixture() -> IngestFixture {
+        let process = crate::observe::ProcessMeters::default();
+        let session = crate::observe::SessionMeters::new(process);
+        let source = MpegTsPacketSource::new(
+            Box::new(ReadInput::closed(Cursor::new(
+                crate::source::fixtures::h264_adts_aac_mpeg_ts(),
+            ))),
+            MpegTsConfig::default(),
+            InputLimits::permissive(),
+            session.source_view(),
+        )
+        .expect("MPEG-TS source starts");
+        ingest_fixture(source).await
     }
 
-    #[tokio::test]
-    async fn normalized_mpeg_ts_packages_as_demuxable_cmaf() {
-        let fixture = mpeg_ts_fixture().await;
+    fn rtmp_audio(timestamp: u32, packet_type: u8, payload: &[u8]) -> IngressEvent {
+        let mut raw = vec![0xaf, packet_type];
+        raw.extend_from_slice(payload);
+        IngressEvent::Audio {
+            timestamp,
+            media: cc_rtmp::ValidatedMedia::parse_audio(
+                bytes::Bytes::from(raw),
+                cc_rtmp::EnhancedValidationMode::Strict,
+            )
+            .expect("legacy AAC is valid"),
+        }
+    }
+
+    fn rtmp_video(timestamp: u32, keyframe: bool, payload: &[u8]) -> IngressEvent {
+        let mut raw = vec![if keyframe { 0x17 } else { 0x27 }, 0x01, 0x00, 0x00, 0x00];
+        raw.extend_from_slice(payload);
+        IngressEvent::Video {
+            timestamp,
+            media: cc_rtmp::ValidatedMedia::parse_video(
+                bytes::Bytes::from(raw),
+                cc_rtmp::EnhancedValidationMode::Strict,
+            )
+            .expect("legacy AVC sample is valid"),
+        }
+    }
+
+    fn rtmp_video_config(payload: &[u8]) -> IngressEvent {
+        let mut raw = vec![0x17, 0x00, 0x00, 0x00, 0x00];
+        raw.extend_from_slice(payload);
+        IngressEvent::Video {
+            timestamp: 0,
+            media: cc_rtmp::ValidatedMedia::parse_video(
+                bytes::Bytes::from(raw),
+                cc_rtmp::EnhancedValidationMode::Strict,
+            )
+            .expect("legacy AVC config is valid"),
+        }
+    }
+
+    async fn rtmp_fixture() -> IngestFixture {
+        let process = crate::observe::ProcessMeters::default();
+        let session = crate::observe::SessionMeters::new(process);
+        let (reader, writer) = channel(nz::usize!(64 * 1024));
+        writer
+            .send(rtmp_video_config(H264_EXTRADATA))
+            .await
+            .expect("video config queues");
+        writer
+            .send(rtmp_audio(0, 0, AAC_EXTRADATA))
+            .await
+            .expect("audio config queues");
+        writer
+            .send(rtmp_video(0, true, H264_IDR))
+            .await
+            .expect("IDR queues");
+        writer
+            .send(rtmp_audio(0, 1, AAC_FRAME))
+            .await
+            .expect("first AAC queues");
+        writer
+            .send(rtmp_video(500, false, H264_P))
+            .await
+            .expect("P-frame queues");
+        let second = u32::try_from(AAC_FRAME_SAMPLES * 1_000 / 48_000).expect("timestamp fits");
+        writer
+            .send(rtmp_audio(second, 1, AAC_FRAME))
+            .await
+            .expect("second AAC queues");
+        writer.finish(InputState::Closed);
+        let source =
+            RtmpPacketSource::new(reader, InputLimits::permissive(), session.source_view())
+                .expect("RTMP source starts");
+        ingest_fixture(source).await
+    }
+
+    fn packages_as_demuxable_cmaf(fixture: IngestFixture) {
         let tracks = fixture
             .presentation
             .tracks()
@@ -1945,7 +1935,7 @@ mod tests {
                 time_anchor: SystemTime::UNIX_EPOCH,
                 events: &sink,
             })
-            .expect("MPEG-TS presentation packages");
+            .expect("presentation packages");
         let mut media = Vec::new();
         for sample in fixture.samples {
             mux.muxer
@@ -1962,10 +1952,50 @@ mod tests {
             .zip([crate::domain::Codec::H264, crate::domain::Codec::Aac])
         {
             assert!(!bytes.is_empty());
-            let (discovery, packets) = demux_cmaf_packets(bytes).await;
-            assert_eq!(discovery.tracks.tracks()[0].codec, expected);
-            assert!(!packets.is_empty());
+            let demuxed = demux_cmaf(&bytes);
+            assert_eq!(cmaf_codec(&demuxed.tracks[0].spec.config), expected);
+            assert!(!demuxed.tracks[0].samples.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn mpeg_ts_normalizes_to_audio_and_video() {
+        let fixture = mpeg_ts_fixture().await;
+        assert!(
+            fixture
+                .samples
+                .iter()
+                .any(|sample| matches!(sample, NormalizedSample::Video(_)))
+                && fixture
+                    .samples
+                    .iter()
+                    .any(|sample| matches!(sample, NormalizedSample::Audio(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn normalized_mpeg_ts_packages_as_demuxable_cmaf() {
+        packages_as_demuxable_cmaf(mpeg_ts_fixture().await);
+    }
+
+    #[tokio::test]
+    async fn rtmp_normalizes_to_audio_and_video() {
+        let fixture = rtmp_fixture().await;
+        assert!(
+            fixture
+                .samples
+                .iter()
+                .any(|sample| matches!(sample, NormalizedSample::Video(_)))
+                && fixture
+                    .samples
+                    .iter()
+                    .any(|sample| matches!(sample, NormalizedSample::Audio(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn normalized_rtmp_packages_as_demuxable_cmaf() {
+        packages_as_demuxable_cmaf(rtmp_fixture().await);
     }
 
     #[test]
@@ -2161,7 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_webvtt_and_rejects_negotiated_cmaf_timebase_changes() {
+    fn accepts_webvtt_and_preserves_the_track_timebase() {
         let sink = discarded_events();
         let subtitle_input = validate(
             &catalog(vec![
@@ -2197,11 +2227,12 @@ mod tests {
         );
         assert_eq!(started.presentation.renditions[1].codecs.as_ref(), "wvtt");
 
-        let changed = start(
-            SegmentBoundaryPolicy::Strict,
-            Timebase::new(nz::u32!(1), nz::u32!(1_000)),
-            &sink,
+        let millisecond = Timebase::new(nz::u32!(1), nz::u32!(1_000));
+        let started = start(SegmentBoundaryPolicy::Strict, millisecond, &sink)
+            .expect("native CMAF keeps the track timebase");
+        assert_eq!(
+            started.presentation.renditions[0].config.timebase,
+            millisecond
         );
-        assert!(matches!(changed, Err(crate::mux::MuxError::InvalidPlan(_))));
     }
 }

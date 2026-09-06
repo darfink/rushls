@@ -50,7 +50,7 @@ impl Default for SessionConfig {
             maximum_admission_time: Duration::from_secs(10),
             discovery: DiscoveryLimits {
                 // A multi-rendition contribution can carry several megabits
-                // per second before FFmpeg has observed enough packets to
+                // per second before the demuxer has observed enough packets to
                 // finish stream discovery.
                 maximum_probe_bytes: crate::source::PipelineMemory::DISCOVERY,
                 maximum_wall_time: Duration::from_secs(10),
