@@ -60,6 +60,7 @@ url = "http://auth.example.internal/v1/publish/admit"
 # client_certificate = "/etc/rushls/auth/client.pem"
 # client_key         = "/etc/rushls/auth/client-key.pem"
 # ca                 = "/etc/rushls/auth/ca.pem"   # pin the service's issuer
+# maximum_response_bytes = "64KiB"       # largest decision this node will read
 
 # Who may watch. Omit this table and anyone with the URL may. Viewers present a
 # JWT, which is verified locally: no request leaves this node per playlist

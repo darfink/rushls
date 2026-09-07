@@ -946,6 +946,7 @@ fn configured_http_auth_resolves_and_guards_its_own_settings() -> Result<(), Box
     let valid = r#"
 [auth.publish]
 url = "http://auth-sidecar:8081/v1/publish/admit"
+maximum_response_bytes = "64KiB"
 "#;
     assert!(
         resolve_toml(valid)?.is_ok(),

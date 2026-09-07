@@ -346,6 +346,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovers_two_h264_video_pids() -> Result<(), SourceError> {
+        let mut source =
+            source(include_bytes!("../../../tests/apple_hls/fixtures/h264_dual_video.ts").to_vec());
+        let discovery = source.discover(discovery_limits()).await?;
+        assert_eq!(
+            discovery.tracks.counts(),
+            TrackCounts {
+                audio: 1,
+                subtitle: 0,
+                video: 2,
+            }
+        );
+        let mut sizes: Vec<_> = discovery
+            .tracks
+            .tracks()
+            .iter()
+            .filter(|track| track.kind() == MediaKind::Video)
+            .map(|track| match track.parameters {
+                crate::domain::MediaParameters::Video { width, height, .. } => {
+                    (width.get(), height.get())
+                }
+                _ => panic!("video track parameters"),
+            })
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(
+            sizes,
+            [(160, 90), (320, 180)],
+            "each video PID keeps its own coded size"
+        );
+        assert!(
+            discovery
+                .tracks
+                .tracks()
+                .iter()
+                .filter(|track| track.kind() == MediaKind::Video)
+                .all(|track| track.codec == Codec::H264 && track.first_pts.is_some())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn caption_scanner_sees_avcc_framing_from_mpeg_ts() {
         let mut source = source(crate::source::fixtures::h264_adts_aac_mpeg_ts());
         let discovery = source

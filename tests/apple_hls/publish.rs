@@ -24,6 +24,7 @@ const HEVC_AAC_FLV: &[u8] = include_bytes!("fixtures/hevc_aac.flv");
 pub const H264_AAC_TS: &[u8] = include_bytes!("fixtures/h264_aac.ts");
 pub const HEVC_AAC_TS: &[u8] = include_bytes!("fixtures/hevc_aac.ts");
 pub const H264_DUAL_AAC_TS: &[u8] = include_bytes!("fixtures/h264_dual_aac.ts");
+pub const H264_DUAL_VIDEO_TS: &[u8] = include_bytes!("fixtures/h264_dual_video.ts");
 
 /// Queue large enough to hold a whole fixture so accept can enqueue then finish.
 fn ingress_capacity() -> std::num::NonZeroUsize {

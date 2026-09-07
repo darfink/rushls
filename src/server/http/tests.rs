@@ -1203,6 +1203,7 @@ async fn shutdown_lets_an_in_flight_blocking_reload_finish() {
 mod end_to_end {
     use std::{
         fs,
+        io::Cursor,
         path::Path,
         process::Command,
         sync::Arc,
@@ -1221,8 +1222,9 @@ mod end_to_end {
         server::{Node, NodeConfig},
         session::{PendingPermit, SessionOutcome, run_session},
         source::{
-            AcceptedPublish, IngressEvent, InputState, PendingPublish, PublishRejection,
-            RtmpPacketSource, TransportError, channel, encode_cue,
+            AcceptedPublish, IngressEvent, InputLimits, InputState, MpegTsConfig,
+            MpegTsPacketSource, PendingPublish, PublishRejection, ReadInput, RtmpPacketSource,
+            TransportError, channel, encode_cue,
             transport::srt::{SrtCaller, SrtConfig, SrtListener},
         },
     };
@@ -1374,6 +1376,50 @@ mod end_to_end {
         events
     }
 
+    fn publish_mpegts(bytes: &'static [u8]) -> Box<dyn PendingPublish> {
+        let mut request = publish_request();
+        request.protocol = IngestProtocol::Srt;
+        Box::new(MpegTsFilePublish { request, bytes })
+    }
+
+    struct MpegTsFilePublish {
+        request: PublishRequest,
+        bytes: &'static [u8],
+    }
+
+    impl PendingPublish for MpegTsFilePublish {
+        fn publish_request(&self) -> Result<PublishRequest, TransportError> {
+            Ok(self.request.clone())
+        }
+
+        fn accept(
+            self: Box<Self>,
+            grant: PublishGrant,
+            meters: Arc<dyn SourceMeters>,
+        ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
+            Box::pin(async move {
+                let source = MpegTsPacketSource::new(
+                    Box::new(ReadInput::closed(Cursor::new(self.bytes))),
+                    MpegTsConfig::default(),
+                    InputLimits::permissive(),
+                    meters,
+                )
+                .map_err(|error| TransportError::Accept(error.to_string().into()))?;
+                Ok(AcceptedPublish {
+                    source: Box::new(source),
+                    grant,
+                })
+            })
+        }
+
+        fn reject(
+            self: Box<Self>,
+            _rejection: PublishRejection,
+        ) -> BoxFuture<'static, Result<(), TransportError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     fn publish(input: crate::source::InputLimits) -> Box<dyn PendingPublish> {
         Box::new(RtmpAacPublish {
             request: publish_request(),
@@ -1487,6 +1533,22 @@ mod end_to_end {
         (node, session)
     }
 
+    /// Cadence that locks on the 8 s Apple MPEG-TS fixtures (1 s GOPs).
+    fn node_for_one_second_gops() -> (Node, crate::session::SessionConfig) {
+        let mut config = NodeConfig::default();
+        config.session.segmentation =
+            SegmentationPolicy::latency_first(Duration::from_secs(2), Duration::from_millis(500));
+        config.hls.readiness = PlaylistReadiness::CompletedSegment;
+        let session = config.session;
+        let node = Node::new(
+            config,
+            Arc::new(OpenStreamAuthenticator::new(StreamPolicy::permissive())),
+            Events::default(),
+        )
+        .expect("node configuration is valid");
+        (node, session)
+    }
+
     fn media_uris(playlist: &str) -> Vec<&str> {
         playlist
             .lines()
@@ -1514,6 +1576,25 @@ mod end_to_end {
         Path::new(uri)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8"))
+    }
+
+    /// URIs that follow `#EXT-X-STREAM-INF` lines, which are the variants.
+    fn stream_inf_uris(multivariant: &str) -> Vec<&str> {
+        let mut uris = Vec::new();
+        let mut expect_uri = false;
+        for line in multivariant.lines() {
+            if line.starts_with("#EXT-X-STREAM-INF:") {
+                expect_uri = true;
+                continue;
+            }
+            if expect_uri {
+                expect_uri = false;
+                if !line.starts_with('#') && !line.is_empty() {
+                    uris.push(line);
+                }
+            }
+        }
+        uris
     }
 
     fn assert_delta_matches_full(full: &str, delta: &str) {
@@ -1645,17 +1726,7 @@ mod end_to_end {
             "/tests/apple_hls/fixtures/h264_aac.ts"
         ));
 
-        let mut config = NodeConfig::default();
-        config.session.segmentation =
-            SegmentationPolicy::latency_first(Duration::from_secs(2), Duration::from_millis(500));
-        config.hls.readiness = PlaylistReadiness::CompletedSegment;
-        let session = config.session;
-        let node = Node::new(
-            config,
-            Arc::new(OpenStreamAuthenticator::new(StreamPolicy::permissive())),
-            Events::default(),
-        )
-        .expect("node configuration is valid");
+        let (node, session) = node_for_one_second_gops();
 
         let srt = SrtConfig::default();
         let mut listener = SrtListener::bind(
@@ -1795,6 +1866,85 @@ mod end_to_end {
             assert!(
                 playlist.contains("#EXT-X-MAP:"),
                 "rendition {rendition}: {playlist}"
+            );
+        }
+
+        validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"));
+
+        let _ = shutdown.send(());
+        server
+            .await
+            .expect("HTTP task did not panic")
+            .expect("HTTP server stopped cleanly");
+    }
+
+    #[tokio::test]
+    async fn mpegts_two_h264_are_separate_http_video_variants() {
+        const MPEG_TS: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/apple_hls/fixtures/h264_dual_video.ts"
+        ));
+        let (node, session) = node_for_one_second_gops();
+        let outcome = run_session(
+            publish_mpegts(MPEG_TS),
+            node.services(),
+            &session,
+            PendingPermit::unlimited(),
+        )
+        .await;
+        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral HTTP listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve(
+            listener,
+            node.application(),
+            HttpConfig::default(),
+            None,
+            Readiness::ready(),
+            async {
+                let _ = stopped.await;
+            },
+        ));
+
+        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
+        assert_eq!(multivariant.status, 200);
+        let body = String::from_utf8(multivariant.body).expect("the multivariant playlist is text");
+        let variants = stream_inf_uris(&body);
+        assert_eq!(
+            variants.len(),
+            2,
+            "each video PID becomes a STREAM-INF variant:\n{body}"
+        );
+        assert!(
+            variants.iter().all(|uri| Path::new(uri)
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("video.m3u8"))),
+            "video tracks are the variants, not audio alternates:\n{body}"
+        );
+        assert!(
+            body.contains("RESOLUTION=320x180") && body.contains("RESOLUTION=160x90"),
+            "each variant advertises its coded size:\n{body}"
+        );
+        assert!(
+            body.contains("#EXT-X-MEDIA:TYPE=AUDIO"),
+            "shared AAC is an alternate, not a third variant:\n{body}"
+        );
+        assert!(
+            !body.contains("#EXT-X-MEDIA:TYPE=VIDEO"),
+            "the video group is the variants themselves:\n{body}"
+        );
+
+        for uri in &variants {
+            let media = request(address, "GET", &format!("/live/camera/{uri}"), &[]).await;
+            assert_eq!(media.status, 200, "GET {uri}");
+            let playlist = String::from_utf8(media.body).expect("media playlist is text");
+            assert!(
+                playlist.contains("#EXT-X-MAP:") && playlist.contains("#EXT-X-ENDLIST"),
+                "pre-roll locked and the closed input ended {uri}:\n{playlist}"
             );
         }
 

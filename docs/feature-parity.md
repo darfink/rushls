@@ -21,7 +21,7 @@ not build them until a publisher needs them.
 | SRT Matroska / WebM | **gap** | EBML magic refused on purpose. MPEG-TS only. |
 | SRT FLV, MP4/fMP4, anything else avformat probed | **gap** | MPEG-TS only. Not an incomplete demuxer; other containers were never the live ingest contract. |
 | Enhanced RTMP extra A/V tracks | **done** | OneTrack and packed `ManyTracks` become distinct catalog entries keyed by `audio/{id}` / `video/{id}`. Legacy default track stays `audio` / `video`. Identical sequence headers are ignored. Changed codec configurations fail the publish; a new id after freeze is `TrackSetChanged`. HTTP e2e: two OneTrack AAC → two `STREAM-INF` audio variants. |
-| MPEG-TS extra audio/video PIDs | **done** | Mapper keeps every mapped PID. Admission default is `tracks = Any`. Apple HLS: H.264 + two AAC-LC PIDs, `mediastreamvalidator` clean. |
+| MPEG-TS extra audio/video PIDs | **done** | Mapper keeps every mapped PID. Admission default is `tracks = Any`. Apple HLS: H.264 + two AAC-LC PIDs, and two H.264 PIDs + AAC. HTTP e2e covers the two-video ladder through pre-roll cadence. |
 
 ## Codecs
 
@@ -109,6 +109,7 @@ fetches a media playlist after `SessionOutcome::Ended` and asserts
 | Enhanced RTMP second audio/video | HTTP e2e: two OneTrack AAC-LC variants. Apple HLS HTTPS: `rtmp_multitrack_h264_two_aac`. |
 | SRT MPEG-TS live | Apple HLS HTTPS: `srt_h264_aac` (one H.264 + one AAC). Dual-audio TS is the in-process MPEG-TS case, not a second SRT matrix row. |
 | MPEG-TS extra audio PIDs | Apple HLS HTTPS: `mpegts_h264_two_aac`. |
+| MPEG-TS extra video PIDs | Apple HLS HTTPS: `mpegts_h264_two_video`. HTTP e2e: two H.264 variants plus shared AAC. |
 | File dump without `-re` | Bounded queues apply backpressure after pre-roll. A closed RTMP input drains all discovery packets across batch boundaries. |
 
 ## In-band captions beyond H.264
@@ -180,5 +181,5 @@ Run it explicitly to check decoding and Opus startup alignment against the TS de
 FFmpeg currently emits the 648 padded final samples from the fragmented Opus fixture.
 The serialized final duration is correct, but this decoder does not apply that end trim.
 The regression checks the full audible prefix against the independently decoded source.
-The existing eight-test Apple HLS matrix also passes after these changes.
+The existing Apple HLS matrix also passes after these changes.
 Apple `mediastreamvalidator` cannot certify AV1 or Opus HLS; Chrome and hls.js are the live proof for those codecs.

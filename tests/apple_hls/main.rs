@@ -11,7 +11,7 @@ mod validator;
 
 use rushls::source::transport::srt::{SrtCaller, SrtConfig, SrtListener};
 
-use crate::publish::{H264_AAC_TS, H264_DUAL_AAC_TS, HEVC_AAC_TS};
+use crate::publish::{H264_AAC_TS, H264_DUAL_AAC_TS, H264_DUAL_VIDEO_TS, HEVC_AAC_TS};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -48,6 +48,11 @@ async fn mpegts_hevc_aac() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mpegts_h264_two_aac() -> TestResult {
     run(publish::mpegts(H264_DUAL_AAC_TS)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mpegts_h264_two_video() -> TestResult {
+    run(publish::mpegts(H264_DUAL_VIDEO_TS)).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
