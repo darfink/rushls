@@ -31,6 +31,7 @@ mod fixtures;
 pub enum IngestProtocol {
     Rtmp,
     Srt,
+    Moq,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

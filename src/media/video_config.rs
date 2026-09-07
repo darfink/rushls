@@ -185,3 +185,21 @@ fn sei_number(bytes: &mut &[u8]) -> Option<usize> {
         }
     }
 }
+
+/// H.264 VUI timing counts fields: a frame spans two clock ticks.
+pub fn h264_frame_rate(units: Option<u32>, scale: Option<u32>) -> Option<crate::domain::FrameRate> {
+    let units = std::num::NonZeroU32::new(units?)?;
+    let scale = std::num::NonZeroU32::new(scale?)?;
+    Some(crate::domain::FrameRate::new(
+        scale,
+        units.checked_mul(nz::u32!(2))?,
+    ))
+}
+
+/// HEVC VUI timing counts complete frames.
+pub fn hevc_frame_rate(units: Option<u32>, scale: Option<u32>) -> Option<crate::domain::FrameRate> {
+    Some(crate::domain::FrameRate::new(
+        std::num::NonZeroU32::new(scale?)?,
+        std::num::NonZeroU32::new(units?)?,
+    ))
+}

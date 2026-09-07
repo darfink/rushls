@@ -86,16 +86,7 @@ impl PacketSource for RtmpPacketSource {
             if self.ingress.is_none() {
                 return Err(DiscoveryProblem::AlreadyStarted.into());
             }
-            if limits.maximum_probe_bytes == 0 || limits.maximum_wall_time.is_zero() {
-                return Err(DiscoveryProblem::LimitNotPositive {
-                    field: if limits.maximum_probe_bytes == 0 {
-                        "maximum probe bytes"
-                    } else {
-                        "maximum wall time"
-                    },
-                }
-                .into());
-            }
+            limits.validate()?;
 
             let deadline = Instant::now() + limits.maximum_wall_time;
             let mut builder = CatalogBuilder::new();

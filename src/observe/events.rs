@@ -256,6 +256,7 @@ pub enum Protocol {
     Srt,
     Http,
     Https,
+    Moq,
 }
 
 pub trait EventObserver: Send + Sync {

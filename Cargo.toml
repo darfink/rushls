@@ -39,6 +39,27 @@ rsrt = "0.3.4"
 # ring still compiles a small C/asm kernel at build time; it does not link a
 # system crypto library.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Already in the tree as the rustls backend; named directly for the one hash
+# this crate computes itself, the MOQ certificate fingerprint a browser pins
+# with `serverCertificateHashes`. Taking a second digest crate for 32 bytes
+# would add a stack that duplicates what rustls already links.
+ring = "0.17"
+# Media-over-QUIC ingest. `web-transport-quinn` defaults to aws-lc-rs; pin
+# `ring` so this crate does not grow a second crypto stack. `moq-native` is
+# deliberately not used: it is a CLI-oriented helper (clap, websocket, tcp)
+# and its default features pull aws-lc-rs.
+web-transport-quinn = { version = "0.12.1", default-features = false, features = ["ring"] }
+moq-net = "0.2.18"
+# LOC frame codec only: a varint property block and the codec bitstream, with
+# `bytes` and `moq-net` as its whole dependency tree. The catalog it pairs with
+# is parsed in `source::moq::catalog`; taking `hang` and `moq-mux` for those two
+# jobs would add a container-conversion stack (MP4, MPEG-TS, MKV, FLV) that
+# this origin never reaches, for a draft schema it refuses most of anyway.
+moq-loc = "0.2.5"
+# Shared with moq-net: poll several track readers under one waiter without
+# cancelling in-flight reads.
+kio = { version = "0.5.7", features = ["time"] }
+url.workspace = true
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
@@ -149,6 +170,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
   "tls12",
   "logging",
 ] }
+url = "2"
 uuid = { version = "1", features = ["v4", "v7"] }
 [profile.release]
 lto = "thin"

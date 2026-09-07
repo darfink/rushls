@@ -801,7 +801,7 @@ mod tests {
             assert_eq!((plan.first_segment_boundary_pts - first_pts) % 1_024, 0);
             assert_eq!(
                 plan.part_duration.get(),
-                u64::from(plan.part_access_units.get()) * AUDIO_FRAME
+                u64::from(plan.part_access_units.expect("constant cadence").get()) * AUDIO_FRAME
             );
             assert_eq!(plan.boundary_tolerance, AUDIO_FRAME);
         }

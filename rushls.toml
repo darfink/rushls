@@ -5,6 +5,8 @@
 #   srt://127.0.0.1:9000?streamid=publish:<name>
 #   http://127.0.0.1:8080/<app>/<name>/index.m3u8
 #
+# WebTransport ingest is off. Turn it on with [moq] listen, a certificate, and
+# a key; compiled defaults stay cert-free.
 # Anyone may publish, at any speed, in any codec this origin can mux. A file
 # pushed as fast as the link allows is packaged that fast, which is what
 # setting no ceiling asks for. For a public deployment start from

@@ -1,6 +1,6 @@
-//! Choosing how many access units make up a regular part.
+//! Choosing a count or duration threshold for regular parts.
 //!
-//! # Why parts are counted rather than scheduled
+//! # Fixed-cadence parts
 //!
 //! Segments use close track-local schedules selected together during pre-roll.
 //! Parts are also rendition-local, and they carry a constraint segments do not:
@@ -23,6 +23,14 @@
 //! unit can be partially primed; CMAF retains its encoded start as the chunk
 //! origin. Fully primed units are not counted. Constant encoded durations
 //! therefore produce regular parts exactly on target, even with pre-skip.
+//!
+//! # Variable-cadence parts
+//!
+//! Browser capture can vary too much for the count rule. Such tracks cut when
+//! their accumulated duration reaches 85% of the target. The target reserves
+//! at least one longest observed access unit in its remaining 15%, so the
+//! crossing unit fits below the ceiling. Delivery still rejects later samples
+//! that violate these bounds; pre-roll cannot predict an arbitrarily long gap.
 //!
 //! # Balanced remainders
 //!
@@ -92,8 +100,9 @@ impl AccessUnitCadence {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PartCadence {
-    pub access_units: NonZero<u32>,
-    /// The advertised `PART-TARGET`: `access_units × the longest access unit`.
+    pub access_units: Option<NonZero<u32>>,
+    /// The advertised `PART-TARGET`, including the largest crossing access unit
+    /// for duration-based parts.
     pub duration: NonZero<TickDuration>,
 }
 
@@ -115,7 +124,7 @@ pub fn select_part_cadence(
     // nominal cadence and are never asked to have produced media at all.
     if kind == MediaKind::Subtitle {
         return Ok(PartCadence {
-            access_units: nz::u32!(1),
+            access_units: Some(nz::u32!(1)),
             duration: NonZero::new(desired.min(segment))
                 .or(NonZero::new(segment))
                 .ok_or(CadenceError::NoSegmentationBoundary)?,
@@ -124,7 +133,20 @@ pub fn select_part_cadence(
     let longest =
         NonZero::new(access_units.longest).ok_or(CadenceError::NoPresentableMedia(track_id))?;
     if !access_units.is_consistent() {
-        return Err(CadenceError::InconsistentPartCadence(track_id));
+        // Cut after reaching 85% of the target. Reserving one longest AU in
+        // the remaining 15% lets jittery capture timestamps keep their real
+        // timing while every regular part still fits the advertised ceiling.
+        let minimum_target = (u128::from(longest.get()) * 100).div_ceil(15);
+        let target = u64::try_from(minimum_target)
+            .map_err(|_| CadenceError::HorizonOverflow(track_id))?
+            .max(desired.min(segment));
+        if target > segment {
+            return Err(CadenceError::InconsistentPartCadence(track_id));
+        }
+        return Ok(PartCadence {
+            access_units: None,
+            duration: NonZero::new(target).expect("longest AU is nonzero"),
+        });
     }
 
     let nearest = desired
@@ -140,7 +162,7 @@ pub fn select_part_cadence(
         .and_then(NonZero::new)
         .ok_or(CadenceError::HorizonOverflow(track_id))?;
     Ok(PartCadence {
-        access_units,
+        access_units: Some(access_units),
         duration,
     })
 }
@@ -228,7 +250,7 @@ mod tests {
         assert_eq!(
             select(&[3_003; 60], 18_000, 180_180),
             Ok(PartCadence {
-                access_units: nz::u32!(6),
+                access_units: Some(nz::u32!(6)),
                 duration: nz::u64!(18_018),
             })
         );
@@ -240,7 +262,7 @@ mod tests {
         assert_eq!(
             select(&[1_024; 100], 9_600, 102_400),
             Ok(PartCadence {
-                access_units: nz::u32!(10),
+                access_units: Some(nz::u32!(10)),
                 duration: nz::u64!(10_240),
             })
         );
@@ -252,7 +274,7 @@ mod tests {
         assert_eq!(
             select_audio(&[1_024; 93], 23_552, 95_232),
             Ok(PartCadence {
-                access_units: nz::u32!(24),
+                access_units: Some(nz::u32!(24)),
                 duration: nz::u64!(24_576),
             })
         );
@@ -264,7 +286,7 @@ mod tests {
         assert_eq!(
             select_audio(&[1_024; 96], 24_576, 98_304),
             Ok(PartCadence {
-                access_units: nz::u32!(24),
+                access_units: Some(nz::u32!(24)),
                 duration: nz::u64!(24_576),
             })
         );
@@ -276,7 +298,7 @@ mod tests {
         assert_eq!(
             select_audio(&[1_000; 119], 20_000, 119_000),
             Ok(PartCadence {
-                access_units: nz::u32!(20),
+                access_units: Some(nz::u32!(20)),
                 duration: nz::u64!(20_000),
             })
         );
@@ -288,7 +310,7 @@ mod tests {
         assert_eq!(
             select_audio(&[1_024; 21], 5_120, 21_504),
             Ok(PartCadence {
-                access_units: nz::u32!(5),
+                access_units: Some(nz::u32!(5)),
                 duration: nz::u64!(5_120),
             })
         );
@@ -300,7 +322,7 @@ mod tests {
         assert_eq!(
             select(&[100, 110, 100, 110, 100, 110], 410, 630),
             Ok(PartCadence {
-                access_units: nz::u32!(4),
+                access_units: Some(nz::u32!(4)),
                 duration: nz::u64!(440),
             })
         );
@@ -312,7 +334,7 @@ mod tests {
         assert_eq!(
             select_audio(&[20; 9], 60, 170),
             Ok(PartCadence {
-                access_units: nz::u32!(3),
+                access_units: Some(nz::u32!(3)),
                 duration: nz::u64!(60),
             })
         );
@@ -326,17 +348,31 @@ mod tests {
         assert_eq!(
             select(&[100, 110, 100, 110, 100, 110], 410, 630),
             Ok(PartCadence {
-                access_units: nz::u32!(4),
+                access_units: Some(nz::u32!(4)),
                 duration: nz::u64!(440),
             })
         );
     }
 
     #[test]
-    fn a_cadence_too_uneven_to_hold_the_85_percent_floor_is_rejected() {
+    fn variable_cadence_reserves_one_access_unit_above_the_85_percent_floor() {
         assert_eq!(
             select(&[100, 20, 100], 200, 1_000),
+            Ok(PartCadence {
+                access_units: None,
+                duration: nz::u64!(667),
+            })
+        );
+        assert_eq!(
+            select(&[100, 20, 100], 200, 600),
             Err(CadenceError::InconsistentPartCadence(TrackId(0)))
+        );
+        assert_eq!(
+            select(&[100, 20, 100], 2_000, 1_000),
+            Ok(PartCadence {
+                access_units: None,
+                duration: nz::u64!(1_000),
+            })
         );
         // Exactly at the floor, which is admissible.
         assert!(select(&[100, 85, 100], 200, 1_000).is_ok());
@@ -347,7 +383,7 @@ mod tests {
         assert_eq!(
             select(&[20; 6], 60, 110),
             Ok(PartCadence {
-                access_units: nz::u32!(3),
+                access_units: Some(nz::u32!(3)),
                 duration: nz::u64!(60),
             })
         );
@@ -361,7 +397,7 @@ mod tests {
         assert_eq!(
             select(&[500; 8], 4_000, 2_000),
             Ok(PartCadence {
-                access_units: nz::u32!(4),
+                access_units: Some(nz::u32!(4)),
                 duration: nz::u64!(2_000),
             })
         );
@@ -372,7 +408,7 @@ mod tests {
         assert_eq!(
             select(&[3_000; 4], 0, 12_000),
             Ok(PartCadence {
-                access_units: nz::u32!(1),
+                access_units: Some(nz::u32!(1)),
                 duration: nz::u64!(3_000),
             })
         );
@@ -394,7 +430,7 @@ mod tests {
                 180_000,
             ),
             Ok(PartCadence {
-                access_units: nz::u32!(1),
+                access_units: Some(nz::u32!(1)),
                 duration: nz::u64!(18_000),
             })
         );
@@ -414,7 +450,7 @@ mod tests {
                 540_000,
             ),
             Ok(PartCadence {
-                access_units: nz::u32!(1),
+                access_units: Some(nz::u32!(1)),
                 duration: nz::u64!(90_000),
             })
         );

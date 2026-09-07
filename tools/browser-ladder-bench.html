@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser ladder bench — paced capture, 3 renditions, AAC</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.45 system-ui, sans-serif; max-width: 980px; margin: 24px auto; padding: 0 16px; }
+  h1 { font-size: 20px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 10px 0; }
+  label { display: inline-flex; align-items: center; gap: 6px; }
+  button { padding: 8px 12px; }
+  input[type=number] { width: 72px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-variant-numeric: tabular-nums; }
+  th, td { border: 1px solid rgba(127,127,127,.35); padding: 5px 8px; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  #log { white-space: pre-wrap; background: rgba(127,127,127,.12); border-radius: 8px; padding: 10px;
+         max-height: 220px; overflow: auto; font: 12px/1.4 ui-monospace, monospace; }
+  .hint { color: #777; font-size: 12px; }
+  .bad { color: #c0392b; font-weight: 600; }
+  .good { color: #1e8449; font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>Browser ladder bench</h1>
+  <p class="hint">
+  Captures a tab or screen, paces it onto a fixed grid (duplicating the last frame when the
+  source goes quiet, which is what a static tab does), fans one paced frame out to three
+  renditions sharing an identical PTS and one keyframe decision, encodes audio as AAC, and
+  publishes the whole ladder to the relay as a moq-lite broadcast (catalog.json + one legacy
+  track per rendition). HLS is served by the origin at /&lt;name&gt;/index.m3u8.
+  </p>
+
+<div class="row">
+  <button id="screen">Capture tab / screen</button>
+  <button id="synthetic">Synthetic 1080p source</button>
+  <button id="freeze" disabled>Freeze source (simulate static tab)</button>
+  <button id="stop" disabled>Stop</button>
+</div>
+<div class="row">
+  <label>fps <input type="number" id="fps" value="30" min="1" max="60"></label>
+  <label>GOP (frames) <input type="number" id="gop" value="60" min="1" max="600"></label>
+  <label><input type="checkbox" id="audio" checked> Audio</label>
+  <label><input type="checkbox" id="hw" checked> prefer-hardware</label>
+</div>
+<div class="row">
+  <label><input type="checkbox" id="publish" checked> Publish</label>
+  <label>Relay <input type="text" id="relay" value="http://localhost:18080/"></label>
+  <label>Broadcast <input type="text" id="name" value="ladder"></label>
+  <label>Cert hash <input type="text" id="cert" size="60" placeholder="sha-256 hex (for a self-signed cert)"></label>
+</div>
+
+<table id="stats">
+  <thead><tr><th>Rendition</th><th>Resolution</th><th>Encoder preference</th><th>fps</th>
+  <th>Mbps</th><th>Keyframes</th><th>Queue</th><th>Skip</th><th>GOP err</th>
+  <th>Encode ms (p50/p95)</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<table id="global">
+  <thead><tr><th>Source frames</th><th>Paced ticks</th><th>Duplicated</th><th>Tick overrun</th>
+  <th>PTS mismatches</th><th>Audio kbps</th><th>JS heap MiB</th><th>Tick cost ms (p50/p95)</th></tr></thead>
+  <tbody><tr><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>0</td><td>-</td><td>-</td></tr></tbody>
+</table>
+
+<pre id="log"></pre>
+
+<script type="module">
+import * as Net from "https://esm.sh/@moq/net@0.3.4";
+import * as Hang from "https://esm.sh/@moq/hang@0.4.2/container";
+import { Aac } from "https://esm.sh/@moq/hang@0.4.2/util";
+const LADDER = [
+  { name: "1080p", width: 1920, height: 1080, bitrate: 4500000 },
+  { name: "720p",  width: 1280, height: 720,  bitrate: 2500000 },
+  { name: "360p",  width: 640,  height: 360,  bitrate: 800000 },
+];
+// High profile level 4.0 covers every rung, so one codec string serves the ladder.
+const CODEC = "avc1.640028";
+// Backpressure: at most this many frames may wait in one encoder before the pacer
+// skips (and counts) instead of letting the queue grow to OOM.
+const MAX_QUEUE = 3;
+// Bounds the pending-chunk bookkeeping; a silently dropped frame frees a slot.
+const MAX_PENDING = 512;
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+const log = (...parts) => {
+  logEl.textContent = (parts.join(" ") + "\n" + logEl.textContent).slice(0, 16000);
+  logEl.scrollTop = 0;
+};
+for (const level of ["debug", "warn", "error"]) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => {
+    orig(...args);
+    const line = args.map((a) => {
+      if (a instanceof Error) {
+        const inner = a.errors ? " [" + a.errors.map((e) => e.name + ": " + e.message).join("; ") + "]" : "";
+        return a.name + ": " + a.message + inner;
+      }
+      return typeof a === "string" ? a : JSON.stringify(a);
+    }).join(" ");
+    log("[" + level + "]", line);
+  };
+}
+
+const percentile = (values, p) => {
+  if (values.length === 0) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+};
+
+let run = null;
+
+function fail(state, error) {
+  if (run !== state || !state.running) return;
+  log("publication failed:", String(error));
+  stop();
+}
+
+// WebCodecs exposes preferences, not a query for the actual hardware backend.
+async function probeVideo(fps, wantHw) {
+  const results = {};
+  for (const rung of LADDER) {
+    const preferences = wantHw ? ["prefer-hardware", "prefer-software"] : ["prefer-software"];
+    for (const hardwareAcceleration of preferences) {
+      const config = {
+        codec: CODEC, width: rung.width, height: rung.height,
+        bitrate: rung.bitrate, framerate: fps,
+        latencyMode: "realtime", hardwareAcceleration, avc: { format: "annexb" },
+      };
+      const support = await VideoEncoder.isConfigSupported(config);
+      if (support.supported) { results[rung.name] = config; break; }
+    }
+    if (!results[rung.name]) throw new Error("No supported H.264 encoder for " + rung.name);
+  }
+  return results;
+}
+
+async function pickAudioCodec() {
+  for (const codec of ["mp4a.40.2", "opus"]) {
+    try {
+      const support = await AudioEncoder.isConfigSupported({
+        codec, sampleRate: 48000, numberOfChannels: 2, bitrate: 128000,
+      });
+      if (support.supported) return codec;
+    } catch (error) { /* try the next one */ }
+  }
+  return undefined;
+}
+
+function syntheticTrack(state) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 1920; canvas.height = 1080;
+  const ctx = canvas.getContext("2d");
+  let frame = 0;
+  const draw = () => {
+    if (!state.running) return;
+    // Frozen means "stop producing frames", which is what a static tab does --
+    // captureStream only emits when the canvas is painted.
+    if (!state.frozen) {
+      frame += 1;
+      ctx.fillStyle = "#101018";
+      ctx.fillRect(0, 0, 1920, 1080);
+      ctx.fillStyle = "hsl(" + ((frame * 2) % 360) + " 80% 55%)";
+      ctx.fillRect((frame * 7) % 1720, 300, 200, 200);
+      ctx.fillStyle = "#fff";
+      ctx.font = "64px system-ui";
+      ctx.fillText("frame " + frame, 80, 140);
+      // Noise defeats trivially-compressible content, so bitrates stay realistic.
+      for (let i = 0; i < 400; i += 1) {
+        ctx.fillStyle = "hsl(" + ((i * 13 + frame) % 360) + " 70% 50%)";
+        ctx.fillRect(Math.random() * 1920, 600 + Math.random() * 400, 12, 12);
+      }
+    }
+    state.animation = requestAnimationFrame(draw);
+  };
+  state.animation = requestAnimationFrame(draw);
+  return canvas.captureStream(60).getVideoTracks()[0];
+}
+function aacHex(sampleRate, channels) {
+  return Array.from(Aac.audioSpecificConfig(sampleRate, channels)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function buildCatalog(state) {
+  const video = { renditions: {} };
+  for (const rung of LADDER) {
+    video.renditions[rung.name] = {
+      // The encoders emit Annex-B (avc:{format:"annexb"}), so the origin must
+      // take the avc3 ingest path, which converts start codes to AVCC itself.
+      codec: "avc3." + CODEC.slice("avc1.".length),
+      container: { kind: "legacy" },
+      codedWidth: rung.width,
+      codedHeight: rung.height,
+    };
+  }
+  const audio = { renditions: {} };
+  if (state.audioCodec) {
+    const config = {
+      codec: state.audioCodec,
+      sampleRate: 48000,
+      numberOfChannels: 2,
+      container: { kind: "legacy" },
+    };
+    if (state.audioCodec.startsWith("mp4a")) config.description = aacHex(48000, 2);
+    audio.renditions.audio = config;
+  }
+  return JSON.stringify({ video, audio });
+}
+async function startRelay(state, rungs) {
+  const relayParam = new URLSearchParams(location.search).get("relay");
+  const relayUrl = (relayParam || $("relay").value).trim();
+  const name = $("name").value.trim();
+  if (!relayUrl || !name) { log("publish skipped: set relay URL and broadcast name"); return; }
+  try {
+    const fingerprintUrl = new URL("/certificate.sha256", relayUrl).href;
+    const response = await fetch(fingerprintUrl);
+    log("fingerprint fetch:", response.status, (await response.text()).trim().slice(0, 16) + "…");
+  } catch (error) {
+    log("fingerprint fetch FAILED:", String(error));
+  }
+  const certHex = ($("cert").value.trim() || new URLSearchParams(location.search).get("cert") || "").trim();
+  let webtransport = {};
+  if (certHex) {
+    const value = new Uint8Array(certHex.match(/../g).map((h) => parseInt(h, 16)));
+    webtransport = { serverCertificateHashes: [{ algorithm: "sha-256", value }] };
+    log("pinning relay certificate hash");
+  }
+  const relay = new Net.Connection.Reload({ url: new URL(relayUrl), enabled: true, webtransport });
+  state.relay = relay;
+  let established;
+  const deadline = performance.now() + 15000;
+  while (!established && state.running && performance.now() < deadline) {
+    established = relay.established.peek();
+    if (!established) await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  if (!established) {
+    log("relay connect failed within 15s; status:", relay.status ? relay.status.peek() : "n/a", "| established:", Boolean(relay.established.peek()));
+    throw new Error("Relay connection failed");
+  }
+  log("relay session established");
+  const broadcast = new Net.Broadcast.Producer();
+  state.broadcast = broadcast;
+  state.serveLoop = serveBroadcast(broadcast, rungs, state).catch((error) => fail(state, error));
+  established.publish(Net.Path.from(name), broadcast);
+  log("announced broadcast", name);
+}
+async function serveBroadcast(broadcast, rungs, state) {
+  state.setAudioServe ??= () => {};
+  const serveable = new Map();
+  for (const cell of rungs) serveable.set(cell.rung.name, cell);
+  for (;;) {
+    let request;
+    try { request = await broadcast.requested(); } catch (error) { log("serve loop ended:", String(error)); break; }
+    if (!request) break;
+    if (request.name === "catalog.json") {
+      const tracked = request.accept();
+      state.catalogTrack = tracked;
+      const group = tracked.appendGroup();
+      group.writeFrame({
+        payload: new TextEncoder().encode(buildCatalog(state)),
+        timestamp: Net.Time.Timestamp.fromMicros(0),
+      });
+      group.close();
+      log("served catalog.json");
+      continue;
+    }
+    if (request.name === "audio" && state.audioCodec) {
+      const tracked = request.accept(Hang.trackInfo());
+      const writer = new Hang.Legacy.Producer(tracked);
+      state.setAudioServe(writer);
+      tracked.closed.then(() => { if (state.audioWriter === writer) state.setAudioServe(null); });
+      log("served track: audio (" + state.audioCodec + ")");
+      continue;
+    }
+    const cell = serveable.get(request.name);
+    if (!cell) {
+      request.reject(new Error("unknown track: " + request.name));
+      log("rejected unknown track:", request.name);
+      continue;
+    }
+    const tracked = request.accept(Hang.trackInfo());
+    const writer = new Hang.Legacy.Producer(tracked);
+    cell.legacy = writer;
+    cell.wroteKeyframe = false;
+    tracked.closed.then(() => {
+      if (cell.legacy === writer) { cell.legacy = null; cell.wroteKeyframe = false; }
+    });
+    log("served track:", request.name);
+  }
+}
+// relay helpers above
+async function start(sourceKind) {
+  if (run) return;
+  const fps = Number($("fps").value) || 30;
+  const gop = Number($("gop").value) || 60;
+  const wantAudio = $("audio").checked;
+  const wantHw = $("hw").checked;
+
+  const state = {
+    running: true, frozen: false, sourceFrames: 0, ticks: 0, duplicated: 0,
+    overruns: 0, ptsMismatch: 0, audioBytes: 0, tickCosts: [], startedAt: performance.now(),
+  };
+  run = state;
+  $("stop").disabled = false; $("freeze").disabled = false;
+  $("screen").disabled = true; $("synthetic").disabled = true;
+
+  const configs = await probeVideo(fps, wantHw);
+  if (!state.running) return;
+  log("encoder preferences (actual backend is not exposed):", JSON.stringify(
+    Object.fromEntries(Object.entries(configs).map(([name, config]) => [name, config.hardwareAcceleration]))));
+
+  let videoTrack;
+  let audioTrack;
+  if (sourceKind === "synthetic") {
+    videoTrack = syntheticTrack(state);
+    state.synthetic = true;
+    log("synthetic 1080p canvas source");
+  } else {
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: { frameRate: fps }, audio: wantAudio,
+    });
+    videoTrack = stream.getVideoTracks()[0];
+    audioTrack = stream.getAudioTracks()[0];
+    const settings = videoTrack.getSettings();
+    log("display source", settings.width + "x" + settings.height,
+        "declared fps", settings.frameRate, audioTrack ? "(with audio)" : "(no audio track)");
+  }
+
+  state.videoTrack = videoTrack;
+  state.audioTrack = audioTrack;
+  if (!state.running) { videoTrack?.stop(); audioTrack?.stop(); return; }
+
+  // One encoder per rung. Chunk bookkeeping only; nothing is muxed.
+  const rungs = LADDER.map((rung) => {
+    const canvas = new OffscreenCanvas(rung.width, rung.height);
+    const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+    const accel = configs[rung.name].hardwareAcceleration;
+    const cell = {
+      rung, canvas, ctx, chunks: 0, bytes: 0, keyframes: 0,
+      encodeCosts: [], lastChunks: 0, lastBytes: 0,
+      accel, skipped: 0, gopErrors: 0, pending: [], legacy: null, wroteKeyframe: false,
+    };
+    cell.encoder = new VideoEncoder({
+      output: (chunk) => {
+        if (!state.running || state.warming) return;
+        cell.chunks += 1;
+        cell.bytes += chunk.byteLength;
+        if (chunk.type === "key") cell.keyframes += 1;
+        const slot = cell.pending.findIndex((entry) => entry.timestamp === chunk.timestamp);
+        if (slot >= 0) {
+          if (cell.pending[slot].keyFrame !== (chunk.type === "key")) cell.gopErrors += 1;
+          cell.encodeCosts.push(performance.now() - cell.pending[slot].at);
+          cell.pending.splice(slot, 1);
+          if (cell.encodeCosts.length > 600) cell.encodeCosts.shift();
+        }
+        if (cell.legacy && (chunk.type === "key" || cell.wroteKeyframe)) {
+          try {
+            cell.legacy.encode(chunk, chunk.timestamp, chunk.type === "key");
+            if (chunk.type === "key") cell.wroteKeyframe = true;
+          } catch (error) {
+            fail(state, new Error(cell.rung.name + " publish failed: " + error));
+          }
+        }
+      },
+      error: (error) => fail(state, error),
+    });
+    cell.encoder.configure(configs[rung.name]);
+// end cell
+    return cell;
+  });
+  state.rungs = rungs;
+
+  // Hardware startup can take several seconds. Do not advance the publication
+  // clock or discard its first GOPs while those encoders initialize.
+  state.warming = true;
+  await Promise.all(rungs.map(async (cell) => {
+    const frame = new VideoFrame(cell.canvas, { timestamp: 0 });
+    cell.encoder.encode(frame, { keyFrame: true });
+    frame.close();
+    await cell.encoder.flush();
+  }));
+  state.warming = false;
+  if (!state.running) return;
+  log("all video encoders warmed up");
+
+  if (wantAudio && (audioTrack || state.synthetic)) {
+    const codec = await pickAudioCodec();
+    if (!codec) {
+      log("no usable audio encoder");
+    } else {
+      log("audio codec", codec);
+      const encoder = new AudioEncoder({
+        output: (chunk) => {
+          if (!state.running) return;
+          state.audioBytes += chunk.byteLength;
+          if (audioWriter) {
+            try { audioWriter.encode(chunk, chunk.timestamp, true); }
+            catch (error) { fail(state, error); }
+          }
+        },
+        error: (error) => fail(state, error),
+      });
+      encoder.configure({ codec, sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 });
+      let audioWriter = null;
+      state.audioCodec = codec;
+      state.setAudioServe = (writer) => { audioWriter = writer; state.audioWriter = writer; };
+      if (state.synthetic) {
+        // Pace generated audio from the video clock, not a second setInterval:
+        // timer delays must not accumulate into audio/video drift.
+        let samples = 0;
+        const FRAME = 960;
+        state.paceAudio = (endMicros) => {
+          while (samples + FRAME <= Math.floor(endMicros * 48000 / 1000000)) {
+            if (encoder.encodeQueueSize >= MAX_QUEUE) throw new Error("Audio encoder cannot keep up");
+            const timestamp = Math.round((samples / 48000) * 1000000);
+            const data = new Float32Array(FRAME * 2);
+            // A quiet tone makes audio decoding verifiable, unlike all-zero input.
+            for (let i = 0; i < FRAME; i += 1) {
+              const value = Math.sin(2 * Math.PI * 440 * (samples + i) / 48000) * 0.08;
+              data[i] = value; data[FRAME + i] = value;
+            }
+            const frame = new AudioData({
+              format: "f32-planar", sampleRate: 48000, numberOfFrames: FRAME,
+              numberOfChannels: 2, timestamp, data,
+            });
+            encoder.encode(frame);
+            frame.close();
+            samples += FRAME;
+          }
+        };
+      } else {
+        const reader = new MediaStreamTrackProcessor({ track: audioTrack }).readable.getReader();
+        state.audioReader = reader;
+        (async () => {
+          while (state.running) {
+            const { value, done } = await reader.read();
+            if (done || !value) break;
+            if (encoder.state === "configured") encoder.encode(value);
+            value.close();
+          }
+        })();
+      }
+      state.audioEncoder = encoder;
+    }
+  }
+  if ($("publish").checked) {
+    await startRelay(state, rungs);
+    const deadline = performance.now() + 15000;
+    while (state.running && (!rungs.every((cell) => cell.legacy) || (state.audioCodec && !state.audioWriter))) {
+      if (performance.now() >= deadline) throw new Error("Origin did not subscribe to the complete ladder");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  if (!state.running) return;
+
+  // Latest-frame holder. The pacer reads this rather than the stream, so a
+  // silent source is republished instead of leaving a hole in the timeline.
+  let latest = null;
+  state.closeLatest = () => { latest?.close(); latest = null; };
+  const reader = new MediaStreamTrackProcessor({ track: videoTrack }).readable.getReader();
+  state.videoReader = reader;
+  (async () => {
+    while (state.running) {
+      const { value, done } = await reader.read();
+      if (done || !value) break;
+      if (!state.running) { value.close(); break; }
+      state.sourceFrames += 1;
+      if (latest) latest.close();
+      latest = value;
+    }
+  })().catch((error) => fail(state, error));
+
+  const frameDuration = Math.round(1000000 / fps);
+  let index = 0;
+  let consumedFrames = 0;
+  let nextAt = performance.now();
+  let keyframePending = true;
+
+  const tick = () => {
+    if (!state.running) return;
+    const began = performance.now();
+    if (latest) {
+      // Timestamps come from the index, never accumulated, so 30fps cannot
+      // drift no matter how late a tick fires.
+      const timestamp = Math.round((index * 1000000) / fps);
+      keyframePending ||= index % gop === 0;
+      // Skip the whole ladder together, and retain a skipped keyframe request.
+      // Otherwise one busy rung can lose the only shared segmentation boundary.
+      const congested = rungs.some((cell) => cell.encoder.encodeQueueSize >= MAX_QUEUE);
+      const keyFrame = keyframePending;
+      if (state.sourceFrames === consumedFrames) state.duplicated += 1;
+      consumedFrames = state.sourceFrames;
+
+      const stamps = [];
+      for (const cell of rungs) {
+        if (congested) {
+          cell.skipped += 1;
+          continue;
+        }
+        cell.ctx.drawImage(latest, 0, 0, cell.rung.width, cell.rung.height);
+        const scaled = new VideoFrame(cell.canvas, { timestamp, duration: frameDuration });
+        stamps.push(scaled.timestamp);
+        if (cell.encoder.state === "configured") {
+          cell.pending.push({ timestamp, at: began, keyFrame });
+          if (cell.pending.length > MAX_PENDING) cell.pending.shift();
+          cell.encoder.encode(scaled, { keyFrame });
+        }
+        scaled.close();
+      }
+      if (stamps.some((value) => value !== stamps[0])) state.ptsMismatch += 1;
+      if (!congested) keyframePending = false;
+      state.paceAudio?.(Math.round(((index + 1) * 1000000) / fps));
+      state.ticks += 1;
+      index += 1;
+    }
+    const cost = performance.now() - began;
+    state.tickCosts.push(cost);
+    if (state.tickCosts.length > 600) state.tickCosts.shift();
+
+    nextAt += 1000 / fps;
+    let delay = nextAt - performance.now();
+    if (delay < 0) { state.overruns += 1; nextAt = performance.now(); delay = 0; }
+    state.timer = setTimeout(safeTick, delay);
+  };
+  const safeTick = () => { try { tick(); } catch (error) { fail(state, error); } };
+  safeTick();
+
+  state.videoTrack = videoTrack;
+  state.audioTrack = audioTrack;
+}
+
+function stop() {
+  if (!run) return;
+  const state = run;
+  state.running = false;
+  clearTimeout(state.timer);
+  cancelAnimationFrame(state.animation);
+  state.videoReader?.cancel().catch(() => {});
+  state.audioReader?.cancel().catch(() => {});
+  state.closeLatest?.();
+  state.catalogTrack?.close();
+  state.audioWriter?.close();
+  for (const cell of state.rungs || []) {
+    cell.legacy?.close();
+    if (cell.encoder.state !== "closed") cell.encoder.close();
+  }
+  if (state.audioEncoder && state.audioEncoder.state !== "closed") state.audioEncoder.close();
+  if (state.relay) state.relay.close();
+  if (state.videoTrack) state.videoTrack.stop();
+  if (state.audioTrack) state.audioTrack.stop();
+  run = null;
+  $("stop").disabled = true; $("freeze").disabled = true;
+  $("freeze").textContent = "Freeze source (simulate static tab)";
+  $("screen").disabled = false; $("synthetic").disabled = false;
+  log("stopped");
+}
+
+setInterval(() => {
+  if (!run || !run.rungs) return;
+  const body = $("stats").querySelector("tbody");
+  body.textContent = "";
+  for (const cell of run.rungs) {
+    const fps = cell.chunks - cell.lastChunks;
+    const mbps = ((cell.bytes - cell.lastBytes) * 8) / 1000000;
+    cell.lastChunks = cell.chunks; cell.lastBytes = cell.bytes;
+    const row = document.createElement("tr");
+    row.innerHTML =
+      "<td>" + cell.rung.name + "</td>" +
+      "<td>" + cell.rung.width + "x" + cell.rung.height + "</td>" +
+      "<td>" + cell.accel + "</td>" +
+      "<td>" + fps + "</td>" +
+      "<td>" + mbps.toFixed(2) + "</td>" +
+      "<td>" + cell.keyframes + "</td>" +
+      "<td>" + cell.encoder.encodeQueueSize + "</td>" +
+      "<td>" + cell.skipped + "</td>" +
+      "<td class=" + (cell.gopErrors === 0 ? "good>0" : ("bad>" + cell.gopErrors)) + "</td>" +
+      "<td>" + percentile(cell.encodeCosts, 0.5).toFixed(1) + " / " +
+               percentile(cell.encodeCosts, 0.95).toFixed(1) + "</td>";
+    body.appendChild(row);
+  }
+  const elapsed = (performance.now() - run.startedAt) / 1000;
+  const audioKbps = (run.audioBytes * 8) / 1000 / Math.max(elapsed, 0.001);
+  const heapMiB = performance.memory ? (performance.memory.usedJSHeapSize / 1048576).toFixed(1) : "-";
+  $("global").querySelector("tbody").innerHTML =
+    "<tr><td>" + run.sourceFrames + "</td><td>" + run.ticks + "</td><td>" + run.duplicated +
+    "</td><td>" + run.overruns + "</td>" +
+    "<td class=" + (run.ptsMismatch === 0 ? "good>0" : ("bad>" + run.ptsMismatch)) + "</td>" +
+    "<td>" + audioKbps.toFixed(0) + "</td>" +
+    "<td>" + heapMiB + "</td>" +
+    "<td>" + percentile(run.tickCosts, 0.5).toFixed(1) + " / " +
+             percentile(run.tickCosts, 0.95).toFixed(1) + "</td></tr>";
+}, 1000);
+
+$("screen").addEventListener("click", () => start("display").catch((e) => {
+  log("failed:", String(e)); stop();
+}));
+$("synthetic").addEventListener("click", () => start("synthetic").catch((e) => {
+  log("failed:", String(e)); stop();
+}));
+$("freeze").addEventListener("click", () => {
+  if (!run) return;
+  run.frozen = !run.frozen;
+  $("freeze").textContent = run.frozen ? "Unfreeze source" : "Freeze source (simulate static tab)";
+  log(run.frozen ? "source frozen — pacer should now duplicate" : "source resumed");
+});
+$("stop").addEventListener("click", stop);
+
+if (new URLSearchParams(location.search).get("auto") === "synthetic") {
+  addEventListener("load", () => setTimeout(() => $("synthetic").click(), 300));
+}
+
+log("ready. Pick a source. WebCodecs:", typeof VideoEncoder, "/ AAC probe runs on start.");
+</script>
+
+</body>
+</html>

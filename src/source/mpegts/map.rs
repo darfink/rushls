@@ -163,9 +163,7 @@ fn video_parameters(
 /// the pass-through normalizer time that tail.
 fn avc_frame_rate(record: &transmux::AVCDecoderConfigurationRecord) -> Option<FrameRate> {
     let info = record.sps.first()?.decode().ok()?;
-    let units = NonZeroU32::new(info.num_units_in_tick?)?;
-    let scale = NonZeroU32::new(info.time_scale?)?;
-    Some(FrameRate::new(scale, units.checked_mul(nz::u32!(2))?))
+    crate::media::video_config::h264_frame_rate(info.num_units_in_tick, info.time_scale)
 }
 
 /// HEVC VUI timing is `time_scale / num_units_in_tick` (ITU-T H.265 §E.2.1).
@@ -175,9 +173,7 @@ fn hevc_frame_rate(record: &transmux::HEVCDecoderConfigurationRecord) -> Option<
         .iter()
         .flat_map(|array| array.nalus.iter())
         .find_map(|nal| nal.decode_sps().ok().flatten())?;
-    let units = NonZeroU32::new(info.num_units_in_tick?)?;
-    let scale = NonZeroU32::new(info.time_scale?)?;
-    Some(FrameRate::new(scale, units))
+    crate::media::video_config::hevc_frame_rate(info.num_units_in_tick, info.time_scale)
 }
 
 fn aac_extradata(esds: &transmux::EsdsBox) -> Result<Payload, SourceError> {

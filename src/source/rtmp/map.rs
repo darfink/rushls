@@ -5,7 +5,8 @@
 //! parsed only far enough to fill [`DiscoveredTrack`] parameters; the payload
 //! bytes themselves are already length-prefixed video or raw AAC/Opus.
 
-use std::num::{NonZeroU16, NonZeroU32};
+use crate::media::video_config::{h264_frame_rate, hevc_frame_rate};
+use std::num::NonZeroU32;
 
 use broadcast_common::Parse;
 use bytes::Bytes;
@@ -13,8 +14,8 @@ use cc_rtmp::{ElementaryCodec, ElementaryUnit, EncoderSummary};
 
 use crate::{
     domain::{
-        AudioTiming, Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload, SourceTrackKey,
-        Timebase, TrackId,
+        Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload, SourceTrackKey, Timebase,
+        TrackId,
     },
     source::{DiscoveryProblem, Packet, SourceError},
 };
@@ -32,8 +33,14 @@ pub fn track(
         ElementaryCodec::Avc => (Codec::H264, video_parameters(&extradata, hint, "H.264")?),
         ElementaryCodec::Hevc => (Codec::Hevc, video_parameters_hevc(&extradata, hint)?),
         ElementaryCodec::Av1 => (Codec::Av1, video_parameters_from_hint(hint, "AV1")?),
-        ElementaryCodec::Aac => (Codec::Aac, aac_parameters(&extradata)?),
-        ElementaryCodec::Opus => (Codec::Opus, opus_parameters(&extradata)?),
+        ElementaryCodec::Aac => (
+            Codec::Aac,
+            crate::media::aac::parameters(&extradata).map_err(SourceError::Demux)?,
+        ),
+        ElementaryCodec::Opus => (
+            Codec::Opus,
+            crate::media::opus::parameters(&extradata).map_err(SourceError::Demux)?,
+        ),
     };
     if let MediaParameters::Video { video_delay, .. } = &mut parameters {
         *video_delay = crate::media::video_config::properties(mapped, &extradata).reorder_depth;
@@ -223,43 +230,6 @@ fn video_size(
         height: nonzero_u32(height, "video height")?,
         frame_rate,
         video_delay: 0,
-    })
-}
-
-/// H.264 VUI timing is `time_scale / (2 × num_units_in_tick)` (ITU-T H.264 §E.2.1).
-fn h264_frame_rate(num_units_in_tick: Option<u32>, time_scale: Option<u32>) -> Option<FrameRate> {
-    let units = NonZeroU32::new(num_units_in_tick?)?;
-    let scale = NonZeroU32::new(time_scale?)?;
-    Some(FrameRate::new(scale, units.checked_mul(nz::u32!(2))?))
-}
-
-/// HEVC VUI timing is `time_scale / num_units_in_tick` (ITU-T H.265 §E.2.1).
-fn hevc_frame_rate(num_units_in_tick: Option<u32>, time_scale: Option<u32>) -> Option<FrameRate> {
-    let units = NonZeroU32::new(num_units_in_tick?)?;
-    let scale = NonZeroU32::new(time_scale?)?;
-    Some(FrameRate::new(scale, units))
-}
-
-fn aac_parameters(extradata: &[u8]) -> Result<MediaParameters, SourceError> {
-    crate::media::aac::parameters(extradata).map_err(SourceError::Demux)
-}
-
-fn opus_parameters(extradata: &[u8]) -> Result<MediaParameters, SourceError> {
-    let config = crate::media::opus::configuration(extradata).map_err(SourceError::Demux)?;
-    Ok(MediaParameters::Audio {
-        sample_rate: nz::u32!(48_000),
-        channels: NonZeroU16::new(u16::from(config.output_channel_count)).ok_or(
-            DiscoveryProblem::NotPositive {
-                field: "audio channels",
-            },
-        )?,
-        frame_size: None,
-        bit_depth: None,
-        timing: AudioTiming {
-            initial_padding_samples: u32::from(config.pre_skip),
-            seek_preroll_samples: 3_840,
-            ..AudioTiming::default()
-        },
     })
 }
 

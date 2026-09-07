@@ -154,6 +154,8 @@ pub struct AppConfig {
     #[conf(flatten, prefix)]
     pub srt: SrtAppConfig,
     #[conf(flatten, prefix)]
+    pub moq: MoqAppConfig,
+    #[conf(flatten, prefix)]
     pub accept: AcceptAppConfig,
     #[conf(flatten, prefix)]
     pub hls: HlsAppConfig,
@@ -347,6 +349,7 @@ impl AppConfig {
         }
         self.rtmp.apply(&mut node, &mut warnings)?;
         self.srt.apply(&mut node)?;
+        self.moq.apply(&mut node, &mut warnings)?;
         self.hls.apply(&mut node, &mut warnings)?;
         // After HLS: a stall expressed as a multiple is sized by the segment
         // duration, which only `hls.apply` establishes.
@@ -355,6 +358,14 @@ impl AppConfig {
         node.hls.uri_base = UriBase::new(self.http.public_url.clone());
         node.http = self.http.resolve()?;
         node.https_address = node.http.tls_address;
+        // After `http.resolve`, which replaces the whole struct: the
+        // fingerprint route is mounted from the MOQ listener's own
+        // certificate, so it exists exactly when MOQ ingest does.
+        node.http.moq_certificate = node
+            .moq
+            .tls
+            .as_ref()
+            .map(|settings| settings.certificate.clone());
         node.metrics = self.metrics.resolve()?;
         if node.http_address.is_none() && node.https_address.is_none() {
             return Err(invalid(
@@ -1006,7 +1017,10 @@ fn startup_warnings(node: &NodeConfig, open_admission: bool) -> Vec<String> {
     let mut warnings = Vec::new();
     let public = |address: &SocketAddr| !address.ip().is_loopback();
 
-    if open_admission && (public(&node.rtmp_address) || public(&node.srt_address)) {
+    let ingest_is_public = public(&node.rtmp_address)
+        || public(&node.srt_address)
+        || node.moq_address.is_some_and(|address| public(&address));
+    if open_admission && ingest_is_public {
         warnings.push(
             "an ingest listener is on a public address with no [auth.publish]: anyone who can \
              reach it may publish"
@@ -1903,6 +1917,104 @@ impl SrtAppConfig {
 
 #[derive(Conf)]
 #[conf(serde)]
+pub struct MoqAppConfig {
+    /// Address receiving WebTransport publishers, or `"off"` to leave MOQ
+    /// unbound. Off is the compiled default: a process can boot without
+    /// certificates, which this listener cannot.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "off",
+        value_parser = parse_optional_address,
+        serde(use_value_parser)
+    )]
+    pub listen: OptionalAddress,
+    /// How long an established publisher may produce nothing before its
+    /// session is closed.
+    ///
+    /// One operator-facing value, the same derivation as `[rtmp] timeout`: the
+    /// handshake is never more patient than a few seconds, even when this is
+    /// `"off"`. QUIC idle is the established-session side; SETUP/CONNECT is
+    /// the unauthenticated one.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "10s",
+        value_parser = parse_optional_duration,
+        serde(use_value_parser)
+    )]
+    timeout: OptionalDuration,
+    /// Path to a PEM certificate chain, leaf first. Required when `listen` is
+    /// on: WebTransport has no cleartext form.
+    #[conf(parameter, long, env)]
+    certificate: Option<PathBuf>,
+    /// Path to a PEM private key. Required with `certificate` when `listen` is
+    /// on.
+    #[conf(parameter, long, env)]
+    key: Option<PathBuf>,
+}
+
+impl MoqAppConfig {
+    fn apply(&self, node: &mut NodeConfig, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
+        node.moq_address = self.listen.0;
+        node.moq.idle_timeout = self.timeout.0;
+        // The lesser of the session limit and the constant: a disabled session
+        // timeout still leaves SETUP bounded, because an unauthenticated peer
+        // is the one that should never be trusted to hold a socket indefinitely.
+        node.moq.handshake_timeout = self.timeout.0.map_or(MAXIMUM_HANDSHAKE_TIMEOUT, |session| {
+            session.min(MAXIMUM_HANDSHAKE_TIMEOUT)
+        });
+
+        if let Some(idle) = node.moq.idle_timeout
+            && idle < Duration::from_secs(1)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "the MOQ timeout ({idle:?}) is below one second, which drops publishers \
+                 between ordinary keyframes"
+            )));
+        }
+
+        if node.moq_address.is_some() && node.moq.idle_timeout.is_none() {
+            warnings.push(
+                "the MOQ timeout is disabled: a publisher that stops responding holds its \
+                 connection until it is closed from the other end"
+                    .to_owned(),
+            );
+        }
+
+        if node.moq_address.is_some() {
+            let (certificate, key) = match (&self.certificate, &self.key) {
+                (Some(certificate), Some(key)) => (certificate.clone(), key.clone()),
+                (None, None) => {
+                    return Err(invalid("a MOQ listener needs a certificate and key"));
+                }
+                (Some(_), None) => {
+                    return Err(invalid("[moq] sets certificate without key"));
+                }
+                (None, Some(_)) => {
+                    return Err(invalid("[moq] sets key without certificate"));
+                }
+            };
+            // handshake_timeout / maximum_pending_handshakes are unused by the
+            // QUIC endpoint: idle and pending-publisher budgets live on MoqConfig
+            // and IngestListener. They exist because TlsSettings is shared with
+            // the HTTPS listener.
+            node.moq.tls = Some(TlsSettings {
+                certificate,
+                key,
+                handshake_timeout: node.moq.handshake_timeout,
+                maximum_pending_handshakes: 256,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Conf)]
+#[conf(serde)]
 pub struct HlsAppConfig {
     /// Desired HLS segment duration. Keyframe cadence may adjust the result.
     #[conf(
@@ -1984,6 +2096,12 @@ impl HlsAppConfig {
             ));
         }
         node.session.segmentation = SegmentationPolicy::latency_first(self.segment, self.part);
+        // Live keyframe timestamps do not repeat an exact pre-roll grid.
+        // Size the bounded wait from the application's segment configuration.
+        node.cmaf.segment_boundary_policy =
+            crate::mux::SegmentBoundaryPolicy::ExtendToRandomAccess {
+                maximum_extension: self.segment,
+            };
         // Interim mapping: the advertised window and the retention window are
         // one quantity now, so the old playlist knob resolves straight into
         // it. `[hls] retain` replaces this when the file is rewritten.
@@ -2107,6 +2225,9 @@ impl HttpAppConfig {
             cors: self.cors.resolve()?,
             tls: self.tls.as_ref().map(TlsAppConfig::resolve).transpose()?,
             tls_address: self.tls.as_ref().map(|tls| tls.listen),
+            // Filled in by the caller, which is the only place that knows
+            // whether the MOQ listener is on.
+            moq_certificate: None,
         };
         config.validate().map_err(invalid)?;
         Ok(config)

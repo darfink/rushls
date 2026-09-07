@@ -459,6 +459,43 @@ impl CertificateWatch {
     }
 }
 
+/// A rustls server configuration for QUIC, with the same rotating certificate
+/// as [`TlsListener`].
+///
+/// QUIC cannot reuse an HTTPS [`ServerConfig`]: HTTP/3 requires TLS 1.3 only,
+/// a different ALPN, and `max_early_data_size = u32::MAX` so Quinn will accept
+/// the config at all. The certificate resolver is the same [`ArcSwap`] the TCP
+/// listener uses, so a rotation is still one atomic store and this config is
+/// never rebuilt.
+///
+/// The returned [`CertificateWatch`] must be held for as long as the QUIC
+/// endpoint lives; dropping it silently stops reloads.
+pub fn rotating_quic_server_config<O: TlsObserver>(
+    settings: TlsSettings,
+    alpn: &[&[u8]],
+    observer: Arc<O>,
+) -> Result<(Arc<ServerConfig>, CertificateWatch), TlsError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let resolver = Arc::new(CertificateResolver(ArcSwap::from_pointee(load(
+        &settings, &provider,
+    )?)));
+    observer.certificate_loaded(&settings.certificate);
+
+    let mut config = ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(TlsError::Configuration)?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
+    config.alpn_protocols = alpn.iter().map(|name| name.to_vec()).collect();
+    // Quinn's `QuicServerConfig::try_from` refuses a rustls config that does
+    // not advertise 0-RTT. The advertised size is the QUIC maximum; whether a
+    // session actually accepts early data is a transport decision, not a TLS one.
+    config.max_early_data_size = u32::MAX;
+
+    let watcher = CertificateWatch::start(settings, resolver, provider, observer)?;
+    Ok((Arc::new(config), watcher))
+}
+
 /// The directories holding the pair, deduplicated when both files share one.
 fn watched_directories(settings: &TlsSettings) -> Vec<PathBuf> {
     let mut directories = Vec::with_capacity(2);
@@ -631,6 +668,19 @@ mod tests {
         };
 
         assert_eq!(watched_directories(&settings), [PathBuf::from("/etc/tls")]);
+    }
+
+    #[tokio::test]
+    async fn a_quic_config_is_tls13_with_early_data_and_custom_alpn() {
+        let directory = scratch("quic");
+        let (settings, _) = write_pair(&directory, "origin.test");
+
+        let (config, _watch) =
+            rotating_quic_server_config(settings, &[b"h3"], Arc::new(IgnoreTlsEvents))
+                .expect("a self-signed pair is usable for QUIC");
+
+        assert_eq!(config.alpn_protocols, vec![b"h3".to_vec()]);
+        assert_eq!(config.max_early_data_size, u32::MAX);
     }
 
     #[tokio::test]

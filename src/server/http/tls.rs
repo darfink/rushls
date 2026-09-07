@@ -5,7 +5,7 @@
 //! reporting: the shared crate has no opinion about how an application counts
 //! or logs, and neither application should have to adopt the other's.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 pub use cc_tls::{TlsError, TlsListener as SharedTlsListener, TlsSettings};
 
@@ -19,11 +19,21 @@ pub type TlsListener = SharedTlsListener<NodeTlsObserver>;
 pub struct NodeTlsObserver {
     meters: ProcessMeters,
     events: Events,
+    protocol: Protocol,
 }
 
 impl NodeTlsObserver {
     pub fn new(meters: ProcessMeters, events: Events) -> Self {
-        Self { meters, events }
+        Self {
+            meters,
+            events,
+            protocol: Protocol::Https,
+        }
+    }
+
+    pub fn for_protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
     }
 }
 
@@ -49,7 +59,7 @@ impl cc_tls::TlsObserver for NodeTlsObserver {
 
     fn accept_failed(&self, reason: &str) {
         self.events.emit(NodeEvent::ListenerAcceptFailed {
-            protocol: Protocol::Https,
+            protocol: self.protocol,
             reason: reason.to_owned(),
         });
     }
@@ -61,4 +71,18 @@ impl cc_tls::TlsObserver for NodeTlsObserver {
     fn handshake_failed(&self) {
         self.meters.tls_handshake_failed();
     }
+}
+
+/// QUIC ingest TLS: TLS 1.3, `h3` ALPN, rotating certificates.
+pub(crate) fn rotating_quic_server_config(
+    settings: TlsSettings,
+    meters: ProcessMeters,
+    events: Events,
+    protocol: Protocol,
+) -> Result<(Arc<rustls::ServerConfig>, cc_tls::CertificateWatch), TlsError> {
+    cc_tls::rotating_quic_server_config(
+        settings,
+        &[web_transport_quinn::ALPN.as_bytes()],
+        Arc::new(NodeTlsObserver::new(meters, events).for_protocol(protocol)),
+    )
 }

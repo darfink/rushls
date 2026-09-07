@@ -60,6 +60,10 @@ async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults() -> Resul
     );
     assert_eq!(config.node.https_address, None);
     assert_eq!(
+        config.node.moq_address, None,
+        "MOQ stays off unless the operator turns it on"
+    );
+    assert_eq!(
         config.node.metrics.listen, None,
         "metrics are off by default"
     );
@@ -99,6 +103,10 @@ async fn the_reference_file_resolves_to_the_hardened_configuration() -> Result<(
         "0.0.0.0:9000".parse().expect("constant is valid")
     );
     assert_eq!(
+        config.node.moq_address, None,
+        "the reference leaves MOQ commented out"
+    );
+    assert_eq!(
         config.node.http_address,
         Some("[::]:8080".parse().expect("constant is valid"))
     );
@@ -118,6 +126,12 @@ async fn the_reference_file_resolves_to_the_hardened_configuration() -> Result<(
     assert_eq!(
         config.node.session.segmentation.desired_segment_duration,
         Duration::from_secs(6)
+    );
+    assert_eq!(
+        config.node.cmaf.segment_boundary_policy,
+        crate::mux::SegmentBoundaryPolicy::ExtendToRandomAccess {
+            maximum_extension: Duration::from_secs(6),
+        }
     );
     assert_eq!(
         config.node.session.supervision.health.stall,
@@ -591,6 +605,162 @@ token_file = "{}"
     ))?;
 
     assert!(matches!(result, Err(ConfigError::Invalid(_))));
+    Ok(())
+}
+
+#[test]
+fn compiled_defaults_leave_moq_off() -> Result<(), Box<dyn Error>> {
+    // Certificates are required to bind WebTransport, so the compiled default
+    // must boot without them.
+    let resolved = AppConfig::load_and_resolve_from(os(["rushls"]), std::iter::empty())?;
+    assert_eq!(resolved.node.moq_address, None);
+    assert!(resolved.node.moq.tls.is_none());
+    Ok(())
+}
+
+#[test]
+fn a_moq_listener_without_certificates_is_refused() -> Result<(), Box<dyn Error>> {
+    let Err(error) = resolve_toml(
+        r#"
+[moq]
+listen = "127.0.0.1:4433"
+"#,
+    )?
+    else {
+        panic!("MOQ listen without a certificate pair must be refused");
+    };
+
+    assert!(
+        error.to_string().contains("certificate"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_moq_listener_with_certificates_resolves() -> Result<(), Box<dyn Error>> {
+    let directory = scratch("moq-listen");
+    let (settings, _) = write_pair(&directory, "origin.internal");
+    let resolved = resolve_toml(&format!(
+        r#"
+[rtmp]
+listen = "127.0.0.1:1935"
+
+[srt]
+listen = "127.0.0.1:9000"
+
+[moq]
+listen = "127.0.0.1:4433"
+certificate = "{}"
+key = "{}"
+timeout = "8s"
+"#,
+        settings.certificate.display(),
+        settings.key.display()
+    ))?
+    .unwrap_or_else(|error| panic!("MOQ with certificates must resolve: {error}"));
+
+    assert_eq!(
+        resolved.node.moq_address,
+        Some("127.0.0.1:4433".parse().expect("constant is valid"))
+    );
+    assert_eq!(resolved.node.moq.idle_timeout, Some(Duration::from_secs(8)));
+    assert_eq!(
+        resolved.node.moq.handshake_timeout,
+        Duration::from_secs(5),
+        "an established timeout still leaves SETUP bounded"
+    );
+    let tls = resolved.node.moq.tls.expect("MOQ TLS is configured");
+    assert_eq!(tls.certificate, settings.certificate);
+    assert_eq!(tls.key, settings.key);
+    Ok(())
+}
+
+#[test]
+fn a_public_moq_listener_with_open_auth_is_warned() -> Result<(), Box<dyn Error>> {
+    let directory = scratch("moq-public");
+    let (settings, _) = write_pair(&directory, "origin.internal");
+    let resolved = resolve_toml(&format!(
+        r#"
+[rtmp]
+listen = "127.0.0.1:1935"
+
+[srt]
+listen = "127.0.0.1:9000"
+
+[moq]
+listen = "0.0.0.0:4433"
+certificate = "{}"
+key = "{}"
+"#,
+        settings.certificate.display(),
+        settings.key.display()
+    ))?
+    .unwrap_or_else(|error| panic!("public MOQ must still resolve: {error}"));
+
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("public address") && warning.contains("[auth.publish]")),
+        "open publish on a public MOQ bind should not be invisible: {:?}",
+        resolved.warnings
+    );
+    Ok(())
+}
+
+#[test]
+fn a_disabled_moq_timeout_still_bounds_the_handshake() -> Result<(), Box<dyn Error>> {
+    let directory = scratch("moq-timeout-off");
+    let (settings, _) = write_pair(&directory, "origin.internal");
+    let resolved = resolve_toml(&format!(
+        r#"
+[rtmp]
+listen = "127.0.0.1:1935"
+
+[srt]
+listen = "127.0.0.1:9000"
+
+[moq]
+listen = "127.0.0.1:4433"
+certificate = "{}"
+key = "{}"
+timeout = "off"
+"#,
+        settings.certificate.display(),
+        settings.key.display()
+    ))?
+    .unwrap_or_else(|error| panic!("a disabled MOQ timeout must resolve: {error}"));
+
+    assert_eq!(resolved.node.moq.idle_timeout, None);
+    assert_eq!(resolved.node.moq.handshake_timeout, Duration::from_secs(5));
+    assert!(
+        resolved
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("MOQ timeout is disabled")),
+        "an unbounded wait on a bound listener should not be invisible: {:?}",
+        resolved.warnings
+    );
+    Ok(())
+}
+
+#[test]
+fn a_moq_timeout_below_a_keyframe_interval_is_refused() -> Result<(), Box<dyn Error>> {
+    let Err(error) = resolve_toml(
+        r#"
+[moq]
+timeout = "500ms"
+"#,
+    )?
+    else {
+        panic!("a sub-second MOQ idle must be refused");
+    };
+
+    assert!(
+        error.to_string().contains("below one second"),
+        "unexpected error: {error}"
+    );
     Ok(())
 }
 

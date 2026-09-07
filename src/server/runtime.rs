@@ -27,6 +27,7 @@ use crate::{
     source::{
         PendingPublish, TransportError,
         transport::{
+            moq::{MoqConfig, MoqListener, MoqPendingPublish},
             rtmp::{RtmpConfig, RtmpPendingPublish},
             srt::{SrtConfig, SrtListener, SrtPendingPublish},
         },
@@ -60,6 +61,9 @@ pub struct NodeConfig {
     pub shutdown: Duration,
     pub rtmp_address: SocketAddr,
     pub srt_address: SocketAddr,
+    /// WebTransport ingest. `None` leaves MOQ off, which is the compiled default
+    /// so a process can boot without certificates.
+    pub moq_address: Option<SocketAddr>,
     /// Cleartext viewer listener. `None` serves HTTPS only.
     pub http_address: Option<SocketAddr>,
     /// TLS viewer listener, bound independently of the cleartext one.
@@ -71,6 +75,7 @@ pub struct NodeConfig {
     pub maximum_sessions: usize,
     pub rtmp: RtmpConfig,
     pub srt: SrtConfig,
+    pub moq: MoqConfig,
     pub session: SessionConfig,
     pub cmaf: CmafMuxerConfig,
     pub store: StoreLimits,
@@ -122,12 +127,14 @@ impl Default for NodeConfig {
             shutdown: Duration::from_secs(10),
             rtmp_address: "0.0.0.0:1935".parse().expect("constant address is valid"),
             srt_address: "0.0.0.0:9000".parse().expect("constant address is valid"),
+            moq_address: None,
             http_address: Some("0.0.0.0:8080".parse().expect("constant address is valid")),
             https_address: None,
             maintenance_interval: Duration::from_secs(1),
             maximum_sessions: 256,
             rtmp: RtmpConfig::default(),
             srt: SrtConfig::default(),
+            moq: MoqConfig::default(),
             session: SessionConfig::default(),
             cmaf: CmafMuxerConfig::default(),
             store: StoreLimits::default(),
@@ -152,6 +159,11 @@ pub enum RuntimeError {
         address: SocketAddr,
         source: crate::source::TransportError,
     },
+    #[error("could not bind MOQ at {address}: {source}")]
+    BindMoq {
+        address: SocketAddr,
+        source: crate::source::TransportError,
+    },
     #[error("could not bind HTTP at {address}: {source}")]
     BindHttp {
         address: SocketAddr,
@@ -168,6 +180,8 @@ pub enum RuntimeError {
     Rtmp(std::io::Error),
     #[error("SRT listener stopped unexpectedly")]
     SrtStopped,
+    #[error("MOQ listener stopped unexpectedly")]
+    MoqStopped,
     #[error("HTTP server failed: {0}")]
     Http(std::io::Error),
     #[error("could not start playback authorization: {0}")]
@@ -315,6 +329,7 @@ impl Node {
         // different supposedly process-wide limit.
         config.rtmp.input_limits = config.session.input;
         config.srt.input_limits = config.session.input;
+        config.moq.input_limits = config.session.input;
         let store = StreamStore::try_new(config.store.clone())?.with_events(events.clone());
         let sessions = Registry::with_capacity(config.maximum_sessions);
         let meters = ProcessMeters::default();
@@ -386,6 +401,34 @@ impl Node {
         &self.metrics
     }
 
+    /// Binds the MOQ listener, when an address asks for one.
+    ///
+    /// Apart from the others because it is the one listener that cannot start
+    /// without a certificate: QUIC has no cleartext form, so an omitted
+    /// `[moq] tls` is a refusal rather than a fallback to plaintext.
+    fn bind_moq(&self) -> Result<Option<MoqListener>, RuntimeError> {
+        let Some(address) = self.config.moq_address else {
+            return Ok(None);
+        };
+        let settings = self
+            .config
+            .moq
+            .tls
+            .clone()
+            .ok_or(RuntimeError::InvalidConfiguration(
+                "a MOQ listener needs a certificate and key",
+            ))?;
+        let (tls, watch) = http::rotating_quic_server_config(
+            settings,
+            self.services.meters.clone(),
+            self.services.events.clone(),
+            Protocol::Moq,
+        )?;
+        let listener = MoqListener::bind(address, tls, watch, self.config.moq.clone())
+            .map_err(|source| RuntimeError::BindMoq { address, source })?;
+        Ok(Some(listener))
+    }
+
     /// Runs both listeners and maintenance until `shutdown` resolves.
     pub async fn serve(
         mut self,
@@ -408,6 +451,7 @@ impl Node {
             address: self.config.srt_address,
             source,
         })?;
+        let moq_listener = self.bind_moq()?;
         // Each viewer listener binds on its own, so enabling TLS adds HTTPS
         // beside cleartext rather than moving it.
         let http_listener = match self.config.http_address {
@@ -436,6 +480,15 @@ impl Node {
         // the real one exists nowhere else.
         report_bound(&events, Protocol::Rtmp, rtmp_listener.local_addr());
         report_bound(&events, Protocol::Srt, Ok(srt_listener.local_address()));
+        if let Some(listener) = &moq_listener {
+            report_bound(
+                &events,
+                Protocol::Moq,
+                listener
+                    .local_address()
+                    .map_err(|error| std::io::Error::other(error.to_string())),
+            );
+        }
 
         let (stop_tx, stop_rx) = watch::channel(false);
         let readiness = Readiness::default();
@@ -452,6 +505,7 @@ impl Node {
             &mut tasks,
             rtmp_listener,
             srt_listener,
+            moq_listener,
             http_listener,
             https_listener,
             metrics_listener,
@@ -497,6 +551,7 @@ impl Node {
         tasks: &mut JoinSet<Result<(), RuntimeError>>,
         rtmp_listener: TcpListener,
         srt_listener: SrtListener,
+        moq_listener: Option<MoqListener>,
         http_listener: Option<TcpListener>,
         https_listener: Option<TcpListener>,
         metrics_listener: Option<TcpListener>,
@@ -517,6 +572,7 @@ impl Node {
             PendingPublishers::new(maximum_pending),
             stop_rx.clone(),
         ));
+        let moq_session_config = moq_listener.is_some().then(|| Arc::clone(&session_config));
         tasks.spawn(run_ingest(
             srt_listener,
             self.services.clone(),
@@ -524,6 +580,15 @@ impl Node {
             PendingPublishers::new(maximum_pending),
             stop_rx.clone(),
         ));
+        if let (Some(moq_listener), Some(session_config)) = (moq_listener, moq_session_config) {
+            tasks.spawn(run_ingest(
+                moq_listener,
+                self.services.clone(),
+                session_config,
+                PendingPublishers::new(maximum_pending),
+                stop_rx.clone(),
+            ));
+        }
 
         // Metrics are served on a viewer listener only when the operator gave
         // them that same address. Matching HTTP or HTTPS is one transport, not
@@ -667,6 +732,27 @@ trait IngestListener: Send + 'static {
     fn handshake(
         connection: Self::Connection,
     ) -> impl Future<Output = Result<Box<dyn PendingPublish>, TransportError>> + Send;
+}
+
+impl IngestListener for MoqListener {
+    type Connection = (web_transport_quinn::quinn::Incoming, MoqConfig);
+
+    const PROTOCOL: Protocol = Protocol::Moq;
+
+    async fn accept(&mut self) -> Accepted<Self::Connection> {
+        match MoqListener::accept(self).await {
+            Some(request) => Accepted::Connection((request, self.config())),
+            None => Accepted::Stopped(RuntimeError::MoqStopped),
+        }
+    }
+
+    async fn handshake(
+        (request, config): Self::Connection,
+    ) -> Result<Box<dyn PendingPublish>, TransportError> {
+        MoqPendingPublish::handshake(request, config)
+            .await
+            .map(|pending| Box::new(pending) as Box<dyn PendingPublish>)
+    }
 }
 
 impl IngestListener for SrtListener {
@@ -953,11 +1039,13 @@ mod tests {
         config.session.input.maximum_packets_per_batch = 17;
         config.rtmp.input_limits.maximum_packets_per_batch = 99;
         config.srt.input_limits.maximum_packets_per_batch = 98;
+        config.moq.input_limits.maximum_packets_per_batch = 97;
 
         let node = node(config).expect("configuration is valid");
 
         assert_eq!(node.config.rtmp.input_limits.maximum_packets_per_batch, 17);
         assert_eq!(node.config.srt.input_limits.maximum_packets_per_batch, 17);
+        assert_eq!(node.config.moq.input_limits.maximum_packets_per_batch, 17);
     }
 
     #[test]
@@ -1034,22 +1122,35 @@ mod tests {
             }
         }
 
+        let directory = crate::server::http::fixtures::scratch("moq-runtime");
+        let (tls, _) = crate::server::http::fixtures::write_pair(&directory, "origin.test");
         let recorder = Arc::new(Recorder::default());
+        let mut config = NodeConfig {
+            rtmp_address: "127.0.0.1:0".parse().expect("constant is valid"),
+            srt_address: "127.0.0.1:0".parse().expect("constant is valid"),
+            moq_address: Some("127.0.0.1:0".parse().expect("constant is valid")),
+            http_address: Some("127.0.0.1:0".parse().expect("constant is valid")),
+            ..NodeConfig::default()
+        };
+        config.moq.tls = Some(tls);
         let node = node_with_events(
-            NodeConfig {
-                rtmp_address: "127.0.0.1:0".parse().expect("constant is valid"),
-                srt_address: "127.0.0.1:0".parse().expect("constant is valid"),
-                http_address: Some("127.0.0.1:0".parse().expect("constant is valid")),
-                ..NodeConfig::default()
-            },
+            config,
             Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>),
         )?;
 
         node.serve(async {}).await?;
-        assert!(matches!(
-            recorder.0.lock().last(),
-            Some(NodeEvent::ShuttingDown)
-        ));
+        let events = recorder.0.lock().clone();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                NodeEvent::ListenerBound {
+                    protocol: Protocol::Moq,
+                    ..
+                }
+            )),
+            "MOQ must bind when listen is on: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(NodeEvent::ShuttingDown)));
         Ok(())
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! Transport and demux are exposed as one accepted source, but remain separate
 //! concerns inside a protocol adapter. RTMP maps `cc-rtmp` tags through
-//! [`rtmp`]; SRT carries MPEG-TS into [`mpegts`]. A [`PendingPublish`] therefore
+//! [`rtmp`]; SRT carries MPEG-TS into [`mpegts`]; MOQ maps hang LOC frames
+//! through [`moq`]. A [`PendingPublish`] therefore
 //! wires its byte transport into the demuxer and yields a ready
 //! [`PacketSource`], so session orchestration cannot accidentally mismatch
 //! those implementation pieces.
@@ -13,6 +14,7 @@ mod caption;
 pub(crate) mod fixtures;
 mod limits;
 mod memory;
+mod moq;
 mod mpegts;
 mod packet;
 mod publish;

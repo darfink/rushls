@@ -353,7 +353,7 @@ mod tests {
             .expect("the plan covers the track");
         assert_eq!(track.segment_duration.get(), 8 * 90_000);
         assert_eq!(track.part_duration.get(), 90_000);
-        assert_eq!(track.part_access_units.get(), 1);
+        assert_eq!(track.part_access_units.expect("constant cadence").get(), 1);
 
         let observed = recorder.events.lock();
         assert_eq!(observed.len(), 1);

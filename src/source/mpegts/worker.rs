@@ -168,16 +168,7 @@ async fn discover_tracks(
     discovery_limits: DiscoveryLimits,
     input_limits: InputLimits,
 ) -> Result<(DiscoveryReport, Option<InputState>), SourceError> {
-    if discovery_limits.maximum_probe_bytes == 0 || discovery_limits.maximum_wall_time.is_zero() {
-        return Err(DiscoveryProblem::LimitNotPositive {
-            field: if discovery_limits.maximum_probe_bytes == 0 {
-                "maximum probe bytes"
-            } else {
-                "maximum wall time"
-            },
-        }
-        .into());
-    }
+    discovery_limits.validate()?;
 
     io.control.begin_probe(discovery_limits.maximum_probe_bytes);
     let outcome = tokio::time::timeout(discovery_limits.maximum_wall_time, async {

@@ -453,7 +453,16 @@ mount `/metrics` on the other.
 
 **A derived handshake timeout.** One operator-facing RTMP timeout fans out to
 an established-session limit and a shorter unauthenticated-handshake limit.
-The per-phase overrides that exist today are removed.
+The per-phase overrides that exist today are removed. `[moq] timeout` uses the
+same derivation for QUIC idle versus SETUP/CONNECT.
+
+**`[moq]` is a third ingest listener, off by default.** WebTransport or raw QUIC with
+moq-lite-05, one broadcast per publication. LOC and legacy Hang frames are accepted. Listen stays `"off"` so a node
+boots without certificates. Turning it on requires a certificate and key; the
+QUIC `ServerConfig` is TLS 1.3 with `h3` ALPN and the same rotating resolver
+as HTTPS, never the HTTPS config itself. Handshake runs on the connection
+task. The hang catalog freezes at discovery; later add, remove, or codec-config
+change is fatal. The browser publisher is out of this crate.
 
 **Enhanced RTMP validation is always strict.** `EnhancedValidationMode` and
 its `passthrough` arm are removed rather than left unreachable. Malformed

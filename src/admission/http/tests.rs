@@ -7,7 +7,9 @@ use axum::{Router, body::Bytes, extract::State, http::StatusCode, routing::post}
 use parking_lot::Mutex;
 
 use crate::{
-    admission::{AdmissionError, Authenticator, StreamPolicy, TakeoverPolicy, fixtures},
+    admission::{
+        AdmissionError, Authenticator, IngestProtocol, StreamPolicy, TakeoverPolicy, fixtures,
+    },
     domain::StreamId,
     outbound::{ClientConfig, Endpoint, HttpClient},
 };
@@ -148,6 +150,24 @@ async fn the_request_carries_the_publisher_without_mangling_its_credential() {
             .is_some_and(|id| !id.is_empty()),
         "a service that wants idempotence needs a key to use"
     );
+}
+
+#[tokio::test]
+async fn a_moq_publisher_is_named_as_moq_on_the_wire() {
+    let sidecar =
+        Sidecar::answering(r#"{"decision":"allow","stream_id":"live/x","principal":"p"}"#);
+    let address = start(sidecar.clone()).await;
+
+    let mut request = fixtures::publish_request("a-key");
+    request.protocol = IngestProtocol::Moq;
+    authenticator(address, HttpAuthConfig::default())
+        .authenticate(&request)
+        .await
+        .expect("the service allows the publisher");
+
+    let asked = sidecar.asked().expect("the sidecar was asked");
+    assert_eq!(asked["protocol"], "moq");
+    assert_eq!(asked["version"], 1);
 }
 
 #[tokio::test]

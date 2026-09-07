@@ -53,6 +53,24 @@ pub fn configuration(extra: &[u8]) -> Result<OpusSpecificBox, Box<str>> {
     Ok(config)
 }
 
+/// Track timing shared by RTMP and MOQ. Opus always decodes at 48 kHz.
+pub fn parameters(extradata: &[u8]) -> Result<crate::domain::MediaParameters, Box<str>> {
+    use crate::domain::{AudioTiming, MediaParameters};
+    let config = configuration(extradata)?;
+    Ok(MediaParameters::Audio {
+        sample_rate: nz::u32!(48_000),
+        channels: std::num::NonZeroU16::new(u16::from(config.output_channel_count))
+            .ok_or("zero Opus channels")?,
+        frame_size: None,
+        bit_depth: None,
+        timing: AudioTiming {
+            initial_padding_samples: u32::from(config.pre_skip),
+            seek_preroll_samples: 3_840,
+            ..AudioTiming::default()
+        },
+    })
+}
+
 /// Decoded samples at 48 kHz from RFC 6716's TOC and frame-count byte.
 /// Durations must come from the packet: Opus can change duration every packet.
 pub fn packet_samples(packet: &[u8]) -> Result<u32, Box<str>> {

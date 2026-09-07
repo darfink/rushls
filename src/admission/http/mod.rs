@@ -177,6 +177,7 @@ impl<'a> AdmissionRequest<'a> {
             protocol: match request.protocol {
                 IngestProtocol::Rtmp => "rtmp",
                 IngestProtocol::Srt => "srt",
+                IngestProtocol::Moq => "moq",
             },
             resource: Resource {
                 namespace: request.resource.namespace.as_deref(),

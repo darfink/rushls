@@ -13,6 +13,20 @@ pub struct DiscoveryLimits {
     pub maximum_wall_time: Duration,
 }
 
+impl DiscoveryLimits {
+    /// Every ingest adapter requires both a byte budget and a time budget.
+    pub fn validate(self) -> Result<(), DiscoveryProblem> {
+        let field = if self.maximum_probe_bytes == 0 {
+            "maximum probe bytes"
+        } else if self.maximum_wall_time.is_zero() {
+            "maximum wall time"
+        } else {
+            return Ok(());
+        };
+        Err(DiscoveryProblem::LimitNotPositive { field })
+    }
+}
+
 /// One demultiplexed access unit, still in its declared timebase.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Packet {

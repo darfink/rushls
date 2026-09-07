@@ -36,7 +36,6 @@
 - Store cached segments on disk?
 - Support Shaka Player
 - Sometimes subtitle cue is layed over the other one - they collide?
-- Support MoQ ingest?
 - Retention window should be in seconds?
 - Pacing should enforce backpressure (e.g. reduce buffers earlier in pipeline)
 - Default pacing maximum_lead should equal retention window?

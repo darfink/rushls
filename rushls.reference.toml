@@ -28,6 +28,19 @@ timeout = "5s"                           # idle limit for a peer; must exceed la
 # passphrase      = "..."                # inline form; prefer passphrase_file
 # encryption      = "aes256"
 
+# WebTransport ingest. Off until certificates exist: there is no cleartext
+# form. One connection is one publication. The URL path is the resource
+# (live/camera → namespace live, name camera); ?token= is the credential, or
+# the path name if omitted. SETUP path is the fallback when the CONNECT path
+# is empty.
+# [moq]
+# listen      = "[::]:4433"
+# timeout     = "10s"                    # idle limit for an established session;
+#                                        # SETUP/CONNECT gets a tighter one. "off"
+#                                        # on a trusted link only
+# certificate = "/etc/rushls/tls/fullchain.pem"
+# key         = "/etc/rushls/tls/private-key.pem"
+
 [http]
 listen     = "[::]:8080"                 # "off" to serve HTTPS only
 public_url = ""                          # empty = relative playlist URLs

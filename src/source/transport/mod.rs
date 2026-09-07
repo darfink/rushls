@@ -5,5 +5,6 @@
 //! [`PacketSource`](super::PacketSource) over the container that protocol
 //! carries.
 
+pub mod moq;
 pub mod rtmp;
 pub mod srt;

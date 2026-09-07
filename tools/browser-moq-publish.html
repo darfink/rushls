@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browser → rushls MoQ ingest test</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.45 system-ui, sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; }
+  h1 { font-size: 20px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 10px 0; }
+  label { display: inline-flex; align-items: center; gap: 6px; }
+  input[type=text] { width: 300px; }
+  button { padding: 8px 12px; }
+  #pub video { width: 100%; max-width: 480px; background: #000; border-radius: 8px; }
+  #log { white-space: pre-wrap; background: rgba(127,127,127,.12); border-radius: 8px; padding: 10px;
+         max-height: 260px; overflow: auto; font: 12px/1.4 ui-monospace, monospace; }
+  .hint { color: #777; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>Browser → HLS (MoQ ingest) test</h1>
+<p class="hint">
+  Captures with the browser's own APIs (<b>Camera+Mic</b> = <code>getUserMedia</code>,
+  <b>Screen</b> = <code>getDisplayMedia</code>), encodes with WebCodecs, and publishes to the
+  origin over WebTransport (<code>moq-lite-05</code>) as a hang <code>legacy</code> broadcast with an
+  H.264 <code>avc3</code> video track and an Opus audio track.
+</p>
+<p class="hint">
+  The origin is <code>http://</code> on purpose. Chromium will not complete a WebTransport
+  handshake against a certificate signed by a locally installed root, so the client fetches
+  <code>/certificate.sha256</code> from that origin, pins it with
+  <code>serverCertificateHashes</code>, and connects over QUIC on the same port &mdash; TCP and
+  UDP have separate port spaces, so one number serves both. Mint the certificate with
+  <code>tools/mint-dev-cert.sh</code>. A publicly trusted certificate needs none of this: use
+  <code>https://</code> and the fingerprint is ignored.
+</p>
+
+<div class="row">
+  <label>Origin <input type="text" id="url" value="https://localhost:4443/"></label>
+  <label>Broadcast <input type="text" id="name" value="web"></label>
+</div>
+<div class="row">
+  <button id="camera">🎥 Camera + Mic</button>
+  <button id="screen">🖥️ Screen</button>
+  <button id="stop" disabled>⏹ Stop</button>
+  <label><input type="checkbox" id="audio" checked> Audio (Opus)</label>
+  <label><input type="checkbox" id="preview" checked> Local preview</label>
+</div>
+
+<moq-publish id="pub" announce="never" preview="source">
+  <video autoplay muted playsinline></video>
+</moq-publish>
+
+<div class="row">
+  <label>HLS manifest <input type="text" id="hls" value="http://127.0.0.1:18080/web/index.m3u8" size="40"></label>
+  <button id="open-hls">Open HLS</button>
+</div>
+<div class="hint">Playable about 6 seconds after the origin reports <code>tracks discovered</code>.</div>
+
+<pre id="log"></pre>
+
+<script type="module">
+import "https://esm.sh/@moq/publish@0.4.6/element";
+
+const $ = (id) => document.getElementById(id);
+const pub = $("pub");
+const logEl = $("log");
+
+function log(...args) {
+  const line = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ");
+  logEl.textContent += new Date().toLocaleTimeString() + "  " + line + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// Mirror the library's console output (connection, ALPN negotiation, codec) into the log.
+for (const level of ["debug", "log", "warn", "error"]) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => {
+    orig(...args);
+    const line = args.map((a) => {
+      if (a instanceof Error) {
+        const inner = a.errors ? " [" + a.errors.map((e) => e.name + ": " + e.message).join("; ") + "]" : "";
+        return a.name + ": " + a.message + inner;
+      }
+      return typeof a === "string" ? a : JSON.stringify(a);
+    }).join(" ");
+    logEl.textContent += "[" + level + "] " + line + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+}
+
+// 1. Pin H.264. The library's *auto* codec selection tries VP9 first, which this
+//    origin does not ingest (H.264/HEVC/AV1 only).
+pub.video.config.set({ codec: "avc1.640028" });
+
+// 2. Sticky relabel to avc3. The library always configures the WebCodecs encoder with
+//    avc:{format:"annexb"}, so the bytes on the wire are Annex-B — but it labels the
+//    catalog codec avc1, which this origin treats as AVCC (length-prefixed). The origin's
+//    avc3 path is the one that converts Annex-B, so relabel every published catalog.
+//    Wrapping catalog.mutate keeps the rewrite atomic inside each mutation, so no
+//    intermediate avc1 snapshot is ever published (a post-freeze codec change is fatal).
+function patchCatalog() {
+  const cat = pub.broadcast?.catalog;
+  if (!cat) return false;
+  const origMutate = cat.mutate.bind(cat);
+  cat.mutate = (fn) => {
+    origMutate((c) => {
+      if (fn) fn(c);
+      const renditions = c?.video?.renditions;
+      if (renditions) {
+        for (const key of Object.keys(renditions)) {
+          const r = renditions[key];
+          if (typeof r?.codec === "string" && r.codec.startsWith("avc1.")) {
+            r.codec = "avc3." + r.codec.slice("avc1.".length);
+          }
+        }
+      }
+    });
+  };
+  return true;
+}
+if (!patchCatalog()) {
+  log("warning: could not patch the catalog producer; the avc3 relabel is not active");
+}
+
+pub.muted = !$("audio").checked;
+$("audio").addEventListener("change", () => (pub.muted = !$("audio").checked));
+$("preview").addEventListener("change", () =>
+  (pub.preview = $("preview").checked ? "source" : "none"));
+$("open-hls").addEventListener("click", () => window.open($("hls").value, "_blank"));
+
+let running = false;
+let waitTimer = 0;
+
+function start(kind) {
+  if (running) return;
+  running = true;
+  const url = $("url").value.trim();
+  const name = $("name").value.trim();
+  if (!url || !name) { log("set an origin URL and a broadcast name"); running = false; return; }
+
+  pub.url = url;
+  pub.name = name;
+  pub.announce = "never";       // hold the broadcast until the catalog is complete
+  pub.source = kind;
+
+  // Adding or removing audio changes the origin's frozen track set.
+  $("audio").disabled = true;
+  $("stop").disabled = false;
+  $("camera").disabled = true;
+  $("screen").disabled = true;
+  log("capture started, encoding… (waiting for the catalog to be complete)");
+
+  // The origin freezes on the first catalog it reads and rejects any later change to
+  // the track set, so we must not announce until both renditions exist. Poll the
+  // resolved encoder outputs, then flip announce on. OpusHead arrives only after
+  // a subscriber starts encoding; the origin accepts it during discovery.
+  waitTimer = setInterval(() => {
+    const v = pub.video?.out?.resolved?.peek?.();
+    const a = pub.audio?.out?.catalog?.peek?.();
+    if (v?.codec && (!$("audio").checked || a?.codec)) {
+      clearInterval(waitTimer);
+      pub.announce = "source";
+      log("catalog ready → announcing broadcast", { video: v, audio: a });
+      $("hls").value = new URL(encodeURIComponent(name) + "/index.m3u8", url).href;
+      log("HLS: " + $("hls").value);
+    }
+  }, 200);
+}
+
+function stop() {
+  if (!running) return;
+  running = false;
+  clearInterval(waitTimer);
+  pub.announce = "never";
+  pub.source = undefined;
+  pub.url = undefined;
+  $("audio").disabled = false;
+  $("stop").disabled = true;
+  $("camera").disabled = false;
+  $("screen").disabled = false;
+  log("stopped and disconnected.");
+}
+
+$("camera").addEventListener("click", () => start("camera"));
+$("screen").addEventListener("click", () => start("screen"));
+$("stop").addEventListener("click", stop);
+log("ready. Choose Camera+Mic or Screen to publish.");
+</script>
+
+</body>
+</html>

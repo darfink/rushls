@@ -30,6 +30,7 @@ pub mod fixtures;
 mod tests;
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -44,6 +45,7 @@ use axum::{
     routing::any,
 };
 use cc_metrics::bearer_token;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::net::TcpListener;
 
 use crate::{
@@ -61,6 +63,7 @@ pub use playback::{PlaybackGate, PlaybackSettings, PlaybackStartError};
 
 use body::{RangeOutcome, StoredMediaBody, parse_range};
 
+pub(crate) use tls::rotating_quic_server_config;
 pub use tls::{TlsError, TlsListener, TlsSettings};
 
 /// What a response with no reusable lifetime says.
@@ -80,6 +83,16 @@ pub struct HttpConfig {
     /// Beside the certificate rather than inside `TlsSettings`, which is
     /// shared with another application that binds its own listeners.
     pub tls_address: Option<SocketAddr>,
+    /// The MOQ listener's certificate, when MOQ ingest is on.
+    ///
+    /// Present only to serve `/certificate.sha256`. A browser cannot complete
+    /// a WebTransport handshake against a certificate it does not trust, and
+    /// Chromium's QUIC path does not consult locally installed roots the way
+    /// its TCP path does, so a development origin publishes the fingerprint
+    /// its client pins with `serverCertificateHashes` instead. Absent when the
+    /// listener is off, which keeps the route off a production origin whose
+    /// publicly trusted certificate needs no pinning.
+    pub moq_certificate: Option<PathBuf>,
 }
 
 impl HttpConfig {
@@ -112,6 +125,9 @@ struct HttpState<P> {
     metrics: Option<MetricsEndpoint>,
     readiness: Readiness,
     playback: Option<Arc<PlaybackGate>>,
+    /// Behind an `Arc` for the same reason as the CORS policy: cloned per
+    /// request, and a `PathBuf` allocates.
+    moq_certificate: Option<Arc<PathBuf>>,
 }
 
 impl<P> Clone for HttpState<P> {
@@ -122,6 +138,7 @@ impl<P> Clone for HttpState<P> {
             metrics: self.metrics.clone(),
             readiness: self.readiness.clone(),
             playback: self.playback.clone(),
+            moq_certificate: self.moq_certificate.clone(),
         }
     }
 }
@@ -174,6 +191,14 @@ fn router<P: Application>(
     let mut viewer = Router::new()
         .route("/{*path}", any(handle::<P>))
         .fallback(any(handle::<P>));
+    // Before the CORS layer, so the fingerprint carries the same
+    // `Access-Control-Allow-Origin` as the media it belongs with: the page
+    // that fetches it is served from wherever a developer keeps it, not from
+    // this origin. A static path outranks the catch-all in axum's router, so
+    // a stream may still be named `certificate.sha256` at any other depth.
+    if config.moq_certificate.is_some() {
+        viewer = viewer.route("/certificate.sha256", any(moq_fingerprint::<P>));
+    }
     if let Some(cors) = cors::layer(&config.cors) {
         viewer = viewer.layer(cors);
     }
@@ -195,6 +220,7 @@ fn router<P: Application>(
         metrics,
         readiness,
         playback,
+        moq_certificate: config.moq_certificate.clone().map(Arc::new),
     })
 }
 
@@ -298,6 +324,60 @@ async fn handle<P: Application>(
 
 async fn liveness(method: Method) -> Response {
     health_response(&method, true)
+}
+
+/// The MOQ certificate's SHA-256, hex encoded, for `serverCertificateHashes`.
+///
+/// Read per request rather than resolved once at startup, because the
+/// certificate rotates underneath a running origin. A fingerprint that
+/// outlived its certificate would be worse than none: the browser pins
+/// exactly what this returns, and a stale hash fails the handshake with no
+/// interstitial to click through.
+///
+/// The value is not a secret. It is a digest of the certificate this origin
+/// already presents in the clear to every peer that opens a connection.
+async fn moq_fingerprint<P: Application>(
+    State(service): State<HttpState<P>>,
+    method: Method,
+) -> Response {
+    if method != Method::GET && method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    // Absent is unreachable while the route is only mounted with a certificate
+    // configured, but answering 404 keeps that an invariant rather than a panic.
+    let Some(path) = service.moq_certificate.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(fingerprint) = leaf_fingerprint(path) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static(REVALIDATE)),
+        ],
+        fingerprint,
+    )
+        .into_response()
+}
+
+/// Hex SHA-256 over the DER of the first certificate in a PEM chain.
+///
+/// The leaf, because that is what a browser hashes: `serverCertificateHashes`
+/// pins one end-entity certificate rather than a chain or an issuer.
+fn leaf_fingerprint(path: &Path) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let leaf = CertificateDer::from_pem_file(path).ok()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, leaf.as_ref());
+    let mut hex = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        write!(hex, "{byte:02x}").ok()?;
+    }
+    Some(hex)
 }
 
 async fn readiness_probe<P: Application>(

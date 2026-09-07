@@ -65,12 +65,30 @@ order the pipeline runs in.
 
 RTMP and HTTP binds default to dual-stack `[::]`. SRT is IPv4-only
 (`0.0.0.0`) because ingest uses `rsrt`, which has no IPv6 listener yet.
+MOQ (`[moq] listen`) is **off** until an operator turns it on: WebTransport
+needs a certificate, and the compiled default must boot without one. The usual
+proxy posture is cleartext on loopback with TLS ended in front, rather than TLS
+in this process. No trusted-proxy list is configured; header trust is not how
+playlist URLs or auth are derived.
+
 `public_url` only shapes playlist URLs:
 empty means relative, which is right behind a proxy or CDN; a trailing slash
 is insignificant. Certificates reload in place on rotation, with secure TLS
-defaults and no cipher knobs. The usual proxy posture is cleartext on loopback
-with TLS ended in front, rather than TLS in this process. No trusted-proxy
-list is configured; header trust is not how playlist URLs or auth are derived.
+defaults and no cipher knobs. HTTPS and MOQ share that rotation machinery, but
+not a `ServerConfig`: HTTP/3 requires TLS 1.3 and `h3` ALPN, so MOQ must not
+reuse the viewer HTTPS config.
+
+MOQ identity matches SRT's last-`/` split: `https://origin/live/camera` is
+namespace `live` and name `camera`; a single path component is a single-key
+publish. The credential is the `token` query parameter when present, otherwise
+the resource name. An empty CONNECT path falls back to the moq-lite SETUP path.
+If both paths are empty, the first broadcast announcement supplies the resource.
+The origin rejects a second broadcast on the same connection.
+
+The listener accepts `moq-lite-05` over WebTransport (`https://`) and raw QUIC
+(`moqt://`). WebTransport selects the version in the CONNECT response.
+Raw QUIC selects the version through TLS ALPN. See [MOQ ingestion](moq-ingestion.md)
+for supported media formats and a local publish test.
 
 ## `[accept]`
 
@@ -527,12 +545,17 @@ waiting for, so a `timeout` at or under `latency` is refused. Raising
 `latency` for a long-haul link without raising `timeout` is the mistake that
 check exists to catch.
 
-Four idle-adjacent knobs, three different signals. `[rtmp] timeout` and
-`[srt] timeout` are transport silence — any bytes reset them — and stay
-per-protocol because what counts as silence differs. `stall` is usable-media
-silence, protocol-agnostic. `floor` is usable-media rate. Collapse any of them
-and one failure mode loses its tuning: a dead socket wants seconds, a degraded
-encoder wants tens of seconds with a pace attached.
+`[moq] timeout` is the QUIC idle timeout for an established WebTransport
+session, derived the same way as `[rtmp] timeout`: `"off"` still leaves
+SETUP/CONNECT bounded, and a value below one second is refused. It is a
+separate knob because QUIC idle is not an RTMP socket read.
+
+Five idle-adjacent knobs, four different signals. `[rtmp] timeout`, `[srt]
+timeout`, and `[moq] timeout` are transport silence — any bytes reset them —
+and stay per-protocol because what counts as silence differs. `stall` is
+usable-media silence, protocol-agnostic. `floor` is usable-media rate.
+Collapse any of them and one failure mode loses its tuning: a dead socket wants
+seconds, a degraded encoder wants tens of seconds with a pace attached.
 
 ## Shutdown
 
@@ -971,13 +994,15 @@ is lifted.
 - `[metrics]` omitted — nothing is exported.
 - `[record]` omitted — no local copies are written.
 - `[http.tls]` omitted — no HTTPS listener.
+- `[moq]` omitted, or `listen = "off"` — no WebTransport ingest. The compiled
+  default; turning it on requires a certificate and key.
 - `[capacity]` omitted — no stream count cap, though the compiled per-stream byte
   backstop remains.
 
 - `[http] listen = "off"` — no cleartext listener. Both listeners off refuses to
   boot.
 - `ceiling` omitted — no publish rate ceiling. This is the compiled default.
-- `stall`, `[rtmp] timeout`, and every numeric `[accept]` predicate accept `"off"` to
+- `stall`, `[rtmp] timeout`, `[moq] timeout`, and every numeric `[accept]` predicate accept `"off"` to
   mean no cap. Omitting a predicate already admits everything; `codecs = "off"` is
   refused rather than given a second spelling for omission.
 - `memory_per_stream = "off"` — the explicit "fill memory", and one of the
@@ -1001,8 +1026,8 @@ origin.
 
 Legal but probably unintended, warned rather than refused: an ingest listener
 on a non-loopback address combined with open auth, an uncapped stream count,
-`memory_per_stream = "off"`, or an omitted `ceiling`. A disabled RTMP timeout on a
-public bind is a second warning.
+`memory_per_stream = "off"`, or an omitted `ceiling`. A disabled RTMP or MOQ
+timeout on a bound listener is a second warning.
 
 Hard refusals are kept for the genuinely unbootable. Rules that bounce an
 administrator over a relationship they did not know existed should warn.

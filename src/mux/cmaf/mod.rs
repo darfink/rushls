@@ -240,9 +240,15 @@ impl CmafTrack {
                 duration: self.segment.filled,
             }));
             self.segment.advance(&self.plan)?;
-        } else if self.segment.part_access_units >= self.plan.part_access_units.get()
-            && self.fragment.is_some()
-        {
+        } else if self.fragment.is_some_and(|fragment| {
+            self.plan.part_access_units.map_or_else(
+                || {
+                    let duration = i128::from(fragment.end) - i128::from(fragment.start);
+                    duration * 100 >= i128::from(self.plan.part_duration.get()) * 85
+                },
+                |count| self.segment.part_access_units >= count.get(),
+            )
+        }) {
             // Audio is in presentation order, so the next PTS is a truthful
             // cut point. Video is in decode order: a reference picture may
             // have a later PTS than B-pictures that follow it, so extending a
@@ -1218,7 +1224,7 @@ mod tests {
     /// exercised alongside a constant one.
     fn packaged_parts(
         access_units: &[u64],
-        part_access_units: NonZero<u32>,
+        part_access_units: Option<NonZero<u32>>,
         part_target: NonZero<u64>,
         segment_ticks: u64,
     ) -> (Vec<u64>, u64) {
@@ -1231,17 +1237,13 @@ mod tests {
             .build();
         let input = validate(&catalog(vec![audio]), &StreamPolicy::permissive())
             .expect("audio fixture validates");
-        let mut started = started(
-            &input,
-            vec![
-                PlanBuilder::new(0, timebase, NonZero::new(segment_ticks).expect("nonzero"))
-                    .part(part_access_units, part_target)
-                    // A jittery cadence needs room for its longest access unit.
-                    .boundary_tolerance(access_units.iter().copied().max().unwrap_or(0))
-                    .build(),
-            ],
-            &sink,
-        );
+        let mut plan = PlanBuilder::new(0, timebase, NonZero::new(segment_ticks).expect("nonzero"))
+            .part(part_access_units.unwrap_or(nz::u32!(1)), part_target)
+            // A jittery cadence needs room for its longest access unit.
+            .boundary_tolerance(access_units.iter().copied().max().unwrap_or(0))
+            .build();
+        plan.part_access_units = part_access_units;
+        let mut started = started(&input, vec![plan], &sink);
 
         let mut media = Vec::new();
         let mut pts = 0_i64;
@@ -1300,7 +1302,7 @@ mod tests {
             ),
         ] {
             let (parts, part_target) =
-                packaged_parts(&access_units, nz::u32!(4), target, 24 * 1_024);
+                packaged_parts(&access_units, Some(nz::u32!(4)), target, 24 * 1_024);
             let minimum = part_target * 85 / 100;
 
             assert_eq!(parts, expected);
@@ -1322,11 +1324,68 @@ mod tests {
     }
 
     #[test]
+    fn duration_based_parts_preserve_jitter_without_exceeding_hls_bounds() {
+        // A large spread defeats fixed AU counts. Vary the phase against the
+        // part boundary to exercise different crossing units over many parts.
+        let durations: Vec<_> = [120, 720, 360, 600, 240]
+            .into_iter()
+            .cycle()
+            .take(500)
+            .collect();
+        let (parts, target) = packaged_parts(&durations, None, nz::u64!(4_800), 480_000);
+        assert!(parts.len() > 30);
+        for duration in parts {
+            assert!(duration * 100 >= target * 85);
+            assert!(duration <= target);
+        }
+    }
+
+    #[test]
+    fn variable_video_parts_keep_the_encoded_timestamps() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let timebase = Timebase::new(nz::u32!(1), nz::u32!(90_000));
+        let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())?;
+        let mut plan = PlanBuilder::new(0, timebase, nz::u64!(900_000))
+            .part(nz::u32!(1), nz::u64!(90_000))
+            .build();
+        plan.part_access_units = None;
+        let mut mux = started(&input, vec![plan], &discarded_events());
+        let mut media = Vec::new();
+        let mut pts = 0;
+        let mut expected_pts = Vec::new();
+        for duration in [1_800, 6_300, 2_700, 4_500].into_iter().cycle().take(200) {
+            let mut sample = sample_for(0, pts, pts == 0);
+            if let NormalizedSample::Video(video) = &mut sample {
+                video.duration = duration;
+            }
+            expected_pts.push(Some(pts));
+            mux.muxer.push(sample, &mut media)?;
+            pts += i64::try_from(duration)?;
+        }
+        // All emitted parts are regular; the unflushed tail is still pending.
+        for event in &media {
+            if let PackagedMedia::Chunk(chunk) = event {
+                assert!(chunk.duration >= 76_500 && chunk.duration <= 90_000);
+            }
+        }
+        mux.muxer
+            .finish(crate::mux::FinishReason::Final, &mut media)?;
+        let demuxed = demux_cmaf(&concat_cmaf_bytes(&media));
+        let actual: Vec<_> = demuxed.tracks[0]
+            .samples
+            .iter()
+            .map(|sample| sample.pts)
+            .collect();
+        assert_eq!(actual, expected_pts);
+        Ok(())
+    }
+
+    #[test]
     fn a_balanced_aac_cadence_emits_no_one_frame_final_part() {
         // The 94th frame closes a segment balanced as 24 + 24 + 24 + 21.
         let (parts, part_target) = packaged_parts(
             &[AAC_FRAME_SAMPLES; 94],
-            nz::u32!(24),
+            Some(nz::u32!(24)),
             nz::u64!(24 * AAC_FRAME_SAMPLES),
             93 * AAC_FRAME_SAMPLES,
         );
@@ -1350,7 +1409,7 @@ mod tests {
         // four units rather than continuing the previous count.
         let (parts, _) = packaged_parts(
             &[AAC_FRAME_SAMPLES; 15],
-            nz::u32!(4),
+            Some(nz::u32!(4)),
             nz::u64!(4 * AAC_FRAME_SAMPLES),
             5 * AAC_FRAME_SAMPLES,
         );

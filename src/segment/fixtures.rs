@@ -39,7 +39,7 @@ impl PlanBuilder {
                 segmentation_origin_pts: 0,
                 first_segment_boundary_pts: 0,
                 segment_duration,
-                part_access_units: nz::u32!(1),
+                part_access_units: Some(nz::u32!(1)),
                 part_duration: segment_duration,
                 boundary_tolerance: 0,
             },
@@ -50,7 +50,7 @@ impl PlanBuilder {
     /// How a regular part is measured: a count, and the ceiling it implies.
     #[must_use]
     pub fn part(mut self, access_units: NonZero<u32>, duration: NonZero<TickDuration>) -> Self {
-        self.plan.part_access_units = access_units;
+        self.plan.part_access_units = Some(access_units);
         self.plan.part_duration = duration;
         self
     }

@@ -136,15 +136,11 @@ pub struct TrackSegmentationPlan {
     /// may differ by an access unit or video frame; the planner proves their
     /// first cadence intervals overlap rather than forcing equal tick values.
     pub segment_duration: NonZero<TickDuration>,
-    /// How many presentable access units make up a regular part.
-    ///
-    /// Parts are counted rather than scheduled so that a regular part can
-    /// never exceed [`Self::part_duration`], which HLS advertises as
-    /// `PART-TARGET` and refuses to see exceeded. The final part of a segment
-    /// holds whatever remains and may be shorter.
-    pub part_access_units: NonZero<u32>,
-    /// The longest a regular part may run: `part_access_units` access units at
-    /// the longest access-unit duration observed for this track.
+    /// Fixed-cadence tracks count access units. Variable-cadence tracks use
+    /// `None` and close a part once it reaches 85% of `part_duration`.
+    pub part_access_units: Option<NonZero<u32>>,
+    /// The advertised ceiling, including room for the final access unit when
+    /// a variable-cadence part crosses its duration threshold.
     pub part_duration: NonZero<TickDuration>,
     /// Maximum delay between a planned segment boundary and the next usable
     /// AU start.
