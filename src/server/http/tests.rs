@@ -1223,6 +1223,7 @@ mod end_to_end {
         source::{
             AcceptedPublish, IngressEvent, InputState, PendingPublish, PublishRejection,
             RtmpPacketSource, TransportError, channel, encode_cue,
+            transport::srt::{SrtCaller, SrtConfig, SrtListener},
         },
     };
 
@@ -1493,6 +1494,28 @@ mod end_to_end {
             .collect()
     }
 
+    /// Media playlist URIs named by a multivariant, including `EXT-X-MEDIA`.
+    fn media_playlist_uris(multivariant: &str) -> Vec<String> {
+        let mut uris = Vec::new();
+        for line in multivariant.lines() {
+            if let Some((_, rest)) = line.split_once("URI=\"")
+                && let Some(uri) = rest.split('"').next()
+                && is_media_playlist_uri(uri)
+            {
+                uris.push(uri.to_owned());
+            } else if !line.starts_with('#') && is_media_playlist_uri(line) {
+                uris.push(line.to_owned());
+            }
+        }
+        uris
+    }
+
+    fn is_media_playlist_uri(uri: &str) -> bool {
+        Path::new(uri)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u8"))
+    }
+
     fn assert_delta_matches_full(full: &str, delta: &str) {
         if let Some(count) = delta.lines().find_map(|line| {
             line.strip_prefix("#EXT-X-SKIP:SKIPPED-SEGMENTS=")
@@ -1611,6 +1634,108 @@ mod end_to_end {
         .await;
         assert_eq!(outcome, Ok(SessionOutcome::Ended));
         assert_published_audio_is_http_playable(node).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_graceful_srt_disconnect_appends_endlist() {
+        // The Apple MPEG-TS fixture is long enough for a 2 s cadence. The 0.12 s
+        // library TS burst is not: pre-roll never locks a keyframe interval.
+        const MPEG_TS: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/apple_hls/fixtures/h264_aac.ts"
+        ));
+
+        let mut config = NodeConfig::default();
+        config.session.segmentation =
+            SegmentationPolicy::latency_first(Duration::from_secs(2), Duration::from_millis(500));
+        config.hls.readiness = PlaylistReadiness::CompletedSegment;
+        let session = config.session;
+        let node = Node::new(
+            config,
+            Arc::new(OpenStreamAuthenticator::new(StreamPolicy::permissive())),
+            Events::default(),
+        )
+        .expect("node configuration is valid");
+
+        let srt = SrtConfig::default();
+        let mut listener = SrtListener::bind(
+            "127.0.0.1:0".parse().expect("constant is valid"),
+            srt.clone(),
+            4,
+        )
+        .await
+        .expect("SRT listener binds");
+        let address = listener.local_address();
+        let caller = tokio::spawn(async move {
+            let caller = SrtCaller::connect(address, &srt, "publish:live/camera:secret")
+                .await
+                .expect("test caller connects");
+            caller
+                .send_mpegts(MPEG_TS)
+                .await
+                .expect("fixture message sends");
+            caller
+        });
+
+        let pending = listener
+            .accept()
+            .await
+            .expect("listener remains open")
+            .expect("connection is accepted");
+        let caller = caller.await.expect("caller did not panic");
+        // Bytes are already in the receive buffer. Dropping sends SHUTDOWN, which
+        // is the orderly encoder stop that must write EXT-X-ENDLIST.
+        drop(caller);
+
+        let outcome = run_session(
+            Box::new(pending),
+            node.services(),
+            &session,
+            PendingPermit::unlimited(),
+        )
+        .await;
+        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+
+        let http = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral HTTP listener binds");
+        let address = http.local_addr().expect("listener has an address");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve(
+            http,
+            node.application(),
+            HttpConfig::default(),
+            None,
+            Readiness::ready(),
+            async {
+                let _ = stopped.await;
+            },
+        ));
+
+        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
+        assert_eq!(multivariant.status, 200);
+        let multivariant =
+            String::from_utf8(multivariant.body).expect("the multivariant playlist is text");
+        let uris = media_playlist_uris(&multivariant);
+        assert!(
+            !uris.is_empty(),
+            "the presentation names at least one media playlist:\n{multivariant}"
+        );
+        for uri in uris {
+            let media = request(address, "GET", &format!("/live/camera/{uri}"), &[]).await;
+            assert_eq!(media.status, 200, "GET {uri}");
+            let playlist = String::from_utf8(media.body).expect("media playlist is text");
+            assert!(
+                playlist.contains("#EXT-X-ENDLIST"),
+                "graceful SRT close must end {uri}:\n{playlist}"
+            );
+        }
+
+        let _ = shutdown.send(());
+        server
+            .await
+            .expect("HTTP task did not panic")
+            .expect("HTTP server stopped cleanly");
     }
 
     #[tokio::test]

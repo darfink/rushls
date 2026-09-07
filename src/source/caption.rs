@@ -1,11 +1,11 @@
 //! Detects in-band closed captions without decoding video.
 //!
 //! A pass-through origin already delivers CEA-608/708 captions: they travel as
-//! SEI messages inside the H.264 access units and reach the output segments
-//! untouched. What is missing is the *declaration* — a player surfaces nothing
-//! unless the multivariant playlist says the captions are there. This module
-//! answers only that question: does this track carry ATSC A53 caption data, and
-//! on which channels.
+//! SEI messages inside H.264 and HEVC access units and reach the output
+//! segments untouched. What is missing is the *declaration* — a player surfaces
+//! nothing unless the multivariant playlist says the captions are there. This
+//! module answers only that question: does this track carry ATSC A53 caption
+//! data, and on which channels.
 //!
 //! FFmpeg cannot answer it for us. `AV_PKT_DATA_A53_CC` is populated by capture
 //! devices and encoders, never by a demuxer, and the extraction in
@@ -13,6 +13,7 @@
 //! one manifest attribute is out of proportion for a pass-through node, so the
 //! SEI is inspected directly instead. Nothing here rewrites the bitstream.
 
+use broadcast_common::Parse;
 use h264_reader::{
     avcc::AvcDecoderConfigurationRecord,
     nal::sei::{HeaderType, SeiReader, user_data_registered_itu_t_t35::ItuTT35},
@@ -23,6 +24,10 @@ use crate::domain::{Codec, DiscoveredTrack};
 
 /// SEI NAL unit type in H.264.
 const NAL_UNIT_TYPE_SEI: u8 = 6;
+/// HEVC prefix SEI (`PREFIX_SEI_NUT`).
+const HEVC_NAL_PREFIX_SEI: u8 = 39;
+/// HEVC suffix SEI (`SUFFIX_SEI_NUT`).
+const HEVC_NAL_SUFFIX_SEI: u8 = 40;
 
 /// ATSC provider code inside an ITU-T T.35 SEI payload.
 const ATSC_PROVIDER_CODE: [u8; 2] = [0x00, 0x31];
@@ -200,20 +205,32 @@ fn observe_services(packet: &[u8], found: &mut CaptionObservation) {
 
 /// How the NAL units of an access unit are framed.
 ///
-/// FLV, RTMP, and MP4 deliver length-prefixed NALs described by an `avcC`
-/// record; MPEG-TS delivers Annex B start codes. Both reach this node, so the
-/// framing is resolved once per track rather than guessed per packet.
+/// FLV, RTMP, and MP4 deliver length-prefixed NALs described by an `avcC` or
+/// `hvcC` record; MPEG-TS delivers Annex B start codes. Both reach this node,
+/// so the framing is resolved once per track rather than guessed per packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Framing {
-    /// Length-prefixed, with the prefix width taken from the `avcC` record.
-    Avcc {
+    /// Length-prefixed, with the prefix width taken from `avcC` / `hvcC`.
+    LengthPrefixed {
         length_size: usize,
     },
     AnnexB,
 }
 
-/// Scans one H.264 track's access units for ATSC A53 caption data.
+/// Which video codec's NAL header and SEI types to walk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeiCodec {
+    Avc,
+    Hevc,
+}
+
+/// Scans one H.264 or HEVC track's access units for ATSC A53 caption data.
+///
+/// The type name is historical: HEVC uses the same A53 payload in prefix and
+/// suffix SEI, so one detector covers both walks. AV1 is a different structure
+/// (Metadata OBUs) and is not inspected here.
 pub struct H264CaptionDetector {
+    codec: SeiCodec,
     framing: Framing,
     observed: CaptionObservation,
     /// Access units seen, whether inspected or skipped by the sampling policy.
@@ -245,17 +262,23 @@ impl H264CaptionDetector {
     /// does not scale with bitrate.
     pub const SAMPLE_INTERVAL_ACCESS_UNITS: u64 = 30;
 
-    /// Builds a detector for an H.264 track, or `None` for anything else.
+    /// Builds a detector for an H.264 or HEVC track, or `None` for anything else.
     ///
     /// The framing is derived from the track's codec configuration: a parsable
-    /// `avcC` record means length-prefixed NALs, and its absence means the
-    /// track is carried as Annex B.
+    /// `avcC` / `hvcC` record means length-prefixed NALs, and its absence means
+    /// the track is carried as Annex B.
     pub fn new(track: &DiscoveredTrack) -> Option<Self> {
-        if track.codec != Codec::H264 {
-            return None;
-        }
+        let (codec, framing) = match track.codec {
+            Codec::H264 => (SeiCodec::Avc, avc_framing(track.codec_extradata.as_bytes())),
+            Codec::Hevc => (
+                SeiCodec::Hevc,
+                hevc_framing(track.codec_extradata.as_bytes()),
+            ),
+            _ => return None,
+        };
         Some(Self {
-            framing: framing_of(track.codec_extradata.as_bytes()),
+            codec,
+            framing,
             observed: CaptionObservation::default(),
             seen: 0,
             malformed: 0,
@@ -316,13 +339,10 @@ impl H264CaptionDetector {
             // Only SEI carries captions. Restricting the scan to this NAL type
             // is also what keeps compressed slice data from producing a false
             // positive when it happens to contain the A53 signature bytes.
-            if nal
-                .first()
-                .is_none_or(|header| header & 0x1F != NAL_UNIT_TYPE_SEI)
-            {
+            if !is_caption_sei(nal, self.codec) {
                 continue;
             }
-            match scan_sei(nal, &mut self.dtvcc) {
+            match scan_sei(nal, self.codec, &mut self.dtvcc) {
                 Ok(observation) => found.merge(observation),
                 Err(()) => malformed = malformed.saturating_add(1),
             }
@@ -334,10 +354,19 @@ impl H264CaptionDetector {
 }
 
 /// Reads the NAL length width from an `avcC` record, falling back to Annex B.
-fn framing_of(extradata: &[u8]) -> Framing {
+fn avc_framing(extradata: &[u8]) -> Framing {
     AvcDecoderConfigurationRecord::try_from(extradata).map_or(Framing::AnnexB, |record| {
-        Framing::Avcc {
+        Framing::LengthPrefixed {
             length_size: usize::from(record.length_size_minus_one()) + 1,
+        }
+    })
+}
+
+/// Reads the NAL length width from an `hvcC` record, falling back to Annex B.
+fn hevc_framing(extradata: &[u8]) -> Framing {
+    transmux::HEVCDecoderConfigurationRecord::parse(extradata).map_or(Framing::AnnexB, |record| {
+        Framing::LengthPrefixed {
+            length_size: usize::from(record.length_size_minus_one) + 1,
         }
     })
 }
@@ -345,12 +374,14 @@ fn framing_of(extradata: &[u8]) -> Framing {
 /// Yields each NAL unit of an access unit, without its framing.
 fn nal_units(access_unit: &[u8], framing: Framing) -> Vec<&[u8]> {
     match framing {
-        Framing::Avcc { length_size } => avcc_nal_units(access_unit, length_size),
+        Framing::LengthPrefixed { length_size } => {
+            length_prefixed_nal_units(access_unit, length_size)
+        }
         Framing::AnnexB => annex_b_nal_units(access_unit),
     }
 }
 
-fn avcc_nal_units(access_unit: &[u8], length_size: usize) -> Vec<&[u8]> {
+fn length_prefixed_nal_units(access_unit: &[u8], length_size: usize) -> Vec<&[u8]> {
     let mut units = Vec::new();
     let mut cursor = 0_usize;
     while cursor + length_size <= access_unit.len() {
@@ -414,14 +445,41 @@ fn trim_trailing_zero(data: &[u8], next_start: usize) -> usize {
     }
 }
 
+/// Whether this NAL is an SEI unit that can carry A53 captions.
+fn is_caption_sei(nal: &[u8], codec: SeiCodec) -> bool {
+    match codec {
+        SeiCodec::Avc => nal
+            .first()
+            .is_some_and(|header| header & 0x1F == NAL_UNIT_TYPE_SEI),
+        SeiCodec::Hevc => {
+            // HEVC NAL headers are two bytes: type in bits 1..=6 of the first,
+            // layer id split across both. Captions live on the base layer.
+            let [first, second, ..] = nal else {
+                return false;
+            };
+            let nal_type = (first >> 1) & 0x3F;
+            let layer_id = ((first & 0x01) << 5) | (second >> 3);
+            layer_id == 0 && matches!(nal_type, HEVC_NAL_PREFIX_SEI | HEVC_NAL_SUFFIX_SEI)
+        }
+    }
+}
+
 /// Reads every SEI message in one NAL, reporting the caption data it carries.
 ///
 /// `Err` means the SEI structure could not be read, which is a publisher
 /// problem rather than a session-ending one.
-fn scan_sei(nal: &[u8], dtvcc: &mut DtvccAssembler) -> Result<CaptionObservation, ()> {
-    // Removes emulation-prevention bytes *and* the one-byte NAL header, so the
-    // result already begins at the first SEI message.
-    let rbsp = rbsp::decode_nal(nal).map_err(|_| ())?;
+fn scan_sei(
+    nal: &[u8],
+    codec: SeiCodec,
+    dtvcc: &mut DtvccAssembler,
+) -> Result<CaptionObservation, ()> {
+    // HEVC's NAL header is two bytes. `decode_nal` always strips one, so the
+    // extra byte is skipped first and the H.264 RBSP decoder handles the rest.
+    let to_decode = match codec {
+        SeiCodec::Avc => nal,
+        SeiCodec::Hevc => nal.get(1..).ok_or(())?,
+    };
+    let rbsp = rbsp::decode_nal(to_decode).map_err(|_| ())?;
     let mut scratch = Vec::new();
     let mut reader = SeiReader::from_rbsp_bytes(&rbsp[..], &mut scratch);
     let mut found = CaptionObservation::default();
@@ -667,6 +725,43 @@ mod tests {
         ]
     }
 
+    /// A minimal `hvcC` record declaring four-byte NAL length prefixes.
+    fn hvcc_extradata() -> Vec<u8> {
+        let mut record = vec![0_u8; 23];
+        record[0] = 1;
+        record[13] = 0xF0;
+        record[15] = 0xFC;
+        record[16] = 0xFC;
+        record[17] = 0xF8;
+        record[18] = 0xF8;
+        record[21] = 0x03; // lengthSizeMinusOne = 3
+        record
+    }
+
+    /// Wraps a payload as an HEVC prefix or suffix SEI NAL.
+    fn hevc_sei_nal(nal_type: u8, payload_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![payload_type];
+        let mut remaining = payload.len();
+        while remaining >= 255 {
+            body.push(0xFF);
+            remaining -= 255;
+        }
+        body.push(u8::try_from(remaining).expect("fixture payload size fits"));
+        body.extend_from_slice(payload);
+        body.push(0x80);
+
+        let mut nal = vec![nal_type << 1, 0x01];
+        nal.extend_from_slice(&emulation_prevent(&body));
+        nal
+    }
+
+    /// A minimal HEVC coded slice, which must never be inspected for captions.
+    fn hevc_slice_nal(payload: &[u8]) -> Vec<u8> {
+        let mut nal = vec![19 << 1, 0x01]; // IDR_W_RADL, layer 0
+        nal.extend_from_slice(payload);
+        nal
+    }
+
     fn track(codec: Codec, extradata: Vec<u8>) -> DiscoveredTrack {
         DiscoveredTrack {
             id: TrackId(0),
@@ -814,8 +909,66 @@ mod tests {
     }
 
     #[test]
-    fn a_non_h264_track_has_no_detector() {
-        assert!(H264CaptionDetector::new(&track(Codec::Hevc, Vec::new())).is_none());
+    fn an_av1_track_has_no_detector() {
+        assert!(H264CaptionDetector::new(&track(Codec::Av1, Vec::new())).is_none());
+    }
+
+    #[test]
+    fn cea608_is_recognized_in_an_hevc_prefix_sei() {
+        let mut detector =
+            H264CaptionDetector::new(&track(Codec::Hevc, hvcc_extradata())).expect("hevc track");
+        let captions = hevc_sei_nal(HEVC_NAL_PREFIX_SEI, 4, &cc_data(&[(0, 0x14, 0x2C)]));
+        let access_unit = avcc_access_unit(&[captions, hevc_slice_nal(&[0x88; 32])]);
+
+        assert!(detector.inspect(&access_unit));
+        assert!(detector.observed().a53_present);
+        assert_eq!(detector.observed().cea608_fields, 0b01);
+    }
+
+    #[test]
+    fn cea608_is_recognized_in_an_hevc_suffix_sei() {
+        let mut detector =
+            H264CaptionDetector::new(&track(Codec::Hevc, hvcc_extradata())).expect("hevc track");
+        let captions = hevc_sei_nal(HEVC_NAL_SUFFIX_SEI, 4, &cc_data(&[(0, 0x14, 0x2C)]));
+        let access_unit = avcc_access_unit(&[hevc_slice_nal(&[0x88; 16]), captions]);
+
+        assert!(detector.inspect(&access_unit));
+        assert_eq!(detector.observed().cea608_fields, 0b01);
+    }
+
+    #[test]
+    fn hevc_annex_b_framing_is_scanned_without_an_hvcc_record() {
+        let mut detector =
+            H264CaptionDetector::new(&track(Codec::Hevc, Vec::new())).expect("hevc track");
+        let captions = hevc_sei_nal(HEVC_NAL_PREFIX_SEI, 4, &cc_data(&[(0, 0x14, 0x2C)]));
+        let access_unit = annex_b_access_unit(&[captions, hevc_slice_nal(&[0x88; 32])]);
+
+        assert!(detector.inspect(&access_unit));
+        assert_eq!(detector.observed().cea608_fields, 0b01);
+    }
+
+    #[test]
+    fn hevc_caption_bytes_inside_slice_data_are_not_inspected() {
+        let mut detector =
+            H264CaptionDetector::new(&track(Codec::Hevc, hvcc_extradata())).expect("hevc track");
+        let mut disguised = vec![0x00, 0x00, 0x00];
+        disguised.extend_from_slice(&cc_data(&[(0, 0x14, 0x2C)]));
+        let access_unit = avcc_access_unit(&[hevc_slice_nal(&disguised)]);
+
+        assert!(!detector.inspect(&access_unit));
+        assert!(!detector.observed().a53_present);
+    }
+
+    #[test]
+    fn hevc_sei_on_a_non_base_layer_is_ignored() {
+        let mut detector =
+            H264CaptionDetector::new(&track(Codec::Hevc, hvcc_extradata())).expect("hevc track");
+        let mut captions = hevc_sei_nal(HEVC_NAL_PREFIX_SEI, 4, &cc_data(&[(0, 0x14, 0x2C)]));
+        captions[0] |= 0x01; // nuh_layer_id high bit: captions live on layer 0
+        let access_unit = avcc_access_unit(&[captions, hevc_slice_nal(&[0x88; 32])]);
+
+        assert!(!detector.inspect(&access_unit));
+        assert!(!detector.observed().a53_present);
     }
 
     /// The services a detector named, lowest first.
@@ -996,6 +1149,8 @@ mod tests {
             H264CaptionDetector::new(&track(Codec::H264, avcc_extradata())).expect("h264 track");
         let mut annex_b =
             H264CaptionDetector::new(&track(Codec::H264, Vec::new())).expect("h264 track");
+        let mut hevc =
+            H264CaptionDetector::new(&track(Codec::Hevc, hvcc_extradata())).expect("hevc track");
 
         for _ in 0..2_000 {
             let length =
@@ -1011,6 +1166,7 @@ mod tests {
             }
             detector.inspect(&unit);
             annex_b.inspect(&unit);
+            hevc.inspect(&unit);
         }
     }
 }

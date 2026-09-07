@@ -285,11 +285,15 @@ mod tests {
         ]
     }
 
-    fn video_track(id: u32) -> DiscoveredTrack {
+    fn video_track_with(
+        id: u32,
+        codec: crate::domain::Codec,
+        extradata: Vec<u8>,
+    ) -> DiscoveredTrack {
         DiscoveredTrack {
             id: TrackId(id),
             source_key: None,
-            codec: crate::domain::Codec::H264,
+            codec,
             parameters: MediaParameters::Video {
                 width: nz::u32!(1920),
                 height: nz::u32!(1080),
@@ -300,8 +304,45 @@ mod tests {
             first_pts: None,
             title: None,
             language: None,
-            codec_extradata: Payload::from(avcc_extradata()),
+            codec_extradata: Payload::from(extradata),
         }
+    }
+
+    fn video_track(id: u32) -> DiscoveredTrack {
+        video_track_with(id, crate::domain::Codec::H264, avcc_extradata())
+    }
+
+    /// A minimal `hvcC` record declaring four-byte NAL length prefixes.
+    fn hvcc_extradata() -> Vec<u8> {
+        let mut record = vec![0_u8; 23];
+        record[0] = 1;
+        record[13] = 0xF0;
+        record[15] = 0xFC;
+        record[16] = 0xFC;
+        record[17] = 0xF8;
+        record[18] = 0xF8;
+        record[21] = 0x03; // lengthSizeMinusOne = 3
+        record
+    }
+
+    /// An HEVC length-prefixed access unit carrying one CEA-608 field 1 SEI.
+    fn hevc_captioned_access_unit() -> Vec<u8> {
+        let payload: &[u8] = &[
+            0xB5, 0x00, 0x31, b'G', b'A', b'9', b'4', 0x03, 0xC1, 0xFF, 0xFC, 0x94, 0x2C, 0xFF,
+        ];
+        let mut sei = vec![39 << 1, 0x01, 0x04];
+        sei.push(u8::try_from(payload.len()).expect("fixture payload fits"));
+        sei.extend_from_slice(payload);
+        sei.push(0x80);
+
+        let mut unit = Vec::new();
+        unit.extend_from_slice(
+            &u32::try_from(sei.len())
+                .expect("fixture NAL fits")
+                .to_be_bytes(),
+        );
+        unit.extend_from_slice(&sei);
+        unit
     }
 
     /// An AVCC access unit carrying one CEA-608 field 1 caption SEI.
@@ -477,5 +518,64 @@ mod tests {
             1
         );
         assert!(declared.iter().all(|service| service.autoselect));
+    }
+
+    #[test]
+    fn an_hevc_track_is_declared() {
+        let tracks = [video_track_with(
+            0,
+            crate::domain::Codec::Hevc,
+            hvcc_extradata(),
+        )];
+        let mut verifier = CaptionVerifier::new(&tracks, Some(Arc::from("en")));
+
+        let declared = verifier
+            .inspect(TrackId(0), &hevc_captioned_access_unit())
+            .expect("HEVC captions declare the same services as H.264");
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].channel, CaptionChannel::Cea608Field(0));
+        assert_eq!(verifier.reconciliation(), CaptionReconciliation::Consistent);
+    }
+
+    #[test]
+    fn a_mixed_h264_and_hevc_ladder_declares_when_both_carry_the_same_channel() {
+        let tracks = [
+            video_track(0),
+            video_track_with(1, crate::domain::Codec::Hevc, hvcc_extradata()),
+        ];
+        let mut verifier = CaptionVerifier::new(&tracks, None);
+
+        assert!(
+            verifier
+                .inspect(TrackId(0), &captioned_access_unit())
+                .is_none()
+        );
+        let declared = verifier
+            .inspect(TrackId(1), &hevc_captioned_access_unit())
+            .expect("the mixed ladder is consistent");
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].channel, CaptionChannel::Cea608Field(0));
+        assert_eq!(verifier.reconciliation(), CaptionReconciliation::Consistent);
+        assert_eq!(verifier.carriage(), (2, 2));
+    }
+
+    #[test]
+    fn an_av1_rendition_keeps_the_ladder_unverifiable() {
+        let tracks = [
+            video_track(0),
+            video_track_with(1, crate::domain::Codec::Av1, Vec::new()),
+        ];
+        let mut verifier = CaptionVerifier::new(&tracks, None);
+
+        assert!(
+            verifier
+                .inspect(TrackId(0), &captioned_access_unit())
+                .is_none()
+        );
+        assert_eq!(
+            verifier.reconciliation(),
+            CaptionReconciliation::PartialLadder
+        );
+        assert_eq!(verifier.carriage(), (1, 2));
     }
 }

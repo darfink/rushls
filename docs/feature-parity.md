@@ -47,7 +47,7 @@ not build them until a publisher needs them.
 | HLS `LANGUAGE` on `EXT-X-MEDIA` | **done** | Both native adapters supply source language when available. Catalog canonicalization and HLS projection remain shared. |
 | RTMP AMF `onCaption` / `onTextData` | **done** | Drain-before-freeze. HTTP e2e WebVTT rendition. |
 | H.264 SEI CEA-608/708 declaration | **done** | Scanner kept; proven on AVCC from native RTMP. |
-| HEVC in-band captions | **gap** | Not a one-line extension. See [In-band captions beyond H.264](#in-band-captions-beyond-h264). |
+| HEVC in-band captions | **done** (unit tests) | Same A53 CEA-608/708 payload as H.264, walked in HEVC prefix SEI (type 39) and suffix SEI (type 40). `hvcC` length-prefix and Annex B are both covered. `CaptionVerifier` treats HEVC like H.264, including mixed H.264+HEVC ladders. |
 | AV1 in-band captions | **gap** | Different walk than HEVC SEI. See [In-band captions beyond H.264](#in-band-captions-beyond-h264). |
 | Container WebVTT / SubRip / MovText | **gap** | Muxer still converts SubRip; MPEG-TS subtitle PIDs are skipped; nothing ingest feeds WebVTT/SubRip. |
 | WebVTT cue id/settings, SubRip position | **gap** | Lived on FFmpeg packet side data. |
@@ -93,9 +93,11 @@ that stays connected and only stops sending media will keep the socket alive
 with keepalives; that is transport silence vs media silence, and the live stall
 policy already covers the latter.
 
-Covered by `peer_shutdown_closes_the_source_and_idle_breaks_interrupt_it` and
-by the MPEG-TS-over-SRT fixture ending `InputState::Closed` after the caller is
-dropped.
+Covered by `peer_shutdown_closes_the_source_and_idle_breaks_interrupt_it`, by
+the MPEG-TS-over-SRT fixture ending `InputState::Closed` after the caller is
+dropped, and by HTTP e2e `a_graceful_srt_disconnect_appends_endlist`, which
+fetches a media playlist after `SessionOutcome::Ended` and asserts
+`#EXT-X-ENDLIST`.
 
 ## Live proof (not unit mapping)
 
@@ -112,30 +114,27 @@ dropped.
 ## In-band captions beyond H.264
 
 `H264CaptionDetector` answers a playlist question: does this track carry ATSC
-A53 CEA-608/708, and on which channels? It does not rewrite the bitstream.
-`CaptionVerifier` only constructs a detector for `Codec::H264`. Any other video
-codec counts as unverifiable, so a mixed H.264+HEVC ladder would never declare
+A53 CEA-608/708, and on which channels? It does not rewrite the bitstream. The
+type name is historical: H.264 and HEVC both construct a detector. Any other
+video codec counts as unverifiable, so a mixed H.264+AV1 ladder never declares
 captions even if the H.264 rendition carries them.
 
-**HEVC** is the same caption payload in a different NAL walk. CEA-608/708 still
-travel as ITU-T T.35 inside SEI; the reusable piece is `scan_sei` /
-`DtvccAssembler`. What is missing:
+**HEVC** is implemented. CEA-608/708 still travel as ITU-T T.35 inside SEI;
+`scan_sei` / `DtvccAssembler` are shared. The HEVC walk is:
 
 - An `hvcC` / Annex-B splitter. HEVC NAL headers are two bytes; prefix SEI is
-  type 39 and suffix SEI is type 40, not H.264 type 6.
-- Wiring `CaptionVerifier` so an HEVC-only publish can declare, and so a mixed
-  ladder can reconcile HEVC observations with H.264 ones.
-
-That is a small, well-bounded walk — not a decoder — but it is new framing
-code plus verifier changes, not a codec flag flip.
+  type 39 and suffix SEI is type 40, not H.264 type 6. Only the base layer
+  (`nuh_layer_id == 0`) is inspected.
+- `CaptionVerifier` constructs a detector for HEVC, so an HEVC-only publish can
+  declare and a mixed H.264+HEVC ladder can reconcile observations.
 
 **AV1** is not SEI. ATSC A/343 puts captions in Metadata OBUs (`obu_type` 5)
 carrying ITU-T T.35. The OBU walker already used for sequence headers and
 keyframes can locate those OBUs; the T.35 body then joins the same A53 parser.
 A reduced-header AV1G stream still has to expose metadata OBUs in-band.
 
-Neither walk is required for native ingest parity with the H.264-only avformat
-path we replaced. Build HEVC first if a captioned HEVC publisher appears.
+AV1 captions are not required for native ingest parity with the H.264-only
+avformat path we replaced.
 
 ## Adapter boundaries and backpressure
 
