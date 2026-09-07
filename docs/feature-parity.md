@@ -8,14 +8,18 @@ Legend: **done** (wired and covered), **extractable** (bytes already in hand,
 not copied onto `DiscoveredTrack`), **mapped** (codec/box path exists, no live
 or HTTP proof), **gap** (dropped or refused), **untested**.
 
+Items marked **gap** below are not leftover FFmpeg replacement work. They are
+new codecs, containers, or caption walks that avformat happened to probe. Do
+not build them until a publisher needs them.
+
 ## Ingest containers
 
 | Feature | Status | Notes |
 |---|---|---|
 | RTMP / Enhanced RTMP, one video + one audio | **done** | Native `cc-rtmp` → `Packet`. Live `mediastreamvalidator` on H.264 + AAC-LC. |
 | SRT MPEG-TS | **done** | `rsrt` (pure Rust, IPv4) into `StreamingTsDemux`. Unit fixture is H.264 + ADTS AAC. |
-| SRT Matroska / WebM | **gap** | EBML magic refused on purpose. |
-| SRT FLV, MP4/fMP4, anything else avformat probed | **gap** | MPEG-TS only. |
+| SRT Matroska / WebM | **gap** | EBML magic refused on purpose. MPEG-TS only. |
+| SRT FLV, MP4/fMP4, anything else avformat probed | **gap** | MPEG-TS only. Not an incomplete demuxer; other containers were never the live ingest contract. |
 | Enhanced RTMP extra A/V tracks | **done** | OneTrack and packed `ManyTracks` become distinct catalog entries keyed by `audio/{id}` / `video/{id}`. Legacy default track stays `audio` / `video`. Identical sequence headers are ignored. Changed codec configurations fail the publish; a new id after freeze is `TrackSetChanged`. HTTP e2e: two OneTrack AAC → two `STREAM-INF` audio variants. |
 | MPEG-TS extra audio/video PIDs | **done** | Mapper keeps every mapped PID. Admission default is `tracks = Any`. Apple HLS: H.264 + two AAC-LC PIDs, `mediastreamvalidator` clean. |
 
@@ -26,12 +30,12 @@ or HTTP proof), **gap** (dropped or refused), **untested**.
 | H.264 + AAC-LC, RTMP | **done** | HTTP e2e + Apple validator (cleartext HTTP/1.1 → HTTP/2 warning only). |
 | H.264 + AAC, MPEG-TS | **done** | Discovery + CMAF round-trip in-process. The MPEG-TS Apple matrix passes. |
 | HEVC | **done** (Apple matrix) | Apple matrix passes for RTMP HEVC + AAC and MPEG-TS HEVC + AAC. |
-| AV1 | **done** (decode) / **untested** (live) | RTMP mapping and CMAF writer exist. TS now accepts GStreamer AV1G private PES with its av1C descriptor and an in-band sequence header. Native round-trip and independent FFmpeg decode pass. Other AV1 TS mappings remain unsupported. |
-| Opus over RTMP | **done** (in-process) / **untested** (live playback) | A stereo silence packet passes RTMP parsing, normalization, CMAF writing, and demuxing. The test checks 312-sample pre-skip, 48 kHz playback, and separate 44.1 kHz input metadata. |
-| Opus over MPEG-TS | **done** (mono/stereo, decode) | Resolves the Opus PMT descriptors and parses PES control headers before shared normalization. Preserves startup and final trim at 48 kHz. Extended channel mappings remain unsupported. |
+| AV1 | **done** (decode + live start-of-stream) | RTMP mapping and CMAF writer exist. TS accepts GStreamer AV1G private PES with its av1C descriptor and an in-band sequence header. Native round-trip and independent FFmpeg decode pass. A live AV1+Opus publish plays in Chrome and hls.js. Other AV1 TS mappings remain unsupported. |
+| Opus over RTMP | **done** (in-process) | A stereo silence packet passes RTMP parsing, normalization, CMAF writing, and demuxing. The test checks 312-sample pre-skip, 48 kHz playback, and separate 44.1 kHz input metadata. Live RTMP Opus is untested; live MPEG-TS Opus is proven in Chrome/hls.js with AV1. |
+| Opus over MPEG-TS | **done** (mono/stereo, decode + live start-of-stream) | Resolves the Opus PMT descriptors and parses PES control headers before shared normalization. Preserves startup and final trim at 48 kHz. Extended channel mappings remain unsupported. |
 | AAC-HE / HEv2 frame size | **done** (signaled SBR/PS) | Shared ASC parser handles hierarchical and sync-extension signaling, core/output sample rates, and 960/1024 core frames. Real HE and HEv2 FLV fixtures yield 2048 output samples at 48 kHz and decode through FFmpeg. Implicit SBR without ASC signaling still needs bitstream detection. |
-| MPEG-TS AAC-LATM | **gap** | Avformat refused the publisher. Native skips the PID (video-only publish possible). |
-| AC-3 / E-AC-3 / MP3 / VVC / VP9 | **gap** | Unmapped; admission would refuse them anyway. |
+| MPEG-TS AAC-LATM | **gap** | Avformat refused the publisher. Native skips the PID (video-only publish possible). Needs an LATM→raw AAC unframer before the shared ASC path. Skip until a publisher sends LATM. |
+| AC-3 / E-AC-3 / MP3 / VVC / VP9 | **gap** | Unmapped; admission would refuse them anyway. New codec work, not unfinished native ingest. |
 
 ## Language, title, captions
 
@@ -39,11 +43,12 @@ or HTTP proof), **gap** (dropped or refused), **untested**.
 |---|---|---|
 | MPEG-TS ISO 639 (PMT `ISO_639_language_descriptor`, tag `0x0A`) | **done** | First three-letter code on `TrackSpec.es_info_descriptors` becomes `DiscoveredTrack.language`. Catalog canonicalizes (`eng` → `en`, `spa` → `es`). Covered by `discovers_iso_639_language_on_each_audio_pid`. |
 | RTMP `onMetaData` language | **done** | Catalog freeze applies per-track language, then audio/video-specific and generic metadata. Empty, oversized, or control-containing text is ignored. |
-| Track `title` | **done** (RTMP) / **gap** (TS) | Uses the same bounded metadata precedence as language. TS service names remain unavailable. |
+| Track `title` | **done** (RTMP) / **gap** (TS) | Uses the same bounded metadata precedence as language. MPEG-TS service names and `stream_identifier_descriptor` titles are not copied onto `DiscoveredTrack`. Skip until a TS publisher needs `NAME` on `EXT-X-MEDIA`. |
 | HLS `LANGUAGE` on `EXT-X-MEDIA` | **done** | Both native adapters supply source language when available. Catalog canonicalization and HLS projection remain shared. |
 | RTMP AMF `onCaption` / `onTextData` | **done** | Drain-before-freeze. HTTP e2e WebVTT rendition. |
 | H.264 SEI CEA-608/708 declaration | **done** | Scanner kept; proven on AVCC from native RTMP. |
-| HEVC/AV1 in-band captions | **gap** | Detector is H.264-only (same as avformat). |
+| HEVC in-band captions | **gap** | Not a one-line extension. See [In-band captions beyond H.264](#in-band-captions-beyond-h264). |
+| AV1 in-band captions | **gap** | Different walk than HEVC SEI. See [In-band captions beyond H.264](#in-band-captions-beyond-h264). |
 | Container WebVTT / SubRip / MovText | **gap** | Muxer still converts SubRip; MPEG-TS subtitle PIDs are skipped; nothing ingest feeds WebVTT/SubRip. |
 | WebVTT cue id/settings, SubRip position | **gap** | Lived on FFmpeg packet side data. |
 
@@ -54,7 +59,7 @@ Delayed start and encoder priming are not the same edit list.
 | Feature | Status | Notes |
 |---|---|---|
 | Different first PTS per track (RTMP and MPEG-TS) | **done** | Each track records its first presentation timestamp. Audio adds declared priming to the encoded timestamp. RTMP video includes its composition offset. Mux rebases by a shared `presentation_origin_pts`. A later-starting track gets an empty edit (`media_time = -1`) and a positive chunk `media_start`. Covered by `audio_and_video_keep_their_relative_offset_through_packaging` and `a_genuine_later_video_start_is_exposed_as_positive_media_start`. RTMP discovery asserts video `first_pts = 0`, audio `21`. |
-| AAC skip-samples / `initial_padding` | **mapped** (mux) / **gap** (ingest) | Mux writes priming into `elst` when `AudioTiming.initial_padding_samples` or packet `AudioTrim` is set. AAC adapters leave both default. Relevant for **file-originated AAC** (MP4/MKV encoder delay, often 1024 or 2112 for HE). **Live RTMP/TS AAC-LC almost never carries skip-samples**; a later first audio PTS is delayed start, not priming. |
+| AAC skip-samples / `initial_padding` | **mapped** (mux) / **gap** (ingest) | Mux writes priming into `elst` when `AudioTiming.initial_padding_samples` or packet `AudioTrim` is set. AAC adapters leave both default. Relevant for **file-originated AAC** (MP4/MKV encoder delay, often 1024 or 2112 for HE). **Live RTMP/TS AAC-LC almost never carries skip-samples**; a later first audio PTS is delayed start, not priming. Skip until file-origin AAC is an ingest source. |
 | Opus `pre_skip` | **done** (RTMP and mono/stereo TS) | `OpusHead` bytes 10–11 contain little-endian pre-skip, after the eight-byte signature. The shared parser preserves gain and channel mapping. Normalization emits leading trim once. CMAF writes `dOps` version 0 and an edit that selects past priming. Delayed starts and priming can coexist. TS takes priming from its first PES control header. |
 | Declared `video_delay` (B-frame reorder depth) | **done** (H.264/HEVC) | Shared SPS parsers read H.264 VUI reorder limits and HEVC sub-layer ordering. Real B-frame fixtures cover both. Missing declarations retain zero; AV1 delay inference remains a gap. |
 
@@ -64,19 +69,73 @@ Delayed start and encoder priming are not the same edit list.
 |---|---|---|
 | Init + fragments, no `sidx`, delayed `moov` | **done** | |
 | Edit lists: priming, delayed start, composition offset | **done** | Regression tests cover priming with a delayed start and delayed video with a composition offset. Packet-only leading trim also reaches the edit list. Opus final trim shortens the last fragment sample duration. |
-| Opus random-access pre-roll | **done** (boxes) / **untested** (live joining) | Init roll descriptions and per-fragment sample groups count enough preceding packets for 80 ms, including variable durations across fragment boundaries. Startup uses a conservative description when history is unavailable. Unit tests check roll distances; live players must still prove retrieval of prior fragments. |
+| Opus random-access pre-roll | **done** (boxes) | Init roll descriptions and per-fragment sample groups count enough preceding packets for 80 ms, including variable durations across fragment boundaries. Startup uses a conservative description when history is unavailable. Unit tests check roll distances. Live start-of-stream playback is proven; mid-window join and DVR seek against those roll groups are not separately proven. |
 | `colr` / `pasp` / HDR (`mdcv`/`clli`) | **done** (H.264/HEVC startup) | SPS/VUI supplies color and aspect. Static HDR SEI seen before init emission supplies mastering display and content light boxes. Real fixtures check serialized values. AV1 visual metadata and changes after init remain gaps. |
+
+## Publisher disconnect (SRT)
+
+libSRT never told the application whether the peer sent `SHUTDOWN` or the socket
+just went quiet. Rushls therefore omitted `#EXT-X-ENDLIST` on every SRT end, so
+a crash could not tear down players that the reconnect budget still covers.
+
+`rsrt` does distinguish those cases:
+
+| `rsrt::CloseReason` | Mapped `InputState` | Playlist |
+|---|---|---|
+| `Shutdown` (peer sent SHUTDOWN) or `Local` | `Closed` | `#EXT-X-ENDLIST` |
+| `PeerIdle`, `DataIdle`, `SequenceDiscrepancy` | `Interrupted` | live playlist kept open |
+
+`SrtSocket::recv` returns `Ok(None)` for SHUTDOWN/Local and `Err(Closed(reason))`
+for a break. Dropping an `rsrt` handle sends SHUTDOWN, which is the orderly
+encoder stop (FFmpeg/`srt-live-transmit` `srt_close`, Ctrl-C). `kill -9` or a
+network cut produces `PeerIdle` after `[srt] timeout` (default 5 s). An encoder
+that stays connected and only stops sending media will keep the socket alive
+with keepalives; that is transport silence vs media silence, and the live stall
+policy already covers the latter.
+
+Covered by `peer_shutdown_closes_the_source_and_idle_breaks_interrupt_it` and
+by the MPEG-TS-over-SRT fixture ending `InputState::Closed` after the caller is
+dropped.
 
 ## Live proof (not unit mapping)
 
 | Publish | Result |
 |---|---|
-| `ff qmpeg -re -c copy -f flv` H.264 High@L4 1080p24 GOP 2s, AAC-LC 48 kHz stereo → RTMP | Playable LL-HLS. `mediastreamvalidator -t 30`: HTTP/2 only once `--http-public-url` is set. |
-| HEVC / AV1 / Opus live | Apple matrix passes for HEVC RTMP and MPEG-TS. AV1 and Opus have independent file decoding, but no live player proof. |
+| `ffmpeg -re -c copy -f flv` H.264 High@L4 1080p24 GOP 2s, AAC-LC 48 kHz stereo → RTMP | Playable LL-HLS. `mediastreamvalidator -t 30`: HTTP/2 only once `--http-public-url` is set. |
+| HEVC live | Apple matrix passes for HEVC RTMP and MPEG-TS. |
+| AV1 + Opus live MPEG-TS | ~30 s start-of-stream plays in Chrome and hls.js. `mediastreamvalidator` reports an unrecognized codec: Apple's validator does not certify AV1 or Opus in HLS, so it cannot replace that player proof. Mid-window join and DVR seek are not separately recorded. |
 | Enhanced RTMP second audio/video | HTTP e2e: two OneTrack AAC-LC variants. Apple HLS HTTPS: `rtmp_multitrack_h264_two_aac`. |
 | SRT MPEG-TS live | Apple HLS HTTPS: `srt_h264_aac` (one H.264 + one AAC). Dual-audio TS is the in-process MPEG-TS case, not a second SRT matrix row. |
 | MPEG-TS extra audio PIDs | Apple HLS HTTPS: `mpegts_h264_two_aac`. |
 | File dump without `-re` | Bounded queues apply backpressure after pre-roll. A closed RTMP input drains all discovery packets across batch boundaries. |
+
+## In-band captions beyond H.264
+
+`H264CaptionDetector` answers a playlist question: does this track carry ATSC
+A53 CEA-608/708, and on which channels? It does not rewrite the bitstream.
+`CaptionVerifier` only constructs a detector for `Codec::H264`. Any other video
+codec counts as unverifiable, so a mixed H.264+HEVC ladder would never declare
+captions even if the H.264 rendition carries them.
+
+**HEVC** is the same caption payload in a different NAL walk. CEA-608/708 still
+travel as ITU-T T.35 inside SEI; the reusable piece is `scan_sei` /
+`DtvccAssembler`. What is missing:
+
+- An `hvcC` / Annex-B splitter. HEVC NAL headers are two bytes; prefix SEI is
+  type 39 and suffix SEI is type 40, not H.264 type 6.
+- Wiring `CaptionVerifier` so an HEVC-only publish can declare, and so a mixed
+  ladder can reconcile HEVC observations with H.264 ones.
+
+That is a small, well-bounded walk — not a decoder — but it is new framing
+code plus verifier changes, not a codec flag flip.
+
+**AV1** is not SEI. ATSC A/343 puts captions in Metadata OBUs (`obu_type` 5)
+carrying ITU-T T.35. The OBU walker already used for sequence headers and
+keyframes can locate those OBUs; the T.35 body then joins the same A53 parser.
+A reduced-header AV1G stream still has to expose metadata OBUs in-band.
+
+Neither walk is required for native ingest parity with the H.264-only avformat
+path we replaced. Build HEVC first if a captioned HEVC publisher appears.
 
 ## Adapter boundaries and backpressure
 
@@ -87,8 +146,10 @@ Rushls owns codec interpretation, timestamp normalization, and packaging.
 
 RTMP and MPEG-TS share input-limit validation and first-presentation timestamp accounting.
 They retain separate discovery state machines because RTMP sequence headers and TS PMT events have different lifecycles.
-RTMP uses an asynchronous queue. MPEG-TS uses a blocking worker for the SRT byte reader.
-A common worker abstraction would need both execution models without removing either state machine.
+Both adapters are async on Tokio. RTMP uses a byte-budgeted ingress queue because the
+RTMP session pushes tags. MPEG-TS demuxes on a Tokio task that pulls from SRT, so the
+rsrt receive queue is drained even while the live pacer is not reading packets.
+The demux task is not a blocking thread.
 
 RTMP limits queued bytes and caps the queue at 4096 events.
 Terminal state remains observable after the queue drains.
@@ -121,4 +182,4 @@ FFmpeg currently emits the 648 padded final samples from the fragmented Opus fix
 The serialized final duration is correct, but this decoder does not apply that end trim.
 The regression checks the full audible prefix against the independently decoded source.
 The existing eight-test Apple HLS matrix also passes after these changes.
-These checks do not replace AV1/Opus live HLS joining or seeking tests.
+Apple `mediastreamvalidator` cannot certify AV1 or Opus HLS; Chrome and hls.js are the live proof for those codecs.

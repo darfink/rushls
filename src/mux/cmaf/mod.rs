@@ -2246,16 +2246,16 @@ mod tests {
     #[tokio::test]
     async fn rtmp_opus_preserves_priming_through_normalization_and_cmaf()
     -> Result<(), Box<dyn std::error::Error>> {
+        const PACKETS: usize = 201;
         let session = crate::observe::SessionMeters::new(crate::observe::ProcessMeters::default());
         let (reader, writer) = channel(nz::usize!(64 * 1024));
         // Stereo OpusHead: 312 samples of pre-skip, 44.1 kHz input metadata.
         // Playback and pre-skip still use 48 kHz.
         let head = b"OpusHead\x01\x02\x38\x01\x44\xac\x00\x00\x00\x00\x00";
-        for (timestamp, tag, payload) in [
-            (0, 0x90, &head[..]),
-            (0, 0x91, &[0xf8, 0xff, 0xfe][..]),
-            (20, 0x91, &[0xf8, 0xff, 0xfe][..]),
-        ] {
+        let tags = std::iter::once((0, 0x90, &head[..])).chain(
+            (0..u32::try_from(PACKETS)?).map(|index| (index * 20, 0x91, &[0xf8, 0xff, 0xfe][..])),
+        );
+        for (timestamp, tag, payload) in tags {
             let mut raw = vec![tag];
             raw.extend_from_slice(b"Opus");
             raw.extend_from_slice(payload);
@@ -2276,7 +2276,7 @@ mod tests {
         let track = &fixture.presentation.tracks()[0];
         assert_eq!(track.first_pts, Some(312));
         assert_eq!(track.timebase, Timebase::new(nz::u32!(1), nz::u32!(48_000)));
-        assert_eq!(fixture.samples.len(), 2);
+        assert_eq!(fixture.samples.len(), PACKETS);
         let NormalizedSample::Audio(first) = &fixture.samples[0] else {
             panic!("audio sample")
         };
@@ -2287,6 +2287,8 @@ mod tests {
         let mut cursor = crate::media::PresentedTimingCursor::for_track(track);
         let presented = cursor.next(&fixture.samples[0])?;
         assert_eq!((presented.start, presented.duration), (312, 648));
+
+        assert_opus_part_cadence(&fixture)?;
         let mut output = super::output::CmafOutput::open(track).expect("Opus output opens");
         for sample in &fixture.samples {
             output.write(sample, sample.pts() - 312, sample.pts() - 312);
@@ -2315,8 +2317,58 @@ mod tests {
             ),
             (0, 2, 312, 44_100)
         );
-        assert_eq!(demuxed.tracks[0].samples.len(), 2);
+        assert_eq!(demuxed.tracks[0].samples.len(), PACKETS);
         assert_eq!(demuxed.tracks[0].samples[0].duration, Some(960));
+        Ok(())
+    }
+
+    fn assert_opus_part_cadence(fixture: &IngestFixture) -> Result<(), Box<dyn std::error::Error>> {
+        let track = &fixture.presentation.tracks()[0];
+        // Exercise the real planner as well as the codec output. A pre-skip
+        // larger than 15% of one packet must not reject a steady packet grid,
+        // even when the requested part holds only one packet.
+        for desired_part_duration in [Duration::from_millis(20), Duration::from_millis(200)] {
+            let mut observer = crate::segment::CadenceObserver::new(
+                &fixture.presentation,
+                &fixture.timeline,
+                crate::segment::SegmentationPolicy {
+                    desired_segment_duration: Duration::from_secs(2),
+                    desired_part_duration,
+                    search: crate::segment::BoundarySearchPolicy::AtOrBeforeDesired,
+                },
+            )?;
+            for sample in &fixture.samples {
+                observer.observe(sample)?;
+            }
+            let plans = observer.plan()?.expect("steady Opus cadence is ready");
+            let target = plans[0].part_duration.get();
+            assert_eq!(
+                target,
+                track.timebase.duration_to_ticks(desired_part_duration)
+            );
+            let mut mux = started(&fixture.presentation, plans, &discarded_events());
+            let mut packaged = Vec::new();
+            for sample in &fixture.samples {
+                mux.muxer.push(sample.clone(), &mut packaged)?;
+            }
+            mux.muxer
+                .finish(crate::mux::FinishReason::Final, &mut packaged)?;
+            let chunks: Vec<_> = packaged
+                .iter()
+                .filter_map(|event| match event {
+                    PackagedMedia::Chunk(chunk) => Some(chunk),
+                    _ => None,
+                })
+                .collect();
+            assert!(chunks.len() > 2);
+            assert_eq!(chunks[0].duration, target);
+            for chunk in &chunks[..chunks.len() - 1] {
+                assert!(chunk.duration <= target);
+                assert!(u128::from(chunk.duration) * 100 >= u128::from(target) * 85);
+            }
+            let demuxed = demux_cmaf(&concat_cmaf_bytes(&packaged));
+            assert_eq!(demuxed.tracks[0].samples.len(), fixture.samples.len());
+        }
         Ok(())
     }
 

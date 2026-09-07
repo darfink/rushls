@@ -30,7 +30,7 @@ pub fn rfc6381(codec: Codec, config: Option<&[u8]>) -> Option<Arc<str>> {
     match codec {
         Codec::H264 => Some(h264(config)),
         Codec::Hevc => Some(Arc::from("hvc1")),
-        Codec::Av1 => Some(Arc::from("av01")),
+        Codec::Av1 => av1(config),
         Codec::Aac => Some(aac(config)),
         Codec::Opus => Some(Arc::from("opus")),
         Codec::WebVtt => Some(Arc::from("wvtt")),
@@ -39,6 +39,34 @@ pub fn rfc6381(codec: Codec, config: Option<&[u8]>) -> Option<Arc<str>> {
         // never describes what a manifest advertises.
         Codec::SubRip | Codec::Text | Codec::Unknown(_) => None,
     }
+}
+
+/// AV1 requires profile, level, tier, and bit depth even in its shortest form.
+fn av1(config: Option<&[u8]>) -> Option<Arc<str>> {
+    let config = config?;
+    if config.len() < 4 || config[0] != 0x81 {
+        return None;
+    }
+    // av1C stores the sequence-header identity in its fixed four-byte header;
+    // config OBUs are optional, so no sequence-header payload is needed here.
+    let profile = config[1] >> 5;
+    let level = config[1] & 0x1f;
+    let tier = if config[2] & 0x80 == 0 { 'M' } else { 'H' };
+    let high_bitdepth = config[2] & 0x40 != 0;
+    let twelve_bit = config[2] & 0x20 != 0;
+    if profile > 2 || (twelve_bit && (profile != 2 || !high_bitdepth)) {
+        return None;
+    }
+    let bit_depth = if twelve_bit {
+        12
+    } else if high_bitdepth {
+        10
+    } else {
+        8
+    };
+    Some(Arc::from(format!(
+        "av01.{profile}.{level:02}{tier}.{bit_depth:02}"
+    )))
 }
 
 /// `avc1.PPCCLL` from the profile, constraint flags, and level of an avcC.
@@ -106,6 +134,35 @@ fn aac(config: Option<&[u8]>) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn av1_declares_the_required_decoder_identity() {
+        for (config, expected) in [
+            ([0x81, 0x09, 0x0d, 0], "av01.0.09M.08"),
+            ([0x81, 0x04, 0x40, 0], "av01.0.04M.10"),
+            ([0x81, 0x2d, 0xc0, 0], "av01.1.13H.10"),
+            ([0x81, 0x48, 0x60, 0], "av01.2.08M.12"),
+        ] {
+            assert_eq!(
+                rfc6381(Codec::Av1, Some(&config)).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn av1_does_not_advertise_an_incomplete_or_invented_identity() {
+        assert_eq!(rfc6381(Codec::Av1, None), None);
+        for config in [
+            &[][..],
+            &[0x81, 9, 13],
+            &[1, 9, 13, 0],
+            &[0x81, 0x60, 0, 0],
+            &[0x81, 0, 0x60, 0],
+        ] {
+            assert_eq!(rfc6381(Codec::Av1, Some(config)), None);
+        }
+    }
 
     #[test]
     fn h264_refines_from_the_configuration_record() {

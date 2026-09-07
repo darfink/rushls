@@ -19,9 +19,10 @@
 //! The floor then reduces to a property of the access units themselves —
 //! `shortest ≥ 85% × longest` — which is a comparison rather than a search.
 //!
-//! For every codec that matters the two are equal (AAC frames are 1024 samples;
-//! constant-frame-rate video is constant), so regular parts land exactly on
-//! target.
+//! Durations describe the encoded grid, before audio trim. The first audible
+//! unit can be partially primed; CMAF retains its encoded start as the chunk
+//! origin. Fully primed units are not counted. Constant encoded durations
+//! therefore produce regular parts exactly on target, even with pre-skip.
 //!
 //! # Balanced remainders
 //!
@@ -51,7 +52,7 @@ const PREFERRED_FINAL_PART_PERCENT: u128 = 85;
 /// Search radius around the nearest access-unit count.
 const REMAINDER_SEARCH_RADIUS: u32 = 1;
 
-/// The observed spread of one track's presentable access-unit durations.
+/// The observed spread of encoded durations for units with presentable media.
 ///
 /// `shortest` is absent until the track presents something. A fully primed
 /// access unit contributes nothing, which is what keeps codec delay from
@@ -421,7 +422,7 @@ mod tests {
 
     #[test]
     fn fully_primed_access_units_do_not_describe_the_grid() {
-        // `observe` is only ever called with presentable durations, so a track
+        // `observe` is only ever called for units with presentable media, so a track
         // whose leading units are entirely codec delay still reports the real
         // frame length once audible media starts.
         let mut cadence = AccessUnitCadence::default();

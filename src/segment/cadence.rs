@@ -153,7 +153,11 @@ impl CadenceObserver {
             .and_then(|end| duration_since(end, origin))
             .ok_or(CadenceError::TimestampOverflow(track_id))?;
         track.observed_until = Some(track.observed_until.map_or(end, |seen| seen.max(end)));
-        track.access_units.observe(presented.duration);
+        // Parts count encoded access units that carry presentable media. Codec
+        // pre-skip can shorten the first audible unit without changing that
+        // grid. CMAF keeps its encoded start as the first chunk's origin, so
+        // using the trimmed duration here would mistake priming for jitter.
+        track.access_units.observe(sample.duration());
 
         let is_boundary = match track.kind {
             MediaKind::Audio => true,
@@ -744,7 +748,7 @@ mod tests {
 
     #[test]
     fn priming_never_moves_audio_off_the_encoded_grid() {
-        for initial_padding_samples in [0, 1_024, 2_048, 2_112, 1] {
+        for initial_padding_samples in [0, 1_024, 2_048, 2_112, 1, 312, 1_023, 3_071] {
             let track = TrackBuilder::new(0, MediaKind::Audio)
                 .codec(Codec::Aac)
                 .timebase(audio_timebase())
@@ -795,6 +799,11 @@ mod tests {
             assert_eq!((plan.segmentation_origin_pts - first_pts) % 1_024, 0);
             assert_eq!(plan.segment_duration.get() % AUDIO_FRAME, 0);
             assert_eq!((plan.first_segment_boundary_pts - first_pts) % 1_024, 0);
+            assert_eq!(
+                plan.part_duration.get(),
+                u64::from(plan.part_access_units.get()) * AUDIO_FRAME
+            );
+            assert_eq!(plan.boundary_tolerance, AUDIO_FRAME);
         }
     }
 

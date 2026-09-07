@@ -20,7 +20,7 @@ mod rtmp;
 
 pub mod transport;
 
-pub use byte::{ByteInput, ByteInputError, ByteInterrupt, ReadInput};
+pub use byte::{ByteInput, ByteInputError, ReadInput};
 
 pub use caption::{CaptionObservation, H264CaptionDetector};
 pub use limits::{

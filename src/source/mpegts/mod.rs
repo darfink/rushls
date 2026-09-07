@@ -1,7 +1,7 @@
 //! Streaming MPEG-TS demux behind a bounded `PacketSource`.
 //!
 //! [`StreamingTsDemux`](transmux::StreamingTsDemux) consumes encoded bytes on a
-//! dedicated worker so blocking SRT receives never sit on a Tokio worker. The
+//! Tokio task so SRT receives stay on the same runtime as the driver. The
 //! adapter maps resolved tracks and access units onto the same [`Packet`]
 //! contract RTMP uses, including Annex-B → length-prefixed video and ADTS →
 //! raw AAC.

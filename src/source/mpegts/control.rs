@@ -1,19 +1,14 @@
-//! Cancellation, probe budget, and deadline for the MPEG-TS worker.
+//! Cancellation and probe budget for the MPEG-TS demux task.
 //!
-//! Same shape as the AVFormat control block: the interrupt is wait-free so a
-//! cancelled session can unwind a blocking SRT receive without taking a lock.
+//! Cancel is wait-free for the session Drop path. The demux task is aborted
+//! when the source is dropped, which cancels a pending SRT receive.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
-
-use crate::source::byte::ByteInterrupt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const NOT_PROBING: usize = usize::MAX;
 
 pub struct Control {
     cancelled: AtomicBool,
-    deadline_nanos: AtomicU64,
-    origin: Instant,
     probe_remaining: AtomicUsize,
     probe_exceeded: AtomicBool,
 }
@@ -22,8 +17,6 @@ impl Control {
     pub fn new() -> Self {
         Self {
             cancelled: AtomicBool::new(false),
-            deadline_nanos: AtomicU64::new(0),
-            origin: Instant::now(),
             probe_remaining: AtomicUsize::new(NOT_PROBING),
             probe_exceeded: AtomicBool::new(false),
         }
@@ -31,30 +24,6 @@ impl Control {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
-    }
-
-    pub fn set_deadline(&self, deadline: Option<Instant>) {
-        let nanos = deadline.map_or(0, |deadline| {
-            u64::try_from(
-                deadline
-                    .saturating_duration_since(self.origin)
-                    .as_nanos()
-                    .max(1),
-            )
-            .unwrap_or(u64::MAX)
-        });
-        self.deadline_nanos.store(nanos, Ordering::Release);
-    }
-
-    pub fn interrupted(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-            || self.probe_exceeded.load(Ordering::Acquire)
-            || self.deadline_elapsed()
-    }
-
-    fn deadline_elapsed(&self) -> bool {
-        let nanos = self.deadline_nanos.load(Ordering::Acquire);
-        nanos != 0 && u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX) >= nanos
     }
 
     pub fn begin_probe(&self, maximum_bytes: usize) {
@@ -103,17 +72,7 @@ impl Control {
         self.probe_exceeded.load(Ordering::Acquire)
     }
 
-    pub fn deadline_exceeded(&self) -> bool {
-        self.deadline_elapsed()
-    }
-
     pub fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
-    }
-}
-
-impl ByteInterrupt for Control {
-    fn interrupted(&self) -> bool {
-        Self::interrupted(self)
     }
 }

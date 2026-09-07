@@ -7,7 +7,9 @@
 //!
 //! The transport is [`rsrt`]: live mode, TSBPD, and HaiCrypt. That crate is
 //! IPv4-only, so the listener refuses IPv6 bind addresses rather than silently
-//! narrowing `[::]` to IPv4.
+//! narrowing `[::]` to IPv4. Peer `SHUTDOWN` becomes [`InputState::Closed`]
+//! (`#EXT-X-ENDLIST`); idle and sequence breaks become
+//! [`InputState::Interrupted`] so a reconnect can continue the live playlist.
 //!
 //! Callers normally use `publish:<namespace/name>:<credential>`, or
 //! `publish:<credential>` when one key identifies both the presented resource
@@ -30,8 +32,8 @@ use crate::{
     domain::BoxFuture,
     observe::SourceMeters,
     source::{
-        AcceptedPublish, ByteInput, ByteInputError, ByteInterrupt, InputLimits, InputState,
-        MpegTsConfig, MpegTsPacketSource, PendingPublish, PublishRejection, TransportError,
+        AcceptedPublish, ByteInput, ByteInputError, InputLimits, InputState, MpegTsConfig,
+        MpegTsPacketSource, PendingPublish, PublishRejection, TransportError,
     },
 };
 
@@ -91,8 +93,6 @@ pub struct SrtConfig {
     /// Receiver latency used by SRT's timestamp-based packet delivery.
     pub latency: Duration,
     pub peer_idle_timeout: Duration,
-    /// Polling interval used by the demux worker to observe cancellation.
-    pub receive_poll_interval: Duration,
     pub receive_buffer_bytes: NonZeroUsize,
     /// Largest complete SRT live message accepted from one caller.
     pub maximum_message_bytes: NonZeroUsize,
@@ -107,7 +107,6 @@ impl Default for SrtConfig {
         Self {
             latency: Duration::from_millis(120),
             peer_idle_timeout: Duration::from_secs(5),
-            receive_poll_interval: Duration::from_millis(25),
             receive_buffer_bytes: nz::usize!(16 * 1024 * 1024),
             maximum_message_bytes: nz::usize!(SRT_MAXIMUM_LIVE_PAYLOAD_BYTES),
             maximum_stream_id_bytes: nz::usize!(SRT_MAXIMUM_STREAM_ID_BYTES),
@@ -120,10 +119,7 @@ impl Default for SrtConfig {
 
 impl SrtConfig {
     fn validate(&self) -> Result<(), TransportError> {
-        if self.latency.is_zero()
-            || self.peer_idle_timeout.is_zero()
-            || self.receive_poll_interval.is_zero()
-        {
+        if self.latency.is_zero() || self.peer_idle_timeout.is_zero() {
             return Err(invalid_request("SRT timing values must be nonzero"));
         }
         if self.maximum_message_bytes.get() > SRT_MAXIMUM_LIVE_PAYLOAD_BYTES {
@@ -262,7 +258,7 @@ impl PendingPublish for SrtPendingPublish {
     ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
         Box::pin(async move {
             let Self { socket, config, .. } = *self;
-            let input = SrtInput::new(socket, config.receive_poll_interval);
+            let input = SrtInput::new(socket);
             let source = MpegTsPacketSource::new(
                 Box::new(input),
                 config.mpegts,
@@ -290,20 +286,14 @@ impl PendingPublish for SrtPendingPublish {
 
 struct SrtInput {
     socket: rsrt::SrtSocket,
-    runtime: tokio::runtime::Handle,
     pending: Bytes,
-    poll_interval: Duration,
 }
 
 impl SrtInput {
-    fn new(socket: rsrt::SrtSocket, poll_interval: Duration) -> Self {
+    fn new(socket: rsrt::SrtSocket) -> Self {
         Self {
             socket,
-            // Captured on the runtime that owns the rsrt UDP driver. The MPEG-TS
-            // worker is a dedicated thread; it parks here so recv can run there.
-            runtime: tokio::runtime::Handle::current(),
             pending: Bytes::new(),
-            poll_interval,
         }
     }
 
@@ -316,48 +306,43 @@ impl SrtInput {
 }
 
 impl ByteInput for SrtInput {
-    fn read(
-        &mut self,
-        output: &mut [u8],
-        interrupt: &dyn ByteInterrupt,
-    ) -> Result<usize, ByteInputError> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        if interrupt.interrupted() {
-            return Err(ByteInputError::End(InputState::Interrupted));
-        }
-        if !self.pending.is_empty() {
-            return Ok(self.copy_pending(output));
-        }
-
-        loop {
-            if interrupt.interrupted() {
-                return Err(ByteInputError::End(InputState::Interrupted));
+    fn read<'a>(
+        &'a mut self,
+        output: &'a mut [u8],
+    ) -> BoxFuture<'a, Result<usize, ByteInputError>> {
+        Box::pin(async move {
+            if output.is_empty() {
+                return Ok(0);
+            }
+            if !self.pending.is_empty() {
+                return Ok(self.copy_pending(output));
             }
 
-            let result = self.runtime.block_on(async {
-                tokio::time::timeout(self.poll_interval, self.socket.recv()).await
-            });
-            match result {
-                Ok(Ok(Some(payload))) if payload.is_empty() => {}
-                Ok(Ok(Some(payload))) => {
-                    self.pending = payload;
-                    return Ok(self.copy_pending(output));
+            loop {
+                match self.socket.recv().await {
+                    Ok(Some(payload)) if payload.is_empty() => {}
+                    Ok(Some(payload)) => {
+                        self.pending = payload;
+                        return Ok(self.copy_pending(output));
+                    }
+                    // Peer SHUTDOWN or a local close: the publisher meant this.
+                    Ok(None) => return Err(ByteInputError::End(InputState::Closed)),
+                    Err(error) => return Err(byte_input_error(error)),
                 }
-                Ok(Ok(None)) => return Err(ByteInputError::End(InputState::Closed)),
-                Ok(Err(error)) => return Err(byte_input_error(error)),
-                Err(_elapsed) => {}
             }
-        }
+        })
     }
 }
 
 fn byte_input_error(error: rsrt::SrtError) -> ByteInputError {
     match error {
+        // recv() already maps Shutdown/Local to Ok(None). Keep the same
+        // distinction if a later call surfaces the closed socket as an error.
         rsrt::SrtError::Closed(CloseReason::Shutdown | CloseReason::Local) => {
             ByteInputError::End(InputState::Closed)
         }
+        // PeerIdle, DataIdle, SequenceDiscrepancy: the link broke. Omit
+        // EXT-X-ENDLIST so a reconnect can continue the live playlist.
         rsrt::SrtError::Closed(_) => ByteInputError::End(InputState::Interrupted),
         other => ByteInputError::Failed(other.to_string().into()),
     }
@@ -419,24 +404,14 @@ impl SrtCaller {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use crate::{
         admission::{Principal, PublishGrant, StreamPolicy},
         domain::{Codec, MediaKind, StreamId, TrackCounts},
         observe::{ProcessMeters, SessionMeters},
-        source::{ByteInterrupt, DiscoveryLimits},
+        source::DiscoveryLimits,
     };
 
     use super::*;
-
-    struct NeverInterrupt(AtomicBool);
-
-    impl ByteInterrupt for NeverInterrupt {
-        fn interrupted(&self) -> bool {
-            self.0.load(Ordering::Relaxed)
-        }
-    }
 
     fn grant() -> PublishGrant {
         PublishGrant {
@@ -494,7 +469,6 @@ mod tests {
             ),
             ..SrtConfig::default()
         };
-        let poll_interval = config.receive_poll_interval;
         let mut listener = bind_loopback(config.clone()).await.expect("listener binds");
         let address = listener.local_address();
         let caller = tokio::spawn(async move {
@@ -510,17 +484,11 @@ mod tests {
             .expect("listener remains open")
             .expect("connection is accepted");
         let caller = caller.await.expect("caller did not panic");
-        let mut input = SrtInput::new(pending.socket, poll_interval);
-        let (first, second) = tokio::task::spawn_blocking(move || {
-            let interrupt = NeverInterrupt(AtomicBool::new(false));
-            let mut first = [0; 3];
-            let mut second = [0; 4];
-            assert_eq!(input.read(&mut first, &interrupt), Ok(3));
-            assert_eq!(input.read(&mut second, &interrupt), Ok(4));
-            (first, second)
-        })
-        .await
-        .expect("demux thread did not panic");
+        let mut input = SrtInput::new(pending.socket);
+        let mut first = [0; 3];
+        let mut second = [0; 4];
+        assert_eq!(input.read(&mut first).await, Ok(3));
+        assert_eq!(input.read(&mut second).await, Ok(4));
         assert_eq!(&first, b"abc");
         assert_eq!(&second, b"defg");
         drop(caller);
@@ -559,6 +527,10 @@ mod tests {
             .await
             .expect("publication is accepted");
         let caller = caller.await.expect("caller did not panic");
+        // A burst this short does not freeze tracks until the PES assembler
+        // is finished. Dropping the caller sends SHUTDOWN, which is also the
+        // orderly end that writes EXT-X-ENDLIST.
+        drop(caller);
         let discovery = accepted
             .source
             .discover(DiscoveryLimits {
@@ -582,17 +554,22 @@ mod tests {
                 .iter()
                 .any(|track| track.codec == Codec::H264 && track.kind() == MediaKind::Video)
         );
-        drop(caller);
 
         let mut packets = Vec::new();
-        while accepted
-            .source
-            .fill(&mut packets)
-            .await
-            .expect("MPEG-TS packets demux")
-            .is_open()
-        {}
+        let mut state = InputState::Open;
+        while state.is_open() {
+            state = accepted
+                .source
+                .fill(&mut packets)
+                .await
+                .expect("MPEG-TS packets demux");
+        }
         assert!(!packets.is_empty());
+        assert_eq!(
+            state,
+            InputState::Closed,
+            "dropping the caller sends SHUTDOWN, which ends the playlist"
+        );
     }
 
     #[tokio::test]
@@ -635,5 +612,29 @@ mod tests {
             "refusal names the required container: {error}"
         );
         drop(caller);
+    }
+
+    #[test]
+    fn peer_shutdown_closes_the_source_and_idle_breaks_interrupt_it() {
+        assert_eq!(
+            byte_input_error(rsrt::SrtError::Closed(CloseReason::Shutdown)),
+            ByteInputError::End(InputState::Closed)
+        );
+        assert_eq!(
+            byte_input_error(rsrt::SrtError::Closed(CloseReason::Local)),
+            ByteInputError::End(InputState::Closed)
+        );
+        assert_eq!(
+            byte_input_error(rsrt::SrtError::Closed(CloseReason::PeerIdle)),
+            ByteInputError::End(InputState::Interrupted)
+        );
+        assert_eq!(
+            byte_input_error(rsrt::SrtError::Closed(CloseReason::DataIdle)),
+            ByteInputError::End(InputState::Interrupted)
+        );
+        assert_eq!(
+            byte_input_error(rsrt::SrtError::Closed(CloseReason::SequenceDiscrepancy)),
+            ByteInputError::End(InputState::Interrupted)
+        );
     }
 }

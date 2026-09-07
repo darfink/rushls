@@ -21,7 +21,7 @@ use super::{
 pub struct MpegTsConfig {
     /// Encoded bytes requested from the transport on each demux turn.
     pub read_buffer_size: NonZeroUsize,
-    /// Encoded packets allowed to wait between the blocking worker and Tokio.
+    /// Encoded packets allowed to wait between the demux task and the source.
     pub packet_channel_capacity: NonZeroUsize,
     /// Aggregate encoded payload allowed to wait in the worker channel.
     pub maximum_queued_payload_bytes: NonZeroUsize,
@@ -50,6 +50,7 @@ pub struct MpegTsPacketSource {
     pending: Option<worker::QueuedPacket>,
     discovery: Option<DiscoveryReport>,
     terminal: Option<InputState>,
+    demux: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl MpegTsPacketSource {
@@ -75,6 +76,7 @@ impl MpegTsPacketSource {
             pending: None,
             discovery: None,
             terminal: None,
+            demux: None,
         })
     }
 
@@ -100,7 +102,7 @@ impl PacketSource for MpegTsPacketSource {
             let input = self.input.take().ok_or(DiscoveryProblem::AlreadyStarted)?;
             let (discovery_tx, discovery_rx) = oneshot::channel();
             let (output_tx, output_rx) = mpsc::channel(self.config.packet_channel_capacity.get());
-            worker::spawn(
+            self.demux = Some(worker::spawn(
                 input,
                 self.config,
                 self.limits,
@@ -108,7 +110,7 @@ impl PacketSource for MpegTsPacketSource {
                 Arc::clone(&self.control),
                 discovery_tx,
                 output_tx,
-            )?;
+            ));
             self.receiver = Some(output_rx);
             let discovery = discovery_rx
                 .await
@@ -182,6 +184,9 @@ impl PacketSource for MpegTsPacketSource {
 impl Drop for MpegTsPacketSource {
     fn drop(&mut self) {
         self.control.cancel();
+        if let Some(demux) = self.demux.take() {
+            demux.abort();
+        }
     }
 }
 

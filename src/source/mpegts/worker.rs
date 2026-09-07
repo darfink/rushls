@@ -1,11 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
-    time::Instant,
 };
 
-use parking_lot::{Condvar, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use parking_lot::Mutex;
+use tokio::sync::{Notify, mpsc, oneshot};
 use transmux::{DemuxEvent, StreamingTsDemux, TrackSpec};
 
 use crate::{
@@ -46,7 +45,7 @@ impl QueuedPacket {
 struct PayloadBudget {
     maximum: usize,
     used: Mutex<usize>,
-    released: Condvar,
+    released: Notify,
 }
 
 impl PayloadBudget {
@@ -54,19 +53,26 @@ impl PayloadBudget {
         Arc::new(Self {
             maximum,
             used: Mutex::new(0),
-            released: Condvar::new(),
+            released: Notify::new(),
         })
     }
 
-    fn reserve(self: &Arc<Self>, bytes: usize) -> PayloadPermit {
-        let mut used = self.used.lock();
-        while used.saturating_add(bytes) > self.maximum {
-            self.released.wait(&mut used);
-        }
-        *used += bytes;
-        PayloadPermit {
-            budget: Arc::clone(self),
-            bytes,
+    async fn reserve(self: &Arc<Self>, bytes: usize) -> PayloadPermit {
+        loop {
+            let notified = self.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut used = self.used.lock();
+                if used.saturating_add(bytes) <= self.maximum {
+                    *used += bytes;
+                    return PayloadPermit {
+                        budget: Arc::clone(self),
+                        bytes,
+                    };
+                }
+            }
+            notified.await;
         }
     }
 }
@@ -92,27 +98,22 @@ pub fn spawn(
     control: Arc<Control>,
     discovery: oneshot::Sender<Result<DiscoveryReport, SourceError>>,
     output: mpsc::Sender<WorkerEvent>,
-) -> Result<(), SourceError> {
-    std::thread::Builder::new()
-        .name("rushls-mpegts".into())
-        .spawn(move || {
-            run(
-                input,
-                config,
-                input_limits,
-                discovery_limits,
-                &control,
-                discovery,
-                &output,
-            );
-        })
-        .map(|_| ())
-        .map_err(|error| {
-            SourceError::Open(format!("could not start MPEG-TS worker: {error}").into())
-        })
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        run(
+            input,
+            config,
+            input_limits,
+            discovery_limits,
+            &control,
+            discovery,
+            &output,
+        )
+        .await;
+    })
 }
 
-fn run(
+async fn run(
     mut input: Box<dyn ByteInput>,
     config: MpegTsConfig,
     input_limits: InputLimits,
@@ -133,7 +134,7 @@ fn run(
         seen_prefix: &mut seen_prefix,
         control,
     };
-    match discover_tracks(&mut io, discovery_limits, input_limits) {
+    match discover_tracks(&mut io, discovery_limits, input_limits).await {
         Ok((catalog, terminal)) => {
             if discovery.send(Ok(catalog)).is_err() {
                 return;
@@ -144,7 +145,8 @@ fn run(
                 config.maximum_queued_payload_bytes.get(),
                 terminal,
                 output,
-            );
+            )
+            .await;
         }
         Err(error) => {
             let _ = discovery.send(Err(error));
@@ -161,7 +163,7 @@ struct WorkerIo<'a> {
     control: &'a Control,
 }
 
-fn discover_tracks(
+async fn discover_tracks(
     io: &mut WorkerIo<'_>,
     discovery_limits: DiscoveryLimits,
     input_limits: InputLimits,
@@ -178,39 +180,38 @@ fn discover_tracks(
     }
 
     io.control.begin_probe(discovery_limits.maximum_probe_bytes);
-    io.control
-        .set_deadline(Some(Instant::now() + discovery_limits.maximum_wall_time));
-
-    loop {
-        match read_chunk(io.input, io.buffer, io.control, io.seen_prefix) {
-            ReadOutcome::Bytes(bytes) => {
-                io.demux.feed(bytes);
-                io.builder.drain(io.demux, input_limits, false)?;
-                if let Some(catalog) = io.builder.take_catalog() {
-                    io.control.finish_probe();
-                    io.control.set_deadline(None);
-                    return Ok((catalog, None));
+    let outcome = tokio::time::timeout(discovery_limits.maximum_wall_time, async {
+        loop {
+            match read_chunk(io.input, io.buffer, io.control, io.seen_prefix).await {
+                ReadOutcome::Bytes(bytes) => {
+                    io.demux.feed(bytes);
+                    io.builder.drain(io.demux, input_limits, false)?;
+                    if let Some(catalog) = io.builder.take_catalog() {
+                        return Ok((catalog, None));
+                    }
                 }
+                ReadOutcome::End(state) => {
+                    io.demux.finish();
+                    io.builder.drain(io.demux, input_limits, true)?;
+                    return io.builder.take_catalog().map_or_else(
+                        || Err(discovery_end_error(io.control, io.builder.saw_mpeg_ts())),
+                        |catalog| Ok((catalog, Some(state))),
+                    );
+                }
+                ReadOutcome::Failed(error) => return Err(error),
+                ReadOutcome::Stopped => return Err(discovery_stop_error(io.control)),
             }
-            ReadOutcome::End(state) => {
-                io.demux.finish();
-                io.builder.drain(io.demux, input_limits, true)?;
-                return io.builder.take_catalog().map_or_else(
-                    || Err(discovery_end_error(io.control, io.builder.saw_mpeg_ts())),
-                    |catalog| {
-                        io.control.finish_probe();
-                        io.control.set_deadline(None);
-                        Ok((catalog, Some(state)))
-                    },
-                );
-            }
-            ReadOutcome::Failed(error) => return Err(error),
-            ReadOutcome::Stopped => return Err(discovery_stop_error(io.control)),
         }
+    })
+    .await;
+    io.control.finish_probe();
+    match outcome {
+        Ok(result) => result,
+        Err(_elapsed) => Err(DiscoveryProblem::DeadlineExceeded.into()),
     }
 }
 
-fn pump(
+async fn pump(
     io: &mut WorkerIo<'_>,
     input_limits: InputLimits,
     queued_payload_bytes: usize,
@@ -218,34 +219,38 @@ fn pump(
     output: &mpsc::Sender<WorkerEvent>,
 ) {
     let budget = PayloadBudget::new(queued_payload_bytes);
-    if !emit_prefetch(io.builder, &budget, output) {
+    if !emit_prefetch(io.builder, &budget, output).await {
         return;
     }
     if let Some(state) = terminal {
-        let _ = output.blocking_send(WorkerEvent::End(state));
+        let _ = output.send(WorkerEvent::End(state)).await;
         return;
     }
 
     loop {
-        match read_chunk(io.input, io.buffer, io.control, io.seen_prefix) {
+        match read_chunk(io.input, io.buffer, io.control, io.seen_prefix).await {
             ReadOutcome::Bytes(bytes) => {
                 io.demux.feed(bytes);
-                if let Err(error) = emit_live(io.builder, io.demux, input_limits, &budget, output) {
-                    let _ = output.blocking_send(WorkerEvent::Error(error));
+                if let Err(error) =
+                    emit_live(io.builder, io.demux, input_limits, &budget, output).await
+                {
+                    let _ = output.send(WorkerEvent::Error(error)).await;
                     return;
                 }
             }
             ReadOutcome::End(state) => {
                 io.demux.finish();
-                if let Err(error) = emit_live(io.builder, io.demux, input_limits, &budget, output) {
-                    let _ = output.blocking_send(WorkerEvent::Error(error));
+                if let Err(error) =
+                    emit_live(io.builder, io.demux, input_limits, &budget, output).await
+                {
+                    let _ = output.send(WorkerEvent::Error(error)).await;
                     return;
                 }
-                let _ = output.blocking_send(WorkerEvent::End(state));
+                let _ = output.send(WorkerEvent::End(state)).await;
                 return;
             }
             ReadOutcome::Failed(error) => {
-                let _ = output.blocking_send(WorkerEvent::Error(error));
+                let _ = output.send(WorkerEvent::Error(error)).await;
                 return;
             }
             ReadOutcome::Stopped => return,
@@ -260,7 +265,7 @@ enum ReadOutcome<'a> {
     Stopped,
 }
 
-fn read_chunk<'a>(
+async fn read_chunk<'a>(
     input: &mut dyn ByteInput,
     buffer: &'a mut [u8],
     control: &Control,
@@ -273,7 +278,7 @@ fn read_chunk<'a>(
     if requested == 0 {
         return ReadOutcome::Failed(discovery_stop_error(control));
     }
-    match input.read(&mut buffer[..requested], control) {
+    match input.read(&mut buffer[..requested]).await {
         Ok(0) => ReadOutcome::End(InputState::Interrupted),
         Ok(read) => {
             control.record_read(read);
@@ -305,8 +310,6 @@ fn discovery_stop_error(control: &Control) -> SourceError {
         DiscoveryProblem::Abandoned.into()
     } else if control.probe_exceeded() {
         DiscoveryProblem::ProbeLimitExceeded.into()
-    } else if control.deadline_exceeded() {
-        DiscoveryProblem::DeadlineExceeded.into()
     } else {
         DiscoveryProblem::Abandoned.into()
     }
@@ -315,9 +318,6 @@ fn discovery_stop_error(control: &Control) -> SourceError {
 fn discovery_end_error(control: &Control, saw_mpeg_ts: bool) -> SourceError {
     if control.probe_exceeded() {
         return DiscoveryProblem::ProbeLimitExceeded.into();
-    }
-    if control.deadline_exceeded() {
-        return DiscoveryProblem::DeadlineExceeded.into();
     }
     if saw_mpeg_ts {
         DiscoveryProblem::Abandoned.into()
@@ -589,20 +589,20 @@ impl CatalogBuilder {
     }
 }
 
-fn emit_prefetch(
+async fn emit_prefetch(
     builder: &mut CatalogBuilder,
     budget: &Arc<PayloadBudget>,
     output: &mpsc::Sender<WorkerEvent>,
 ) -> bool {
     while let Some(packet) = builder.prefetch.pop_front() {
-        if !send_packet(packet, budget, output) {
+        if !send_packet(packet, budget, output).await {
             return false;
         }
     }
     true
 }
 
-fn emit_live(
+async fn emit_live(
     builder: &mut CatalogBuilder,
     demux: &mut StreamingTsDemux,
     limits: InputLimits,
@@ -611,23 +611,24 @@ fn emit_live(
 ) -> Result<(), SourceError> {
     builder.drain(demux, limits, false)?;
     while let Some(packet) = builder.prefetch.pop_front() {
-        if !send_packet(packet, budget, output) {
+        if !send_packet(packet, budget, output).await {
             return Ok(());
         }
     }
     Ok(())
 }
 
-fn send_packet(
+async fn send_packet(
     packet: Packet,
     budget: &Arc<PayloadBudget>,
     output: &mpsc::Sender<WorkerEvent>,
 ) -> bool {
-    let permit = budget.reserve(packet.retained_payload_bytes());
+    let permit = budget.reserve(packet.retained_payload_bytes()).await;
     output
-        .blocking_send(WorkerEvent::Packet(QueuedPacket {
+        .send(WorkerEvent::Packet(QueuedPacket {
             packet,
             _permit: permit,
         }))
+        .await
         .is_ok()
 }

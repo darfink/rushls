@@ -1,12 +1,14 @@
-//! Blocking encoded-byte inputs shared by demux adapters.
+//! Encoded-byte inputs shared by demux adapters.
 //!
-//! Live transports read sockets on their own threads. Demuxers consume those
-//! bytes through this contract so SRT can feed MPEG-TS without the packet
-//! source knowing about sockets.
+//! Live transports yield bytes as they arrive. Demuxers consume those bytes
+//! through this contract so SRT can feed MPEG-TS without the packet source
+//! knowing about sockets. Reads are async: the MPEG-TS demux task sits on the
+//! same Tokio runtime as the SRT driver, and a cancelled session aborts a
+//! pending receive by dropping it.
 
 use std::io::Read;
 
-use crate::source::InputState;
+use crate::{domain::BoxFuture, source::InputState};
 
 /// Why a byte input could not satisfy another read.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -17,30 +19,20 @@ pub enum ByteInputError {
     Failed(Box<str>),
 }
 
-/// Cancellation and discovery-deadline state shared with a blocking reader.
-pub trait ByteInterrupt {
-    fn interrupted(&self) -> bool;
-}
-
-/// Blocking byte stream consumed exclusively by a demux worker.
+/// Async byte stream consumed exclusively by a demux task.
 ///
-/// The worker drives this method whenever it needs more encoded bytes. Live
-/// transports should observe `interrupt` while a socket read is idle: a
-/// cancelled session must not sit in a blocking receive until the peer hangs
-/// up.
+/// The task drives this method whenever it needs more encoded bytes. A live
+/// socket should complete when the peer shuts down or the connection breaks;
+/// cancellation is the demux task's job, by dropping the read future.
 pub trait ByteInput: Send {
-    fn read(
-        &mut self,
-        buffer: &mut [u8],
-        interrupt: &dyn ByteInterrupt,
-    ) -> Result<usize, ByteInputError>;
+    fn read<'a>(&'a mut self, buffer: &'a mut [u8])
+    -> BoxFuture<'a, Result<usize, ByteInputError>>;
 }
 
 /// Adapts an ordinary blocking reader into a demux byte input.
 ///
 /// Intended for finite memory/file readers. `std::io::Read` has no cancellation
-/// facility, so live sockets should implement [`ByteInput`] directly and
-/// observe [`ByteInterrupt`].
+/// facility; live sockets implement [`ByteInput`] directly.
 pub struct ReadInput<R> {
     reader: R,
     end: InputState,
@@ -63,15 +55,16 @@ impl<R> ReadInput<R> {
 }
 
 impl<R: Read + Send> ByteInput for ReadInput<R> {
-    fn read(
-        &mut self,
-        buffer: &mut [u8],
-        _interrupt: &dyn ByteInterrupt,
-    ) -> Result<usize, ByteInputError> {
-        match self.reader.read(buffer) {
-            Ok(0) => Err(ByteInputError::End(self.end)),
-            Ok(read) => Ok(read),
-            Err(error) => Err(ByteInputError::Failed(error.to_string().into())),
-        }
+    fn read<'a>(
+        &'a mut self,
+        buffer: &'a mut [u8],
+    ) -> BoxFuture<'a, Result<usize, ByteInputError>> {
+        Box::pin(async move {
+            match self.reader.read(buffer) {
+                Ok(0) => Err(ByteInputError::End(self.end)),
+                Ok(read) => Ok(read),
+                Err(error) => Err(ByteInputError::Failed(error.to_string().into())),
+            }
+        })
     }
 }
