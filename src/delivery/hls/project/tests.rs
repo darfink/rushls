@@ -270,6 +270,50 @@ fn siblings_are_reported_so_a_switching_client_knows_where_to_resume()
 }
 
 #[test]
+fn query_variables_raise_the_version_and_suffix_every_uri() -> Result<(), Box<dyn std::error::Error>>
+{
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0), audio(1)]);
+    for local in [0, 1] {
+        write(&lease, initialization(local, 1));
+        write_segment(&lease, local, 0, 0);
+    }
+
+    let uris = uris().with_query_variables();
+    let (stream, media) = snapshots(&lease, 0)?;
+    let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
+    let rendered = media_playlist(
+        &stream,
+        &media,
+        control,
+        &policy(),
+        &uris,
+        PlaylistDelta::Full,
+    )?;
+    let multivariant = multivariant_playlist(&stream, &policy(), &uris)?.ok_or("topology")?;
+
+    assert!(
+        rendered.contains("#EXT-X-VERSION:11\n"),
+        "QUERYPARAM requires protocol version 11: {rendered}"
+    );
+    assert!(rendered.contains("#EXT-X-DEFINE:QUERYPARAM=\"token\"\n"));
+    assert!(rendered.contains("URI=\"init/1.mp4?token={$token}\""));
+    assert!(rendered.contains("segment/1.m4s?token={$token}"));
+    assert!(rendered.contains("URI=\"../1/audio.m3u8?token={$token}\""));
+    assert!(
+        !rendered.contains("token=eyJ"),
+        "the playlist names the variable, not a viewer token: {rendered}"
+    );
+    assert!(multivariant.contains("#EXT-X-VERSION:11\n"));
+    assert!(multivariant.contains("#EXT-X-DEFINE:QUERYPARAM=\"token\"\n"));
+    assert!(
+        multivariant.contains("0/video.m3u8?token={$token}"),
+        "STREAM-INF names the query-variable playlist: {multivariant}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_cueless_subtitle_rendition_is_still_reported_to_its_siblings()
 -> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();

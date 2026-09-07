@@ -21,7 +21,7 @@ use crate::{
             MediaPlaylistWriter, Part, PreloadHint, PreloadHintType, RenditionReport, Segment,
             ServerControl,
         },
-        uri::{PlaylistUris, RenditionUris},
+        uri::{PlaylistUris, QUERYPARAM_VERSION, RenditionUris, TOKEN_QUERYPARAM},
     },
     domain::{RenditionId, TickTimestamp, Timebase},
 };
@@ -68,7 +68,11 @@ pub fn media_playlist(
     writer.version(version(
         contract.is_chunked(),
         (skip_count > 0).then_some(delta),
+        uris.query_variables(),
     ))?;
+    if uris.query_variables() {
+        writer.define_queryparam(TOKEN_QUERYPARAM)?;
+    }
     writer.target_duration(contract.target_duration)?;
     if let Some(control) = server_control {
         writer.server_control(control)?;
@@ -370,7 +374,7 @@ fn write_rendition_reports(
     Ok(())
 }
 
-fn version(chunked: bool, skip: Option<PlaylistDelta>) -> NonZeroU8 {
+fn version(chunked: bool, skip: Option<PlaylistDelta>, query_variables: bool) -> NonZeroU8 {
     let mut version = if chunked {
         VERSION_WITH_PARTS
     } else {
@@ -380,6 +384,9 @@ fn version(chunked: bool, skip: Option<PlaylistDelta>) -> NonZeroU8 {
         Some(PlaylistDelta::Skip) => version = version.max(VERSION_WITH_SKIP),
         Some(PlaylistDelta::SkipV2) => version = version.max(VERSION_WITH_SKIP_DATERANGES),
         None | Some(PlaylistDelta::Full) => {}
+    }
+    if query_variables {
+        version = version.max(QUERYPARAM_VERSION);
     }
     NonZeroU8::new(version).unwrap_or(NonZeroU8::MIN)
 }

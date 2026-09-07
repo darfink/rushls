@@ -1,8 +1,8 @@
 # RFC: the Rushls configuration surface
 
 > **Status: implemented**, apart from the features named as not built below:
-> playback authorization, `[record]`, and payload-carrying
-> hooks. Their keys are refused at startup rather than silently accepted.
+> `[record]` and payload-carrying hooks. Their keys are refused at startup
+> rather than silently accepted.
 >
 > **The goal was inverted on purpose.** This document does not describe how to
 > configure the internals. It describes the configuration an administrator
@@ -795,7 +795,35 @@ The token arrives as `Authorization: Bearer <jwt>` or as `?token=<jwt>`. Both
 are always accepted, with no setting to rename or disable either: the header
 is preferred when the client can set headers, and the query form exists
 because a browser player cannot set headers on the requests its media element
-issues.
+issues. An empty `?token=` is a 401, not an open playlist.
+
+Native HLS cannot copy `Authorization` onto the URIs it fetches next, so a
+query-token client is answered a **second playlist form**: protocol version 11,
+`#EXT-X-DEFINE:QUERYPARAM="token"`, and every minted URI carrying
+`?token={$token}`. The player substitutes the query value it already has.
+Bearer and ungated clients keep the ordinary v6/v9/v10 playlists, with no
+DEFINE. Both forms are gzipped once at render; the origin does not re-gzip per
+viewer, and two viewers with different tokens receive identical playlist bytes
+and the same `ETag`. `EXT-X-DEFINE IMPORT` is out of scope.
+
+That form is a hard requirement on the player: a client that does not expand
+QUERYPARAM (hls.js-light among them) will request `token={$token}` literally
+and be refused. A CDN or player that cannot speak protocol version 11 will
+hard-fail the entry playlist rather than degrade. Apple's `mediastreamvalidator`
+rejects v11, so the ungated `apple_hls` path stays on the ordinary form.
+
+When playback authorization is on, `Cache-Control` **drops `public`**. `max-age`
+is unchanged. RFC 9111 § 3.5: `public` waives the default rule that a response
+to a request carrying `Authorization` must not be stored by a shared cache.
+Leaving it on would let a CDN serve one viewer's playlist to another.
+
+CDN cache keys are a deployment concern this origin cannot enforce:
+
+| Resource | Key on |
+|---|---|
+| Media (init, segments, parts) | Strip `token`. The bytes are identical for every admitted viewer. |
+| Playlists | The **presence** of `token`, not its value. Bearer playlists and query-token playlists are different bytes; a cache that ignores the query entirely will mix them. Never ignore all query parameters: `_HLS_msn` / `_HLS_part` / `_HLS_skip` name different playlists. |
+| Redirects | Must keep `token` on the Location they issue. A 302 that drops it is a 401 on the next hop. |
 
 The query form has a consequence that is a requirement rather than advice:
 **tokens appear in access logs, referrer headers, and any intermediary's
@@ -1005,7 +1033,3 @@ the playlist type rather than as a second retention window.
 Structural, and honestly not designed for: **transcoding**. A rendition ladder
 needs named variants and per-variant constraints, which is a new top-level
 concept rather than a field.
-
-**Playback authorization is designed here but not built.** `[auth.playback]` is
-specified above and appears in the reference; the application has no notion of
-viewer identity yet. Designed, not deferred to a later design.

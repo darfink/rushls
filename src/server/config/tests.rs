@@ -855,8 +855,6 @@ fn keys_for_unbuilt_features_are_refused_by_name() -> Result<(), Box<dyn Error>>
     // keys must fail startup rather than be accepted and do nothing, which is
     // the silent-misconfiguration failure the whole design is against.
     for configuration in [
-        // Playback authorization.
-        "[auth.playback]\nsecret = \"shh\"\n",
         // Mutual TLS to the admission service.
         "[auth.publish]\nurl = \"http://auth\"\nclient_certificate = \"/x.pem\"\n",
         // Payload-carrying hooks.
@@ -978,6 +976,104 @@ url = "not-a-url"
         );
     }
     assert!(resolve_toml("[auth]\n")?.is_ok());
+    Ok(())
+}
+
+#[test]
+fn playback_auth_requires_one_key_source_and_iss_aud() -> Result<(), Box<dyn Error>> {
+    let hmac = r#"
+[auth.playback]
+secret = "playback-hmac-secret"
+[auth.playback.claims]
+iss = "https://issuer.example"
+aud = "rushls-origin"
+tier = "premium"
+n = 7
+ok = true
+"#;
+    let resolved = resolve_toml(hmac)??;
+    let playback = resolved
+        .playback
+        .as_ref()
+        .ok_or("playback authorization should resolve")?;
+    assert_eq!(playback.issuer, "https://issuer.example");
+    assert_eq!(playback.audience, "rushls-origin");
+    assert_eq!(playback.stream_claim, "stream");
+    assert_eq!(playback.leeway, Duration::from_secs(30));
+    assert_eq!(
+        playback.extra.get("tier"),
+        Some(&crate::server::http::playback::ClaimValue::String(
+            "premium".into()
+        ))
+    );
+    assert_eq!(
+        playback.extra.get("n"),
+        Some(&crate::server::http::playback::ClaimValue::Integer(7))
+    );
+    assert_eq!(
+        playback.extra.get("ok"),
+        Some(&crate::server::http::playback::ClaimValue::Boolean(true))
+    );
+    assert!(matches!(
+        playback.keys,
+        crate::server::http::playback::PlaybackKeyMaterial::Secret(_)
+    ));
+
+    let jwks = r#"
+[auth.playback]
+jwks_url = "https://issuer.example/.well-known/jwks.json"
+[auth.playback.claims]
+iss = "https://issuer.example"
+aud = "rushls-origin"
+"#;
+    let jwks_resolved = resolve_toml(jwks)??;
+    assert!(
+        matches!(
+            jwks_resolved.playback.unwrap().keys,
+            crate::server::http::playback::PlaybackKeyMaterial::Jwks { .. }
+        ),
+        "a JWKS URL is accepted at resolve without being fetched"
+    );
+
+    for configuration in [
+        "[auth.playback]\nsecret = \"shh\"\n",
+        r#"
+[auth.playback]
+secret = "shh"
+jwks_url = "https://issuer.example/jwks.json"
+[auth.playback.claims]
+iss = "https://issuer.example"
+aud = "rushls-origin"
+"#,
+        r#"
+[auth.playback]
+secret = ""
+[auth.playback.claims]
+iss = "https://issuer.example"
+aud = "rushls-origin"
+"#,
+        r#"
+[auth.playback]
+secret = "shh"
+[auth.playback.claims]
+iss = 1
+aud = "rushls-origin"
+"#,
+        r#"
+[auth.playback]
+secret = "shh"
+jwks_url = "https://issuer.example/jwks.json"
+public_key = "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
+[auth.playback.claims]
+iss = "https://issuer.example"
+aud = "rushls-origin"
+"#,
+    ] {
+        assert!(
+            resolve_toml(configuration)?.is_err(),
+            "expected a startup error for:\n{configuration}"
+        );
+    }
     Ok(())
 }
 

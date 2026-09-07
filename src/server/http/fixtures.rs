@@ -25,8 +25,12 @@ use super::tls::TlsSettings;
 
 /// The production HLS/media composition used by HTTP integration tests.
 pub(crate) fn application(store: &StreamStore) -> Arc<ViewerApplication> {
+    application_with(store, HlsConfig::default())
+}
+
+pub(crate) fn application_with(store: &StreamStore, hls: HlsConfig) -> Arc<ViewerApplication> {
     let origin = Arc::new(Origin::new(store.clone()));
-    let hls = Arc::new(HlsService::new(Arc::clone(&origin), HlsConfig::default()));
+    let hls = Arc::new(HlsService::new(Arc::clone(&origin), hls));
     Arc::new(ViewerApplication::new(origin, hls))
 }
 

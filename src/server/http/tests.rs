@@ -6,7 +6,7 @@
 //! with the right `Content-Range`, that a blocked request keeps its connection
 //! open, and that shutdown lets an in-flight blocking reload finish.
 
-use std::{fmt::Write as _, net::SocketAddr, time::Duration};
+use std::{fmt::Write as _, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -25,7 +25,6 @@ use crate::{
     session::Registry,
 };
 
-use super::fixtures::application;
 use super::{AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, Readiness, serve};
 
 /// A raw HTTP/1.1 response, parsed just enough to assert on.
@@ -218,29 +217,73 @@ impl Harness {
         metrics: MetricsMode,
         readiness: Readiness,
     ) -> Self {
+        Self::start_gated(config, metrics, readiness, None).await
+    }
+
+    async fn start_with_playback(playback: Arc<super::PlaybackGate>) -> Self {
+        Self::start_gated(
+            HttpConfig::default(),
+            MetricsMode::Disabled,
+            Readiness::ready(),
+            Some(playback),
+        )
+        .await
+    }
+
+    async fn start_with_playback_and_metrics(playback: Arc<super::PlaybackGate>) -> Self {
+        Self::start_gated(
+            HttpConfig::default(),
+            MetricsMode::Enabled(None),
+            Readiness::ready(),
+            Some(playback),
+        )
+        .await
+    }
+
+    async fn start_gated(
+        config: HttpConfig,
+        metrics: MetricsMode,
+        readiness: Readiness,
+        playback: Option<Arc<super::PlaybackGate>>,
+    ) -> Self {
         let store = StreamStore::default();
-        let origin = application(&store);
+        let hls = crate::delivery::hls::service::Config {
+            query_variables: playback.is_some(),
+            ..crate::delivery::hls::service::Config::default()
+        };
+        let origin = super::fixtures::application_with(&store, hls);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("an ephemeral port is available");
         let address = listener.local_addr().expect("the listener is bound");
         let (shutdown, signal) = tokio::sync::oneshot::channel();
         let metrics = match metrics {
-            MetricsMode::Enabled(token) => Some(MetricsEndpoint::new(
-                MetricsReader::new(
+            MetricsMode::Enabled(token) => {
+                let mut reader = MetricsReader::new(
                     ProcessMeters::default(),
                     OriginMeters::default(),
                     HlsMeters::default(),
                     Registry::default(),
                     store.clone(),
-                ),
-                token,
-            )),
+                );
+                if let Some(gate) = &playback {
+                    reader = reader.with_playback(gate.meters());
+                }
+                Some(MetricsEndpoint::new(reader, token))
+            }
             MetricsMode::Disabled => None,
         };
-        let served = tokio::spawn(serve(listener, origin, config, metrics, readiness, async {
-            let _ = signal.await;
-        }));
+        let served = tokio::spawn(serve(
+            listener,
+            origin,
+            config,
+            metrics,
+            playback,
+            readiness,
+            async {
+                let _ = signal.await;
+            },
+        ));
         Self {
             address,
             store,
@@ -462,7 +505,7 @@ fn a_playlist_leaves_this_layer_carrying_its_own_length() {
     };
 
     let identity =
-        super::into_http(response(), None, false, None).expect("a playlist is representable");
+        super::into_http(response(), None, false, None, true).expect("a playlist is representable");
     assert_eq!(
         identity
             .headers()
@@ -474,7 +517,7 @@ fn a_playlist_leaves_this_layer_carrying_its_own_length() {
     );
 
     let encoded =
-        super::into_http(response(), None, true, None).expect("a playlist is representable");
+        super::into_http(response(), None, true, None, true).expect("a playlist is representable");
     assert_eq!(
         encoded
             .headers()
@@ -518,9 +561,9 @@ fn each_playlist_encoding_validates_as_a_different_entity() {
     };
 
     let identity =
-        super::into_http(response(), None, false, None).expect("a playlist is representable");
+        super::into_http(response(), None, false, None, true).expect("a playlist is representable");
     let encoded =
-        super::into_http(response(), None, true, None).expect("a playlist is representable");
+        super::into_http(response(), None, true, None, true).expect("a playlist is representable");
 
     let (identity, encoded) = (etag(&identity), etag(&encoded));
     assert!(identity.is_some(), "a playlist carries a validator");
@@ -673,7 +716,7 @@ fn a_playlist_refuses_ranges_and_asks_not_to_be_transformed() {
 
     for accepts_gzip in [false, true] {
         // The range is offered exactly as libavformat sends it.
-        let reply = super::into_http(response(), Some("bytes=0-"), accepts_gzip, None)
+        let reply = super::into_http(response(), Some("bytes=0-"), accepts_gzip, None, true)
             .expect("a playlist is representable");
 
         assert_eq!(
@@ -914,6 +957,397 @@ async fn already_compressed_media_is_neither_gzipped_nor_negotiated() {
          asks caches to hold it"
     );
     assert_eq!(reply.body.len(), 6 * PART_BYTES);
+
+    harness.stop().await;
+}
+
+const PLAYBACK_SECRET: &[u8] = b"playback-hmac-secret";
+const PLAYBACK_ISS: &str = "https://issuer.example";
+const PLAYBACK_AUD: &str = "rushls-origin";
+
+fn playback_gate() -> std::sync::Arc<super::PlaybackGate> {
+    std::sync::Arc::new(super::PlaybackGate::hmac(
+        PLAYBACK_SECRET,
+        PLAYBACK_ISS,
+        PLAYBACK_AUD,
+        "stream",
+        Duration::from_secs(30),
+        std::collections::BTreeMap::new(),
+    ))
+}
+
+fn playback_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs()
+}
+
+fn playback_token(stream: &str) -> String {
+    playback_token_from(&serde_json::json!({
+        "iss": PLAYBACK_ISS,
+        "aud": PLAYBACK_AUD,
+        "exp": playback_now() + 60,
+        "nbf": playback_now() - 5,
+        "stream": stream,
+    }))
+}
+
+fn playback_token_from(claims: &serde_json::Value) -> String {
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        claims,
+        &jsonwebtoken::EncodingKey::from_secret(PLAYBACK_SECRET),
+    )
+    .expect("a test token encodes")
+}
+
+fn publish_camera(harness: &Harness) {
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+}
+
+#[tokio::test]
+async fn ungated_playlists_remain_public_and_omit_queryparam() {
+    let harness = Harness::start().await;
+    publish_camera(&harness);
+
+    let reply = request(harness.address, "GET", "/live/camera/index.m3u8", &[]).await;
+    assert_eq!(reply.status, 200);
+    assert!(
+        reply
+            .header("cache-control")
+            .is_some_and(|value| value.contains("public")),
+        "an ungated origin still asks shared caches to store: {:?}",
+        reply.header("cache-control")
+    );
+    let body = String::from_utf8(reply.body).expect("a playlist is text");
+    assert!(!body.contains("EXT-X-DEFINE"));
+    assert!(!body.contains("token={$token}"));
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_missing_or_empty_query_token_is_unauthorized_before_any_playlist() {
+    let harness = Harness::start_with_playback(playback_gate()).await;
+    publish_camera(&harness);
+
+    for target in [
+        "/live/camera/index.m3u8",
+        "/live/camera/index.m3u8?token=",
+        "/live/camera/0/video.m3u8?token=",
+    ] {
+        let reply = request(harness.address, "GET", target, &[]).await;
+        assert_eq!(reply.status, 401, "{target}");
+        assert_eq!(reply.header("www-authenticate"), Some("Bearer"));
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+        assert!(
+            !reply.body.starts_with(b"#EXTM3U"),
+            "an empty token must not mint a QUERYPARAM playlist: {target}"
+        );
+    }
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_bearer_token_serves_the_ungated_playlist_form_without_public_caching() {
+    let harness = Harness::start_with_playback(playback_gate()).await;
+    publish_camera(&harness);
+    let jwt = playback_token("live/camera");
+
+    let reply = request(
+        harness.address,
+        "GET",
+        "/live/camera/index.m3u8",
+        &[("Authorization", &format!("Bearer {jwt}"))],
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    let cache = reply.header("cache-control").expect("a lifetime is stated");
+    assert!(
+        cache.contains("max-age="),
+        "authorized traffic still has a lifetime: {cache}"
+    );
+    assert!(
+        !cache.contains("public"),
+        "public would waive Authorization for shared caches: {cache}"
+    );
+    let body = String::from_utf8(reply.body).expect("a playlist is text");
+    assert!(!body.contains("EXT-X-DEFINE"));
+    assert!(!body.contains("token={$token}"));
+    assert!(
+        body.contains("#EXT-X-VERSION:6\n"),
+        "Bearer traffic keeps the ungated version: {body}"
+    );
+
+    let encoded = request(
+        harness.address,
+        "GET",
+        "/live/camera/index.m3u8",
+        &[
+            ("Authorization", &format!("Bearer {jwt}")),
+            ("Accept-Encoding", "gzip"),
+        ],
+    )
+    .await;
+    assert_eq!(encoded.header("content-encoding"), Some("gzip"));
+    let decoded = String::from_utf8(ungzip(&encoded.body)).expect("gzip is text");
+    assert!(!decoded.contains("EXT-X-DEFINE"));
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_query_token_serves_the_queryparam_form_gzipped_identically_for_two_viewers() {
+    let harness = Harness::start_with_playback(playback_gate()).await;
+    publish_camera(&harness);
+    let first = playback_token("live/camera");
+    let second = playback_token_from(&serde_json::json!({
+        "iss": PLAYBACK_ISS,
+        "aud": PLAYBACK_AUD,
+        "exp": playback_now() + 120,
+        "stream": "live/camera",
+    }));
+
+    let one = request(
+        harness.address,
+        "GET",
+        &format!("/live/camera/index.m3u8?token={first}"),
+        &[],
+    )
+    .await;
+    let two = request(
+        harness.address,
+        "GET",
+        &format!("/live/camera/index.m3u8?token={second}"),
+        &[],
+    )
+    .await;
+    let encoded = request(
+        harness.address,
+        "GET",
+        &format!("/live/camera/index.m3u8?token={first}"),
+        &[("Accept-Encoding", "gzip")],
+    )
+    .await;
+
+    assert_eq!(one.status, 200);
+    assert_eq!(two.status, 200);
+    assert_eq!(one.body, two.body);
+    assert_eq!(one.header("etag"), two.header("etag"));
+    assert_eq!(encoded.status, 200);
+    assert_eq!(encoded.header("content-encoding"), Some("gzip"));
+    let identity = String::from_utf8(one.body.clone()).expect("a playlist is text");
+    let decoded = String::from_utf8(ungzip(&encoded.body)).expect("gzip is text");
+    assert_eq!(identity, decoded);
+    assert!(identity.contains("#EXT-X-VERSION:11\n"));
+    assert!(identity.contains("#EXT-X-DEFINE:QUERYPARAM=\"token\"\n"));
+    assert!(identity.contains("0/video.m3u8?token={$token}"));
+    assert!(
+        !identity.contains(&first) && !identity.contains(&second),
+        "the playlist names the variable, not a viewer JWT"
+    );
+    let cache = one.header("cache-control").expect("a lifetime is stated");
+    assert!(!cache.contains("public"), "{cache}");
+
+    let media = request(
+        harness.address,
+        "GET",
+        &format!("/live/camera/0/video.m3u8?token={first}"),
+        &[],
+    )
+    .await;
+    let media_body = String::from_utf8(media.body).expect("a playlist is text");
+    assert!(media_body.contains("#EXT-X-DEFINE:QUERYPARAM=\"token\"\n"));
+    assert!(media_body.contains("URI=\"init/1.mp4?token={$token}\""));
+    assert!(media_body.contains("segment/1.m4s?token={$token}"));
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_query_token_still_honours_a_blocking_reload() {
+    let harness = Harness::start_with_playback(playback_gate()).await;
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+    write(&lease, chunk(0, 1, 0, 6));
+    let jwt = playback_token("live/camera");
+
+    let address = harness.address;
+    let held = tokio::spawn(async move {
+        request(
+            address,
+            "GET",
+            &format!("/live/camera/0/video.m3u8?token={jwt}&_HLS_msn=1&_HLS_part=1"),
+            &[],
+        )
+        .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!held.is_finished(), "the part has not been published yet");
+
+    write(&lease, chunk(0, 1, 1, 7));
+    let reply = held.await.expect("the request task ran");
+    assert_eq!(reply.status, 200);
+    let body = String::from_utf8(reply.body).expect("a playlist is text");
+    assert!(body.contains("#EXT-X-DEFINE:QUERYPARAM=\"token\"\n"));
+    assert!(body.contains("URI=\"part/8.m4s?token={$token}\""));
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn claim_failures_are_unauthorized_and_a_wrong_stream_is_forbidden() {
+    let harness = Harness::start_with_playback(playback_gate()).await;
+    publish_camera(&harness);
+
+    let expired = playback_token_from(&serde_json::json!({
+        "iss": PLAYBACK_ISS,
+        "aud": PLAYBACK_AUD,
+        "exp": playback_now() - 120,
+        "stream": "live/camera",
+    }));
+    let wrong_aud = playback_token_from(&serde_json::json!({
+        "iss": PLAYBACK_ISS,
+        "aud": "other-origin",
+        "exp": playback_now() + 60,
+        "stream": "live/camera",
+    }));
+    let other_stream = playback_token("live/other");
+
+    for (jwt, status) in [(expired, 401), (wrong_aud, 401), (other_stream, 403)] {
+        let reply = request(
+            harness.address,
+            "GET",
+            &format!("/live/camera/index.m3u8?token={jwt}"),
+            &[],
+        )
+        .await;
+        assert_eq!(reply.status, status);
+        assert_eq!(reply.header("cache-control"), Some("no-store"));
+        if status == 401 {
+            assert_eq!(reply.header("www-authenticate"), Some("Bearer"));
+        }
+    }
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn the_header_is_verified_when_both_are_present_and_the_query_still_selects_queryparam() {
+    let harness = Harness::start_with_playback(playback_gate()).await;
+    publish_camera(&harness);
+    let header = playback_token("live/camera");
+    let query = playback_token("live/other");
+
+    let reply = request(
+        harness.address,
+        "GET",
+        &format!("/live/camera/index.m3u8?token={query}"),
+        &[("Authorization", &format!("Bearer {header}"))],
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    let body = String::from_utf8(reply.body).expect("a playlist is text");
+    assert!(body.contains("#EXT-X-DEFINE:QUERYPARAM=\"token\"\n"));
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn health_and_cors_preflight_stay_ungated() {
+    let harness = Harness::start_with_playback(playback_gate()).await;
+
+    let live = request(harness.address, "GET", "/health/live", &[]).await;
+    assert_eq!(live.status, 200);
+
+    let preflight = request(
+        harness.address,
+        "OPTIONS",
+        "/live/camera/index.m3u8",
+        &[
+            ("Origin", "https://player.example"),
+            ("Access-Control-Request-Method", "GET"),
+        ],
+    )
+    .await;
+    assert_eq!(preflight.status, 200);
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn playback_denials_are_counted_by_status_only() {
+    let harness = Harness::start_with_playback_and_metrics(playback_gate()).await;
+    publish_camera(&harness);
+    let other = playback_token("live/other");
+
+    let unauthorized = request(harness.address, "GET", "/live/camera/index.m3u8", &[]).await;
+    let forbidden = request(
+        harness.address,
+        "GET",
+        &format!("/live/camera/index.m3u8?token={other}"),
+        &[],
+    )
+    .await;
+    assert_eq!(unauthorized.status, 401);
+    assert_eq!(forbidden.status, 403);
+
+    let metrics = request(harness.address, "GET", "/metrics", &[]).await;
+    let body = String::from_utf8(metrics.body).expect("metrics are text");
+    assert!(body.contains("rushls_playback_denied_total{status=\"401\"} 1\n"));
+    assert!(body.contains("rushls_playback_denied_total{status=\"403\"} 1\n"));
+    assert!(
+        !body.contains("stream="),
+        "playback denials must not carry a stream label"
+    );
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn an_es256_pem_admits_a_viewer() {
+    let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+        .expect("a P-256 key is generated");
+    let gate = std::sync::Arc::new(
+        super::PlaybackGate::public_pem(
+            pair.public_key_pem().as_bytes(),
+            PLAYBACK_ISS,
+            PLAYBACK_AUD,
+            "stream",
+            Duration::from_secs(30),
+            std::collections::BTreeMap::new(),
+        )
+        .expect("the verifying key loads"),
+    );
+    let jwt = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256),
+        &serde_json::json!({
+            "iss": PLAYBACK_ISS,
+            "aud": PLAYBACK_AUD,
+            "exp": playback_now() + 60,
+            "stream": "live/camera",
+        }),
+        &jsonwebtoken::EncodingKey::from_ec_pem(pair.serialize_pem().as_bytes())
+            .expect("the signing key loads"),
+    )
+    .expect("an ES256 token encodes");
+
+    let harness = Harness::start_with_playback(gate).await;
+    publish_camera(&harness);
+    let reply = request(
+        harness.address,
+        "GET",
+        "/live/camera/index.m3u8",
+        &[("Authorization", &format!("Bearer {jwt}"))],
+    )
+    .await;
+    assert_eq!(reply.status, 200);
 
     harness.stop().await;
 }
@@ -1528,6 +1962,7 @@ mod end_to_end {
             config,
             Arc::new(OpenStreamAuthenticator::new(policy)),
             Events::default(),
+            None,
         )
         .expect("node configuration is valid");
         (node, session)
@@ -1544,6 +1979,7 @@ mod end_to_end {
             config,
             Arc::new(OpenStreamAuthenticator::new(StreamPolicy::permissive())),
             Events::default(),
+            None,
         )
         .expect("node configuration is valid");
         (node, session)
@@ -1650,6 +2086,7 @@ mod end_to_end {
             listener,
             node.application(),
             HttpConfig::default(),
+            None,
             None,
             Readiness::ready(),
             async {
@@ -1777,6 +2214,7 @@ mod end_to_end {
             node.application(),
             HttpConfig::default(),
             None,
+            None,
             Readiness::ready(),
             async {
                 let _ = stopped.await;
@@ -1830,6 +2268,7 @@ mod end_to_end {
             listener,
             node.application(),
             HttpConfig::default(),
+            None,
             None,
             Readiness::ready(),
             async {
@@ -1903,6 +2342,7 @@ mod end_to_end {
             listener,
             node.application(),
             HttpConfig::default(),
+            None,
             None,
             Readiness::ready(),
             async {
@@ -2010,6 +2450,7 @@ mod end_to_end {
             listener,
             node.application(),
             HttpConfig::default(),
+            None,
             None,
             Readiness::ready(),
             async {
@@ -2498,6 +2939,7 @@ mod tls {
                 origin,
                 config,
                 metrics,
+                None,
                 Readiness::ready(),
                 async {
                     let _ = signal.await;

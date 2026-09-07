@@ -286,7 +286,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None => (base, None, None),
     };
 
-    let mut node = Node::new(resolved.node, resolved.authenticator, Events::new(observer))?;
+    let mut node = Node::new(
+        resolved.node,
+        resolved.authenticator,
+        Events::new(observer),
+        resolved.playback,
+    )?;
     if let Some(hooks) = exported {
         node = node.with_hooks(hooks);
     }

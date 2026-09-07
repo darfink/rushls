@@ -20,6 +20,12 @@ use crate::{
 
 const MULTIVARIANT_NAME: &str = "index.m3u8";
 const NAMED_KINDS: [MediaKind; 3] = [MediaKind::Audio, MediaKind::Subtitle, MediaKind::Video];
+/// Query parameter native HLS substitutes from `EXT-X-DEFINE:QUERYPARAM`.
+pub const TOKEN_QUERYPARAM: &str = "token";
+/// Suffix appended to every minted URI when playlists carry QUERYPARAM.
+const TOKEN_VARIABLE: &str = "token={$token}";
+/// Protocol version required by `EXT-X-DEFINE` with `QUERYPARAM`.
+pub const QUERYPARAM_VERSION: u8 = 11;
 
 const fn media_playlist_name(kind: MediaKind) -> &'static str {
     match kind {
@@ -95,6 +101,7 @@ impl UriBase {
                 .0
                 .as_ref()
                 .map(|base| format!("{base}/{}", PercentEncoded(stream.as_str()))),
+            query_variables: false,
         }
     }
 }
@@ -102,13 +109,29 @@ impl UriBase {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlaylistUris {
     root: Option<String>,
+    /// When set, every minted URI carries `token={$token}` for native HLS.
+    query_variables: bool,
 }
 
 impl PlaylistUris {
+    /// A second URI set whose names carry the QUERYPARAM substitution.
+    #[must_use]
+    pub fn with_query_variables(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            query_variables: true,
+        }
+    }
+
+    pub fn query_variables(&self) -> bool {
+        self.query_variables
+    }
+
     pub fn media_playlist(&self, rendition: RenditionId, kind: MediaKind) -> String {
         let mut out = String::new();
         self.write_prefix(&mut out, None, rendition);
         out.push_str(media_playlist_name(kind));
+        self.append_token_variable(&mut out);
         out
     }
 
@@ -129,6 +152,14 @@ impl PlaylistUris {
             (None, Some(emitter)) if emitter != rendition => write!(out, "../{}/", rendition.0),
             (None, Some(_)) => Ok(()),
         };
+    }
+
+    fn append_token_variable(&self, out: &mut String) {
+        if !self.query_variables {
+            return;
+        }
+        out.push(if out.contains('?') { '&' } else { '?' });
+        out.push_str(TOKEN_VARIABLE);
     }
 }
 
@@ -165,6 +196,7 @@ impl RenditionUris<'_> {
     ) -> &'a str {
         self.uris.write_prefix(out, Some(self.rendition), rendition);
         out.push_str(media_playlist_name(kind));
+        self.uris.append_token_variable(out);
         out
     }
 
@@ -175,7 +207,9 @@ impl RenditionUris<'_> {
     fn media<'a>(&self, resource: MediaResource, out: &'a mut String) -> Option<&'a str> {
         self.uris
             .write_prefix(out, Some(self.rendition), resource.rendition());
-        append_media_leaf(out, resource)
+        append_media_leaf(out, resource)?;
+        self.uris.append_token_variable(out);
+        Some(out.as_str())
     }
 }
 
@@ -238,6 +272,28 @@ mod tests {
         assert_eq!(
             rendition.sibling_playlist(RenditionId(9), MediaKind::Audio, &mut out),
             "../9/audio.m3u8"
+        );
+    }
+
+    #[test]
+    fn query_variables_suffix_every_minted_name() {
+        let uris = UriBase::default()
+            .uris(&StreamId::new("live/camera"))
+            .with_query_variables();
+        let rendition = uris.within(RenditionId(3), MediaSegmentFormat::Cmaf);
+        let mut out = String::new();
+
+        assert_eq!(
+            uris.media_playlist(RenditionId(3), MediaKind::Video),
+            "3/video.m3u8?token={$token}"
+        );
+        assert_eq!(
+            rendition.segment(SegmentId(7), &mut out),
+            "segment/7.m4s?token={$token}"
+        );
+        assert_eq!(
+            rendition.sibling_playlist(RenditionId(9), MediaKind::Audio, &mut out),
+            "../9/audio.m3u8?token={$token}"
         );
     }
 }

@@ -38,7 +38,10 @@ use crate::{
     segment::SegmentationPolicy,
     server::{
         NodeConfig,
-        http::{AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, TlsSettings},
+        http::{
+            AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, TlsSettings,
+            playback::{ClaimValue, PlaybackKeyMaterial, PlaybackSettings},
+        },
         metrics::{MetricsConfig, MetricsToken},
     },
     source::transport::srt::{SrtEncryption, SrtKeyLength},
@@ -62,6 +65,13 @@ pub struct ResolvedAppConfig {
     /// whatever certificate it started with until the process restarted --
     /// which is the failure the watch exists to prevent, and a silent one.
     pub outbound_tls: Vec<OutboundTls>,
+    /// Viewer JWT settings, present when `[auth.playback]` is configured.
+    ///
+    /// The JWKS fetch, when that is the key source, happens when the gate is
+    /// started rather than here: configuration resolve is synchronous and a
+    /// URL being well-formed is a different question from the issuer being
+    /// reachable.
+    pub playback: Option<PlaybackSettings>,
     /// File this process actually loaded, if any.
     ///
     /// Chosen before values overlay. CLI `--config` and `RUSHLS_CONFIG` win;
@@ -301,13 +311,22 @@ impl AppConfig {
         let stall = self.accept.stall;
         let open_admission = self.auth.is_open();
         let mut outbound_tls = Vec::new();
-        let authenticator = self.auth.resolve(
-            default_policy,
-            policies,
-            defaults.session.maximum_admission_time,
-            &mut client,
-            &mut outbound_tls,
-        )?;
+        let AuthAppConfig { publish, playback } = self.auth;
+        let authenticator = match publish {
+            Some(publish) => publish
+                .resolve(
+                    default_policy,
+                    policies,
+                    defaults.session.maximum_admission_time,
+                    &mut client,
+                    &mut outbound_tls,
+                )
+                .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)?,
+            None => Arc::new(OpenStreamAuthenticator::new(default_policy)),
+        };
+        let playback = playback
+            .map(|playback| playback.resolve(&mut client))
+            .transpose()?;
 
         let mut node = NodeConfig {
             maximum_sessions: self.capacity.publishers,
@@ -354,6 +373,7 @@ impl AppConfig {
         Ok(ResolvedAppConfig {
             node,
             authenticator,
+            playback,
             hooks,
             warnings,
             outbound_tls,
@@ -419,6 +439,10 @@ pub struct AuthAppConfig {
     /// and every publisher gets the default accept set.
     #[conf(flatten, prefix = "publish", serde(rename = "publish"))]
     publish: Option<HttpAuthAppConfig>,
+    /// Optional local JWT verification for viewers. When omitted, anyone with
+    /// the URL may watch.
+    #[conf(flatten, prefix = "playback", serde(rename = "playback"))]
+    playback: Option<PlaybackAuthAppConfig>,
 }
 
 impl AuthAppConfig {
@@ -426,22 +450,102 @@ impl AuthAppConfig {
     fn is_open(&self) -> bool {
         self.publish.is_none()
     }
+}
 
-    fn resolve(
-        self,
-        default: StreamPolicy,
-        policies: BTreeMap<String, StreamPolicy>,
-        admission_deadline: Duration,
-        client: &mut LazyHttpClient,
-        outbound_tls: &mut Vec<OutboundTls>,
-    ) -> Result<Arc<dyn Authenticator>, ConfigError> {
-        if let Some(publish) = self.publish {
-            publish
-                .resolve(default, policies, admission_deadline, client, outbound_tls)
-                .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)
-        } else {
-            Ok(Arc::new(OpenStreamAuthenticator::new(default)))
+#[derive(Conf)]
+#[conf(serde)]
+pub struct PlaybackAuthAppConfig {
+    #[conf(parameter, env, secret)]
+    public_key: Option<String>,
+    #[conf(parameter, long, env)]
+    public_key_file: Option<PathBuf>,
+    #[conf(parameter, long, env)]
+    jwks_url: Option<String>,
+    #[conf(parameter, env, secret)]
+    secret: Option<String>,
+    #[conf(parameter, long, env)]
+    secret_file: Option<PathBuf>,
+    #[conf(parameter, long, env, default_value = "stream")]
+    stream_claim: String,
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "30s",
+        value_parser = humantime::parse_duration,
+        serde(use_value_parser)
+    )]
+    leeway: Duration,
+    #[conf(parameter, value_parser = TomlTable::<ClaimValue>::from_str)]
+    claims: Option<TomlTable<ClaimValue>>,
+}
+
+impl PlaybackAuthAppConfig {
+    fn resolve(self, client: &mut LazyHttpClient) -> Result<PlaybackSettings, ConfigError> {
+        let public_key = resolve_optional_text_secret(
+            "the playback public key",
+            self.public_key.as_ref(),
+            self.public_key_file.as_ref(),
+        )?;
+        let secret = resolve_optional_text_secret(
+            "the playback secret",
+            self.secret.as_ref(),
+            self.secret_file.as_ref(),
+        )?;
+        let keys = match (public_key, self.jwks_url.as_deref(), secret) {
+            (Some(pem), None, None) => PlaybackKeyMaterial::PublicPem(pem.into_bytes()),
+            (None, Some(url), None) => PlaybackKeyMaterial::Jwks {
+                endpoint: Endpoint::parse(url).map_err(|error| invalid(error.to_string()))?,
+                client: Box::new(client.with_limits(Duration::from_secs(5), 64 * 1024)?),
+            },
+            (None, None, Some(secret)) => {
+                if secret.is_empty() {
+                    return Err(invalid("the playback secret must not be empty"));
+                }
+                PlaybackKeyMaterial::Secret(secret.into_bytes())
+            }
+            _ => {
+                return Err(invalid(
+                    "[auth.playback] must set exactly one of public_key, public_key_file, \
+                     jwks_url, secret, or secret_file",
+                ));
+            }
+        };
+
+        let claims = self.claims.unwrap_or_default().0;
+        let issuer = required_string_claim(&claims, "iss")?;
+        let audience = required_string_claim(&claims, "aud")?;
+        let mut extra = claims;
+        extra.remove("iss");
+        extra.remove("aud");
+
+        if self.stream_claim.is_empty() {
+            return Err(invalid("stream_claim must not be empty"));
         }
+
+        Ok(PlaybackSettings {
+            issuer,
+            audience,
+            extra,
+            stream_claim: self.stream_claim,
+            leeway: self.leeway,
+            keys,
+        })
+    }
+}
+
+fn required_string_claim(
+    claims: &BTreeMap<String, ClaimValue>,
+    name: &str,
+) -> Result<String, ConfigError> {
+    match claims.get(name) {
+        Some(ClaimValue::String(value)) if !value.is_empty() => Ok(value.clone()),
+        Some(_) => Err(invalid(format!(
+            "[auth.playback.claims] {name} must be a non-empty string"
+        ))),
+        None => Err(invalid(format!(
+            "[auth.playback.claims] must include {name}"
+        ))),
     }
 }
 

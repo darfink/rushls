@@ -299,6 +299,21 @@ impl HttpClient {
         })
     }
 
+    /// Fetches one URL and reads the whole response.
+    ///
+    /// Used for rotating key sets: the body is JSON, not a form, and there is
+    /// nothing to POST. Redirects are still not followed — a JWKS URL that
+    /// 30x's the origin elsewhere would be a configuration error, not a hop
+    /// this client should take on its own.
+    pub async fn get(&self, endpoint: &Endpoint) -> Result<Response, OutboundError> {
+        let request = Request::get(endpoint.uri())
+            .body(Full::new(Bytes::new()))
+            .map_err(|error| OutboundError::Unreachable(error.to_string()))?;
+        tokio::time::timeout(self.config.request_timeout, self.send(request))
+            .await
+            .map_err(|_| OutboundError::Timeout)?
+    }
+
     /// Sends one request and reads the whole response.
     pub async fn post(
         &self,

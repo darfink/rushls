@@ -10,6 +10,7 @@ use crate::{
         HlsMeters, HlsSnapshot, MeterSnapshot, MetricKind, OriginMeters, OriginSnapshot,
         ProcessMeters, ProcessSnapshot, Series, counters::series,
     },
+    server::http::playback::{PlaybackDenials, PlaybackMeters},
     session::{Registry, SessionSnapshot},
 };
 
@@ -60,6 +61,8 @@ pub struct MetricsSnapshot {
     pub retention_requested: Duration,
     /// One reading per retained stream, including idle ones.
     pub retention: Vec<(StreamId, RetentionDepth)>,
+    /// Viewer JWT denials, present only when playback authorization is on.
+    pub playback: Option<PlaybackDenials>,
 }
 
 /// A configured HTTP exporter backed by the node's live metrics reader.
@@ -114,6 +117,8 @@ pub struct MetricsReader {
     /// Absent unless hooks are configured, which is also when they have
     /// anything to report.
     hooks: Option<Hooks>,
+    /// Absent unless `[auth.playback]` is configured.
+    playback: Option<PlaybackMeters>,
 }
 
 impl MetricsReader {
@@ -131,6 +136,7 @@ impl MetricsReader {
             sessions,
             store,
             hooks: None,
+            playback: None,
         }
     }
 
@@ -138,6 +144,13 @@ impl MetricsReader {
     #[must_use]
     pub fn with_hooks(mut self, hooks: Hooks) -> Self {
         self.hooks = Some(hooks);
+        self
+    }
+
+    /// Also exports viewer JWT denials labelled only by status.
+    #[must_use]
+    pub fn with_playback(mut self, meters: PlaybackMeters) -> Self {
+        self.playback = Some(meters);
         self
     }
 
@@ -170,6 +183,7 @@ impl MetricsReader {
             spills_failed: self.store.disk().map_or(0, |disk| disk.spills_failed()),
             retention_requested: self.store.limits().retention.retain,
             retention,
+            playback: self.playback.as_ref().map(PlaybackMeters::snapshot),
         }
     }
 
@@ -223,6 +237,7 @@ pub fn render(snapshot: &MetricsSnapshot) -> String {
     scalars(&mut output, HlsSnapshot::SERIES, &snapshot.hls);
     scalars(&mut output, MetricsSnapshot::SERIES, snapshot);
     render_retention_capacity(&mut output, snapshot);
+    render_playback(&mut output, snapshot.playback);
 
     if !snapshot.hooks.is_empty() {
         render_hooks(&mut output, &snapshot.hooks);
@@ -269,6 +284,32 @@ fn render_retention_capacity(output: &mut String, snapshot: &MetricsSnapshot) {
         output,
         "{RETENTION_CAPACITY_BYTES}{{tier=\"disk\"}} {}",
         snapshot.retention_disk_capacity
+    )
+    .expect("writing to a String cannot fail");
+}
+
+const PLAYBACK_DENIED_TOTAL: &str = "rushls_playback_denied_total";
+
+fn render_playback(output: &mut String, playback: Option<PlaybackDenials>) {
+    let Some(denials) = playback else {
+        return;
+    };
+    metadata(
+        output,
+        PLAYBACK_DENIED_TOTAL,
+        "Viewer requests refused by playback authorization, labelled by HTTP status.",
+        MetricKind::Counter,
+    );
+    writeln!(
+        output,
+        "{PLAYBACK_DENIED_TOTAL}{{status=\"401\"}} {}",
+        denials.unauthorized
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "{PLAYBACK_DENIED_TOTAL}{{status=\"403\"}} {}",
+        denials.forbidden
     )
     .expect("writing to a String cannot fail");
 }
@@ -561,6 +602,7 @@ mod tests {
             spills_failed: 0,
             retention_requested: Duration::ZERO,
             retention: Vec::new(),
+            playback: None,
         });
 
         assert!(output.contains("# TYPE rushls_sessions_started_total counter\n"));
@@ -588,6 +630,10 @@ mod tests {
             !output.contains("rushls_hook_"),
             "a node with no hooks exports no hook series at all, rather than \
              zeroes an operator would have to learn to ignore"
+        );
+        assert!(
+            !output.contains("rushls_playback_denied_total"),
+            "playback denials are absent until [auth.playback] is configured"
         );
     }
 
@@ -664,6 +710,7 @@ mod tests {
             spills_failed: 0,
             retention_requested: Duration::ZERO,
             retention: Vec::new(),
+            playback: None,
         });
 
         assert!(output.contains("# TYPE rushls_hook_deliveries_total counter\n"));
@@ -758,6 +805,7 @@ mod tests {
             spills_failed: 4,
             retention_requested: Duration::from_mins(2),
             retention: Vec::new(),
+            playback: None,
         });
 
         assert!(output.contains("rushls_disk_spill_pending 3\n"));

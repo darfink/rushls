@@ -21,6 +21,7 @@
 
 mod body;
 mod cors;
+pub mod playback;
 mod tls;
 
 #[cfg(test)]
@@ -51,10 +52,12 @@ use crate::{
         Response as DeliveryResponse, Reuse,
     },
     observe::{Events, ProcessMeters},
+    server::http::playback::PlaybackDenial,
     server::metrics::MetricsEndpoint,
 };
 
 pub use cors::{AllowedOrigins, CorsConfig, OriginPattern, OriginPatternError, WildcardDepth};
+pub use playback::{PlaybackGate, PlaybackSettings, PlaybackStartError};
 
 use body::{RangeOutcome, StoredMediaBody, parse_range};
 
@@ -108,6 +111,7 @@ struct HttpState<P> {
     cors: Arc<CorsConfig>,
     metrics: Option<MetricsEndpoint>,
     readiness: Readiness,
+    playback: Option<Arc<PlaybackGate>>,
 }
 
 impl<P> Clone for HttpState<P> {
@@ -117,6 +121,7 @@ impl<P> Clone for HttpState<P> {
             cors: Arc::clone(&self.cors),
             metrics: self.metrics.clone(),
             readiness: self.readiness.clone(),
+            playback: self.playback.clone(),
         }
     }
 }
@@ -161,6 +166,7 @@ fn router<P: Application>(
     config: &HttpConfig,
     metrics: Option<MetricsEndpoint>,
     readiness: Readiness,
+    playback: Option<Arc<PlaybackGate>>,
 ) -> Router {
     // One catch-all rather than a route table: a stream identity may contain
     // slashes, so path structure is resolved by the application rather than by
@@ -188,6 +194,7 @@ fn router<P: Application>(
         cors: Arc::new(config.cors.clone()),
         metrics,
         readiness,
+        playback,
     })
 }
 
@@ -205,6 +212,7 @@ pub async fn serve<L, P>(
     application: Arc<P>,
     config: HttpConfig,
     metrics: Option<MetricsEndpoint>,
+    playback: Option<Arc<PlaybackGate>>,
     readiness: Readiness,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()>
@@ -215,7 +223,7 @@ where
 {
     axum::serve(
         listener,
-        router(application, &config, metrics, readiness).into_make_service(),
+        router(application, &config, metrics, readiness, playback).into_make_service(),
     )
     .with_graceful_shutdown(shutdown)
     .await
@@ -258,13 +266,20 @@ async fn handle<P: Application>(
             .into_response();
     }
 
+    let shared = service.playback.is_none();
+    if let Some(gate) = &service.playback
+        && let Err(denial) = gate.authorize(uri.path(), query.as_deref(), &headers)
+    {
+        return playback_denied(denial);
+    }
+
     let response = match service
         .application
         .serve(uri.path(), query.as_deref())
         .await
     {
         Ok(response) => response,
-        Err(failure) => return error_response(failure),
+        Err(failure) => return error_response(failure, shared),
     };
 
     // Borrowed straight from the request headers: the response is already
@@ -275,7 +290,7 @@ async fn handle<P: Application>(
     let conditional = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok());
-    match into_http(response, range, accepts_gzip(&headers), conditional) {
+    match into_http(response, range, accepts_gzip(&headers), conditional, shared) {
         Ok(response) => response,
         Err(status) => status.into_response(),
     }
@@ -427,6 +442,7 @@ fn into_http(
     range: Option<&str>,
     accepts_gzip: bool,
     if_none_match: Option<&str>,
+    shared: bool,
 ) -> Result<Response, StatusCode> {
     let content_type = HeaderValue::from_static(response.content_type.name());
     // Announced only where an encoding was actually available to choose. Saying
@@ -437,7 +453,7 @@ fn into_http(
     // Transformation is only a hazard for a resource that has two encodings to
     // be converted between, so the request not to transform is stated exactly
     // there.
-    let cache = cache_control(response.reuse, varies);
+    let cache = cache_control(response.reuse, varies, shared);
     // Derived before the gzip representation is consumed below, because both
     // tags are read out of the same member's trailer.
     let identity_tag = response
@@ -640,8 +656,13 @@ fn matches_etag(header: &str, tag: &HeaderValue) -> bool {
 /// intermediary not to convert between content codings. It is stated only for
 /// resources that have more than one coding, because it is meaningless — and
 /// on media, misleading — anywhere else.
-fn cache_control(reuse: Reuse, negotiated: bool) -> HeaderValue {
-    let value: HeaderValue = reuse.into();
+///
+/// `public` is omitted when playback authorization is on. RFC 9111 § 3.5 says
+/// that directive waives the default restriction on storing a response to a
+/// request that carried `Authorization`, which would let a CDN serve one
+/// viewer's playlist to another.
+fn cache_control(reuse: Reuse, negotiated: bool, shared: bool) -> HeaderValue {
+    let value = reuse_header(reuse, shared);
     if !negotiated {
         return value;
     }
@@ -650,6 +671,28 @@ fn cache_control(reuse: Reuse, negotiated: bool) -> HeaderValue {
         .ok()
         .and_then(|directives| HeaderValue::try_from(format!("{directives}, no-transform")).ok())
         .unwrap_or(value)
+}
+
+/// Writes a resolved lifetime as the header that communicates it.
+///
+/// Whole seconds is all the header carries, so a lifetime shorter than one
+/// becomes a revalidation. Truncating errs toward asking again sooner than
+/// policy allows rather than later, which is the safe direction for a live
+/// edge.
+fn reuse_header(reuse: Reuse, shared: bool) -> HeaderValue {
+    let seconds = reuse.max_age.as_secs();
+    if seconds == 0 {
+        return HeaderValue::from_static(REVALIDATE);
+    }
+    let mut value = if shared {
+        format!("public, max-age={seconds}")
+    } else {
+        format!("max-age={seconds}")
+    };
+    if reuse.immutable {
+        value.push_str(", immutable");
+    }
+    HeaderValue::try_from(value).unwrap_or(HeaderValue::from_static(REVALIDATE))
 }
 
 /// Declares the length of a body that is already whole in memory.
@@ -705,33 +748,13 @@ fn media_response(
     response
 }
 
-/// Writes a resolved lifetime as the header that communicates it.
-///
-/// Whole seconds is all the header carries, so a lifetime shorter than one
-/// becomes a revalidation. Truncating errs toward asking again sooner than
-/// policy allows rather than later, which is the safe direction for a live
-/// edge.
-impl From<Reuse> for HeaderValue {
-    fn from(reuse: Reuse) -> Self {
-        let seconds = reuse.max_age.as_secs();
-        if seconds == 0 {
-            return Self::from_static(REVALIDATE);
-        }
-        let mut value = format!("public, max-age={seconds}");
-        if reuse.immutable {
-            value.push_str(", immutable");
-        }
-        Self::try_from(value).unwrap_or(Self::from_static(REVALIDATE))
-    }
-}
-
 /// Maps a delivery failure onto the status that describes it.
 ///
 /// The distinctions carry real information for an operator reading logs: a
 /// directive naming an impossible position is the client's mistake (400), a
 /// deadline passing without the media arriving is the origin failing to keep up
 /// (503), and an unknown resource is neither.
-fn error_response(failure: DeliveryFailure) -> Response {
+fn error_response(failure: DeliveryFailure, shared: bool) -> Response {
     let status = match failure.error {
         DeliveryError::UnknownStream
         | DeliveryError::UnknownRendition
@@ -742,7 +765,7 @@ fn error_response(failure: DeliveryFailure) -> Response {
     };
     let mut response = (status, failure.error.to_string()).into_response();
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, failure.reuse.into());
+    headers.insert(header::CACHE_CONTROL, reuse_header(failure.reuse, shared));
     if matches!(failure.error, DeliveryError::Unsatisfied) {
         // Tells a client to come back rather than to give up on the stream.
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -750,5 +773,16 @@ fn error_response(failure: DeliveryFailure) -> Response {
     // Errors carry the same CORS policy as successes — a player that cannot
     // read a 404 cross-origin sees a network failure instead, and retries
     // forever — which the layer now applies to every response alike.
+    response
+}
+
+/// A viewer JWT that was missing, malformed, or not admitted for this stream.
+fn playback_denied(denial: PlaybackDenial) -> Response {
+    let mut response = denial.status().into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if matches!(denial, PlaybackDenial::Unauthorized) {
+        headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    }
     response
 }

@@ -4,7 +4,12 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use axum::{Router, extract::Request, response::IntoResponse, routing::post};
+use axum::{
+    Router,
+    extract::Request,
+    response::IntoResponse,
+    routing::{get, post},
+};
 use bytes::Bytes;
 use http::{StatusCode, header};
 
@@ -60,6 +65,10 @@ async fn dated() -> impl IntoResponse {
     )
 }
 
+async fn keys() -> impl IntoResponse {
+    r#"{"keys":[]}"#
+}
+
 /// Starts a server on an ephemeral loopback port and returns its address.
 async fn start() -> SocketAddr {
     let router = Router::new()
@@ -68,7 +77,8 @@ async fn start() -> SocketAddr {
         .route("/enormous", post(enormous))
         .route("/teapot", post(teapot))
         .route("/busy", post(busy))
-        .route("/dated", post(dated));
+        .route("/dated", post(dated))
+        .route("/keys", get(keys));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("an ephemeral port is available");
@@ -126,6 +136,19 @@ async fn a_status_is_reported_rather_than_interpreted() {
          and hooks classify the same status differently"
     );
     assert_eq!(response.body, Bytes::from_static(b"no coffee"));
+}
+
+#[tokio::test]
+async fn a_get_fetches_without_a_body_or_content_type() {
+    let address = start().await;
+
+    let response = client(ClientConfig::default())
+        .get(&endpoint(address, "/keys"))
+        .await
+        .expect("the endpoint answers");
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body, Bytes::from_static(br#"{"keys":[]}"#));
 }
 
 #[tokio::test]

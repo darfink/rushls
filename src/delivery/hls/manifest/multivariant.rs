@@ -24,6 +24,11 @@ impl<'a> MultivariantPlaylistWriter<'a> {
         Ok(self)
     }
 
+    pub fn define_queryparam(&mut self, name: &str) -> ManifestWriteResult<&mut Self> {
+        super::write_queryparam_define(self.out, name)?;
+        Ok(self)
+    }
+
     pub fn independent_segments(&mut self) -> ManifestWriteResult<&mut Self> {
         writeln!(self.out, "#EXT-X-INDEPENDENT-SEGMENTS")?;
         Ok(self)

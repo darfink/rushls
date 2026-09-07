@@ -25,6 +25,9 @@ rml_amf0.workspace = true
 broadcast-common = { version = "9.3", default-features = false, features = ["std"] }
 humantime = "2"
 isolang = { version = "2.4.0", default-features = false }
+# Local JWT verification on every viewer request. `ring` matches this crate's
+# rustls backend, so playback auth does not pull in a second crypto stack.
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 libc = "0.2"
 notify = "8"
 notify-debouncer-full = "0.7"

@@ -30,7 +30,7 @@ use crate::{
             media::media_playlist, multivariant::multivariant_playlist,
             timing::blocking_reload_deadline,
         },
-        uri::{Resource, UriBase, parse_path},
+        uri::{Resource, TOKEN_QUERYPARAM, UriBase, parse_path},
     },
     delivery::{EdgeCondition, Origin, Reuse, uri::ContentType},
     domain::{RenditionId, StreamId},
@@ -103,6 +103,12 @@ pub struct Config {
     pub cache_control: CacheControlPolicy,
     /// Where the names playlists emit are rooted. Relative by default.
     pub uri_base: UriBase,
+    /// When set, a non-empty `token` query selects the QUERYPARAM playlist form.
+    ///
+    /// HTTP verifies the JWT. This flag only chooses which cached bytes to
+    /// serve: native HLS clients cannot set `Authorization` on media fetches,
+    /// so the playlist has to name `?token={$token}` itself.
+    pub query_variables: bool,
 }
 
 /// A blocking playlist reload: "do not answer until you have this".
@@ -148,6 +154,8 @@ pub struct Request {
     pub blocking: Option<BlockingReload>,
     /// Playlist Delta Update request. Ignored on the multivariant playlist.
     pub skip: PlaylistDelta,
+    /// Whether this request should be answered with the QUERYPARAM playlist.
+    pub query_variables: bool,
 }
 
 impl Request {
@@ -156,12 +164,19 @@ impl Request {
             resource,
             blocking,
             skip: PlaylistDelta::Full,
+            query_variables: false,
         }
     }
 
     #[must_use]
     pub fn with_skip(mut self, skip: PlaylistDelta) -> Self {
         self.skip = skip;
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_variables(mut self, query_variables: bool) -> Self {
+        self.query_variables = query_variables;
         self
     }
 }
@@ -242,7 +257,11 @@ impl Service {
         };
         self.serve(
             &named.stream,
-            Request::new(named.resource, directives.blocking).with_skip(directives.skip),
+            Request::new(named.resource, directives.blocking)
+                .with_skip(directives.skip)
+                .with_query_variables(
+                    self.config.query_variables && query_has_nonempty_token(query),
+                ),
         )
         .await
     }
@@ -347,7 +366,7 @@ impl Service {
             .stream(stream)
             .ok_or(DeliveryError::UnknownStream)?;
         match request.resource {
-            Resource::Multivariant => self.multivariant(stream, &live),
+            Resource::Multivariant => self.multivariant(stream, &live, request.query_variables),
             Resource::MediaPlaylist(rendition, _) => {
                 self.media_playlist(stream, &live, rendition, request).await
             }
@@ -358,6 +377,7 @@ impl Service {
         &self,
         stream_id: &StreamId,
         live: &Arc<LiveStream>,
+        query_variables: bool,
     ) -> Result<Response, DeliveryError> {
         let stream = live.snapshot();
         // A topology exists only once a publisher has attached; the playlist is
@@ -367,9 +387,9 @@ impl Service {
         }
         let caches = self.cache_for(stream_id);
         let rendered = caches.multivariant().get_or_render(
-            PlaylistKey::multivariant(&stream),
+            PlaylistKey::multivariant(&stream).with_query_variables(query_variables),
             || -> Result<String, DeliveryError> {
-                multivariant_playlist(&stream, &self.config.playlist, caches.uris())?
+                multivariant_playlist(&stream, &self.config.playlist, caches.uris(query_variables))?
                     .ok_or(DeliveryError::UnknownResource)
             },
         )?;
@@ -438,7 +458,8 @@ impl Service {
                 let stream = live.snapshot();
                 let snapshot = rendition_for_stream(&stream, request.resource)?;
                 Ok((
-                    PlaylistKey::media(&stream, media_revision, skip),
+                    PlaylistKey::media(&stream, media_revision, skip)
+                        .with_query_variables(request.query_variables),
                     (stream, snapshot),
                 ))
             },
@@ -449,7 +470,7 @@ impl Service {
                     snapshot,
                     control,
                     &self.config.playlist,
-                    caches.uris(),
+                    caches.uris(request.query_variables),
                     skip,
                 )?)
             },
@@ -569,6 +590,30 @@ fn parse_directives(query: Option<&str>) -> Result<PlaylistQuery, DeliveryError>
         blocking: BlockingReload::from_directives(msn, part)?,
         skip,
     })
+}
+
+/// Whether the query carries a non-empty `token` parameter.
+///
+/// Delivery chooses the playlist form from this rather than from the verified
+/// JWT, so the bytes and the cache key that names them are decided by the same
+/// fact. It stays true when the header carried the token as well: native HLS
+/// will fetch the children of that playlist without a header either way.
+///
+/// An empty `token=` is not this. The HTTP gate 401s it before delivery is
+/// reached, and a playlist declaring `QUERYPARAM` is unparseable to a client
+/// whose request has no value to substitute.
+fn query_has_nonempty_token(query: Option<&str>) -> bool {
+    query
+        .and_then(|query| {
+            query
+                .split('&')
+                .filter(|pair| !pair.is_empty())
+                .find_map(|pair| {
+                    let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    (key == TOKEN_QUERYPARAM).then_some(value)
+                })
+        })
+        .is_some_and(|value| !value.is_empty())
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -2,8 +2,9 @@
 
 > **Status: largely implemented.** Outstanding, in the order they are least
 > to most self-contained: moderate timestamp jumps becoming discontinuities,
-> payload-carrying hooks, `[record]`, playback authorization,
-> and enforcing `memory_per_publisher`. Playlist Delta Updates and
+> payload-carrying hooks, `[record]`,
+> and enforcing `memory_per_publisher`. Playlist Delta Updates,
+> playback authorization, and
 > effective retention-depth reporting have landed, including the disk tier.
 > Every key belonging to an unbuilt feature is refused
 > at startup by name, so nothing here silently does nothing. Everything else
@@ -530,5 +531,5 @@ Out of scope for this design, neither specified nor planned here:
 per-hook rendition filtering, and transcoding with any rendition ladder.
 
 Everything else in this ledger is specified in `config.md` and pending
-implementation. In particular, playback authorization and environment
-interpolation are designed, not deferred to a later design.
+implementation. Environment interpolation is designed, not deferred to a later
+design.

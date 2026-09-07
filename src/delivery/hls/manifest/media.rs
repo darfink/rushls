@@ -24,6 +24,19 @@ impl<'a> MediaPlaylistWriter<'a> {
         Ok(self)
     }
 
+    pub fn define_queryparam(&mut self, name: &str) -> ManifestWriteResult<&mut Self> {
+        super::write_queryparam_define(self.out, name)?;
+        Ok(self)
+    }
+
+    /// Declares that every Media Segment this playlist names is independently
+    /// decodable.
+    ///
+    /// Projection does not emit this on media playlists today: the
+    /// multivariant playlist already asserts it for the presentation, and HLS
+    /// applies that to the media playlists it names. The writer still knows
+    /// the tag so a later projection that needs it on a media playlist is not
+    /// forced to invent a second spelling.
     pub fn independent_segments(&mut self) -> ManifestWriteResult<&mut Self> {
         writeln!(self.out, "#EXT-X-INDEPENDENT-SEGMENTS")?;
         Ok(self)

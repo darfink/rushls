@@ -56,6 +56,8 @@ pub struct PlaylistKey {
     media_revision: u64,
     /// Full and delta of one epoch are different playlists of the same inputs.
     skip: PlaylistDelta,
+    /// QUERYPARAM and Bearer/ungated forms are different bytes of the same epoch.
+    query_variables: bool,
 }
 
 impl PlaylistKey {
@@ -70,6 +72,7 @@ impl PlaylistKey {
             catalog_revision: stream.revision,
             media_revision: 0,
             skip: PlaylistDelta::Full,
+            query_variables: false,
         }
     }
 
@@ -79,7 +82,14 @@ impl PlaylistKey {
             catalog_revision: stream.media_catalog_revision,
             media_revision,
             skip,
+            query_variables: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_query_variables(mut self, query_variables: bool) -> Self {
+        self.query_variables = query_variables;
+        self
     }
 
     fn epoch(self) -> PlaylistEpoch {
@@ -121,10 +131,19 @@ struct Encoded {
 ///
 /// A single `latest` would let a full request evict a delta of the same
 /// epoch, and mixed traffic would re-render both. Sibling slots share the
-/// epoch so a part on another rendition still busts all of them.
+/// epoch so a part on another rendition still busts all of them. QUERYPARAM
+/// and Bearer forms occupy parallel skip slots: they are different bytes
+/// of the same epoch, not a reason to evict each other.
 #[derive(Clone, Debug, Default)]
 struct Cached {
     epoch: PlaylistEpoch,
+    plain: SkipForms,
+    query: SkipForms,
+}
+
+/// One encoding of each skip flavour, for one playlist form.
+#[derive(Clone, Debug, Default)]
+struct SkipForms {
     full: Option<Encoded>,
     skip: Option<Encoded>,
     skip_v2: Option<Encoded>,
@@ -135,7 +154,7 @@ impl Cached {
         if self.epoch != key.epoch() {
             return None;
         }
-        self.slot(key.skip).map(|encoded| Rendered {
+        self.slot(key).map(|encoded| Rendered {
             bytes: encoded.rendered.clone(),
             gzip: encoded.gzip.clone(),
             freshly_rendered: false,
@@ -149,23 +168,47 @@ impl Cached {
                 ..Self::default()
             };
         }
-        *self.slot_mut(key.skip) = Some(encoded);
+        *self.slot_mut(key) = Some(encoded);
     }
 
-    fn slot(&self, skip: PlaylistDelta) -> Option<&Encoded> {
-        match skip {
-            PlaylistDelta::Full => self.full.as_ref(),
-            PlaylistDelta::Skip => self.skip.as_ref(),
-            PlaylistDelta::SkipV2 => self.skip_v2.as_ref(),
+    fn slot(&self, key: &PlaylistKey) -> Option<&Encoded> {
+        skip_slot(self.forms(key.query_variables), key.skip)
+    }
+
+    fn slot_mut(&mut self, key: PlaylistKey) -> &mut Option<Encoded> {
+        skip_slot_mut(self.forms_mut(key.query_variables), key.skip)
+    }
+
+    fn forms(&self, query_variables: bool) -> &SkipForms {
+        if query_variables {
+            &self.query
+        } else {
+            &self.plain
         }
     }
 
-    fn slot_mut(&mut self, skip: PlaylistDelta) -> &mut Option<Encoded> {
-        match skip {
-            PlaylistDelta::Full => &mut self.full,
-            PlaylistDelta::Skip => &mut self.skip,
-            PlaylistDelta::SkipV2 => &mut self.skip_v2,
+    fn forms_mut(&mut self, query_variables: bool) -> &mut SkipForms {
+        if query_variables {
+            &mut self.query
+        } else {
+            &mut self.plain
         }
+    }
+}
+
+fn skip_slot(forms: &SkipForms, skip: PlaylistDelta) -> Option<&Encoded> {
+    match skip {
+        PlaylistDelta::Full => forms.full.as_ref(),
+        PlaylistDelta::Skip => forms.skip.as_ref(),
+        PlaylistDelta::SkipV2 => forms.skip_v2.as_ref(),
+    }
+}
+
+fn skip_slot_mut(forms: &mut SkipForms, skip: PlaylistDelta) -> &mut Option<Encoded> {
+    match skip {
+        PlaylistDelta::Full => &mut forms.full,
+        PlaylistDelta::Skip => &mut forms.skip,
+        PlaylistDelta::SkipV2 => &mut forms.skip_v2,
     }
 }
 
@@ -287,6 +330,7 @@ impl PlaylistCache {
 #[derive(Debug, Default)]
 pub struct StreamPlaylistCache {
     uris: PlaylistUris,
+    query_uris: PlaylistUris,
     multivariant: PlaylistCache,
     renditions: Mutex<Vec<(RenditionId, Arc<PlaylistCache>)>>,
 }
@@ -294,13 +338,19 @@ pub struct StreamPlaylistCache {
 impl StreamPlaylistCache {
     pub fn new(uris: PlaylistUris) -> Self {
         Self {
+            query_uris: uris.with_query_variables(),
             uris,
-            ..Self::default()
+            multivariant: PlaylistCache::new(),
+            renditions: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn uris(&self) -> &PlaylistUris {
-        &self.uris
+    pub fn uris(&self, query_variables: bool) -> &PlaylistUris {
+        if query_variables {
+            &self.query_uris
+        } else {
+            &self.uris
+        }
     }
 
     pub fn multivariant(&self) -> &PlaylistCache {
@@ -363,6 +413,7 @@ mod tests {
                         catalog_revision: 1,
                         media_revision: revision.get(),
                         skip: PlaylistDelta::Full,
+                        query_variables: false,
                     },
                     (),
                 ))
@@ -387,6 +438,7 @@ mod tests {
                     catalog_revision: 1,
                     media_revision: 0,
                     skip: PlaylistDelta::Full,
+                    query_variables: false,
                 })
                 .is_none(),
             "bytes observed across a revision change are never cached"
@@ -573,6 +625,33 @@ mod tests {
             "storing one skip form of the new epoch must not keep the other \
              form from the previous epoch"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn queryparam_and_plain_forms_occupy_sibling_slots() -> Result<(), ()> {
+        let cache = PlaylistCache::new();
+        let plain = PlaylistKey::default();
+        let query = plain.with_query_variables(true);
+        let mut renders = 0;
+
+        cache.get_or_render::<()>(plain, || {
+            renders += 1;
+            Ok("plain".to_owned())
+        })?;
+        cache.get_or_render::<()>(query, || {
+            renders += 1;
+            Ok("query".to_owned())
+        })?;
+        let again_plain =
+            cache.get_or_render::<()>(plain, || panic!("plain of this epoch is already cached"))?;
+        let again_query =
+            cache.get_or_render::<()>(query, || panic!("query of this epoch is already cached"))?;
+
+        assert_eq!(renders, 2);
+        assert_eq!(again_plain.bytes.as_ref(), b"plain");
+        assert_eq!(again_query.bytes.as_ref(), b"query");
+        assert_ne!(again_plain.gzip, again_query.gzip);
         Ok(())
     }
 }

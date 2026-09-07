@@ -34,7 +34,10 @@ use crate::{
 };
 
 use super::{
-    http::{self, Application, HttpConfig, Readiness, TlsError},
+    http::{
+        self, Application, HttpConfig, PlaybackGate, PlaybackSettings, PlaybackStartError,
+        Readiness, TlsError,
+    },
     metrics::{MetricsConfig, MetricsEndpoint, MetricsReader},
 };
 
@@ -167,6 +170,8 @@ pub enum RuntimeError {
     SrtStopped,
     #[error("HTTP server failed: {0}")]
     Http(std::io::Error),
+    #[error("could not start playback authorization: {0}")]
+    Playback(#[from] PlaybackStartError),
     #[error("a runtime task failed: {0}")]
     Task(JoinError),
 }
@@ -180,6 +185,7 @@ pub struct Node {
     hls: Arc<HlsService>,
     application: Arc<ViewerApplication>,
     metrics: MetricsReader,
+    playback: Option<PlaybackSettings>,
 }
 
 /// The protocols sharing one viewer-facing HTTP namespace.
@@ -271,6 +277,7 @@ impl Node {
         mut config: NodeConfig,
         authenticator: Arc<dyn Authenticator>,
         events: Events,
+        playback: Option<PlaybackSettings>,
     ) -> Result<Self, RuntimeError> {
         if config.maximum_sessions == 0 {
             return Err(RuntimeError::InvalidConfiguration(
@@ -299,6 +306,8 @@ impl Node {
             .http
             .validate()
             .map_err(RuntimeError::InvalidConfiguration)?;
+
+        config.hls.query_variables = playback.is_some();
 
         // There is one input policy for a publication. Keeping both transport
         // adapters and the session driver on the same value prevents bytes
@@ -342,6 +351,7 @@ impl Node {
             hls,
             application,
             metrics,
+            playback,
         })
     }
 
@@ -378,7 +388,7 @@ impl Node {
 
     /// Runs both listeners and maintenance until `shutdown` resolves.
     pub async fn serve(
-        self,
+        mut self,
         shutdown: impl Future<Output = ()> + Send,
     ) -> Result<(), RuntimeError> {
         let rtmp_listener =
@@ -429,6 +439,14 @@ impl Node {
 
         let (stop_tx, stop_rx) = watch::channel(false);
         let readiness = Readiness::default();
+        let playback = match self.playback.take() {
+            Some(settings) => {
+                let gate = PlaybackGate::start(settings).await?;
+                self.metrics = self.metrics.with_playback(gate.meters());
+                Some(Arc::new(gate))
+            }
+            None => None,
+        };
         let mut tasks = JoinSet::new();
         self.spawn_listeners(
             &mut tasks,
@@ -437,6 +455,7 @@ impl Node {
             http_listener,
             https_listener,
             metrics_listener,
+            playback,
             &events,
             &readiness,
             stop_rx,
@@ -481,6 +500,7 @@ impl Node {
         http_listener: Option<TcpListener>,
         https_listener: Option<TcpListener>,
         metrics_listener: Option<TcpListener>,
+        playback: Option<Arc<PlaybackGate>>,
         events: &Events,
         readiness: &Readiness,
         stop_rx: watch::Receiver<bool>,
@@ -519,6 +539,7 @@ impl Node {
                 metrics
                     .clone()
                     .filter(|_| self.config.shares_metrics_with_http()),
+                playback.clone(),
                 readiness.clone(),
                 stop_rx.clone(),
                 self.config.shutdown,
@@ -552,6 +573,7 @@ impl Node {
                 metrics
                     .clone()
                     .filter(|_| self.config.shares_metrics_with_https()),
+                playback.clone(),
                 readiness.clone(),
                 stop_rx.clone(),
                 self.config.shutdown,
@@ -565,6 +587,7 @@ impl Node {
                 Arc::clone(&self.application),
                 self.config.http.clone(),
                 self.metrics_endpoint(),
+                playback,
                 readiness.clone(),
                 stop_rx.clone(),
                 self.config.shutdown,
@@ -795,11 +818,13 @@ fn report_panic<L: IngestListener>(services: &Services, completed: Option<Result
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_http<L>(
     listener: L,
     application: Arc<ViewerApplication>,
     config: HttpConfig,
     metrics: Option<MetricsEndpoint>,
+    playback: Option<Arc<PlaybackGate>>,
     readiness: Readiness,
     stop: watch::Receiver<bool>,
     shutdown: Duration,
@@ -813,6 +838,7 @@ where
         application,
         config,
         metrics,
+        playback,
         readiness,
         wait_for_stop(stop.clone()),
     );
@@ -917,6 +943,7 @@ mod tests {
             config,
             Arc::new(OpenStreamAuthenticator::new(StreamPolicy::permissive())),
             events,
+            None,
         )
     }
 

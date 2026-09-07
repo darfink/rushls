@@ -78,6 +78,17 @@ pub fn validate_uri(
     Ok(())
 }
 
+/// Declares that URI variables are taken from a query parameter of this name.
+///
+/// Written here rather than hanging off one playlist writer, because both the
+/// multivariant and media playlists must carry it, and it must appear before
+/// any URI that references `{$name}`.
+pub fn write_queryparam_define(out: &mut String, name: &str) -> ManifestWriteResult<()> {
+    let mut attributes = AttributeList::new(out, "EXT-X-DEFINE");
+    attributes.quoted("QUERYPARAM", name)?;
+    attributes.end()
+}
+
 /// Writes one tag's comma-separated attribute list.
 ///
 /// Every attribute goes through a method that knows how its value is encoded,
