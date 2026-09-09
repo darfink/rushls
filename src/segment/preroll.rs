@@ -74,7 +74,7 @@ pub async fn run(
             return Ok(lock(segmentation, buffered, InputState::Open, events));
         }
         if observer.exhausted() {
-            return Err(CadenceError::NoSegmentationBoundary.into());
+            return Err(observer.rejection()?.into());
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -108,7 +108,7 @@ pub async fn run(
             // The input is gone, so no further evidence can arrive. Whatever
             // the observer can conclude now is final.
             observer.close_input();
-            let segmentation = select(
+            let Some(segmentation) = select(
                 &observer,
                 presentation,
                 &buffered,
@@ -116,7 +116,9 @@ pub async fn run(
                 limits,
                 &mut work,
             )?
-            .ok_or(CadenceError::NoSegmentationBoundary)?;
+            else {
+                return Err(observer.rejection()?.into());
+            };
             return Ok(lock(segmentation, buffered, state, events));
         }
     }
@@ -568,6 +570,115 @@ mod admission_tests {
     use crate::media::fixtures::{video_presentation, video_sample, video_timeline};
     use crate::segment::fixtures::SampleBatches;
     use std::time::Duration;
+    #[tokio::test]
+    async fn three_24fps_encoders_require_common_idrs_not_just_a_48_frame_gop_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            domain::{
+                FrameRate, MediaKind, MediaParameters, Timebase, TrackId, fixtures::TrackBuilder,
+            },
+            media::fixtures,
+        };
+        // Keyframe indexes captured from three GStreamer x264enc instances
+        // fed the same 24 fps tee at 2500, 620, and 90 kbit/s. Scene cuts
+        // reset each encoder's GOP at different frames despite key-int-max=48.
+        let keyframes: [&[i64]; 3] = [
+            &[
+                0, 2, 3, 4, 7, 8, 11, 12, 14, 15, 16, 18, 19, 20, 22, 23, 24, 26, 27, 28, 31, 32,
+                34, 35, 36, 38, 39, 40, 42, 43, 44, 46, 47, 48, 51, 52, 54, 55, 56, 59, 60, 62, 63,
+                64, 66, 67, 68, 70, 71, 72, 74, 75, 76, 78, 79, 80, 82, 83, 84, 86, 87, 88, 90, 91,
+                92, 94, 95, 96,
+            ],
+            &[0, 12, 24, 37, 50, 63, 76, 88],
+            &[0, 23, 46, 68, 90],
+        ];
+        let audio_base = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+        let mut tracks: Vec<_> = (0..3)
+            .map(|id| {
+                TrackBuilder::new(id, MediaKind::Video)
+                    .parameters(MediaParameters::Video {
+                        width: nz::u32!(1920),
+                        height: nz::u32!(1080),
+                        frame_rate: Some(FrameRate::new(nz::u32!(24), nz::u32!(1))),
+                        video_delay: 0,
+                    })
+                    .build()
+            })
+            .collect();
+        tracks.push(
+            TrackBuilder::new(3, MediaKind::Audio)
+                .timebase(audio_base)
+                .build(),
+        );
+        let presentation = fixtures::presentation(tracks);
+        let timeline = fixtures::timeline([
+            (0, Timebase::hz90k()),
+            (1, Timebase::hz90k()),
+            (2, Timebase::hz90k()),
+            (3, audio_base),
+        ]);
+        for aligned in [false, true] {
+            let mut samples = Vec::new();
+            for frame in 0..=97 {
+                for (id, keys) in keyframes.iter().enumerate() {
+                    let mut sample = video_sample(
+                        frame * 3750,
+                        3750,
+                        if aligned {
+                            frame % 48 == 0
+                        } else {
+                            keys.contains(&frame)
+                        },
+                        0,
+                    );
+                    if let NormalizedSample::Video(video) = &mut sample {
+                        video.track_id = TrackId(u32::try_from(id)?);
+                    }
+                    samples.push(sample);
+                }
+            }
+            samples.extend((0..193).map(|frame| fixtures::audio_sample(3, frame * 1024, 1024)));
+            samples.sort_by_key(|sample| {
+                sample.pts()
+                    * if sample.track_id() == TrackId(3) {
+                        15
+                    } else {
+                        8
+                    }
+            });
+            // Exercise streaming admission rather than only the EOF path.
+            let batches = samples.chunks(17).map(<[_]>::to_vec).collect();
+            let result = run(
+                &mut SampleBatches::new(batches),
+                PrerollRequest {
+                    presentation: &presentation,
+                    timeline: &timeline,
+                    limits: PrerollLimits::permissive(),
+                    policy: SegmentationPolicy::latency_first(
+                        Duration::from_secs(2),
+                        Duration::from_secs(1),
+                    ),
+                },
+                &crate::mux::fixtures::discarded_events(),
+            )
+            .await;
+            if aligned {
+                let admitted = result?;
+                assert_eq!(admitted.input_state, InputState::Open);
+                for id in 0..3 {
+                    let plan = admitted.segmentation.get(TrackId(id)).expect("video plan");
+                    assert_eq!(plan.segment_duration.get(), 180_000);
+                    assert_eq!(plan.part_duration.get(), 90_000);
+                }
+            } else {
+                assert!(
+                    matches!(result, Err(PrerollError::Cadence(CadenceError::UnalignedVideoBoundaries { maximum, .. })) if maximum == Duration::from_secs(4))
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn bounded_admission_selects_three_seconds_without_runtime_slack()
     -> Result<(), Box<dyn std::error::Error>> {

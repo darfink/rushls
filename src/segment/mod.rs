@@ -324,6 +324,10 @@ pub enum CadenceError {
     InconsistentPartCadence(TrackId),
     #[error("no usable random-access boundary satisfies the segmentation policy")]
     NoSegmentationBoundary,
+    #[error(
+        "{tracks} video tracks have no common random-access boundary after startup within segment maximum {maximum:?}"
+    )]
+    UnalignedVideoBoundaries { tracks: usize, maximum: Duration },
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

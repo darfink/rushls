@@ -314,6 +314,57 @@ impl CadenceObserver {
             .all(|(index, _)| self.has_crossed(index, self.policy.segment_cap()))
     }
 
+    /// Diagnose alignment only after admission has exhausted its evidence.
+    /// A common boundary with an infeasible contract keeps the generic error.
+    pub fn rejection(&self) -> Result<CadenceError, CadenceError> {
+        let videos: Vec<_> = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, track)| (track.kind == MediaKind::Video).then_some(index))
+            .collect();
+        if videos.len() > 1 {
+            let authority = videos[0];
+            let track = &self.tracks[authority];
+            let maximum = track
+                .timebase
+                .duration_to_ticks_floor(self.policy.segment_cap());
+            let mut work = 0usize;
+            for boundary in track
+                .boundaries
+                .iter()
+                .filter(|boundary| boundary.start <= maximum)
+            {
+                work = work.saturating_add(
+                    videos
+                        .iter()
+                        .map(|index| self.tracks[*index].boundaries.len())
+                        .sum::<usize>(),
+                );
+                if work > 1_000_000 {
+                    return Ok(CadenceError::NoSegmentationBoundary);
+                }
+                if self
+                    .video_boundaries_covering(
+                        &videos,
+                        BoundaryPoint {
+                            track_index: authority,
+                            ticks: boundary.start,
+                        },
+                    )?
+                    .is_some()
+                {
+                    return Ok(CadenceError::NoSegmentationBoundary);
+                }
+            }
+            return Ok(CadenceError::UnalignedVideoBoundaries {
+                tracks: videos.len(),
+                maximum: self.policy.segment_cap(),
+            });
+        }
+        Ok(CadenceError::NoSegmentationBoundary)
+    }
+
     fn video_boundaries_covering(
         &self,
         video_tracks: &[usize],
