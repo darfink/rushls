@@ -570,6 +570,85 @@ mod tests {
         }
     }
 
+    /// A muxer that cannot flush what it is still holding.
+    ///
+    /// Stands in for the real cases: an open segment whose duration would
+    /// overrun its ceiling once held-back reorder samples are released, or a
+    /// coordinated cut that no track can satisfy.
+    struct UnflushableMuxer;
+
+    impl Muxer for UnflushableMuxer {
+        fn expected_publication_interval(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(1)
+        }
+
+        fn push(
+            &mut self,
+            _sample: NormalizedSample,
+            _out: &mut dyn Appender<PackagedMedia>,
+        ) -> Result<(), MuxError> {
+            Ok(())
+        }
+
+        fn finish(
+            &mut self,
+            _reason: FinishReason,
+            _out: &mut dyn Appender<PackagedMedia>,
+        ) -> Result<(), MuxError> {
+            Err(MuxError::Mux("cannot flush the open segment".into()))
+        }
+    }
+
+    /// Records the reason a publisher was finalized with, if it ever was.
+    struct FinalizedPublisher(Arc<parking_lot::Mutex<Option<FinishReason>>>);
+
+    impl HlsPublisher for FinalizedPublisher {
+        fn write(&mut self, _media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
+            Ok(PublishOutcome::Published)
+        }
+
+        fn finish(&mut self, reason: FinishReason) -> Result<(), HlsError> {
+            *self.0.lock() = Some(reason);
+            Ok(())
+        }
+    }
+
+    /// A muxer that cannot flush must not leave the publication open.
+    ///
+    /// [\`MediaTail::finish\`] runs three steps: close the muxer, publish what it
+    /// produced, then finalize the publisher. Only the third writes
+    /// \`EXT-X-ENDLIST\` and drops the preload hint, and propagating the first
+    /// step's error skips it — so a publication whose last bytes could not be
+    /// muxed serves a playlist that says, forever, that more media is coming.
+    ///
+    /// That is strictly worse than the failure it follows. The muxer failing
+    /// costs a viewer the final fragment; not finalizing costs every viewer an
+    /// endless poll, and costs a blocking reload an answer it can never be
+    /// given. The stream is over in both cases, and the playlist has to say so.
+    #[test]
+    fn a_muxer_that_cannot_flush_still_finalizes_the_publication() {
+        let session = SessionMeters::new(ProcessMeters::default());
+        let finalized = Arc::new(parking_lot::Mutex::new(None));
+        let mut tail = MediaTail::new(
+            Box::new(UnflushableMuxer),
+            Box::new(FinalizedPublisher(Arc::clone(&finalized))),
+            session.mux_view(),
+            session.delivery_view(),
+        );
+
+        let result = tail.finish(FinishReason::Final);
+
+        assert!(
+            result.is_err(),
+            "the drain failure is still reported to the caller"
+        );
+        assert_eq!(
+            *finalized.lock(),
+            Some(FinishReason::Final),
+            "a failed flush must not prevent the playlist from being ended"
+        );
+    }
+
     /// What a publisher saw, in the order it saw it.
     #[derive(Default)]
     struct PublishLog {

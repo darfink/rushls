@@ -86,7 +86,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["a
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-rcgen = "0.14"
+# `x509-parser` so the Apple HLS suite can sign a throwaway listener leaf with
+# a CA the machine already trusts, instead of installing a trust root itself.
+rcgen = { version = "0.14", features = ["x509-parser"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 cc-rtmp.workspace = true
 bytes = "1.12.1"

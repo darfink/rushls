@@ -2154,6 +2154,175 @@ mod end_to_end {
         assert_published_audio_is_http_playable(node).await;
     }
 
+    /// A graceful RTMP unpublish must end the playlist even mid-segment.
+    ///
+    /// The SRT case below covers an input that happens to run out on a segment
+    /// boundary. This one deliberately does not: the FLV carries eight seconds
+    /// of one-second GOPs against a two-second cadence, so the publisher stops
+    /// with a segment still open and with samples the normalizer is holding
+    /// back for reordering.
+    ///
+    /// Ending mid-segment is the ordinary case, not the exotic one — an encoder
+    /// stopping does not consult the packager about when to do it — so this is
+    /// the shape a graceful end has to survive. The transport signal is the same
+    /// either way: \`on_unpublish\` and a clean session close both resolve to
+    /// [\`InputState::Closed\`], which is what this publisher sends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_graceful_rtmp_unpublish_appends_endlist_mid_segment() {
+        const FLV: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/apple_hls/fixtures/h264_aac.flv"
+        ));
+
+        let (node, session) = node_for_one_second_gops();
+        let outcome = run_session(
+            Box::new(FlvPublish {
+                request: publish_request(),
+                flv: FLV,
+                input: session.input,
+            }),
+            node.services(),
+            &session,
+            PendingPermit::unlimited(),
+        )
+        .await;
+        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+
+        let http = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral HTTP listener binds");
+        let address = http.local_addr().expect("listener has an address");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve(
+            http,
+            node.application(),
+            HttpConfig::default(),
+            None,
+            None,
+            Readiness::ready(),
+            async {
+                let _ = stopped.await;
+            },
+        ));
+
+        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
+        assert_eq!(multivariant.status, 200);
+        let multivariant =
+            String::from_utf8(multivariant.body).expect("the multivariant playlist is text");
+        let uris = media_playlist_uris(&multivariant);
+        assert!(
+            !uris.is_empty(),
+            "the presentation names media:\n{multivariant}"
+        );
+        for uri in uris {
+            let media = request(address, "GET", &format!("/live/camera/{uri}"), &[]).await;
+            assert_eq!(media.status, 200, "GET {uri}");
+            let playlist = String::from_utf8(media.body).expect("media playlist is text");
+            assert!(
+                playlist.contains("#EXT-X-ENDLIST"),
+                "a graceful RTMP unpublish must end {uri}:\n{playlist}"
+            );
+            assert!(
+                !playlist.contains("#EXT-X-PRELOAD-HINT"),
+                "an ended playlist must not hint a part that will never exist, \
+                 {uri}:\n{playlist}"
+            );
+        }
+
+        let _ = shutdown.send(());
+        server
+            .await
+            .expect("HTTP task did not panic")
+            .expect("HTTP server stopped cleanly");
+    }
+
+    /// Publishes a checked-in FLV's tags as RTMP ingress, then closes cleanly.
+    struct FlvPublish {
+        request: PublishRequest,
+        flv: &'static [u8],
+        input: crate::source::InputLimits,
+    }
+
+    impl PendingPublish for FlvPublish {
+        fn publish_request(&self) -> Result<PublishRequest, TransportError> {
+            Ok(self.request.clone())
+        }
+
+        fn accept(
+            self: Box<Self>,
+            grant: crate::admission::PublishGrant,
+            meters: Arc<dyn crate::observe::SourceMeters>,
+        ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
+            Box::pin(async move {
+                let (reader, writer) = crate::source::channel(nz::usize!(4 * 1024 * 1024));
+                for event in flv_ingress_events(self.flv) {
+                    writer
+                        .send(event)
+                        .await
+                        .map_err(|error| TransportError::Accept(error.to_string().into()))?;
+                }
+                // What \`on_unpublish\` sends, and what a clean session close
+                // sends. Nothing about this path is specific to a test.
+                writer.finish(InputState::Closed);
+                let source = RtmpPacketSource::new(reader, self.input, meters)
+                    .map_err(|error| TransportError::Accept(error.to_string().into()))?;
+                Ok(AcceptedPublish {
+                    source: Box::new(source),
+                    grant,
+                })
+            })
+        }
+
+        fn reject(
+            self: Box<Self>,
+            _rejection: PublishRejection,
+        ) -> BoxFuture<'static, Result<(), TransportError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Splits an FLV into audio and video tag bodies as RTMP ingress events.
+    fn flv_ingress_events(flv: &[u8]) -> Vec<IngressEvent> {
+        let mut events = Vec::new();
+        let mut offset = 13;
+        while offset + 11 <= flv.len() {
+            let kind = flv[offset];
+            let size =
+                u32::from_be_bytes([0, flv[offset + 1], flv[offset + 2], flv[offset + 3]]) as usize;
+            let timestamp =
+                u32::from_be_bytes([0, flv[offset + 4], flv[offset + 5], flv[offset + 6]])
+                    | (u32::from(flv[offset + 7]) << 24);
+            let start = offset + 11;
+            let Some(end) = start.checked_add(size).filter(|end| end + 4 <= flv.len()) else {
+                break;
+            };
+            let payload = bytes::Bytes::copy_from_slice(&flv[start..end]);
+            match kind {
+                8 => events.push(IngressEvent::Audio {
+                    timestamp,
+                    media: cc_rtmp::ValidatedMedia::parse_audio(
+                        payload,
+                        cc_rtmp::EnhancedValidationMode::Strict,
+                    )
+                    .expect("fixture audio tag is valid"),
+                }),
+                9 => events.push(IngressEvent::Video {
+                    timestamp,
+                    media: cc_rtmp::ValidatedMedia::parse_video(
+                        payload,
+                        cc_rtmp::EnhancedValidationMode::Strict,
+                    )
+                    .expect("fixture video tag is valid"),
+                }),
+                // Script data carries \`onMetaData\`, which this source does not need.
+                _ => {}
+            }
+            offset = end + 4;
+        }
+        assert!(!events.is_empty(), "the fixture carries media");
+        events
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_graceful_srt_disconnect_appends_endlist() {
         // The Apple MPEG-TS fixture is long enough for a 2 s cadence. The 0.12 s

@@ -8,24 +8,38 @@ use rushls::{
         ClientInfo, IngestProtocol, PresentedCredential, PublishGrant, PublishRequest,
         PublishResource,
     },
-    domain::{BoxFuture, DiscoveredTrack, MediaKind, TrackCatalog},
+    domain::BoxFuture,
     observe::SourceMeters,
     source::{
-        AcceptedPublish, DiscoveryLimits, DiscoveryReport, IngressEvent, InputLimits, InputState,
-        MpegTsConfig, MpegTsPacketSource, Packet, PacketSource, PendingPublish, PublishRejection,
-        ReadInput, RtmpPacketSource, SourceError, TransportError, channel,
+        AcceptedPublish, IngressEvent, InputLimits, InputState, MpegTsConfig, MpegTsPacketSource,
+        PendingPublish, PublishRejection, ReadInput, RtmpPacketSource, TransportError, channel,
     },
 };
 
-use crate::flv;
+use crate::{
+    flv,
+    shape::{Shape, shaped},
+};
 
 const H264_AAC_FLV: &[u8] = include_bytes!("fixtures/h264_aac.flv");
 const H264_BFRAMES_AAC_FLV: &[u8] = include_bytes!("fixtures/h264_bframes_aac.flv");
 const HEVC_AAC_FLV: &[u8] = include_bytes!("fixtures/hevc_aac.flv");
+const H264_BPYRAMID_AAC_FLV: &[u8] = include_bytes!("fixtures/h264_bpyramid_aac.flv");
+const H264_HE_AAC_FLV: &[u8] = include_bytes!("fixtures/h264_he_aac.flv");
+const H264_AAC_441_MONO_FLV: &[u8] = include_bytes!("fixtures/h264_aac_441_mono.flv");
+const H264_AAC_51_FLV: &[u8] = include_bytes!("fixtures/h264_aac_51.flv");
 pub const H264_AAC_TS: &[u8] = include_bytes!("fixtures/h264_aac.ts");
 pub const HEVC_AAC_TS: &[u8] = include_bytes!("fixtures/hevc_aac.ts");
 pub const H264_DUAL_AAC_TS: &[u8] = include_bytes!("fixtures/h264_dual_aac.ts");
 pub const H264_DUAL_VIDEO_TS: &[u8] = include_bytes!("fixtures/h264_dual_video.ts");
+pub const H264_2398_AAC_TS: &[u8] = include_bytes!("fixtures/h264_2398_aac.ts");
+pub const H264_LADDER3_AAC_TS: &[u8] = include_bytes!("fixtures/h264_ladder3_aac.ts");
+pub const HEVC_HDR10_AAC_TS: &[u8] = include_bytes!("fixtures/hevc_hdr10_aac.ts");
+pub const H264_MULTILANG_AAC_TS: &[u8] = include_bytes!("fixtures/h264_multilang_aac.ts");
+pub const H264_LONGGOP_AAC_TS: &[u8] = include_bytes!("fixtures/h264_longgop_aac.ts");
+pub const H264_ANAMORPHIC_AAC_TS: &[u8] = include_bytes!("fixtures/h264_anamorphic_aac.ts");
+pub const H264_OPUS_TS: &[u8] = include_bytes!("fixtures/h264_opus.ts");
+pub const AV1_TS: &[u8] = include_bytes!("fixtures/av1_long.ts");
 
 /// Queue large enough to hold a whole fixture so accept can enqueue then finish.
 fn ingress_capacity() -> std::num::NonZeroUsize {
@@ -64,49 +78,115 @@ pub fn rtmp_hevc_aac() -> Result<Box<dyn PendingPublish>, String> {
     Ok(rtmp_events(flv::ingress_events(HEVC_AAC_FLV)?, &[]))
 }
 
+/// Eight consecutive B-frames under a normal pyramid: the composition offset
+/// on some access units is seven frame periods, so decode order and
+/// presentation order disagree far beyond one GOP's lookahead.
+pub fn rtmp_h264_bpyramid_aac() -> Result<Box<dyn PendingPublish>, String> {
+    Ok(rtmp_events(
+        flv::ingress_events(H264_BPYRAMID_AAC_FLV)?,
+        &[],
+    ))
+}
+
+/// HE-AAC: the decoder output rate is twice the encoded frame rate, and the
+/// RFC 6381 string is `mp4a.40.5` rather than `mp4a.40.2`.
+pub fn rtmp_h264_he_aac() -> Result<Box<dyn PendingPublish>, String> {
+    Ok(rtmp_events(flv::ingress_events(H264_HE_AAC_FLV)?, &[]))
+}
+
+/// 44.1 kHz mono. The audio grid shares no common period with a 30 fps video
+/// timescale, so no segment boundary is exact in both.
+pub fn rtmp_h264_aac_441_mono() -> Result<Box<dyn PendingPublish>, String> {
+    Ok(rtmp_events(
+        flv::ingress_events(H264_AAC_441_MONO_FLV)?,
+        &[],
+    ))
+}
+
+/// 5.1 audio, which the audio rendition must advertise as `CHANNELS="6"`.
+pub fn rtmp_h264_aac_51() -> Result<Box<dyn PendingPublish>, String> {
+    Ok(rtmp_events(flv::ingress_events(H264_AAC_51_FLV)?, &[]))
+}
+
+/// The same media with the catalog reshaped, for topologies no adapter emits.
+pub fn rtmp_shaped_h264_aac(shape: Shape) -> Result<Box<dyn PendingPublish>, String> {
+    Ok(rtmp_shaped(flv::ingress_events(H264_AAC_FLV)?, shape))
+}
+
+/// H.264 and AAC with WebVTT cues, reshaped before the session sees it.
+pub fn rtmp_shaped_h264_aac_captions(shape: Shape) -> Result<Box<dyn PendingPublish>, String> {
+    let mut events = flv::ingress_events(H264_AAC_FLV)?;
+    Ok(rtmp_shaped(
+        events_with_captions(&mut events, &caption_cues()),
+        shape,
+    ))
+}
+
+/// Cues spread across the publication so every segment carries at least one.
+fn caption_cues() -> Vec<(u32, Vec<u8>)> {
+    (0..8)
+        .map(|index| (index * 1_000, format!("caption at {index} s").into_bytes()))
+        .collect()
+}
+
 pub fn rtmp_h264_two_aac() -> Result<Box<dyn PendingPublish>, String> {
     Ok(rtmp_events(flv::ingress_events_two_aac(H264_AAC_FLV)?, &[]))
 }
 
 pub fn rtmp_h264_aac_captions() -> Result<Box<dyn PendingPublish>, String> {
-    let captions = [
-        (0_u32, "first caption"),
-        (2_000, "second caption"),
-        (4_000, "third caption"),
-        (6_000, "fourth caption"),
-    ];
     Ok(rtmp_events(
         flv::ingress_events(H264_AAC_FLV)?,
-        &captions.map(|(timestamp, text)| (timestamp, text.as_bytes().to_vec())),
+        &caption_cues(),
     ))
 }
 
 pub fn mpegts(bytes: &'static [u8]) -> Box<dyn PendingPublish> {
-    Box::new(LabeledPublish {
-        inner: Box::new(MpegTsPublish {
+    mpegts_shaped(bytes, Shape::labelled())
+}
+
+pub fn mpegts_shaped(bytes: &'static [u8], shape: Shape) -> Box<dyn PendingPublish> {
+    shaped(
+        Box::new(MpegTsPublish {
             request: live_camera(IngestProtocol::Srt),
             bytes,
         }),
-    })
+        shape,
+    )
 }
 
 pub fn labeled(inner: Box<dyn PendingPublish>) -> Box<dyn PendingPublish> {
-    Box::new(LabeledPublish { inner })
+    shaped(inner, Shape::labelled())
 }
 
 fn rtmp_events(
     mut events: Vec<IngressEvent>,
     captions: &[(u32, Vec<u8>)],
 ) -> Box<dyn PendingPublish> {
-    if !captions.is_empty() {
-        events = interleave_captions(events, captions);
-    }
-    Box::new(LabeledPublish {
-        inner: Box::new(RtmpPublish {
+    rtmp_shaped(
+        events_with_captions(&mut events, captions),
+        Shape::labelled(),
+    )
+}
+
+/// Same media, with the catalog reshaped before the session sees it.
+pub fn rtmp_shaped(events: Vec<IngressEvent>, shape: Shape) -> Box<dyn PendingPublish> {
+    shaped(
+        Box::new(RtmpPublish {
             request: live_camera(IngestProtocol::Rtmp),
             events,
         }),
-    })
+        shape,
+    )
+}
+
+fn events_with_captions(
+    events: &mut Vec<IngressEvent>,
+    captions: &[(u32, Vec<u8>)],
+) -> Vec<IngressEvent> {
+    if !captions.is_empty() {
+        *events = interleave_captions(std::mem::take(events), captions);
+    }
+    std::mem::take(events)
 }
 
 fn interleave_captions(media: Vec<IngressEvent>, captions: &[(u32, Vec<u8>)]) -> Vec<IngressEvent> {
@@ -232,83 +312,4 @@ impl PendingPublish for MpegTsPublish {
     ) -> BoxFuture<'static, Result<(), TransportError>> {
         Box::pin(async { Ok(()) })
     }
-}
-
-struct LabeledPublish {
-    inner: Box<dyn PendingPublish>,
-}
-
-impl PendingPublish for LabeledPublish {
-    fn publish_request(&self) -> Result<PublishRequest, TransportError> {
-        self.inner.publish_request()
-    }
-
-    fn accept(
-        self: Box<Self>,
-        grant: PublishGrant,
-        meters: Arc<dyn SourceMeters>,
-    ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
-        Box::pin(async move {
-            let mut accepted = self.inner.accept(grant, meters).await?;
-            accepted.source = Box::new(LabeledSource {
-                inner: accepted.source,
-            });
-            Ok(accepted)
-        })
-    }
-
-    fn reject(
-        self: Box<Self>,
-        rejection: PublishRejection,
-    ) -> BoxFuture<'static, Result<(), TransportError>> {
-        self.inner.reject(rejection)
-    }
-}
-
-/// Stamps `LANGUAGE` after discovery only when the adapter left it unset.
-///
-/// MPEG-TS already copies PMT ISO 639 onto the catalog. RTMP and caption
-/// tracks still have none, and Apple's reports want a tag when one exists.
-struct LabeledSource {
-    inner: Box<dyn PacketSource>,
-}
-
-impl PacketSource for LabeledSource {
-    fn discover(
-        &mut self,
-        limits: DiscoveryLimits,
-    ) -> BoxFuture<'_, Result<DiscoveryReport, SourceError>> {
-        Box::pin(async move {
-            let mut report = self.inner.discover(limits).await?;
-            stamp_languages(&mut report)?;
-            Ok(report)
-        })
-    }
-
-    fn fill<'a>(
-        &'a mut self,
-        out: &'a mut dyn rushls::domain::Appender<Packet>,
-    ) -> BoxFuture<'a, Result<InputState, SourceError>> {
-        self.inner.fill(out)
-    }
-}
-
-fn stamp_languages(report: &mut DiscoveryReport) -> Result<(), SourceError> {
-    let mut tracks: Vec<DiscoveredTrack> = report.tracks.tracks().to_vec();
-    let mut audio = 0_usize;
-    for track in &mut tracks {
-        if track.language.is_some() {
-            continue;
-        }
-        match track.kind() {
-            MediaKind::Audio => {
-                track.language = Some(if audio == 0 { "en" } else { "es" }.into());
-                audio += 1;
-            }
-            MediaKind::Subtitle => track.language = Some("en".into()),
-            MediaKind::Video => {}
-        }
-    }
-    report.tracks = TrackCatalog::new(tracks)?;
-    Ok(())
 }
