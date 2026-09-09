@@ -167,9 +167,9 @@ async fn mpegts_av1_video_only() -> TestResult {
     run_with(
         Setup::default()
             .named("mpegts_av1_video_only")
-            .expect(Expect::unlisted_codec)
-            // 10 fps with a two-frame GOP: a two-second target needs a much
-            // smaller part than the rest of the suite uses.
+            .expect(|expect| expect.unlisted_codec().video_only())
+            // 10 fps with a two-frame GOP: exercise frequent random-access
+            // points in one-second segments without an audio clock.
             .segmentation(SegmentationPolicy::latency_first(
                 Duration::from_secs(1),
                 Duration::from_millis(500),
@@ -473,19 +473,21 @@ async fn srt_h264_aac() -> TestResult {
         .await
         .ok_or("SRT listener closed")?
         .map_err(|error| error.to_string())?;
-    // Keep the caller socket open until Apple has fetched: closing first
-    // races the demuxer and looks like a non-MPEG-TS input.
+    // This finite publisher must close before validation. Leaving an idle
+    // socket open makes blocking reloads wait for media that will never arrive.
     let session = origin.spawn_session(publish::labeled(Box::new(pending)));
-    origin.validate_playlist()?;
     drop(caller.await.map_err(|_| "SRT caller panicked")??);
     match session.await? {
-        Ok(
-            rushls::session::SessionOutcome::Ended
-            | rushls::session::SessionOutcome::Interrupted,
-        ) => Ok(()),
-        Ok(other) => Err(format!("SRT session ended unexpectedly: {other:?}").into()),
-        Err(error) => Err(error.into()),
+        Ok(rushls::session::SessionOutcome::Ended) => {}
+        Ok(other) => return Err(format!("SRT session ended unexpectedly: {other:?}").into()),
+        Err(error) => return Err(error.into()),
     }
+    assert!(
+        origin.reported_failures().is_empty(),
+        "{:?}",
+        origin.reported_failures()
+    );
+    origin.validate_playlist()
 }
 
 // ---------------------------------------------------------------------------

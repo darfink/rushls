@@ -210,8 +210,13 @@ impl VideoNormalizer {
             .or(self.last_duration)
             .ok_or_else(|| {
                 processing(format!(
-                    "{} video duration cannot be derived at end of input",
-                    self.track_id
+                    "{} video duration cannot be derived {}",
+                    self.track_id,
+                    if next.is_some() {
+                        "from access-unit timestamps or codec timing"
+                    } else {
+                        "at end of input"
+                    }
                 ))
             })?;
         self.last_duration = Some(duration);

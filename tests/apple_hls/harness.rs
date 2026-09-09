@@ -222,7 +222,6 @@ impl Origin {
         self.recorder.failures()
     }
 
-
     /// Runs the session in the background so a live transport can stay open
     /// while Apple fetches. The caller closes the publisher after this returns.
     pub fn spawn_session(

@@ -244,6 +244,7 @@ impl RenditionState {
         let (edge_updates, _) = watch::channel(live_edge);
         let published = Arc::new(RenditionView::new(RenditionSnapshot {
             rendition_id,
+            media_kind: descriptor.media.kind(),
             config: Some(descriptor.config),
             contract,
             media_sequence: 0,
@@ -343,6 +344,7 @@ impl RenditionState {
         });
         RenditionSnapshot {
             rendition_id: self.rendition_id,
+            media_kind: self.descriptor.media.kind(),
             config: self.advertised_config,
             contract: self.contract,
             media_sequence: self.media_sequence,

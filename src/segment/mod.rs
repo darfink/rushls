@@ -6,9 +6,9 @@
 //!
 //! # The rule
 //!
-//! Pre-roll observes through the desired duration and chooses the latest
-//! matching random-access instant across every video track. If no compatible
-//! boundary exists, it expands the horizon only to the configured hard limit.
+//! Pre-roll chooses the feasible common random-access instant closest to the
+//! desired duration, preferring shorter durations on ties. Boundary evidence
+//! may extend beyond the target, but the configured maximum remains a hard limit.
 //! Audio snaps that video-prioritized instant to its own access-unit grid, so
 //! codec priming and incompatible tick domains never invent a mid-unit cut.
 //! Runtime coordination keeps video boundaries aligned across timebases.
@@ -103,11 +103,8 @@ impl SegmentationPolicy {
         Ok(())
     }
 
-    /// Uses the latest compatible video cadence at or before the desired
-    /// duration, extending by at most one more desired-duration window.
-    ///
-    /// The desired horizon is still decisive: extension is used only when one
-    /// or more tracks cannot satisfy the contract at an earlier boundary.
+    /// Uses the feasible cadence closest to the desired duration, with a
+    /// maximum of twice that duration. Shorter cadences win exact ties.
     pub fn latency_first(
         desired_segment_duration: Duration,
         desired_part_duration: Duration,
@@ -160,9 +157,9 @@ pub struct TrackSegmentationPlan {
     /// Maximum delay between a planned segment boundary and the next usable
     /// AU start.
     ///
-    /// Video boundaries are selected random-access starts and therefore use
-    /// zero; a muxer that waits for a late keyframe accounts for that from its
-    /// own extension budget. Variable-duration audio may need up to one encoded
+    /// Video reserves container-clock quantization when frame timing requires
+    /// rounding. Waiting for a late keyframe consumes the separate boundary
+    /// window. Variable-duration audio may need up to one encoded
     /// frame when later access units do not repeat the pre-roll grid exactly.
     pub boundary_tolerance: TickDuration,
 }

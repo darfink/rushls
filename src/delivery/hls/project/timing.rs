@@ -84,7 +84,16 @@ pub fn server_control(
     let longest_target = longest_target?;
     Some(ServerControl {
         hold_back: Some(policy.hold_back.apply(longest_target)),
-        part_hold_back: longest_part_target.map(|target| policy.part_hold_back.resolve(target)),
+        part_hold_back: longest_part_target.map(|target| {
+            let hold_back = policy.part_hold_back.resolve(target);
+            // A microsecond margin avoids a false failure when clients compare
+            // the recommended three-target floor in floating point.
+            if hold_back == target.saturating_mul(3) {
+                hold_back.saturating_add(Duration::from_micros(1))
+            } else {
+                hold_back
+            }
+        }),
         can_block_reload: policy.can_block_reload,
         can_skip_until: Some(TargetDurationMultiple::integer(6).apply(longest_target)),
         can_skip_dateranges: false,
@@ -168,7 +177,10 @@ mod tests {
         .expect("an active presentation has a server control");
 
         assert_eq!(control.hold_back, Some(Duration::from_secs(18)));
-        assert_eq!(control.part_hold_back, Some(Duration::from_secs(6)));
+        assert_eq!(
+            control.part_hold_back,
+            Some(Duration::from_micros(6_000_001))
+        );
         assert!(control.can_block_reload);
         assert_eq!(
             control.can_skip_until,

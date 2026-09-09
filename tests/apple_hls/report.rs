@@ -44,6 +44,8 @@ pub struct Expect {
     pub ladder: bool,
     /// No video track is published.
     pub audio_only: bool,
+    /// No audio track is published; useful when Apple cannot identify the video codec.
+    pub video_only: bool,
     /// Delivery is over TLS, so the transport findings are real.
     pub tls: bool,
     /// The cadence under test is deliberately not Apple's recommended one.
@@ -65,6 +67,7 @@ impl Default for Expect {
             captions: false,
             ladder: false,
             audio_only: false,
+            video_only: false,
             tls: false,
             unconventional_cadence: true,
             unlisted_codec: false,
@@ -85,6 +88,11 @@ impl Expect {
 
     pub fn audio_only(mut self) -> Self {
         self.audio_only = true;
+        self
+    }
+
+    pub fn video_only(mut self) -> Self {
+        self.video_only = true;
         self
     }
 
@@ -248,6 +256,9 @@ fn conditional(title: &str, scopes: &str, expect: &Expect) -> Option<Verdict> {
         || title.contains("unsupported audio track codec")
         || title.contains("extraneous codecs")
         || title.contains("supported stereo audio formats are")
+        // Apple cannot report a format present when it did not recognise the
+        // format, so this says nothing about the CODECS attribute itself.
+        || (title.contains("codecs attribute") && expect.unlisted_codec)
     {
         return Some(when(
             expect.unlisted_codec,
@@ -259,6 +270,11 @@ fn conditional(title: &str, scopes: &str, expect: &Expect) -> Option<Verdict> {
     // rule is written for a presentation that also has video, where an
     // audio-only variant would be selectable by mistake.
     if title.contains("no audio-only variants") {
+        if expect.video_only && expect.unlisted_codec {
+            return Some(Verdict::NotApplicable(
+                "Apple cannot classify this unsupported video-only codec",
+            ));
+        }
         return Some(when(
             expect.audio_only,
             "the case publishes no video at all",
@@ -302,11 +318,17 @@ fn conditional(title: &str, scopes: &str, expect: &Expect) -> Option<Verdict> {
         });
     }
 
-    // Apple's own segment MIME table gives text/vtt for WebVTT, which is what
-    // this origin serves and what hlsreport reports as wrong. Its expectation of
-    // text/plain cannot be reconciled with the specification it is checking, so
-    // a subtitle-only occurrence is reported and not failed. An audio rendition
-    // served as video/iso.segment is unambiguous.
+    // WebVTT segments are served as text/vtt. That is a settled decision, not
+    // an open question: RFC 8216bis and Apple's own authoring specification
+    // both give text/vtt, it is the registered media type for the format, and
+    // players key off it. hlsreport nevertheless expects text/plain, which
+    // cannot be reconciled with the document it is checking against, so the
+    // finding is treated as a defect in Apple's tool and reported rather than
+    // failed.
+    //
+    // Only when it is subtitle-only. An audio rendition served as
+    // video/iso.segment is a different finding wearing the same words, and that
+    // one is unambiguous.
     if title.contains("mime type") {
         return Some(
             if scopes.contains("subtitle") && !scopes.contains("audio") {
@@ -627,4 +649,32 @@ fn decode_entities(text: &str) -> String {
     }
     out.push_str(rest);
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_video_only_does_not_exempt_mixed_or_supported_presentations() {
+        let finding = Finding {
+            source: Source::Authoring,
+            level: Level::MustFix,
+            context: "Additional requirements for tvOS".into(),
+            title: "There MUST be no audio-only variants listed in the Multivariant playlist"
+                .into(),
+            scopes: vec!["All Variants".into()],
+        };
+        assert!(matches!(
+            judge(&finding, &Expect::default().unlisted_codec().video_only()),
+            Verdict::NotApplicable(_)
+        ));
+        for expect in [
+            Expect::default(),
+            Expect::default().unlisted_codec(),
+            Expect::default().video_only(),
+        ] {
+            assert!(matches!(judge(&finding, &expect), Verdict::Defect));
+        }
+    }
 }

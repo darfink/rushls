@@ -574,8 +574,11 @@ fn config() -> SessionConfig {
             maximum_wall_time: Duration::from_secs(5),
             maximum_media_duration: Duration::from_secs(30),
         },
+        // The synthetic source provides a one-second boundary before it may
+        // stall. Lock that exact target so lifecycle tests reach publication
+        // without waiting for evidence of a closer, later boundary.
         segmentation: SegmentationPolicy::latency_first(
-            Duration::from_secs(2),
+            Duration::from_secs(1),
             Duration::from_secs(1),
         ),
         // Long enough that liveness never fires unless a test asks it to.

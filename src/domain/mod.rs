@@ -6,6 +6,7 @@
 
 use std::{future::Future, pin::Pin};
 
+pub mod aac;
 mod appender;
 mod ids;
 mod instant;

@@ -248,6 +248,7 @@ impl ViewerApplication {
                 object.body,
                 object.gzip,
                 named.resource,
+                rendition.media_kind,
                 self.hls.media_reuse(Some(target)),
             )
         }

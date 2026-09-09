@@ -28,11 +28,12 @@ For HEv2, use `-profile:a 28 -b:a 32000`.
 Then remux each file with `-c:a copy -f flv`.
 The preserved ASC includes backward-compatible SBR/PS sync extensions.
 
-For AV1, encode a raw OBU file with `-c:v libsvtav1 -g 2 -f obu`.
-Remux it with this GStreamer pipeline:
+For AV1, encode an IVF file with `-c:v libsvtav1 -g 2 -f ivf`.
+IVF preserves timestamps. A raw OBU stream can produce a TS file with identical timestamps on every packet.
+Remux IVF with this GStreamer pipeline:
 
 ```sh
-gst-launch-1.0 filesrc location=av1.obu ! av1parse ! \
+gst-launch-1.0 filesrc location=av1.ivf ! ivfparse ! av1parse ! \
   mpegtsmux enable-custom-mappings=true ! filesink location=av1.ts
 ```
 

@@ -2,9 +2,9 @@
 //!
 //! Pre-roll examines candidates in this order:
 //!
-//! 1. Observe through the desired duration.
-//! 2. Try common video boundaries from latest to earliest below the target.
-//! 3. If none is feasible, try later boundaries up to the configured maximum.
+//! 1. Observe boundary evidence on both sides of the desired duration.
+//! 2. Try boundaries within the maximum in order of distance from the target.
+//! 3. Prefer the shorter cadence when two candidates are equally close.
 //! 4. Snap audio to its encoded grid and replay the complete candidate contract.
 //!
 //! Video random-access starts must identify the same presentation instant.
@@ -81,6 +81,7 @@ enum Target {
 pub struct CadenceObserver {
     policy: SegmentationPolicy,
     tracks: Vec<TrackCadence>,
+    input_closed: bool,
 }
 
 impl CadenceObserver {
@@ -117,7 +118,17 @@ impl CadenceObserver {
             });
         }
 
-        Ok(Self { policy, tracks })
+        Ok(Self {
+            policy,
+            tracks,
+            input_closed: false,
+        })
+    }
+
+    /// EOF closes the evidence search, not the final-part duration rules used
+    /// by timing replay. A missing preferred boundary can now be skipped.
+    pub fn close_input(&mut self) {
+        self.input_closed = true;
     }
 
     pub fn observe(&mut self, sample: &NormalizedSample) -> Result<(), CadenceError> {
@@ -213,9 +224,7 @@ impl CadenceObserver {
             return Ok(());
         }
         let source = &self.tracks[authority];
-        let desired = source
-            .timebase
-            .duration_to_ticks_floor(self.policy.desired_segment_duration);
+        let desired = self.policy.desired_segment_duration;
         let maximum = source
             .timebase
             .duration_to_ticks_floor(self.policy.segment_cap());
@@ -224,13 +233,35 @@ impl CadenceObserver {
             .iter()
             .filter(|boundary| boundary.start <= maximum)
             .collect();
-        // Below the target, prefer the latest boundary; beyond it, extend greedily.
+        // A frame whose end crosses the target does not establish the next
+        // random-access start. Wait for that boundary before choosing a shorter
+        // cadence; otherwise selection depends on where ingest batches stop.
+        // EOF and the configured cap still bound this evidence search.
+        if !self.input_closed
+            && required.iter().any(|index| {
+                let track = &self.tracks[*index];
+                let target = track
+                    .timebase
+                    .duration_to_ticks_ceil(self.policy.desired_segment_duration);
+                !track
+                    .boundaries
+                    .iter()
+                    .any(|boundary| boundary.start >= target)
+                    && !self.has_crossed(*index, self.policy.segment_cap())
+            })
+        {
+            return Ok(());
+        }
+        // Shorter wins an exact tie. Complete-contract replay still rejects
+        // candidates whose audio rounding or other allowances exceed the cap.
         boundaries.sort_by_key(|boundary| {
-            if boundary.start <= desired {
-                (false, u64::MAX - boundary.start)
-            } else {
-                (true, boundary.start)
-            }
+            (
+                source
+                    .timebase
+                    .ticks_to_duration(boundary.start)
+                    .abs_diff(desired),
+                boundary.start,
+            )
         });
         for boundary in boundaries {
             // Charge boundary scans as well as replay. Stop on the first
@@ -257,6 +288,10 @@ impl CadenceObserver {
             for (index, track) in self.tracks.iter().enumerate() {
                 match self.plan_track(index, track, Target::Point(point), selection.as_ref()) {
                     Ok(Some(plan)) => tracks.push(plan),
+                    // A slower track may still supply this preferred candidate.
+                    // Missing evidence is not proof that a shorter cadence is
+                    // necessary; retain the preference until that evidence arrives.
+                    Ok(None) if !self.input_closed => return Ok(()),
                     Ok(None) | Err(CadenceError::NoSegmentationBoundary) => break,
                     Err(error) => return Err(error.into()),
                 }
@@ -395,8 +430,19 @@ impl CadenceObserver {
             part_duration,
             boundary_tolerance: match track.kind {
                 MediaKind::Audio => track.access_units.longest(),
+                // An integral GOP may still contain fractional frame periods,
+                // or arrive through a coarser container clock (for example FLV).
+                // Native integral timing needs no extra ceiling allowance.
                 MediaKind::Video => {
-                    if segment_period.is_some() {
+                    let fractional_frames = track.frame_rate.is_some_and(|rate| {
+                        let numerator = u128::from(rate.denominator().get())
+                            * u128::from(track.timebase.den().get());
+                        let denominator = u128::from(rate.numerator().get())
+                            * u128::from(track.timebase.num().get());
+                        !numerator.is_multiple_of(denominator)
+                    });
+                    if track.timestamp_quantum > 1 || fractional_frames || segment_period.is_some()
+                    {
                         track.timestamp_quantum
                     } else {
                         0
@@ -608,6 +654,94 @@ mod tests {
         observer
             .observe(&video(track_id, pts, VIDEO_FRAME, random_access))
             .expect("video is observable");
+    }
+
+    #[test]
+    fn integral_gops_still_reserve_fractional_frame_and_container_rounding()
+    -> Result<(), CadenceError> {
+        for (rate, quantum, expected) in [
+            (
+                crate::domain::FrameRate::new(nz::u32!(24000), nz::u32!(1001)),
+                1,
+                1,
+            ),
+            (
+                crate::domain::FrameRate::new(nz::u32!(30), nz::u32!(1)),
+                90,
+                90,
+            ),
+            (
+                crate::domain::FrameRate::new(nz::u32!(30), nz::u32!(1)),
+                1,
+                0,
+            ),
+        ] {
+            let mut observer = observer(&[(0, MediaKind::Video)], Duration::from_secs(8));
+            observer.tracks[0].frame_rate = Some(rate);
+            observer.tracks[0].timestamp_quantum = quantum;
+            // 96 frames at 23.976 have an integral GOP period of 360360 ticks.
+            observe_video(&mut observer, 0, 0, true);
+            observe_video(&mut observer, 0, 360_360, true);
+            let plans = observer.plan()?.expect("a complete boundary");
+            assert_eq!(plans[0].segment_period, None);
+            assert_eq!(plans[0].boundary_tolerance, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_boundary_search_waits_for_the_fractional_gop_after_the_target()
+    -> Result<(), CadenceError> {
+        let mut observer = observer(&[(0, MediaKind::Video)], Duration::from_secs(12));
+        observer.policy.desired_segment_duration = Duration::from_secs(6);
+        for pts in [0, 180_180, 360_360] {
+            observe_video(&mut observer, 0, pts, true);
+        }
+        // The final frame crosses six seconds before the 6.006-second IDR.
+        observer.observe(&video(0, 536_786, 3754, false))?;
+        assert!(observer.plan()?.is_none());
+        observe_video(&mut observer, 0, 540_540, true);
+        assert_eq!(
+            observer.plan()?.expect("boundary evidence")[0]
+                .segment_duration
+                .get(),
+            540_540
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_boundary_compares_against_the_unrounded_target() -> Result<(), CadenceError> {
+        let mut observer = observer(&[(0, MediaKind::Video)], Duration::from_secs(8));
+        observer.policy.desired_segment_duration = Duration::from_micros(4_000_009);
+        for pts in [0, 360_000, 360_001] {
+            observe_video(&mut observer, 0, pts, true);
+        }
+        assert_eq!(
+            observer.plan()?.expect("boundary evidence")[0]
+                .segment_duration
+                .get(),
+            360_001
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_candidates_respect_ties_caps_and_replay_rejections() -> Result<(), CadenceError> {
+        for (maximum, expected) in [(8, vec![3, 5, 2]), (4, vec![3, 2])] {
+            let mut observer = observer(&[(0, MediaKind::Video)], Duration::from_secs(maximum));
+            for second in [0, 2, 3, 5] {
+                observe_video(&mut observer, 0, second * VIDEO_SECOND, true);
+            }
+            let mut seen = Vec::new();
+            observer.visit_candidates(&mut 0, |plans, _| {
+                seen.push(plans[0].segment_duration.get() / 90_000);
+                Ok::<_, CadenceError>(false)
+            })?;
+            // Three and five are equally close to four: shorter wins the tie.
+            assert_eq!(seen, expected);
+        }
+        Ok(())
     }
 
     #[test]

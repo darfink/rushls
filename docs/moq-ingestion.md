@@ -188,13 +188,18 @@ The corresponding CLI flags include `--hls-segment-target 2s` and `--hls-segment
 Maxima accept absolute durations or multipliers of their configured targets.
 Equal target and maximum values forbid growth during admission.
 
-Pre-roll tries the latest common video boundary at or before the segment target.
-If the complete contract fails, it tries earlier boundaries before it extends the search beyond the target.
+Pre-roll tries common video boundaries in order of distance from the segment target.
+It prefers the shorter duration when two boundaries are equally close.
+It waits for boundary evidence beyond the target while the input remains open and the configured maximum permits further observation.
+If the complete contract fails, admission tries the next closest boundary within the maximum.
 Audio boundaries use whole encoded samples. Audio-only input can select an earlier boundary to keep rounding within the maximum.
-Admission selects a larger part ceiling only if the preferred ceiling fails and the configured maximum permits growth.
+Admission can select a larger part ceiling when the preferred ceiling cannot safely fit the encoded samples.
+For reordered video, it reserves space for complete B-frame groups between the 85% duration floor and the part ceiling.
+The configured part maximum still applies.
 Selected ceilings remain fixed throughout the publication.
 
 The part writer retains a bounded window before it commits a cut.
+Video cuts keep B-frame groups together so adjacent parts do not overlap in presentation time.
 It can repair nearby cuts without changing published parts or waiting for a whole segment.
 Some input sequences still require more lookahead than the window permits and terminate the publication.
 

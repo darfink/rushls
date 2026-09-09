@@ -247,6 +247,13 @@ pub struct RenditionBandwidth {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RenditionSnapshot {
     pub rendition_id: RenditionId,
+    /// What this rendition carries.
+    ///
+    /// Held here rather than derived from [\`Self::config\`] because the media
+    /// type of a delivered object depends on it and the request path has only
+    /// the snapshot: a segment is framed the same way whatever it contains, so
+    /// nothing else on this side of the store can tell audio from video.
+    pub media_kind: crate::domain::MediaKind,
     pub config: Option<RenditionConfig>,
     /// The playlist terms this rendition was created under, and keeps.
     pub contract: PlaylistContract,

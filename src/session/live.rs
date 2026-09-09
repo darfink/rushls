@@ -251,10 +251,15 @@ impl MediaTail {
     }
 
     fn finish(&mut self, reason: FinishReason) -> Result<(), ExecutionError> {
-        self.muxer.finish(reason, &mut self.media)?;
-        self.publish()?;
-        self.publisher.finish(reason)?;
-        Ok(())
+        // Each stage must run even if an earlier stage fails: the lease must
+        // end so clients do not wait forever for a part that cannot arrive.
+        let muxed = self
+            .muxer
+            .finish(reason, &mut self.media)
+            .map_err(ExecutionError::from);
+        let published = self.publish();
+        let finished = self.publisher.finish(reason).map_err(ExecutionError::from);
+        muxed.and(published).and(finished)
     }
 
     /// Hands everything the muxer produced to the publisher, counting as it
@@ -516,10 +521,14 @@ impl LiveSession {
         // Flush before closing the muxer: samples held back for reordering are
         // media the publisher already sent and we already accepted, and a
         // cancellation is no reason to drop them on the floor.
-        self.head.flush(&mut self.samples)?;
+        let flushed = self
+            .head
+            .flush(&mut self.samples)
+            .map_err(ExecutionError::from);
         self.drained = true;
-        self.tail.write_all(&mut self.samples)?;
-        self.tail.finish(reason)
+        let written = self.tail.write_all(&mut self.samples);
+        let finished = self.tail.finish(reason);
+        flushed.and(written).and(finished)
     }
 }
 

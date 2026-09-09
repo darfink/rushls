@@ -18,7 +18,7 @@ use crate::{
 use super::{
     FinishReason, InitializationSegment, MediaSegmentFormat, MuxError, PackagedChunk,
     PackagedMedia, PackagedRendition, PackagedSegmentCompletion, PackagingRenditionId,
-    PackagingSegmentId, RenditionConfig, RenditionKey, RenditionMedia, TrackPackager,
+    PackagingSegmentId, RenditionConfig, RenditionKey, RenditionMedia, TrackPackager, VideoRange,
 };
 use output::CmafOutput;
 
@@ -84,6 +84,7 @@ struct OpenFragment {
     start: TickTimestamp,
     /// Furthest media end observed. Reordering can only move this forward.
     end: TickTimestamp,
+    presentation_end: TickTimestamp,
     independent: bool,
 }
 
@@ -156,6 +157,8 @@ struct CmafTrack {
     presented_timing: PresentedTimingCursor,
     initialized: bool,
     last_dts: Option<TickTimestamp>,
+    composition: crate::segment::cutter::CompositionGroups,
+    published_presentation_end: Option<TickTimestamp>,
     finished: bool,
 }
 
@@ -190,6 +193,8 @@ impl CmafTrack {
             presented_timing: PresentedTimingCursor::for_track(track),
             initialized: false,
             last_dts: None,
+            composition: crate::segment::cutter::CompositionGroups::default(),
+            published_presentation_end: None,
             finished: false,
         })
     }
@@ -221,9 +226,17 @@ impl CmafTrack {
             .partition_clock
             .advance(presented_pts, presented.duration)
             .ok_or_else(|| mux_error("partition span overflows"))?;
+        // A decode-order cut inside a B-frame group creates overlapping
+        // presentation ranges in adjacent chunks. Wait until the presentation
+        // high-water mark fits the elapsed decode span before allowing a cut.
+        let can_end = self.kind != MediaKind::Video
+            || self
+                .composition
+                .advance(pts, dts, sample.duration(), self.plan.boundary_tolerance)
+                .ok_or_else(|| mux_error("composition group timing overflows"))?;
         let cuts = self
             .partitioner
-            .push(partition_duration, sample.random_access())
+            .push_with_boundary(partition_duration, sample.random_access(), can_end)
             .map_err(|error| MuxError::Part {
                 track: self.track_id,
                 error,
@@ -320,6 +333,21 @@ impl CmafTrack {
         presented_pts: TickTimestamp,
         presented_duration: TickDuration,
     ) -> Result<(), MuxError> {
+        // Malformed or changing presentation order cannot revise a published
+        // chunk, even if its decode timestamps continue to advance.
+        if self.kind == MediaKind::Video
+            && let Some(previous) = self.published_presentation_end
+        {
+            let overlap = duration_since(previous, presented_pts).unwrap_or(0);
+            if overlap > self.plan.boundary_tolerance {
+                return Err(MuxError::Boundary {
+                    track: self.track_id,
+                    reason: "video presentation overlaps a published part",
+                    observed: overlap,
+                    maximum: self.plan.boundary_tolerance,
+                });
+            }
+        }
         let end = presented_pts
             .checked_add_unsigned(presented_duration)
             .ok_or_else(|| mux_error(format!("sample end overflowed for {}", self.track_id)))?;
@@ -349,9 +377,14 @@ impl CmafTrack {
                     } else {
                         end
                     },
+                    presentation_end: end,
                     independent: sample.random_access(),
                 });
             }
+        }
+        if let Some(fragment) = &mut self.fragment {
+            fragment.presentation_end = fragment.presentation_end.max(end);
+            fragment.independent |= sample.random_access();
         }
         Ok(())
     }
@@ -435,6 +468,7 @@ impl CmafTrack {
                 payload,
             }));
         }
+        self.published_presentation_end = Some(fragment.presentation_end);
         self.segment.chunk_index = self
             .segment
             .chunk_index
@@ -530,6 +564,50 @@ impl TrackPackager for CmafTrack {
     }
 }
 
+/// The transfer function a video track's own bitstream declares.
+///
+/// Read from the codec configuration rather than carried down from discovery,
+/// because that is where it is unambiguous: an ingest adapter may or may not
+/// surface colour signalling depending on its container, while the parameter
+/// set inside the extradata is the same bytes a decoder will use.
+///
+/// \`None\` when the bitstream declares nothing. HLS makes \`VIDEO-RANGE\` optional
+/// and a player defaults it to SDR, so an absent declaration is honest; a
+/// guessed \`SDR\` on unsignalled HDR content is not, and would tell a display
+/// not to switch modes for content that needs it.
+fn video_range(track: &DiscoveredTrack) -> Option<VideoRange> {
+    let colour =
+        crate::media::video_config::properties(track.codec, track.codec_extradata.as_bytes())
+            .colour?;
+    // ISO/IEC 23091-2 transfer characteristics. Everything outside these two
+    // is a standard-dynamic-range curve as far as HLS is concerned; the
+    // attribute has no third HDR value to offer.
+    Some(match colour.1 {
+        16 => VideoRange::Pq,
+        18 => VideoRange::Hlg,
+        _ => VideoRange::Sdr,
+    })
+}
+
+// HLS RESOLUTION describes display pixels; the sample entry keeps coded size.
+fn display_width(
+    width: NonZero<u32>,
+    aspect: Option<(u16, u16)>,
+) -> Result<NonZero<u32>, MuxError> {
+    let Some((numerator, denominator)) = aspect else {
+        return Ok(width);
+    };
+    if numerator == 0 || denominator == 0 {
+        return Err(invalid("video sample aspect ratio is zero"));
+    }
+    let scaled = (u64::from(width.get()) * u64::from(numerator) + u64::from(denominator) / 2)
+        / u64::from(denominator);
+    u32::try_from(scaled)
+        .ok()
+        .and_then(NonZero::new)
+        .ok_or_else(|| invalid("video display width cannot be represented"))
+}
+
 fn packaged_rendition(
     rendition_id: PackagingRenditionId,
     track: &DiscoveredTrack,
@@ -545,12 +623,19 @@ fn packaged_rendition(
             height,
             frame_rate,
             ..
-        } => RenditionMedia::Video {
-            width,
-            height,
-            frame_rate,
-            video_range: None,
-        },
+        } => {
+            let aspect = crate::media::video_config::properties(
+                track.codec,
+                track.codec_extradata.as_bytes(),
+            )
+            .aspect;
+            RenditionMedia::Video {
+                width: display_width(width, aspect)?,
+                height,
+                frame_rate,
+                video_range: video_range(track),
+            }
+        }
         MediaParameters::Audio {
             sample_rate,
             channels,
@@ -649,6 +734,23 @@ mod tests {
     };
 
     use crate::mux::{MuxerFactory, PassThroughMuxerFactory};
+
+    #[test]
+    fn display_resolution_applies_sar_with_nearest_pixel_rounding()
+    -> Result<(), crate::mux::MuxError> {
+        assert_eq!(
+            super::display_width(nz::u32!(320), Some((4, 3)))?.get(),
+            427
+        );
+        assert_eq!(super::display_width(nz::u32!(320), None)?.get(), 320);
+        assert_eq!(
+            super::display_width(nz::u32!(320), Some((3, 4)))?.get(),
+            240
+        );
+        assert!(super::display_width(nz::u32!(320), Some((1, 0))).is_err());
+        assert!(super::display_width(nz::u32!(u32::MAX), Some((2, 1))).is_err());
+        Ok(())
+    }
 
     const FRAME: u64 = 8_192;
 
@@ -1018,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn reordered_video_parts_are_measured_on_the_decode_timeline() {
+    fn a_part_ceiling_smaller_than_a_reorder_group_is_rejected() {
         let sink = discarded_events();
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(16_384));
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
@@ -1026,37 +1128,61 @@ mod tests {
         let mut started = started(
             &input,
             vec![
-                PlanBuilder::new(0, timebase, NonZero::new(16 * FRAME).expect("nonzero"))
-                    .part(nz::u32!(1), NonZero::new(FRAME).expect("nonzero"))
+                PlanBuilder::new(0, timebase, nz::u64!(131_072))
+                    .part(nz::u32!(1), nz::u64!(8_192))
                     .build(),
             ],
             &sink,
         );
-        let frame = i64::try_from(FRAME).expect("fixture duration fits");
+        let frame = i64::try_from(FRAME).expect("frame fits");
         let mut media = Vec::new();
-
-        // The second decoded access unit is a future reference picture. Its
-        // PTS must neither stretch the preceding part nor make its own part
-        // exceed the one-access-unit target.
-        for sample in [
-            sample_with_dts(0, 0, -3 * frame, true),
-            sample_with_dts(0, 4 * frame, -2 * frame, false),
-            sample_with_dts(0, frame, -frame, false),
-        ] {
+        started
+            .muxer
+            .push(sample_with_dts(0, 0, -3 * frame, true), &mut media)
+            .expect("first frame");
+        started
+            .muxer
+            .push(sample_with_dts(0, 4 * frame, -2 * frame, false), &mut media)
+            .expect("reference frame");
+        assert!(matches!(
             started
                 .muxer
-                .push(sample, &mut media)
-                .expect("reordered sample packages");
-        }
+                .push(sample_with_dts(0, frame, -frame, false), &mut media),
+            Err(crate::mux::MuxError::Part { .. })
+        ));
+    }
 
-        let durations: Vec<_> = media
-            .iter()
-            .filter_map(|event| match event {
-                PackagedMedia::Chunk(chunk) => Some(chunk.duration),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(durations, [FRAME, FRAME]);
+    #[test]
+    fn late_presentation_samples_cannot_rewrite_published_parts() -> Result<(), crate::mux::MuxError>
+    {
+        let mut started = start(
+            SegmentBoundaryPolicy::Strict,
+            Timebase::new(nz::u32!(1), nz::u32!(16_384)),
+            &discarded_events(),
+        )?;
+        let frame = i64::try_from(FRAME).expect("frame fits");
+        let mut media = Vec::new();
+        for sample in [
+            sample_with_dts(0, 0, 0, true),
+            sample_with_dts(0, frame, frame, false),
+            sample_with_dts(0, 0, 2 * frame, false),
+        ] {
+            started.muxer.push(sample, &mut media)?;
+        }
+        let published = media.len();
+        let error = started
+            .muxer
+            .finish(crate::mux::FinishReason::Final, &mut media)
+            .expect_err("overlap with published media");
+        assert!(matches!(
+            error,
+            crate::mux::MuxError::Boundary {
+                reason: "video presentation overlaps a published part",
+                ..
+            }
+        ));
+        assert_eq!(media.len(), published);
+        Ok(())
     }
 
     #[test]
@@ -1950,7 +2076,18 @@ mod tests {
                 )
                 .part(
                     nz::u32!(1),
-                    NonZero::new(longest).expect("samples have duration"),
+                    NonZero::new(
+                        longest
+                            * u64::from(
+                                crate::media::video_config::properties(
+                                    track.codec,
+                                    track.codec_extradata.as_bytes(),
+                                )
+                                .reorder_depth
+                                    + 1,
+                            ),
+                    )
+                    .expect("samples have duration"),
                 )
                 .presentation_origin(
                     fixture
@@ -2129,9 +2266,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fractional_video_preserves_sample_timing_across_parts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = ts_bytes_fixture(include_bytes!(
+            "../../../tests/apple_hls/fixtures/h264_2398_aac.ts"
+        ))
+        .await;
+        let track = fixture
+            .presentation
+            .tracks()
+            .iter()
+            .find(|track| track.kind() == MediaKind::Video)
+            .expect("video")
+            .clone();
+        let samples: Vec<_> = fixture
+            .samples
+            .into_iter()
+            .filter(|sample| sample.track_id() == track.id)
+            .collect();
+        let input = crate::media::fixtures::presentation(vec![track.clone()]);
+        let admitted = crate::segment::run_preroll(
+            &mut crate::segment::fixtures::SampleBatches::new(vec![samples.clone()]),
+            crate::segment::PrerollRequest {
+                presentation: &input,
+                timeline: &crate::media::fixtures::calibrated([(
+                    track.id.0,
+                    track.timebase,
+                    samples[0].pts(),
+                )]),
+                limits: crate::segment::PrerollLimits::permissive(),
+                policy: crate::segment::SegmentationPolicy::latency_first(
+                    Duration::from_secs(2),
+                    Duration::from_millis(500),
+                ),
+            },
+            &discarded_events(),
+        )
+        .await?;
+        let mut mux = started(
+            &input,
+            admitted.segmentation.iter().copied().collect(),
+            &discarded_events(),
+        );
+        let mut media = Vec::new();
+        for sample in &samples {
+            mux.muxer.push(sample.clone(), &mut media)?;
+        }
+        mux.muxer
+            .finish(crate::mux::FinishReason::Final, &mut media)?;
+        let bytes = concat_cmaf_bytes(&media);
+        let demuxed = demux_cmaf(&bytes);
+        let output = &demuxed.tracks[0].samples;
+        assert_eq!(output.len(), samples.len());
+        let origin = super::sample_dts(&samples[0]);
+        for (actual, expected) in output.iter().zip(&samples) {
+            assert_eq!(actual.duration.map(u64::from), Some(expected.duration()));
+            assert_eq!(actual.dts, Some(super::sample_dts(expected) - origin));
+            assert_eq!(actual.pts, Some(expected.pts() - origin));
+        }
+        let init = media
+            .iter()
+            .find_map(|event| match event {
+                PackagedMedia::Initialization(init) => Some(init.payload.as_bytes()),
+                _ => None,
+            })
+            .expect("initialization");
+        let mut previous_end = None;
+        for chunk in media.iter().filter_map(|event| match event {
+            PackagedMedia::Chunk(chunk) => Some(chunk),
+            _ => None,
+        }) {
+            let bytes = [init, chunk.payload.as_bytes()].concat();
+            let demuxed = demux_cmaf(&bytes);
+            let samples = &demuxed.tracks[0].samples;
+            let start = samples
+                .iter()
+                .map(|sample| sample.pts.expect("PTS"))
+                .min()
+                .expect("samples");
+            let end = samples
+                .iter()
+                .map(|sample| {
+                    sample.pts.expect("PTS") + i64::from(sample.duration.expect("duration"))
+                })
+                .max()
+                .expect("samples");
+            if let Some(previous) = previous_end {
+                assert!(start >= previous - 1, "part presentation ranges overlap");
+            }
+            previous_end = Some(end);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn long_av1_fixture_has_eighty_timed_video_frames() {
+        let fixture = ts_bytes_fixture(include_bytes!(
+            "../../../tests/apple_hls/fixtures/av1_long.ts"
+        ))
+        .await;
+        assert_eq!(fixture.presentation.tracks().len(), 1);
+        assert_eq!(
+            fixture.presentation.tracks()[0].codec,
+            crate::domain::Codec::Av1
+        );
+        assert_eq!(fixture.presentation.tracks()[0].kind(), MediaKind::Video);
+        assert_eq!(fixture.samples.len(), 80);
+        assert!(
+            fixture
+                .samples
+                .iter()
+                .all(|sample| sample.duration() == 9000)
+        );
+        assert!(
+            fixture
+                .samples
+                .windows(2)
+                .all(|pair| pair[1].pts() - pair[0].pts() == 9000)
+        );
+    }
+
+    #[tokio::test]
     async fn av1g_and_opus_ts_package_as_cmaf() {
         for bytes in [
             &include_bytes!("../../../tests/apple_hls/fixtures/av1.ts")[..],
+            &include_bytes!("../../../tests/apple_hls/fixtures/av1_long.ts")[..],
             &include_bytes!("../../../tests/apple_hls/fixtures/opus.ts")[..],
         ] {
             let fixture = ts_bytes_fixture(bytes).await;
@@ -2160,6 +2419,10 @@ mod tests {
                 (
                     "av1",
                     &include_bytes!("../../../tests/apple_hls/fixtures/av1.ts")[..],
+                ),
+                (
+                    "av1_long",
+                    &include_bytes!("../../../tests/apple_hls/fixtures/av1_long.ts")[..],
                 ),
                 (
                     "opus",
@@ -2452,6 +2715,43 @@ mod tests {
             [PackagedMedia::Initialization(_), PackagedMedia::Chunk(chunk)]
                 if chunk.media_start == 0 && chunk.duration == FRAME
         ));
+    }
+
+    #[test]
+    fn a_part_containing_a_later_idr_is_marked_independent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let timebase = Timebase::new(nz::u32!(1), nz::u32!(16_384));
+        let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())?;
+        let mut started = started(
+            &input,
+            vec![
+                PlanBuilder::new(0, timebase, nz::u64!(65_536))
+                    .part(nz::u32!(2), nz::u64!(16_384))
+                    .build(),
+            ],
+            &discarded_events(),
+        );
+        let mut media = Vec::new();
+        for frame in 0..4 {
+            started.muxer.push(
+                sample_for(0, frame * i64::try_from(FRAME)?, frame == 0 || frame == 3),
+                &mut media,
+            )?;
+        }
+        started
+            .muxer
+            .finish(crate::mux::FinishReason::Final, &mut media)?;
+        let parts: Vec<_> = media
+            .iter()
+            .filter_map(|event| match event {
+                PackagedMedia::Chunk(chunk) => Some(chunk),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|part| part.independent));
+        assert!(parts.iter().all(|part| part.duration == 2 * FRAME));
+        Ok(())
     }
 
     #[test]

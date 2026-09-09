@@ -107,6 +107,7 @@ pub async fn run(
         if !state.is_open() {
             // The input is gone, so no further evidence can arrive. Whatever
             // the observer can conclude now is final.
+            observer.close_input();
             let segmentation = select(
                 &observer,
                 presentation,
@@ -728,6 +729,61 @@ mod admission_tests {
             ),
             Err(PrerollError::LimitExceeded)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admission_waits_for_preferred_boundary_audio_until_eof()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            domain::{MediaKind, Timebase, fixtures::TrackBuilder},
+            media::fixtures,
+        };
+        let audio_base = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+        let presentation = fixtures::presentation(vec![
+            TrackBuilder::new(0, MediaKind::Video).build(),
+            TrackBuilder::new(1, MediaKind::Audio)
+                .timebase(audio_base)
+                .build(),
+        ]);
+        let timeline = fixtures::timeline([(0, Timebase::hz90k()), (1, audio_base)]);
+        for catches_up in [true, false] {
+            let mut initial: Vec<_> = (0..=180)
+                .map(|frame| video_sample(frame * 3000, 3000, frame % 30 == 0, 0))
+                .collect();
+            initial.extend((0..240).map(|frame| fixtures::audio_sample(1, frame * 1024, 1024)));
+            let tail = if catches_up {
+                (240..284)
+                    .map(|frame| fixtures::audio_sample(1, frame * 1024, 1024))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let admitted = run(
+                &mut SampleBatches::new(vec![initial, tail]),
+                PrerollRequest {
+                    presentation: &presentation,
+                    timeline: &timeline,
+                    limits: PrerollLimits::permissive(),
+                    policy: SegmentationPolicy::latency_first(
+                        Duration::from_secs(6),
+                        Duration::from_secs(1),
+                    ),
+                },
+                &crate::mux::fixtures::discarded_events(),
+            )
+            .await?;
+            assert_eq!(admitted.input_state, InputState::Closed);
+            assert_eq!(
+                admitted
+                    .segmentation
+                    .get(crate::domain::TrackId(0))
+                    .expect("video")
+                    .segment_duration
+                    .get(),
+                if catches_up { 540_000 } else { 450_000 }
+            );
+        }
         Ok(())
     }
 

@@ -179,16 +179,17 @@ ffmpeg -y -loglevel error \
   -f mpegts "$out/h264_opus.ts"
 
 # --- AV1 ---------------------------------------------------------------------
-# FFmpeg cannot write AV1 into MPEG-TS, so the OBU stream is remuxed by
+# FFmpeg cannot write AV1 into MPEG-TS, so a timestamped IVF stream is remuxed by
 # GStreamer's custom AV1G mapping, which is the mapping this origin's demuxer
 # implements.
 say "av1_long.ts"
 ffmpeg -y -loglevel error \
   -f lavfi -i "testsrc2=size=160x96:rate=10:duration=$seconds" \
-  -c:v libsvtav1 -preset 12 -g 20 -b:v 80k -pix_fmt yuv420p \
-  -f obu "$work/av1.obu"
+  -c:v libsvtav1 -preset 12 -g 2 -b:v 80k -pix_fmt yuv420p \
+  -f ivf "$work/av1.ivf"
 if command -v gst-launch-1.0 >/dev/null; then
-  gst-launch-1.0 -q filesrc "location=$work/av1.obu" ! av1parse ! \
+  # Raw OBUs have no timestamps; IVF preserves the ten-frame-per-second clock.
+  gst-launch-1.0 -q filesrc "location=$work/av1.ivf" ! ivfparse ! av1parse ! \
     mpegtsmux enable-custom-mappings=true ! filesink "location=$out/av1_long.ts"
 else
   printf 'skipping av1_long.ts: gst-launch-1.0 is not installed\n' >&2

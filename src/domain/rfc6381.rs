@@ -29,7 +29,7 @@ use super::Codec;
 pub fn rfc6381(codec: Codec, config: Option<&[u8]>) -> Option<Arc<str>> {
     match codec {
         Codec::H264 => Some(h264(config)),
-        Codec::Hevc => Some(Arc::from("hvc1")),
+        Codec::Hevc => Some(hevc(config)),
         Codec::Av1 => av1(config),
         Codec::Aac => Some(aac(config)),
         Codec::Opus => Some(Arc::from("opus")),
@@ -89,6 +89,64 @@ fn h264(config: Option<&[u8]>) -> Arc<str> {
     }
 }
 
+/// \`hvc1.PPP.CCCCCCCC.TLLL.BB...\` from an \`HEVCDecoderConfigurationRecord\`.
+///
+/// Every component after the sample entry name comes from the record's general
+/// profile-tier-level fields, which is the whole reason this takes the bytes:
+/// a bare \`hvc1\` tells a player nothing, and Apple's validator reports it as a
+/// \`CODECS\` attribute that does not declare the format actually present.
+///
+/// ISO/IEC 14496-15 annex E fixes the spelling, and it is not the hexadecimal
+/// run that H.264 uses:
+///
+/// * the profile space is \`\`/\`A\`/\`B\`/\`C\` followed by the decimal profile;
+/// * the compatibility flags are hexadecimal, *bit-reversed*, with leading
+///   zeros dropped — a detail that is easy to miss and produces a string
+///   players silently reject;
+/// * the tier is \`L\` or \`H\` followed by the decimal level;
+/// * the six constraint bytes are hexadecimal, dot-separated, with trailing
+///   zero bytes omitted.
+///
+/// A record that will not parse falls back to the bare name rather than
+/// guessing: an inaccurate refinement is worse than none, because a player
+/// trusts it enough to refuse the stream without fetching a segment.
+fn hevc(config: Option<&[u8]>) -> Arc<str> {
+    let Some(record) = config.and_then(|bytes| {
+        <transmux::HEVCDecoderConfigurationRecord as broadcast_common::Parse>::parse(bytes).ok()
+    }) else {
+        return Arc::from("hvc1");
+    };
+
+    let space = match record.general_profile_space {
+        0 => "",
+        1 => "A",
+        2 => "B",
+        3 => "C",
+        _ => return Arc::from("hvc1"),
+    };
+    let compatibility = record.general_profile_compatibility_flags.reverse_bits();
+    let tier = if record.general_tier_flag { 'H' } else { 'L' };
+
+    let mut codec = format!(
+        "hvc1.{space}{}.{compatibility:X}.{tier}{}",
+        record.general_profile_idc, record.general_level_idc
+    );
+    // The 48-bit field is stored most-significant byte first. Trailing zero
+    // bytes carry no information and annex E omits them, so a Main-profile
+    // stream with only the progressive-source flag set spells one byte rather
+    // than six.
+    let constraints = record.general_constraint_indicator_flags.to_be_bytes();
+    let significant = constraints[2..]
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |index| index + 1);
+    for byte in &constraints[2..2 + significant] {
+        use std::fmt::Write as _;
+        let _ = write!(codec, ".{byte:02X}");
+    }
+    Arc::from(codec)
+}
+
 /// Finds the first SPS and reads the three bytes shared with avcC.
 ///
 /// They immediately follow the SPS NAL header, before fields whose Exp-Golomb
@@ -119,13 +177,18 @@ fn annex_b_sps_identity(config: &[u8]) -> Option<[u8; 3]> {
 
 /// `mp4a.40.N` from the audio object type of an AudioSpecificConfig.
 fn aac(config: Option<&[u8]>) -> Arc<str> {
+    // Parse backward-compatible SBR/PS extensions with the same reader used
+    // for audio timing. A partial configuration retains the old header fallback.
     // AudioSpecificConfig: the first 5 bits are audioObjectType. Type 0 is
     // "null" and never describes real media, so it falls back to 2 (AAC-LC),
     // which is what an encoder that declared nothing is overwhelmingly likely
     // to be producing.
     let audio_object_type = config
-        .and_then(|asc| asc.first().copied())
-        .map(|first| u32::from(first >> 3))
+        .and_then(|asc| {
+            super::aac::audio_object_type(asc)
+                .ok()
+                .or_else(|| asc.first().map(|first| u32::from(first >> 3)))
+        })
         .filter(|value| *value > 0)
         .unwrap_or(2);
     Arc::from(format!("mp4a.40.{audio_object_type}"))

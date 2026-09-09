@@ -96,7 +96,7 @@ fn a_live_playlist_states_its_terms_before_any_media() -> Result<(), Box<dyn std
             "#EXTM3U",
             "#EXT-X-VERSION:9",
             "#EXT-X-TARGETDURATION:6",
-            "#EXT-X-SERVER-CONTROL:HOLD-BACK=18,PART-HOLD-BACK=3,CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=36",
+            "#EXT-X-SERVER-CONTROL:HOLD-BACK=18,PART-HOLD-BACK=3.000001,CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=36",
             "#EXT-X-PART-INF:PART-TARGET=1",
             "#EXT-X-MEDIA-SEQUENCE:0",
         ],

@@ -29,6 +29,7 @@ pub fn admit(
             return Err(CadenceError::NoSegmentationBoundary.into());
         }
     }
+    reserve_composition_groups(plan, samples, policy, work)?;
     loop {
         *work = work.saturating_add(samples.len());
         if *work > 1_000_000 {
@@ -95,6 +96,63 @@ pub fn admit(
             Err(error) => return Err(PrerollError::Packaging(error)),
         }
     }
+}
+
+fn reserve_composition_groups(
+    plan: &mut SegmentationPlan,
+    samples: &[NormalizedSample],
+    policy: SegmentationPolicy,
+    work: &mut usize,
+) -> Result<(), PrerollError> {
+    // Whole presentation groups are the indivisible units for reordered video
+    // chunks. Reserve an integral number of the largest observed group rather
+    // than locking a ceiling between two usable group durations.
+    for track in &mut plan.tracks {
+        let mut groups = super::cutter::CompositionGroups::default();
+        for sample in samples
+            .iter()
+            .filter(|sample| sample.track_id() == track.track_id)
+        {
+            if let NormalizedSample::Video(video) = sample {
+                *work = work.saturating_add(1);
+                if *work > 1_000_000 {
+                    return Err(PrerollError::LimitExceeded);
+                }
+                groups
+                    .advance(
+                        video.pts,
+                        video.dts,
+                        video.duration,
+                        track.boundary_tolerance,
+                    )
+                    .ok_or(CadenceError::TimestampOverflow(track.track_id))?;
+            }
+        }
+        if groups.reordered && groups.longest > 0 {
+            let maximum = track
+                .timebase
+                .duration_to_ticks_floor(policy.maximum_part_duration)
+                .min(track.segment_duration.get());
+            let aligned = track
+                .part_duration
+                .get()
+                .div_ceil(groups.longest)
+                .checked_mul(groups.longest)
+                .ok_or(CadenceError::InvalidPolicy)?;
+            // A cut that reaches the 85% floor may need the remainder of one
+            // reorder group. Reserve that room when the configured cap permits
+            // it; replay remains authoritative when the cap is tighter.
+            let remainder = groups
+                .longest
+                .saturating_sub(groups.shortest_sample.unwrap_or(0))
+                .saturating_add(track.boundary_tolerance.saturating_mul(2));
+            let robust = u64::try_from((u128::from(remainder) * 100).div_ceil(15))
+                .map_err(|_| CadenceError::InvalidPolicy)?;
+            let target = aligned.max(robust).min(maximum);
+            track.part_duration = NonZero::new(target).ok_or(CadenceError::InvalidPolicy)?;
+        }
+    }
+    Ok(())
 }
 
 fn candidates(

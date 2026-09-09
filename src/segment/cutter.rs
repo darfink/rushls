@@ -145,20 +145,59 @@ impl PartClock {
     }
 }
 
+/// Finds decode-order prefixes whose presentation range is complete.
+#[derive(Default)]
+pub struct CompositionGroups {
+    offset: Option<i64>,
+    high: Option<i64>,
+    span: u64,
+    pub longest: u64,
+    pub shortest_sample: Option<u64>,
+    pub reordered: bool,
+}
+
+impl CompositionGroups {
+    pub fn advance(&mut self, pts: i64, dts: i64, duration: u64, tolerance: u64) -> Option<bool> {
+        let offset = *self.offset.get_or_insert(pts.checked_sub(dts)?);
+        let end = pts.checked_add_unsigned(duration)?;
+        let high = self.high.map_or(end, |previous| previous.max(end));
+        self.high = Some(high);
+        self.span = self.span.checked_add(duration)?;
+        self.shortest_sample = Some(
+            self.shortest_sample
+                .map_or(duration, |old| old.min(duration)),
+        );
+        let frontier = dts
+            .checked_add(offset)?
+            .checked_add_unsigned(duration)?
+            .checked_add_unsigned(tolerance)?;
+        let complete = high <= frontier;
+        self.reordered |= !complete;
+        if complete {
+            self.longest = self.longest.max(self.span);
+            self.span = 0;
+        }
+        Some(complete)
+    }
+}
+
 /// Timing retained until a part boundary can no longer be repaired.
 #[derive(Clone, Copy, Debug)]
 struct Unit {
     duration: TickDuration,
     independent: bool,
+    can_end: bool,
 }
 
-/// One-access-unit lookahead over unpublished parts, shared by replay and CMAF.
+/// Bounded lookahead over unpublished parts, shared by replay and CMAF.
+/// Reordered video retains a legal successor before committing its predecessor.
 /// Payloads stay with the writer; returned counts always refer to its queue head.
 pub struct PartPartitioner {
     units: Vec<Unit>,
     maximum: TickDuration,
     tentative_at: Option<usize>,
     committed: bool,
+    restricted_boundaries: bool,
 }
 
 impl PartPartitioner {
@@ -168,6 +207,7 @@ impl PartPartitioner {
             maximum,
             tentative_at: None,
             committed: false,
+            restricted_boundaries: false,
         }
     }
 
@@ -176,15 +216,27 @@ impl PartPartitioner {
         duration: TickDuration,
         independent: bool,
     ) -> Result<Vec<usize>, CutError> {
+        self.push_with_boundary(duration, independent, true)
+    }
+
+    /// Reordered video may only cut after a complete presentation group.
+    pub fn push_with_boundary(
+        &mut self,
+        duration: TickDuration,
+        independent: bool,
+        can_end: bool,
+    ) -> Result<Vec<usize>, CutError> {
         if duration > self.maximum {
             return Err(CutError::SampleTooLong {
                 duration,
                 maximum: self.maximum,
             });
         }
+        self.restricted_boundaries |= !can_end;
         self.units.push(Unit {
             duration,
             independent,
+            can_end,
         });
         let mut cuts = Vec::new();
         loop {
@@ -207,9 +259,23 @@ impl PartPartitioner {
                 && u128::from(self.units[0].duration) + u128::from(self.units[1].duration)
                     > u128::from(self.maximum))
                 || self.units.iter().all(|unit| unit.independent);
-            let ready = irrevocable
-                || self.tentative_at.is_some_and(|at| self.units.len() > at)
-                || total > u128::from(self.maximum) * 2;
+            // A B-frame group can span several access units. Prove that its
+            // successor has a legal group boundary before publishing this cut.
+            let ready = if self.restricted_boundaries {
+                let successor = &self.units[partition[0]..partition[1]];
+                let duration = successor.iter().map(|unit| unit.duration).sum();
+                (self.units[partition[1] - 1].can_end
+                    && regular(
+                        duration,
+                        self.maximum,
+                        successor.iter().any(|unit| unit.independent),
+                    ))
+                    || total > u128::from(self.maximum) * 2
+            } else {
+                irrevocable
+                    || self.tentative_at.is_some_and(|at| self.units.len() > at)
+                    || total > u128::from(self.maximum) * 2
+            };
             if !ready {
                 self.tentative_at = Some(self.units.len());
                 break;
@@ -256,12 +322,18 @@ impl PartPartitioner {
         let mut independent = self.units[0].independent;
         let mut ends = Vec::new();
         for (index, unit) in self.units.iter().enumerate() {
-            if before_sample(duration, unit.duration, independent, self.maximum).ok()? {
+            if before_sample(duration, unit.duration, independent, self.maximum).ok()?
+                && self.units[index - 1].can_end
+            {
                 ends.push(index);
                 duration = 0;
                 independent = unit.independent;
             }
+            independent |= unit.independent;
             duration = duration.checked_add(unit.duration)?;
+            if duration > self.maximum {
+                return None;
+            }
         }
         ends.push(self.units.len());
         Some(ends)
@@ -277,7 +349,9 @@ impl PartPartitioner {
         let mut work = 0_usize;
         for start in (0..n).rev() {
             let mut sum = 0_u64;
+            let mut independent = false;
             for end in start..n {
+                independent |= self.units[end].independent;
                 work += 1;
                 if work > 1_000_000 {
                     return Err(CutError::RepairWindowExhausted {
@@ -292,7 +366,8 @@ impl PartPartitioner {
                     break;
                 }
                 let legal = sum > 0
-                    && (end + 1 == n || regular(sum, self.maximum, self.units[start].independent));
+                    && (end + 1 == n
+                        || (self.units[end].can_end && regular(sum, self.maximum, independent)));
                 if legal && cost[end + 1] != usize::MAX && cost[end + 1] < cost[start] {
                     cost[start] = cost[end + 1] + 1;
                     next[start] = end + 1;
@@ -341,7 +416,13 @@ mod partition_tests {
                 break;
             }
             if sum == 0
-                || (end + 1 != units.len() && !regular(sum, maximum, units[start].independent))
+                || (end + 1 != units.len()
+                    && (!units[end].can_end
+                        || !regular(
+                            sum,
+                            maximum,
+                            units[start..=end].iter().any(|unit| unit.independent),
+                        )))
             {
                 continue;
             }
@@ -370,6 +451,7 @@ mod partition_tests {
                         Unit {
                             duration,
                             independent: flags & (1 << index) != 0,
+                            can_end: true,
                         }
                     })
                     .collect();
@@ -385,6 +467,64 @@ mod partition_tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn repair_matches_the_oracle_with_restricted_group_boundaries() -> Result<(), CutError> {
+        for encoded in 0_u32..81 {
+            for flags in 0..16 {
+                for boundaries in 0..8 {
+                    let units: Vec<_> = (0..4)
+                        .map(|index| Unit {
+                            duration: u64::from((encoded / 3_u32.pow(index) % 3 + 1) * 20),
+                            independent: flags & (1 << index) != 0,
+                            can_end: index == 3 || boundaries & (1 << index) != 0,
+                        })
+                        .collect();
+                    let expected = oracle(&units, 0, 100);
+                    let mut planner = PartPartitioner::new(100);
+                    planner.units = units;
+                    match expected {
+                        Some(expected) => assert_eq!(planner.repair()?, expected),
+                        None => assert!(planner.repair().is_err()),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn composition_groups_close_after_the_delayed_b_frames() {
+        let mut groups = CompositionGroups::default();
+        let closed: Vec<_> = [0, 40, 10, 20, 30]
+            .into_iter()
+            .enumerate()
+            .map(|(index, pts)| {
+                groups
+                    .advance(
+                        pts,
+                        i64::try_from(index).expect("small index") * 10 - 30,
+                        10,
+                        0,
+                    )
+                    .expect("timing fits")
+            })
+            .collect();
+        assert_eq!(closed, [true, false, false, false, true]);
+        assert_eq!(groups.longest, 40);
+        assert_eq!(groups.shortest_sample, Some(10));
+    }
+
+    #[test]
+    fn an_independent_frame_inside_a_part_exempts_its_duration_floor() -> Result<(), CutError> {
+        let mut planner = PartPartitioner::new(100);
+        for (duration, independent) in [(30, false), (30, true), (50, false)] {
+            assert!(planner.push(duration, independent)?.is_empty());
+        }
+        assert_eq!(planner.push(10, false)?, [2]);
+        assert_eq!(planner.finish()?, [2]);
         Ok(())
     }
 

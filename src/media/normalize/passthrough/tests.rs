@@ -285,6 +285,44 @@ fn an_audio_packet_longer_than_its_fixed_frame_is_still_rejected() {
 }
 
 #[test]
+fn av1_without_declared_timing_uses_observed_steps_and_rejects_frozen_timestamps()
+-> Result<(), NormalizeError> {
+    let video = TrackBuilder::new(0, MediaKind::Video)
+        .codec(Codec::Av1)
+        .parameters(MediaParameters::Video {
+            width: nz::u32!(160),
+            height: nz::u32!(96),
+            frame_rate: None,
+            video_delay: 0,
+        })
+        .build();
+    let (mut normal, _, _) = start(vec![video.clone()]);
+    let mut samples = Vec::new();
+    for pts in [0, 9000, 18000] {
+        normal
+            .normalizer
+            .push(packet(0, Some(pts), Some(pts), None), &mut samples)?;
+    }
+    normal.normalizer.finish(&mut samples)?;
+    assert_eq!(samples.len(), 3);
+    assert!(samples.iter().all(|sample| sample.duration() == 9000));
+    let (mut frozen, _, _) = start(vec![video]);
+    frozen
+        .normalizer
+        .push(packet(0, Some(0), Some(0), None), &mut Vec::new())?;
+    let error = frozen
+        .normalizer
+        .push(packet(0, Some(0), Some(0), None), &mut Vec::new())
+        .expect_err("no timing evidence");
+    assert!(
+        error
+            .to_string()
+            .contains("from access-unit timestamps or codec timing")
+    );
+    Ok(())
+}
+
+#[test]
 fn video_derives_variable_durations_and_synthesizes_missing_dts() {
     let video = TrackBuilder::new(0, MediaKind::Video)
         .timebase(Timebase::new(nz::u32!(1), nz::u32!(10_000)))

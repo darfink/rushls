@@ -36,6 +36,7 @@ impl Response {
         body: MediaBody,
         gzip: Option<Bytes>,
         resource: MediaResource,
+        kind: crate::domain::MediaKind,
         reuse: Reuse,
     ) -> Result<Self, DeliveryError> {
         debug_assert!(
@@ -46,7 +47,7 @@ impl Response {
             body: Body::Media(body),
             gzip,
             content_type: resource
-                .content_type()
+                .content_type(kind)
                 .ok_or(DeliveryError::UnknownResource)?,
             reuse,
         })

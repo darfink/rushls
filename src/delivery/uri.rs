@@ -16,7 +16,7 @@ use urlencoding::{Encoded, decode};
 
 use crate::{
     delivery::store::{InitializationId, PartId, SegmentId},
-    domain::{RenditionId, StreamId},
+    domain::{MediaKind, RenditionId, StreamId},
     mux::MediaSegmentFormat,
 };
 
@@ -30,10 +30,28 @@ const PACKAGING_FORMATS: [MediaSegmentFormat; 3] = [
 ];
 
 /// A media type the delivery surface can emit.
+///
+/// One variant per media type, each naming its own spelling in full. The
+/// ISO-BMFF ones are split by what the track carries because that is what the
+/// media type says: an audio-only segment and a video one are framed
+/// identically, so nothing about the bytes distinguishes them and answering
+/// \`video/...\` for the first is simply wrong.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentType {
-    Mp4,
-    IsoSegment,
+    /// Any ISO-BMFF object carrying audio, initialization or segment alike.
+    ///
+    /// Video distinguishes the two and audio does not, which looks like an
+    /// oversight and is not: Apple's authoring specification gives
+    /// \`video/iso.segment\` for a video media segment but \`audio/mp4\` for both
+    /// audio roles, and \`mediastreamvalidator\` enforces it — serving the
+    /// symmetric \`audio/iso.segment\` is reported as the wrong MIME type. The
+    /// asymmetry is Apple's; recording it here is what keeps it from being
+    /// re-derived, and wrongly, the next time someone tidies this table.
+    AudioMp4,
+    /// An ISO-BMFF initialization object for a video track.
+    VideoMp4,
+    /// An ISO-BMFF media segment carrying video.
+    VideoSegment,
     MpegTs,
     WebVtt,
     /// Text emitted by a manifest adapter, with its protocol media type.
@@ -43,8 +61,9 @@ pub enum ContentType {
 impl ContentType {
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Mp4 => "video/mp4",
-            Self::IsoSegment => "video/iso.segment",
+            Self::AudioMp4 => "audio/mp4",
+            Self::VideoMp4 => "video/mp4",
+            Self::VideoSegment => "video/iso.segment",
             Self::MpegTs => "video/mp2t",
             Self::WebVtt => "text/vtt",
             Self::Manifest(name) => name,
@@ -73,7 +92,7 @@ impl MediaResource {
         }
     }
 
-    pub fn format(self) -> MediaSegmentFormat {
+    pub const fn format(self) -> MediaSegmentFormat {
         match self {
             Self::Initialization(_, _, format)
             | Self::Segment(_, _, format)
@@ -81,24 +100,39 @@ impl MediaResource {
         }
     }
 
-    pub fn content_type(self) -> Option<ContentType> {
+    /// The media type this object is served as.
+    ///
+    /// \`kind\` is required rather than inferred because a [\`MediaResource\`] is
+    /// parsed from a request path, which names a rendition but says nothing
+    /// about what that rendition carries. Only the store knows, so only a
+    /// caller holding its snapshot can answer.
+    ///
+    /// \`None\` when this combination has no media type: a packaging with no
+    /// initialization object, or a subtitle track in ISO-BMFF, which has no
+    /// spelling here because nothing produces one.
+    pub const fn content_type(self, kind: MediaKind) -> Option<ContentType> {
         match self {
-            Self::Initialization(_, _, format) => spellings(format)
-                .initialization
-                .map(|spelling| spelling.content_type),
+            Self::Initialization(_, _, format) => match spellings(format).initialization {
+                Some(spelling) => spelling.content_type.of(kind),
+                None => None,
+            },
             Self::Segment(_, _, format) | Self::Part(_, _, format) => {
-                Some(spellings(format).segment.content_type)
+                spellings(format).segment.content_type.of(kind)
             }
         }
     }
 
-    pub fn compressible(self) -> bool {
-        self.content_type().is_some_and(ContentType::is_text)
+    /// Whether this object has a gzip representation.
+    ///
+    /// A property of the packaging alone: whether bytes are text does not
+    /// depend on whether the track they describe is audio or video.
+    pub const fn compressible(self) -> bool {
+        is_text(self.format())
     }
 }
 
 /// Whether media in this packaging is text and may have a gzip representation.
-pub fn is_text(format: MediaSegmentFormat) -> bool {
+pub const fn is_text(format: MediaSegmentFormat) -> bool {
     spellings(format).segment.content_type.is_text()
 }
 
@@ -115,7 +149,59 @@ struct Spellings {
 #[derive(Clone, Copy)]
 struct Spelling {
     extension: &'static str,
-    content_type: ContentType,
+    content_type: Typed,
+}
+
+/// Whether one object's media type depends on what its track carries.
+///
+/// Making the dependency a property of the table entry is the point: reading
+/// it says which containers care and which do not, instead of leaving that in
+/// a fixup applied somewhere else to a value that was already wrong.
+#[derive(Clone, Copy)]
+enum Typed {
+    /// The same media type whatever the track carries.
+    Fixed(ContentType),
+    /// ISO-BMFF, whose media type names the track's media.
+    ByMedia {
+        audio: ContentType,
+        video: ContentType,
+    },
+}
+
+impl Typed {
+    /// The media type for a track of \`kind\`, or \`None\` if there is not one.
+    ///
+    /// Subtitles in ISO-BMFF are the \`None\`. This origin packages every
+    /// subtitle rendition as WebVTT — the CMAF packager refuses a subtitle
+    /// track outright — so the combination cannot arise today, and answering
+    /// it honestly costs nothing.
+    ///
+    /// What it buys is that the honest answer is the *only* one available.
+    /// Folding subtitles in with video to keep this total would compile, never
+    /// fire, and then serve \`video/iso.segment\` on WebVTT bytes the day
+    /// somebody adds \`wvtt\` or \`stpp\` output. A \`None\` becomes a request
+    /// error that names the resource; a wrong \`Content-Type\` becomes a player
+    /// bug reported weeks later.
+    ///
+    /// It is deliberately not a panic. This runs on the request path for every
+    /// media object, subtitle segments included, so an \`unreachable!()\` here
+    /// would be reachable by anyone who can issue a GET.
+    const fn of(self, kind: MediaKind) -> Option<ContentType> {
+        match (self, kind) {
+            (Self::Fixed(content_type), _) => Some(content_type),
+            (Self::ByMedia { audio, .. }, MediaKind::Audio) => Some(audio),
+            (Self::ByMedia { video, .. }, MediaKind::Video) => Some(video),
+            (Self::ByMedia { .. }, MediaKind::Subtitle) => None,
+        }
+    }
+
+    /// Only a fixed media type is ever text; no ISO-BMFF object is.
+    const fn is_text(self) -> bool {
+        match self {
+            Self::Fixed(content_type) => content_type.is_text(),
+            Self::ByMedia { .. } => false,
+        }
+    }
 }
 
 const fn spellings(format: MediaSegmentFormat) -> Spellings {
@@ -123,22 +209,28 @@ const fn spellings(format: MediaSegmentFormat) -> Spellings {
         MediaSegmentFormat::Cmaf => Spellings {
             initialization: Some(Spelling {
                 extension: "mp4",
-                content_type: ContentType::Mp4,
+                content_type: Typed::ByMedia {
+                    audio: ContentType::AudioMp4,
+                    video: ContentType::VideoMp4,
+                },
             }),
             segment: Spelling {
                 extension: "m4s",
-                content_type: ContentType::IsoSegment,
+                content_type: Typed::ByMedia {
+                    audio: ContentType::AudioMp4,
+                    video: ContentType::VideoSegment,
+                },
             },
         },
         // WebVTT's header is a real initialization object carried by EXT-X-MAP.
         MediaSegmentFormat::WebVtt => Spellings {
             initialization: Some(Spelling {
                 extension: "vtt",
-                content_type: ContentType::WebVtt,
+                content_type: Typed::Fixed(ContentType::WebVtt),
             }),
             segment: Spelling {
                 extension: "vtt",
-                content_type: ContentType::WebVtt,
+                content_type: Typed::Fixed(ContentType::WebVtt),
             },
         },
         // MPEG-TS segments are self-describing.
@@ -146,7 +238,7 @@ const fn spellings(format: MediaSegmentFormat) -> Spellings {
             initialization: None,
             segment: Spelling {
                 extension: "ts",
-                content_type: ContentType::MpegTs,
+                content_type: Typed::Fixed(ContentType::MpegTs),
             },
         },
     }
@@ -349,7 +441,10 @@ mod tests {
         let segment =
             MediaResource::Segment(RenditionId(3), SegmentId(7), MediaSegmentFormat::WebVtt);
         assert_eq!(append_media_leaf(&mut name, segment), Some("segment/7.vtt"));
-        assert_eq!(segment.content_type(), Some(ContentType::WebVtt));
+        // WebVTT ignores what the track carries, so every kind must agree.
+        for kind in [MediaKind::Audio, MediaKind::Subtitle, MediaKind::Video] {
+            assert_eq!(segment.content_type(kind), Some(ContentType::WebVtt));
+        }
         assert!(segment.compressible());
 
         let initialization = MediaResource::Initialization(
@@ -358,7 +453,86 @@ mod tests {
             MediaSegmentFormat::MpegTs,
         );
         assert_eq!(append_media_leaf(&mut name, initialization), None);
-        assert_eq!(initialization.content_type(), None);
+        assert_eq!(initialization.content_type(MediaKind::Video), None);
+    }
+
+    /// Every ISO-BMFF object names the media it carries.
+    ///
+    /// The audio segment sharing its type with the audio initialization is
+    /// Apple's rule rather than an oversight; see [\`ContentType::AudioMp4\`].
+    #[test]
+    fn iso_bmff_media_types_name_what_the_track_carries() {
+        const CMAF: MediaSegmentFormat = MediaSegmentFormat::Cmaf;
+        let init = MediaResource::Initialization(RenditionId(0), InitializationId(1), CMAF);
+        let segment = MediaResource::Segment(RenditionId(0), SegmentId(1), CMAF);
+        let part = MediaResource::Part(RenditionId(0), PartId(1), CMAF);
+
+        assert_eq!(
+            init.content_type(MediaKind::Video).map(ContentType::name),
+            Some("video/mp4")
+        );
+        assert_eq!(
+            init.content_type(MediaKind::Audio).map(ContentType::name),
+            Some("audio/mp4")
+        );
+        for object in [segment, part] {
+            assert_eq!(
+                object.content_type(MediaKind::Video).map(ContentType::name),
+                Some("video/iso.segment")
+            );
+            assert_eq!(
+                object.content_type(MediaKind::Audio).map(ContentType::name),
+                Some("audio/mp4")
+            );
+        }
+    }
+
+    /// ISO-BMFF has no spelling for a subtitle track, and says so.
+    ///
+    /// Nothing produces this combination: subtitle renditions are packaged as
+    /// WebVTT. It is checked anyway because the alternative implementations —
+    /// answering \`video/...\` or panicking — are both wrong in ways that only
+    /// show up once somebody adds \`wvtt\` output, and by then the first is a
+    /// player bug and the second is a request that kills the response.
+    #[test]
+    fn a_subtitle_track_has_no_iso_bmff_media_type() {
+        for object in [
+            MediaResource::Initialization(
+                RenditionId(0),
+                InitializationId(1),
+                MediaSegmentFormat::Cmaf,
+            ),
+            MediaResource::Segment(RenditionId(0), SegmentId(1), MediaSegmentFormat::Cmaf),
+            MediaResource::Part(RenditionId(0), PartId(1), MediaSegmentFormat::Cmaf),
+        ] {
+            assert_eq!(object.content_type(MediaKind::Subtitle), None);
+        }
+    }
+
+    /// The subtitle path this origin actually serves keeps working.
+    ///
+    /// Not hypothetical: every WebVTT segment fetch reaches
+    /// [\`MediaResource::content_type\`] with [\`MediaKind::Subtitle\`], so this is
+    /// the arm under load, not a corner.
+    #[test]
+    fn a_webvtt_subtitle_object_is_text_vtt() {
+        for object in [
+            MediaResource::Initialization(
+                RenditionId(2),
+                InitializationId(1),
+                MediaSegmentFormat::WebVtt,
+            ),
+            MediaResource::Segment(RenditionId(2), SegmentId(1), MediaSegmentFormat::WebVtt),
+            MediaResource::Part(RenditionId(2), PartId(1), MediaSegmentFormat::WebVtt),
+        ] {
+            assert_eq!(
+                object
+                    .content_type(MediaKind::Subtitle)
+                    .map(ContentType::name),
+                Some("text/vtt"),
+                "a subtitle rendition must keep serving text/vtt"
+            );
+        }
     }
 
     #[test]
