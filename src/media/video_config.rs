@@ -203,3 +203,68 @@ pub fn hevc_frame_rate(units: Option<u32>, scale: Option<u32>) -> Option<crate::
         std::num::NonZeroU32::new(units?)?,
     ))
 }
+
+/// Recognize closed random access in a length-prefixed AVC/HEVC access unit.
+/// `None` means this helper cannot inspect the payload; demux validation still
+/// owns malformed payloads and codecs with another framing format.
+pub fn closed_random_access(codec: Codec, extra: &[u8], payload: &[u8]) -> Option<bool> {
+    let width = match codec {
+        Codec::H264 => usize::from(
+            transmux::AVCDecoderConfigurationRecord::parse(extra)
+                .ok()?
+                .length_size_minus_one
+                + 1,
+        ),
+        Codec::Hevc => usize::from(
+            transmux::HEVCDecoderConfigurationRecord::parse(extra)
+                .ok()?
+                .length_size_minus_one
+                + 1,
+        ),
+        _ => return None,
+    };
+    let mut bytes = payload;
+    while !bytes.is_empty() {
+        let header = bytes.get(..width)?;
+        let length = header
+            .iter()
+            .fold(0usize, |value, byte| (value << 8) | usize::from(*byte));
+        let end = width.checked_add(length)?;
+        let nal = bytes.get(width..end)?;
+        let first = *nal.first()?;
+        match codec {
+            Codec::H264 if matches!(first & 31, 1..=5) => return Some(first & 31 == 5),
+            // CRA with reordering can have leading RASL pictures. A zero
+            // SPS reorder bound excludes those; otherwise require IDR/BLA.
+            Codec::Hevc if (first >> 1) & 63 <= 31 => {
+                let kind = (first >> 1) & 63;
+                return Some(
+                    matches!(kind, 16..=20)
+                        || (kind == 21
+                            && hevc(extra).is_some_and(|properties| properties.reorder_depth == 0)),
+                );
+            }
+            _ => {}
+        }
+        bytes = &bytes[end..];
+    }
+    None
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    #[test]
+    fn transport_flags_cannot_turn_avc_non_idr_into_closed_random_access() {
+        let extra = crate::mux::fixtures::H264_EXTRADATA;
+        assert_eq!(
+            closed_random_access(Codec::H264, extra, &[0, 0, 0, 2, 0x65, 0x80]),
+            Some(true)
+        );
+        assert_eq!(
+            closed_random_access(Codec::H264, extra, &[0, 0, 0, 2, 0x41, 0x80]),
+            Some(false)
+        );
+        assert_eq!(closed_random_access(Codec::H264, extra, &[0, 0]), None);
+    }
+}

@@ -20,6 +20,7 @@ use rushls::{
 use crate::flv;
 
 const H264_AAC_FLV: &[u8] = include_bytes!("fixtures/h264_aac.flv");
+const H264_BFRAMES_AAC_FLV: &[u8] = include_bytes!("fixtures/h264_bframes_aac.flv");
 const HEVC_AAC_FLV: &[u8] = include_bytes!("fixtures/hevc_aac.flv");
 pub const H264_AAC_TS: &[u8] = include_bytes!("fixtures/h264_aac.ts");
 pub const HEVC_AAC_TS: &[u8] = include_bytes!("fixtures/hevc_aac.ts");
@@ -49,6 +50,14 @@ pub fn live_camera(protocol: IngestProtocol) -> PublishRequest {
 
 pub fn rtmp_h264_aac() -> Result<Box<dyn PendingPublish>, String> {
     Ok(rtmp_events(flv::ingress_events(H264_AAC_FLV)?, &[]))
+}
+
+/// Reordered pictures on a keyframe period that is not a whole number of
+/// container ticks: 75 frames of 30000/1001 alternates between 2502 and 2503
+/// milliseconds, so a planned period fixed at either one is wrong every other
+/// segment. The boundary window has to absorb that in both directions.
+pub fn rtmp_h264_bframes_aac() -> Result<Box<dyn PendingPublish>, String> {
+    Ok(rtmp_events(flv::ingress_events(H264_BFRAMES_AAC_FLV)?, &[]))
 }
 
 pub fn rtmp_hevc_aac() -> Result<Box<dyn PendingPublish>, String> {

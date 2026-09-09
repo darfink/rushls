@@ -106,6 +106,7 @@ pub struct StorePublisherFactory {
     /// Present in a running node. Kept optional so this publisher remains
     /// usable as a standalone delivery component with no observability sink.
     events: Option<Events>,
+    timing: Option<(super::DurationRule, super::DurationRule)>,
 }
 
 impl StorePublisherFactory {
@@ -113,6 +114,7 @@ impl StorePublisherFactory {
         Self {
             store,
             events: None,
+            timing: None,
         }
     }
 
@@ -121,6 +123,17 @@ impl StorePublisherFactory {
     #[must_use]
     pub fn with_events(mut self, events: Events) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Validate fixed operator budgets against the actual admitted contract.
+    #[must_use]
+    pub fn with_timing(
+        mut self,
+        hold_back: super::DurationRule,
+        retain: super::DurationRule,
+    ) -> Self {
+        self.timing = Some((hold_back, retain));
         self
     }
 
@@ -135,6 +148,41 @@ impl PublisherFactory for StorePublisherFactory {
         stream: &StreamId,
         presentation: Arc<PackagedPresentation>,
     ) -> Result<Box<dyn HlsPublisher>, HlsError> {
+        if let Some((hold_back, retain)) = self.timing {
+            // The same presentation-wide value every media playlist will
+            // advertise, so a fixed budget is judged against what viewers see.
+            let target_duration =
+                crate::delivery::store::PlaylistContract::presentation_target_duration(
+                    presentation
+                        .renditions
+                        .iter()
+                        .map(|rendition| &rendition.config),
+                );
+            for rendition in presentation.renditions.iter() {
+                let Some(target_duration) = target_duration else {
+                    break;
+                };
+                let contract = crate::delivery::store::PlaylistContract::derive(
+                    &rendition.config,
+                    target_duration,
+                )
+                .ok_or_else(|| HlsError::Publication("inconsistent presentation target".into()))?;
+                if contract
+                    .part_target
+                    .is_some_and(|part| hold_back.resolve(part) < part.saturating_mul(2))
+                {
+                    return Err(HlsError::Initialization(
+                        "hold-back is below twice the selected part target".into(),
+                    ));
+                }
+                let segment = std::time::Duration::from_secs(contract.target_duration.get());
+                if retain.resolve(segment) < segment.saturating_mul(3) {
+                    return Err(HlsError::Initialization(
+                        "retention is below three selected segment targets".into(),
+                    ));
+                }
+            }
+        }
         // Which renditions carry text is fixed for the publication, so the
         // question is answered once here rather than per published object.
         let text = presentation

@@ -292,7 +292,7 @@ impl Projector {
                 None
             }
             SessionEvent::Ended { end } => self.finish(session, (*end).into(), None),
-            SessionEvent::Failed { reason } => {
+            SessionEvent::Failed { reason, .. } => {
                 self.finish(session, Outcome::Failed, Some(reason.clone()))
             }
             // Everything else is pipeline detail. Listed as a catch-all rather
@@ -383,6 +383,7 @@ mod tests {
         let ended = projector.project(
             session,
             &SessionEvent::Failed {
+                segmentation: None,
                 reason: "the input delivered nothing for 5s".into(),
             },
         );

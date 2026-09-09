@@ -176,7 +176,7 @@ fn a_departed_discontinuity_survives_as_a_sequence_number() -> Result<(), Box<dy
     // test is what survives departure, not how wide a shipped `retain` is.
     let store = StreamStore::new(crate::delivery::hls::StoreLimits {
         retention: crate::delivery::hls::RetentionPolicy {
-            retain: std::time::Duration::from_secs(36),
+            retain: std::time::Duration::from_secs(36).into(),
             ..crate::delivery::hls::RetentionPolicy::default()
         },
         ..crate::delivery::hls::StoreLimits::default()
@@ -691,7 +691,7 @@ fn a_stream_nobody_has_published_to_has_no_presentation() -> Result<(), Box<dyn 
 fn long_window() -> StreamStore {
     StreamStore::new(StoreLimits {
         retention: RetentionPolicy {
-            retain: Duration::from_hours(2),
+            retain: Duration::from_hours(2).into(),
             ..RetentionPolicy::default()
         },
         ..StoreLimits::default()

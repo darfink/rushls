@@ -124,8 +124,13 @@ tracks = { max = 8 }
 # audio = { channels = { max = 6 } }
 
 [hls]
-segment  = "6s"                          # target length of each media file
-part     = "1s"                          # low-latency update interval; shorter than segment
+segment = { target = "6s", max = "2x", jitter = "0s" }
+part    = { target = "1s", max = "2x" }
+# max and jitter accept durations or multiples of their configured target.
+# Equal target and max forbid growth during admission.
+# Segment ceilings include both jitter endpoints and timestamp quantization.
+# Admission freezes the selected targets. Runtime cannot enlarge them.
+# Fixed hold_back and retain must cover the maximum admission targets.
 hold_back = "3x"                         # live-edge latency floor, as a multiple of part
 #          = "3s"                        # or an absolute duration; both forms are accepted
 retain   = "1m"                          # how long media stays fetchable, live and after a drop
@@ -177,7 +182,7 @@ listen = "127.0.0.1:9090"
 # events = ["publisher.stop"]
 
 # Fires once per completed segment, per rendition. Segment cadence: one stream
-# at segment = "6s" sends 600/hour.
+# at segment.target = "6s" sends 600/hour.
 # [hook.archive]
 # url    = "http://archive.example.internal/rushls"
 # events = ["segment.ready"]

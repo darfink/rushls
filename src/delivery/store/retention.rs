@@ -109,7 +109,7 @@ pub struct RetentionPolicy {
     /// One quantity, not two. Media a playlist does not name is media no
     /// player can request, so a retention window wider than the advertised one
     /// would hold bytes nothing could reach. Both meanings move together.
-    pub retain: Duration,
+    pub retain: DurationRule,
     pub part_tag_retention: DurationRule,
     /// How long a part URI remains fetchable after its tag disappears.
     pub part_fetch_grace_period: DurationRule,
@@ -127,6 +127,7 @@ impl RetentionPolicy {
     /// layer warns when it has to do this.
     pub fn minimum_playlist_duration_for(self, target: Duration) -> Duration {
         self.retain
+            .resolve(target)
             .max(target.saturating_mul(u32::try_from(MINIMUM_PLAYLIST_SEGMENTS).unwrap_or(3)))
     }
 
@@ -159,7 +160,7 @@ impl RetentionPolicy {
         removed_at: Instant,
         target: Duration,
     ) -> Option<Instant> {
-        let promised = first_published_at.checked_add(self.retain)?;
+        let promised = first_published_at.checked_add(self.retain.resolve(target))?;
         let in_flight = removed_at.checked_add(target)?;
         Some(promised.max(in_flight))
     }
@@ -219,7 +220,7 @@ pub struct RetentionTier {
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
-            retain: Duration::from_mins(1),
+            retain: Duration::from_mins(1).into(),
             part_tag_retention: TargetDurationMultiple::integer(3).into(),
             part_fetch_grace_period: TargetDurationMultiple::integer(3).into(),
             maximum_payload_bytes: DEFAULT_MAXIMUM_RETAINED_PAYLOAD_BYTES,
@@ -253,7 +254,7 @@ mod tests {
         // appeared in happened to be.
         let published_at = Instant::now();
         let policy = RetentionPolicy {
-            retain: Duration::from_hours(2),
+            retain: Duration::from_hours(2).into(),
             ..RetentionPolicy::default()
         };
 
@@ -270,7 +271,7 @@ mod tests {
     #[test]
     fn the_advertised_window_never_falls_below_the_protocol_floor() {
         let policy = RetentionPolicy {
-            retain: Duration::from_secs(5),
+            retain: Duration::from_secs(5).into(),
             ..RetentionPolicy::default()
         };
 

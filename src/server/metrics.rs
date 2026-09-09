@@ -181,7 +181,11 @@ impl MetricsReader {
             retention_disk_capacity: retention.iter().map(|(_, depth)| depth.disk_capacity).sum(),
             spill_pending: self.store.disk().map_or(0, |disk| disk.spill_pending()),
             spills_failed: self.store.disk().map_or(0, |disk| disk.spills_failed()),
-            retention_requested: self.store.limits().retention.retain,
+            retention_requested: retention
+                .iter()
+                .map(|(_, depth)| depth.requested)
+                .max()
+                .unwrap_or_else(|| self.store.limits().retention.retain.resolve(Duration::ZERO)),
             retention,
             playback: self.playback.as_ref().map(PlaybackMeters::snapshot),
         }
@@ -213,7 +217,7 @@ series! {
             "Media payload bytes currently retained for viewers in the disk tier.")
             = |snapshot: &MetricsSnapshot| snapshot.retained_disk_bytes,
         Gauge("rushls_retention_requested_seconds",
-            "Configured retain window in seconds. Per-stream held duration is at /metrics/streams.")
+            "Largest effective retention request across stored streams, or the fixed setting when empty.")
             = |snapshot: &MetricsSnapshot| snapshot.retention_requested.as_secs_f64(),
         Gauge("rushls_disk_spill_pending",
             "Spill jobs accepted and not yet written. At capacity publishers wait for disk progress.")

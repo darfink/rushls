@@ -40,7 +40,7 @@ fn limits() -> StoreLimits {
             // Six six-second segments. Pinned rather than taken from the
             // default so these fixtures describe a window of a known size,
             // independent of whatever `retain` a shipped file chooses.
-            retain: Duration::from_secs(36),
+            retain: Duration::from_secs(36).into(),
             ..RetentionPolicy::default()
         },
         disk: None,
@@ -116,6 +116,37 @@ fn presentation_with(
         .config(rendition_config)
         .build();
     Arc::new(presentation_at(time_anchor, &input, vec![rendition]))
+}
+
+/// Several renditions in one publication, each with its own cadence.
+///
+/// A playlist contract's target duration is presentation-wide, so a test about
+/// it needs more than one rendition in the same publication to say anything.
+fn presentation_with_all(
+    renditions: &[(u32, &str, RenditionConfig)],
+    time_anchor: SystemTime,
+) -> Arc<PackagedPresentation> {
+    let input = validated(vec![
+        TrackBuilder::new(0, MediaKind::Video)
+            .timebase(renditions[0].2.timebase)
+            .build(),
+    ]);
+    let renditions = renditions
+        .iter()
+        .map(|(local_id, key, rendition_config)| {
+            RenditionBuilder::new(*local_id, MediaKind::Video)
+                .key(key)
+                .config(*rendition_config)
+                .build()
+        })
+        .collect();
+    Arc::new(presentation_at(time_anchor, &input, renditions))
+}
+
+/// One tick is one millisecond, so a cadence can straddle the half-second
+/// step `EXT-X-TARGETDURATION` rounding turns on.
+fn milliseconds() -> Timebase {
+    Timebase::new(nz::u32!(1), nz::u32!(1_000))
 }
 
 fn initialization(rendition: u32, byte: u8) -> PackagedMedia {
@@ -235,7 +266,7 @@ fn a_retain_below_the_protocol_floor_is_raised_to_it() {
     // Nine seconds against six-second segments is one and a half targets,
     // below the three a live playlist must carry. It is raised rather than
     // refused, so the window holds three segments and not one.
-    limits.retention.retain = Duration::from_secs(9);
+    limits.retention.retain = Duration::from_secs(9).into();
     let store = StreamStore::new(limits);
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
@@ -934,7 +965,7 @@ fn live_window_never_falls_below_three_target_durations() {
     // The shipped default is a six-target window; this test pins the floor
     // the spec makes mandatory, so the mechanism is what is being exercised
     // rather than whichever default is current.
-    limits.retention.retain = Duration::from_secs(18);
+    limits.retention.retain = Duration::from_secs(18).into();
     let store = StreamStore::new(limits);
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
@@ -1067,7 +1098,7 @@ fn byte_pressure_clips_the_playlist_until_the_write_fits() {
     // configured window. A tiny byte cap must hide completed parents — and
     // actually free their payloads — rather than grow past the budget.
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     // Initialization is 1 byte. Ten 10-byte parents fill the cap; twenty
     // would overflow it if history were not shed.
     limits.retention.maximum_payload_bytes = 101;
@@ -1113,7 +1144,7 @@ fn byte_pressure_clips_the_playlist_until_the_write_fits() {
 fn memory_pressure_emits_one_clip_event() {
     let log = StreamLog::default();
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     limits.retention.maximum_payload_bytes = 101;
     let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
     let lease = lease(&store, &[(0, false)]);
@@ -1178,7 +1209,7 @@ fn retain_trim_does_not_emit_a_clip_event() {
 fn a_full_sibling_does_not_hide_capacity_drops() -> Result<(), Box<dyn std::error::Error>> {
     let log = StreamLog::default();
     let mut limits = limits();
-    limits.retention.retain = Duration::from_mins(1);
+    limits.retention.retain = Duration::from_mins(1).into();
     limits.retention.maximum_payload_bytes = 51;
     let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
     let lease = lease(&store, &[(0, false), (1, false)]);
@@ -1211,7 +1242,7 @@ fn a_full_sibling_does_not_hide_capacity_drops() -> Result<(), Box<dyn std::erro
 fn object_pressure_emits_one_clip_event() {
     let log = StreamLog::default();
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     limits.retention.maximum_segments = 6;
     let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
     let lease = lease(&store, &[(0, false)]);
@@ -1245,7 +1276,7 @@ fn object_pressure_emits_one_clip_event() {
 #[test]
 fn the_playlist_floor_may_remain_over_the_byte_cap() {
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     limits.retention.maximum_payload_bytes = 50;
     let store = StreamStore::new(limits);
     let lease = lease(&store, &[(0, false)]);
@@ -1278,7 +1309,7 @@ fn the_playlist_floor_may_remain_over_the_byte_cap() {
 #[test]
 fn capacity_eviction_unpicks_chunked_parts_so_bytes_actually_fall() {
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     // Init (1) plus six 60-byte parents is 361. Cap 200 forces several
     // completed parents off, and their parts must leave with them.
     limits.retention.maximum_payload_bytes = 200;
@@ -1559,6 +1590,85 @@ fn a_reconnect_that_changes_cadence_gets_a_new_playlist_rather_than_new_terms() 
 }
 
 #[test]
+fn every_rendition_in_a_publication_advertises_one_target_duration() {
+    let store = store();
+    let _lease = store
+        .lease(
+            stream(),
+            &presentation_with_all(
+                &[
+                    // The same 2.47 s cadence, seen by renditions whose
+                    // boundary tolerance differs by an access unit. Derived
+                    // per rendition these round to 2 and 3.
+                    (0, "camera/audio", config(milliseconds(), 2_491, None)),
+                    (1, "camera/video", config(milliseconds(), 2_503, None)),
+                ],
+                SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .expect("test publication fits");
+
+    let catalog = store.get(&stream()).unwrap().snapshot();
+
+    assert_eq!(
+        (
+            catalog.renditions[0].contract.target_duration,
+            catalog.renditions[1].contract.target_duration
+        ),
+        (nz::u64!(3), nz::u64!(3)),
+        "section 6.2.4 requires one target duration across the multivariant +         playlist, and only the larger admits both renditions' segments"
+    );
+}
+
+#[test]
+fn a_sibling_that_raises_the_shared_target_retires_the_playlist_it_would_change() {
+    let store = store();
+    let first = store
+        .lease(
+            stream(),
+            &presentation_with(
+                0,
+                "camera/main",
+                config(milliseconds(), 2_491, None),
+                SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .expect("test publication fits");
+    write(&first, initialization(0, 1));
+    write(&first, direct(0, 0, 0, 2_491, 1));
+
+    // Alone this rendition advertises 2. The reconnect adds a sibling whose
+    // cadence rounds to 3, which is now the shared value, so the existing
+    // playlist cannot continue: its target would have to change under viewers.
+    let _second = store
+        .lease(
+            stream(),
+            &presentation_with_all(
+                &[
+                    (0, "camera/main", config(milliseconds(), 2_491, None)),
+                    (1, "camera/second", config(milliseconds(), 2_503, None)),
+                ],
+                SystemTime::UNIX_EPOCH,
+            ),
+        )
+        .expect("test publication fits");
+
+    let catalog = store.get(&stream()).unwrap().snapshot();
+
+    assert_eq!(catalog.renditions.len(), 3);
+    assert_eq!(catalog.renditions[0].contract.target_duration, nz::u64!(2));
+    assert!(!catalog.renditions[0].active);
+    assert!(
+        catalog.renditions[0].snapshot().live_edge.ended,
+        "the playlist that cannot keep its target ends cleanly"
+    );
+    for rendition in &catalog.renditions[1..] {
+        assert!(rendition.active);
+        assert_eq!(rendition.contract.target_duration, nz::u64!(3));
+    }
+}
+
+#[test]
 fn media_breaking_the_advertised_target_is_refused_without_disturbing_the_playlist() {
     let store = store();
     let lease = lease(&store, &[(0, true)]);
@@ -1610,7 +1720,11 @@ fn a_part_is_held_to_its_target_at_both_ends() {
         "a part longer than PART-TARGET is refused outright"
     );
 
-    write(&lease, chunk(0, 0, 0, 0, 500, 1));
+    let mut short = chunk(0, 0, 0, 0, 500, 1);
+    if let PackagedMedia::Chunk(part) = &mut short {
+        part.independent = false;
+    }
+    write(&lease, short);
     assert!(
         matches!(
             lease.write(chunk(0, 0, 1, 500, 1_000, 1)),
@@ -1679,7 +1793,10 @@ async fn a_reconnect_does_not_announce_a_stream_viewers_never_lost() {
 
     // Nobody comes back this time.
     drop(second);
-    tokio::time::advance(limits().reconnect_window() + Duration::from_secs(1)).await;
+    tokio::time::advance(
+        limits().retention.retain.resolve(Duration::from_secs(6)) + Duration::from_secs(1),
+    )
+    .await;
 
     assert_eq!(
         store.maintain().retired,
@@ -1695,7 +1812,10 @@ async fn a_stream_that_never_served_anything_never_became_unavailable() {
     let lease = lease(&store, &[(0, true)]);
 
     drop(lease);
-    tokio::time::advance(limits().reconnect_window() + Duration::from_secs(1)).await;
+    tokio::time::advance(
+        limits().retention.retain.resolve(Duration::from_secs(6)) + Duration::from_secs(1),
+    )
+    .await;
 
     assert_eq!(
         store.maintain(),
@@ -1801,7 +1921,7 @@ fn wait_until(description: &str, ready: impl Fn() -> bool) {
 #[test]
 fn publication_anchors_survive_until_the_last_sibling_is_shed() {
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     // Init plus nine 10-byte parents. Fifteen published parents shed the
     // first publication entirely and leave the second one's window intact.
     limits.retention.maximum_payload_bytes = 91;
@@ -1837,7 +1957,7 @@ fn publication_anchors_survive_until_the_last_sibling_is_shed() {
 async fn spill_keeps_playlist_duration_and_serves_the_same_payload() {
     let directory = scratch_disk("spill");
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     // Init plus four 10-byte parents. The fifth write must spill rather than clip.
     limits.retention.maximum_payload_bytes = 41;
     limits.disk = Some(DiskLimits {
@@ -1934,7 +2054,7 @@ fn gzip_sidecars_count_against_the_memory_cap() {
 async fn gzip_sidecars_count_against_the_disk_cap() {
     let directory = scratch_disk("gzip");
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     limits.retention.maximum_payload_bytes = 12;
     limits.disk = Some(DiskLimits {
         directory: directory.clone(),
@@ -1985,7 +2105,10 @@ async fn a_republished_stream_serves_its_own_spilled_payload() {
         "viewers could already fetch this publication"
     );
     drop(first);
-    tokio::time::advance(limits.reconnect_window() + Duration::from_secs(1)).await;
+    tokio::time::advance(
+        limits.retention.retain.resolve(Duration::from_secs(6)) + Duration::from_secs(1),
+    )
+    .await;
     assert_eq!(store.maintain().retired, vec![stream()]);
 
     let second = lease(&store, &[(0, false)]);
@@ -2023,7 +2146,7 @@ async fn a_republished_stream_serves_its_own_spilled_payload() {
 fn both_tiers_full_hides_and_drops_so_held_falls() {
     let directory = scratch_disk("both-full");
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     limits.retention.maximum_payload_bytes = 41;
     limits.disk = Some(DiskLimits {
         directory: directory.clone(),
@@ -2061,7 +2184,7 @@ fn disk_pressure_emits_one_clip_event() {
     let directory = scratch_disk("disk-clip");
     let log = StreamLog::default();
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     limits.retention.maximum_payload_bytes = 41;
     limits.disk = Some(DiskLimits {
         directory: directory.clone(),
@@ -2097,7 +2220,7 @@ fn disk_pressure_emits_one_clip_event() {
 async fn live_edge_parts_stay_in_memory_and_do_not_wait_on_spill() {
     let directory = scratch_disk("live-edge");
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     limits.retention.maximum_payload_bytes = 200;
     limits.disk = Some(DiskLimits {
         directory: directory.clone(),
@@ -2157,7 +2280,7 @@ async fn live_edge_parts_stay_in_memory_and_do_not_wait_on_spill() {
 async fn a_range_of_a_spilled_chunked_parent_keeps_byte_offsets() {
     let directory = scratch_disk("range-spill");
     let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2);
+    limits.retention.retain = Duration::from_hours(2).into();
     limits.retention.maximum_payload_bytes = 200;
     limits.disk = Some(DiskLimits {
         directory: directory.clone(),
@@ -2225,7 +2348,7 @@ async fn burst_spill_waits_without_discarding_history() -> Result<(), Box<dyn st
     for (count, queued) in [(80, 16), (120, 32)] {
         let directory = scratch_disk("burst-spill");
         let mut limits = limits();
-        limits.retention.retain = Duration::from_mins(15);
+        limits.retention.retain = Duration::from_mins(15).into();
         limits.retention.maximum_payload_bytes = 641;
         limits.disk = Some(DiskLimits {
             directory: directory.clone(),
@@ -2305,7 +2428,7 @@ async fn spilled_parts_share_a_segment_file_until_fetch_grace_expires()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = scratch_disk("segment-file");
     let mut limits = limits();
-    limits.retention.retain = Duration::from_mins(15);
+    limits.retention.retain = Duration::from_mins(15).into();
     limits.retention.maximum_payload_bytes = 301;
     limits.disk = Some(DiskLimits {
         directory: directory.clone(),
@@ -2395,5 +2518,26 @@ async fn spilled_parts_share_a_segment_file_until_fetch_grace_expires()
     drop(lease);
     drop(store);
     let _ = std::fs::remove_dir_all(directory);
+    Ok(())
+}
+
+#[test]
+fn relative_retention_reports_the_selected_shared_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut policy = limits();
+    policy.retention.retain = TargetDurationMultiple::integer(6).into();
+    let store = StreamStore::new(policy);
+    let _lease = store.lease(
+        stream(),
+        &presentation_with_all(
+            &[
+                (0, "video", config(milliseconds(), 2_503, None)),
+                (1, "audio", config(milliseconds(), 2_491, None)),
+            ],
+            SystemTime::UNIX_EPOCH,
+        ),
+    )?;
+    let live = store.get(&stream()).expect("published stream");
+    assert_eq!(live.retention_depth().requested, Duration::from_secs(18));
     Ok(())
 }

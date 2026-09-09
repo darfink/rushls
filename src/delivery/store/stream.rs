@@ -12,6 +12,7 @@
 
 use std::{
     collections::HashMap,
+    num::NonZeroU64,
     sync::{
         Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -246,7 +247,17 @@ impl LiveStream {
             .max()
             .unwrap_or(Duration::ZERO);
         RetentionDepth {
-            requested: self.limits.retain,
+            requested: snapshot
+                .renditions
+                .iter()
+                .map(|r| {
+                    self.limits
+                        .minimum_playlist_duration_for(Duration::from_secs(
+                            r.contract.target_duration.get(),
+                        ))
+                })
+                .max()
+                .unwrap_or_else(|| self.limits.retain.resolve(Duration::ZERO)),
             held,
             memory_bytes: self.retained_payload_bytes(),
             memory_capacity: self.limits.maximum_payload_bytes,
@@ -425,6 +436,16 @@ impl LiveStream {
         }
 
         let mut mapping = HashMap::new();
+        // One value for the whole publication: section 6.2.4 requires every
+        // media playlist in the multivariant playlist to advertise the same
+        // target duration, so it cannot be a function of one rendition.
+        let target_duration = PlaylistContract::presentation_target_duration(
+            presentation
+                .renditions
+                .iter()
+                .map(|rendition| &rendition.config),
+        )
+        .unwrap_or(NonZeroU64::MIN);
         for descriptor in presentation.renditions.iter() {
             // Two independent gates. Packaging compatibility is the muxer's
             // notion of "the same output", and the playlist contract is this
@@ -432,7 +453,8 @@ impl LiveStream {
             // PART-TARGET cannot continue an existing playlist even when the
             // muxer considers it a continuation, so it falls through to a new
             // durable rendition and the old one retires with an ENDLIST.
-            let contract = PlaylistContract::derive(&descriptor.config);
+            let contract = PlaylistContract::derive(&descriptor.config, target_duration)
+                .expect("target computed from every rendition");
             let existing = state.renditions.iter().position(|rendition| {
                 !rendition.active
                     && !rendition.retired
@@ -444,9 +466,11 @@ impl LiveStream {
             } else {
                 let rendition_id = RenditionId(state.issued_renditions);
                 state.issued_renditions = state.issued_renditions.saturating_add(1);
-                state
-                    .renditions
-                    .push(RenditionState::new(rendition_id, descriptor.clone()));
+                state.renditions.push(RenditionState::new(
+                    rendition_id,
+                    descriptor.clone(),
+                    contract,
+                ));
                 state.renditions.len() - 1
             };
             let rendition = &mut state.renditions[index];
@@ -737,7 +761,18 @@ impl LiveStream {
             .filter(|duration| !duration.is_zero())
             .min()
             .unwrap_or(Duration::ZERO);
-        if held >= self.limits.retain {
+        let requested = state
+            .renditions
+            .iter()
+            .map(|r| {
+                self.limits
+                    .minimum_playlist_duration_for(Duration::from_secs(
+                        r.contract.target_duration.get(),
+                    ))
+            })
+            .max()
+            .unwrap_or_else(|| self.limits.retain.resolve(Duration::ZERO));
+        if held >= requested {
             state.capacity_clipped = false;
             return None;
         }
@@ -748,7 +783,7 @@ impl LiveStream {
         state.capacity_clipped = true;
         Some(StreamEvent::RetentionClipped {
             reason,
-            requested: self.limits.retain,
+            requested,
             held,
         })
     }

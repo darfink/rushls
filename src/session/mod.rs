@@ -294,6 +294,20 @@ async fn pipeline(
         time_anchor: std::time::SystemTime::now(),
         events: context.events(),
     })?;
+    context.emit(SessionEvent::SegmentationContract {
+        desired_segment: config.segmentation.desired_segment_duration,
+        desired_part: config.segmentation.desired_part_duration,
+        selected_segment: preroll.segmentation.longest_segment_duration(),
+        selected_part: preroll
+            .segmentation
+            .iter()
+            .map(|track| track.timebase.ticks_to_duration(track.part_duration.get()))
+            .max()
+            .unwrap_or_default(),
+        maximum_segment: config.segmentation.maximum_segment_duration,
+        maximum_part: config.segmentation.maximum_part_duration,
+        jitter: config.segmentation.late_boundary,
+    });
     let publisher = services
         .publishers
         .start(context.stream(), Arc::clone(&started.presentation))?;
@@ -360,7 +374,19 @@ fn report(
         }
         Err(error) => {
             services.meters.session_failed();
+            let mux = match error {
+                SessionError::Mux(error)
+                | SessionError::Preroll(PrerollError::Packaging(error))
+                | SessionError::Supervision(SupervisionError::Execution(
+                    live::ExecutionError::Mux(error),
+                )) => Some(error),
+                _ => None,
+            };
+            if let Some(error) = mux {
+                services.meters.segmentation_failed(error);
+            }
             context.emit(SessionEvent::Failed {
+                segmentation: mux.cloned(),
                 reason: error.to_string(),
             });
         }

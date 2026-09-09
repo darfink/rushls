@@ -26,7 +26,7 @@ impl EventObserver for TracingEvents {
                 info!(session = %session, stream = %stream, "displaced");
             }
             SessionEvent::TracksDiscovered { counts } => {
-                info!(
+                debug!(
                     session = %session,
                     audio = counts.audio,
                     subtitle = counts.subtitle,
@@ -35,10 +35,21 @@ impl EventObserver for TracingEvents {
                 );
             }
             SessionEvent::TimelineCalibrated { authority } => {
-                info!(session = %session, authority = %authority, "timeline calibrated");
+                debug!(session = %session, authority = %authority, "timeline calibrated");
             }
             SessionEvent::SegmentationLocked { segment, part } => {
-                info!(session = %session, segment = ?segment, part = ?part, "segmentation locked");
+                debug!(session = %session, segment = ?segment, part = ?part, "segmentation locked");
+            }
+            SessionEvent::SegmentationContract {
+                desired_segment,
+                desired_part,
+                selected_segment,
+                selected_part,
+                maximum_segment,
+                maximum_part,
+                jitter,
+            } => {
+                debug!(session = %session, ?desired_segment, ?desired_part, ?selected_segment, ?selected_part, ?maximum_segment, ?maximum_part, ?jitter, "segmentation contract");
             }
             SessionEvent::SegmentationExtended {
                 track,
@@ -95,7 +106,7 @@ impl EventObserver for TracingEvents {
                 warn!(session = %session, messages, "closed captions SEI malformed");
             }
             SessionEvent::Running => {
-                info!(session = %session, "running");
+                debug!(session = %session, "running");
             }
             SessionEvent::TrackSetChanged => {
                 warn!(session = %session, "track set changed");
@@ -124,7 +135,7 @@ impl EventObserver for TracingEvents {
                 warn!(session = %session, reason = %reason, "unhealthy");
             }
             SessionEvent::Draining => {
-                info!(session = %session, "draining");
+                debug!(session = %session, "draining");
             }
             SessionEvent::DrainFailed { reason } => {
                 warn!(session = %session, reason = %reason, "drain failed");
@@ -140,8 +151,11 @@ impl EventObserver for TracingEvents {
                     info!(session = %session, end = %end, "ended");
                 }
             },
-            SessionEvent::Failed { reason } => {
-                warn!(session = %session, reason = %reason, "failed");
+            SessionEvent::Failed {
+                reason,
+                segmentation,
+            } => {
+                warn!(session = %session, reason = %reason, ?segmentation, "failed");
             }
         }
     }

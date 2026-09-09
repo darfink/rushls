@@ -1174,7 +1174,7 @@ mod tests {
     async fn a_skip_request_renders_a_delta_once_the_window_is_wide_enough() {
         let store = StreamStore::new(crate::delivery::hls::StoreLimits {
             retention: crate::delivery::hls::RetentionPolicy {
-                retain: Duration::from_hours(2),
+                retain: Duration::from_hours(2).into(),
                 ..crate::delivery::hls::RetentionPolicy::default()
             },
             ..crate::delivery::hls::StoreLimits::default()
@@ -1343,7 +1343,15 @@ mod cache_tests {
         );
 
         drop(lease);
-        tokio::time::advance(store.limits().reconnect_window() + Duration::from_secs(1)).await;
+        tokio::time::advance(
+            store
+                .limits()
+                .retention
+                .retain
+                .resolve(Duration::from_secs(6))
+                + Duration::from_secs(1),
+        )
+        .await;
         let retired = store.maintain().retired;
 
         assert_eq!(

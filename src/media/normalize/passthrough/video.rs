@@ -16,6 +16,7 @@ const MAXIMUM_VIDEO_REORDER_DEPTH: u32 = 64;
 pub(super) struct VideoNormalizer {
     track_id: TrackId,
     codec: Codec,
+    extradata: crate::domain::Payload,
     projection: TimebaseProjection,
     declared_clock: Option<RationalTickAccumulator>,
     video_delay: usize,
@@ -48,6 +49,7 @@ impl VideoNormalizer {
         Ok(Self {
             track_id: track.id,
             codec: track.codec,
+            extradata: track.codec_extradata.clone(),
             projection: TimebaseProjection::new(track.timebase, output_timebase),
             declared_clock: frame_rate
                 .map(|rate| video_cadence(output_timebase, rate, track.id))
@@ -67,7 +69,7 @@ impl VideoNormalizer {
 
     pub(super) fn push(
         &mut self,
-        packet: Packet,
+        mut packet: Packet,
         out: &mut dyn Appender<NormalizedSample>,
     ) -> Result<(), NormalizeError> {
         if self.finished {
@@ -75,6 +77,21 @@ impl VideoNormalizer {
                 "{} video packet arrived after finish",
                 self.track_id
             )));
+        }
+        if packet.random_access
+            && crate::media::video_config::closed_random_access(
+                self.codec,
+                self.extradata.as_bytes(),
+                packet.payload.as_bytes(),
+            ) == Some(false)
+        {
+            if self.codec == Codec::H264 {
+                return Err(NormalizeError::UnsupportedRandomAccess {
+                    track: self.track_id,
+                    codec: self.codec,
+                });
+            }
+            packet.random_access = false;
         }
         if packet.pts.is_none() {
             return Err(processing(format!(
@@ -337,4 +354,38 @@ fn video_cadence(
         )));
     }
     Ok(clock)
+}
+
+#[cfg(test)]
+mod access_tests {
+    use super::*;
+    #[test]
+    fn avc_open_gop_has_an_actionable_typed_failure() -> Result<(), NormalizeError> {
+        let track = crate::domain::fixtures::TrackBuilder::new(0, crate::domain::MediaKind::Video)
+            .codec_extradata(crate::mux::fixtures::H264_EXTRADATA)
+            .build();
+        let mut normalizer = VideoNormalizer::new(&track, track.timebase, None, 0)?;
+        let packet = Packet {
+            track_id: track.id,
+            pts: Some(0),
+            dts: Some(0),
+            duration: Some(3_000),
+            random_access: true,
+            audio_trim: crate::domain::AudioTrim::default(),
+            subtitle_position: None,
+            webvtt: crate::domain::WebVttCueMetadata::default(),
+            payload: crate::domain::Payload::from_bytes(bytes::Bytes::from_static(&[
+                0, 0, 0, 2, 0x41, 0x80,
+            ])),
+        };
+        let error = normalizer
+            .push(packet, &mut Vec::new())
+            .expect_err("non-IDR cannot start an independent AVC segment");
+        assert!(matches!(
+            error,
+            NormalizeError::UnsupportedRandomAccess { .. }
+        ));
+        assert!(error.to_string().contains("closed GOPs with IDR"));
+        Ok(())
+    }
 }

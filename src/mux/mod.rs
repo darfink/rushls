@@ -16,6 +16,7 @@ use crate::{
 };
 
 mod cmaf;
+mod coordinator;
 mod passthrough;
 mod presentation;
 mod track;
@@ -24,9 +25,8 @@ mod webvtt;
 #[cfg(test)]
 pub mod fixtures;
 
-pub use cmaf::{CmafMuxerConfig, SegmentBoundaryPolicy};
-pub use passthrough::PassThroughMuxerFactory;
-pub use track::{TrackPackager, TrackRouter};
+pub use passthrough::{PassThroughMuxerFactory, validate_timing};
+pub use track::TrackPackager;
 
 pub use presentation::{
     CaptionChannel, ClosedCaptionService, MuxerStartRequest, PackagedPresentation,
@@ -129,6 +129,31 @@ impl PackagedMedia {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum MuxError {
+    #[error(
+        "{track}: {reason}; progress={progress}, permitted window=[{earliest}, {latest}] in {timebase:?}"
+    )]
+    BoundaryWindow {
+        track: crate::domain::TrackId,
+        reason: &'static str,
+        progress: TickTimestamp,
+        earliest: TickTimestamp,
+        latest: TickTimestamp,
+        timebase: Timebase,
+    },
+    #[error("{track}: {reason}; observed={observed}, maximum={maximum} ticks")]
+    Boundary {
+        track: crate::domain::TrackId,
+        reason: &'static str,
+        observed: u64,
+        maximum: u64,
+    },
+    #[error("coordinator retained {samples} samples / {bytes} bytes beyond its budget")]
+    CoordinatorLimit { samples: usize, bytes: usize },
+    #[error("{track}: {error}")]
+    Part {
+        track: crate::domain::TrackId,
+        error: crate::segment::cutter::CutError,
+    },
     #[error("cannot mux the locked segmentation plan: {0}")]
     InvalidPlan(Box<str>),
     #[error("media muxing failed: {0}")]

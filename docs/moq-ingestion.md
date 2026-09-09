@@ -138,12 +138,11 @@ For that test, remove `-map 0:a:0` from the decode command.
 
 Browser capture does not guarantee constant frame durations or exact keyframe intervals.
 For variable frame durations, the origin closes each regular part after it reaches 85% of the advertised part target.
-The target reserves space for the largest access unit observed during pre-roll.
+Pre-roll replays observed sample durations through the same part cutter used during publication.
 Later media must still satisfy the HLS duration limits.
 
-The live server permits a late keyframe within one configured segment duration of the planned boundary.
-It includes this extension budget in the advertised HLS target duration.
-This bounded wait also applies to other ingestion protocols.
+Late-keyframe allowance defaults to zero. Configure an explicit allowance for publishers that need it.
+The frozen segment ceiling includes that allowance. All video renditions must supply matching random-access timestamps.
 Actual decoder reconfiguration, including changed SPS/PPS, still requires a new publication.
 
 
@@ -152,7 +151,7 @@ Actual decoder reconfiguration, including changed SPS/PPS, still requires a new 
 Use the certificate and HTTP server commands above. Add these options to the origin command for two-second segments:
 
 ```sh
---hls-segment 2s --hls-part 500ms
+--hls-segment-target 2s --hls-part-target 500ms
 ```
 
 Open `http://localhost:18099/browser-ladder-bench.html` in Chrome and click **Synthetic 1080p**.
@@ -173,3 +172,62 @@ The publisher warms all video encoders before it starts the media clock.
 It also waits for all origin subscriptions. If one encoder falls behind, all renditions skip the same input frame.
 A skipped keyframe request remains pending for the next accepted frame.
 The hardware option requests `prefer-hardware`; WebCodecs does not expose which encoder backend it selects.
+
+
+## Adaptive segmentation
+
+The configuration uses target and maximum objects. These are the defaults:
+
+```toml
+[hls]
+segment = { target = "6s", max = "2x", jitter = "0s" }
+part = { target = "1s", max = "2x" }
+```
+
+The corresponding CLI flags include `--hls-segment-target 2s` and `--hls-segment-max 3s`.
+Maxima accept absolute durations or multipliers of their configured targets.
+Equal target and maximum values forbid growth during admission.
+
+Pre-roll tries the latest common video boundary at or before the segment target.
+If the complete contract fails, it tries earlier boundaries before it extends the search beyond the target.
+Audio boundaries use whole encoded samples. Audio-only input can select an earlier boundary to keep rounding within the maximum.
+Admission selects a larger part ceiling only if the preferred ceiling fails and the configured maximum permits growth.
+Selected ceilings remain fixed throughout the publication.
+
+The part writer retains a bounded window before it commits a cut.
+It can repair nearby cuts without changing published parts or waiting for a whole segment.
+Some input sequences still require more lookahead than the window permits and terminate the publication.
+
+Both CFR and VFR use duration-based part cutting. A regular part normally reaches 85% of its ceiling.
+Independent parts and segment tails can be shorter. No part can exceed its ceiling.
+The origin preserves encoded payloads and normalizes timing. It does not create replacement frames or transcode input.
+
+The coordinator selects matching random-access points across video renditions.
+`segment.jitter` defines a symmetric window around each planned boundary.
+Its multiplier form resolves against `segment.target`.
+The planned timeline never resets after an early or late cut. The actual segment must also fit the frozen ceiling.
+The advertised ceiling includes both allowances, plus the required timestamp quantization.
+Thus, an early cut followed by a late cut can use the full combined budget.
+An observed long GOP during pre-roll does not grant extra late allowance during publication.
+
+The coordinator bounds retained samples and bytes with the publication's pre-roll limits.
+The existing stall timeout bounds wall-clock waiting. A missing required track fails the publication; topology does not change automatically.
+Valid published media remains available after failure.
+
+The `segmentation contract` event reports desired durations, selected durations, maxima, and jitter.
+Failure warnings identify the cause and applicable bounds. Metrics separately count part, boundary, and coordinator-capacity failures.
+Retention multiples and hold-back use the selected contract. Incompatible fixed values reject publication before it becomes visible.
+
+Active codec and topology changes remain unsupported. A replacement publication must satisfy the existing playlist contract or receive new rendition playlists.
+
+Admission runs the live coordinator and CMAF timing logic without serializing CMAF fragments.
+The factory only constructs the admitted publication. It does not run a hidden validation pass.
+
+Fractional GOP periods stay on an anchored rational grid. Each boundary is rounded separately.
+The planner preserves the source timestamp precision through normalization. It does not add a full frame of video slack.
+Fixed hold-back and retention settings must cover the maximum admission targets at startup.
+Relative retention uses the selected shared target for both expiry and reported retention depth.
+
+AVC segments require IDR frames. Configure the encoder for closed GOPs.
+A transport keyframe flag or recovery-point SEI does not establish independent decoding.
+Unsupported AVC random-access pictures produce a specific error with this configuration guidance.

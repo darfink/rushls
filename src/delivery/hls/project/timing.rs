@@ -148,7 +148,10 @@ mod tests {
 
     fn contract(segment_ticks: u64, chunk_ticks: Option<u64>) -> PlaylistContract {
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(1));
-        PlaylistContract::derive(&config(timebase, segment_ticks, chunk_ticks))
+        let config = config(timebase, segment_ticks, chunk_ticks);
+        let target = PlaylistContract::presentation_target_duration([&config])
+            .expect("one rendition supplies a target");
+        PlaylistContract::derive(&config, target).expect("target computed from rendition")
     }
 
     #[test]

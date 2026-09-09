@@ -2016,26 +2016,12 @@ impl MoqAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct HlsAppConfig {
-    /// Desired HLS segment duration. Keyframe cadence may adjust the result.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "6s",
-        value_parser = humantime::parse_duration,
-        serde(use_value_parser)
-    )]
-    segment: Duration,
-    /// Desired low-latency HLS partial-segment duration.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "1s",
-        value_parser = humantime::parse_duration,
-        serde(use_value_parser)
-    )]
-    part: Duration,
+    /// Preferred cadence and maximum admitted segment ceiling.
+    #[conf(flatten, prefix)]
+    segment: HlsSegmentConfig,
+    /// Preferred and maximum admitted partial-segment targets.
+    #[conf(flatten, prefix)]
+    part: HlsPartConfig,
     /// Minimum completed media retained in each live playlist.
     ///
     /// A fixed duration (`"18s"`) or a multiple of the segment duration
@@ -2048,7 +2034,7 @@ pub struct HlsAppConfig {
         long,
         env,
         default_value = "6x",
-        value_parser = parse_playlist_window,
+        value_parser = parse_duration_rule,
         serde(use_value_parser)
     )]
     retain: DurationRule,
@@ -2062,66 +2048,111 @@ pub struct HlsAppConfig {
         long,
         env,
         default_value = "3x",
-        value_parser = parse_playlist_window,
+        value_parser = parse_duration_rule,
         serde(use_value_parser)
     )]
     hold_back: DurationRule,
 }
 
+/// Segment preferences are distinct from the immutable contract admission selects.
+#[derive(Conf)]
+#[conf(serde)]
+pub struct HlsSegmentConfig {
+    /// Preferred segment cadence.
+    #[conf(parameter, long, env, default_value = "6s", value_parser = humantime::parse_duration, serde(use_value_parser))]
+    target: Duration,
+    /// Maximum segment ceiling, including rounding and both jitter endpoints.
+    #[conf(parameter, long, env, default_value = "2x", value_parser = parse_duration_rule, serde(use_value_parser))]
+    max: DurationRule,
+    /// Symmetric runtime boundary tolerance, relative to the configured target.
+    #[conf(parameter, long, env, default_value = "0s", value_parser = parse_duration_rule, serde(use_value_parser))]
+    jitter: DurationRule,
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct HlsPartConfig {
+    /// Preferred advertised partial-segment target.
+    #[conf(parameter, long, env, default_value = "1s", value_parser = humantime::parse_duration, serde(use_value_parser))]
+    target: Duration,
+    /// Largest part target admission may select; runtime never enlarges it.
+    #[conf(parameter, long, env, default_value = "2x", value_parser = parse_duration_rule, serde(use_value_parser))]
+    max: DurationRule,
+}
+
+/// Unlike retention minima, an admission ceiling must never silently saturate.
+fn resolve_hls_rule(rule: DurationRule, target: Duration) -> Result<Duration, ConfigError> {
+    match rule {
+        DurationRule::Fixed(duration) => Ok(duration),
+        DurationRule::MultipleOfTarget(multiple) => {
+            let nanos = target
+                .as_nanos()
+                .checked_mul(u128::from(multiple.numerator()))
+                .map(|n| n.div_ceil(u128::from(multiple.denominator().get())))
+                .filter(|n| *n <= Duration::MAX.as_nanos())
+                .ok_or_else(|| invalid("HLS duration rule overflows"))?;
+            Ok(Duration::new(
+                u64::try_from(nanos / 1_000_000_000)
+                    .map_err(|_| invalid("HLS duration rule overflows"))?,
+                u32::try_from(nanos % 1_000_000_000).expect("subsecond nanoseconds fit u32"),
+            ))
+        }
+    }
+}
+
 impl HlsAppConfig {
     /// The segment duration other sections size their relative values by.
     fn segment_duration(&self) -> Duration {
-        self.segment
+        self.segment.target
     }
 
     fn apply(&self, node: &mut NodeConfig, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
-        if self.segment.is_zero() || self.part.is_zero() {
-            return Err(invalid("HLS segment and part durations must be nonzero"));
-        }
-        if self.part > self.segment {
-            return Err(invalid(
-                "HLS part duration must not exceed the segment duration",
-            ));
-        }
+        let maximum_segment = resolve_hls_rule(self.segment.max, self.segment.target)?;
+        let maximum_part = resolve_hls_rule(self.part.max, self.part.target)?;
+        let jitter = resolve_hls_rule(self.segment.jitter, self.segment.target)?;
+        node.session.segmentation = SegmentationPolicy {
+            desired_segment_duration: self.segment.target,
+            desired_part_duration: self.part.target,
+            maximum_segment_duration: maximum_segment,
+            maximum_part_duration: maximum_part,
+            early_boundary: jitter,
+            late_boundary: jitter,
+        };
+        node.session
+            .segmentation
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
         let window = self.retain;
-        let window_duration = window.resolve(self.segment);
-        if window_duration.is_zero() {
-            return Err(invalid("HLS playlist window must be nonzero"));
-        }
-        if let DurationRule::Fixed(fixed) = window
-            && fixed < self.segment.saturating_mul(3)
-        {
+        // Validate fixed delivery settings for every contract admission can select.
+        let maximum_target = Duration::from_secs(
+            u64::try_from(maximum_segment.as_nanos().saturating_add(500_000_000) / 1_000_000_000)
+                .unwrap_or(u64::MAX)
+                .max(1),
+        );
+        if window.resolve(maximum_target) < maximum_target.saturating_mul(3) {
             return Err(invalid(
-                "HLS playlist window must be at least three times the segment duration",
+                "HLS playlist window must be at least three times the maximum target duration",
             ));
         }
-        node.session.segmentation = SegmentationPolicy::latency_first(self.segment, self.part);
-        // Live keyframe timestamps do not repeat an exact pre-roll grid.
-        // Size the bounded wait from the application's segment configuration.
-        node.cmaf.segment_boundary_policy =
-            crate::mux::SegmentBoundaryPolicy::ExtendToRandomAccess {
-                maximum_extension: self.segment,
-            };
         // Interim mapping: the advertised window and the retention window are
         // one quantity now, so the old playlist knob resolves straight into
         // it. `[hls] retain` replaces this when the file is rewritten.
-        node.store.retention.retain = window_duration;
+        node.store.retention.retain = window;
         // Two thresholds, because the specification has two. Below three parts
         // is a SHOULD, so it is warned: a deployment on a good network may
         // genuinely want the latency, and refusing would deny a legitimate
         // choice. Below two parts is a MUST, so it is refused — a value the
         // protocol forbids cannot be honoured approximately, and advertising
         // it anyway makes clients stall.
-        let hold_back = self.hold_back.resolve(self.part);
-        if hold_back < self.part.saturating_mul(2) {
+        let hold_back = self.hold_back.resolve(maximum_part);
+        if hold_back < maximum_part.saturating_mul(2) {
             return Err(invalid(format!(
-                "HLS hold_back ({hold_back:?}) must be at least twice the part duration ({:?}): \
+                "HLS hold_back ({hold_back:?}) must be at least twice the maximum part duration ({maximum_part:?}): \
                  a client given less than two parts of head start runs out of buffered media \
-                 on any loss",
-                self.part
+                 on any loss"
             )));
         }
-        if hold_back < self.part.saturating_mul(3) {
+        if hold_back < maximum_part.saturating_mul(3) {
             warnings.push(format!(
                 "hls.hold_back ({hold_back:?}) is below the three part durations HLS \
                  recommends; clients on a lossy link may stall at the live edge"
@@ -2132,19 +2163,19 @@ impl HlsAppConfig {
     }
 }
 
-/// Parses a playlist window: a multiple of the segment duration (`"6x"`) or
+/// Parses a duration rule: a multiple of the applicable target (`"6x"`) or
 /// a fixed duration (`"18s"`).
 ///
 /// The `x` suffix is the multiple form, so the two can never be confused
 /// with each other or with a bare count.
-fn parse_playlist_window(value: &str) -> Result<DurationRule, String> {
+fn parse_duration_rule(value: &str) -> Result<DurationRule, String> {
     if let Some(multiple) = value.strip_suffix('x') {
         let (numerator, denominator) = decimal_fraction(multiple)?;
         if numerator == 0 {
-            return Err("a playlist window multiple must be nonzero".into());
+            return Err("a duration multiple must be nonzero".into());
         }
         let denominator = NonZeroU32::new(denominator)
-            .ok_or_else(|| "a playlist window multiple must be nonzero".to_owned())?;
+            .ok_or_else(|| "a duration multiple must be nonzero".to_owned())?;
         return Ok(DurationRule::MultipleOfTarget(TargetDurationMultiple::new(
             numerator,
             denominator,
@@ -2152,7 +2183,7 @@ fn parse_playlist_window(value: &str) -> Result<DurationRule, String> {
     }
     humantime::parse_duration(value)
         .map(DurationRule::Fixed)
-        .map_err(|error| format!("invalid playlist window: {error}"))
+        .map_err(|error| format!("invalid duration rule: {error}"))
 }
 
 /// Parses a decimal into a reduced fraction, so `"1.5"` becomes `3/2`.

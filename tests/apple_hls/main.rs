@@ -21,6 +21,11 @@ async fn rtmp_legacy_h264_aac() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rtmp_h264_bframes_aac() -> TestResult {
+    run(publish::rtmp_h264_bframes_aac()?).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rtmp_enhanced_hevc_aac() -> TestResult {
     run(publish::rtmp_hevc_aac()?).await
 }

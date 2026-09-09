@@ -191,7 +191,7 @@ case. The eviction machinery exists; the change is to drop oldest rather than
 only time-expired media in the same retry path.
 
 The same applies to `maximum_parts` and `maximum_segments`, which fail the
-same way and are compiled constants. At `segment = "1s"` with `retain = "2h"`
+same way and are compiled constants. At `segment = { target = "1s" }` with `retain = "2h"`
 a stream needs 7200 segments against a 4096 ceiling, so the session dies
 part-way through with no operator setting that explains why. Shedding has to
 cover all three budgets, not only bytes.

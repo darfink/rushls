@@ -30,7 +30,7 @@
 //! This module keeps only the process-wide entry points: the store itself and
 //! the write lease a publisher holds against one stream.
 
-use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -85,19 +85,6 @@ pub struct StoreLimits {
     pub retention: RetentionPolicy,
     /// Overflow directory and per-stream byte cap, or memory-only.
     pub disk: Option<DiskLimits>,
-}
-
-impl StoreLimits {
-    /// How long an unleased stream stays available for a publisher to return.
-    ///
-    /// The same window its media is fetchable for, deliberately. A stream that
-    /// still has playable media is one a viewer can still be watching, and
-    /// retiring it early would end that playback; a stream whose media has all
-    /// expired has nothing left to resume into. One window answers both, so
-    /// there is no second retention concept to keep in step with this one.
-    pub fn reconnect_window(&self) -> Duration {
-        self.retention.retain
-    }
 }
 
 impl Default for StoreLimits {
@@ -308,7 +295,7 @@ impl StreamStore {
 
         for (stream, live) in current.iter() {
             live.sweep_expired();
-            if live.retire_if_idle_for(self.limits.reconnect_window()) {
+            if live.retire_if_idle_for(live.retention_depth().requested) {
                 // Only a stream viewers could reach becomes unreachable. One
                 // that never served anything was never available to lose.
                 if live.was_announced() {

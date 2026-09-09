@@ -10,6 +10,13 @@ pub use passthrough::PassThroughNormalizerFactory;
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum NormalizeError {
+    #[error(
+        "{track}: unsupported random-access picture for {codec:?}; configure closed GOPs with IDR frames (AVC recovery-point SEI does not make an independent segment)"
+    )]
+    UnsupportedRandomAccess {
+        track: crate::domain::TrackId,
+        codec: crate::domain::Codec,
+    },
     #[error("cannot normalize the validated presentation: {0}")]
     InvalidPlan(Box<str>),
     #[error("media processing failed: {0}")]

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use crate::domain::MediaKind;
 
 use super::{
-    CmafMuxerConfig, MuxError, MuxerFactory, MuxerStartRequest, PackagedPresentation,
-    PackagingRenditionId, StartedMuxer, TrackPackager, TrackRouter, cmaf, webvtt,
+    MuxError, MuxerFactory, MuxerStartRequest, PackagedPresentation, PackagingRenditionId,
+    StartedMuxer, TrackPackager, cmaf, webvtt,
 };
 
 /// Builds one pass-through rendition per source track.
@@ -14,16 +14,7 @@ use super::{
 /// Encoded audio and video are routed to the CMAF packager while textual
 /// subtitle codecs are packaged directly as WebVTT.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct PassThroughMuxerFactory {
-    cmaf: CmafMuxerConfig,
-}
-
-impl PassThroughMuxerFactory {
-    /// Uses `cmaf` for every audio/video rendition created by this factory.
-    pub fn new(cmaf: CmafMuxerConfig) -> Self {
-        Self { cmaf }
-    }
-}
+pub struct PassThroughMuxerFactory;
 
 impl MuxerFactory for PassThroughMuxerFactory {
     fn start(&self, request: MuxerStartRequest<'_>) -> Result<StartedMuxer, MuxError> {
@@ -42,9 +33,16 @@ impl MuxerFactory for PassThroughMuxerFactory {
                     .map_err(|_| invalid("too many tracks for packaging rendition IDs"))?,
             );
             let (rendition, packager) = match track.kind() {
-                MediaKind::Audio | MediaKind::Video => {
-                    cmaf::build_track(rendition_id, track, plan, self.cmaf, request.events.clone())?
-                }
+                MediaKind::Audio | MediaKind::Video => cmaf::build_track(
+                    rendition_id,
+                    track,
+                    plan,
+                    request
+                        .segmentation
+                        .late_boundary
+                        .saturating_add(request.segmentation.early_boundary),
+                    request.events.clone(),
+                )?,
                 MediaKind::Subtitle => {
                     webvtt::build_track(rendition_id, track, plan, request.events.clone())?
                 }
@@ -60,7 +58,12 @@ impl MuxerFactory for PassThroughMuxerFactory {
         )
         .map_err(|error| invalid(error.to_string()))?;
         Ok(StartedMuxer {
-            muxer: Box::new(TrackRouter::new(packagers, request.segmentation)),
+            muxer: Box::new(super::coordinator::Coordinator::new(
+                packagers,
+                request.presentation,
+                request.segmentation,
+                request.events.clone(),
+            )?),
             presentation: Arc::new(presentation),
         })
     }
@@ -68,6 +71,47 @@ impl MuxerFactory for PassThroughMuxerFactory {
 
 fn invalid(message: impl Into<Box<str>>) -> MuxError {
     MuxError::InvalidPlan(message.into())
+}
+
+/// Admission replays timing through the same coordinator and writers as live
+/// packaging. No CMAF payloads are serialized and no live lifecycle events fire.
+pub fn validate_timing(
+    presentation: &crate::media::PresentationPlan,
+    segmentation: &crate::segment::SegmentationPlan,
+    samples: &[crate::media::NormalizedSample],
+) -> Result<(), MuxError> {
+    use super::Muxer;
+    let events = crate::observe::Events::default().scoped(crate::domain::SessionId(nz::u64!(1)));
+    let mut writers = Vec::new();
+    for (index, track) in presentation.tracks().iter().enumerate() {
+        let plan = *segmentation
+            .get(track.id)
+            .ok_or_else(|| invalid("missing timing plan"))?;
+        let id =
+            PackagingRenditionId(u32::try_from(index).map_err(|_| invalid("too many tracks"))?);
+        let writer = if track.kind() == MediaKind::Subtitle {
+            webvtt::build_track(id, track, plan, events.clone())?.1
+        } else {
+            cmaf::timing_track(
+                id,
+                track,
+                plan,
+                segmentation
+                    .early_boundary
+                    .saturating_add(segmentation.late_boundary),
+                events.clone(),
+            )?
+        };
+        writers.push(writer);
+    }
+    let mut mux =
+        super::coordinator::Coordinator::new(writers, presentation, segmentation, events)?;
+    let mut out = Vec::new();
+    for sample in samples {
+        mux.push(sample.clone(), &mut out)?;
+        out.clear();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -114,7 +158,7 @@ mod tests {
         )?;
         let events = Events::default().scoped(SessionId(nz::u64!(1)));
 
-        let started = PassThroughMuxerFactory::default().start(MuxerStartRequest {
+        let started = PassThroughMuxerFactory.start(MuxerStartRequest {
             presentation: &input,
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,
@@ -165,6 +209,7 @@ mod tests {
             vec![
                 PlanBuilder::new(0, audio_timebase, nz::u64!(48_000))
                     .part(nz::u32!(8), nz::u64!(8_192))
+                    .boundary_tolerance(1_024)
                     .build(),
                 // One-second subtitle segments, so a couple of seconds of audio
                 // is enough to cross several boundaries.
@@ -174,7 +219,7 @@ mod tests {
             ],
         )?;
         let events = Events::default().scoped(SessionId(nz::u64!(3)));
-        let mut started = PassThroughMuxerFactory::default().start(MuxerStartRequest {
+        let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
             presentation: &input,
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,
@@ -259,7 +304,7 @@ mod tests {
             ],
         )?;
         let events = Events::default().scoped(SessionId(nz::u64!(2)));
-        let mut started = PassThroughMuxerFactory::default().start(MuxerStartRequest {
+        let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
             presentation: &input,
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,

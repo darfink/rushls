@@ -16,9 +16,24 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PresentationPlan {
     tracks: TrackCatalog,
+    timestamp_timebases: Vec<(TrackId, crate::domain::Timebase)>,
 }
 
 impl PresentationPlan {
+    /// Original timestamp precision survives normalization to a finer clock.
+    pub fn timestamp_quantum(&self, id: TrackId, output: crate::domain::Timebase) -> u64 {
+        self.timestamp_timebases
+            .iter()
+            .find(|(track, _)| *track == id)
+            .map_or(1, |(_, input)| {
+                let numerator = u128::from(input.num().get()) * u128::from(output.den().get());
+                let denominator = u128::from(input.den().get()) * u128::from(output.num().get());
+                u64::try_from(numerator.div_ceil(denominator))
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+            })
+    }
+
     pub fn tracks(&self) -> &[DiscoveredTrack] {
         self.tracks.tracks()
     }
@@ -55,6 +70,7 @@ impl PresentationPlan {
         );
         Ok(Self {
             tracks: TrackCatalog::new(tracks)?,
+            timestamp_timebases: self.timestamp_timebases.clone(),
         })
     }
 }
@@ -136,6 +152,11 @@ pub fn validate(
 
     Ok(PresentationPlan {
         tracks: tracks.clone(),
+        timestamp_timebases: tracks
+            .tracks()
+            .iter()
+            .map(|track| (track.id, track.timebase))
+            .collect(),
     })
 }
 

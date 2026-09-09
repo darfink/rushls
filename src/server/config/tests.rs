@@ -21,7 +21,7 @@ use crate::{
     },
 };
 
-use super::{AppConfig, ConfigError, decimal_fraction, parse_playlist_window};
+use super::{AppConfig, ConfigError, decimal_fraction, parse_duration_rule};
 
 const BASE_CONFIG: &str = "";
 
@@ -122,16 +122,17 @@ async fn the_reference_file_resolves_to_the_hardened_configuration() -> Result<(
         config.node.store.retention.maximum_payload_bytes,
         256 * 1024 * 1024
     );
-    assert_eq!(config.node.store.retention.retain, Duration::from_mins(1));
+    assert_eq!(
+        config.node.store.retention.retain,
+        Duration::from_mins(1).into()
+    );
     assert_eq!(
         config.node.session.segmentation.desired_segment_duration,
         Duration::from_secs(6)
     );
     assert_eq!(
-        config.node.cmaf.segment_boundary_policy,
-        crate::mux::SegmentBoundaryPolicy::ExtendToRandomAccess {
-            maximum_extension: Duration::from_secs(6),
-        }
+        config.node.session.segmentation.late_boundary,
+        Duration::ZERO
     );
     assert_eq!(
         config.node.session.supervision.health.stall,
@@ -1488,7 +1489,7 @@ fn a_stall_shorter_than_one_segment_is_refused() -> Result<(), Box<dyn Error>> {
     let Err(error) = resolve_toml(
         r#"
 [hls]
-segment = "10s"
+segment = { target = "10s" }
 
 [accept]
 stall = "5s"
@@ -1664,27 +1665,24 @@ fn os<const N: usize>(values: [&str; N]) -> impl Iterator<Item = OsString> {
 #[test]
 fn playlist_windows_parse_as_durations_or_target_multiples() -> Result<(), Box<dyn Error>> {
     assert_eq!(
-        parse_playlist_window("6x")?,
+        parse_duration_rule("6x")?,
         DurationRule::MultipleOfTarget(TargetDurationMultiple::integer(6))
     );
     assert_eq!(
-        parse_playlist_window("1.5x")?,
+        parse_duration_rule("1.5x")?,
         DurationRule::MultipleOfTarget(TargetDurationMultiple::new(3, nz::u32!(2)))
     );
     assert_eq!(
-        parse_playlist_window("18s")?,
+        parse_duration_rule("18s")?,
         DurationRule::Fixed(Duration::from_secs(18))
     );
-    assert!(parse_playlist_window("0x").is_err(), "zero is refused");
+    assert!(parse_duration_rule("0x").is_err(), "zero is refused");
+    assert!(parse_duration_rule("x").is_err(), "bare suffix is refused");
     assert!(
-        parse_playlist_window("x").is_err(),
-        "bare suffix is refused"
-    );
-    assert!(
-        parse_playlist_window("1.2.3x").is_err(),
+        parse_duration_rule("1.2.3x").is_err(),
         "one decimal point only"
     );
-    assert!(parse_playlist_window("abc").is_err(), "garbage is refused");
+    assert!(parse_duration_rule("abc").is_err(), "garbage is refused");
     Ok(())
 }
 
@@ -1711,7 +1709,7 @@ fn hold_back_accepts_both_forms_and_refuses_a_stalling_one() -> Result<(), Box<d
     let relative = resolve_toml(
         r#"
 [hls]
-part = "1s"
+part = { target = "1s" }
 hold_back = "4x"
 "#,
     )??;
@@ -1728,7 +1726,7 @@ hold_back = "4x"
     let absolute = resolve_toml(
         r#"
 [hls]
-part = "1s"
+part = { target = "1s", max = "1x" }
 hold_back = "2500ms"
 "#,
     )??;
@@ -1747,7 +1745,7 @@ hold_back = "2500ms"
     let error = resolve_toml(
         r#"
 [hls]
-part = "1s"
+part = { target = "1s" }
 hold_back = "1s"
 "#,
     )?
@@ -1767,7 +1765,7 @@ fn a_hold_back_between_two_and_three_parts_is_warned_rather_than_refused()
     let resolved = resolve_toml(
         r#"
 [hls]
-part = "1s"
+part = { target = "1s", max = "1x" }
 hold_back = "2s"
 "#,
     )??;
@@ -1798,13 +1796,16 @@ fn the_playlist_window_becomes_the_retention_window() -> Result<(), Box<dyn Erro
     let config = resolve_toml(
         r#"
 [hls]
-segment = "6s"
+segment = { target = "6s", max = "1x" }
 retain = "18s"
 "#,
     )??;
 
     let retention = config.node.store.retention;
-    assert_eq!(retention.retain, Duration::from_secs(18));
+    assert_eq!(
+        retention.retain.resolve(Duration::from_secs(3)),
+        Duration::from_secs(18)
+    );
     Ok(())
 }
 
@@ -1814,7 +1815,7 @@ fn a_fixed_window_below_three_target_durations_is_refused() -> Result<(), Box<dy
         resolve_toml(
             r#"
 [hls]
-segment = "6s"
+segment = { target = "6s" }
 retain = "12s"
 "#,
         )?
@@ -1830,7 +1831,7 @@ fn a_reconnect_window_below_the_hold_back_is_refused() -> Result<(), Box<dyn Err
         resolve_toml(
             r#"
 [hls]
-segment = "6s"
+segment = { target = "6s" }
 
 [capacity]
 inactive_stream_retention = "5s"
@@ -1858,7 +1859,7 @@ fn hostile_playlist_windows_never_panic() {
     for _ in 0..4_000 {
         let value = crate::test_fuzz::string(&mut state, 24);
         // A window either parses into a rule or is refused; both are fine.
-        let _ = parse_playlist_window(&value);
+        let _ = parse_duration_rule(&value);
     }
 }
 
@@ -1939,5 +1940,100 @@ video = { codecs = ["text"] }
 "#,
     )?;
     assert!(matches!(wrong_kind, Err(ConfigError::Invalid(_))));
+    Ok(())
+}
+
+#[test]
+fn hls_objects_resolve_targets_maxima_and_symmetric_jitter() -> Result<(), Box<dyn Error>> {
+    let bounded =
+        resolve_toml("[hls]\nsegment = { target = '2s' }\npart = { target = '500ms' }\n")??;
+    let policy = bounded.node.session.segmentation;
+    assert_eq!(policy.maximum_part_duration, Duration::from_secs(1));
+    assert_eq!(policy.segment_cap(), Duration::from_secs(4));
+    assert_eq!(policy.late_boundary, Duration::ZERO);
+    let explicit = resolve_toml(
+        "[hls]\nsegment = { target = '2s', max = '1.5x', jitter = '0.05x' }\npart = { target = '500ms', max = '750ms' }\n",
+    )??;
+    let policy = explicit.node.session.segmentation;
+    assert_eq!(policy.segment_cap(), Duration::from_secs(3));
+    assert_eq!(policy.early_boundary, Duration::from_millis(100));
+    assert_eq!(policy.late_boundary, Duration::from_millis(100));
+    assert_eq!(policy.maximum_part_duration, Duration::from_millis(750));
+    let nested = resolve_toml("[hls.segment]\nmax = '1x'\n[hls.part]\nmax = '1x'\n")??;
+    assert_eq!(
+        nested.node.session.segmentation.segment_cap(),
+        Duration::from_secs(6)
+    );
+    assert_eq!(
+        nested.node.session.segmentation.maximum_part_duration,
+        Duration::from_secs(1)
+    );
+    for invalid in [
+        "segment = '6s'",
+        "part = '1s'",
+        "admission = 'hard'",
+        "maximum_segment = '2x'",
+        "maximum_part = '2x'",
+        "early_boundary = '0s'",
+        "late_boundary = '0s'",
+        "segment = { max = '1s' }",
+        "segment = { target = '0s' }",
+        "part = { target = '0s' }",
+        "segment = { jitter = '1x' }",
+        "part = { jitter = '0s' }",
+        "part = { max = '20s' }",
+    ] {
+        assert!(
+            resolve_toml(&format!("[hls]\n{invalid}\n"))?.is_err(),
+            "{invalid}"
+        );
+    }
+    assert!(
+        super::resolve_hls_rule(
+            DurationRule::MultipleOfTarget(TargetDurationMultiple::integer(2)),
+            Duration::MAX
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn fixed_delivery_budgets_cover_the_entire_admission_range() -> Result<(), Box<dyn Error>> {
+    assert!(resolve_toml("[hls]\npart = { target = '1s' }\nhold_back = '3s'\n")?.is_err());
+    assert!(resolve_toml("[hls]\nsegment = { target = '6s' }\nretain = '18s'\n")?.is_err());
+    assert!(resolve_toml("[hls]\nsegment = { max = '1x' }\npart = { max = '1x' }\nhold_back = '3s'\nretain = '18s'\n")?.is_ok());
+    Ok(())
+}
+
+#[test]
+fn nested_hls_sources_preserve_precedence() -> Result<(), Box<dyn Error>> {
+    let resolved = resolve_with(
+        "[hls]\nsegment = { target = '2s', max = '3x' }\npart = { target = '100ms' }\n",
+        &["--hls-segment-target", "4s", "--hls-part-max", "4x"],
+        &[
+            ("RUSHLS_HLS_SEGMENT_TARGET", "3s"),
+            ("RUSHLS_HLS_PART_TARGET", "200ms"),
+        ],
+    )??;
+    let policy = resolved.node.session.segmentation;
+    assert_eq!(policy.desired_segment_duration, Duration::from_secs(4));
+    assert_eq!(policy.maximum_segment_duration, Duration::from_secs(12));
+    assert_eq!(policy.desired_part_duration, Duration::from_millis(200));
+    assert_eq!(policy.maximum_part_duration, Duration::from_millis(800));
+    for flag in [
+        "--hls-segment",
+        "--hls-part",
+        "--hls-admission",
+        "--hls-maximum-segment",
+        "--hls-maximum-part",
+        "--hls-early-boundary",
+        "--hls-late-boundary",
+    ] {
+        assert!(
+            resolve_with("", &[flag, "1s"], &[])?.is_err(),
+            "removed flag {flag}"
+        );
+    }
     Ok(())
 }

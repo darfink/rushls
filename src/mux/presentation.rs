@@ -510,6 +510,7 @@ pub struct StartedMuxer {
 /// All immutable planning inputs needed to construct a muxer publication.
 #[derive(Clone, Copy, Debug)]
 pub struct MuxerStartRequest<'a> {
+    /// Retained admission media, validated before the presentation is exposed.
     pub presentation: &'a PresentationPlan,
     pub segmentation: &'a crate::segment::SegmentationPlan,
     pub time_anchor: SystemTime,

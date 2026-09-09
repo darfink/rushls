@@ -1,16 +1,14 @@
 //! Choosing one close, track-local cadence for every rendition.
 //!
-//! Pre-roll has one greedy rule:
+//! Pre-roll examines candidates in this order:
 //!
 //! 1. Observe through the desired duration.
-//! 2. Find the latest keyframe interval shared by every video track.
-//! 3. If there is none, keep observing only until the configured extension.
-//! 4. Snap audio to the access unit covering the selected video instant.
+//! 2. Try common video boundaries from latest to earliest below the target.
+//! 3. If none is feasible, try later boundaries up to the configured maximum.
+//! 4. Snap audio to its encoded grid and replay the complete candidate contract.
 //!
-//! Candidate intervals are compared by elapsed time from each track's first
-//! presentable encoded access unit. Their starts may differ by a frame, but an
-//! overlap proves the resulting cadences are close. Each track keeps its own
-//! start and period, so neither video nor primed audio is forced off its grid.
+//! Video random-access starts must identify the same presentation instant.
+//! Audio boundaries stay on their encoded sample grid, including priming.
 
 use std::{cmp::Ordering, num::NonZero, time::Duration};
 
@@ -21,10 +19,7 @@ use crate::{
     media::{NormalizedSample, PresentationPlan, PresentedTimingCursor, TimelineCalibration},
 };
 
-use super::{
-    BoundarySearchPolicy, CadenceError, SegmentationPolicy, TrackSegmentationPlan,
-    part::{AccessUnitCadence, select_part_cadence},
-};
+use super::{CadenceError, SegmentationPolicy, TrackSegmentationPlan, part::AccessUnitCadence};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Boundary {
@@ -38,6 +33,8 @@ struct Boundary {
 struct TrackCadence {
     track_id: TrackId,
     kind: MediaKind,
+    frame_rate: Option<crate::domain::FrameRate>,
+    timestamp_quantum: u64,
     timebase: Timebase,
     /// Track-local PTS naming the shared presentation origin.
     presentation_origin: TickTimestamp,
@@ -72,19 +69,11 @@ struct SelectedBoundary {
 #[derive(Debug)]
 struct VideoSelection {
     /// The latest boundary start inside the shared keyframe intersection.
-    point: BoundaryPoint,
     tracks: Vec<SelectedBoundary>,
-}
-
-enum VideoSearch {
-    NoVideo,
-    Pending,
-    Ready(VideoSelection),
 }
 
 #[derive(Clone, Copy)]
 enum Target {
-    Duration(Duration),
     Point(BoundaryPoint),
 }
 
@@ -100,6 +89,7 @@ impl CadenceObserver {
         timeline: &TimelineCalibration,
         policy: SegmentationPolicy,
     ) -> Result<Self, CadenceError> {
+        policy.validate()?;
         let mut tracks: Vec<TrackCadence> = Vec::with_capacity(timeline.tracks.len());
         for timing in &timeline.tracks {
             if tracks
@@ -112,7 +102,12 @@ impl CadenceObserver {
             tracks.push(TrackCadence {
                 track_id: timing.track_id,
                 kind: source.kind(),
+                frame_rate: match source.parameters {
+                    crate::domain::MediaParameters::Video { frame_rate, .. } => frame_rate,
+                    _ => None,
+                },
                 timebase: timing.timebase,
+                timestamp_quantum: presentation.timestamp_quantum(source.id, timing.timebase),
                 presentation_origin: timing.origin_pts,
                 presented_timing: PresentedTimingCursor::for_track(source),
                 segmentation_origin: None,
@@ -172,123 +167,116 @@ impl CadenceObserver {
         Ok(())
     }
 
-    /// Returns a complete plan as soon as the desired horizon is conclusive.
-    ///
-    /// Extension is considered only when no compatible video cluster exists at
-    /// or before the desired duration. As soon as an extended cluster appears,
-    /// it wins; pre-roll never waits out unused extension budget.
+    /// The first timing candidate, primarily useful to inspect boundary discovery.
+    /// Admission must replay candidates before committing to one.
     pub fn plan(&self) -> Result<Option<Vec<TrackSegmentationPlan>>, CadenceError> {
-        let search = self.search_videos()?;
-        let target = match &search {
-            VideoSearch::Pending => return Ok(None),
-            VideoSearch::NoVideo => Target::Duration(self.policy.desired_segment_duration),
-            VideoSearch::Ready(selection) => Target::Point(selection.point),
-        };
-
-        let selected_videos = match &search {
-            VideoSearch::Ready(selection) => Some(selection),
-            VideoSearch::NoVideo | VideoSearch::Pending => None,
-        };
-        let mut plans = Vec::with_capacity(self.tracks.len());
-        for (track_index, track) in self.tracks.iter().enumerate() {
-            let Some(plan) = self.plan_track(track_index, track, target, selected_videos)? else {
-                return Ok(None);
-            };
-            plans.push(plan);
+        let mut plan = None;
+        self.visit_candidates(&mut 0, |tracks, _| {
+            plan = Some(tracks);
+            Ok::<_, CadenceError>(true)
+        })?;
+        if plan.is_none() && self.exhausted() {
+            return Err(CadenceError::NoSegmentationBoundary);
         }
-        Ok(Some(plans))
+        Ok(plan)
     }
 
-    fn search_videos(&self) -> Result<VideoSearch, CadenceError> {
-        let video_tracks: Vec<usize> = self
+    /// Enumerates complete plans in preference order without declaring them feasible.
+    pub fn visit_candidates<E: From<CadenceError>>(
+        &self,
+        work: &mut usize,
+        mut accept: impl FnMut(Vec<TrackSegmentationPlan>, &mut usize) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let videos: Vec<usize> = self
             .tracks
             .iter()
             .enumerate()
             .filter_map(|(index, track)| (track.kind == MediaKind::Video).then_some(index))
             .collect();
-        if video_tracks.is_empty() {
-            return Ok(VideoSearch::NoVideo);
-        }
-
-        // Until every video has crossed the inclusive endpoint, a keyframe
-        // beginning exactly there could still be the best candidate.
-        if !video_tracks
+        let authority = videos.first().copied().or_else(|| {
+            self.tracks
+                .iter()
+                .position(|track| track.kind == MediaKind::Audio)
+        });
+        let Some(authority) = authority else {
+            return Ok(());
+        };
+        let required = if videos.is_empty() {
+            vec![authority]
+        } else {
+            videos.clone()
+        };
+        if !required
             .iter()
             .all(|index| self.has_crossed(*index, self.policy.desired_segment_duration))
         {
-            return Ok(VideoSearch::Pending);
+            return Ok(());
         }
-        if let Some(selection) = self.best_common_video_boundary(
-            &video_tracks,
-            self.policy.desired_segment_duration,
-            SearchDirection::LatestAtOrBefore,
-        )? {
-            return Ok(VideoSearch::Ready(selection));
-        }
-
-        let BoundarySearchPolicy::ExtendToNext { maximum_extension } = self.policy.search else {
-            return Err(CadenceError::NoSegmentationBoundary);
-        };
-        let maximum = self
-            .policy
-            .desired_segment_duration
-            .saturating_add(maximum_extension);
-        if let Some(selection) = self.best_common_video_boundary(
-            &video_tracks,
-            maximum,
-            SearchDirection::EarliestAfterDesired,
-        )? {
-            return Ok(VideoSearch::Ready(selection));
-        }
-        if video_tracks
+        let source = &self.tracks[authority];
+        let desired = source
+            .timebase
+            .duration_to_ticks_floor(self.policy.desired_segment_duration);
+        let maximum = source
+            .timebase
+            .duration_to_ticks_floor(self.policy.segment_cap());
+        let mut boundaries: Vec<_> = source
+            .boundaries
             .iter()
-            .all(|index| self.has_crossed(*index, maximum))
-        {
-            return Err(CadenceError::NoSegmentationBoundary);
-        }
-        Ok(VideoSearch::Pending)
-    }
-
-    /// Finds one overlapping keyframe interval across all video tracks.
-    ///
-    /// The overlap is the closeness rule. It accepts starts that differ by up
-    /// to a frame while rejecting periods that would visibly drift apart.
-    fn best_common_video_boundary(
-        &self,
-        video_tracks: &[usize],
-        limit: Duration,
-        direction: SearchDirection,
-    ) -> Result<Option<VideoSelection>, CadenceError> {
-        let mut selected: Option<VideoSelection> = None;
-        for track_index in video_tracks {
-            for boundary in &self.tracks[*track_index].boundaries {
-                let point = BoundaryPoint {
-                    track_index: *track_index,
-                    ticks: boundary.start,
-                };
-                if !direction.admits(
-                    boundary.start,
-                    self.tracks[*track_index].timebase,
-                    self.policy.desired_segment_duration,
-                    limit,
-                ) {
-                    continue;
-                }
-                let Some(tracks) = self.video_boundaries_covering(video_tracks, point)? else {
+            .filter(|boundary| boundary.start <= maximum)
+            .collect();
+        // Below the target, prefer the latest boundary; beyond it, extend greedily.
+        boundaries.sort_by_key(|boundary| {
+            if boundary.start <= desired {
+                (false, u64::MAX - boundary.start)
+            } else {
+                (true, boundary.start)
+            }
+        });
+        for boundary in boundaries {
+            // Charge boundary scans as well as replay. Stop on the first
+            // accepted candidate instead of materializing every possible plan.
+            *work = self.tracks.iter().fold(*work, |work, track| {
+                work.saturating_add(track.boundaries.len().saturating_add(1))
+            });
+            if *work > 1_000_000 {
+                return Err(CadenceError::WorkLimitExceeded.into());
+            }
+            let point = BoundaryPoint {
+                track_index: authority,
+                ticks: boundary.start,
+            };
+            let selection = if videos.is_empty() {
+                None
+            } else {
+                let Some(tracks) = self.video_boundaries_covering(&videos, point)? else {
                     continue;
                 };
-                let replace = match &selected {
-                    None => true,
-                    Some(current) => {
-                        self.compare_points(point, current.point)? == direction.preference()
-                    }
-                };
-                if replace {
-                    selected = Some(VideoSelection { point, tracks });
+                Some(VideoSelection { tracks })
+            };
+            let mut tracks = Vec::new();
+            for (index, track) in self.tracks.iter().enumerate() {
+                match self.plan_track(index, track, Target::Point(point), selection.as_ref()) {
+                    Ok(Some(plan)) => tracks.push(plan),
+                    Ok(None) | Err(CadenceError::NoSegmentationBoundary) => break,
+                    Err(error) => return Err(error.into()),
                 }
             }
+            if tracks.len() == self.tracks.len() && accept(tracks, work)? {
+                return Ok(());
+            }
         }
-        Ok(selected)
+        Ok(())
+    }
+
+    /// Missing evidence may still arrive until every governing track crosses the cap.
+    pub fn exhausted(&self) -> bool {
+        // A video can lead audio by several batches. Crossing the video cap
+        // does not prove that the audio needed by an existing candidate is absent.
+        self.tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| track.kind != MediaKind::Subtitle)
+            .all(|(index, _)| self.has_crossed(index, self.policy.segment_cap()))
     }
 
     fn video_boundaries_covering(
@@ -300,7 +288,14 @@ impl CadenceObserver {
         for track_index in video_tracks {
             let mut covering = None;
             for boundary in &self.tracks[*track_index].boundaries {
-                if self.boundary_covers_point(*track_index, *boundary, point)? {
+                if self.compare_points(
+                    BoundaryPoint {
+                        track_index: *track_index,
+                        ticks: boundary.start,
+                    },
+                    point,
+                )? == Ordering::Equal
+                {
                     covering = Some(*boundary);
                     break;
                 }
@@ -361,16 +356,34 @@ impl CadenceObserver {
         let first_segment_boundary_pts = segmentation_origin
             .checked_add_unsigned(segment_duration.get())
             .ok_or(CadenceError::TimestampOverflow(track.track_id))?;
-        let part = select_part_cadence(
-            track.track_id,
-            track.kind,
-            track.access_units,
-            track
-                .timebase
-                .duration_to_ticks(self.policy.desired_part_duration),
-            segment_duration.get(),
-        )?;
+        let part_duration = NonZero::new(
+            track.timebase.duration_to_ticks_floor(
+                self.policy
+                    .desired_part_duration
+                    .min(track.timebase.ticks_to_duration(segment_duration.get())),
+            ),
+        )
+        .ok_or(CadenceError::InconsistentPartCadence(track.track_id))?;
 
+        let segment_period = track.frame_rate.and_then(|rate| {
+            let numerator =
+                u128::from(rate.denominator().get()) * u128::from(track.timebase.den().get());
+            let denominator =
+                u128::from(rate.numerator().get()) * u128::from(track.timebase.num().get());
+            let observed = u128::from(segment_duration.get()) * denominator;
+            let frames = (observed + numerator / 2) / numerator;
+            let period = frames.checked_mul(numerator)?;
+            (frames > 0
+                && period.abs_diff(observed) <= denominator * u128::from(track.timestamp_quantum)
+                && period != observed)
+                .then(|| {
+                    Some((
+                        u64::try_from(period).ok()?,
+                        u64::try_from(denominator).ok()?,
+                    ))
+                })
+                .flatten()
+        });
         Ok(Some(TrackSegmentationPlan {
             track_id: track.track_id,
             timebase: track.timebase,
@@ -378,11 +391,18 @@ impl CadenceObserver {
             segmentation_origin_pts: segmentation_origin,
             first_segment_boundary_pts,
             segment_duration,
-            part_access_units: part.access_units,
-            part_duration: part.duration,
+            segment_period,
+            part_duration,
             boundary_tolerance: match track.kind {
                 MediaKind::Audio => track.access_units.longest(),
-                MediaKind::Subtitle | MediaKind::Video => 0,
+                MediaKind::Video => {
+                    if segment_period.is_some() {
+                        track.timestamp_quantum
+                    } else {
+                        0
+                    }
+                }
+                MediaKind::Subtitle => 0,
             },
         }))
     }
@@ -394,12 +414,6 @@ impl CadenceObserver {
     ) -> Result<Option<Boundary>, CadenceError> {
         for boundary in &self.tracks[track_index].boundaries {
             let covers = match target {
-                Target::Duration(duration) => {
-                    let ticks = self.tracks[track_index]
-                        .timebase
-                        .duration_to_ticks_floor(duration);
-                    boundary.start <= ticks && ticks < boundary.end
-                }
                 Target::Point(point) => {
                     self.boundary_covers_point(track_index, *boundary, point)?
                 }
@@ -435,9 +449,6 @@ impl CadenceObserver {
             return Ok(false);
         };
         match target {
-            Target::Duration(duration) => {
-                Ok(observed > track.timebase.duration_to_ticks_ceil(duration))
-            }
             Target::Point(point) => self
                 .compare_points(
                     BoundaryPoint {
@@ -457,7 +468,6 @@ impl CadenceObserver {
     ) -> Result<TickDuration, CadenceError> {
         let track = &self.tracks[track_index];
         match target {
-            Target::Duration(duration) => Ok(track.timebase.duration_to_ticks(duration)),
             Target::Point(point) => {
                 let source = &self.tracks[point.track_index];
                 let ticks = TickTimestamp::try_from(point.ticks)
@@ -487,41 +497,23 @@ impl CadenceObserver {
         left_track
             .timebase
             .compare_offsets(
-                i128::from(left.ticks),
+                i128::from(left.ticks)
+                    + i128::from(
+                        left_track
+                            .segmentation_origin
+                            .unwrap_or(left_track.presentation_origin),
+                    )
+                    - i128::from(left_track.presentation_origin),
                 right_track.timebase,
-                i128::from(right.ticks),
+                i128::from(right.ticks)
+                    + i128::from(
+                        right_track
+                            .segmentation_origin
+                            .unwrap_or(right_track.presentation_origin),
+                    )
+                    - i128::from(right_track.presentation_origin),
             )
             .ok_or(CadenceError::ComparisonOverflow)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum SearchDirection {
-    LatestAtOrBefore,
-    EarliestAfterDesired,
-}
-
-impl SearchDirection {
-    fn admits(
-        self,
-        ticks: TickDuration,
-        timebase: Timebase,
-        desired: Duration,
-        limit: Duration,
-    ) -> bool {
-        let desired = timebase.duration_to_ticks_floor(desired);
-        let limit = timebase.duration_to_ticks_floor(limit);
-        match self {
-            Self::LatestAtOrBefore => ticks <= desired,
-            Self::EarliestAfterDesired => desired < ticks && ticks <= limit,
-        }
-    }
-
-    fn preference(self) -> Ordering {
-        match self {
-            Self::LatestAtOrBefore => Ordering::Greater,
-            Self::EarliestAfterDesired => Ordering::Less,
-        }
     }
 }
 
@@ -557,11 +549,14 @@ mod tests {
         Timebase::new(nz::u32!(1), nz::u32!(48_000))
     }
 
-    fn policy(search: BoundarySearchPolicy) -> SegmentationPolicy {
+    fn policy(maximum_segment_duration: Duration) -> SegmentationPolicy {
         SegmentationPolicy {
             desired_segment_duration: Duration::from_secs(4),
             desired_part_duration: Duration::from_millis(200),
-            search,
+            maximum_segment_duration,
+            maximum_part_duration: Duration::from_secs(2),
+            early_boundary: Duration::ZERO,
+            late_boundary: Duration::ZERO,
         }
     }
 
@@ -591,9 +586,9 @@ mod tests {
         (presentation, timeline)
     }
 
-    fn observer(kinds: &[(u32, MediaKind)], search: BoundarySearchPolicy) -> CadenceObserver {
+    fn observer(kinds: &[(u32, MediaKind)], maximum_segment_duration: Duration) -> CadenceObserver {
         let (presentation, timeline) = tracks(kinds);
-        CadenceObserver::new(&presentation, &timeline, policy(search))
+        CadenceObserver::new(&presentation, &timeline, policy(maximum_segment_duration))
             .expect("test observer is valid")
     }
 
@@ -616,38 +611,23 @@ mod tests {
     }
 
     #[test]
-    fn every_video_track_constrains_the_plan_without_requiring_equal_ticks() {
+    fn overlapping_but_misaligned_video_keyframes_do_not_form_a_boundary() {
         let mut observer = observer(
             &[(0, MediaKind::Video), (1, MediaKind::Video)],
-            BoundarySearchPolicy::ExtendToNext {
-                maximum_extension: Duration::from_secs(4),
-            },
+            Duration::from_secs(8),
         );
         observe_video(&mut observer, 0, 0, true);
         observe_video(&mut observer, 1, 0, true);
         observe_video(&mut observer, 0, 4 * VIDEO_SECOND, true);
-        // The starts differ, but the two frame intervals overlap.
         observe_video(&mut observer, 1, 4 * VIDEO_SECOND + 1_500, true);
-
-        let plans = observer
-            .plan()
-            .expect("search succeeds")
-            .expect("both tracks supplied a compatible boundary");
-
-        assert_eq!(plans[0].segment_duration.get(), 4 * VIDEO_SECOND as u64);
-        assert_eq!(
-            plans[1].segment_duration.get(),
-            (4 * VIDEO_SECOND + 1_500) as u64
-        );
+        assert!(observer.plan().expect("search succeeds").is_none());
     }
 
     #[test]
     fn a_video_track_without_a_compatible_keyframe_extends_the_shared_horizon() {
         let mut observer = observer(
             &[(0, MediaKind::Video), (1, MediaKind::Video)],
-            BoundarySearchPolicy::ExtendToNext {
-                maximum_extension: Duration::from_secs(4),
-            },
+            Duration::from_secs(8),
         );
         for track_id in [0, 1] {
             observe_video(&mut observer, track_id, 0, true);
@@ -657,26 +637,21 @@ mod tests {
 
         observe_video(&mut observer, 0, 6 * VIDEO_SECOND, true);
         assert!(observer.plan().expect("search succeeds").is_none());
-        observe_video(&mut observer, 1, 6 * VIDEO_SECOND + 1_000, true);
+        observe_video(&mut observer, 1, 6 * VIDEO_SECOND, true);
 
         let plans = observer
             .plan()
             .expect("search succeeds")
             .expect("the first compatible extended cluster resolves immediately");
         assert_eq!(plans[0].segment_duration.get(), 6 * VIDEO_SECOND as u64);
-        assert_eq!(
-            plans[1].segment_duration.get(),
-            (6 * VIDEO_SECOND + 1_000) as u64
-        );
+        assert_eq!(plans[1].segment_duration.get(), (6 * VIDEO_SECOND) as u64);
     }
 
     #[test]
     fn incompatible_video_cadences_are_rejected_at_the_upper_bound() {
         let mut observer = observer(
             &[(0, MediaKind::Video), (1, MediaKind::Video)],
-            BoundarySearchPolicy::ExtendToNext {
-                maximum_extension: Duration::from_secs(2),
-            },
+            Duration::from_secs(6),
         );
         for track_id in [0, 1] {
             observe_video(&mut observer, track_id, 0, true);
@@ -697,10 +672,7 @@ mod tests {
 
     #[test]
     fn strict_search_rejects_once_the_desired_horizon_is_conclusive() {
-        let mut observer = observer(
-            &[(0, MediaKind::Video)],
-            BoundarySearchPolicy::AtOrBeforeDesired,
-        );
+        let mut observer = observer(&[(0, MediaKind::Video)], Duration::from_secs(4));
         observe_video(&mut observer, 0, 0, true);
         observe_video(&mut observer, 0, 4 * VIDEO_SECOND, false);
 
@@ -711,7 +683,7 @@ mod tests {
     fn video_priority_snaps_audio_to_its_own_access_unit_grid() {
         let mut observer = observer(
             &[(0, MediaKind::Video), (1, MediaKind::Audio)],
-            BoundarySearchPolicy::AtOrBeforeDesired,
+            Duration::from_secs(4),
         );
         observe_video(&mut observer, 0, 0, true);
         observe_video(&mut observer, 0, 4 * VIDEO_SECOND, true);
@@ -768,7 +740,7 @@ mod tests {
             let mut observer = CadenceObserver::new(
                 &presentation(vec![track]),
                 &calibrated([(0, audio_timebase(), first_pts)]),
-                policy(BoundarySearchPolicy::AtOrBeforeDesired),
+                policy(Duration::from_secs(4)),
             )
             .expect("test observer is valid");
             for frame in 0..=240_u64 {
@@ -799,10 +771,7 @@ mod tests {
             assert_eq!((plan.segmentation_origin_pts - first_pts) % 1_024, 0);
             assert_eq!(plan.segment_duration.get() % AUDIO_FRAME, 0);
             assert_eq!((plan.first_segment_boundary_pts - first_pts) % 1_024, 0);
-            assert_eq!(
-                plan.part_duration.get(),
-                u64::from(plan.part_access_units.expect("constant cadence").get()) * AUDIO_FRAME
-            );
+
             assert_eq!(plan.boundary_tolerance, AUDIO_FRAME);
         }
     }
@@ -811,7 +780,7 @@ mod tests {
     fn a_sparse_subtitle_track_never_gates_video() {
         let mut observer = observer(
             &[(0, MediaKind::Video), (1, MediaKind::Subtitle)],
-            BoundarySearchPolicy::AtOrBeforeDesired,
+            Duration::from_secs(4),
         );
         observe_video(&mut observer, 0, 0, true);
         observe_video(&mut observer, 0, 4 * VIDEO_SECOND, true);
@@ -832,7 +801,7 @@ mod tests {
             CadenceObserver::new(
                 &presentation,
                 &calibrated([(7, Timebase::hz90k(), 0)]),
-                policy(BoundarySearchPolicy::AtOrBeforeDesired),
+                policy(Duration::from_secs(4)),
             )
             .err(),
             Some(CadenceError::UnknownTrack(TrackId(7)))
@@ -841,7 +810,7 @@ mod tests {
             CadenceObserver::new(
                 &presentation,
                 &calibrated([(0, Timebase::hz90k(), 0), (0, Timebase::hz90k(), 0),]),
-                policy(BoundarySearchPolicy::AtOrBeforeDesired),
+                policy(Duration::from_secs(4)),
             )
             .err(),
             Some(CadenceError::DuplicateTrack(TrackId(0)))

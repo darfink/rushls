@@ -233,10 +233,15 @@ pub struct RenditionState {
 }
 
 impl RenditionState {
-    pub fn new(rendition_id: RenditionId, descriptor: PackagedRendition) -> Self {
+    /// `contract` is supplied rather than derived: its target duration is a
+    /// presentation-wide value that one descriptor cannot know.
+    pub fn new(
+        rendition_id: RenditionId,
+        descriptor: PackagedRendition,
+        contract: PlaylistContract,
+    ) -> Self {
         let live_edge = super::RenditionLiveEdge::default();
         let (edge_updates, _) = watch::channel(live_edge);
-        let contract = PlaylistContract::derive(&descriptor.config);
         let published = Arc::new(RenditionView::new(RenditionSnapshot {
             rendition_id,
             config: Some(descriptor.config),
@@ -500,7 +505,9 @@ impl RenditionState {
                 // the arrival of a successor is the first moment the
                 // predecessor can be judged — and the last moment before it
                 // becomes unfixable.
-                if let Some(previous) = open.parts.last() {
+                if let Some(previous) = open.parts.last()
+                    && !previous.independent
+                {
                     self.require_permitted_non_final_part(
                         config.timebase.ticks_to_duration(previous.duration),
                     )?;

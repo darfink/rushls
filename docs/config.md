@@ -342,9 +342,45 @@ knowledge the auth service has and the origin does not.
 
 ## HLS
 
-`segment` and `part` are output cadence. `retain` is **how long media stays
-fetchable** — while live, and after the publisher drops. It is also **what the
-live playlist advertises**: the two are one setting, not two.
+The `segment` and `part` objects describe preferred targets and admission limits:
+
+```toml
+[hls]
+segment = { target = "6s", max = "2x", jitter = "0s" }
+part    = { target = "1s", max = "2x" }
+```
+
+These are the defaults. Omitted objects and fields use their defaults.
+Equivalent `[hls.segment]` and `[hls.part]` tables are also supported.
+`target` accepts an absolute duration. `max` accepts an absolute duration or
+an exact multiplier of the configured target, including fractional values such as `"1.5x"`.
+Equal target and maximum values forbid growth during admission.
+
+Admission selects the latest feasible common video boundary at or before the
+segment target. If none fits, admission searches beyond the target up to the maximum.
+It checks audio rounding and part feasibility before it selects a boundary.
+Audio-only input uses encoded audio boundaries. Pre-roll capacity limits the
+search resources, independently of these duration limits.
+
+`segment.jitter` permits equal early and late movement around the admitted
+runtime schedule. It accepts a duration or a multiplier of `segment.target`.
+The default is zero. A 100 ms jitter allowance can increase a segment by
+200 ms because both endpoints can move. The complete segment ceiling,
+including audio rounding and timestamp quantization, must fit `segment.max`.
+
+Admission freezes each selected part target. Ordinary dependent parts span
+85–100% of that target; independent and final parts can be shorter.
+The part writer uses bounded lookahead to repair unpublished cuts.
+It never changes published parts or enlarges targets during runtime.
+A later input change that cannot fit the contract terminates the publication.
+
+This configuration replaces scalar `segment` and `part` values and removes
+`admission`, `maximum_segment`, `maximum_part`, `early_boundary`, and `late_boundary`.
+Old TOML forms and CLI flags are rejected. New environment variables use names
+such as `RUSHLS_HLS_SEGMENT_TARGET`; CLI flags use `--hls-segment-target`.
+
+`retain` controls how long media stays fetchable, during publication and after
+the publisher disconnects. It also controls the history that the live playlist advertises.
 
 There is deliberately no separate `playlist` window. Media a playlist does not
 name is media no player can ask for, so retaining beyond the advertised window
@@ -367,10 +403,8 @@ from one response*, not what the playlist advertises: a client without a prior
 copy still receives the full window. So the boundary is a property of the
 delta mechanism, derived from `segment`, and never an operator setting.
 
-`retain` has a floor of **three segments**, which live playlists require. A
-shorter value is raised to it with a warning rather than refused: the intent is
-unambiguous and refusing to boot over an arithmetic relationship an operator
-did not know about is the nagging this design avoids.
+`retain` must cover three maximum target durations. A shorter fixed duration
+is a configuration error. Relative values resolve against the admitted playlist target.
 
 `retain` is **time only**, never bytes. It is a promise to viewers about how
 far back a playlist can point, and viewers seek along time. The storage tiers
@@ -388,7 +422,7 @@ capacity planning is the one that multiplies by `streams`.
 `hold_back` is how far behind the live edge a player is told to start, and it
 is therefore **the floor on live-edge latency**. It takes either a multiple of
 `part` (`"3x"`, the default) or an absolute duration (`"3s"`), the same two
-forms `playlist` accepts.
+forms `retain` accepts.
 
 It is exposed while the other delivery timing values stay compiled because it
 is the only one that is a genuine tradeoff rather than a correctness
@@ -399,7 +433,7 @@ the origin cannot know. The segment-level `HOLD-BACK` stays derived at three
 target durations, where the specification leaves no such latitude.
 
 The multiple form is the default because the quantity it bounds is the part
-cadence itself: an absolute value chosen against `part = "1s"` silently
+cadence itself: an absolute value chosen against `part = { target = "1s" }` silently
 becomes aggressive when parts are retuned, which is the same reasoning the
 stall rules use.
 
@@ -968,7 +1002,7 @@ needs no ceremony, because a bare scalar is already valid TOML on the
 right-hand side:
 
 ```
-RUSHLS_HLS_SEGMENT=6s
+RUSHLS_HLS_SEGMENT_TARGET=6s
 RUSHLS_ACCEPT_VIDEO_FRAME_RATE='{ min = 24, max = 60 }'
 ```
 

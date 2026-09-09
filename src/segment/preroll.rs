@@ -9,7 +9,7 @@ use crate::{
 
 use super::{
     CadenceError, CadenceObserver, PrerollError, PrerollLimits, SegmentationPlan,
-    SegmentationPolicy, TrackSegmentationPlan,
+    SegmentationPolicy,
 };
 
 /// Enough for a second or two of multi-track media, so the common case reaches
@@ -60,10 +60,21 @@ pub async fn run(
     let mut buffered = Vec::with_capacity(INITIAL_BUFFER_SAMPLES);
     let mut buffered_bytes = 0_usize;
     let deadline = Instant::now() + limits.maximum_wall_time;
+    let mut work = 0_usize;
 
     loop {
-        if let Some(tracks) = observer.plan()? {
-            return lock(presentation, tracks, buffered, InputState::Open, events);
+        if let Some(segmentation) = select(
+            &observer,
+            presentation,
+            &buffered,
+            policy,
+            limits,
+            &mut work,
+        )? {
+            return Ok(lock(segmentation, buffered, InputState::Open, events));
+        }
+        if observer.exhausted() {
+            return Err(CadenceError::NoSegmentationBoundary.into());
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -96,10 +107,16 @@ pub async fn run(
         if !state.is_open() {
             // The input is gone, so no further evidence can arrive. Whatever
             // the observer can conclude now is final.
-            let tracks = observer
-                .plan()?
-                .ok_or(CadenceError::NoSegmentationBoundary)?;
-            return lock(presentation, tracks, buffered, state, events);
+            let segmentation = select(
+                &observer,
+                presentation,
+                &buffered,
+                policy,
+                limits,
+                &mut work,
+            )?
+            .ok_or(CadenceError::NoSegmentationBoundary)?;
+            return Ok(lock(segmentation, buffered, state, events));
         }
     }
 }
@@ -178,29 +195,71 @@ fn admit(
     Ok(())
 }
 
-fn lock(
+/// An infeasible candidate is not a malformed publisher: try the next boundary.
+fn select(
+    observer: &CadenceObserver,
     presentation: &PresentationPlan,
-    tracks: Vec<TrackSegmentationPlan>,
+    buffered: &[NormalizedSample],
+    policy: SegmentationPolicy,
+    limits: PrerollLimits,
+    work: &mut usize,
+) -> Result<Option<SegmentationPlan>, PrerollError> {
+    let mut selected = None;
+    let result = observer.visit_candidates(work, |tracks, work| {
+        let mut segmentation = SegmentationPlan::new(presentation, tracks)?;
+        segmentation.early_boundary = policy.early_boundary;
+        segmentation.late_boundary = policy.late_boundary;
+        segmentation.limits = limits;
+        match super::replay::admit(presentation, &mut segmentation, buffered, policy, work) {
+            Ok(()) => {
+                selected = Some(segmentation);
+                return Ok(true);
+            }
+            Err(
+                PrerollError::Cadence(
+                    CadenceError::NoSegmentationBoundary | CadenceError::InconsistentPartCadence(_),
+                )
+                | PrerollError::Packaging(
+                    crate::mux::MuxError::BoundaryWindow { .. }
+                    | crate::mux::MuxError::Boundary {
+                        reason: "segment ceiling exhausted",
+                        ..
+                    },
+                ),
+            ) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(false)
+    });
+    match result {
+        Err(PrerollError::Cadence(CadenceError::WorkLimitExceeded)) => {
+            Err(PrerollError::LimitExceeded)
+        }
+        Err(error) => Err(error),
+        Ok(()) => Ok(selected),
+    }
+}
+
+fn lock(
+    segmentation: SegmentationPlan,
     buffered: Vec<NormalizedSample>,
     input_state: InputState,
     events: &EventSink,
-) -> Result<Preroll, PrerollError> {
-    let segmentation = SegmentationPlan::new(presentation, tracks)?;
+) -> Preroll {
     events.emit(SessionEvent::SegmentationLocked {
         segment: segmentation.longest_segment_duration(),
         part: segmentation.shortest_part_duration(),
     });
-
-    Ok(Preroll {
+    Preroll {
         segmentation,
         input_state,
         buffered,
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
     use parking_lot::Mutex;
 
@@ -217,41 +276,7 @@ mod tests {
 
     use super::*;
 
-    /// Replays prepared batches, then reports the input as exhausted.
-    struct Replay {
-        batches: VecDeque<Vec<NormalizedSample>>,
-    }
-
-    impl Replay {
-        fn new(batches: Vec<Vec<NormalizedSample>>) -> Self {
-            Self {
-                batches: batches.into(),
-            }
-        }
-    }
-
-    impl SampleSource for Replay {
-        fn next_batch<'a>(
-            &'a mut self,
-            out: &'a mut dyn Appender<NormalizedSample>,
-        ) -> BoxFuture<'a, Result<InputState, MediaError>> {
-            Box::pin(async move {
-                match self.batches.pop_front() {
-                    Some(batch) => {
-                        for sample in batch {
-                            out.push(sample);
-                        }
-                        Ok(if self.batches.is_empty() {
-                            InputState::Closed
-                        } else {
-                            InputState::Open
-                        })
-                    }
-                    None => Ok(InputState::Closed),
-                }
-            })
-        }
-    }
+    use crate::segment::fixtures::SampleBatches;
 
     struct Stalled;
 
@@ -286,7 +311,7 @@ mod tests {
     }
 
     fn policy() -> SegmentationPolicy {
-        SegmentationPolicy::latency_first(Duration::from_secs(10), Duration::from_millis(200))
+        SegmentationPolicy::latency_first(Duration::from_secs(10), Duration::from_secs(1))
     }
 
     /// A byte budget expressed as room for `slots` single-byte samples.
@@ -336,9 +361,9 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let events = Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>)
             .scoped(SessionId(nz::u64!(1)));
-        let mut source = Replay::new(
+        let mut source = SampleBatches::new(
             (0..=10)
-                .map(|second| vec![sample(second, second == 8, 1)])
+                .map(|second| vec![sample(second, second == 0 || second == 8, 1)])
                 .collect(),
         );
 
@@ -353,7 +378,6 @@ mod tests {
             .expect("the plan covers the track");
         assert_eq!(track.segment_duration.get(), 8 * 90_000);
         assert_eq!(track.part_duration.get(), 90_000);
-        assert_eq!(track.part_access_units.expect("constant cadence").get(), 1);
 
         let observed = recorder.events.lock();
         assert_eq!(observed.len(), 1);
@@ -365,10 +389,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_whole_batch_of_samples_is_admitted_in_order() {
-        let mut source = Replay::new(vec![
-            (0..5).map(|second| sample(second, false, 1)).collect(),
+        let mut source = SampleBatches::new(vec![
+            (0..5)
+                .map(|second| sample(second, second == 0, 1))
+                .collect(),
             (5..=10)
-                .map(|second| sample(second, second == 8, 1))
+                .map(|second| sample(second, second == 0 || second == 8, 1))
                 .collect(),
         ]);
 
@@ -391,9 +417,9 @@ mod tests {
             crate::domain::Timebase::hz90k(),
             VIDEO_SECOND / 2,
         )]);
-        let mut source = Replay::new(vec![
+        let mut source = SampleBatches::new(vec![
             (1..24)
-                .map(|second| sample(second, second % 4 == 0, 1))
+                .map(|second| sample(second, (second - 1) % 4 == 0, 1))
                 .collect(),
         ]);
 
@@ -432,7 +458,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_when_buffered_bytes_exceed_the_limit() {
-        let mut source = Replay::new(vec![vec![sample(8, true, 3)]]);
+        let mut source = SampleBatches::new(vec![vec![sample(8, true, 3)]]);
 
         let error = preroll(&mut source, limits(1, Duration::from_secs(20)), &sink())
             .await
@@ -445,7 +471,7 @@ mod tests {
     async fn empty_access_units_are_charged_for_the_room_they_occupy() {
         // Zero-length payloads that never advance the clock: under a budget
         // charged on payload size alone, this buffers until the node dies.
-        let mut source = Replay::new(vec![
+        let mut source = SampleBatches::new(vec![
             (0..64)
                 .map(|_| crate::media::fixtures::video_sample(0, 0, false, 0))
                 .collect(),
@@ -460,9 +486,9 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_when_the_retained_sample_count_exceeds_the_limit() {
-        let mut source = Replay::new(vec![
+        let mut source = SampleBatches::new(vec![
             (0..10)
-                .map(|second| sample(second, second == 8, 1))
+                .map(|second| sample(second, second == 0 || second == 8, 1))
                 .collect(),
         ]);
         let mut limits = limits(1_000, Duration::from_secs(20));
@@ -477,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_when_media_duration_exceeds_the_limit() {
-        let mut source = Replay::new(vec![vec![sample(8, true, 1)]]);
+        let mut source = SampleBatches::new(vec![vec![sample(8, true, 1)]]);
 
         let error = preroll(&mut source, limits(10, Duration::from_secs(5)), &sink())
             .await
@@ -506,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_after_the_horizon_without_a_random_access_boundary() {
-        let mut source = Replay::new(vec![
+        let mut source = SampleBatches::new(vec![
             (0..=10).map(|second| sample(second, false, 1)).collect(),
         ]);
 
@@ -522,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_when_the_input_ends_before_a_boundary_is_provable() {
-        let mut source = Replay::new(vec![vec![sample(0, false, 1)]]);
+        let mut source = SampleBatches::new(vec![vec![sample(0, true, 1)]]);
 
         let error = preroll(&mut source, limits(10, Duration::from_secs(20)), &sink())
             .await
@@ -532,5 +558,381 @@ mod tests {
             error,
             PrerollError::Cadence(CadenceError::NoSegmentationBoundary)
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use crate::media::fixtures::{video_presentation, video_sample, video_timeline};
+    use crate::segment::fixtures::SampleBatches;
+    use std::time::Duration;
+    #[tokio::test]
+    async fn bounded_admission_selects_three_seconds_without_runtime_slack()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let presentation = video_presentation();
+        let timeline = video_timeline();
+        let events =
+            crate::observe::Events::default().scoped(crate::domain::SessionId(nz::u64!(1)));
+        for hard in [false, true] {
+            let mut source = SampleBatches::new(vec![
+                (0..=3)
+                    .map(|second| {
+                        video_sample(second * 90_000, 90_000, second == 0 || second == 3, 1)
+                    })
+                    .collect(),
+            ]);
+            let mut policy =
+                SegmentationPolicy::latency_first(Duration::from_secs(2), Duration::from_secs(1));
+            if hard {
+                policy.maximum_segment_duration = policy.desired_segment_duration;
+                policy.maximum_part_duration = Duration::from_secs(1);
+            }
+            let result = run(
+                &mut source,
+                PrerollRequest {
+                    presentation: &presentation,
+                    timeline: &timeline,
+                    limits: PrerollLimits::permissive(),
+                    policy,
+                },
+                &events,
+            )
+            .await;
+            if hard {
+                assert!(result.is_err());
+            } else {
+                let admitted = result?;
+                assert_eq!(
+                    admitted.segmentation.longest_segment_duration(),
+                    Duration::from_secs(3)
+                );
+                assert_eq!(admitted.segmentation.late_boundary, Duration::ZERO);
+            }
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn hard_admission_accepts_exact_cfr_without_frame_slack()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let presentation = video_presentation();
+        let timeline = video_timeline();
+        let events =
+            crate::observe::Events::default().scoped(crate::domain::SessionId(nz::u64!(1)));
+        let mut source = SampleBatches::new(vec![
+            (0..=60)
+                .map(|frame| video_sample(frame * 3_000, 3_000, frame % 60 == 0, 1))
+                .collect(),
+        ]);
+        let mut policy =
+            SegmentationPolicy::latency_first(Duration::from_secs(2), Duration::from_secs(1));
+        policy.maximum_segment_duration = policy.desired_segment_duration;
+        policy.maximum_part_duration = Duration::from_secs(1);
+        let admitted = run(
+            &mut source,
+            PrerollRequest {
+                presentation: &presentation,
+                timeline: &timeline,
+                limits: PrerollLimits::permissive(),
+                policy,
+            },
+            &events,
+        )
+        .await?;
+        let track = admitted.segmentation.iter().next().expect("video plan");
+        assert_eq!(track.maximum_segment_ticks(Duration::ZERO), 180_000);
+        assert_eq!(track.boundary_tolerance, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn timing_replay_selects_a_larger_part_only_when_needed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let presentation = video_presentation();
+        let timeline = video_timeline();
+        let events =
+            crate::observe::Events::default().scoped(crate::domain::SessionId(nz::u64!(1)));
+        let mut source = SampleBatches::new(vec![
+            (0..=4)
+                .map(|frame| video_sample(frame * 5_400, 5_400, frame % 4 == 0, 1))
+                .collect(),
+        ]);
+        let policy = SegmentationPolicy::latency_first(
+            Duration::from_millis(240),
+            Duration::from_millis(100),
+        );
+        let admitted = run(
+            &mut source,
+            PrerollRequest {
+                presentation: &presentation,
+                timeline: &timeline,
+                limits: PrerollLimits::permissive(),
+                policy,
+            },
+            &events,
+        )
+        .await?;
+        assert_eq!(
+            admitted.segmentation.shortest_part_duration(),
+            Duration::from_millis(120)
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn exact_audio_cap_selects_an_earlier_feasible_access_unit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            domain::{MediaKind, Timebase, fixtures::TrackBuilder},
+            media::fixtures,
+        };
+        let tb = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+        let presentation = fixtures::presentation(vec![
+            TrackBuilder::new(0, MediaKind::Audio).timebase(tb).build(),
+        ]);
+        let timeline = fixtures::timeline([(0, tb)]);
+        let mut policy =
+            SegmentationPolicy::latency_first(Duration::from_secs(6), Duration::from_secs(1));
+        policy.maximum_segment_duration = Duration::from_secs(6);
+        policy.maximum_part_duration = Duration::from_secs(1);
+        let mut source = SampleBatches::new(vec![
+            (0..283)
+                .map(|i| fixtures::audio_sample(0, i * 1024, 1024))
+                .collect(),
+        ]);
+        let admitted = run(
+            &mut source,
+            PrerollRequest {
+                presentation: &presentation,
+                timeline: &timeline,
+                limits: PrerollLimits::permissive(),
+                policy,
+            },
+            &crate::mux::fixtures::discarded_events(),
+        )
+        .await?;
+        let track = admitted.segmentation.iter().next().expect("audio plan");
+        assert_eq!(track.segment_duration.get(), 286_720);
+        assert!(track.maximum_segment_ticks(Duration::ZERO) <= 288_000);
+        let mut observer = CadenceObserver::new(&presentation, &timeline, policy)?;
+        for sample in &admitted.buffered {
+            observer.observe(sample)?;
+        }
+        assert!(matches!(
+            select(
+                &observer,
+                &presentation,
+                &admitted.buffered,
+                policy,
+                PrerollLimits::permissive(),
+                &mut 999_999
+            ),
+            Err(PrerollError::LimitExceeded)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audio_rounding_falls_back_to_an_earlier_common_video_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            domain::{AudioTrim, MediaKind, MediaParameters, Timebase, fixtures::TrackBuilder},
+            media::fixtures,
+        };
+        for (padding, delay, jitter) in [(0_u32, 0_i64, 0_u64), (312, 0, 0), (0, 4800, 100)] {
+            let audio_base = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+            let second_video_base = Timebase::new(nz::u32!(1), nz::u32!(30_000));
+            let mut audio = TrackBuilder::new(1, MediaKind::Audio)
+                .timebase(audio_base)
+                .first_pts(Some(delay))
+                .build();
+            if let MediaParameters::Audio { timing, .. } = &mut audio.parameters {
+                timing.initial_padding_samples = padding;
+            }
+            let presentation = fixtures::presentation(vec![
+                TrackBuilder::new(0, MediaKind::Video).build(),
+                audio,
+                TrackBuilder::new(2, MediaKind::Video)
+                    .timebase(second_video_base)
+                    .build(),
+            ]);
+            let timeline = fixtures::timeline([
+                (0, Timebase::hz90k()),
+                (1, audio_base),
+                (2, second_video_base),
+            ]);
+            let mut samples = Vec::new();
+            for frame in 0..=181 {
+                samples.push(video_sample(frame * 3000, 3000, frame % 60 == 0, 0));
+                let mut second = video_sample(frame * 1000, 1000, frame % 60 == 0, 0);
+                if let NormalizedSample::Video(video) = &mut second {
+                    video.track_id = crate::domain::TrackId(2);
+                }
+                samples.push(second);
+            }
+            for frame in 0..284 {
+                let mut sample =
+                    fixtures::audio_sample(1, delay - i64::from(padding) + frame * 1024, 1024);
+                if frame == 0
+                    && let NormalizedSample::Audio(audio) = &mut sample
+                {
+                    audio.trim = AudioTrim {
+                        leading_samples: padding,
+                        trailing_samples: 0,
+                    };
+                }
+                samples.push(sample);
+            }
+            samples.sort_by_key(|sample| {
+                sample.pts()
+                    * match sample.track_id().0 {
+                        0 => 8,
+                        1 => 15,
+                        _ => 24,
+                    }
+            });
+            let mut policy =
+                SegmentationPolicy::latency_first(Duration::from_secs(6), Duration::from_secs(1));
+            policy.maximum_segment_duration = Duration::from_secs(6);
+            policy.maximum_part_duration = Duration::from_secs(1);
+            policy.early_boundary = Duration::from_millis(jitter);
+            policy.late_boundary = policy.early_boundary;
+            let (video_samples, audio_samples): (Vec<_>, Vec<_>) = samples
+                .into_iter()
+                .partition(|sample| sample.track_id().0 != 1);
+            let admitted = run(
+                &mut SampleBatches::new(vec![video_samples, audio_samples]),
+                PrerollRequest {
+                    presentation: &presentation,
+                    timeline: &timeline,
+                    limits: PrerollLimits::permissive(),
+                    policy,
+                },
+                &crate::mux::fixtures::discarded_events(),
+            )
+            .await?;
+            assert_eq!(
+                admitted
+                    .segmentation
+                    .get(crate::domain::TrackId(0))
+                    .expect("video")
+                    .segment_duration
+                    .get(),
+                360_000
+            );
+            for track in admitted.segmentation.iter() {
+                assert!(
+                    track.timebase.ticks_to_duration(
+                        track.maximum_segment_ticks(policy.early_boundary + policy.late_boundary)
+                    ) <= policy.segment_cap()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repaired_vfr_parts_pass_admission_cmaf_and_hls_storage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            delivery::hls::{PublisherFactory, StorePublisherFactory, StreamStore},
+            domain::{MediaKind, Payload, StreamId, fixtures::TrackBuilder},
+            media::fixtures,
+            mux::{
+                MuxerFactory, MuxerStartRequest, PackagedMedia, PassThroughMuxerFactory,
+                fixtures::{H264_EXTRADATA, H264_IDR, H264_P},
+            },
+        };
+        let presentation = fixtures::presentation(vec![
+            TrackBuilder::new(0, MediaKind::Video)
+                .codec_extradata(H264_EXTRADATA)
+                .build(),
+        ]);
+        let timeline = video_timeline();
+        let samples = [
+            (0, 20, true),
+            (20, 55, false),
+            (75, 45, false),
+            (120, 60, false),
+            (180, 20, true),
+        ]
+        .into_iter()
+        .map(|(pts, duration, rap)| {
+            let mut sample = video_sample(pts * 90, duration * 90, rap, 0);
+            if let NormalizedSample::Video(video) = &mut sample {
+                video.payload = Payload::from(if rap { H264_IDR } else { H264_P });
+            }
+            sample
+        })
+        .collect();
+        let mut policy = SegmentationPolicy::latency_first(
+            Duration::from_millis(180),
+            Duration::from_millis(100),
+        );
+        policy.maximum_segment_duration = Duration::from_millis(180);
+        policy.maximum_part_duration = Duration::from_millis(100);
+        let events = crate::mux::fixtures::discarded_events();
+        let admitted = run(
+            &mut SampleBatches::new(vec![samples]),
+            PrerollRequest {
+                presentation: &presentation,
+                timeline: &timeline,
+                limits: PrerollLimits::permissive(),
+                policy,
+            },
+            &events,
+        )
+        .await?;
+        assert_eq!(
+            admitted.segmentation.shortest_part_duration(),
+            Duration::from_millis(100)
+        );
+        let mut corrupt = admitted.buffered.clone();
+        if let NormalizedSample::Video(video) = &mut corrupt[0] {
+            video.codec = crate::domain::Codec::Hevc;
+        }
+        let error = run(
+            &mut SampleBatches::new(vec![corrupt]),
+            PrerollRequest {
+                presentation: &presentation,
+                timeline: &timeline,
+                limits: PrerollLimits::permissive(),
+                policy,
+            },
+            &events,
+        )
+        .await
+        .expect_err("malformed media is not a candidate rejection");
+        assert!(matches!(
+            error,
+            PrerollError::Packaging(crate::mux::MuxError::Mux(_))
+        ));
+
+        let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
+            presentation: &presentation,
+            segmentation: &admitted.segmentation,
+            time_anchor: std::time::SystemTime::UNIX_EPOCH,
+            events: &events,
+        })?;
+        let store = StreamStore::default();
+        let stream = StreamId::new("repair");
+        let mut publisher =
+            StorePublisherFactory::new(store.clone()).start(&stream, started.presentation)?;
+        let mut output = Vec::new();
+        for sample in admitted.buffered {
+            started.muxer.push(sample, &mut output)?;
+        }
+        let parts: Vec<_> = output
+            .iter()
+            .filter_map(|media| match media {
+                PackagedMedia::Chunk(chunk) => Some((chunk.duration, chunk.independent)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(parts, [(1800, true), (9000, false), (5400, false)]);
+        for media in output {
+            publisher.write(media)?;
+        }
+        assert!(store.get(&stream).is_some());
+        Ok(())
     }
 }

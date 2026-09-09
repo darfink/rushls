@@ -529,6 +529,7 @@ fn name(event: &SessionEvent) -> &'static str {
         SessionEvent::DrainFailed { .. } => "drain_failed",
         SessionEvent::Ended { .. } => "ended",
         SessionEvent::Failed { .. } => "failed",
+        SessionEvent::SegmentationContract { .. } => "contract",
     }
 }
 
@@ -538,7 +539,7 @@ fn packet(pts: i64, random_access: bool) -> Packet {
         pts: Some(pts),
         dts: Some(pts),
         duration: Some(SECOND),
-        random_access,
+        random_access: random_access || pts == 0,
         audio_trim: crate::domain::AudioTrim::default(),
         webvtt: crate::domain::WebVttCueMetadata::default(),
         subtitle_position: None,
@@ -575,7 +576,7 @@ fn config() -> SessionConfig {
         },
         segmentation: SegmentationPolicy::latency_first(
             Duration::from_secs(2),
-            Duration::from_millis(200),
+            Duration::from_secs(1),
         ),
         // Long enough that liveness never fires unless a test asks it to.
         supervision: SupervisionPolicy {
@@ -717,6 +718,7 @@ async fn a_publication_runs_through_every_stage_and_releases_everything_it_held(
             "tracks_discovered",
             "timeline_calibrated",
             "segmentation_locked",
+            "contract",
             "running",
             "draining",
             "ended",
@@ -1195,6 +1197,7 @@ async fn a_muxer_that_cannot_finalize_is_reported_without_failing_the_session() 
             "tracks_discovered",
             "timeline_calibrated",
             "segmentation_locked",
+            "contract",
             "running",
             "draining",
             "drain_failed",

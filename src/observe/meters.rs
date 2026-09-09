@@ -67,6 +67,9 @@ counters! {
             "rushls_sessions_completed_total",
             "Publishing sessions completed successfully."
         ),
+        part_contract_failures: u64 = Counter("rushls_part_contract_failures_total", "Publications rejected by the part contract."),
+        boundary_contract_failures: u64 = Counter("rushls_boundary_contract_failures_total", "Publications rejected by segment boundary constraints."),
+        coordinator_limit_failures: u64 = Counter("rushls_coordinator_limit_failures_total", "Publications exceeding coordinator resource limits."),
         sessions_failed: u64 = Counter(
             "rushls_sessions_failed_total",
             "Publishing sessions that failed."
@@ -132,6 +135,19 @@ impl ProcessMeters {
 
     pub fn session_completed(&self) {
         add(&self.counters.sessions_completed, 1);
+    }
+
+    pub fn segmentation_failed(&self, error: &crate::mux::MuxError) {
+        match error {
+            crate::mux::MuxError::Part { .. } => add(&self.counters.part_contract_failures, 1),
+            crate::mux::MuxError::Boundary { .. } | crate::mux::MuxError::BoundaryWindow { .. } => {
+                add(&self.counters.boundary_contract_failures, 1);
+            }
+            crate::mux::MuxError::CoordinatorLimit { .. } => {
+                add(&self.counters.coordinator_limit_failures, 1);
+            }
+            _ => {}
+        }
     }
 
     pub fn session_failed(&self) {

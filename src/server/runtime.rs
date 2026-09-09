@@ -21,7 +21,7 @@ use crate::{
     },
     hooks::Hooks,
     media::PassThroughNormalizerFactory,
-    mux::{CmafMuxerConfig, PassThroughMuxerFactory},
+    mux::PassThroughMuxerFactory,
     observe::{Events, NodeEvent, ProcessMeters, Protocol, StreamEvent},
     session::{PendingPublishers, Registry, Services, SessionConfig, StopReason, run_session},
     source::{
@@ -77,7 +77,6 @@ pub struct NodeConfig {
     pub srt: SrtConfig,
     pub moq: MoqConfig,
     pub session: SessionConfig,
-    pub cmaf: CmafMuxerConfig,
     pub store: StoreLimits,
     pub hls: HlsConfig,
     pub http: HttpConfig,
@@ -136,7 +135,6 @@ impl Default for NodeConfig {
             srt: SrtConfig::default(),
             moq: MoqConfig::default(),
             session: SessionConfig::default(),
-            cmaf: CmafMuxerConfig::default(),
             store: StoreLimits::default(),
             hls: HlsConfig::default(),
             http: HttpConfig::default(),
@@ -336,9 +334,14 @@ impl Node {
         let services = Services {
             authenticator,
             normalizers: Arc::new(PassThroughNormalizerFactory),
-            muxers: Arc::new(PassThroughMuxerFactory::new(config.cmaf)),
+            muxers: Arc::new(PassThroughMuxerFactory),
             publishers: Arc::new(
-                StorePublisherFactory::new(store.clone()).with_events(events.clone()),
+                StorePublisherFactory::new(store.clone())
+                    .with_events(events.clone())
+                    .with_timing(
+                        config.hls.timing.part_hold_back,
+                        config.store.retention.retain,
+                    ),
             ),
             sessions: sessions.clone(),
             meters: meters.clone(),

@@ -32,6 +32,15 @@ pub enum SessionEvent {
         segment: Duration,
         part: Duration,
     },
+    SegmentationContract {
+        desired_segment: Duration,
+        desired_part: Duration,
+        selected_segment: Duration,
+        selected_part: Duration,
+        maximum_segment: Duration,
+        maximum_part: Duration,
+        jitter: Duration,
+    },
     /// A non-strict muxer kept parts flowing while extending a segment to a
     /// usable random-access boundary.
     SegmentationExtended {
@@ -137,6 +146,7 @@ pub enum SessionEvent {
     },
     Failed {
         reason: String,
+        segmentation: Option<crate::mux::MuxError>,
     },
 }
 

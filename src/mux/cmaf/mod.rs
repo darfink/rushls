@@ -3,7 +3,7 @@
 mod output;
 mod roll;
 
-use std::{num::NonZero, sync::Arc, time::Duration};
+use std::{collections::VecDeque, num::NonZero, sync::Arc, time::Duration};
 
 use crate::{
     domain::{
@@ -11,7 +11,7 @@ use crate::{
         TrackId, duration_since,
     },
     media::{NormalizedSample, PresentedTiming, PresentedTimingCursor},
-    observe::{EventSink, SessionEvent},
+    observe::EventSink,
     segment::TrackSegmentationPlan,
 };
 
@@ -22,32 +22,11 @@ use super::{
 };
 use output::CmafOutput;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum SegmentBoundaryPolicy {
-    #[default]
-    Strict,
-    /// Waits past the planned boundary for a random-access sample, by at most
-    /// `maximum_extension`.
-    ///
-    /// The bound is mandatory rather than advisory. HLS advertises one target
-    /// duration for a playlist's whole life, and the parts of an over-long
-    /// segment are published before its completion is known, so an unbounded
-    /// wait would put media into playlists that the advertised target cannot
-    /// cover and that no later rejection can withdraw. Exhausting the budget
-    /// fails the publication instead.
-    ExtendToRandomAccess { maximum_extension: Duration },
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CmafMuxerConfig {
-    pub segment_boundary_policy: SegmentBoundaryPolicy,
-}
-
 pub(super) fn build_track(
     rendition_id: PackagingRenditionId,
     track: &DiscoveredTrack,
     plan: TrackSegmentationPlan,
-    config: CmafMuxerConfig,
+    boundary_allowance: Duration,
     events: EventSink,
 ) -> Result<(PackagedRendition, Box<dyn TrackPackager>), MuxError> {
     if track.kind() == MediaKind::Subtitle {
@@ -60,16 +39,34 @@ pub(super) fn build_track(
         )));
     }
     let output = CmafOutput::open(track).map_err(|error| invalid(error.to_string()))?;
-    let rendition = packaged_rendition(rendition_id, track, &plan, config.segment_boundary_policy)?;
+    let rendition = packaged_rendition(rendition_id, track, &plan, boundary_allowance)?;
     let packager = CmafTrack::new(
         rendition_id,
         track,
         plan,
-        output,
-        config.segment_boundary_policy,
+        Some(output),
+        boundary_allowance,
         events,
     )?;
     Ok((rendition, Box::new(packager)))
+}
+
+/// Runs exactly the live timing state machine without constructing container bytes.
+pub fn timing_track(
+    rendition_id: PackagingRenditionId,
+    track: &DiscoveredTrack,
+    plan: TrackSegmentationPlan,
+    allowance: Duration,
+    events: EventSink,
+) -> Result<Box<dyn TrackPackager>, MuxError> {
+    Ok(Box::new(CmafTrack::new(
+        rendition_id,
+        track,
+        plan,
+        None,
+        allowance,
+        events,
+    )?))
 }
 
 /// The chunk currently accumulating, if one is open.
@@ -98,13 +95,6 @@ struct SegmentCursor {
     start: TickTimestamp,
     /// Media accumulated by the chunks already emitted for this segment.
     filled: TickDuration,
-    next_boundary: TickTimestamp,
-    /// Presentable access units accumulated into the open chunk.
-    ///
-    /// Parts are counted rather than scheduled because HLS refuses a part
-    /// longer than the advertised `PART-TARGET`, and a target the plan derived
-    /// from an access-unit count is one a count can never exceed.
-    part_access_units: u32,
 }
 
 impl SegmentCursor {
@@ -113,17 +103,11 @@ impl SegmentCursor {
             .segmentation_origin_pts
             .checked_sub(plan.presentation_origin_pts)
             .ok_or_else(|| invalid("segmentation origin rebasing overflowed"))?;
-        let next_boundary = plan
-            .first_segment_boundary_pts
-            .checked_sub(plan.presentation_origin_pts)
-            .ok_or_else(|| invalid("first segment boundary rebasing overflowed"))?;
         Ok(Self {
             id: 0,
             chunk_index: 0,
             start,
             filled: 0,
-            next_boundary,
-            part_access_units: 0,
         })
     }
 
@@ -134,26 +118,24 @@ impl SegmentCursor {
             .ok_or_else(|| mux_error("segment timing overflowed"))
     }
 
-    /// Opens the next segment at the boundary the closed one actually reached.
-    ///
-    /// Planned boundaries remain on this track's absolute locked schedule.
-    ///
-    /// Re-anchoring on an achieved cut would accumulate an occasional late
-    /// audio unit or video keyframe into permanent drift. Keeping the planned
-    /// schedule makes the following segment absorb that bounded quantization.
-    fn advance(&mut self, plan: &TrackSegmentationPlan) -> Result<(), MuxError> {
+    /// The coordinator supplies the achieved cut; the writer owns no grid.
+    fn advance(&mut self, _plan: &TrackSegmentationPlan) -> Result<(), MuxError> {
         let boundary = self.filled_to()?;
-        let next_boundary = self
-            .next_boundary
-            .checked_add_unsigned(plan.segment_duration.get())
-            .ok_or_else(|| mux_error("next segment boundary overflowed"))?;
         self.id = self.id.saturating_add(1);
         self.chunk_index = 0;
         self.start = boundary;
         self.filled = 0;
-        self.next_boundary = next_boundary;
         Ok(())
     }
+}
+
+/// Timing is validated once on arrival; serialization waits for a committed cut.
+struct PendingSample {
+    sample: NormalizedSample,
+    pts: TickTimestamp,
+    dts: TickTimestamp,
+    presented_pts: TickTimestamp,
+    duration: TickDuration,
 }
 
 /// CMAF packaging state for one track.
@@ -163,9 +145,12 @@ struct CmafTrack {
     codec: Codec,
     kind: MediaKind,
     plan: TrackSegmentationPlan,
-    output: CmafOutput,
-    policy: SegmentBoundaryPolicy,
-    events: EventSink,
+    output: Option<CmafOutput>,
+    boundary_allowance: Duration,
+    partitioner: crate::segment::cutter::PartPartitioner,
+    pending: VecDeque<PendingSample>,
+    pending_bytes: usize,
+    partition_clock: crate::segment::cutter::PartClock,
     segment: SegmentCursor,
     fragment: Option<OpenFragment>,
     presented_timing: PresentedTimingCursor,
@@ -179,9 +164,9 @@ impl CmafTrack {
         rendition_id: PackagingRenditionId,
         track: &DiscoveredTrack,
         plan: TrackSegmentationPlan,
-        output: CmafOutput,
-        policy: SegmentBoundaryPolicy,
-        events: EventSink,
+        output: Option<CmafOutput>,
+        boundary_allowance: Duration,
+        _events: EventSink,
     ) -> Result<Self, MuxError> {
         Ok(Self {
             rendition_id,
@@ -190,8 +175,16 @@ impl CmafTrack {
             kind: track.kind(),
             plan,
             output,
-            policy,
-            events,
+            boundary_allowance,
+            partitioner: crate::segment::cutter::PartPartitioner::new(plan.part_duration.get()),
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            partition_clock: crate::segment::cutter::PartClock::new(
+                track.kind(),
+                plan.segmentation_origin_pts
+                    .checked_sub(plan.presentation_origin_pts)
+                    .ok_or_else(|| invalid("partition origin overflows"))?,
+            ),
             segment: SegmentCursor::new(&plan)?,
             fragment: None,
             presented_timing: PresentedTimingCursor::for_track(track),
@@ -206,6 +199,14 @@ impl CmafTrack {
         sample: &NormalizedSample,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
+        if self.last_dts.is_none() && self.kind == MediaKind::Video && !sample.random_access() {
+            return Err(MuxError::Boundary {
+                track: self.track_id,
+                reason: "publication must start at random access",
+                observed: 0,
+                maximum: 0,
+            });
+        }
         let (pts, dts, presented) = self.rebase_sample(sample)?;
         let presented_pts = presented
             .start
@@ -216,55 +217,69 @@ impl CmafTrack {
                     self.track_id
                 ))
             })?;
-        if presented.duration == 0 {
-            // A fully trimmed access unit still carries codec priming into
-            // the fragment, but it must not advance delivery-visible chunk timing.
-            self.output.write(sample, pts, dts);
-            return Ok(());
-        }
-
-        let closes_segment = self.segment_boundary(sample, presented_pts)?;
-        if closes_segment {
-            self.close_fragment_at(presented_pts);
-            self.flush_fragment(out)?;
-            if self.segment.filled == 0 {
-                return Err(mux_error(format!(
-                    "{} reached an empty segment boundary",
-                    self.track_id
-                )));
-            }
-            out.push(PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
-                rendition_id: self.rendition_id,
-                packaging_segment_id: PackagingSegmentId(self.segment.id),
-                media_start: self.segment.start,
-                duration: self.segment.filled,
-            }));
-            self.segment.advance(&self.plan)?;
-        } else if self.fragment.is_some_and(|fragment| {
-            self.plan.part_access_units.map_or_else(
-                || {
-                    let duration = i128::from(fragment.end) - i128::from(fragment.start);
-                    duration * 100 >= i128::from(self.plan.part_duration.get()) * 85
-                },
-                |count| self.segment.part_access_units >= count.get(),
-            )
-        }) {
-            // Audio is in presentation order, so the next PTS is a truthful
-            // cut point. Video is in decode order: a reference picture may
-            // have a later PTS than B-pictures that follow it, so extending a
-            // part to the next packet's PTS can exceed the target despite the
-            // part containing exactly the planned number of access units.
-            if self.kind != MediaKind::Video {
-                self.close_fragment_at(presented_pts);
-            }
+        let partition_duration = self
+            .partition_clock
+            .advance(presented_pts, presented.duration)
+            .ok_or_else(|| mux_error("partition span overflows"))?;
+        let cuts = self
+            .partitioner
+            .push(partition_duration, sample.random_access())
+            .map_err(|error| MuxError::Part {
+                track: self.track_id,
+                error,
+            })?;
+        // A push never seals the final suffix, so these cuts consume only
+        // samples already retained before the incoming unit.
+        for count in cuts {
+            self.write_pending(count)?;
             self.flush_fragment(out)?;
         }
+        self.pending_bytes = self.pending_bytes.saturating_add(sample.retained_bytes());
+        self.pending.push_back(PendingSample {
+            sample: sample.clone(),
+            pts,
+            dts,
+            presented_pts,
+            duration: presented.duration,
+        });
+        Ok(())
+    }
 
-        self.open_or_extend_fragment(sample, presented_pts, presented.duration)?;
-        // Counted after the sample joins the chunk, so the count always
-        // describes what the open chunk holds.
-        self.segment.part_access_units = self.segment.part_access_units.saturating_add(1);
-        self.output.write(sample, pts, dts);
+    fn write_pending(&mut self, count: usize) -> Result<(), MuxError> {
+        for _ in 0..count {
+            let pending = self
+                .pending
+                .pop_front()
+                .expect("partition counts match the sample queue");
+            self.pending_bytes -= pending.sample.retained_bytes();
+            if pending.duration > 0 {
+                self.open_or_extend_fragment(
+                    &pending.sample,
+                    pending.presented_pts,
+                    pending.duration,
+                )?;
+            }
+            // Fully primed units still initialize the decoder, but contribute
+            // no presentation duration to the part.
+            if let Some(output) = &mut self.output {
+                output.write(&pending.sample, pending.pts, pending.dts);
+            }
+        }
+        Ok(())
+    }
+
+    /// Seal regular prefixes, leaving the true tail open for boundary accounting.
+    fn prepare_tail(&mut self, out: &mut dyn Appender<PackagedMedia>) -> Result<(), MuxError> {
+        let counts = self.partitioner.finish().map_err(|error| MuxError::Part {
+            track: self.track_id,
+            error,
+        })?;
+        for (index, count) in counts.iter().enumerate() {
+            self.write_pending(*count)?;
+            if index + 1 < counts.len() {
+                self.flush_fragment(out)?;
+            }
+        }
         Ok(())
     }
 
@@ -341,98 +356,24 @@ impl CmafTrack {
         Ok(())
     }
 
-    /// Closes the delivery interval at the access unit that triggers a cut.
-    ///
-    /// Packet timestamps remain untouched in the fragment. This only defines
-    /// the delivery-visible interval so consecutive chunks meet at the cut even
-    /// when sparse or imperfect input timing leaves no access unit covering its
-    /// final ticks. PTS reordering is harmless because the end only advances.
-    fn close_fragment_at(&mut self, presented_pts: TickTimestamp) {
+    /// The final open part may absorb timestamp quantization, but already
+    /// published parts and encoded sample durations must never be rewritten.
+    fn close_fragment_at(&mut self, presented_pts: TickTimestamp) -> Result<(), MuxError> {
         if let Some(fragment) = &mut self.fragment {
-            fragment.end = fragment.end.max(presented_pts);
-        }
-    }
-
-    fn segment_boundary(
-        &mut self,
-        sample: &NormalizedSample,
-        pts: TickTimestamp,
-    ) -> Result<bool, MuxError> {
-        if pts < self.segment.next_boundary {
-            return Ok(false);
-        }
-        let exact = pts == self.segment.next_boundary;
-        let random_access = sample.random_access();
-        let maximum_extension = match self.policy {
-            SegmentBoundaryPolicy::Strict => None,
-            SegmentBoundaryPolicy::ExtendToRandomAccess { maximum_extension } => {
-                // Checked before either cutting or extending: a cut beyond the
-                // budget is as unpublishable as a wait beyond it, because both
-                // produce a segment longer than the advertised target.
-                self.require_within_extension(pts, maximum_extension)?;
-                Some(maximum_extension)
-            }
-        };
-        if self.kind != MediaKind::Video {
-            // Variable-duration audio may not repeat its observed grid exactly.
-            // Cut at the first AU on or after the planned instant; the plan's
-            // boundary tolerance bounds the resulting quantization.
-            return Ok(true);
-        }
-        match (maximum_extension, random_access) {
-            (None, true) if exact => Ok(true),
-            (None, _) => Err(mux_error(format!(
-                "{} did not provide a random-access sample at its planned segment boundary",
-                self.track_id
-            ))),
-            (Some(_), true) => {
-                if pts > self.segment.next_boundary {
-                    let actual_ticks = pts
-                        .checked_sub(self.segment.start)
-                        .and_then(|duration| u64::try_from(duration).ok())
-                        .ok_or_else(|| mux_error("extended segment duration overflowed"))?;
-                    self.events.emit(SessionEvent::SegmentationExtended {
+            if self.kind == MediaKind::Video && fragment.end > presented_pts {
+                let overshoot = duration_since(fragment.end, presented_pts).unwrap_or(u64::MAX);
+                if overshoot > self.plan.boundary_tolerance || presented_pts <= fragment.start {
+                    return Err(MuxError::Boundary {
                         track: self.track_id,
-                        planned: self
-                            .plan
-                            .timebase
-                            .ticks_to_duration(self.plan.segment_duration.get()),
-                        actual: self.plan.timebase.ticks_to_duration(actual_ticks),
+                        reason: "encoded video duration exceeds selected presentation cut",
+                        observed: overshoot,
+                        maximum: self.plan.boundary_tolerance,
                     });
                 }
-                Ok(true)
+                fragment.end = presented_pts;
+            } else {
+                fragment.end = fragment.end.max(presented_pts);
             }
-            (Some(_), false) => Ok(false),
-        }
-    }
-
-    /// Rejects a boundary the advertised target duration could not cover.
-    ///
-    /// The limit is the planned boundary plus the configured extension, which
-    /// is exactly the `maximum_segment_duration` this rendition advertises.
-    /// Failing here is deliberate: by the time an over-long segment completes,
-    /// its parts are already fetchable, so there is no later point at which
-    /// the overrun can be contained.
-    fn require_within_extension(
-        &self,
-        pts: TickTimestamp,
-        maximum_extension: Duration,
-    ) -> Result<(), MuxError> {
-        let extension_ticks = self
-            .plan
-            .timebase
-            .duration_to_ticks_floor(maximum_extension);
-        let limit = self
-            .segment
-            .next_boundary
-            .checked_add_unsigned(extension_ticks)
-            .ok_or_else(|| mux_error("segment extension limit overflowed"))?;
-        if pts > limit {
-            return Err(mux_error(format!(
-                "{} found no random-access sample within its {maximum_extension:?} \
-                 maximum segment extension",
-                self.track_id
-            )));
         }
         Ok(())
     }
@@ -445,43 +386,60 @@ impl CmafTrack {
             .filter(|duration| *duration > 0)
             .ok_or_else(|| mux_error(format!("{} produced a zero-length chunk", self.track_id)))?;
 
-        let mut payload = self
-            .output
-            .flush_fragment()
-            .map_err(|error| mux_error(error.to_string()))?;
-        if !self.initialized {
-            if payload.is_empty() {
-                return Err(mux_error("CMAF initialization segment was empty"));
-            }
-            out.push(PackagedMedia::Initialization(InitializationSegment {
-                rendition_id: self.rendition_id,
-                version: 0,
-                payload,
-            }));
-            self.initialized = true;
-            payload = self
-                .output
+        if duration > self.plan.part_duration.get() {
+            return Err(MuxError::Part {
+                track: self.track_id,
+                error: crate::segment::cutter::CutError::PartTooLong {
+                    duration,
+                    maximum: self.plan.part_duration.get(),
+                },
+            });
+        }
+        let maximum = self.plan.maximum_segment_ticks(self.boundary_allowance);
+        if self.segment.filled.saturating_add(duration) > maximum {
+            return Err(MuxError::Boundary {
+                track: self.track_id,
+                reason: "segment ceiling exhausted",
+                observed: self.segment.filled.saturating_add(duration),
+                maximum,
+            });
+        }
+        if let Some(output) = &mut self.output {
+            let mut payload = output
                 .flush_fragment()
                 .map_err(|error| mux_error(error.to_string()))?;
+            if !self.initialized {
+                if payload.is_empty() {
+                    return Err(mux_error("CMAF initialization segment was empty"));
+                }
+                out.push(PackagedMedia::Initialization(InitializationSegment {
+                    rendition_id: self.rendition_id,
+                    version: 0,
+                    payload,
+                }));
+                self.initialized = true;
+                payload = output
+                    .flush_fragment()
+                    .map_err(|error| mux_error(error.to_string()))?;
+            }
+            if payload.is_empty() {
+                return Err(mux_error("CMAF mux produced an empty chunk"));
+            }
+            out.push(PackagedMedia::Chunk(PackagedChunk {
+                rendition_id: self.rendition_id,
+                packaging_segment_id: PackagingSegmentId(self.segment.id),
+                chunk_index: self.segment.chunk_index,
+                media_start: fragment.start,
+                duration,
+                independent: fragment.independent,
+                payload,
+            }));
         }
-        if payload.is_empty() {
-            return Err(mux_error("CMAF mux produced an empty chunk"));
-        }
-        out.push(PackagedMedia::Chunk(PackagedChunk {
-            rendition_id: self.rendition_id,
-            packaging_segment_id: PackagingSegmentId(self.segment.id),
-            chunk_index: self.segment.chunk_index,
-            media_start: fragment.start,
-            duration,
-            independent: fragment.independent,
-            payload,
-        }));
         self.segment.chunk_index = self
             .segment
             .chunk_index
             .checked_add(1)
             .ok_or_else(|| mux_error("chunk index overflowed"))?;
-        self.segment.part_access_units = 0;
         self.segment.filled = self
             .segment
             .filled
@@ -492,6 +450,44 @@ impl CmafTrack {
 }
 
 impl TrackPackager for CmafTrack {
+    fn buffered(&self) -> (usize, usize) {
+        (self.pending_bytes, self.pending.len())
+    }
+
+    fn cut(
+        &mut self,
+        pts: TickTimestamp,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
+        self.prepare_tail(out)?;
+        let pts = pts
+            .checked_sub(self.plan.presentation_origin_pts)
+            .ok_or_else(|| mux_error("boundary rebasing overflowed"))?;
+        if self.kind == MediaKind::Video
+            && self.fragment.is_none()
+            && self.segment.filled_to()? != pts
+        {
+            return Err(MuxError::Boundary {
+                track: self.track_id,
+                reason: "published video parts do not end at the selected presentation cut",
+                observed: self.segment.filled_to()?.abs_diff(pts),
+                maximum: 0,
+            });
+        }
+        self.close_fragment_at(pts)?;
+        self.flush_fragment(out)?;
+        if self.segment.filled == 0 {
+            return Err(mux_error("empty coordinated segment"));
+        }
+        out.push(PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
+            rendition_id: self.rendition_id,
+            packaging_segment_id: PackagingSegmentId(self.segment.id),
+            media_start: self.segment.start,
+            duration: self.segment.filled,
+        }));
+        self.segment.advance(&self.plan)
+    }
+
     fn track_id(&self) -> TrackId {
         self.track_id
     }
@@ -514,6 +510,7 @@ impl TrackPackager for CmafTrack {
         }
         self.finished = true;
         if !matches!(reason, FinishReason::Superseded) {
+            self.prepare_tail(out)?;
             self.flush_fragment(out)?;
             if self.segment.filled > 0 {
                 out.push(PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
@@ -524,7 +521,11 @@ impl TrackPackager for CmafTrack {
                 }));
             }
         }
-        self.output.finalize();
+        self.pending.clear();
+        self.pending_bytes = 0;
+        if let Some(output) = &mut self.output {
+            output.finalize();
+        }
         Ok(())
     }
 }
@@ -533,7 +534,7 @@ fn packaged_rendition(
     rendition_id: PackagingRenditionId,
     track: &DiscoveredTrack,
     plan: &TrackSegmentationPlan,
-    policy: SegmentBoundaryPolicy,
+    boundary_allowance: Duration,
 ) -> Result<PackagedRendition, MuxError> {
     let codecs = track
         .rfc6381_codec()
@@ -560,21 +561,7 @@ fn packaged_rendition(
         },
         MediaParameters::Subtitle => return Err(invalid("subtitle tracks require WebVTT output")),
     };
-    let first_segment_target = duration_since(
-        plan.first_segment_boundary_pts,
-        plan.segmentation_origin_pts,
-    )
-    .ok_or_else(|| invalid("first segment target is invalid"))?;
-    let maximum_target = first_segment_target.max(plan.segment_duration.get());
-    let mut maximum_segment_duration = maximum_target
-        .checked_add(plan.boundary_tolerance)
-        .ok_or_else(|| invalid("maximum segment duration overflowed"))?;
-    if let SegmentBoundaryPolicy::ExtendToRandomAccess { maximum_extension } = policy {
-        maximum_segment_duration = maximum_segment_duration
-            .checked_add(plan.timebase.duration_to_ticks_floor(maximum_extension))
-            .ok_or_else(|| invalid("maximum segment duration overflowed"))?;
-    }
-    let maximum_segment_duration = NonZero::new(maximum_segment_duration)
+    let maximum_segment_duration = NonZero::new(plan.maximum_segment_ticks(boundary_allowance))
         .ok_or_else(|| invalid("maximum segment duration is zero"))?;
     let fallback_name = format!("{:?} {}", track.kind(), rendition_id.0 + 1);
     Ok(PackagedRendition {
@@ -623,6 +610,12 @@ fn mux_error(message: impl Into<Box<str>>) -> MuxError {
 
 #[cfg(test)]
 mod tests {
+    #[derive(Clone, Copy)]
+    enum SegmentBoundaryPolicy {
+        Strict,
+        ExtendToRandomAccess { maximum_extension: Duration },
+    }
+
     use std::{
         io::Cursor,
         num::NonZero,
@@ -641,7 +634,7 @@ mod tests {
             calibrate, validate,
         },
         mux::{
-            InitializationSegment, MuxerStartRequest, PackagedMedia, SegmentBoundaryPolicy,
+            InitializationSegment, MuxerStartRequest, PackagedMedia,
             fixtures::{
                 AAC_EXTRADATA, AAC_FRAME, AAC_FRAME_SAMPLES, H264_EXTRADATA, H264_IDR, H264_P,
                 RecordedEvents, discarded_events,
@@ -655,7 +648,6 @@ mod tests {
         },
     };
 
-    use super::CmafMuxerConfig;
     use crate::mux::{MuxerFactory, PassThroughMuxerFactory};
 
     const FRAME: u64 = 8_192;
@@ -800,7 +792,7 @@ mod tests {
     ) -> crate::mux::StartedMuxer {
         let segmentation =
             SegmentationPlan::new(input, plans).expect("fixture segmentation validates");
-        PassThroughMuxerFactory::default()
+        PassThroughMuxerFactory
             .start(MuxerStartRequest {
                 presentation: input,
                 segmentation: &segmentation,
@@ -817,12 +809,13 @@ mod tests {
     ) -> Result<crate::mux::StartedMuxer, crate::mux::MuxError> {
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
             .expect("fixture presentation validates");
-        let segmentation = SegmentationPlan::new(&input, vec![video_plan(0, timebase).build()])
+        let mut segmentation = SegmentationPlan::new(&input, vec![video_plan(0, timebase).build()])
             .expect("fixture segmentation validates");
-        PassThroughMuxerFactory::new(CmafMuxerConfig {
-            segment_boundary_policy: policy,
-        })
-        .start(MuxerStartRequest {
+        segmentation.late_boundary = match policy {
+            SegmentBoundaryPolicy::Strict => Duration::ZERO,
+            SegmentBoundaryPolicy::ExtendToRandomAccess { maximum_extension } => maximum_extension,
+        };
+        PassThroughMuxerFactory.start(MuxerStartRequest {
             presentation: &input,
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,
@@ -950,37 +943,23 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_gap_at_a_boundary_keeps_delivery_timing_contiguous() {
-        let sink = discarded_events();
+    fn a_timestamp_gap_cannot_extend_a_part_past_its_ceiling() {
         let mut started = start(
             SegmentBoundaryPolicy::Strict,
             Timebase::new(nz::u32!(1), nz::u32!(16_384)),
-            &sink,
+            &discarded_events(),
         )
-        .expect("CMAF muxer starts");
-
+        .expect("mux starts");
         let mut media = Vec::new();
-        // Frame 8_192 is absent. The boundary sample still closes segment zero;
-        // packet timestamps remain sparse while delivery timing spans the full
-        // interval up to the cut.
-        for sample in [sample(0, true), sample(16_384, true)] {
-            started
-                .muxer
-                .push(sample, &mut media)
-                .expect("sparse timestamps remain packageable");
-        }
-
+        started
+            .muxer
+            .push(sample(0, true), &mut media)
+            .expect("first sample");
         assert!(matches!(
-            media.as_slice(),
-            [
-                PackagedMedia::Initialization(_),
-                PackagedMedia::Chunk(chunk),
-                PackagedMedia::SegmentCompleted(completion),
-            ] if chunk.media_start == 0
-                && chunk.duration == 16_384
-                && completion.media_start == 0
-                && completion.duration == 16_384
+            started.muxer.push(sample(16_384, true), &mut media),
+            Err(crate::mux::MuxError::Part { .. })
         ));
+        assert!(media.is_empty(), "the invalid part must never be emitted");
     }
 
     #[test]
@@ -1237,12 +1216,11 @@ mod tests {
             .build();
         let input = validate(&catalog(vec![audio]), &StreamPolicy::permissive())
             .expect("audio fixture validates");
-        let mut plan = PlanBuilder::new(0, timebase, NonZero::new(segment_ticks).expect("nonzero"))
+        let plan = PlanBuilder::new(0, timebase, NonZero::new(segment_ticks).expect("nonzero"))
             .part(part_access_units.unwrap_or(nz::u32!(1)), part_target)
             // A jittery cadence needs room for its longest access unit.
             .boundary_tolerance(access_units.iter().copied().max().unwrap_or(0))
             .build();
-        plan.part_access_units = part_access_units;
         let mut started = started(&input, vec![plan], &sink);
 
         let mut media = Vec::new();
@@ -1345,10 +1323,9 @@ mod tests {
     {
         let timebase = Timebase::new(nz::u32!(1), nz::u32!(90_000));
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())?;
-        let mut plan = PlanBuilder::new(0, timebase, nz::u64!(900_000))
+        let plan = PlanBuilder::new(0, timebase, nz::u64!(900_000))
             .part(nz::u32!(1), nz::u64!(90_000))
             .build();
-        plan.part_access_units = None;
         let mut mux = started(&input, vec![plan], &discarded_events());
         let mut media = Vec::new();
         let mut pts = 0;
@@ -1381,8 +1358,8 @@ mod tests {
     }
 
     #[test]
-    fn a_balanced_aac_cadence_emits_no_one_frame_final_part() {
-        // The 94th frame closes a segment balanced as 24 + 24 + 24 + 21.
+    fn duration_cutting_keeps_aac_parts_within_the_selected_ceiling() {
+        // The threshold closes regular parts at 21 frames; the tail is shorter.
         let (parts, part_target) = packaged_parts(
             &[AAC_FRAME_SAMPLES; 94],
             Some(nz::u32!(24)),
@@ -1394,10 +1371,11 @@ mod tests {
         assert_eq!(
             parts,
             vec![
-                24 * AAC_FRAME_SAMPLES,
-                24 * AAC_FRAME_SAMPLES,
-                24 * AAC_FRAME_SAMPLES,
                 21 * AAC_FRAME_SAMPLES,
+                21 * AAC_FRAME_SAMPLES,
+                21 * AAC_FRAME_SAMPLES,
+                21 * AAC_FRAME_SAMPLES,
+                9 * AAC_FRAME_SAMPLES,
             ]
         );
     }
@@ -1444,7 +1422,7 @@ mod tests {
                 // multiple of the 1_500-tick period, which is what this test
                 // is about.
                 PlanBuilder::new(0, timebase, nz::u64!(1_500))
-                    .part(nz::u32!(1), nz::u64!(500))
+                    .part(nz::u32!(1), nz::u64!(1_024))
                     .first_boundary(1_900)
                     .boundary_tolerance(AAC_FRAME_SAMPLES)
                     .build(),
@@ -1988,7 +1966,7 @@ mod tests {
         let segmentation = SegmentationPlan::new(&fixture.presentation, tracks)
             .expect("fixture segmentation is valid");
         let sink = discarded_events();
-        let mut mux = PassThroughMuxerFactory::default()
+        let mut mux = PassThroughMuxerFactory
             .start(MuxerStartRequest {
                 presentation: &fixture.presentation,
                 segmentation: &segmentation,
@@ -2391,9 +2369,12 @@ mod tests {
                 &fixture.presentation,
                 &fixture.timeline,
                 crate::segment::SegmentationPolicy {
+                    maximum_part_duration: Duration::from_secs(2),
+                    early_boundary: Duration::ZERO,
+                    late_boundary: Duration::ZERO,
                     desired_segment_duration: Duration::from_secs(2),
                     desired_part_duration,
-                    search: crate::segment::BoundarySearchPolicy::AtOrBeforeDesired,
+                    maximum_segment_duration: Duration::from_secs(2),
                 },
             )?;
             for sample in &fixture.samples {
@@ -2420,10 +2401,13 @@ mod tests {
                 })
                 .collect();
             assert!(chunks.len() > 2);
-            assert_eq!(chunks[0].duration, target);
+            assert!(chunks[0].duration <= target);
             for chunk in &chunks[..chunks.len() - 1] {
                 assert!(chunk.duration <= target);
-                assert!(u128::from(chunk.duration) * 100 >= u128::from(target) * 85);
+                assert!(
+                    chunk.independent
+                        || u128::from(chunk.duration) * 100 >= u128::from(target) * 85
+                );
             }
             let demuxed = demux_cmaf(&concat_cmaf_bytes(&packaged));
             assert_eq!(demuxed.tracks[0].samples.len(), fixture.samples.len());
@@ -2541,8 +2525,8 @@ mod tests {
         }
 
         assert!(matches!(
-            started.muxer.push(sample(16_384, false), &mut media),
-            Err(crate::mux::MuxError::Mux(_))
+            started.muxer.push(sample(16_385, false), &mut media),
+            Err(crate::mux::MuxError::BoundaryWindow { .. })
         ));
     }
 
@@ -2620,7 +2604,7 @@ mod tests {
         assert!(
             matches!(
                 started.muxer.push(sample(32_768, false), &mut media),
-                Err(crate::mux::MuxError::Mux(_))
+                Err(crate::mux::MuxError::BoundaryWindow { .. })
             ),
             "past the budget the publication fails: its parts are already \
              fetchable, so there is no later point at which an overrun could be \
@@ -2651,7 +2635,7 @@ mod tests {
                 .collect(),
         )
         .expect("fixture segmentation validates");
-        let started = PassThroughMuxerFactory::default()
+        let started = PassThroughMuxerFactory
             .start(MuxerStartRequest {
                 presentation: &subtitle_input,
                 segmentation: &segmentation,
@@ -2672,5 +2656,41 @@ mod tests {
             started.presentation.renditions[0].config.timebase,
             millisecond
         );
+    }
+}
+
+#[cfg(test)]
+mod boundary_accounting_tests {
+    use super::*;
+    #[test]
+    fn an_overshoot_is_rejected_before_the_fragment_is_published() -> Result<(), MuxError> {
+        let track = crate::domain::fixtures::TrackBuilder::new(0, MediaKind::Video)
+            .codec_extradata(crate::mux::fixtures::H264_EXTRADATA)
+            .build();
+        let plan =
+            crate::segment::fixtures::PlanBuilder::new(0, track.timebase, nz::u64!(90_000)).build();
+        let events = crate::mux::fixtures::discarded_events();
+        let (_, mut writer) = build_track(
+            PackagingRenditionId(0),
+            &track,
+            plan,
+            Duration::ZERO,
+            events,
+        )?;
+        let mut out = Vec::new();
+        writer.push(
+            crate::media::fixtures::video_sample(0, 90_000, true, 1),
+            &mut out,
+        )?;
+        assert!(matches!(
+            writer.cut(89_900, &mut out),
+            Err(MuxError::Boundary {
+                observed: 100,
+                maximum: 0,
+                ..
+            })
+        ));
+        assert!(out.is_empty());
+        Ok(())
     }
 }

@@ -8,10 +8,15 @@
 //! the muxer's declared output configuration, and held immutable for the
 //! rendition's life.
 //!
-//! A publisher whose cadence stops satisfying its rendition's contract is not
-//! refused; it is given a *different* durable rendition, so the incompatible
-//! playlist ends cleanly rather than silently changing terms under viewers
-//! already reading it.
+//! The target duration is a property of the *presentation* rather than of one
+//! rendition: the protocol requires every media playlist in a multivariant
+//! playlist to advertise the same value. It is therefore supplied to
+//! [`PlaylistContract::derive`] rather than computed from one configuration,
+//! so a rendition cannot be given a contract that disagrees with its siblings.
+//!
+//! A new publication with an incompatible contract receives a different durable
+//! rendition. An active publication cannot change its contract: timing failures
+//! end it rather than silently changing terms under existing viewers.
 
 use std::{num::NonZeroU64, time::Duration};
 
@@ -42,18 +47,46 @@ pub struct PlaylistContract {
 }
 
 impl PlaylistContract {
-    pub fn derive(config: &RenditionConfig) -> Self {
-        let maximum_segment_duration = config
-            .timebase
-            .ticks_to_duration(config.maximum_segment_duration.get());
-        Self {
-            target_duration: nearest_whole_seconds(maximum_segment_duration),
+    /// The one `EXT-X-TARGETDURATION` every media playlist of a presentation
+    /// advertises, or `None` for a presentation with no renditions.
+    ///
+    /// Section 6.2.4 of draft-pantos-hls-rfc8216bis requires that "each Media
+    /// Playlist in each Variant Stream and Rendition MUST have the same Target
+    /// Duration". Its exceptions cover SUBTITLES renditions and I-frames-only
+    /// playlists only when they carry an `EXT-X-PLAYLIST-TYPE` of VOD, which a
+    /// live origin never publishes, so every rendition is included here.
+    ///
+    /// The shared value is the largest rendition requirement, because each
+    /// rendition's own rounded ceiling is a floor rather than a preference: a
+    /// smaller target would refuse the longest segment that rendition's muxer
+    /// has already been permitted to emit.
+    pub fn presentation_target_duration<'a>(
+        configs: impl IntoIterator<Item = &'a RenditionConfig>,
+    ) -> Option<NonZeroU64> {
+        configs
+            .into_iter()
+            .map(|config| nearest_whole_seconds(longest_segment(config)))
+            .max()
+    }
+
+    /// Freezes one rendition's contract against the presentation-wide
+    /// `target_duration` from [`Self::presentation_target_duration`].
+    ///
+    /// Reject an inconsistent presentation ceiling; never silently change one
+    /// sibling's target independently of the others.
+    pub fn derive(config: &RenditionConfig, target_duration: NonZeroU64) -> Option<Self> {
+        let maximum_segment_duration = longest_segment(config);
+        if target_duration < nearest_whole_seconds(maximum_segment_duration) {
+            return None;
+        }
+        Some(Self {
+            target_duration,
             maximum_segment_duration,
             part_target: config
                 .chunk_target
                 .map(|target| config.timebase.ticks_to_duration(target.get())),
             segment_format: config.segment_format,
-        }
+        })
     }
 
     /// Whether the rendition publishes partial segments at all.
@@ -95,6 +128,13 @@ impl PlaylistContract {
     }
 }
 
+/// The longest segment this rendition's muxer is permitted to emit.
+fn longest_segment(config: &RenditionConfig) -> Duration {
+    config
+        .timebase
+        .ticks_to_duration(config.maximum_segment_duration.get())
+}
+
 /// Rounds to the nearest whole second, never below one.
 ///
 /// The protocol version 6 semantics of `EXT-X-TARGETDURATION` make the tag
@@ -129,11 +169,18 @@ mod tests {
         }
     }
 
+    /// The contract this rendition gets when it is the whole presentation.
+    fn alone(config: &RenditionConfig) -> PlaylistContract {
+        let target = PlaylistContract::presentation_target_duration([config])
+            .expect("one rendition supplies a target");
+        PlaylistContract::derive(config, target).expect("computed presentation target fits")
+    }
+
     #[test]
     fn the_target_covers_the_longest_permitted_segment_after_rounding() {
         // Six seconds planned, with a one-second extension budget: the target
         // has to be seven, because a segment may legitimately reach 7 s.
-        let contract = PlaylistContract::derive(&config(630_000, Some(90_000)));
+        let contract = alone(&config(630_000, Some(90_000)));
 
         assert_eq!(contract.target_duration, nz::u64!(7));
         assert_eq!(contract.maximum_segment_duration, Duration::from_secs(7));
@@ -145,16 +192,13 @@ mod tests {
     #[test]
     fn rounding_is_to_nearest_and_never_reaches_zero() {
         assert_eq!(
-            PlaylistContract::derive(&config(585_000, None)).target_duration,
+            alone(&config(585_000, None)).target_duration,
             nz::u64!(7),
             "6.5 s rounds up, so a 6.5 s segment still rounds within its target"
         );
+        assert_eq!(alone(&config(584_999, None)).target_duration, nz::u64!(6));
         assert_eq!(
-            PlaylistContract::derive(&config(584_999, None)).target_duration,
-            nz::u64!(6)
-        );
-        assert_eq!(
-            PlaylistContract::derive(&config(9_000, None)).target_duration,
+            alone(&config(9_000, None)).target_duration,
             nz::u64!(1),
             "a sub-second cadence still needs a representable target"
         );
@@ -162,7 +206,7 @@ mod tests {
 
     #[test]
     fn segments_are_judged_by_their_rounded_duration_like_the_spec_requires() {
-        let contract = PlaylistContract::derive(&config(540_000, None));
+        let contract = alone(&config(540_000, None));
 
         assert_eq!(contract.target_duration, nz::u64!(6));
         assert!(
@@ -177,7 +221,7 @@ mod tests {
 
     #[test]
     fn non_final_parts_have_an_exact_eighty_five_percent_floor() {
-        let contract = PlaylistContract::derive(&config(540_000, Some(90_000)));
+        let contract = alone(&config(540_000, Some(90_000)));
 
         assert_eq!(
             contract.minimum_non_final_part_duration(),
@@ -191,11 +235,84 @@ mod tests {
 
     #[test]
     fn a_segment_only_rendition_constrains_nothing_about_parts() {
-        let contract = PlaylistContract::derive(&config(540_000, None));
+        let contract = alone(&config(540_000, None));
 
         assert!(!contract.is_chunked());
         assert_eq!(contract.minimum_non_final_part_duration(), None);
         assert!(contract.permits_part(Duration::from_mins(10)));
         assert!(contract.permits_non_final_part(Duration::ZERO));
+    }
+
+    #[test]
+    fn one_target_duration_covers_every_rendition_in_the_presentation() {
+        // The same 2.47 s cadence seen by two renditions whose boundary
+        // tolerance differs: one AAC frame is about 21 ms and one 30 fps video
+        // frame about 33 ms, which lands them either side of the half-second
+        // rounding step. Derived per rendition they would advertise 2 and 3.
+        let audio = config(224_190, None);
+        let video = config(225_270, None);
+        assert_eq!(nearest_whole_seconds(longest_segment(&audio)), nz::u64!(2));
+        assert_eq!(nearest_whole_seconds(longest_segment(&video)), nz::u64!(3));
+
+        let target = PlaylistContract::presentation_target_duration([&audio, &video])
+            .expect("a presentation with renditions has a target");
+
+        assert_eq!(target, nz::u64!(3), "the larger requirement admits both");
+        assert_eq!(
+            PlaylistContract::derive(&audio, target)
+                .expect("shared target fits")
+                .target_duration,
+            PlaylistContract::derive(&video, target)
+                .expect("shared target fits")
+                .target_duration,
+            "section 6.2.4 requires one value across the multivariant playlist"
+        );
+    }
+
+    #[test]
+    fn the_shared_target_is_independent_of_rendition_order() {
+        let audio = config(224_190, None);
+        let video = config(225_270, None);
+
+        assert_eq!(
+            PlaylistContract::presentation_target_duration([&audio, &video]),
+            PlaylistContract::presentation_target_duration([&video, &audio])
+        );
+    }
+
+    #[test]
+    fn a_subtitle_rendition_shares_the_live_target_duration() {
+        // The exception section 6.2.4 grants SUBTITLES renditions applies only
+        // with an EXT-X-PLAYLIST-TYPE of VOD, which a live origin never
+        // publishes, so a long cue segment raises the shared value.
+        let video = config(180_000, Some(90_000));
+        let subtitles = RenditionConfig {
+            segment_format: MediaSegmentFormat::WebVtt,
+            ..config(810_000, None)
+        };
+
+        let target = PlaylistContract::presentation_target_duration([&video, &subtitles])
+            .expect("a presentation with renditions has a target");
+
+        assert_eq!(target, nz::u64!(9));
+        assert_eq!(
+            PlaylistContract::derive(&video, target)
+                .expect("shared target fits")
+                .target_duration,
+            nz::u64!(9)
+        );
+    }
+
+    #[test]
+    fn a_shared_target_never_falls_below_what_a_rendition_needs() {
+        assert!(PlaylistContract::derive(&config(630_000, None), nz::u64!(2)).is_none());
+    }
+
+    #[test]
+    fn a_presentation_without_renditions_has_no_target_duration() {
+        assert_eq!(
+            PlaylistContract::presentation_target_duration(std::iter::empty()),
+            None
+        );
     }
 }

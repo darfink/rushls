@@ -39,7 +39,7 @@ impl PlanBuilder {
                 segmentation_origin_pts: 0,
                 first_segment_boundary_pts: 0,
                 segment_duration,
-                part_access_units: Some(nz::u32!(1)),
+                segment_period: None,
                 part_duration: segment_duration,
                 boundary_tolerance: 0,
             },
@@ -49,8 +49,7 @@ impl PlanBuilder {
 
     /// How a regular part is measured: a count, and the ceiling it implies.
     #[must_use]
-    pub fn part(mut self, access_units: NonZero<u32>, duration: NonZero<TickDuration>) -> Self {
-        self.plan.part_access_units = Some(access_units);
+    pub fn part(mut self, _access_units: NonZero<u32>, duration: NonZero<TickDuration>) -> Self {
         self.plan.part_duration = duration;
         self
     }
@@ -103,4 +102,47 @@ pub fn plan(
     segment_duration: NonZero<TickDuration>,
 ) -> TrackSegmentationPlan {
     PlanBuilder::new(track_id, timebase, segment_duration).build()
+}
+
+use crate::{
+    domain::{Appender, BoxFuture},
+    media::{MediaError, NormalizedSample, SampleSource},
+    source::InputState,
+};
+use std::collections::VecDeque;
+
+/// Replays prepared batches, then reports the input as exhausted.
+pub struct SampleBatches {
+    batches: VecDeque<Vec<NormalizedSample>>,
+}
+
+impl SampleBatches {
+    pub fn new(batches: Vec<Vec<NormalizedSample>>) -> Self {
+        Self {
+            batches: batches.into(),
+        }
+    }
+}
+
+impl SampleSource for SampleBatches {
+    fn next_batch<'a>(
+        &'a mut self,
+        out: &'a mut dyn Appender<NormalizedSample>,
+    ) -> BoxFuture<'a, Result<InputState, MediaError>> {
+        Box::pin(async move {
+            match self.batches.pop_front() {
+                Some(batch) => {
+                    for sample in batch {
+                        out.push(sample);
+                    }
+                    Ok(if self.batches.is_empty() {
+                        InputState::Closed
+                    } else {
+                        InputState::Open
+                    })
+                }
+                None => Ok(InputState::Closed),
+            }
+        })
+    }
 }
