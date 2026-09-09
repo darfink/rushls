@@ -2016,6 +2016,15 @@ impl MoqAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct HlsAppConfig {
+    /// Publish I-frame playlists for CMAF video, using one frame per completed segment.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_if_missing = "true",
+        default_value = "false"
+    )]
+    iframe_playlists: bool,
     /// Preferred cadence and maximum admitted segment ceiling.
     #[conf(flatten, prefix)]
     segment: HlsSegmentConfig,
@@ -2159,6 +2168,7 @@ impl HlsAppConfig {
             ));
         }
         node.hls.timing.part_hold_back = self.hold_back;
+        node.hls.playlist.iframe_playlists = self.iframe_playlists;
         Ok(())
     }
 }

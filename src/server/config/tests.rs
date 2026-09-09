@@ -2037,3 +2037,56 @@ fn nested_hls_sources_preserve_precedence() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+#[test]
+fn iframe_playlistss_are_disabled_by_default_and_configurable() -> Result<(), Box<dyn Error>> {
+    assert!(!resolve_toml("")??.node.hls.playlist.iframe_playlists);
+    assert!(
+        !load_shipped("rushls.reference.toml")?
+            .node
+            .hls
+            .playlist
+            .iframe_playlists
+    );
+    assert!(
+        resolve_toml("[hls]\niframe_playlists = true")??
+            .node
+            .hls
+            .playlist
+            .iframe_playlists
+    );
+    assert!(
+        resolve_with_env(&[("RUSHLS_HLS_IFRAME_PLAYLISTS", "true")])??
+            .node
+            .hls
+            .playlist
+            .iframe_playlists
+    );
+    assert!(
+        resolve_with("", &["--hls-iframe-playlists", "true"], &[])??
+            .node
+            .hls
+            .playlist
+            .iframe_playlists
+    );
+    assert!(
+        !resolve_with(
+            "[hls]\niframe_playlists = true",
+            &["--hls-iframe-playlists", "false"],
+            &[]
+        )??
+        .node
+        .hls
+        .playlist
+        .iframe_playlists
+    );
+    assert!(load_toml("[hls]\niframe_playlists = 1")?.is_err());
+    assert!(
+        resolve_with("", &["--hls-iframe-playlists"], &[])??
+            .node
+            .hls
+            .playlist
+            .iframe_playlists
+    );
+    Ok(())
+}

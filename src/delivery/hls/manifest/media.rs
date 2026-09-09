@@ -42,6 +42,21 @@ impl<'a> MediaPlaylistWriter<'a> {
         Ok(self)
     }
 
+    pub fn iframes_only(&mut self) -> ManifestWriteResult<&mut Self> {
+        writeln!(self.out, "#EXT-X-I-FRAMES-ONLY")?;
+        Ok(self)
+    }
+
+    /// Explicit offsets keep each range independently resolvable after a delta update.
+    pub fn byte_range(
+        &mut self,
+        length: NonZeroU64,
+        offset: u64,
+    ) -> ManifestWriteResult<&mut Self> {
+        writeln!(self.out, "#EXT-X-BYTERANGE:{length}@{offset}")?;
+        Ok(self)
+    }
+
     pub fn target_duration(&mut self, seconds: NonZeroU64) -> ManifestWriteResult<&mut Self> {
         writeln!(self.out, "#EXT-X-TARGETDURATION:{seconds}")?;
         Ok(self)

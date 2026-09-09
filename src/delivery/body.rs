@@ -182,6 +182,8 @@ mod tests {
 
     fn contiguous(payload: HeldBytes) -> StoredSegment {
         StoredSegment {
+            iframe_msn: 0,
+            iframes: [].into(),
             id: SegmentId(1),
             msn: Msn(1),
             publication: 1,
@@ -227,6 +229,8 @@ mod tests {
             .collect::<Vec<_>>()
             .into();
         StoredSegment {
+            iframe_msn: 0,
+            iframes: [].into(),
             id: SegmentId(1),
             msn: Msn(1),
             publication: 1,

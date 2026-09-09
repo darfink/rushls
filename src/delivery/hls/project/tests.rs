@@ -1041,3 +1041,302 @@ fn siblings_are_still_reported_on_a_delta() -> Result<(), Box<dyn std::error::Er
     );
     Ok(())
 }
+
+#[test]
+fn iframe_multivariant_tags_are_opt_in_and_video_only() -> Result<(), Box<dyn std::error::Error>> {
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0), video(1), audio(2), subtitle(3)]);
+    let stream = lease.live().snapshot();
+    let plain = multivariant_playlist(&stream, &policy(), &uris())?.ok_or("no index")?;
+    assert!(!plain.contains("I-FRAME"));
+    let enabled = PlaylistPolicy {
+        iframe_playlists: true,
+        ..policy()
+    };
+    let manifest = multivariant_playlist(&stream, &enabled, &uris().with_query_variables())?
+        .ok_or("no index")?;
+    let tags: Vec<_> = manifest
+        .lines()
+        .filter(|line| line.starts_with("#EXT-X-I-FRAME-STREAM-INF:"))
+        .collect();
+    assert_eq!(tags.len(), 2);
+    for (id, tag) in tags.iter().enumerate() {
+        assert!(tag.contains("BANDWIDTH="));
+        assert!(tag.contains(&format!("URI=\"{id}/iframe.m3u8?token={{$token}}\"")));
+        for forbidden in ["FRAME-RATE=", "AUDIO=", "SUBTITLES=", "CLOSED-CAPTIONS="] {
+            assert!(!tag.contains(forbidden));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn iframe_playlist_preserves_delta_maps_discontinuities_and_the_live_window()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::delivery::hls::{fixtures::write_cmaf_segment, project::media::iframe_playlist};
+    let store = StreamStore::new(StoreLimits {
+        retention: RetentionPolicy {
+            retain: Duration::from_secs(180).into(),
+            ..RetentionPolicy::default()
+        },
+        ..StoreLimits::default()
+    });
+    let first = lease(&store, vec![video(0), audio(1)]);
+    write(&first, initialization(0, 1));
+    write(&first, initialization(1, 1));
+    for id in 0..8 {
+        write_cmaf_segment(&first, 0, id, i64::try_from(id)? * 6)?;
+    }
+    write_segment(&first, 1, 0, 0);
+    let enabled = PlaylistPolicy {
+        iframe_playlists: true,
+        ..policy()
+    };
+    let (stream, media) = snapshots(&first, 0)?;
+    let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
+    let full = iframe_playlist(
+        &stream,
+        &media,
+        control,
+        &enabled,
+        &uris(),
+        PlaylistDelta::Full,
+    )?;
+    assert!(full.contains("#EXT-X-I-FRAMES-ONLY\n"));
+    assert_eq!(full.matches("#EXT-X-BYTERANGE:").count(), 8);
+    assert_eq!(full.matches("#EXTINF:6,").count(), 8);
+    assert!(!full.contains("#EXT-X-GAP"));
+    for forbidden in ["#EXT-X-PART:", "#EXT-X-PRELOAD-HINT:"] {
+        assert!(!full.contains(forbidden));
+    }
+    let regular = render(&first, 0, &enabled)?;
+    let control_line = full
+        .lines()
+        .find(|line| line.starts_with("#EXT-X-SERVER-CONTROL:"));
+    assert_eq!(
+        control_line,
+        regular
+            .lines()
+            .find(|line| line.starts_with("#EXT-X-SERVER-CONTROL:"))
+    );
+    assert!(full.contains("#EXT-X-PART-INF:PART-TARGET=1"));
+    assert!(full.contains("#EXT-X-RENDITION-REPORT:"));
+    assert!(!regular.contains("iframe.m3u8"));
+    let delta = iframe_playlist(
+        &stream,
+        &media,
+        control,
+        &enabled,
+        &uris().with_query_variables(),
+        PlaylistDelta::SkipV2,
+    )?;
+    assert!(delta.contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=1,RECENTLY-REMOVED-DATERANGES=\"\""));
+    assert_eq!(delta.matches("#EXT-X-BYTERANGE:").count(), 7);
+    assert!(delta.contains("URI=\"init/1.mp4?token={$token}\""));
+    assert!(delta.contains("segment/2.m4s?token={$token}"));
+
+    let second = lease(&store, vec![video(0), audio(1)]);
+    write(&second, initialization(0, 2));
+    write_cmaf_segment(&second, 0, 0, 0)?;
+    second.end();
+    let (stream, media) = snapshots(&second, 0)?;
+    let ended = iframe_playlist(
+        &stream,
+        &media,
+        control,
+        &enabled,
+        &uris(),
+        PlaylistDelta::Skip,
+    )?;
+    assert!(ended.contains("#EXT-X-DISCONTINUITY\n#EXT-X-MAP:URI=\"init/2.mp4\""));
+    assert!(ended.contains("#EXT-X-PROGRAM-DATE-TIME:"));
+    assert!(!ended.contains("#EXT-X-SKIP:"));
+    assert!(ended.ends_with("#EXT-X-ENDLIST\n"));
+    Ok(())
+}
+
+#[test]
+fn iframe_live_eviction_advances_sequence_and_marks_missing_sync_samples_as_gaps()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::delivery::hls::{fixtures::write_cmaf_segment, project::media::iframe_playlist};
+    let store = StreamStore::new(StoreLimits {
+        retention: RetentionPolicy {
+            retain: Duration::from_secs(18).into(),
+            ..RetentionPolicy::default()
+        },
+        ..StoreLimits::default()
+    });
+    let lease = lease(&store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    for id in 0..9 {
+        write_cmaf_segment(&lease, 0, id, i64::try_from(id)? * 6)?;
+    }
+    // Unindexable media is a gap, never a full multi-frame segment mislabeled
+    // as one I-frame. It still occupies its parent sequence number.
+    write_segment(&lease, 0, 9, 54);
+    let (stream, media) = snapshots(&lease, 0)?;
+    assert!(media.media_sequence > 0);
+    let manifest = iframe_playlist(
+        &stream,
+        &media,
+        None,
+        &PlaylistPolicy {
+            iframe_playlists: true,
+            ..policy()
+        },
+        &uris(),
+        PlaylistDelta::Full,
+    )?;
+    assert!(manifest.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", media.media_sequence)));
+    assert_eq!(manifest.matches("#EXTINF:").count(), media.segments.len());
+    assert_eq!(
+        manifest.matches("#EXT-X-BYTERANGE:").count(),
+        media.segments.len() - 1
+    );
+    assert!(manifest.contains("#EXT-X-GAP\n#EXTINF:6,\nsegment/10.m4s"));
+    Ok(())
+}
+
+#[test]
+fn dense_iframes_use_keyframe_sequences_for_delta_and_eviction()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::delivery::hls::{
+        fixtures::write_cmaf_segment_with_keyframes, project::media::iframe_playlist,
+    };
+    let store = StreamStore::new(StoreLimits {
+        retention: RetentionPolicy {
+            retain: Duration::from_secs(48).into(),
+            ..RetentionPolicy::default()
+        },
+        ..StoreLimits::default()
+    });
+    let lease = lease(&store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    let enabled = PlaylistPolicy {
+        iframe_playlists: true,
+        ..policy()
+    };
+    for id in 0..12 {
+        write_cmaf_segment_with_keyframes(&lease, 0, id, i64::try_from(id)? * 6, &[0, 2, 4])?;
+    }
+    let (stream, media) = snapshots(&lease, 0)?;
+    assert!(media.media_sequence > 0);
+    assert_eq!(media.iframe_media_sequence(), media.media_sequence * 3);
+    assert_eq!(media.live_edge.last_iframe, Some(35));
+    let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
+    let full = iframe_playlist(
+        &stream,
+        &media,
+        control,
+        &enabled,
+        &uris(),
+        PlaylistDelta::Full,
+    )?;
+    assert_eq!(
+        full.matches("#EXTINF:2,\n").count(),
+        media.segments.len() * 3
+    );
+    assert!(full.contains(&format!(
+        "#EXT-X-MEDIA-SEQUENCE:{}\n",
+        media.media_sequence * 3
+    )));
+    assert!(!full.contains("#EXT-X-PART:"));
+    let delta = iframe_playlist(
+        &stream,
+        &media,
+        control,
+        &enabled,
+        &uris(),
+        PlaylistDelta::Skip,
+    )?;
+    let skipped = full.matches("#EXTINF:").count() - delta.matches("#EXTINF:").count();
+    assert!(skipped > 0);
+    assert_eq!(skipped % 3, 0);
+    assert!(delta.contains(&format!("SKIPPED-SEGMENTS={skipped}")));
+    for parent in media.segments.iter() {
+        assert_eq!(parent.iframes.len(), 3);
+        assert_eq!(
+            parent
+                .iframes
+                .iter()
+                .map(|frame| frame.start)
+                .collect::<Vec<_>>(),
+            [0, 2, 4]
+        );
+        assert!(
+            parent
+                .iframes
+                .windows(2)
+                .all(|pair| pair[0].offset + pair[0].length.get() < pair[1].offset)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rendition_reports_only_target_regular_playlists_including_from_iframe_senders()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::delivery::hls::{
+        fixtures::write_cmaf_segment_with_keyframes, project::media::iframe_playlist,
+    };
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0), video(1), audio(2), subtitle(3)]);
+    for id in 0..4 {
+        write(&lease, initialization(id, 1));
+    }
+    for id in 0..2 {
+        write_cmaf_segment_with_keyframes(&lease, id, 0, 0, &[0, 2, 4])?;
+    }
+    write_segment(&lease, 2, 0, 0);
+    write_direct(&lease, 3, 0, 0);
+    let enabled = PlaylistPolicy {
+        iframe_playlists: true,
+        ..policy()
+    };
+    for id in 0..4 {
+        let (stream, media) = snapshots(&lease, id)?;
+        let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
+        for iframe in [false, true].into_iter().filter(|iframe| !iframe || id < 2) {
+            let manifest = if iframe {
+                iframe_playlist(
+                    &stream,
+                    &media,
+                    control,
+                    &enabled,
+                    &uris(),
+                    PlaylistDelta::Full,
+                )?
+            } else {
+                render(&lease, id, &enabled)?
+            };
+            let reports: Vec<_> = manifest
+                .lines()
+                .filter(|line| line.starts_with("#EXT-X-RENDITION-REPORT:"))
+                .collect();
+            assert_eq!(reports.len(), if iframe { 4 } else { 3 });
+            assert!(reports.iter().all(|line| !line.contains("iframe.m3u8")));
+            for target in 0..4 {
+                if !iframe && target == id {
+                    continue;
+                }
+                let target_kind = match target {
+                    0 | 1 => crate::domain::MediaKind::Video,
+                    2 => crate::domain::MediaKind::Audio,
+                    _ => crate::domain::MediaKind::Subtitle,
+                };
+                let mut uri = String::new();
+                let names = uris();
+                let expected = names
+                    .within(media.rendition_id, media.contract.segment_format)
+                    .sibling_playlist(crate::domain::RenditionId(target), target_kind, &mut uri);
+                let report = reports
+                    .iter()
+                    .find(|line| line.contains(&format!("URI=\"{expected}\"")))
+                    .ok_or("missing regular target")?;
+                // The regular video's MSN is 0, even though its I-frame edge is 2.
+                assert!(report.contains("LAST-MSN=0"));
+            }
+        }
+    }
+    Ok(())
+}

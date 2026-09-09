@@ -417,6 +417,36 @@ memory" has no fixed byte meaning at a variable bitrate, so it would be a
 second, weaker way of writing `retain` — and the number an operator needs for
 capacity planning is the one that multiplies by `streams`.
 
+### `iframe_playlists`
+
+`iframe_playlists = false` is the default. With `true`, the multivariant playlist
+advertises an `EXT-X-I-FRAME-STREAM-INF` entry for each CMAF video rendition.
+Each entry references `<rendition>/iframe.m3u8`.
+Audio and subtitle renditions have no I-frame playlist.
+
+The I-frame playlist selects every available keyframe in each completed segment.
+Each keyframe has its own duration, byte range, and media sequence number.
+At 24 fps, a GOP of 48 provides one keyframe every two seconds.
+Use a GOP of 24 for the recommended one-frame-per-second density.
+It uses byte ranges into existing segments and the same initialization sections.
+It follows the normal live retention window, including media on disk.
+A segment without an opening sync sample appears as a gap.
+
+This feature supports live low-latency HLS. The I-frame playlist has no partial
+segments or preload hints. It includes PART-INF metadata for Apple validator compatibility.
+It supports blocking reloads, delta updates,
+rendition reports, and token query variables.
+Reports target regular playlists only, including reports from I-frame playlists.
+Apple hlsreport 1.20.7 rejects the optional reports that target I-frame playlists.
+Its server-control values match the other playlists.
+See draft-pantos-hls-rfc8216bis-22, sections 3.3, 4.4.3.6, 4.4.4.9,
+4.4.6.3, 6.2.4, and Appendix B.1.
+
+The environment variable is `RUSHLS_HLS_IFRAME_PLAYLISTS`.
+The CLI parameter is `--hls-iframe-playlists`. A bare flag means `true`;
+an explicit `--hls-iframe-playlists true` or `--hls-iframe-playlists false`
+also works.
+
 ### `hold_back`
 
 `hold_back` is how far behind the live edge a player is told to start, and it

@@ -62,6 +62,19 @@ impl<'a> MultivariantPlaylistWriter<'a> {
         Ok(self)
     }
 
+    pub fn iframe_variant(&mut self, variant: IFrameVariant<'_>) -> ManifestWriteResult<&mut Self> {
+        let mut attributes = AttributeList::new(self.out, "EXT-X-I-FRAME-STREAM-INF");
+        attributes.plain("BANDWIDTH", variant.bandwidth)?;
+        attributes.optional_quoted("CODECS", variant.codecs)?;
+        if let Some((width, height)) = variant.resolution {
+            attributes.plain("RESOLUTION", format_args!("{width}x{height}"))?;
+        }
+        attributes.optional("VIDEO-RANGE", variant.video_range)?;
+        attributes.uri("URI", variant.uri)?;
+        attributes.end()?;
+        Ok(self)
+    }
+
     pub fn variant(&mut self, variant: Variant<'_>) -> ManifestWriteResult<&mut Self> {
         let mut attributes = AttributeList::new(self.out, "EXT-X-STREAM-INF");
         attributes.plain("BANDWIDTH", variant.bandwidth)?;
@@ -201,6 +214,15 @@ pub struct Rendition<'a> {
     pub default: bool,
     pub autoselect: bool,
     pub uri: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IFrameVariant<'a> {
+    pub bandwidth: NonZeroU64,
+    pub codecs: Option<&'a str>,
+    pub resolution: Option<(NonZeroU32, NonZeroU32)>,
+    pub video_range: Option<VideoRange>,
+    pub uri: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

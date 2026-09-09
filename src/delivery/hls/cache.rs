@@ -333,6 +333,7 @@ pub struct StreamPlaylistCache {
     query_uris: PlaylistUris,
     multivariant: PlaylistCache,
     renditions: Mutex<Vec<(RenditionId, Arc<PlaylistCache>)>>,
+    iframes: Mutex<Vec<(RenditionId, Arc<PlaylistCache>)>>,
 }
 
 impl StreamPlaylistCache {
@@ -342,6 +343,7 @@ impl StreamPlaylistCache {
             uris,
             multivariant: PlaylistCache::new(),
             renditions: Mutex::new(Vec::new()),
+            iframes: Mutex::new(Vec::new()),
         }
     }
 
@@ -358,7 +360,18 @@ impl StreamPlaylistCache {
     }
 
     pub fn rendition(&self, rendition: RenditionId) -> Arc<PlaylistCache> {
-        let mut renditions = self.renditions.lock();
+        Self::rendition_cache(&self.renditions, rendition)
+    }
+
+    pub fn iframe(&self, rendition: RenditionId) -> Arc<PlaylistCache> {
+        Self::rendition_cache(&self.iframes, rendition)
+    }
+
+    fn rendition_cache(
+        caches: &Mutex<Vec<(RenditionId, Arc<PlaylistCache>)>>,
+        rendition: RenditionId,
+    ) -> Arc<PlaylistCache> {
+        let mut renditions = caches.lock();
         if let Some((_, cache)) = renditions.iter().find(|(id, _)| *id == rendition) {
             return Arc::clone(cache);
         }

@@ -171,14 +171,30 @@ impl CmafOutput {
                 pending.random_access,
             ));
         }
+        let video = matches!(self.codec, Codec::H264 | Codec::Hevc | Codec::Av1);
+        let mut bytes = Vec::new();
+        let mut start = 0;
+        for end in 1..=samples.len() {
+            if end < samples.len() && !(video && samples[end].flags.is_sync) {
+                continue;
+            }
+            // Each keyframe gets its own moof, so trick play can fetch it
+            // without preceding dependent frames. Parts retain their cadence.
+            bytes.extend_from_slice(&self.build_run(&samples[start..end])?);
+            start = end;
+        }
+        Ok(Payload::from_bytes(bytes))
+    }
+
+    fn build_run(&mut self, samples: &[Sample]) -> Result<Vec<u8>, Box<str>> {
         let first_dts = samples[0].dts.unwrap_or(0);
         let tfdt = u64::try_from(first_dts)
             .map_err(|_| Box::<str>::from("fragment decode time is negative after rebasing"))?;
-        let fragment = FragmentTrackData::new(TRACK_ID, tfdt, &samples);
+        let fragment = FragmentTrackData::new(TRACK_ID, tfdt, samples);
         let bytes =
             build_media_segment(self.sequence, std::slice::from_ref(&fragment)).map_err(mux)?;
         let bytes = if let Some(roll) = &mut self.roll {
-            roll.fragment(&bytes, &samples)?
+            roll.fragment(&bytes, samples)?
         } else {
             bytes
         };
@@ -186,7 +202,7 @@ impl CmafOutput {
             .sequence
             .checked_add(1)
             .ok_or_else(|| Box::<str>::from("CMAF fragment sequence number overflowed"))?;
-        Ok(Payload::from_bytes(bytes))
+        Ok(bytes)
     }
 }
 
@@ -515,6 +531,61 @@ fn mux(error: impl std::fmt::Display) -> Box<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyframes_inside_one_part_have_independent_fragment_ranges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            domain::{MediaKind, fixtures::TrackBuilder},
+            mux::fixtures::{H264_EXTRADATA, H264_IDR, H264_P},
+        };
+        let track = TrackBuilder::new(0, MediaKind::Video)
+            .codec_extradata(H264_EXTRADATA.to_vec())
+            .build();
+        let mut output =
+            CmafOutput::open(&track).map_err(|error| std::io::Error::other(error.to_string()))?;
+        output.first_decode = Some(100);
+        for index in 0..6 {
+            output.pending.push(PendingSample {
+                dts: 100 + index,
+                pts: 102 + index,
+                duration: 1,
+                random_access: index % 2 == 0,
+                data: Bytes::from_static(if index % 2 == 0 { H264_IDR } else { H264_P }),
+            });
+        }
+        let payload = output
+            .build_media()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut remaining = payload.as_bytes();
+        let mut times = Vec::new();
+        while !remaining.is_empty() {
+            let (atom, size) = transmux::parse_box(remaining)?;
+            if atom.header.box_type.is(b"moof") {
+                let moof = transmux::MovieFragmentBox::parse_body(atom.body)?;
+                let track = &moof.traf[0];
+                times.push(
+                    track
+                        .tfdt
+                        .as_ref()
+                        .ok_or("missing tfdt")?
+                        .base_media_decode_time(),
+                );
+                assert_eq!(track.trun[0].samples.len(), 2);
+                assert_eq!(
+                    track.trun[0].samples[0].sample_composition_time_offset,
+                    Some(2)
+                );
+            } else if atom.header.box_type.is(b"mdat") {
+                assert!(atom.body.starts_with(H264_IDR));
+                assert!(atom.body.ends_with(H264_P));
+            }
+            remaining = &remaining[size..];
+        }
+        assert_eq!(times, [0, 2, 4]);
+        assert_eq!(output.sequence, 4);
+        Ok(())
+    }
 
     #[test]
     fn delayed_audio_keeps_both_priming_and_movie_offset() {

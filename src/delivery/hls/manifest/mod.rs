@@ -20,8 +20,8 @@ pub use media::{
     ServerControl,
 };
 pub use multivariant::{
-    ClosedCaptions, InstreamId, MultivariantPlaylistWriter, PlaylistMediaType, Rendition, Variant,
-    VideoRange,
+    ClosedCaptions, IFrameVariant, InstreamId, MultivariantPlaylistWriter, PlaylistMediaType,
+    Rendition, Variant, VideoRange,
 };
 
 #[derive(Debug, Error)]

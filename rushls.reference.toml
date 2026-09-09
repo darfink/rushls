@@ -124,6 +124,8 @@ tracks = { max = 8 }
 # audio = { channels = { max = 6 } }
 
 [hls]
+# Optional scrubbing playlists for CMAF video. Compatible with live LL-HLS.
+iframe_playlists = false                 # index all keyframes in completed segments
 segment = { target = "6s", max = "2x", jitter = "0s" }
 part    = { target = "1s", max = "2x" }
 # max and jitter accept durations or multiples of their configured target.

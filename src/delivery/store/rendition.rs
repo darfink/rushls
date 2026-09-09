@@ -206,6 +206,7 @@ pub struct RenditionState {
     /// HLS numbering is independent from publisher-local packaging IDs and is
     /// never reset when a publisher reconnects.
     next_msn: u64,
+    next_iframe_msn: u64,
     /// The MSN a media playlist must currently advertise.
     media_sequence: u64,
     /// Discontinuity tags already evicted from the front of the playlist.
@@ -280,6 +281,7 @@ impl RenditionState {
             retained_payload_bytes: 0,
             retained_disk_bytes: 0,
             next_msn: 0,
+            next_iframe_msn: 0,
             media_sequence: 0,
             discontinuity_sequence: 0,
             last_parent_publication: None,
@@ -748,6 +750,18 @@ impl RenditionState {
             }
         }
         let segment = StoredSegment {
+            iframe_msn: 0,
+            iframes: super::iframe::ranges(
+                self.descriptor.media.kind(),
+                config.segment_format,
+                parts.iter().map(|part| {
+                    (
+                        part.payload.as_bytes(),
+                        part.media_start.saturating_sub(completion.media_start),
+                    )
+                }),
+                completion.duration,
+            ),
             id: open.id,
             msn: open.msn,
             publication: open.publication,
@@ -787,6 +801,13 @@ impl RenditionState {
             .expect("validated initialization");
         self.issued_segments = self.issued_segments.saturating_add(1);
         let segment = StoredSegment {
+            iframe_msn: 0,
+            iframes: super::iframe::ranges(
+                self.descriptor.media.kind(),
+                config.segment_format,
+                std::iter::once((packaged.payload.as_bytes(), 0)),
+                packaged.duration,
+            ),
             id: SegmentId(self.issued_segments),
             msn: Msn(self.next_msn),
             publication,
@@ -849,7 +870,14 @@ impl RenditionState {
         self.playlist_position = self.playlist_position.saturating_add(duration);
     }
 
-    fn insert_segment(&mut self, segment: StoredSegment, now: Instant, retention: RetentionPolicy) {
+    fn insert_segment(
+        &mut self,
+        mut segment: StoredSegment,
+        now: Instant,
+        retention: RetentionPolicy,
+    ) {
+        segment.iframe_msn = self.next_iframe_msn;
+        self.next_iframe_msn = self.next_iframe_msn.saturating_add(segment.iframe_count());
         let id = segment.id;
         let publication = segment.publication;
         let payload_bytes = segment_resource_bytes(&segment);
@@ -969,6 +997,8 @@ impl RenditionState {
         }
         let duration = config.segment_target.get();
         let segment = StoredSegment {
+            iframe_msn: 0,
+            iframes: [].into(),
             id: open.id,
             msn: open.msn,
             publication: open.publication,
@@ -1677,6 +1707,7 @@ impl RenditionState {
             .filter(|(_, config)| config.chunk_target.is_some())
             .map(|_| PartId(self.issued_parts.saturating_add(1)));
         let next = super::RenditionLiveEdge {
+            last_iframe: self.next_iframe_msn.checked_sub(1),
             last_segment,
             last_part,
             next_part_id,

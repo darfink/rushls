@@ -246,11 +246,21 @@ impl Harness {
         readiness: Readiness,
         playback: Option<Arc<super::PlaybackGate>>,
     ) -> Self {
-        let store = StreamStore::default();
         let hls = crate::delivery::hls::service::Config {
             query_variables: playback.is_some(),
             ..crate::delivery::hls::service::Config::default()
         };
+        Self::start_hls(config, metrics, readiness, playback, hls).await
+    }
+
+    async fn start_hls(
+        config: HttpConfig,
+        metrics: MetricsMode,
+        readiness: Readiness,
+        playback: Option<Arc<super::PlaybackGate>>,
+        hls: crate::delivery::hls::service::Config,
+    ) -> Self {
+        let store = StreamStore::default();
         let origin = super::fixtures::application_with(&store, hls);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -3403,4 +3413,76 @@ mod tls {
             let _ = parse_range(&header, length);
         }
     }
+}
+
+#[tokio::test]
+async fn iframe_manifest_ranges_fetch_only_the_opening_avc_sample()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::delivery::hls::{
+        fixtures::{cmaf_fragment, write_cmaf_segment},
+        project::PlaylistPolicy,
+        service::Config,
+    };
+    let harness = Harness::start_hls(
+        HttpConfig::default(),
+        MetricsMode::Disabled,
+        Readiness::default(),
+        None,
+        Config {
+            playlist: PlaylistPolicy {
+                iframe_playlists: true,
+                ..PlaylistPolicy::default()
+            },
+            ..Config::default()
+        },
+    )
+    .await;
+    let lease = lease(&harness.store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_cmaf_segment(&lease, 0, 0, 0)?;
+    let index = request(harness.address, "GET", "/live/camera/index.m3u8", &[]).await;
+    assert_eq!(index.status, 200);
+    assert!(std::str::from_utf8(&index.body)?.contains("URI=\"0/iframe.m3u8\""));
+    let manifest = request(harness.address, "GET", "/live/camera/0/iframe.m3u8", &[]).await;
+    assert_eq!(manifest.status, 200);
+    let text = std::str::from_utf8(&manifest.body)?;
+    let range = text
+        .lines()
+        .find_map(|line| line.strip_prefix("#EXT-X-BYTERANGE:"))
+        .ok_or("missing range")?;
+    let (length, offset) = range.split_once('@').ok_or("missing explicit offset")?;
+    let length: usize = length.parse()?;
+    let offset: usize = offset.parse()?;
+    let segment = text
+        .lines()
+        .find(|line| line.starts_with("segment/"))
+        .ok_or("missing segment")?;
+    let response = request(
+        harness.address,
+        "GET",
+        &format!("/live/camera/0/{segment}"),
+        &[("Range", &format!("bytes={offset}-{}", offset + length - 1))],
+    )
+    .await;
+    assert_eq!(response.status, 206);
+    let fragment = cmaf_fragment(true)?;
+    assert_eq!(response.body, fragment.as_bytes()[offset..offset + length]);
+    assert!(response.body.ends_with(crate::mux::fixtures::H264_IDR));
+    assert_eq!(
+        offset + length,
+        fragment.len() - crate::mux::fixtures::H264_P.len()
+    );
+    assert_eq!(
+        response.header("content-range"),
+        Some(
+            format!(
+                "bytes {offset}-{}/{}",
+                offset + length - 1,
+                fragment.len() * 6
+            )
+            .as_str()
+        )
+    );
+    harness.stop().await;
+    Ok(())
 }

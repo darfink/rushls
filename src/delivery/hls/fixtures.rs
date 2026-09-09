@@ -194,3 +194,80 @@ pub fn write_direct(lease: &StreamLease, local: u32, segment: u64, start: i64) {
         }),
     );
 }
+
+/// A real fragment header with an IDR followed by a dependent AVC sample.
+/// At two ticks per second the two samples make one one-second part.
+pub fn cmaf_fragment(sync: bool) -> Result<Payload, Box<dyn std::error::Error>> {
+    cmaf_fragment_at(sync, 0, 0)
+}
+
+/// A fragment with explicit decode and composition timing for index tests.
+pub fn cmaf_fragment_at(
+    sync: bool,
+    decode: i64,
+    composition: i64,
+) -> Result<Payload, Box<dyn std::error::Error>> {
+    use crate::mux::fixtures::{H264_IDR, H264_P};
+    let samples = [
+        transmux::Sample::new(
+            bytes::Bytes::from_static(H264_IDR),
+            Some(decode),
+            Some(decode + composition),
+            Some(1),
+            sync,
+        ),
+        transmux::Sample::new(
+            bytes::Bytes::from_static(H264_P),
+            Some(decode + 1),
+            Some(decode + composition + 1),
+            Some(1),
+            false,
+        ),
+    ];
+    Ok(Payload::from_bytes(transmux::build_media_segment(
+        1,
+        &[transmux::FragmentTrackData::new(
+            1,
+            u64::try_from(decode)?,
+            &samples,
+        )],
+    )?))
+}
+
+/// A completed six-second parent whose opening part has a real CMAF index.
+pub fn write_cmaf_segment(
+    lease: &StreamLease,
+    local: u32,
+    segment: u64,
+    start: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_cmaf_segment_with_keyframes(lease, local, segment, start, &[0])
+}
+
+/// Select keyframe-bearing parts within a six-second parent.
+pub fn write_cmaf_segment_with_keyframes(
+    lease: &StreamLease,
+    local: u32,
+    segment: u64,
+    start: i64,
+    keys: &[u32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for index in 0..6 {
+        let PackagedMedia::Chunk(mut part) = chunk(local, segment, index, start + i64::from(index))
+        else {
+            unreachable!()
+        };
+        part.payload = cmaf_fragment(keys.contains(&index))?;
+        write(lease, PackagedMedia::Chunk(part));
+    }
+    write(
+        lease,
+        PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
+            rendition_id: PackagingRenditionId(local),
+            packaging_segment_id: PackagingSegmentId(segment),
+            media_start: start,
+            duration: 6,
+        }),
+    );
+    Ok(())
+}

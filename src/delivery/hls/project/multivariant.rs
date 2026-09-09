@@ -19,8 +19,8 @@ use crate::{
     delivery::hls::{
         RenditionCatalogEntry, StreamSnapshot,
         manifest::{
-            ClosedCaptions, InstreamId, MultivariantPlaylistWriter, PlaylistMediaType, Rendition,
-            Variant, VideoRange,
+            ClosedCaptions, IFrameVariant, InstreamId, MultivariantPlaylistWriter,
+            PlaylistMediaType, Rendition, Variant, VideoRange,
         },
         uri::{PlaylistUris, QUERYPARAM_VERSION, TOKEN_QUERYPARAM},
     },
@@ -182,7 +182,46 @@ pub fn multivariant_playlist(
         }
     }
 
+    if policy.iframe_playlists {
+        write_iframe_variants(&mut writer, stream, policy, uris)?;
+    }
+
     Ok(Some(out))
+}
+
+/// A separate entry for each video view keeps trick play independent of audio.
+fn write_iframe_variants(
+    writer: &mut MultivariantPlaylistWriter<'_>,
+    stream: &StreamSnapshot,
+    policy: &PlaylistPolicy,
+    uris: &PlaylistUris,
+) -> Result<(), ProjectionError> {
+    // Include alternate video renditions as well as primary variants.
+    for entry in stream.renditions.iter().filter(|entry| {
+        entry.active
+            && entry.media.kind() == MediaKind::Video
+            && entry.contract.segment_format == crate::mux::MediaSegmentFormat::Cmaf
+    }) {
+        let RenditionMedia::Video {
+            width,
+            height,
+            video_range,
+            ..
+        } = entry.media
+        else {
+            continue;
+        };
+        writer.iframe_variant(IFrameVariant {
+            // Use the full video rendition's advertised rate as the estimate
+            // until dedicated I-frame bandwidth measurements are available.
+            bandwidth: effective_bandwidth(entry, policy),
+            codecs: Some(&entry.codecs),
+            resolution: Some((width, height)),
+            video_range: video_range.map(video_range_of),
+            uri: &uris.iframe_playlist(entry.rendition_id),
+        })?;
+    }
+    Ok(())
 }
 
 /// One combination a client may play, split into the part that becomes variant

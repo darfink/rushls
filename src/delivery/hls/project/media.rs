@@ -53,6 +53,39 @@ pub fn media_playlist(
     uris: &PlaylistUris,
     delta: PlaylistDelta,
 ) -> Result<String, ProjectionError> {
+    render_media(
+        stream,
+        rendition,
+        server_control,
+        policy,
+        uris,
+        delta,
+        false,
+    )
+}
+
+/// Trick-play view of all keyframes in completed parents, with its own
+/// sequence numbers and the same retained time window as regular video.
+pub fn iframe_playlist(
+    stream: &StreamSnapshot,
+    rendition: &RenditionSnapshot,
+    server_control: Option<ServerControl>,
+    policy: &PlaylistPolicy,
+    uris: &PlaylistUris,
+    delta: PlaylistDelta,
+) -> Result<String, ProjectionError> {
+    render_media(stream, rendition, server_control, policy, uris, delta, true)
+}
+
+fn render_media(
+    stream: &StreamSnapshot,
+    rendition: &RenditionSnapshot,
+    server_control: Option<ServerControl>,
+    policy: &PlaylistPolicy,
+    uris: &PlaylistUris,
+    delta: PlaylistDelta,
+    iframe: bool,
+) -> Result<String, ProjectionError> {
     let contract = rendition.contract;
     let names = uris.within(rendition.rendition_id, contract.segment_format);
     let timebase = rendition
@@ -65,27 +98,14 @@ pub fn media_playlist(
     let skip_count = skipped_parents(rendition, server_control, delta, timebase);
     let mut out = String::with_capacity(estimated_size(rendition));
     let mut writer = MediaPlaylistWriter::new(&mut out)?;
-    writer.version(version(
-        contract.is_chunked(),
+    write_header(
+        &mut writer,
+        rendition,
+        server_control,
         (skip_count > 0).then_some(delta),
         uris.query_variables(),
-    ))?;
-    if uris.query_variables() {
-        writer.define_queryparam(TOKEN_QUERYPARAM)?;
-    }
-    writer.target_duration(contract.target_duration)?;
-    if let Some(control) = server_control {
-        writer.server_control(control)?;
-    }
-    if let Some(part_target) = contract.part_target {
-        writer.part_information(part_target)?;
-    }
-    // MEDIA-SEQUENCE is the window head, including skipped parents.
-    // SKIPPED-SEGMENTS is how a client reconstructs that prefix.
-    writer.media_sequence(rendition.media_sequence)?;
-    if rendition.discontinuity_sequence > 0 {
-        writer.discontinuity_sequence(rendition.discontinuity_sequence)?;
-    }
+        iframe,
+    )?;
 
     // Tracks what the playlist has already said, so EXT-X-MAP is repeated only
     // where it actually changes and PROGRAM-DATE-TIME is not restated on every
@@ -99,7 +119,12 @@ pub fn media_playlist(
     for segment in skipped {
         observe_parent(&mut state, segment, names.has_initialization());
     }
-    if let Some(count) = NonZeroU64::new(u64::try_from(skip_count).unwrap_or(0)) {
+    let skipped_entries = if iframe {
+        skipped.iter().map(|segment| segment.iframe_count()).sum()
+    } else {
+        u64::try_from(skip_count).unwrap_or(0)
+    };
+    if let Some(count) = NonZeroU64::new(skipped_entries) {
         writer.skipped_segments(count, delta.recently_removed_dateranges())?;
         // Re-emit the MAP in effect. A tail cut that omits it is merge-correct
         // (the MAP sat on skipped parents) and validator-hostile.
@@ -117,17 +142,23 @@ pub fn media_playlist(
             policy,
             &mut uri,
         )?;
-        for part in rendition.segments.parts(segment) {
+        for part in rendition.segments.parts(segment).iter().filter(|_| !iframe) {
             write_part(&mut writer, part, &names, timebase, &mut uri)?;
         }
-        writer.segment(Segment {
-            uri: names.segment(segment.id, &mut uri),
-            duration: timebase.ticks_to_duration(segment.duration),
-            gap: matches!(segment.kind, StoredSegmentKind::Gap),
-        })?;
+        if iframe {
+            write_iframe_segments(&mut writer, segment, &names, &mut uri)?;
+        } else {
+            writer.segment(Segment {
+                uri: names.segment(segment.id, &mut uri),
+                duration: timebase.ticks_to_duration(segment.duration),
+                gap: matches!(segment.kind, StoredSegmentKind::Gap),
+            })?;
+        }
     }
 
-    if let Some(open) = &rendition.open_segment {
+    if let Some(open) = &rendition.open_segment
+        && !iframe
+    {
         write_parent_tags(
             &mut writer,
             &mut state,
@@ -146,17 +177,20 @@ pub fn media_playlist(
 
     // A preload hint names media that does not exist yet, which is exactly what
     // lets a client have its request already in flight when it does.
-    if let Some(next) = rendition.live_edge.next_part_id {
+    if let Some(next) = rendition.live_edge.next_part_id.filter(|_| !iframe) {
         writer.preload_hint(PreloadHint {
             hint_type: PreloadHintType::Part,
             uri: names.part(next, &mut uri),
         })?;
     }
 
+    // B.1 requires regular targets even when the sender is an I-frame playlist.
+    // I-frame targets are a SHOULD, omitted for hlsreport 1.20.7 compatibility:
+    // it labels reports to advertised I-frame variants "Unknown rendition report".
     write_rendition_reports(
         &mut writer,
         stream,
-        rendition.rendition_id,
+        (!iframe).then_some(rendition.rendition_id),
         &names,
         &mut uri,
     )?;
@@ -165,6 +199,79 @@ pub fn media_playlist(
         writer.endlist()?;
     }
     Ok(out)
+}
+
+/// Every range is a Media Segment in the I-frame playlist. Its duration is
+/// the presentation interval to the next keyframe, not the coded frame length.
+fn write_iframe_segments(
+    writer: &mut MediaPlaylistWriter<'_>,
+    parent: &StoredSegment,
+    names: &RenditionUris<'_>,
+    uri: &mut String,
+) -> Result<(), ProjectionError> {
+    if parent.iframes.is_empty() {
+        writer.segment(Segment {
+            uri: names.segment(parent.id, uri),
+            duration: parent.timebase.ticks_to_duration(parent.duration),
+            gap: true,
+        })?;
+    }
+    for (index, frame) in parent.iframes.iter().enumerate() {
+        let end = parent
+            .iframes
+            .get(index + 1)
+            .map_or(parent.duration, |next| next.start);
+        writer.byte_range(frame.length, frame.offset)?;
+        writer.segment(Segment {
+            uri: names.segment(parent.id, uri),
+            duration: parent.timebase.ticks_to_duration(end - frame.start),
+            gap: false,
+        })?;
+    }
+    Ok(())
+}
+
+/// Both views share live delivery controls, but only regular video has parts.
+fn write_header(
+    writer: &mut MediaPlaylistWriter<'_>,
+    rendition: &RenditionSnapshot,
+    server_control: Option<ServerControl>,
+    skip: Option<PlaylistDelta>,
+    query_variables: bool,
+    iframe: bool,
+) -> Result<(), ProjectionError> {
+    writer.version(version(
+        rendition.contract.is_chunked() || iframe,
+        skip,
+        query_variables,
+    ))?;
+    if query_variables {
+        writer.define_queryparam(TOKEN_QUERYPARAM)?;
+    }
+    if iframe {
+        writer.iframes_only()?;
+    }
+    writer.target_duration(rendition.contract.target_duration)?;
+    if let Some(control) = server_control {
+        writer.server_control(control)?;
+    }
+    // Apple's validator requires PART-INF on I-frame siblings of LL playlists.
+    // Carry the parent's part target as metadata without publishing PART tags.
+    if let Some(part_target) = rendition.contract.part_target {
+        writer.part_information(part_target)?;
+    }
+    // MEDIA-SEQUENCE is the window head, including skipped parents.
+    // SKIPPED-SEGMENTS is how a client reconstructs that prefix.
+    writer.media_sequence(if iframe {
+        rendition.iframe_media_sequence()
+    } else {
+        rendition.media_sequence
+    })?;
+    if rendition.discontinuity_sequence > 0 {
+        writer.discontinuity_sequence(rendition.discontinuity_sequence)?;
+    }
+
+    Ok(())
 }
 
 /// What the playlist says about a parent segment rather than about its media.
@@ -348,12 +455,12 @@ fn write_part(
 fn write_rendition_reports(
     writer: &mut MediaPlaylistWriter<'_>,
     stream: &StreamSnapshot,
-    self_id: RenditionId,
+    self_id: Option<RenditionId>,
     names: &RenditionUris<'_>,
     uri: &mut String,
 ) -> Result<(), ProjectionError> {
     for entry in stream.renditions.iter() {
-        if entry.rendition_id == self_id || !entry.active {
+        if Some(entry.rendition_id) == self_id || !entry.active {
             continue;
         }
         let edge = entry.snapshot().live_edge;

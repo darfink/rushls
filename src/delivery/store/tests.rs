@@ -579,6 +579,7 @@ fn durable_part_ids_and_cursors_advance_independently() {
         lease.live().rendition_live_edge(RenditionId(0)).unwrap(),
         RenditionLiveEdge {
             last_segment: None,
+            last_iframe: None,
             last_part: Some((
                 PartCursor {
                     msn: Msn(0),
@@ -2539,5 +2540,92 @@ fn relative_retention_reports_the_selected_shared_contract()
     )?;
     let live = store.get(&stream()).expect("published stream");
     assert_eq!(live.retention_depth().requested, Duration::from_secs(18));
+    Ok(())
+}
+
+#[tokio::test]
+async fn iframe_ranges_survive_disk_spill_and_remain_fetchable()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::delivery::hls::{
+        fixtures as hls,
+        project::{PlaylistDelta, PlaylistPolicy, media::iframe_playlist},
+        uri::PlaylistUris,
+    };
+    let directory = scratch_disk("iframe-spill");
+    let payload = hls::cmaf_fragment(true)?;
+    let expected = super::iframe::prefix_len(
+        crate::domain::MediaKind::Video,
+        MediaSegmentFormat::Cmaf,
+        payload.as_bytes(),
+    )
+    .ok_or("missing frame index")?;
+    let mut limits = limits();
+    limits.retention.retain = Duration::from_secs(180).into();
+    limits.retention.maximum_payload_bytes = payload.len() * 6 * 4 + 1;
+    limits.disk = Some(DiskLimits {
+        directory: directory.clone(),
+        maximum_payload_bytes: 100_000,
+    });
+    let store = StreamStore::new(limits);
+    let lease = hls::lease(&store, vec![hls::video(0)]);
+    hls::write(&lease, hls::initialization(0, 1));
+    for id in 0..8 {
+        hls::write_cmaf_segment_with_keyframes(&lease, 0, id, i64::try_from(id)? * 6, &[0, 2, 4])?;
+    }
+    wait_until("I-frame parents spill", || {
+        lease.live().retained_disk_bytes() > 0
+    });
+    let snapshot = lease
+        .live()
+        .rendition(RenditionId(0))
+        .ok_or("no rendition")?;
+    let spilled = snapshot.segments.iter().find(|segment| matches!(
+        &segment.kind, StoredSegmentKind::Media(SegmentBody::Chunked(parts)) if parts.iter().any(|part| !part.payload.is_memory())
+    )).ok_or("no spilled segment")?;
+    assert_eq!(
+        spilled
+            .iframes
+            .first()
+            .and_then(|frame| std::num::NonZeroU64::new(frame.offset + frame.length.get())),
+        Some(expected)
+    );
+    let playlist = iframe_playlist(
+        &lease.live().snapshot(),
+        &snapshot,
+        None,
+        &PlaylistPolicy {
+            iframe_playlists: true,
+            ..PlaylistPolicy::default()
+        },
+        &PlaylistUris::default(),
+        PlaylistDelta::Full,
+    )?;
+    assert_eq!(playlist.matches("#EXT-X-BYTERANGE:").count(), 24);
+    let origin = Origin::new(store.clone());
+    let object = origin
+        .media(
+            &hls::stream_id(),
+            MediaResource::Segment(RenditionId(0), spilled.id, MediaSegmentFormat::Cmaf),
+            Duration::ZERO,
+        )
+        .await?;
+    assert_eq!(spilled.iframes.len(), 3);
+    for frame in spilled.iframes.iter() {
+        let clipped: Vec<_> = object
+            .body
+            .clone()
+            .range(frame.offset, frame.offset + frame.length.get() - 1)
+            .ok_or("range missing")?
+            .into_frames()
+            .flatten()
+            .collect();
+        assert_eq!(&clipped[4..8], b"moof");
+        assert!(clipped.ends_with(crate::mux::fixtures::H264_IDR));
+        assert_eq!(clipped.len(), usize::try_from(frame.length.get())?);
+    }
+    drop(origin);
+    drop(lease);
+    drop(store);
+    std::fs::remove_dir_all(directory)?;
     Ok(())
 }

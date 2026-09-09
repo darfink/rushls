@@ -80,6 +80,8 @@ pub enum ProgramDateTimePolicy {
 /// Everything a projection needs that is not in a snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlaylistPolicy {
+    /// Advertise and serve a sparse I-frame playlist for each CMAF video rendition.
+    pub iframe_playlists: bool,
     pub program_date_time: ProgramDateTimePolicy,
     /// What to advertise for a rendition that has neither measured nor
     /// declared a bitrate.
@@ -96,6 +98,7 @@ pub struct PlaylistPolicy {
 impl Default for PlaylistPolicy {
     fn default() -> Self {
         Self {
+            iframe_playlists: false,
             program_date_time: ProgramDateTimePolicy::default(),
             // Deliberately high: unknown is not the same as small, and the cost
             // of guessing high is one conservative segment.

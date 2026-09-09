@@ -45,13 +45,14 @@ fn media_playlist_kind(name: &str) -> Option<MediaKind> {
 pub enum Resource {
     Multivariant,
     MediaPlaylist(RenditionId, MediaKind),
+    IFramePlaylist(RenditionId),
 }
 
 impl Resource {
     pub fn rendition(self) -> Option<RenditionId> {
         match self {
             Self::Multivariant => None,
-            Self::MediaPlaylist(rendition, _) => Some(rendition),
+            Self::MediaPlaylist(rendition, _) | Self::IFramePlaylist(rendition) => Some(rendition),
         }
     }
 }
@@ -72,12 +73,23 @@ pub fn parse_path(path: &str) -> Result<ResourcePath, ResourcePathError> {
         (Resource::Multivariant, 1)
     } else {
         let rendition = tail.next().ok_or(ResourcePathError::Unrecognized)?;
-        let kind = media_playlist_kind(name).ok_or(ResourcePathError::Unrecognized)?;
+        // Classify the leaf before parsing its parent: media paths belong to
+        // the shared router and must remain Unrecognized by this adapter.
+        let kind = if name == "iframe.m3u8" {
+            None
+        } else {
+            Some(media_playlist_kind(name).ok_or(ResourcePathError::Unrecognized)?)
+        };
         let rendition = rendition
             .parse()
             .map(RenditionId)
             .map_err(|_| ResourcePathError::InvalidIdentifier)?;
-        (Resource::MediaPlaylist(rendition, kind), 2)
+        (
+            kind.map_or(Resource::IFramePlaylist(rendition), |kind| {
+                Resource::MediaPlaylist(rendition, kind)
+            }),
+            2,
+        )
     };
     Ok(ResourcePath {
         stream: parse_stream(path, segment_count.saturating_sub(consumed))?,
@@ -131,6 +143,14 @@ impl PlaylistUris {
         let mut out = String::new();
         self.write_prefix(&mut out, None, rendition);
         out.push_str(media_playlist_name(kind));
+        self.append_token_variable(&mut out);
+        out
+    }
+
+    pub fn iframe_playlist(&self, rendition: RenditionId) -> String {
+        let mut out = String::new();
+        self.write_prefix(&mut out, None, rendition);
+        out.push_str("iframe.m3u8");
         self.append_token_variable(&mut out);
         out
     }

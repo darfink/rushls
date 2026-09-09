@@ -47,6 +47,7 @@ mod contract;
 mod disk;
 mod error;
 mod ids;
+mod iframe;
 mod media;
 mod rendition;
 mod retention;

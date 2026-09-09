@@ -80,6 +80,10 @@ pub enum StoredSegmentKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredSegment {
+    /// Every independently decodable fragment range, retained across disk spill.
+    pub iframes: Arc<[super::iframe::IFrameRange]>,
+    /// First I-frame media sequence in this parent, distinct from its regular MSN.
+    pub iframe_msn: u64,
     pub id: SegmentId,
     pub msn: Msn,
     /// Publisher generation that produced the media.
@@ -106,6 +110,13 @@ pub struct StoredSegment {
     /// opaquely: the store never inspects it and does not know which formats
     /// are text.
     pub gzip: Option<HeldBytes>,
+}
+
+impl StoredSegment {
+    /// An unindexable parent occupies one GAP in the I-frame timeline.
+    pub fn iframe_count(&self) -> u64 {
+        u64::try_from(self.iframes.len()).unwrap_or(u64::MAX).max(1)
+    }
 }
 
 /// Completed segments and the prefix frontier controlling their PART tags.
@@ -203,6 +214,7 @@ pub struct OpenSegment {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RenditionLiveEdge {
+    pub last_iframe: Option<u64>,
     pub last_segment: Option<(Msn, SegmentId)>,
     pub last_part: Option<(PartCursor, PartId)>,
     pub next_part_id: Option<PartId>,
@@ -279,6 +291,17 @@ pub struct RenditionSnapshot {
 }
 
 impl RenditionSnapshot {
+    pub fn iframe_media_sequence(&self) -> u64 {
+        self.segments.first().map_or_else(
+            || {
+                self.live_edge
+                    .last_iframe
+                    .map_or(0, |last| last.saturating_add(1))
+            },
+            |segment| segment.iframe_msn,
+        )
+    }
+
     /// Whether the snapshot contains any completed parent segment.
     ///
     /// HLS permits an empty Media Playlist, so this is an operational readiness

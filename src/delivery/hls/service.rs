@@ -61,12 +61,14 @@ pub enum PlaylistReadiness {
 pub enum WaitUntil {
     AnyMedia,
     CompletedSegment,
+    IFramePosition(u64),
     PlaylistPosition { msn: Msn, part: Option<PartIndex> },
 }
 
 impl EdgeCondition for WaitUntil {
     fn reached(&self, edge: &RenditionLiveEdge) -> bool {
         match *self {
+            Self::IFramePosition(msn) => edge.last_iframe.is_some_and(|last| last >= msn),
             Self::AnyMedia => edge.last_segment.is_some() || edge.last_part.is_some(),
             Self::CompletedSegment => edge.last_segment.is_some(),
             Self::PlaylistPosition { msn, part: None } => {
@@ -367,7 +369,10 @@ impl Service {
             .ok_or(DeliveryError::UnknownStream)?;
         match request.resource {
             Resource::Multivariant => self.multivariant(stream, &live, request.query_variables),
-            Resource::MediaPlaylist(rendition, _) => {
+            Resource::IFramePlaylist(_) if !self.config.playlist.iframe_playlists => {
+                Err(DeliveryError::UnknownResource)
+            }
+            Resource::MediaPlaylist(rendition, _) | Resource::IFramePlaylist(rendition) => {
                 self.media_playlist(stream, &live, rendition, request).await
             }
         }
@@ -416,30 +421,43 @@ impl Service {
     ) -> Result<Response, DeliveryError> {
         let snapshot = Self::rendition_for(live, request.resource)?;
         let deadline = blocking_reload_deadline(snapshot.contract, self.config.timing);
-        let blocking = request.blocking;
+        let iframe = matches!(request.resource, Resource::IFramePlaylist(_));
+        // No partial segments exist in this view. A part directive therefore
+        // waits for its completed parent, not for the regular video's part.
+        let blocking = request.blocking.map(|mut blocking| {
+            if iframe {
+                blocking.part = None;
+            }
+            blocking
+        });
 
         if let Some(blocking) = blocking {
             // A terminal playlist will never advance, so a directive naming
             // media beyond its end is not an error and not something to wait
             // for; it is simply already answered.
             if !snapshot.live_edge.ended {
-                Self::validate_blocking(&snapshot, blocking)?;
+                let condition = if iframe {
+                    Self::validate_iframe_blocking(&snapshot, blocking.msn.0)?;
+                    WaitUntil::IFramePosition(blocking.msn.0)
+                } else {
+                    Self::validate_blocking(&snapshot, blocking)?;
+                    WaitUntil::PlaylistPosition {
+                        msn: blocking.msn,
+                        part: blocking.part,
+                    }
+                };
                 self.meters.blocking_reload_started();
                 let _outcome = self
                     .origin
-                    .wait_for(
-                        live,
-                        rendition,
-                        deadline,
-                        WaitUntil::PlaylistPosition {
-                            msn: blocking.msn,
-                            part: blocking.part,
-                        },
-                    )
+                    .wait_for(live, rendition, deadline, condition)
                     .await?;
             }
         } else {
-            let readiness = WaitUntil::from(self.config.readiness);
+            let readiness = if iframe {
+                WaitUntil::CompletedSegment
+            } else {
+                WaitUntil::from(self.config.readiness)
+            };
             if !readiness.reached(&snapshot.live_edge) && !snapshot.live_edge.ended {
                 // The first request for a stream that has published nothing yet:
                 // hold it rather than answer with a playlist naming no media.
@@ -452,7 +470,12 @@ impl Service {
 
         let caches = self.cache_for(stream_id);
         let skip = request.skip;
-        let rendered = caches.rendition(rendition).get_or_render_stable(
+        let cache = if iframe {
+            caches.iframe(rendition)
+        } else {
+            caches.rendition(rendition)
+        };
+        let rendered = cache.get_or_render_stable(
             || -> Result<_, DeliveryError> {
                 let media_revision = live.media_revision();
                 let stream = live.snapshot();
@@ -465,7 +488,12 @@ impl Service {
             },
             |(stream, snapshot)| -> Result<String, DeliveryError> {
                 let control = project::presentation_server_control(stream, self.config.timing);
-                Ok(media_playlist(
+                let render = if iframe {
+                    project::media::iframe_playlist
+                } else {
+                    media_playlist
+                };
+                Ok(render(
                     stream,
                     snapshot,
                     control,
@@ -487,6 +515,24 @@ impl Service {
                 blocking.is_some(),
             ),
         ))
+    }
+
+    fn validate_iframe_blocking(
+        snapshot: &RenditionSnapshot,
+        msn: u64,
+    ) -> Result<(), DeliveryError> {
+        if msn
+            > snapshot
+                .live_edge
+                .last_iframe
+                .unwrap_or(0)
+                .saturating_add(ADVANCE_SEGMENT_LIMIT)
+        {
+            return Err(DeliveryError::InvalidDirective(
+                "_HLS_msn is too far beyond the I-frame live edge",
+            ));
+        }
+        Ok(())
     }
 
     /// Rejects a directive naming media so far ahead it cannot be a wait.
@@ -630,6 +676,10 @@ fn rendition_for_stream(
     let entry = rendition_entry(stream, rendition).ok_or(DeliveryError::UnknownRendition)?;
     let holds = match resource {
         Resource::MediaPlaylist(_, kind) => entry.media.kind() == kind,
+        Resource::IFramePlaylist(_) => {
+            entry.media.kind() == crate::domain::MediaKind::Video
+                && entry.contract.segment_format == crate::mux::MediaSegmentFormat::Cmaf
+        }
         Resource::Multivariant => false,
     };
     holds
@@ -721,6 +771,150 @@ mod tests {
             Body::Manifest(bytes) => std::str::from_utf8(bytes).expect("a playlist is valid UTF-8"),
             Body::Media(_) => panic!("expected a playlist"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn iframe_routes_are_opt_in_and_have_separate_token_and_video_caches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::delivery::hls::fixtures::write_cmaf_segment;
+        let store = StreamStore::default();
+        let lease = lease(&store, vec![video(0), audio(1)]);
+        write(&lease, initialization(0, 1));
+        write_cmaf_segment(&lease, 0, 0, 0)?;
+        let iframe = Resource::IFramePlaylist(RenditionId(0));
+        assert_eq!(
+            origin(&store)
+                .serve(&stream_id(), fetch(iframe))
+                .await
+                .unwrap_err()
+                .error,
+            DeliveryError::UnknownResource
+        );
+        let service = Service::new(
+            Arc::new(Origin::new(store)),
+            Config {
+                playlist: PlaylistPolicy {
+                    iframe_playlists: true,
+                    ..PlaylistPolicy::default()
+                },
+                query_variables: true,
+                ..Config::default()
+            },
+        );
+        assert_eq!(
+            service
+                .serve(
+                    &stream_id(),
+                    fetch(Resource::IFramePlaylist(RenditionId(1)))
+                )
+                .await
+                .unwrap_err()
+                .error,
+            DeliveryError::UnknownResource
+        );
+        for _ in 0..3 {
+            for query in [false, true] {
+                let result = service
+                    .serve(&stream_id(), fetch(iframe).with_query_variables(query))
+                    .await
+                    .map_err(|failure| failure.error)?;
+                assert!(playlist(&result).contains("#EXT-X-I-FRAMES-ONLY"));
+                assert_eq!(playlist(&result).contains("token={$token}"), query);
+                let normal = service
+                    .serve(
+                        &stream_id(),
+                        video_playlist(None).with_query_variables(query),
+                    )
+                    .await
+                    .map_err(|failure| failure.error)?;
+                assert!(!playlist(&normal).contains("#EXT-X-I-FRAMES-ONLY"));
+                assert!(playlist(&normal).contains("#EXT-X-PART:"));
+            }
+        }
+        assert_eq!(service.meters().snapshot().playlists_rendered, 4);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn iframe_blocking_reload_waits_for_the_completed_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            delivery::hls::fixtures::{cmaf_fragment, write_cmaf_segment_with_keyframes},
+            mux::{
+                PackagedMedia, PackagedSegmentCompletion, PackagingRenditionId, PackagingSegmentId,
+            },
+        };
+        let store = StreamStore::default();
+        let lease = lease(&store, vec![video(0)]);
+        write(&lease, initialization(0, 1));
+        write_cmaf_segment_with_keyframes(&lease, 0, 0, 0, &[0, 2, 4])?;
+        let service = Service::new(
+            Arc::new(Origin::new(store)),
+            Config {
+                playlist: PlaylistPolicy {
+                    iframe_playlists: true,
+                    ..PlaylistPolicy::default()
+                },
+                readiness: PlaylistReadiness::AnyMedia,
+                ..Config::default()
+            },
+        );
+        let request = Request::new(
+            Resource::IFramePlaylist(RenditionId(0)),
+            Some(BlockingReload {
+                msn: Msn(3),
+                part: Some(PartIndex(0)),
+            }),
+        );
+        let held = tokio::spawn({
+            let service = service.clone();
+            async move { service.serve(&stream_id(), request).await }
+        });
+        tokio::task::yield_now().await;
+        let PackagedMedia::Chunk(mut first) = chunk(0, 1, 0, 6) else {
+            unreachable!()
+        };
+        first.payload = cmaf_fragment(true)?;
+        write(&lease, PackagedMedia::Chunk(first));
+        tokio::task::yield_now().await;
+        assert!(
+            !held.is_finished(),
+            "an I-frame reload cannot wake on a regular video part"
+        );
+        for index in 1..6 {
+            let PackagedMedia::Chunk(mut part) = chunk(0, 1, index, 6 + i64::from(index)) else {
+                unreachable!()
+            };
+            part.payload = cmaf_fragment(false)?;
+            write(&lease, PackagedMedia::Chunk(part));
+        }
+        write(
+            &lease,
+            PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
+                rendition_id: PackagingRenditionId(0),
+                packaging_segment_id: PackagingSegmentId(1),
+                media_start: 6,
+                duration: 6,
+            }),
+        );
+        let response = held.await?.map_err(|failure| failure.error)?;
+        assert_eq!(playlist(&response).matches("#EXT-X-BYTERANGE:").count(), 4);
+        lease.end();
+        let ended = service
+            .serve(
+                &stream_id(),
+                Request::new(
+                    Resource::IFramePlaylist(RenditionId(0)),
+                    Some(BlockingReload {
+                        msn: Msn(99),
+                        part: None,
+                    }),
+                ),
+            )
+            .await
+            .map_err(|failure| failure.error)?;
+        assert!(playlist(&ended).ends_with("#EXT-X-ENDLIST\n"));
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
