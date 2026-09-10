@@ -122,7 +122,7 @@ publish = false
 # Internal
 cc-outbound = { path = "crates/cc-outbound" }
 cc-hooks = { path = "crates/cc-hooks" }
-rtmpx = { git = "https://github.com/darfink/rtmpx", rev = "2d0894fdd3285ad688c9670f3cb99aca0075af15" }
+rtmpx = "2.0"
 cc-tls = { path = "crates/cc-tls" }
 cc-metrics = { path = "crates/cc-metrics" }
 
