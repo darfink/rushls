@@ -550,7 +550,6 @@ where
                 ServerSessionResult::OutboundResponse(packet) => {
                     timed_write(io, &packet.bytes, config.timeouts.write).await?;
                 }
-                ServerSessionResult::UnhandleableMessageReceived(_) => {}
                 ServerSessionResult::RaisedEvent(event) => match event {
                     ServerSessionEvent::ConnectionRequested {
                         request_id,
@@ -576,7 +575,7 @@ where
                         ..
                     } => {
                         match handler
-                            .on_publish(stream_id, &app_name, &stream_key)
+                            .on_publish(stream_id.get(), &app_name, &stream_key)
                             .await?
                         {
                             PublishOutcome::Accepted => {
@@ -622,33 +621,21 @@ where
                         })?;
                         handler.on_video(stream_id, timestamp.value, media).await?;
                     }
-                    ServerSessionEvent::StreamMetadataChanged {
-                        raw_metadata,
-                        raw_payload,
-                        ..
-                    } => {
-                        let metadata = ValidatedMetadata::parse(
-                            raw_payload,
-                            raw_metadata,
-                            ENHANCED_VALIDATION,
-                        )
-                        .map_err(|error| error.to_string().into_boxed_str())?;
+                    ServerSessionEvent::StreamMetadataChanged { message, .. } => {
+                        let metadata = ValidatedMetadata::parse(message, ENHANCED_VALIDATION)
+                            .map_err(|error| error.to_string().into_boxed_str())?;
                         let stream_id = handler.active_stream_id.ok_or_else(|| {
                             Box::<str>::from("metadata arrived before publish acceptance")
                         })?;
                         handler.on_metadata(stream_id, metadata).await?;
                     }
-                    ServerSessionEvent::StreamDataReceived {
-                        raw_payload,
-                        timestamp,
-                        ..
-                    } => {
+                    ServerSessionEvent::StreamDataReceived { message, .. } => {
                         let stream_id = handler.active_stream_id.ok_or_else(|| {
                             Box::<str>::from("script data arrived before publish acceptance")
                         })?;
-                        handler
-                            .on_script(stream_id, timestamp.value, raw_payload)
-                            .await?;
+                        let timestamp = message.timestamp().value;
+                        let payload = message.into_payload();
+                        handler.on_script(stream_id, timestamp, payload).await?;
                     }
                     ServerSessionEvent::PublishStreamFinished { .. } => {
                         if let Some(stream_id) = handler.active_stream_id {
@@ -669,6 +656,7 @@ where
                     }
                     _ => {}
                 },
+                _ => {}
             }
         }
         if follow_up.is_empty() {
@@ -805,7 +793,13 @@ fn session_handshake_error(
 #[cfg(test)]
 mod tests {
     use bytes::{Bytes, BytesMut};
-    use rtmpx::{EnhancedValidationMode, chunk_io::ChunkDeserializer};
+    use rtmpx::{
+        EnhancedValidationMode,
+        amf0::{Amf0Object, Amf0Value},
+        chunk_io::{ChunkDeserializer, ChunkSerializer},
+        messages::{MessagePayload, RtmpMessage},
+        time::RtmpTimestamp,
+    };
 
     use crate::{
         domain::Codec,
@@ -953,20 +947,162 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Feeds one client message into the session, pumping server replies back
+    /// through the deserializer so later responses decode against the same
+    /// chunk state.
+    fn exchange(
+        session: &mut ServerSession,
+        serializer: &mut ChunkSerializer,
+        deserializer: &mut ChunkDeserializer,
+        message: &MessagePayload,
+    ) -> (Vec<RtmpMessage>, Vec<ServerSessionEvent>) {
+        let packet = serializer
+            .serialize(message, false, false)
+            .expect("test message serializes");
+        let results = session
+            .handle_input(&packet.bytes[..])
+            .expect("session accepts test bytes");
+        drain(deserializer, results)
+    }
+
+    /// Splits session results into decoded server messages and raised events,
+    /// keeping the deserializer in step with the server chunk stream.
+    fn drain(
+        deserializer: &mut ChunkDeserializer,
+        results: Vec<ServerSessionResult>,
+    ) -> (Vec<RtmpMessage>, Vec<ServerSessionEvent>) {
+        let mut messages = Vec::new();
+        let mut events = Vec::new();
+        for result in results {
+            match result {
+                ServerSessionResult::OutboundResponse(packet) => {
+                    let mut next = deserializer
+                        .get_next_message(&packet.bytes[..])
+                        .expect("server bytes decode");
+                    loop {
+                        match next {
+                            Some(payload) => {
+                                let message =
+                                    payload.to_rtmp_message().expect("server message decodes");
+                                if let RtmpMessage::SetChunkSize { size } = &message {
+                                    deserializer
+                                        .set_max_chunk_size(*size as usize)
+                                        .expect("chunk size is valid");
+                                }
+                                messages.push(message);
+                            }
+                            None => break,
+                        }
+                        next = deserializer
+                            .get_next_message(&[])
+                            .expect("buffered bytes decode");
+                    }
+                }
+                ServerSessionResult::RaisedEvent(event) => events.push(event),
+                _ => {}
+            }
+        }
+        (messages, events)
+    }
+
+    // The session drive below is the test: splitting the connect/publish
+    // choreography across more helpers would hide the sequence under review.
+    // The `_result` stream id is a small server-assigned integer, so the
+    // float-to-int conversion cannot lose anything in practice.
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     #[tokio::test]
     async fn script_data_events_are_queued_for_the_packet_source() {
-        let (mut handler, _attempt, reader) = handler(nz::usize!(1024), 512);
-        handler.active_stream_id = Some(7);
-        let payload = crate::source::encode_cue(b"onCaption", b"hello");
-        let event = ServerSessionEvent::StreamDataReceived {
-            app_name: "live".into(),
-            stream_key: "camera-key".into(),
-            raw_payload: payload.clone(),
-            is_amf3: false,
-            timestamp: rtmpx::time::RtmpTimestamp::new(1_234),
-        };
+        let (handler, attempt, reader) = handler(nz::usize!(1024), 512);
         let (mut session, _initial) =
             ServerSession::new(ServerSessionConfig::new()).expect("session config is valid");
+        let mut serializer = ChunkSerializer::new();
+        let mut deserializer = ChunkDeserializer::new();
+
+        // The session only emits script events for an accepted publication,
+        // so drive connect, createStream, and publish for real.
+        let connect = RtmpMessage::Amf0Command {
+            command_name: "connect".into(),
+            transaction_id: 1.0,
+            command_object: Amf0Value::Object(Amf0Object::from([
+                ("app".into(), Amf0Value::Utf8String("live".into())),
+                ("objectEncoding".into(), Amf0Value::Number(0.0)),
+            ])),
+            additional_arguments: Vec::new(),
+        }
+        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .expect("connect encodes");
+        let (_, events) = exchange(&mut session, &mut serializer, &mut deserializer, &connect);
+        let request_id = match events.as_slice() {
+            [ServerSessionEvent::ConnectionRequested { request_id, .. }] => *request_id,
+            other => panic!("expected a connection request, got {other:?}"),
+        };
+        let accepted = session
+            .accept_request(request_id)
+            .expect("connection is accepted");
+        drain(&mut deserializer, accepted);
+
+        let create = RtmpMessage::Amf0Command {
+            command_name: "createStream".into(),
+            transaction_id: 2.0,
+            command_object: Amf0Value::Null,
+            additional_arguments: Vec::new(),
+        }
+        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .expect("createStream encodes");
+        let (responses, _) = exchange(&mut session, &mut serializer, &mut deserializer, &create);
+        let stream_id = responses
+            .iter()
+            .find_map(|response| match response {
+                RtmpMessage::Amf0Command {
+                    command_name,
+                    additional_arguments,
+                    ..
+                } if command_name == "_result" => match additional_arguments.as_slice() {
+                    [Amf0Value::Number(id)] => Some(*id as u32),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("server assigns a stream id");
+
+        let publish = RtmpMessage::Amf0Command {
+            command_name: "publish".into(),
+            transaction_id: 3.0,
+            command_object: Amf0Value::Null,
+            additional_arguments: vec![
+                Amf0Value::Utf8String("camera-key".into()),
+                Amf0Value::Utf8String("live".into()),
+            ],
+        }
+        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .expect("publish encodes");
+        let (_, events) = exchange(&mut session, &mut serializer, &mut deserializer, &publish);
+        let request_id = match events.as_slice() {
+            [ServerSessionEvent::PublishStreamRequested { request_id, .. }] => *request_id,
+            other => panic!("expected a publish request, got {other:?}"),
+        };
+        let accepted = session
+            .accept_request(request_id)
+            .expect("publish is accepted");
+        drain(&mut deserializer, accepted);
+        let mut handler = accept(handler, attempt, stream_id, "live", "camera-key").await;
+
+        // The cue bytes travel untouched: the session raises the event and the
+        // transport queues the raw payload for the packet source.
+        let payload = crate::source::encode_cue(b"onCaption", b"hello");
+        let script = MessagePayload {
+            timestamp: RtmpTimestamp::new(1_234),
+            type_id: 18, // AMF0 data, matching RtmpMessage::Amf0Data
+            message_stream_id: stream_id,
+            data: payload.clone(),
+        };
+        let packet = serializer
+            .serialize(&script, false, false)
+            .expect("script data serializes");
+        let results = session
+            .handle_input(&packet.bytes[..])
+            .expect("session accepts script data");
         let mut sink = tokio::io::sink();
 
         process_session_results(
@@ -974,7 +1110,7 @@ mod tests {
             &mut session,
             &mut handler,
             RtmpConfig::default(),
-            vec![ServerSessionResult::RaisedEvent(event)],
+            results,
         )
         .await
         .expect("script data is queued");
@@ -989,7 +1125,7 @@ mod tests {
             }
             other => panic!("expected script event, got {other:?}"),
         }
-        handler.on_unpublish(7).expect("clean unpublish");
+        handler.on_unpublish(stream_id).expect("clean unpublish");
     }
 
     #[tokio::test]

@@ -36,9 +36,9 @@ pub enum IngressEvent {
 impl IngressEvent {
     pub fn queued_bytes(&self) -> usize {
         match self {
-            Self::Audio { media, .. } => media.raw.len(),
-            Self::Video { media, .. } => media.raw.len(),
-            Self::Metadata(metadata) => metadata.raw.len(),
+            Self::Audio { media, .. } => media.raw().len(),
+            Self::Video { media, .. } => media.raw().len(),
+            Self::Metadata(metadata) => metadata.raw().len(),
             Self::Script { payload, .. } => payload.len(),
             Self::End(_) | Self::Failed(_) => 0,
         }

@@ -317,11 +317,11 @@ impl CatalogBuilder {
     ) -> Result<Observe, SourceError> {
         match event {
             IngressEvent::Metadata(metadata) => {
-                if let MediaInterpretation::Parsed(parsed) = metadata.interpretation {
+                if let MediaInterpretation::Parsed(parsed) = metadata.interpretation() {
                     self.hint = Some(parsed.encoder_summary());
                     self.expected_audio = numbered_track_ids(parsed.audio_tracks.keys());
                     self.expected_video = numbered_track_ids(parsed.video_tracks.keys());
-                    self.metadata = Some(parsed);
+                    self.metadata = Some(parsed.clone());
                 }
                 Ok(Observe::Continue)
             }
@@ -395,6 +395,7 @@ impl CatalogBuilder {
                 codec,
                 extradata,
                 track_id,
+                ..
             } => self.add_track(codec, extradata, track_id),
             sample @ ElementaryUnit::Sample {
                 codec, track_id, ..
@@ -420,6 +421,9 @@ impl CatalogBuilder {
                 self.prefetch.push_back(packet);
                 Ok(())
             }
+            _ => Err(SourceError::Demux(
+                "RTMP elementary unit is not recognized".into(),
+            )),
         }
     }
 
@@ -642,6 +646,9 @@ fn live_sample(
             )
             .map(Some)
         }
+        _ => Err(SourceError::Demux(
+            "RTMP elementary unit is not recognized".into(),
+        )),
     }
 }
 

@@ -41,6 +41,9 @@ pub fn track(
             Codec::Opus,
             crate::media::opus::parameters(&extradata).map_err(SourceError::Demux)?,
         ),
+        _ => {
+            return Err(SourceError::Demux("unsupported elementary codec".into()));
+        }
     };
     if let MediaParameters::Video { video_delay, .. } = &mut parameters {
         *video_delay = crate::media::video_config::properties(mapped, &extradata).reorder_depth;
@@ -244,5 +247,9 @@ pub fn codec(codec: ElementaryCodec) -> Codec {
         ElementaryCodec::Av1 => Codec::Av1,
         ElementaryCodec::Aac => Codec::Aac,
         ElementaryCodec::Opus => Codec::Opus,
+        // `ElementaryCodec` is non-exhaustive: a future rtmpx codec has no
+        // numeric identity here, so it compares unequal to every discovered
+        // codec and the live path rejects it as changed parameters.
+        _ => Codec::Unknown(u32::MAX),
     }
 }

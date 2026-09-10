@@ -43,27 +43,43 @@ fn text(properties: &Amf0Object, key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::domain::{SourceTrackKey, fixtures::TrackBuilder};
+    use rtmpx::sessions::{DataMessage, DataMessageType};
+    use rtmpx::time::RtmpTimestamp;
+    use rtmpx::{EnhancedValidationMode, MediaInterpretation, ValidatedMetadata};
+
     #[test]
     fn per_track_metadata_overrides_publication_defaults() {
-        let mut metadata = ParsedMetadata::default();
-        metadata
-            .properties
-            .insert("language".into(), Amf0Value::Utf8String("eng".into()));
-        metadata.properties.insert(
-            "audiotitle".into(),
-            Amf0Value::Utf8String("Main audio".into()),
-        );
-        metadata.audio_tracks.insert(
-            2,
-            rtmpx::metadata::TrackMetadata {
-                track_id: 2,
-                codec: None,
-                properties: Amf0Object::from([
-                    ("language".into(), Amf0Value::Utf8String("spa".into())),
-                    ("title".into(), Amf0Value::Utf8String(" Español ".into())),
-                ]),
-            },
-        );
+        // TrackMetadata is sealed inside rtmpx, so build the onMetaData bytes
+        // an encoder would send and parse them like the ingest path does.
+        let track = Amf0Object::from([
+            ("language".into(), Amf0Value::Utf8String("spa".into())),
+            ("title".into(), Amf0Value::Utf8String(" Español ".into())),
+        ]);
+        let properties = Amf0Object::from([
+            ("language".into(), Amf0Value::Utf8String("eng".into())),
+            (
+                "audiotitle".into(),
+                Amf0Value::Utf8String("Main audio".into()),
+            ),
+            (
+                "audioTrackIdInfoMap".into(),
+                Amf0Value::Object(Amf0Object::from([("2".into(), Amf0Value::Object(track))])),
+            ),
+        ]);
+        let payload = rtmpx::amf0::serialize(&[
+            Amf0Value::Utf8String("onMetaData".into()),
+            Amf0Value::Object(properties),
+        ])
+        .expect("test metadata serializes");
+        let message =
+            DataMessage::new(DataMessageType::Amf0, RtmpTimestamp::new(0), payload.into());
+        let metadata = ValidatedMetadata::parse(message, EnhancedValidationMode::Strict)
+            .expect("test metadata validates")
+            .into_parts()
+            .1;
+        let MediaInterpretation::Parsed(metadata) = metadata else {
+            panic!("test metadata parses");
+        };
         let mut track = TrackBuilder::new(0, MediaKind::Audio).build();
         track.source_key = Some(SourceTrackKey::new("audio/2"));
         apply(&mut track, &metadata);

@@ -241,16 +241,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
-name = "bitmask-enum"
-version = "2.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6cbbb8f56245b5a479b30a62cdc86d26e2f35c2b9f594bc4671654b03851380"
-dependencies = [
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "bitstream-io"
 version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1735,17 +1725,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
-name = "num-derive"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "num-integer"
 version = "0.1.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2231,15 +2210,14 @@ dependencies = [
 
 [[package]]
 name = "rtmpx"
-version = "1.0.0"
-source = "git+https://github.com/darfink/rtmpx?rev=70f0c497a70d35b1a9d7b2cdcb6bc3863dfca9d6#70f0c497a70d35b1a9d7b2cdcb6bc3863dfca9d6"
+version = "2.0.0"
+source = "git+https://github.com/darfink/rtmpx?rev=2d0894fdd3285ad688c9670f3cb99aca0075af15#2d0894fdd3285ad688c9670f3cb99aca0075af15"
 dependencies = [
  "byteorder",
  "bytes",
  "hmac 0.10.1",
  "indexmap",
  "rand 0.8.8",
- "scuffle-flv",
  "serde",
  "sha2",
  "thiserror",
@@ -2457,37 +2435,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "scuffle-aac"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b348e0f98480de1f16a9e9d9ffd338bdf2a43397954661005e2e1183553b30d8"
-dependencies = [
- "byteorder",
- "bytes",
- "num-derive",
- "num-traits",
- "scuffle-bytes-util",
- "scuffle-workspace-hack",
-]
-
-[[package]]
-name = "scuffle-amf0"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2db0c6c36b3c0ace0a46d73193d800374b6152de0e3209d0953078bd8eaa4e27"
-dependencies = [
- "byteorder",
- "bytes",
- "bytestring",
- "num-derive",
- "num-traits",
- "scuffle-bytes-util",
- "scuffle-workspace-hack",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "scuffle-av1"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2509,7 +2456,6 @@ dependencies = [
  "bytes",
  "bytestring",
  "scuffle-workspace-hack",
- "serde",
 ]
 
 [[package]]
@@ -2519,44 +2465,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48d21330974c941e4c0aedc1e7255ea809e8cbac51e135209f6d67843ad1b94d"
 dependencies = [
  "scuffle-bytes-util",
- "scuffle-workspace-hack",
-]
-
-[[package]]
-name = "scuffle-flv"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce3edb7142932d70b064c245df1215be9333ccf83f88cf3a9abe961ca82ef8"
-dependencies = [
- "bitmask-enum",
- "byteorder",
- "bytes",
- "num-derive",
- "num-traits",
- "nutype-enum",
- "scuffle-aac",
- "scuffle-amf0",
- "scuffle-av1",
- "scuffle-bytes-util",
- "scuffle-h264",
- "scuffle-h265",
- "scuffle-workspace-hack",
- "serde",
- "serde_derive",
- "thiserror",
-]
-
-[[package]]
-name = "scuffle-h264"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34ea4785ddd4440e626ec52557d29ae4e3ef576540eeb83b8928a767e6320588"
-dependencies = [
- "byteorder",
- "bytes",
- "nutype-enum",
- "scuffle-bytes-util",
- "scuffle-expgolomb",
  "scuffle-workspace-hack",
 ]
 
