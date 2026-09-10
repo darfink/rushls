@@ -1,9 +1,8 @@
 //! Descriptive RTMP metadata applied once, when discovery freezes the catalog.
 
 use crate::domain::{DiscoveredTrack, MediaKind};
-use cc_rtmp::ParsedMetadata;
-use rml_amf0::Amf0Value;
-use std::collections::HashMap;
+use rtmpx::ParsedMetadata;
+use rtmpx::amf0::{Amf0Object, Amf0Value};
 
 pub fn apply(track: &mut DiscoveredTrack, metadata: &ParsedMetadata) {
     let (tracks, language, title) = match track.kind() {
@@ -29,7 +28,7 @@ pub fn apply(track: &mut DiscoveredTrack, metadata: &ParsedMetadata) {
         .or_else(|| text(&metadata.properties, "title"));
 }
 
-fn text(properties: &HashMap<String, Amf0Value>, key: &str) -> Option<String> {
+fn text(properties: &Amf0Object, key: &str) -> Option<String> {
     let Amf0Value::Utf8String(value) = properties.get(key)? else {
         return None;
     };
@@ -56,10 +55,10 @@ mod tests {
         );
         metadata.audio_tracks.insert(
             2,
-            cc_rtmp::metadata::TrackMetadata {
+            rtmpx::metadata::TrackMetadata {
                 track_id: 2,
                 codec: None,
-                properties: HashMap::from([
+                properties: Amf0Object::from([
                     ("language".into(), Amf0Value::Utf8String("spa".into())),
                     ("title".into(), Amf0Value::Utf8String(" Español ".into())),
                 ]),

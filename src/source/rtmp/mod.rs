@@ -1,4 +1,4 @@
-//! Native RTMP `PacketSource` over `cc-rtmp` validated media.
+//! Native RTMP `PacketSource` over `rtmpx` validated media.
 //!
 //! The transport owns the socket and handshake. This module maps parsed audio
 //! and video messages onto the same [`Packet`](crate::source::Packet) contract

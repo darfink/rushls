@@ -1,7 +1,7 @@
 //! Where media enters the node.
 //!
 //! Transport and demux are exposed as one accepted source, but remain separate
-//! concerns inside a protocol adapter. RTMP maps `cc-rtmp` tags through
+//! concerns inside a protocol adapter. RTMP maps `rtmpx` tags through
 //! [`rtmp`]; SRT carries MPEG-TS into [`mpegts`]; MOQ maps hang LOC frames
 //! through [`moq`]. A [`PendingPublish`] therefore
 //! wires its byte transport into the demuxer and yields a ready

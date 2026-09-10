@@ -14,7 +14,6 @@ RUN apt-get update \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-COPY vendor ./vendor
 COPY apps ./apps
 
 # `.dockerignore` omits `.git`, so bake the commit in from the host:

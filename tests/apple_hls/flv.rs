@@ -1,7 +1,7 @@
 //! Split a checked-in FLV into RTMP tag bodies.
 
 use bytes::Bytes;
-use cc_rtmp::{EnhancedValidationMode, ValidatedMedia};
+use rtmpx::{EnhancedValidationMode, ValidatedMedia};
 use rushls::source::IngressEvent;
 
 /// FLV tags as RTMP ingress events. Script `onMetaData` is dropped: the native
@@ -102,7 +102,7 @@ fn tags(flv: &[u8]) -> Result<Vec<Tag<'_>>, String> {
 fn one_track_aac(
     legacy: &[u8],
     track_id: u8,
-) -> Result<cc_rtmp::ValidatedMedia<cc_rtmp::ParsedAudio>, String> {
+) -> Result<rtmpx::ValidatedMedia<rtmpx::ParsedAudio>, String> {
     if legacy.len() < 2 || legacy[0] != 0xaf {
         return Err("expected a legacy AAC FLV audio tag".into());
     }

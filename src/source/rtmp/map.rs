@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 
 use broadcast_common::Parse;
 use bytes::Bytes;
-use cc_rtmp::{ElementaryCodec, ElementaryUnit, EncoderSummary};
+use rtmpx::{ElementaryCodec, ElementaryUnit, EncoderSummary};
 
 use crate::{
     domain::{

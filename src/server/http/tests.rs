@@ -1794,9 +1794,9 @@ mod end_to_end {
             sequence.extend_from_slice(AAC_EXTRADATA);
             events.push(IngressEvent::Audio {
                 timestamp: 0,
-                media: cc_rtmp::ValidatedMedia::parse_audio(
+                media: rtmpx::ValidatedMedia::parse_audio(
                     bytes::Bytes::from(sequence),
-                    cc_rtmp::EnhancedValidationMode::Strict,
+                    rtmpx::EnhancedValidationMode::Strict,
                 )
                 .expect("OneTrack AAC sequence header is valid"),
             });
@@ -1809,9 +1809,9 @@ mod end_to_end {
                 payload.extend_from_slice(AAC_FRAME);
                 events.push(IngressEvent::Audio {
                     timestamp,
-                    media: cc_rtmp::ValidatedMedia::parse_audio(
+                    media: rtmpx::ValidatedMedia::parse_audio(
                         bytes::Bytes::from(payload),
-                        cc_rtmp::EnhancedValidationMode::Strict,
+                        rtmpx::EnhancedValidationMode::Strict,
                     )
                     .expect("OneTrack AAC frame is valid"),
                 });
@@ -1903,9 +1903,9 @@ mod end_to_end {
         sequence.extend_from_slice(AAC_EXTRADATA);
         audio.push(IngressEvent::Audio {
             timestamp: 0,
-            media: cc_rtmp::ValidatedMedia::parse_audio(
+            media: rtmpx::ValidatedMedia::parse_audio(
                 bytes::Bytes::from(sequence),
-                cc_rtmp::EnhancedValidationMode::Strict,
+                rtmpx::EnhancedValidationMode::Strict,
             )
             .expect("AAC sequence header is valid"),
         });
@@ -1917,9 +1917,9 @@ mod end_to_end {
                 .expect("test fixture timestamp fits");
             audio.push(IngressEvent::Audio {
                 timestamp,
-                media: cc_rtmp::ValidatedMedia::parse_audio(
+                media: rtmpx::ValidatedMedia::parse_audio(
                     bytes::Bytes::from(payload),
-                    cc_rtmp::EnhancedValidationMode::Strict,
+                    rtmpx::EnhancedValidationMode::Strict,
                 )
                 .expect("AAC frame is valid"),
             });
@@ -2310,17 +2310,17 @@ mod end_to_end {
             match kind {
                 8 => events.push(IngressEvent::Audio {
                     timestamp,
-                    media: cc_rtmp::ValidatedMedia::parse_audio(
+                    media: rtmpx::ValidatedMedia::parse_audio(
                         payload,
-                        cc_rtmp::EnhancedValidationMode::Strict,
+                        rtmpx::EnhancedValidationMode::Strict,
                     )
                     .expect("fixture audio tag is valid"),
                 }),
                 9 => events.push(IngressEvent::Video {
                     timestamp,
-                    media: cc_rtmp::ValidatedMedia::parse_video(
+                    media: rtmpx::ValidatedMedia::parse_video(
                         payload,
-                        cc_rtmp::EnhancedValidationMode::Strict,
+                        rtmpx::EnhancedValidationMode::Strict,
                     )
                     .expect("fixture video tag is valid"),
                 }),

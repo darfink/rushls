@@ -16,7 +16,7 @@ not build them until a publisher needs them.
 
 | Feature | Status | Notes |
 |---|---|---|
-| RTMP / Enhanced RTMP, one video + one audio | **done** | Native `cc-rtmp` → `Packet`. Live `mediastreamvalidator` on H.264 + AAC-LC. |
+| RTMP / Enhanced RTMP, one video + one audio | **done** | Native `rtmpx` → `Packet`. Live `mediastreamvalidator` on H.264 + AAC-LC. |
 | SRT MPEG-TS | **done** | `rsrt` (pure Rust, IPv4) into `StreamingTsDemux`. Unit fixture is H.264 + ADTS AAC. |
 | SRT Matroska / WebM | **gap** | EBML magic refused on purpose. MPEG-TS only. |
 | SRT FLV, MP4/fMP4, anything else avformat probed | **gap** | MPEG-TS only. Not an incomplete demuxer; other containers were never the live ingest contract. |
@@ -140,7 +140,7 @@ avformat path we replaced.
 
 ## Adapter boundaries and backpressure
 
-`cc-rtmp` exposes `ElementaryUnit` and `ElementaryCodec` through `elementary_units()`.
+`rtmpx` exposes `ElementaryUnit` and `ElementaryCodec` through `elementary_units()`.
 This API removes FLV framing and preserves decoder configuration bytes.
 It does not choose a media container or write CMAF boxes.
 Rushls owns codec interpretation, timestamp normalization, and packaging.

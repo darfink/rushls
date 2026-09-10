@@ -10,7 +10,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use cc_rtmp::{ElementaryCodec, ElementaryUnit, EncoderSummary, MediaInterpretation};
+use rtmpx::{ElementaryCodec, ElementaryUnit, EncoderSummary, MediaInterpretation};
 
 use crate::{
     domain::{
@@ -286,7 +286,7 @@ struct CatalogBuilder {
     text: Option<DiscoveredTrack>,
     next_id: u32,
     hint: Option<EncoderSummary>,
-    metadata: Option<cc_rtmp::ParsedMetadata>,
+    metadata: Option<rtmpx::ParsedMetadata>,
     expected_audio: BTreeSet<u8>,
     expected_video: BTreeSet<u8>,
     prefetch: VecDeque<Packet>,
@@ -666,7 +666,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use cc_rtmp::{EnhancedValidationMode, ValidatedMedia};
+    use rtmpx::{EnhancedValidationMode, ValidatedMedia};
 
     use crate::{
         domain::{Codec, MediaKind},

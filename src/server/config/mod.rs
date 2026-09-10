@@ -17,9 +17,9 @@ use std::{
 };
 
 use bytesize::ByteSize;
-use cc_rtmp::ServerSessionTimeouts;
 use cc_tls::{ClientIdentity, load_roots};
 use conf::{Conf, find_parameter, introspection::ProgramOptionMeta};
+use rtmpx::ServerSessionTimeouts;
 use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use thiserror::Error;

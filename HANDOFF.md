@@ -25,7 +25,7 @@
   - subtitle timing projected to 90 kHz for future `X-TIMESTAMP-MAP` rendering.
 - Normalization was split by responsibility: pipeline samples, presented
   timing, contracts, and per-kind pass-through implementations are separate.
-- Enhanced RTMP v2 r2 ingest through the shared `cc-rtmp` core. Admission
+- Enhanced RTMP v2 r2 ingest through the shared `rtmpx` core. Admission
   pauses the publish command, typed-and-validated audio/video and lossless AMF
   payloads are framed as a byte-bounded FLV stream, and the existing AVFormat
   source performs discovery and demuxing.

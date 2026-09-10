@@ -10,7 +10,7 @@ allocation-counting = []
 cc-hooks.workspace = true
 cc-metrics.workspace = true
 cc-outbound.workspace = true
-cc-rtmp.workspace = true
+rtmpx.workspace = true
 cc-tls = { workspace = true, features = ["axum"] }
 arc-swap = "1"
 derive_more = { version = "2", features = ["debug", "deref", "display"] }
@@ -21,7 +21,6 @@ directories = "6"
 # Streaming MPEG-TS demux and codec-config records. CENC and playlist
 # spokes stay off: this crate only consumes the TS event source.
 transmux = { version = "0.24", default-features = false, features = ["std"] }
-rml_amf0.workspace = true
 broadcast-common = { version = "9.3", default-features = false, features = ["std"] }
 humantime = "2"
 isolang = { version = "2.4.0", default-features = false }
@@ -90,7 +89,7 @@ tower = { version = "0.5", features = ["util"] }
 # a CA the machine already trusts, instead of installing a trust root itself.
 rcgen = { version = "0.14", features = ["x509-parser"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
-cc-rtmp.workspace = true
+rtmpx.workspace = true
 bytes = "1.12.1"
 serde_json = "1"
 nz = "0.4"
@@ -123,10 +122,9 @@ publish = false
 # Internal
 cc-outbound = { path = "crates/cc-outbound" }
 cc-hooks = { path = "crates/cc-hooks" }
-cc-rtmp = { path = "crates/cc-rtmp" }
+rtmpx = { git = "https://github.com/darfink/rtmpx", rev = "70f0c497a70d35b1a9d7b2cdcb6bc3863dfca9d6" }
 cc-tls = { path = "crates/cc-tls" }
 cc-metrics = { path = "crates/cc-metrics" }
-rml_rtmp = { path = "vendor/rml_rtmp" }
 
 # External
 arc-swap = "1"
@@ -142,12 +140,12 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
   "logging",
 ] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+# Order-preserving map: AMF object property order is part of the wire encoding,
+# and a std HashMap randomises iteration per process, which makes the bytes we
+# emit differ between runs.
 notify = "8"
 notify-debouncer-full = "0.7"
 parking_lot = "0.12"
-rml_amf0 = "0.3"
-# `ring` rather than `aws-lc-rs`: the latter wants cmake and NASM, which both
-# applications independently chose to avoid in their build images.
 rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "std",

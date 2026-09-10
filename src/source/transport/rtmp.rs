@@ -1,12 +1,12 @@
 //! RTMP handshake and native packet source.
 //!
-//! RTMP media messages are already parsed by `cc-rtmp`. This adapter maps those
+//! RTMP media messages are already parsed by `rtmpx`. This adapter maps those
 //! tags onto [`crate::source::rtmp::RtmpPacketSource`].
 
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use cc_rtmp::{
+use rtmpx::{
     EnhancedCapabilities, EnhancedValidationMode, ServerSessionTimeouts, ValidatedMedia,
     ValidatedMetadata,
     handshake::{Handshake, HandshakeProcessResult, PeerType},
@@ -410,7 +410,7 @@ impl MediaHandler {
         &mut self,
         stream_id: u32,
         timestamp: u32,
-        media: ValidatedMedia<cc_rtmp::ParsedAudio>,
+        media: ValidatedMedia<rtmpx::ParsedAudio>,
     ) -> Result<(), Box<str>> {
         self.require_active(stream_id)?;
         self.send(IngressEvent::Audio { timestamp, media }).await
@@ -420,7 +420,7 @@ impl MediaHandler {
         &mut self,
         stream_id: u32,
         timestamp: u32,
-        media: ValidatedMedia<cc_rtmp::ParsedVideo>,
+        media: ValidatedMedia<rtmpx::ParsedVideo>,
     ) -> Result<(), Box<str>> {
         self.require_active(stream_id)?;
         self.send(IngressEvent::Video { timestamp, media }).await
@@ -699,9 +699,8 @@ fn publish_rejection_status(rejection: PublishRejection) -> (&'static str, &'sta
     }
 }
 
-fn enhanced_server_capabilities() -> std::collections::HashMap<String, cc_rtmp::rml_amf0::Amf0Value>
-{
-    use cc_rtmp::rml_amf0::Amf0Value;
+fn enhanced_server_capabilities() -> rtmpx::amf0::Amf0Object {
+    use rtmpx::amf0::Amf0Value;
     let video = ["avc1", "hvc1", "av01"];
     let audio = ["mp4a", "Opus"];
     let info_map = |values: &[&str]| {
@@ -712,7 +711,7 @@ fn enhanced_server_capabilities() -> std::collections::HashMap<String, cc_rtmp::
                 .collect(),
         )
     };
-    std::collections::HashMap::from([
+    rtmpx::amf0::Amf0Object::from([
         (
             "fourCcList".to_owned(),
             Amf0Value::StrictArray(
@@ -806,7 +805,7 @@ fn session_handshake_error(
 #[cfg(test)]
 mod tests {
     use bytes::{Bytes, BytesMut};
-    use cc_rtmp::{EnhancedValidationMode, chunk_io::ChunkDeserializer};
+    use rtmpx::{EnhancedValidationMode, chunk_io::ChunkDeserializer};
 
     use crate::{
         domain::Codec,
@@ -963,7 +962,8 @@ mod tests {
             app_name: "live".into(),
             stream_key: "camera-key".into(),
             raw_payload: payload.clone(),
-            timestamp: cc_rtmp::time::RtmpTimestamp::new(1_234),
+            is_amf3: false,
+            timestamp: rtmpx::time::RtmpTimestamp::new(1_234),
         };
         let (mut session, _initial) =
             ServerSession::new(ServerSessionConfig::new()).expect("session config is valid");

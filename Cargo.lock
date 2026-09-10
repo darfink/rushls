@@ -125,7 +125,7 @@ dependencies = [
  "nom",
  "num-traits",
  "rusticata-macros",
- "thiserror 2.0.20",
+ "thiserror",
  "time",
 ]
 
@@ -292,7 +292,7 @@ checksum = "5f877d1a97df67c36b18d58e688ac2c1fe0141610dcfb80b15e2e8d077fb60da"
 dependencies = [
  "broadcast-common",
  "serde",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -350,7 +350,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror",
  "time",
  "tokio",
  "uuid",
@@ -376,21 +376,8 @@ dependencies = [
  "hyper-util",
  "rustls",
  "rustls-native-certs",
- "thiserror 2.0.20",
+ "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "cc-rtmp"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "pretty_assertions",
- "rml_amf0",
- "rml_rtmp",
- "scuffle-flv",
- "serde",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -403,7 +390,7 @@ dependencies = [
  "notify-debouncer-full",
  "rcgen",
  "rustls",
- "thiserror 2.0.20",
+ "thiserror",
  "tokio",
  "tokio-rustls",
 ]
@@ -695,12 +682,6 @@ dependencies = [
  "syn 2.0.119",
  "unicode-xid",
 ]
-
-[[package]]
-name = "diff"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "digest"
@@ -1372,7 +1353,7 @@ dependencies = [
  "jni-sys",
  "log",
  "simd_cesu8",
- "thiserror 2.0.20",
+ "thiserror",
  "walkdir",
  "windows-link",
 ]
@@ -1597,7 +1578,7 @@ checksum = "b2857d2a3b939c161edce8296806cd27eed7f082255af8cf6ca704808cad5cbb"
 dependencies = [
  "bytes",
  "moq-net",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -1614,7 +1595,7 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "slab",
- "thiserror 2.0.20",
+ "thiserror",
  "tracing",
  "web-async",
  "web-transport-trait",
@@ -1627,7 +1608,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "138b87f1ec4f563225517347af8714e9b5a630d6bbc8bfe3f8270b65be19140f"
 dependencies = [
  "broadcast-common",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -1646,7 +1627,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7b0a14b2fccfe1185e9ac1445c6cc4b03817dc86cb0b5aae77e749f2b85a3f9"
 dependencies = [
  "broadcast-common",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -1657,7 +1638,7 @@ checksum = "512cb7deb70d98f550ffa3e79cf21e1b9d5a5246ecc5cbaedf496f604230789b"
 dependencies = [
  "broadcast-common",
  "mpeg-pes",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -1669,7 +1650,7 @@ dependencies = [
  "broadcast-common",
  "bytes",
  "serde",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -1978,16 +1959,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pretty_assertions"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
-dependencies = [
- "diff",
- "yansi",
-]
-
-[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2019,7 +1990,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror 2.0.20",
+ "thiserror",
  "tokio",
  "tracing",
  "web-time",
@@ -2043,7 +2014,7 @@ dependencies = [
  "rustls-pki-types",
  "rustls-platform-verifier",
  "slab",
- "thiserror 2.0.20",
+ "thiserror",
  "tinyvec",
  "tracing",
  "web-time",
@@ -2165,7 +2136,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -2230,29 +2201,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rml_amf0"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63551cfcd4d1f42733c190e4b58dd268b1eacb73410d9afbf62784aa12cac240"
-dependencies = [
- "byteorder",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "rml_rtmp"
-version = "0.8.0"
-dependencies = [
- "byteorder",
- "bytes",
- "hmac 0.10.1",
- "rand 0.8.8",
- "rml_amf0",
- "sha2",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "rsrt"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2278,7 +2226,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d15f8ed86bb42723fc757106758ac613e05fb3271853ae47c67c3c29bb0f347a"
 dependencies = [
  "broadcast-common",
- "thiserror 2.0.20",
+ "thiserror",
+]
+
+[[package]]
+name = "rtmpx"
+version = "1.0.0"
+source = "git+https://github.com/darfink/rtmpx?rev=70f0c497a70d35b1a9d7b2cdcb6bc3863dfca9d6#70f0c497a70d35b1a9d7b2cdcb6bc3863dfca9d6"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "hmac 0.10.1",
+ "indexmap",
+ "rand 0.8.8",
+ "scuffle-flv",
+ "serde",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -2288,7 +2252,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e90bb0dff7dd49086be03f6c6b90b87c6a8a0457e66b4470a4853e0b2fb7d8a"
 dependencies = [
  "broadcast-common",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -2304,7 +2268,6 @@ dependencies = [
  "cc-hooks",
  "cc-metrics",
  "cc-outbound",
- "cc-rtmp",
  "cc-tls",
  "conf",
  "derive_more",
@@ -2329,14 +2292,14 @@ dependencies = [
  "parking_lot",
  "rcgen",
  "ring",
- "rml_amf0",
  "rsrt",
+ "rtmpx",
  "rustls",
  "scuffle-av1",
  "scuffle-h265",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
+ "thiserror",
  "time",
  "tokio",
  "tokio-rustls",
@@ -2521,7 +2484,7 @@ dependencies = [
  "scuffle-bytes-util",
  "scuffle-workspace-hack",
  "serde",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -2580,7 +2543,7 @@ dependencies = [
  "scuffle-workspace-hack",
  "serde",
  "serde_derive",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -2812,7 +2775,7 @@ checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
 dependencies = [
  "num-bigint",
  "num-traits",
- "thiserror 2.0.20",
+ "thiserror",
  "time",
 ]
 
@@ -2903,31 +2866,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl 2.0.20",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -3226,7 +3169,7 @@ dependencies = [
  "rtcp-packet",
  "rtp-packet",
  "serde",
- "thiserror 2.0.20",
+ "thiserror",
 ]
 
 [[package]]
@@ -3442,7 +3385,7 @@ dependencies = [
  "bytes",
  "http",
  "sfv",
- "thiserror 2.0.20",
+ "thiserror",
  "tokio",
  "url",
 ]
@@ -3460,7 +3403,7 @@ dependencies = [
  "quinn",
  "rustls",
  "rustls-native-certs",
- "thiserror 2.0.20",
+ "thiserror",
  "tokio",
  "tracing",
  "url",
@@ -3739,15 +3682,9 @@ dependencies = [
  "oid-registry",
  "ring",
  "rusticata-macros",
- "thiserror 2.0.20",
+ "thiserror",
  "time",
 ]
-
-[[package]]
-name = "yansi"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yasna"

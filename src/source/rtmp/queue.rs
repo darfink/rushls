@@ -7,8 +7,8 @@
 use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc};
 
 use bytes::Bytes;
-use cc_rtmp::{ParsedAudio, ParsedVideo, ValidatedMedia, ValidatedMetadata};
 use parking_lot::Mutex;
+use rtmpx::{ParsedAudio, ParsedVideo, ValidatedMedia, ValidatedMetadata};
 use tokio::sync::Notify;
 
 use crate::source::InputState;

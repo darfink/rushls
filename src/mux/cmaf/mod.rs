@@ -1980,9 +1980,9 @@ mod tests {
         raw.extend_from_slice(payload);
         IngressEvent::Audio {
             timestamp,
-            media: cc_rtmp::ValidatedMedia::parse_audio(
+            media: rtmpx::ValidatedMedia::parse_audio(
                 bytes::Bytes::from(raw),
-                cc_rtmp::EnhancedValidationMode::Strict,
+                rtmpx::EnhancedValidationMode::Strict,
             )
             .expect("legacy AAC is valid"),
         }
@@ -1993,9 +1993,9 @@ mod tests {
         raw.extend_from_slice(payload);
         IngressEvent::Video {
             timestamp,
-            media: cc_rtmp::ValidatedMedia::parse_video(
+            media: rtmpx::ValidatedMedia::parse_video(
                 bytes::Bytes::from(raw),
-                cc_rtmp::EnhancedValidationMode::Strict,
+                rtmpx::EnhancedValidationMode::Strict,
             )
             .expect("legacy AVC sample is valid"),
         }
@@ -2006,9 +2006,9 @@ mod tests {
         raw.extend_from_slice(payload);
         IngressEvent::Video {
             timestamp: 0,
-            media: cc_rtmp::ValidatedMedia::parse_video(
+            media: rtmpx::ValidatedMedia::parse_video(
                 bytes::Bytes::from(raw),
-                cc_rtmp::EnhancedValidationMode::Strict,
+                rtmpx::EnhancedValidationMode::Strict,
             )
             .expect("legacy AVC config is valid"),
         }
@@ -2171,9 +2171,9 @@ mod tests {
                 writer
                     .send(IngressEvent::Audio {
                         timestamp,
-                        media: cc_rtmp::ValidatedMedia::parse_audio(
+                        media: rtmpx::ValidatedMedia::parse_audio(
                             bytes::Bytes::copy_from_slice(payload),
-                            cc_rtmp::EnhancedValidationMode::Strict,
+                            rtmpx::EnhancedValidationMode::Strict,
                         )
                         .expect("AAC FLV tag"),
                     })
@@ -2562,9 +2562,9 @@ mod tests {
             writer
                 .send(IngressEvent::Audio {
                     timestamp,
-                    media: cc_rtmp::ValidatedMedia::parse_audio(
+                    media: rtmpx::ValidatedMedia::parse_audio(
                         bytes::Bytes::from(raw),
-                        cc_rtmp::EnhancedValidationMode::Strict,
+                        rtmpx::EnhancedValidationMode::Strict,
                     )?,
                 })
                 .await?;

@@ -6,7 +6,7 @@
 
 use std::io::Cursor;
 
-use rml_amf0::Amf0Value;
+use rtmpx::amf0::Amf0Value;
 
 const ON_CAPTION: &str = "onCaption";
 const ON_TEXT_DATA: &str = "onTextData";
@@ -16,7 +16,7 @@ const ON_TEXT_DATA: &str = "onTextData";
 /// Unknown script names, malformed AMF0, and objects without a string `text`
 /// property are ignored: a caption glitch must not fail the publication.
 pub fn cue_text(payload: &[u8]) -> Option<String> {
-    let values = rml_amf0::deserialize(&mut Cursor::new(payload)).ok()?;
+    let values = rtmpx::amf0::deserialize(&mut Cursor::new(payload)).ok()?;
     let Amf0Value::Utf8String(name) = values.first()? else {
         return None;
     };
