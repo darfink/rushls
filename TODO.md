@@ -1,5 +1,6 @@
 - Support AV1 SVC
 - Original IP-address for MoQ sources?
+- Should we have IP rate limiting in app? Otherwise, w/o pacing, publisher can do 256 publishes to saturate capacity
 - Warn instead of prevent non-HLS compliant settings?
 - Input tracks may in theory have PTS belonging to different epochs
 - Run an LLM against HLS spec and comment all spec related behavior
