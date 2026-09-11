@@ -8,6 +8,7 @@
 pub mod body;
 pub mod hls;
 pub mod origin;
+pub mod record;
 pub mod response;
 pub mod store;
 pub mod uri;

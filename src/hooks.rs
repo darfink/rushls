@@ -63,6 +63,9 @@ impl Occurrence for Event {
                 "stream_id": started.stream.0.as_str(),
                 "session_id": session_id(started.session),
                 "principal": started.principal,
+                "protocol": started.publisher.protocol,
+                "resource": started.publisher.resource,
+                "client": started.publisher.client,
             }),
             // Stream-lifetime events carry no session: they are about the
             // stream, which outlives whichever publisher made it playable.
@@ -76,6 +79,9 @@ impl Occurrence for Event {
                 "stream_id": ended.stream.0.as_str(),
                 "session_id": session_id(ended.session),
                 "principal": ended.principal,
+                "protocol": ended.publisher.protocol,
+                "resource": ended.publisher.resource,
+                "client": ended.publisher.client,
                 "outcome": ended.outcome.to_string(),
                 "duration_ms": u64::try_from(ended.duration.as_millis()).unwrap_or(u64::MAX),
                 "was_available": ended.was_available,

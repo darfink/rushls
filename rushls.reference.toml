@@ -151,12 +151,16 @@ memory_per_stream = "256MiB"             # retained parts and segments; worst-ca
 
 # Write a copy of every segment to a filesystem. Outlives the stream and is
 # never served by this origin, so it is unrelated to retain. For sending
-# segments elsewhere, use a hook with payload = true; this table is local only.
+# segments elsewhere requires the future payload-hook feature; this table is local only.
 # [record]
 # dir     = "/archive"
-# pattern = "{stream}/{time:%Y/%m/%d}/{rendition}_{segment}.m4s"
+# pattern = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
+# queue_capacity = 128
+# maximum_pending_bytes = 268435456
 # Completed segments only, never parts. Each file carries its own header, so it
-# plays on its own, and appears at its final name only once fully written.
+# contains its decoder configuration. Source random access and codec preroll
+# still apply. Final filenames appear only after all bytes are written.
+# Queue overflow or disk errors report recording failures; live delivery continues.
 
 # Omit this whole table to serve no metrics at all. Present, they get their own
 # listener; set listen to the [http] address to serve them on that port instead.
@@ -168,9 +172,11 @@ listen = "127.0.0.1:9090"
 
 # [hook.automation]
 # url        = "http://automation.example.internal/rushls"
-# events     = ["publisher.start", "stream.ready", "stream.gone", "publisher.stop"]
+# events     = ["session.started", "stream.available", "stream.unavailable", "session.ended"]
 # token_file = "/run/secrets/rushls-webhook-token"
 # token      = "${WEBHOOK_TOKEN}"        # inline form; prefer token_file
+# signing_secret_file = "/run/secrets/rushls-webhook-signing"
+# signing_secret = "${WEBHOOK_SIGNING_SECRET}" # whsec_ plus base64 of 32+ random bytes
 # On an untrusted network, prove this origin to the endpoint and pin the
 # issuer in return. Same three fields as [auth.publish], and the same reload
 # behaviour: certificates rotate in place. A hook setting any of these gets a
@@ -181,9 +187,10 @@ listen = "127.0.0.1:9090"
 
 # [hook.billing]
 # url    = "http://billing.example.internal/rushls"
-# events = ["publisher.stop"]
+# events = ["session.ended"]
 
-# Fires once per completed segment, per rendition. Segment cadence: one stream
+# Not implemented: segment.ready and payload hooks are refused at startup.
+# Future design: fires once per completed segment, per rendition. Segment cadence: one stream
 # at segment.target = "6s" sends 600/hour.
 # [hook.archive]
 # url    = "http://archive.example.internal/rushls"

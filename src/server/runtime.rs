@@ -59,6 +59,7 @@ pub struct NodeConfig {
     /// One budget covering both drains, because it answers one operator
     /// question and is sized against an orchestrator's own grace period.
     pub shutdown: Duration,
+    pub record: Option<crate::delivery::record::Config>,
     pub rtmp_address: SocketAddr,
     pub srt_address: SocketAddr,
     /// WebTransport ingest. `None` leaves MOQ off, which is the compiled default
@@ -124,6 +125,7 @@ impl Default for NodeConfig {
         Self {
             name: node_name(),
             shutdown: Duration::from_secs(10),
+            record: None,
             rtmp_address: "0.0.0.0:1935".parse().expect("constant address is valid"),
             srt_address: "0.0.0.0:9000".parse().expect("constant address is valid"),
             moq_address: None,
@@ -147,6 +149,8 @@ impl Default for NodeConfig {
 pub enum RuntimeError {
     #[error("invalid node configuration: {0}")]
     InvalidConfiguration(&'static str),
+    #[error("could not initialize recording: {0}")]
+    Recording(std::io::Error),
     #[error("could not bind RTMP at {address}: {source}")]
     BindRtmp {
         address: SocketAddr,
@@ -198,6 +202,7 @@ pub struct Node {
     application: Arc<ViewerApplication>,
     metrics: MetricsReader,
     playback: Option<PlaybackSettings>,
+    recorder: Option<crate::delivery::record::Recorder>,
 }
 
 /// The protocols sharing one viewer-facing HTTP namespace.
@@ -228,7 +233,7 @@ impl ViewerApplication {
             .origin
             .stream(&named.stream)
             .and_then(|live| self.origin.rendition_for(&live, named.resource).ok())
-            .map(|rendition| Duration::from_secs(rendition.contract.target_duration.get()));
+            .map(|rendition| rendition.contract.target_duration());
         let result = async {
             let live = self
                 .origin
@@ -243,7 +248,7 @@ impl ViewerApplication {
                     self.hls.media_deadline(rendition.contract),
                 )
                 .await?;
-            let target = Duration::from_secs(object.contract.target_duration.get());
+            let target = object.contract.target_duration();
             DeliveryResponse::media(
                 object.body,
                 object.gzip,
@@ -332,7 +337,15 @@ impl Node {
         let store = StreamStore::try_new(config.store.clone())?.with_events(events.clone());
         let sessions = Registry::with_capacity(config.maximum_sessions);
         let meters = ProcessMeters::default();
-        let services = Services {
+        let recorder = config
+            .record
+            .as_ref()
+            .map(|record| {
+                crate::delivery::record::Recorder::start(record, events.clone(), meters.clone())
+            })
+            .transpose()
+            .map_err(RuntimeError::Recording)?;
+        let mut services = Services {
             authenticator,
             normalizers: Arc::new(PassThroughNormalizerFactory),
             muxers: Arc::new(PassThroughMuxerFactory),
@@ -348,6 +361,12 @@ impl Node {
             meters: meters.clone(),
             events,
         };
+        if let Some(recorder) = &recorder {
+            services.publishers = Arc::new(crate::delivery::record::RecordingFactory {
+                inner: services.publishers.clone(),
+                recorder: recorder.clone(),
+            });
+        }
         let origin = Arc::new(Origin::new(store.clone()));
         let hls = Arc::new(HlsService::new(Arc::clone(&origin), config.hls.clone()));
         let application = Arc::new(ViewerApplication::new(
@@ -371,6 +390,7 @@ impl Node {
             application,
             metrics,
             playback,
+            recorder,
         })
     }
 
@@ -528,6 +548,7 @@ impl Node {
             joined = tasks.join_next() => (false, joined.and_then(task_error)),
         };
 
+        let drain_deadline = tokio::time::Instant::now() + self.config.shutdown;
         readiness.mark_not_ready();
 
         if shutdown_requested {
@@ -541,6 +562,11 @@ impl Node {
             }
         }
 
+        if let Some(recorder) = &self.recorder {
+            recorder
+                .drain(drain_deadline.saturating_duration_since(tokio::time::Instant::now()))
+                .await;
+        }
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),

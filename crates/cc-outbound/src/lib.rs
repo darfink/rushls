@@ -322,10 +322,29 @@ impl HttpClient {
         bearer: Option<&BearerToken>,
         body: Bytes,
     ) -> Result<Response, OutboundError> {
+        self.post_with_headers(endpoint, content_type, bearer, body, &HeaderMap::new())
+            .await
+    }
+
+    /// Sends application headers alongside the ordinary content type and credential.
+    /// The latter remain authoritative even if the supplied map contains them.
+    pub async fn post_with_headers(
+        &self,
+        endpoint: &Endpoint,
+        content_type: &'static str,
+        bearer: Option<&BearerToken>,
+        body: Bytes,
+        headers: &HeaderMap,
+    ) -> Result<Response, OutboundError> {
         let mut request = Request::post(endpoint.uri())
             .header(header::CONTENT_TYPE, HeaderValue::from_static(content_type))
             .body(Full::new(body))
             .map_err(|error| OutboundError::Unreachable(error.to_string()))?;
+        request.headers_mut().extend(headers.clone());
+        request
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+        request.headers_mut().remove(header::AUTHORIZATION);
         if let Some(bearer) = bearer {
             request
                 .headers_mut()

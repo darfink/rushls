@@ -12,6 +12,8 @@ mod ids;
 mod instant;
 mod language;
 mod payload;
+mod publisher;
+pub use publisher::{ClientInfo, IngestProtocol, PublishResource, PublisherContext};
 mod rfc6381;
 mod time;
 mod track;

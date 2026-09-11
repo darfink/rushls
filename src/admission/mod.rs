@@ -6,7 +6,6 @@
 //! the two modules from depending on each other.
 
 use std::{
-    net::SocketAddr,
     num::{NonZeroU16, NonZeroU32},
     time::Duration,
 };
@@ -27,37 +26,7 @@ pub use predicate::{Bounds, Codecs, FrameBox, Resolution};
 #[cfg(test)]
 mod fixtures;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IngestProtocol {
-    Rtmp,
-    Srt,
-    Moq,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PublishResource {
-    pub namespace: Option<String>,
-    pub name: String,
-}
-
-impl PublishResource {
-    /// Preserves the transport's requested resource as a canonical stream ID.
-    ///
-    /// The namespace may itself contain separators (for example an SRT
-    /// resource such as `organization/live/camera`), so joining happens only
-    /// at this already-normalized resource boundary.
-    pub fn stream_id(&self) -> Option<StreamId> {
-        if self.name.is_empty() {
-            return None;
-        }
-
-        match &self.namespace {
-            Some(namespace) if namespace.is_empty() => None,
-            Some(namespace) => Some(StreamId::new(format!("{namespace}/{}", self.name))),
-            None => Some(StreamId::new(self.name.clone())),
-        }
-    }
-}
+pub use crate::domain::{ClientInfo, IngestProtocol, PublishResource};
 
 #[derive(Clone, Eq, PartialEq, Debug)]
 #[debug("PresentedCredential([REDACTED])")]
@@ -71,13 +40,6 @@ impl PresentedCredential {
     pub fn expose(&self) -> &[u8] {
         &self.0
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClientInfo {
-    pub remote_address: SocketAddr,
-    pub encoder: Option<String>,
-    pub protocol_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

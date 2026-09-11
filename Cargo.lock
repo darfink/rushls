@@ -333,11 +333,13 @@ name = "cc-hooks"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bytes",
  "cc-outbound",
  "derive_more",
  "http",
  "parking_lot",
+ "ring",
  "serde",
  "serde_json",
  "thiserror",
@@ -2248,6 +2250,7 @@ dependencies = [
  "cc-metrics",
  "cc-outbound",
  "cc-tls",
+ "chrono",
  "conf",
  "derive_more",
  "directories",

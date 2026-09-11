@@ -115,6 +115,7 @@ pub struct SessionStarted {
     pub stream: StreamId,
     pub session: SessionId,
     pub principal: String,
+    pub publisher: crate::domain::PublisherContext,
 }
 
 /// The stream became playable.
@@ -151,6 +152,7 @@ pub struct SessionEnded {
     pub stream: StreamId,
     pub session: SessionId,
     pub principal: String,
+    pub publisher: crate::domain::PublisherContext,
     pub outcome: Outcome,
     /// How long the publisher was admitted for.
     pub duration: Duration,
@@ -231,6 +233,7 @@ pub struct Projector {
 struct Tracked {
     stream: StreamId,
     principal: String,
+    publisher: crate::domain::PublisherContext,
     started_at: Instant,
     /// Whether this publisher's pipeline ever started running.
     reached_running: bool,
@@ -263,7 +266,11 @@ impl Projector {
     /// report and no stream to report it against.
     pub fn project(&self, session: SessionId, event: &SessionEvent) -> Option<Event> {
         match event {
-            SessionEvent::Accepted { stream, principal } => {
+            SessionEvent::Accepted {
+                stream,
+                principal,
+                publisher,
+            } => {
                 let mut live = self.live.lock();
                 // A session id is unique per publisher, so an occupied entry
                 // would mean the pipeline emitted `Accepted` twice.
@@ -272,6 +279,7 @@ impl Projector {
                     Tracked {
                         stream: stream.clone(),
                         principal: principal.clone(),
+                        publisher: publisher.clone(),
                         started_at: Instant::now(),
                         reached_running: false,
                     },
@@ -280,6 +288,7 @@ impl Projector {
                     stream: stream.clone(),
                     session,
                     principal: principal.clone(),
+                    publisher: publisher.clone(),
                 }))
             }
             SessionEvent::Running => {
@@ -322,6 +331,7 @@ impl Projector {
             stream: tracked.stream,
             session,
             principal: tracked.principal,
+            publisher: tracked.publisher,
             outcome,
             duration: Instant::now().saturating_duration_since(tracked.started_at),
             was_available: tracked.reached_running,
@@ -339,6 +349,7 @@ mod tests {
         SessionEvent::Accepted {
             stream: StreamId::new(stream),
             principal: "studio-camera".into(),
+            publisher: crate::domain::fixtures::publisher(),
         }
     }
 

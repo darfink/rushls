@@ -19,8 +19,12 @@ impl EventObserver for TracingEvents {
     #[allow(clippy::too_many_lines)]
     fn observe(&self, session: SessionId, event: SessionEvent) {
         match event {
-            SessionEvent::Accepted { stream, principal } => {
-                info!(session = %session, stream = %stream, principal = %principal, "accepted");
+            SessionEvent::Accepted {
+                stream,
+                principal,
+                publisher,
+            } => {
+                info!(session = %session, stream = %stream, principal = %principal, protocol = %publisher.protocol, remote_address = %publisher.client.remote_address, "accepted");
             }
             SessionEvent::Displaced { stream } => {
                 info!(session = %session, stream = %stream, "displaced");
@@ -228,6 +232,18 @@ impl EventObserver for TracingEvents {
                     hook = %hook,
                     count,
                     "hook deliveries had unknown outcomes at shutdown"
+                );
+            }
+            NodeEvent::RecordingFailed { stream, reason } => {
+                error!(%stream, %reason, "recording failed");
+            }
+            NodeEvent::RecordingRecovered { lost } => {
+                info!(lost, "recording recovered");
+            }
+            NodeEvent::RecordingDrainExpired { pending } => {
+                warn!(
+                    pending,
+                    "recording shutdown deadline expired; pending outcomes unknown"
                 );
             }
             NodeEvent::HookEventUnrenderable { reason } => {

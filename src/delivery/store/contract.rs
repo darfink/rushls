@@ -47,6 +47,16 @@ pub struct PlaylistContract {
 }
 
 impl PlaylistContract {
+    /// The advertised `EXT-X-TARGETDURATION` as a wall-clock [`Duration`].
+    ///
+    /// The tag is a whole-second count, so this is exact rather than rounded.
+    /// [`Duration::from_secs`] is total over every `u64`, so the widest
+    /// `NonZeroU64` yields the widest representable whole-second duration
+    /// without a multiplication that could overflow.
+    pub fn target_duration(&self) -> Duration {
+        Duration::from_secs(self.target_duration.get())
+    }
+
     /// The one `EXT-X-TARGETDURATION` every media playlist of a presentation
     /// advertises, or `None` for a presentation with no renditions.
     ///
@@ -187,6 +197,22 @@ mod tests {
         assert!(contract.permits_segment(Duration::from_secs(7)));
         assert!(contract.permits_segment(Duration::from_millis(7_499)));
         assert!(!contract.permits_segment(Duration::from_millis(7_500)));
+    }
+
+    #[test]
+    fn the_target_duration_accessor_is_exact_and_never_panics() {
+        assert_eq!(
+            alone(&config(630_000, Some(90_000))).target_duration(),
+            Duration::from_secs(7)
+        );
+
+        // Nothing in the tag type bounds the count, but `from_secs` is total:
+        // the widest count maps to the widest whole-second duration.
+        let absurd = PlaylistContract {
+            target_duration: NonZeroU64::MAX,
+            ..alone(&config(630_000, None))
+        };
+        assert_eq!(absurd.target_duration(), Duration::new(u64::MAX, 0));
     }
 
     #[test]

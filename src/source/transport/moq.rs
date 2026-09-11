@@ -124,7 +124,7 @@ impl MoqListener {
         let companion = loopback_companion(address).and_then(|sibling| {
             match web_transport_quinn::quinn::Endpoint::server(server_config, sibling) {
                 Ok(endpoint) => {
-                    tracing::info!(protocol = "MOQ", address = %sibling, "listening on the sibling loopback address");
+                    tracing::info!(protocol = "moq", address = %sibling, "listening on the sibling loopback address");
                     Some(endpoint)
                 }
                 Err(error) => {

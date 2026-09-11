@@ -252,9 +252,7 @@ impl LiveStream {
                 .iter()
                 .map(|r| {
                     self.limits
-                        .minimum_playlist_duration_for(Duration::from_secs(
-                            r.contract.target_duration.get(),
-                        ))
+                        .minimum_playlist_duration_for(r.contract.target_duration())
                 })
                 .max()
                 .unwrap_or_else(|| self.limits.retain.resolve(Duration::ZERO)),
@@ -766,9 +764,7 @@ impl LiveStream {
             .iter()
             .map(|r| {
                 self.limits
-                    .minimum_playlist_duration_for(Duration::from_secs(
-                        r.contract.target_duration.get(),
-                    ))
+                    .minimum_playlist_duration_for(r.contract.target_duration())
             })
             .max()
             .unwrap_or_else(|| self.limits.retain.resolve(Duration::ZERO));

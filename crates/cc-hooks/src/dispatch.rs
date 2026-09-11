@@ -191,12 +191,27 @@ async fn send<E: Occurrence>(
     let mut backoff = INITIAL_BACKOFF;
 
     for attempt in 1..=shared.config.maximum_attempts {
+        // Timestamp the attempt, not the occurrence: queued events can be old,
+        // while receivers must still be able to enforce a short replay window.
+        let headers =
+            shared
+                .config
+                .signing_secret
+                .as_ref()
+                .map_or_else(http::HeaderMap::new, |secret| {
+                    secret.headers(
+                        &envelope.id,
+                        time::OffsetDateTime::now_utc().unix_timestamp(),
+                        &envelope.body,
+                    )
+                });
         let result = client
-            .post(
+            .post_with_headers(
                 &shared.config.endpoint,
                 CONTENT_TYPE,
                 shared.config.bearer.as_ref(),
                 envelope.body.clone(),
+                &headers,
             )
             .await;
 

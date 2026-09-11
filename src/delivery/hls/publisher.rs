@@ -175,7 +175,7 @@ impl PublisherFactory for StorePublisherFactory {
                         "hold-back is below twice the selected part target".into(),
                     ));
                 }
-                let segment = std::time::Duration::from_secs(contract.target_duration.get());
+                let segment = contract.target_duration();
                 if retain.resolve(segment) < segment.saturating_mul(3) {
                     return Err(HlsError::Initialization(
                         "retention is below three selected segment targets".into(),

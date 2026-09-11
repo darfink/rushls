@@ -41,6 +41,11 @@ pub enum TransportError {
     Reject(Box<str>),
 }
 
+/// Transport-level acceptance: the demultiplexed source plus its grant.
+///
+/// Session admission wraps this with the observed publisher identity; see
+/// `session::run_session`. The names differ on purpose: accepted is what the
+/// transport hands over, admitted is what the session runs.
 pub struct AcceptedPublish {
     pub source: Box<dyn PacketSource>,
     pub grant: PublishGrant,

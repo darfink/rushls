@@ -2,7 +2,7 @@
 
 > **Status: largely implemented.** Outstanding, in the order they are least
 > to most self-contained: moderate timestamp jumps becoming discontinuities,
-> payload-carrying hooks, `[record]`,
+> payload-carrying hooks,
 > and enforcing `memory_per_publisher`. Playlist Delta Updates,
 > playback authorization, and
 > effective retention-depth reporting have landed, including the disk tier.
@@ -352,16 +352,19 @@ refresh, and a claim naming the stream a token admits.
 
 ## Export
 
-**`[record]`**: a filesystem sink with pattern expansion. No URL form.
+**`[record]`**: implemented as a bounded filesystem writer with pattern expansion.
+No URL form. The archive publication UUID prevents sequence collisions across
+restarts. Recording errors report failures without stopping live delivery.
 
-**Atomic writes**: temporary name on the same filesystem, sync, rename, sync
-the parent directory. The temporary path sharing the destination's filesystem
+**Atomic writes**: temporary name on the same filesystem, sync, atomically link
+the final name without replacement, remove the temporary name, sync the parent
+directory. The temporary path sharing the destination's filesystem
 is a correctness requirement, not a preference.
 
 **Initialization prepended to every export.** Both recorded files and hook
-payloads. Delivery over HLS is unchanged and keeps using `EXT-X-MAP`. There is
-precedent in the codebase: the subtitle muxer already concatenates its header
-into segment bytes.
+payloads. Delivery over HLS is unchanged and keeps using `EXT-X-MAP`. The
+recorder also prepends the WebVTT header to subtitle cue bodies.
+Exported codec configuration does not replace random-access or preroll media.
 
 ## Hooks
 

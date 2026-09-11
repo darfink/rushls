@@ -16,6 +16,7 @@ pub enum SessionEvent {
     Accepted {
         stream: StreamId,
         principal: String,
+        publisher: crate::domain::PublisherContext,
     },
     /// A previously running session lost this stream to a new publisher.
     Displaced {
@@ -228,6 +229,24 @@ pub enum NodeEvent {
     /// A fault in this process rather than in delivery, so it names no hook:
     /// nothing was addressed yet when it failed.
     HookEventUnrenderable { reason: String },
+    /// The recorder started losing archive segments; live delivery continues.
+    ///
+    /// A transition, not a per-segment report: it fires once when a healthy
+    /// recorder begins failing and stays quiet while the failure persists, so a
+    /// stalled disk is one event rather than one per segment. The rate belongs
+    /// in [`ProcessMeters`](super::ProcessMeters); [`Self::RecordingRecovered`]
+    /// closes the window and carries the total lost while it was open.
+    RecordingFailed { stream: StreamId, reason: String },
+    /// Archive writes are succeeding again after [`Self::RecordingFailed`].
+    ///
+    /// Carries the segments lost while the window was open, so a consumer that
+    /// saw only the edge can still account for everything it thereby missed.
+    /// The window is node-wide rather than per-stream because every cause —
+    /// disk, delivery queue, and byte budget — is a resource shared by all
+    /// streams on the node.
+    RecordingRecovered { lost: usize },
+    /// These writes may still complete, but shutdown no longer waits for them.
+    RecordingDrainExpired { pending: usize },
     /// A connection ended before it said what it wanted to publish.
     ///
     /// How often this happens is up to whoever is connecting, so the count
@@ -260,7 +279,7 @@ pub enum NodeEvent {
 
 /// Which listener an event is about.
 #[derive(Clone, Copy, Debug, Display, Eq, PartialEq)]
-#[display(rename_all = "UPPERCASE")]
+#[display(rename_all = "lowercase")]
 pub enum Protocol {
     Rtmp,
     Srt,

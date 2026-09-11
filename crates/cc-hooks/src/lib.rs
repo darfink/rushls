@@ -36,6 +36,8 @@
 mod dispatch;
 mod envelope;
 mod queue;
+mod signing;
+pub use signing::{InvalidSigningSecret, SigningSecret};
 
 #[cfg(test)]
 mod tests;
@@ -160,6 +162,8 @@ pub struct HookConfig<K> {
     pub maximum_attempts: u32,
     #[debug(skip)]
     pub bearer: Option<BearerToken>,
+    /// Optional Standard Webhooks HMAC-SHA256 signing key.
+    pub signing_secret: Option<SigningSecret>,
     /// A client of this destination's own, or `None` to use the shared one.
     ///
     /// Present only when a destination asked for something a shared pool
@@ -181,6 +185,10 @@ pub struct HooksConfig<K> {
     /// consumers see a single logical producer.
     pub source: String,
     /// Versions the whole event vocabulary as one family.
+    ///
+    /// Additive changes keep the version: consumers must ignore fields they
+    /// do not recognize. Removing or redefining a field bumps it, and a
+    /// subscription names the kind, so it receives every version of that kind.
     pub schema_version: u32,
     /// How long a shutdown waits for queued events before abandoning them.
     pub drain_timeout: Duration,

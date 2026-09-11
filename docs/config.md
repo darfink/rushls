@@ -1,7 +1,7 @@
 # RFC: the Rushls configuration surface
 
 > **Status: implemented**, apart from the features named as not built below:
-> `[record]` and payload-carrying hooks. Their keys are refused at startup
+> Payload-carrying hooks and `segment.ready`. Their keys are refused at startup
 > rather than silently accepted.
 >
 > **The goal was inverted on purpose.** This document does not describe how to
@@ -660,72 +660,97 @@ each event id to recognise a repeat, so several nodes sharing one name appear
 as a single logical producer — which is occasionally what a deployment wants,
 and is expressed by setting the same `name`.
 
-## Exports carry their own header
+## Recording and exports
 
-A fragmented-MP4 segment cannot be decoded without its initialization segment.
-The rule:
+`[record]` writes persistent local copies of completed segments. It never writes
+unfinished segments or individual LL-HLS parts. DVR retention does not remove
+recordings, and the origin does not serve the archive.
 
-- **Segments leaving the origin carry their header.** Both `[record]` files and
-  hook payloads are self-contained and play on their own.
-- **Segments served over HLS do not.** `EXT-X-MAP` is how the specification
-  wants it, and duplicating the header to every viewer is real bandwidth.
+Each MP4 file contains its matching initialization followed by its media chunks
+in order. Initialization versions stay attached to the segments they describe.
+WebVTT files contain one header followed by cue data. HLS delivery still uses
+`EXT-X-MAP` and does not repeat the initialization in each media response.
 
-A header is typically under 2KB against a multi-megabyte segment — roughly
-0.04% — and it removes a whole class of silent corruption, because an
-initialization can be retired while segments that referenced it are still live.
-A consumer caching "the header for this rendition" can otherwise pair the wrong
-one after a mid-stream parameter change.
+These files preserve the source timeline. They are separate rendition files,
+not a combined audio/video movie. They contain the decoder configuration but do
+not add missing random-access samples or codec preroll. Video must have a usable
+random-access boundary. Opus recovery can require preceding audio for an exact
+start. Recording does not transcode or repair the source.
 
-## `[record]` versus hooks
+### Filesystem destinations
 
-| | Moves | Destination |
-| --- | --- | --- |
-| `[record]` | segment bytes | a filesystem |
-| `[hook.*]` | events, optionally with bytes | HTTP |
-
-Every outbound HTTP request is a hook. `[record]` writes locally and has no URL
-form, because sending bytes over HTTP is what a hook with `payload = true`
-already does, and two ways to POST identical bytes to identical endpoints is
-the kind of silent overlap this design removes elsewhere.
-
-`[auth]` keeps its own table despite also being HTTP: it is request/response
-inside the publisher's admission deadline and its answer changes what happens
-next. Hooks are fire-and-forget with retries and a queue. Same transport,
-opposite control flow.
+`dir` accepts a filesystem path. URLs, including `file://`, are refused.
+HTTP export belongs to payload hooks, which remain unimplemented.
+Object-storage FUSE mounts are unsuitable because they can lack the required
+filesystem operations. A separate uploader can scan completed files, upload
+them, then remove them. Rotation and offload remain external.
 
 ### Pattern
 
-`pattern` has four variables. `{stream}` is the requested name with `/` preserved
-as directories; `..`, absolute paths, and empty segments are refused rather
-than sanitized into collisions. `{time:...}` is the UTC wall-clock time of
-segment completion in `strftime` form. `{rendition}` is the durable rendition
-name and `{segment}` is its integer media sequence. The trailing extension in the
-pattern sets the media suffix (`.m4s` in the reference); subtitle renditions keep
-the same basename with `.vtt` instead, so one pattern covers both without collision.
-Unknown variables refuse at startup. The directory grows unbounded by design;
-rotation and offload are external, which is why the atomic-rename contract below matters.
+The default configuration is:
 
-### Atomicity
+```toml
+[record]
+dir = "/archive"
+pattern = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
+queue_capacity = 128
+maximum_pending_bytes = 268435456
+```
 
-Recorded segments appear at their final name only once fully written: write to
-a temporary name on the same filesystem, sync, rename, then sync the parent
-directory. Rename within a filesystem is atomic, so a directory scan never sees
-a partial file.
+The placeholders have these meanings:
 
-That gives a colocated uploader a contract with no coordination: scan, upload,
-delete. A file existing at its final name *is* the completion signal, which
-survives a restart in a way that a missed notification does not.
+| Placeholder | Value |
+| --- | --- |
+| `{stream}` | Authorized stream ID, matching hook `stream_id`, with `/` preserved |
+| `{publication}` | Archive publication UUID, unique across reconnects and restarts |
+| `{time:...}` | UTC segment-completion time in `strftime` format |
+| `{rendition}` | Stable rendition key, with `/` preserved |
+| `{segment}` | Publisher-local segment sequence, starting at zero |
 
-Object-storage FUSE layers do not provide atomic rename. For those targets the
-right answer is a hook with `payload = true`, not `[record]` onto a filesystem
-that only looks like one.
+The archive publication UUID is separate from the process-local hook `session_id`.
+The default pattern prevents collisions after sequence numbering restarts.
+Custom patterns can omit placeholders, but existing files are never overwritten.
+Subtitle files replace the configured suffix with `.vtt`.
+Because that replacement drops everything after the last dot of the last path
+component, `{segment}` cannot be the last placeholder in one: `{rendition}.{segment}`
+fails configuration validation, while `{rendition}_{segment}` and
+`{rendition}.{segment}.mp4` both keep the segment in the name.
+Environment interpolation runs first, so `${ARCHIVE_ROOT}` can supply `dir`.
 
-Completed segments only, never low-latency parts. The archive therefore lags
-the live edge by up to one `segment`.
+Unknown placeholders and invalid time formats fail configuration validation.
+Absolute expanded paths, empty path components, `.` and `..` are refused.
+Backslashes, control characters, and the `.rushls-` temporary prefix are also
+refused. Archive subdirectories cannot be symlinks.
+
+### Atomicity and failures
+
+The writer creates a hidden temporary file in the destination directory and
+syncs its contents. It then creates the final name with an atomic hard link,
+removes the temporary name, and syncs the parent directory. Unlike ordinary
+rename, this commit refuses an existing destination without a race.
+New subdirectory entries are also synced. A final filename means the entire
+file was written. Scanners must ignore `.rushls-*.tmp` files. A crash can leave
+these temporary files behind.
+
+One background thread performs filesystem writes. `queue_capacity` bounds
+waiting segments. `maximum_pending_bytes` bounds retained bytes for open
+segments, queued files, and the active write. Small payloads also incur a
+minimum metadata charge. An open segment has a separate 16,384-handle limit.
+
+If the queue or byte budget is exhausted, the recorder discards the entire
+affected segment and reports a recording failure. Disk errors and filename
+collisions also report failures. Live delivery continues. Recording is
+best-effort during overload, not a lossless admission requirement.
+
+An invalid archive root fails startup. After publishers stop, accepted writes drain
+within the remaining `[node] shutdown` budget. An expired drain reports pending
+outcomes as unknown. Unsynced work does not survive a process crash.
 
 ## Hook delivery
 
-Bodies are CloudEvents. Two modes:
+Lifecycle hooks use structured CloudEvents JSON. `segment.ready` and payload
+hooks are not implemented. The following two-mode design describes that future
+export feature:
 
 In configuration you subscribe with the short name (`segment.ready`). On the wire
 the type is versioned (`rushls.segment.ready.v1`) so consumers can distinguish
@@ -804,33 +829,38 @@ trip would put an external service on the critical path of playback.
 
 ### Publish
 
-One HTTP service, asked once per publisher:
+One HTTP service receives a versioned JSON request per publisher. It returns one
+of these decisions:
 
 ```json
-{"decision": "allow", "stream": "live/camera", "user": "account-42"}
-{"decision": "allow", "stream": "live/camera", "user": "account-42",
+{"decision": "allow", "stream_id": "live/camera", "principal": "account-42"}
+{"decision": "allow", "stream_id": "live/camera", "principal": "account-42",
  "policy": "premium"}
 {"decision": "deny", "reason": "subscription_inactive"}
 ```
 
-`policy` names an entry under `[accept.policy]`, replacing `[accept]` for that
-publisher; omitting it applies `[accept]`. That is the whole of what a response
-may decide about media, and Layering above says why it is a name rather than
-the predicates themselves.
+`policy` selects a local `[accept.policy]` entry. An omitted policy uses
+`[accept]`. The response cannot define media predicates or override observed
+transport details. Unknown fields, unknown policies, missing identities, and
+blank identities fail closed. The request version defines the response schema.
 
-**The admission service is trusted.** A policy may widen what this node
-accepts, so a service choosing policies can admit more than the default
-allows — bounded, though, by the set the file defines, which is the point of
-naming rather than carrying. The channel still carries real authority: a
-bearer token at minimum, and on an untrusted network a client certificate.
+The request carries `version`, `request_id`, `protocol`, `resource`, `credential`,
+and `client`. Protocol is `rtmp`, `srt`, or `moq`. Credentials use base64 so
+non-UTF-8 bytes survive unchanged. A configured token supplies the HTTP
+`Authorization: Bearer` header independently of the publisher credential.
 
-The request is a POST with a JSON body carrying four fields: `protocol` (`rtmp`
-or `srt`), `stream` (the requested name), `remote` (the peer address), and a unique
-`request_id` the service can use for idempotence. When a token is configured it
-goes out as `Authorization: Bearer`. The call has a short
-timeout inside the 10s admission deadline and is fail-closed: a timeout, an
-error, or a deny all refuse the publisher, with no retries. A refused publisher
-can reconnect, which is the retry.
+The call runs inside the admission deadline and never retries. A timeout,
+non-success status, malformed response, or deny refuses the publisher.
+A publisher can reconnect for a new admission attempt.
+
+Both `session.started` and `session.ended` hooks carry the same observed
+`protocol`, `resource`, and `client` shape as the auth request. They also carry
+the authorized `stream_id` and `principal`. Credentials never enter lifecycle
+events. The auth service controls the grant, while the node controls observed
+transport facts.
+
+See [Publisher API](publisher-api.md) for complete examples and hook signature
+verification.
 
 ### Playback
 

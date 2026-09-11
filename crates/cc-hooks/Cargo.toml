@@ -8,6 +8,8 @@ publish.workspace = true
 description = "Best-effort, per-subject-ordered delivery of lifecycle events to operator-configured endpoints"
 
 [dependencies]
+ring = "0.17"
+base64 = "0.22"
 bytes.workspace = true
 cc-outbound.workspace = true
 # Redacts the bearer token from `Debug`, so a credential cannot reach a log

@@ -94,6 +94,16 @@ counters! {
             "rushls_drain_failures_total",
             "Sessions that failed while flushing their tail."
         ),
+        /// The rate a stalled recorder runs at. Carried here rather than in an
+        /// event because [`NodeEvent::RecordingFailed`] is reported on the edge
+        /// of a failure window, not once per segment; without this the count of
+        /// lost segments would be readable only from the log stream.
+        ///
+        /// [`NodeEvent::RecordingFailed`]: super::NodeEvent::RecordingFailed
+        recording_segments_lost: u64 = Counter(
+            "rushls_recording_segments_lost_total",
+            "Archive segments not written because recording failed."
+        ),
         bytes_received: u64 = Counter(
             "rushls_bytes_received_total",
             "Bytes received from publishers."
@@ -181,6 +191,14 @@ impl ProcessMeters {
     /// mid-segment disconnect look like a node-level fault.
     pub fn drain_failed(&self) {
         add(&self.counters.drain_failures, 1);
+    }
+
+    /// Records one archive segment that was not written.
+    ///
+    /// Called for every loss, so it climbs throughout a failure window while
+    /// the matching event fires only at the edges.
+    pub fn recording_segment_lost(&self) {
+        add(&self.counters.recording_segments_lost, 1);
     }
 
     pub fn tls_handshake_completed(&self) {

@@ -83,6 +83,7 @@ fn hook(address: SocketAddr, events: &[lifecycle::Kind]) -> HookConfig {
         maximum_in_flight: 4,
         maximum_attempts: 3,
         bearer: None,
+        signing_secret: None,
         // Nothing to authenticate over loopback, so the shared pool serves.
         client: None,
     }
@@ -93,6 +94,7 @@ fn started(stream: &str, session: u64) -> Event {
         stream: StreamId::new(stream),
         session: SessionId(session.try_into().expect("a nonzero session id")),
         principal: "studio-camera".into(),
+        publisher: crate::domain::fixtures::publisher(),
     })
 }
 
@@ -213,6 +215,7 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
         SessionEvent::Accepted {
             stream: StreamId::new("live/camera"),
             principal: "camera".into(),
+            publisher: crate::domain::fixtures::publisher(),
         },
     );
     observer.observe(session, SessionEvent::Running);
@@ -244,6 +247,13 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
         ],
         "both lifetimes arrive interleaved on one ordered stream: the +         publisher stops before the stream does"
     );
+    let bodies = recorder.bodies();
+    for body in [&bodies[0], &bodies[2]] {
+        assert_eq!(body["data"]["protocol"], "rtmp");
+        assert_eq!(body["data"]["client"]["remote_address"], "127.0.0.1:1935");
+        assert_eq!(body["data"]["resource"]["name"], "presented-key");
+        assert!(body["data"].get("credential").is_none());
+    }
     assert_eq!(
         seen.sessions.lock().len(),
         3,
@@ -304,6 +314,7 @@ async fn only_subscribed_events_are_delivered() {
         stream: StreamId::new("live/camera"),
         session: SessionId(nz::u64!(1)),
         principal: "studio-camera".into(),
+        publisher: crate::domain::fixtures::publisher(),
         outcome: lifecycle::Outcome::Ended,
         duration: Duration::from_mins(3),
         was_available: true,
@@ -333,6 +344,7 @@ fn a_projected_session_reaches_the_hooks_it_subscribed_to() {
         SessionEvent::Accepted {
             stream: StreamId::new("live/camera"),
             principal: "studio-camera".into(),
+            publisher: crate::domain::fixtures::publisher(),
         },
         SessionEvent::Running,
         SessionEvent::Draining,

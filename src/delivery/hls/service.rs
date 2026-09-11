@@ -354,7 +354,7 @@ impl Service {
         resource
             .rendition()
             .and_then(|rendition| rendition_entry(&stream, rendition))
-            .map(|entry| target_duration_of(entry.contract))
+            .map(|entry| entry.contract.target_duration())
             .or_else(|| longest_target_duration(&stream))
     }
 
@@ -509,7 +509,7 @@ impl Service {
             rendered.gzip,
             HLS_CONTENT_TYPE,
             self.config.cache_control.playlist(
-                Some(target_duration_of(snapshot.contract)),
+                Some(snapshot.contract.target_duration()),
                 // Skip-only is still the live edge. Skip plus `_HLS_msn` /
                 // `_HLS_part` names one playlist state.
                 blocking.is_some(),
@@ -709,11 +709,6 @@ fn advance_part_limit_exceeded(
     }
 }
 
-/// The whole-second target duration a contract promised.
-fn target_duration_of(contract: PlaylistContract) -> Duration {
-    Duration::from_secs(contract.target_duration.get())
-}
-
 /// The widest cadence in the presentation.
 ///
 /// What paces anything that belongs to no single rendition, for the same reason
@@ -721,7 +716,7 @@ fn target_duration_of(contract: PlaylistContract) -> Duration {
 /// narrowest cadence would be wrong for every other rendition in the playlist.
 fn longest_target_duration(stream: &StreamSnapshot) -> Option<Duration> {
     project::active_contracts(stream)
-        .map(target_duration_of)
+        .map(|contract| contract.target_duration())
         .max()
 }
 

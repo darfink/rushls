@@ -1030,8 +1030,6 @@ fn keys_for_unbuilt_features_are_refused_by_name() -> Result<(), Box<dyn Error>>
         "[auth.publish]\nurl = \"http://auth\"\nclient_certificate = \"/x.pem\"\n",
         // Payload-carrying hooks.
         "[hook.archive]\nurl = \"http://archive\"\nevents = [\"session.started\"]\npayload = true\n",
-        // The local archive.
-        "[record]\ndir = \"/archive\"\n",
     ] {
         assert!(
             resolve_toml(configuration)?.is_err(),
@@ -2088,5 +2086,70 @@ fn iframe_playlistss_are_disabled_by_default_and_configurable() -> Result<(), Bo
             .playlist
             .iframe_playlists
     );
+    Ok(())
+}
+
+#[test]
+fn recording_patterns_and_hook_signing_are_validated_at_startup() -> Result<(), Box<dyn Error>> {
+    let resolved = resolve_toml(
+        "[record]\ndir = '/archive'\npattern = '{stream}/{publication}/{time:%Y%m%d}/{rendition}_{segment}.mp4'\n",
+    )??;
+    assert_eq!(
+        resolved
+            .node
+            .record
+            .as_ref()
+            .map(|record| record.queue_capacity),
+        Some(128)
+    );
+    for config in [
+        "[record]\ndir = 'https://archive'",
+        "[record]\ndir = '/archive'\npattern = '{typo}.mp4'",
+        "[record]\ndir = '/archive'\npattern = '../{stream}.mp4'",
+        // The `.vtt` suffix of a subtitle rendition replaces everything after
+        // the last dot, so this would name one file for every subtitle segment.
+        "[record]\ndir = '/archive'\npattern = '{rendition}.{segment}'",
+        "[record]\ndir = '/archive'\nqueue_capacity = 0",
+        "[record]\ndir = '/archive'\nmaximum_pending_bytes = 0",
+        "[record]\ndir = '/archive'\nunknown = 1",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = 'bad-secret'",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = 'bad-secret'\nsigning_secret_file = '/missing'",
+    ] {
+        assert!(!matches!(resolve_toml(config), Ok(Ok(_))), "{config}");
+    }
+    let signed = resolve_toml(
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = 'whsec_BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc='\n",
+    )??;
+    assert!(signed.hooks.is_some());
+    Ok(())
+}
+
+#[test]
+fn secret_files_tolerate_a_trailing_newline() -> Result<(), Box<dyn Error>> {
+    // Every ordinary way of writing a secret file -- `openssl rand -base64 32
+    // > file`, a heredoc, a Kubernetes secret projection -- ends it with a
+    // newline. base64 decoding and header parsing both reject that byte, so
+    // the resolver has to absorb it rather than fail startup with a message
+    // that blames the secret's format.
+    let signing = TempConfig::new("whsec_BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\n")?;
+    let token = TempConfig::new("hunter2\n")?;
+    let resolved = resolve_toml(&format!(
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret_file = '{}'\ntoken_file = '{}'\n",
+        signing.path.display(),
+        token.path.display(),
+    ))??;
+    assert!(resolved.hooks.is_some());
+
+    // A file that is genuinely not a valid secret still fails, and still
+    // names the format rather than the whitespace it once carried.
+    let malformed = TempConfig::new("whsec_not+base64!\n")?;
+    let Err(error) = resolve_toml(&format!(
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret_file = '{}'\n",
+        malformed.path.display(),
+    ))?
+    else {
+        panic!("a malformed signing secret must be refused");
+    };
+    assert!(error.to_string().contains("base64"), "{error}");
     Ok(())
 }

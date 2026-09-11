@@ -95,6 +95,7 @@ fn envelope(thing: &str) -> crate::Envelope<Thing, Happening> {
 #[derive(Clone, Default)]
 struct Recorder {
     received: Arc<Mutex<Vec<serde_json::Value>>>,
+    wire: Arc<Mutex<Vec<(http::HeaderMap, Bytes)>>>,
     /// Answered until `failures` requests have been served.
     failing_status: Arc<AtomicU16>,
     failures: Arc<AtomicUsize>,
@@ -113,7 +114,12 @@ impl Recorder {
     }
 }
 
-async fn receive(State(recorder): State<Recorder>, body: Bytes) -> StatusCode {
+async fn receive(
+    State(recorder): State<Recorder>,
+    headers: http::HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    recorder.wire.lock().push((headers, body.clone()));
     let body: serde_json::Value =
         serde_json::from_slice(&body).expect("a hook body is always JSON");
     recorder.received.lock().push(body);
@@ -173,6 +179,7 @@ fn hook(address: SocketAddr, events: &[Happening]) -> HookConfig<Happening> {
         maximum_in_flight: 4,
         maximum_attempts: 3,
         bearer: None,
+        signing_secret: None,
         client: None,
     }
 }
@@ -486,4 +493,62 @@ fn losses_are_counted_apart_because_they_mean_different_things() {
     .collect();
 
     assert_eq!(names.len(), 5);
+}
+
+#[tokio::test]
+async fn signed_retries_cover_the_exact_wire_body_and_stable_event_id() -> Result<(), Box<dyn Error>>
+{
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let recorder = Recorder::default();
+    recorder.failures.store(1, Ordering::Relaxed);
+    recorder.failing_status.store(503, Ordering::Relaxed);
+    let address = start(recorder.clone()).await;
+    let mut destination = hook(address, &[Happening::Began]);
+    destination.signing_secret = Some(crate::SigningSecret::parse(&format!(
+        "whsec_{}",
+        STANDARD.encode([7; 32])
+    ))?);
+    destination.bearer = Some(cc_outbound::BearerToken::new("shared-token")?);
+    deliver(destination, &[began("camera", 1)], 2, &recorder).await;
+    let wire = recorder.wire.lock();
+    assert_eq!(wire.len(), 2);
+    assert_eq!(wire[0].1, wire[1].1);
+    assert_eq!(wire[0].0["webhook-id"], wire[1].0["webhook-id"]);
+    for (headers, body) in wire.iter() {
+        let parsed: serde_json::Value = serde_json::from_slice(body)?;
+        assert_eq!(
+            headers["webhook-id"].to_str()?,
+            parsed["id"].as_str().unwrap()
+        );
+        assert_eq!(headers["authorization"], "Bearer shared-token");
+        assert_eq!(headers["content-type"], crate::CONTENT_TYPE);
+        let timestamp: i64 = headers["webhook-timestamp"].to_str()?.parse()?;
+        assert!((time::OffsetDateTime::now_utc().unix_timestamp() - timestamp).abs() < 10);
+        let mut signed = format!("{}.{}.", headers["webhook-id"].to_str()?, timestamp).into_bytes();
+        signed.extend_from_slice(body);
+        let signature = STANDARD.decode(
+            headers["webhook-signature"]
+                .to_str()?
+                .strip_prefix("v1,")
+                .unwrap(),
+        )?;
+        assert!(
+            ring::hmac::verify(
+                &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; 32]),
+                &signed,
+                &signature
+            )
+            .is_ok()
+        );
+        signed.push(b' ');
+        assert!(
+            ring::hmac::verify(
+                &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[7; 32]),
+                &signed,
+                &signature
+            )
+            .is_err()
+        );
+    }
+    Ok(())
 }

@@ -70,7 +70,7 @@ pub fn server_control(
     let mut longest_target = None::<Duration>;
     let mut longest_part_target = None::<Duration>;
     for contract in contracts {
-        let target = Duration::from_secs(contract.target_duration.get());
+        let target = contract.target_duration();
         longest_target = Some(longest_target.map_or(target, |current| current.max(target)));
         // Only renditions that publish parts contribute a part target. A
         // presentation mixing chunked video with segment-only WebVTT still
@@ -117,7 +117,7 @@ pub fn blocking_reload_deadline(
     contract: PlaylistContract,
     policy: DeliveryTimingPolicy,
 ) -> Duration {
-    let target = Duration::from_secs(contract.target_duration.get());
+    let target = contract.target_duration();
     let protocol_floor = TargetDurationMultiple::integer(3).apply(target);
     let Some(part_target) = contract.part_target else {
         // Without parts there is no part hold-back to outlive.

@@ -159,7 +159,11 @@ pub async fn run_session(
     // the whole point: a session that runs for hours must not still be holding
     // a slot that exists to absorb connection bursts.
     drop(slot);
-    let AcceptedPublish { source, grant } = admitted??;
+    let SessionAdmission {
+        source,
+        grant,
+        publisher,
+    } = admitted??;
     services.meters.session_started();
 
     let stop = StopToken::new();
@@ -168,11 +172,20 @@ pub async fn run_session(
     context.emit(SessionEvent::Accepted {
         stream: grant.stream_id.clone(),
         principal: grant.principal.to_string(),
+        publisher,
     });
 
     let result = pipeline(&context, source, &grant, services, config).await;
     report(&context, services, &result);
     result
+}
+
+// What admission hands to the session: transport output plus the observed
+// publisher identity preserved from the request.
+struct SessionAdmission {
+    source: Box<dyn PacketSource>,
+    grant: PublishGrant,
+    publisher: crate::domain::PublisherContext,
 }
 
 /// Authenticates the handshake, then either accepts it or turns it away at the
@@ -181,7 +194,7 @@ async fn admit(
     pending: Box<dyn PendingPublish>,
     services: &Services,
     meters: &SessionMeters,
-) -> Result<AcceptedPublish, SessionError> {
+) -> Result<SessionAdmission, SessionError> {
     let request = pending.publish_request()?;
     let grant = match services.authenticator.authenticate(&request).await {
         Ok(grant) => grant,
@@ -210,7 +223,17 @@ async fn admit(
         });
     }
 
-    Ok(pending.accept(grant, meters.source_view()).await?)
+    let publisher = crate::domain::PublisherContext {
+        protocol: request.protocol,
+        resource: request.resource,
+        client: request.client,
+    };
+    let AcceptedPublish { source, grant } = pending.accept(grant, meters.source_view()).await?;
+    Ok(SessionAdmission {
+        source,
+        grant,
+        publisher,
+    })
 }
 
 /// The stages an admitted publication passes through.

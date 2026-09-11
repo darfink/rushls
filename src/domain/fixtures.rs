@@ -113,3 +113,19 @@ pub fn catalog(tracks: Vec<DiscoveredTrack>) -> TrackCatalog {
 pub fn video_catalog() -> TrackCatalog {
     catalog(vec![track(0, MediaKind::Video)])
 }
+
+/// Transport facts shared by auth and lifecycle tests.
+pub fn publisher() -> super::PublisherContext {
+    super::PublisherContext {
+        protocol: super::IngestProtocol::Rtmp,
+        resource: super::PublishResource {
+            namespace: Some("live".into()),
+            name: "presented-key".into(),
+        },
+        client: super::ClientInfo {
+            remote_address: "127.0.0.1:1935".parse().expect("constant address"),
+            encoder: None,
+            protocol_version: None,
+        },
+    }
+}

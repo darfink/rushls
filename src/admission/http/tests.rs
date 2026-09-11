@@ -255,3 +255,26 @@ impl Clone for Sidecar {
         }
     }
 }
+
+#[tokio::test]
+async fn malformed_or_overbroad_grants_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+    for body in [
+        r#"{"decision":"allow","stream_id":"live/camera","principal":" "}"#,
+        r#"{"decision":"allow","stream_id":"live/camera","principal":"p","protocol":"srt"}"#,
+        r#"{"decision":"allow","stream_id":"live/camera","principal":"p","client":{"remote_address":"elsewhere"}}"#,
+        r#"{"decision":"allow","stream":"live/camera","user":"p"}"#,
+        r#"{"decision":"deny","stream_id":"live/camera"}"#,
+    ] {
+        let address = start(Sidecar::answering(body)).await;
+        assert!(
+            matches!(
+                authenticator(address, HttpAuthConfig::default())
+                    .authenticate(&fixtures::publish_request("secret"))
+                    .await,
+                Err(AdmissionError::Service(_))
+            ),
+            "{body}"
+        );
+    }
+    Ok(())
+}

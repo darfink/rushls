@@ -165,13 +165,9 @@ pub struct AppConfig {
     pub http: HttpAppConfig,
     #[conf(flatten, prefix)]
     pub metrics: MetricsAppConfig,
-    /// Local segment archive. Specified in the reference and **not built**.
-    ///
-    /// Present so the key is refused by name rather than silently ignored: a
-    /// configuration that writes no files while an operator believes it does
-    /// is the failure mode this design exists to remove.
-    #[conf(parameter, value_parser = TomlValue::<toml::Value>::from_str)]
-    pub record: Option<TomlValue<toml::Value>>,
+    /// Persistent local segment exports, independent of DVR retention.
+    #[conf(parameter, value_parser = TomlValue::<crate::delivery::record::Config>::from_str)]
+    pub record: Option<TomlValue<crate::delivery::record::Config>>,
     /// Hook destinations, keyed by the name that identifies each in logs and
     /// metrics.
     ///
@@ -372,11 +368,9 @@ impl AppConfig {
                 "both listeners are off, so this node could serve nothing",
             ));
         }
-        if self.record.is_some() {
-            return Err(invalid(
-                "[record] is specified in the reference configuration but not yet implemented; \
-                 remove it rather than run a node that writes no archive",
-            ));
+        node.record = self.record.map(|value| value.0);
+        if let Some(record) = &node.record {
+            record.validate().map_err(invalid)?;
         }
         let hooks = resolve_hooks(self.hook, &node, &mut client, &mut outbound_tls)?;
         warnings.extend(startup_warnings(&node, open_admission));
@@ -753,6 +747,8 @@ pub struct HookEndpointAppConfig {
     token: Option<String>,
     /// Reads the bearer credential from a mounted secret instead.
     token_file: Option<PathBuf>,
+    signing_secret: Option<String>,
+    signing_secret_file: Option<PathBuf>,
     /// Path to a PEM certificate chain this node presents to this endpoint.
     client_certificate: Option<PathBuf>,
     /// Path to the PEM private key for that chain.
@@ -811,6 +807,15 @@ impl HookEndpointAppConfig {
             self.token_file.as_ref(),
         )?;
 
+        let signing_secret = resolve_optional_text_secret(
+            &format!("the signing secret for hook `{name}`"),
+            self.signing_secret.as_ref(),
+            self.signing_secret_file.as_ref(),
+        )?
+        .map(|secret| cc_hooks::SigningSecret::parse(&secret))
+        .transpose()
+        .map_err(|error| invalid(error.to_string()))?;
+
         // Only a destination that asked for an identity or a pinned authority
         // gets a client of its own; everything else shares the process pool.
         // The material is held in `outbound_tls` for the same reason
@@ -844,6 +849,7 @@ impl HookEndpointAppConfig {
                 .transpose()
                 .map_err(|error| invalid(error.to_string()))?,
             client,
+            signing_secret,
         })
     }
 }
@@ -2618,8 +2624,15 @@ fn resolve_optional_text_secret(
         ))),
         (Some(value), None) => Ok(Some(value.clone())),
         (None, Some(path)) => {
+            // Secrets are routinely written with a trailing newline: shell
+            // redirection, a heredoc, or a Kubernetes secret projection all
+            // leave one behind. That newline is an artifact of how the file
+            // was produced, never part of the value, and downstream consumers
+            // (base64 decoding in particular) reject it outright. Inline
+            // values are left untouched: TOML and the command line can state
+            // surrounding whitespace deliberately, and have no such artifact.
             fs::read_to_string(path)
-                .map(Some)
+                .map(|value| Some(value.trim().to_owned()))
                 .map_err(|source| ConfigError::SecretRead {
                     secret: label.to_owned(),
                     path: path.clone(),
