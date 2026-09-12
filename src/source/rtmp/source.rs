@@ -326,10 +326,10 @@ impl CatalogBuilder {
                 Ok(Observe::Continue)
             }
             IngressEvent::Audio { timestamp, media } => {
-                self.on_units(timestamp, media.elementary_units().map_err(demux)?, limits)
+                self.on_units(timestamp, |emit| media.visit_elementary_units(emit), limits)
             }
             IngressEvent::Video { timestamp, media } => {
-                self.on_units(timestamp, media.elementary_units().map_err(demux)?, limits)
+                self.on_units(timestamp, |emit| media.visit_elementary_units(emit), limits)
             }
             IngressEvent::Script { timestamp, payload } => {
                 self.on_script(timestamp, &payload, limits)
@@ -375,12 +375,19 @@ impl CatalogBuilder {
     fn on_units(
         &mut self,
         timestamp: u32,
-        units: Vec<ElementaryUnit>,
+        visit: impl FnOnce(&mut dyn FnMut(ElementaryUnit)) -> Result<(), rtmpx::MediaValidationError>,
         limits: InputLimits,
     ) -> Result<Observe, SourceError> {
-        for unit in units {
-            self.on_unit(timestamp, unit, limits)?;
-        }
+        // Visiting avoids a temporary collection for each audio/video message,
+        // while retaining every sibling in Enhanced RTMP multitrack messages.
+        let mut result = Ok(());
+        visit(&mut |unit| {
+            if result.is_ok() {
+                result = self.on_unit(timestamp, unit, limits);
+            }
+        })
+        .map_err(demux)?;
+        result?;
         Ok(Observe::Continue)
     }
 
@@ -580,13 +587,13 @@ fn live_packets(
         )),
         IngressEvent::Audio { timestamp, media } => live_samples(
             timestamp,
-            media.elementary_units().map_err(demux)?,
+            |emit| media.visit_elementary_units(emit),
             tracks,
             limits,
         ),
         IngressEvent::Video { timestamp, media } => live_samples(
             timestamp,
-            media.elementary_units().map_err(demux)?,
+            |emit| media.visit_elementary_units(emit),
             tracks,
             limits,
         ),
@@ -595,16 +602,23 @@ fn live_packets(
 
 fn live_samples(
     timestamp: u32,
-    units: Vec<ElementaryUnit>,
+    visit: impl FnOnce(&mut dyn FnMut(ElementaryUnit)) -> Result<(), rtmpx::MediaValidationError>,
     tracks: &LiveTracks,
     limits: InputLimits,
 ) -> Result<VecDeque<Packet>, SourceError> {
     let mut packets = VecDeque::new();
-    for unit in units {
-        if let Some(packet) = live_sample(timestamp, unit, tracks, limits)? {
-            packets.push_back(packet);
+    let mut result = Ok(());
+    visit(&mut |unit| {
+        if result.is_ok() {
+            match live_sample(timestamp, unit, tracks, limits) {
+                Ok(Some(packet)) => packets.push_back(packet),
+                Ok(None) => {}
+                Err(error) => result = Err(error),
+            }
         }
-    }
+    })
+    .map_err(demux)?;
+    result?;
     Ok(packets)
 }
 

@@ -71,7 +71,7 @@ mod tests {
             Amf0Value::Object(properties),
         ])
         .expect("test metadata serializes");
-        let message =
+        let message: DataMessage =
             DataMessage::new(DataMessageType::Amf0, RtmpTimestamp::new(0), payload.into());
         let metadata = ValidatedMetadata::parse(message, EnhancedValidationMode::Strict)
             .expect("test metadata validates")

@@ -5,12 +5,11 @@
 
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rtmpx::{
-    EnhancedCapabilities, EnhancedValidationMode, ServerSessionTimeouts, ValidatedMedia,
-    ValidatedMetadata,
-    handshake::{Handshake, HandshakeProcessResult, PeerType},
-    sessions::{ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult},
+    EnhancedCapabilities, EnhancedValidationMode, ValidatedMedia, ValidatedMetadata,
+    handshake::{Handshake, HandshakeProgress, HandshakeRole},
+    sessions::{ServerEvent, ServerOutput, ServerSession, ServerSessionConfig},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -43,6 +42,14 @@ use crate::{
 /// than whether the framing is well-formed at all.
 const ENHANCED_VALIDATION: EnhancedValidationMode = EnhancedValidationMode::Strict;
 
+/// Socket deadlines owned by the RTMP transport, independent of protocol state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RtmpTimeouts {
+    pub handshake_read: Option<Duration>,
+    pub session_read: Option<Duration>,
+    pub write: Option<Duration>,
+}
+
 /// Resource and memory policy for one RTMP connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RtmpConfig {
@@ -55,7 +62,7 @@ pub struct RtmpConfig {
     /// `maximum_publish_wait` bounds the whole pre-publish phase. A peer that
     /// dribbles one byte per second defeats the first and is caught by the
     /// second.
-    pub timeouts: ServerSessionTimeouts,
+    pub timeouts: RtmpTimeouts,
     /// Incomplete RTMP messages the chunk deserializer may reassemble.
     pub maximum_reassembly_bytes: NonZeroUsize,
     /// Encoded access units allowed to wait between the session and the source.
@@ -74,7 +81,7 @@ impl Default for RtmpConfig {
             // network between keyframes. The configuration layer resolves
             // these from `peer_timeout`; this value is what a caller
             // constructing the transport directly gets.
-            timeouts: ServerSessionTimeouts {
+            timeouts: RtmpTimeouts {
                 handshake_read: Some(Duration::from_secs(10)),
                 session_read: Some(Duration::from_secs(10)),
                 write: Some(Duration::from_secs(10)),
@@ -464,7 +471,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut read_buffer = vec![0_u8; 16 * 1024];
-    let mut handshake = Handshake::new(PeerType::Server);
+    let mut handshake = Handshake::new(HandshakeRole::Server);
     let carry = loop {
         let read = timed_read(
             &mut io,
@@ -480,10 +487,10 @@ where
             .process_bytes(&read_buffer[..read])
             .map_err(|error| format!("RTMP handshake failed: {error:?}").into_boxed_str())?
         {
-            HandshakeProcessResult::InProgress { response_bytes } => {
+            HandshakeProgress::InProgress { response_bytes } => {
                 timed_write(&mut io, &response_bytes, config.timeouts.write).await?;
             }
-            HandshakeProcessResult::Completed {
+            HandshakeProgress::Completed {
                 response_bytes,
                 remaining_bytes,
             } => {
@@ -495,175 +502,162 @@ where
 
     let mut session_config = ServerSessionConfig::new();
     session_config.window_ack_size = 2_500_000;
-    session_config.chunk_deserializer.maximum_message_size = config.maximum_message_bytes.get();
-    session_config.chunk_deserializer.maximum_buffered_bytes =
-        config.maximum_reassembly_bytes.get();
-    let (mut session, initial) = ServerSession::new(session_config)
+    session_config.decoder_limits.maximum_message_size = config.maximum_message_bytes.get();
+    session_config.decoder_limits.maximum_buffered_bytes = config.maximum_reassembly_bytes.get();
+    session_config.session_limits.max_streams = 1;
+    session_config.payload_pool = Some(rtmpx::PayloadPool::new(rtmpx::PayloadPoolConfig {
+        max_cached_payloads: 2,
+        max_descriptors_per_payload: 4096,
+    }));
+    let mut session = ServerSession::new(session_config)
         .map_err(|error| format!("could not create RTMP session: {error}").into_boxed_str())?;
-    debug_assert!(initial.is_empty(), "server must not write before connect");
-
-    if !carry.is_empty() {
-        let results = session
-            .handle_input(&carry)
-            .map_err(|error| format!("invalid RTMP input: {error}").into_boxed_str())?;
-        if !process_session_results(&mut io, &mut session, &mut handler, config, results).await? {
+    let mut input = Bytes::from(carry);
+    let mut buffer = BytesMut::with_capacity(16 * 1024);
+    loop {
+        if !process_session_input(&mut io, &mut session, &mut handler, config, &mut input).await? {
             return Ok(false);
         }
-    }
-
-    loop {
-        let read = timed_read(
-            &mut io,
-            &mut read_buffer,
-            config.timeouts.session_read,
-            "RTMP session read",
-        )
-        .await?;
-        if read == 0 {
+        // Retain the read allocation while the decoder holds incomplete messages.
+        buffer.reserve(16 * 1024);
+        let read = async { (&mut io).take(16 * 1024).read_buf(&mut buffer).await };
+        let count = match config.timeouts.session_read {
+            Some(duration) => tokio::time::timeout(duration, read)
+                .await
+                .map_err(|_| Box::<str>::from("RTMP session read timed out"))?,
+            None => read.await,
+        }
+        .map_err(|error| format!("RTMP session read failed: {error}").into_boxed_str())?;
+        if count == 0 {
             return Ok(true);
         }
-        let results = session
-            .handle_input(&read_buffer[..read])
-            .map_err(|error| format!("invalid RTMP input: {error}").into_boxed_str())?;
-        if !process_session_results(&mut io, &mut session, &mut handler, config, results).await? {
-            return Ok(false);
-        }
+        input = buffer.split().freeze();
     }
 }
 
 #[allow(clippy::too_many_lines)] // Keep the protocol event taxonomy visible in one dispatcher.
-async fn process_session_results<S>(
+async fn process_session_input<S>(
     io: &mut S,
     session: &mut ServerSession,
     handler: &mut MediaHandler,
     config: RtmpConfig,
-    results: Vec<ServerSessionResult>,
+    input: &mut Bytes,
 ) -> Result<bool, Box<str>>
 where
     S: AsyncWrite + Unpin,
 {
-    let mut pending = results;
-    loop {
-        let mut follow_up = Vec::new();
-        for result in pending {
-            match result {
-                ServerSessionResult::OutboundResponse(packet) => {
-                    timed_write(io, &packet.bytes, config.timeouts.write).await?;
+    while let Some(output) = session
+        .receive(input)
+        .map_err(|error| format!("invalid RTMP input: {error}").into_boxed_str())?
+    {
+        match output {
+            ServerOutput::Packet(packet) => timed_packet(io, packet, config.timeouts.write).await?,
+            ServerOutput::Event(event) => match event {
+                ServerEvent::ConnectionRequested {
+                    request_id,
+                    additional_properties,
+                    ..
+                } => {
+                    EnhancedCapabilities::parse(&additional_properties, ENHANCED_VALIDATION)
+                        .map_err(String::into_boxed_str)?;
+                    session
+                        .accept_request_with_properties(request_id, enhanced_server_capabilities())
+                        .map_err(|error| error.to_string().into_boxed_str())?;
                 }
-                ServerSessionResult::RaisedEvent(event) => match event {
-                    ServerSessionEvent::ConnectionRequested {
-                        request_id,
-                        additional_properties,
-                        ..
-                    } => {
-                        EnhancedCapabilities::parse(&additional_properties, ENHANCED_VALIDATION)
-                            .map_err(String::into_boxed_str)?;
-                        follow_up.extend(
+                ServerEvent::PublishStreamRequested {
+                    request_id,
+                    app_name,
+                    stream_key,
+                    stream_id,
+                    ..
+                } => {
+                    match handler
+                        .on_publish(stream_id.get(), &app_name, &stream_key)
+                        .await?
+                    {
+                        PublishOutcome::Accepted => session
+                            .accept_request(request_id)
+                            .map_err(|error| error.to_string().into_boxed_str())?,
+                        PublishOutcome::Rejected {
+                            rejection,
+                            completion,
+                        } => {
+                            let (code, description) = publish_rejection_status(rejection);
                             session
-                                .accept_request_with_properties(
-                                    request_id,
-                                    enhanced_server_capabilities(),
-                                )
-                                .map_err(|error| error.to_string().into_boxed_str())?,
-                        );
-                    }
-                    ServerSessionEvent::PublishStreamRequested {
-                        request_id,
-                        app_name,
-                        stream_key,
-                        stream_id,
-                        ..
-                    } => {
-                        match handler
-                            .on_publish(stream_id.get(), &app_name, &stream_key)
-                            .await?
-                        {
-                            PublishOutcome::Accepted => {
-                                follow_up.extend(
-                                    session
-                                        .accept_request(request_id)
-                                        .map_err(|error| error.to_string().into_boxed_str())?,
-                                );
-                            }
-                            PublishOutcome::Rejected {
-                                rejection,
-                                completion,
-                            } => {
-                                let (code, description) = publish_rejection_status(rejection);
-                                follow_up.extend(
-                                    session
-                                        .reject_request(request_id, code, description)
-                                        .map_err(|error| error.to_string().into_boxed_str())?,
-                                );
-                                write_server_results(io, config.timeouts.write, follow_up).await?;
-                                let _ = completion.send(());
-                                return Ok(false);
-                            }
+                                .reject_request(request_id, code, description)
+                                .map_err(|error| error.to_string().into_boxed_str())?;
+                            drain_control(io, session, config.timeouts.write).await?;
+                            let _ = completion.send(());
+                            return Ok(false);
                         }
                     }
-                    ServerSessionEvent::AudioDataReceived {
-                        data, timestamp, ..
-                    } => {
-                        let media = ValidatedMedia::parse_audio(data, ENHANCED_VALIDATION)
-                            .map_err(|error| error.to_string().into_boxed_str())?;
-                        let stream_id = handler.active_stream_id.ok_or_else(|| {
-                            Box::<str>::from("audio arrived before publish acceptance")
-                        })?;
-                        handler.on_audio(stream_id, timestamp.value, media).await?;
-                    }
-                    ServerSessionEvent::VideoDataReceived {
-                        data, timestamp, ..
-                    } => {
-                        let media = ValidatedMedia::parse_video(data, ENHANCED_VALIDATION)
-                            .map_err(|error| error.to_string().into_boxed_str())?;
-                        let stream_id = handler.active_stream_id.ok_or_else(|| {
-                            Box::<str>::from("video arrived before publish acceptance")
-                        })?;
-                        handler.on_video(stream_id, timestamp.value, media).await?;
-                    }
-                    ServerSessionEvent::StreamMetadataChanged { message, .. } => {
+                }
+                ServerEvent::AudioDataReceived {
+                    data,
+                    timestamp,
+                    stream_id,
+                    ..
+                } => {
+                    // The codec pipeline needs contiguous samples. Reuse a single segment,
+                    // otherwise coalesce once here; the RTMP decoder itself keeps slices.
+                    let media = ValidatedMedia::parse_audio(data.into_bytes(), ENHANCED_VALIDATION)
+                        .map_err(|error| error.to_string().into_boxed_str())?;
+                    handler
+                        .on_audio(stream_id.get(), timestamp.value, media)
+                        .await?;
+                }
+                ServerEvent::VideoDataReceived {
+                    data,
+                    timestamp,
+                    stream_id,
+                    ..
+                } => {
+                    let media = ValidatedMedia::parse_video(data.into_bytes(), ENHANCED_VALIDATION)
+                        .map_err(|error| error.to_string().into_boxed_str())?;
+                    handler
+                        .on_video(stream_id.get(), timestamp.value, media)
+                        .await?;
+                }
+                ServerEvent::StreamDataReceived {
+                    message, stream_id, ..
+                } => {
+                    if message
+                        .metadata()
+                        .map_err(|error| error.to_string().into_boxed_str())?
+                        .is_some()
+                    {
                         let metadata = ValidatedMetadata::parse(message, ENHANCED_VALIDATION)
                             .map_err(|error| error.to_string().into_boxed_str())?;
-                        let stream_id = handler.active_stream_id.ok_or_else(|| {
-                            Box::<str>::from("metadata arrived before publish acceptance")
-                        })?;
-                        handler.on_metadata(stream_id, metadata).await?;
-                    }
-                    ServerSessionEvent::StreamDataReceived { message, .. } => {
-                        let stream_id = handler.active_stream_id.ok_or_else(|| {
-                            Box::<str>::from("script data arrived before publish acceptance")
-                        })?;
+                        handler.on_metadata(stream_id.get(), metadata).await?;
+                    } else {
                         let timestamp = message.timestamp().value;
-                        let payload = message.into_payload();
-                        handler.on_script(stream_id, timestamp, payload).await?;
+                        handler
+                            .on_script(
+                                stream_id.get(),
+                                timestamp,
+                                message.into_payload().into_bytes(),
+                            )
+                            .await?;
                     }
-                    ServerSessionEvent::PublishStreamFinished { .. } => {
-                        if let Some(stream_id) = handler.active_stream_id {
-                            handler.on_unpublish(stream_id)?;
-                        }
-                        return Ok(false);
-                    }
-                    ServerSessionEvent::PlayStreamRequested { request_id, .. } => {
-                        follow_up.extend(
-                            session
-                                .reject_request(
-                                    request_id,
-                                    "NetStream.Play.Failed",
-                                    "this endpoint only accepts publishers",
-                                )
-                                .map_err(|error| error.to_string().into_boxed_str())?,
-                        );
-                    }
-                    _ => {}
-                },
+                }
+                ServerEvent::PublishStreamFinished { stream_id, .. } => {
+                    handler.on_unpublish(stream_id.get())?;
+                    return Ok(false);
+                }
+                ServerEvent::PlayStreamRequested { request_id, .. } => {
+                    session
+                        .reject_request(
+                            request_id,
+                            "NetStream.Play.Failed",
+                            "this endpoint only accepts publishers",
+                        )
+                        .map_err(|error| error.to_string().into_boxed_str())?;
+                }
                 _ => {}
-            }
+            },
+            _ => {}
         }
-        if follow_up.is_empty() {
-            return Ok(true);
-        }
-        pending = follow_up;
     }
+    Ok(true)
 }
 
 fn publish_rejection_status(rejection: PublishRejection) -> (&'static str, &'static str) {
@@ -716,20 +710,47 @@ fn enhanced_server_capabilities() -> rtmpx::amf0::Amf0Object {
     ])
 }
 
-async fn write_server_results<S>(
+async fn drain_control<S: AsyncWrite + Unpin>(
     io: &mut S,
+    session: &mut ServerSession,
     timeout: Option<Duration>,
-    results: Vec<ServerSessionResult>,
-) -> Result<(), Box<str>>
-where
-    S: AsyncWrite + Unpin,
-{
-    for result in results {
-        if let ServerSessionResult::OutboundResponse(packet) = result {
-            timed_write(io, &packet.bytes, timeout).await?;
+) -> Result<(), Box<str>> {
+    while let Some(output) = session
+        .receive(&mut Bytes::new())
+        .map_err(|error| error.to_string().into_boxed_str())?
+    {
+        if let ServerOutput::Packet(packet) = output {
+            timed_packet(io, packet, timeout).await?;
         }
     }
     Ok(())
+}
+
+async fn timed_packet<S: AsyncWrite + Unpin>(
+    io: &mut S,
+    mut packet: rtmpx::Packet,
+    timeout: Option<Duration>,
+) -> Result<(), Box<str>> {
+    let write = async {
+        while !packet.is_complete() {
+            let mut slices = [std::io::IoSlice::new(&[]); 32];
+            let count = packet.io_slices(&mut slices);
+            match io.write_vectored(&slices[..count]).await {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(written) => packet.advance(written),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        io.flush().await
+    };
+    match timeout {
+        Some(duration) => tokio::time::timeout(duration, write)
+            .await
+            .map_err(|_| Box::<str>::from("RTMP write timed out"))?,
+        None => write.await,
+    }
+    .map_err(|error| format!("RTMP write failed: {error}").into_boxed_str())
 }
 
 async fn timed_read<S>(
@@ -796,8 +817,8 @@ mod tests {
     use rtmpx::{
         EnhancedValidationMode,
         amf0::{Amf0Object, Amf0Value},
-        chunk_io::{ChunkDeserializer, ChunkSerializer},
-        messages::{MessagePayload, RtmpMessage},
+        chunk_io::{ChunkEncoder, ContiguousDecoder},
+        messages::{RawMessage, RtmpMessage},
         time::RtmpTimestamp,
     };
 
@@ -826,7 +847,7 @@ mod tests {
         // Type 3: a complete new message reusing the delta, length, and type.
         wire.extend_from_slice(&[0xc4]);
         wire.extend_from_slice(b"ccc");
-        let mut reader = ChunkDeserializer::new();
+        let mut reader = ContiguousDecoder::new();
 
         let first = reader
             .get_next_message(&wire)
@@ -856,7 +877,7 @@ mod tests {
         ]);
         wire.extend_from_slice(&[b'a'; 128]);
         wire.extend_from_slice(&[0xc4, b'b', b'b']);
-        let mut reader = ChunkDeserializer::new();
+        let mut reader = ContiguousDecoder::new();
 
         let message = reader
             .get_next_message(&wire)
@@ -952,32 +973,30 @@ mod tests {
     /// chunk state.
     fn exchange(
         session: &mut ServerSession,
-        serializer: &mut ChunkSerializer,
-        deserializer: &mut ChunkDeserializer,
-        message: &MessagePayload,
-    ) -> (Vec<RtmpMessage>, Vec<ServerSessionEvent>) {
+        serializer: &mut ChunkEncoder,
+        deserializer: &mut ContiguousDecoder,
+        message: &RawMessage,
+    ) -> (Vec<RtmpMessage>, Vec<ServerEvent>) {
         let packet = serializer
-            .serialize(message, false, false)
+            .encode(message.as_ref(), rtmpx::EncodeOptions::default())
             .expect("test message serializes");
-        let results = session
-            .handle_input(&packet.bytes[..])
-            .expect("session accepts test bytes");
-        drain(deserializer, results)
+        drain(deserializer, session, &mut Bytes::from(packet.to_vec()))
     }
 
     /// Splits session results into decoded server messages and raised events,
     /// keeping the deserializer in step with the server chunk stream.
     fn drain(
-        deserializer: &mut ChunkDeserializer,
-        results: Vec<ServerSessionResult>,
-    ) -> (Vec<RtmpMessage>, Vec<ServerSessionEvent>) {
+        deserializer: &mut ContiguousDecoder,
+        session: &mut ServerSession,
+        input: &mut Bytes,
+    ) -> (Vec<RtmpMessage>, Vec<ServerEvent>) {
         let mut messages = Vec::new();
         let mut events = Vec::new();
-        for result in results {
+        while let Some(result) = session.receive(input).expect("session accepts input") {
             match result {
-                ServerSessionResult::OutboundResponse(packet) => {
+                ServerOutput::Packet(packet) => {
                     let mut next = deserializer
-                        .get_next_message(&packet.bytes[..])
+                        .get_next_message(&packet.to_vec())
                         .expect("server bytes decode");
                     loop {
                         match next {
@@ -986,7 +1005,7 @@ mod tests {
                                     payload.to_rtmp_message().expect("server message decodes");
                                 if let RtmpMessage::SetChunkSize { size } = &message {
                                     deserializer
-                                        .set_max_chunk_size(*size as usize)
+                                        .set_chunk_size(*size as usize)
                                         .expect("chunk size is valid");
                                 }
                                 messages.push(message);
@@ -998,7 +1017,7 @@ mod tests {
                             .expect("buffered bytes decode");
                     }
                 }
-                ServerSessionResult::RaisedEvent(event) => events.push(event),
+                ServerOutput::Event(event) => events.push(event),
                 _ => {}
             }
         }
@@ -1014,10 +1033,10 @@ mod tests {
     #[tokio::test]
     async fn script_data_events_are_queued_for_the_packet_source() {
         let (handler, attempt, reader) = handler(nz::usize!(1024), 512);
-        let (mut session, _initial) =
+        let mut session =
             ServerSession::new(ServerSessionConfig::new()).expect("session config is valid");
-        let mut serializer = ChunkSerializer::new();
-        let mut deserializer = ChunkDeserializer::new();
+        let mut serializer = ChunkEncoder::new();
+        let mut deserializer = ContiguousDecoder::new();
 
         // The session only emits script events for an accepted publication,
         // so drive connect, createStream, and publish for real.
@@ -1030,17 +1049,17 @@ mod tests {
             ])),
             additional_arguments: Vec::new(),
         }
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .expect("connect encodes");
         let (_, events) = exchange(&mut session, &mut serializer, &mut deserializer, &connect);
         let request_id = match events.as_slice() {
-            [ServerSessionEvent::ConnectionRequested { request_id, .. }] => *request_id,
+            [ServerEvent::ConnectionRequested { request_id, .. }] => *request_id,
             other => panic!("expected a connection request, got {other:?}"),
         };
-        let accepted = session
+        session
             .accept_request(request_id)
             .expect("connection is accepted");
-        drain(&mut deserializer, accepted);
+        drain(&mut deserializer, &mut session, &mut Bytes::new());
 
         let create = RtmpMessage::Amf0Command {
             command_name: "createStream".into(),
@@ -1048,7 +1067,7 @@ mod tests {
             command_object: Amf0Value::Null,
             additional_arguments: Vec::new(),
         }
-        .into_message_payload(RtmpTimestamp::new(0), 0)
+        .into_raw_message(RtmpTimestamp::new(0), 0)
         .expect("createStream encodes");
         let (responses, _) = exchange(&mut session, &mut serializer, &mut deserializer, &create);
         let stream_id = responses
@@ -1075,42 +1094,40 @@ mod tests {
                 Amf0Value::Utf8String("live".into()),
             ],
         }
-        .into_message_payload(RtmpTimestamp::new(0), stream_id)
+        .into_raw_message(RtmpTimestamp::new(0), stream_id)
         .expect("publish encodes");
         let (_, events) = exchange(&mut session, &mut serializer, &mut deserializer, &publish);
         let request_id = match events.as_slice() {
-            [ServerSessionEvent::PublishStreamRequested { request_id, .. }] => *request_id,
+            [ServerEvent::PublishStreamRequested { request_id, .. }] => *request_id,
             other => panic!("expected a publish request, got {other:?}"),
         };
-        let accepted = session
+        session
             .accept_request(request_id)
             .expect("publish is accepted");
-        drain(&mut deserializer, accepted);
+        drain(&mut deserializer, &mut session, &mut Bytes::new());
         let mut handler = accept(handler, attempt, stream_id, "live", "camera-key").await;
 
         // The cue bytes travel untouched: the session raises the event and the
         // transport queues the raw payload for the packet source.
         let payload = crate::source::encode_cue(b"onCaption", b"hello");
-        let script = MessagePayload {
+        let script = RawMessage {
             timestamp: RtmpTimestamp::new(1_234),
             type_id: 18, // AMF0 data, matching RtmpMessage::Amf0Data
             message_stream_id: stream_id,
             data: payload.clone(),
         };
         let packet = serializer
-            .serialize(&script, false, false)
+            .encode(script, rtmpx::EncodeOptions::default())
             .expect("script data serializes");
-        let results = session
-            .handle_input(&packet.bytes[..])
-            .expect("session accepts script data");
+        let mut input = Bytes::from(packet.to_vec());
         let mut sink = tokio::io::sink();
 
-        process_session_results(
+        process_session_input(
             &mut sink,
             &mut session,
             &mut handler,
             RtmpConfig::default(),
-            results,
+            &mut input,
         )
         .await
         .expect("script data is queued");

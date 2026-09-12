@@ -16,10 +16,10 @@ use std::{
     time::Duration,
 };
 
+use crate::source::transport::rtmp::RtmpTimeouts;
 use bytesize::ByteSize;
 use cc_tls::{ClientIdentity, load_roots};
 use conf::{Conf, find_parameter, introspection::ProgramOptionMeta};
-use rtmpx::ServerSessionTimeouts;
 use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use thiserror::Error;
@@ -1735,9 +1735,9 @@ const MAXIMUM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl RtmpAppConfig {
     /// Derives the per-phase timeouts from the one operator-facing value.
-    fn timeouts(&self) -> ServerSessionTimeouts {
+    fn timeouts(&self) -> RtmpTimeouts {
         let session = self.timeout.0;
-        ServerSessionTimeouts {
+        RtmpTimeouts {
             // The lesser of the session limit and the constant: a disabled
             // session timeout still leaves the handshake bounded, because an
             // unauthenticated peer is the one that should never be trusted to

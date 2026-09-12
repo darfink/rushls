@@ -140,10 +140,17 @@ avformat path we replaced.
 
 ## Adapter boundaries and backpressure
 
-`rtmpx` exposes `ElementaryUnit` and `ElementaryCodec` through `elementary_units()`.
+`rtmpx` exposes `ElementaryUnit` and `ElementaryCodec` through `visit_elementary_units()`.
 This API removes FLV framing and preserves decoder configuration bytes.
 It does not choose a media container or write CMAF boxes.
 Rushls owns codec interpretation, timestamp normalization, and packaging.
+Both Rushls and Routmp use RTMPX 3 from crates.io through the shared workspace dependency.
+The transport pulls one session output at a time and writes control packets with a resumable cursor.
+Socket reads become owned buffers; the decoder retains their slices while it assembles messages.
+Rushls coalesces fragmented media once at its contiguous codec-input boundary.
+A message that already occupies one contiguous slice keeps that allocation.
+Elementary-unit visitors avoid a temporary result vector for each media message.
+Socket deadlines belong to Rushls's `RtmpTimeouts`; RTMPX remains sans-I/O.
 
 RTMP and MPEG-TS share input-limit validation and first-presentation timestamp accounting.
 They retain separate discovery state machines because RTMP sequence headers and TS PMT events have different lifecycles.
