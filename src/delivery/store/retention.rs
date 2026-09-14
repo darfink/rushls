@@ -113,6 +113,7 @@ pub struct RetentionPolicy {
     pub part_tag_retention: DurationRule,
     /// How long a part URI remains fetchable after its tag disappears.
     pub part_fetch_grace_period: DurationRule,
+    /// Shared retained media-and-manifest budget; media has priority.
     pub maximum_payload_bytes: usize,
     pub maximum_parts: usize,
     pub maximum_segments: usize,
@@ -180,9 +181,13 @@ pub struct RetentionDepth {
     /// parts. The longest rendition wins, so a shorter sibling does not hide
     /// how far back video still goes.
     pub held: Duration,
-    /// Payload bytes in the memory tier, including fetch-grace media the
-    /// playlist no longer names.
+    /// Combined retained media and manifest bytes in memory, including
+    /// fetch-grace media the playlist no longer names.
     pub memory_bytes: usize,
+    /// Media buffers held by the store, excluding manifest caches.
+    pub media_bytes: usize,
+    /// Plain and gzip manifest bytes retained for reuse.
+    pub manifest_bytes: usize,
     /// [`RetentionPolicy::maximum_payload_bytes`].
     pub memory_capacity: usize,
     /// Payload bytes in the disk overflow tier.

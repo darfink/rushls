@@ -34,6 +34,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
+use crate::delivery::memory::{ManifestClass, ManifestHandle, MemoryBudget};
 use crate::domain::RenditionId;
 
 use super::{StreamSnapshot, gzip::gzip, project::PlaylistDelta, uri::PlaylistUris};
@@ -46,6 +47,7 @@ use super::{StreamSnapshot, gzip::gzip, project::PlaylistDelta, uri::PlaylistUri
 /// one internally consistent snapshot, which is all a single render ever
 /// promised, so they are served uncached rather than withheld forever.
 const MAXIMUM_RENDER_ATTEMPTS: u32 = 8;
+const MAXIMUM_CACHED_RENDITIONS: usize = 128;
 
 /// Identifies exactly the inputs a rendered media playlist depends on.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -123,8 +125,7 @@ pub struct Rendered {
 /// Gzipped and plain bytes of one skip form.
 #[derive(Clone, Debug)]
 struct Encoded {
-    rendered: Bytes,
-    gzip: Bytes,
+    handle: Arc<ManifestHandle>,
 }
 
 /// Every skip form rendered from one media epoch.
@@ -154,9 +155,10 @@ impl Cached {
         if self.epoch != key.epoch() {
             return None;
         }
-        self.slot(key).map(|encoded| Rendered {
-            bytes: encoded.rendered.clone(),
-            gzip: encoded.gzip.clone(),
+        let (bytes, gzip) = self.slot(key)?.handle.get()?;
+        Some(Rendered {
+            bytes,
+            gzip,
             freshly_rendered: false,
         })
     }
@@ -214,17 +216,34 @@ fn skip_slot_mut(forms: &mut SkipForms, skip: PlaylistDelta) -> &mut Option<Enco
 
 /// One rendition's cached playlist text.
 ///
-/// The render itself is serialised by a mutex while reads are lock-free. That
+/// The render itself is serialised by a mutex; hits take a short budget lock. That
 /// asymmetry is the point: a thousand viewers arriving at once should produce
 /// one render, not a thousand, and the one that does the work should not block
 /// the readers who could already have used the previous value.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PlaylistCache {
+    budget: MemoryBudget,
+    class: ManifestClass,
     latest: ArcSwap<Option<Cached>>,
     rendering: Mutex<()>,
 }
 
+impl Default for PlaylistCache {
+    fn default() -> Self {
+        Self::with_budget(MemoryBudget::new(usize::MAX), ManifestClass::Media)
+    }
+}
+
 impl PlaylistCache {
+    fn with_budget(budget: MemoryBudget, class: ManifestClass) -> Self {
+        Self {
+            budget,
+            class,
+            latest: ArcSwap::from_pointee(None),
+            rendering: Mutex::new(()),
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -308,15 +327,29 @@ impl PlaylistCache {
             // each. Every viewer after that is handed a refcount whichever
             // encoding they asked for.
             let gzip = gzip(&bytes);
-            let mut next = self.latest.load().as_ref().clone().unwrap_or_default();
-            next.store(
-                key,
-                Encoded {
-                    rendered: bytes.clone(),
-                    gzip: gzip.clone(),
-                },
-            );
-            self.latest.store(Arc::new(Some(next)));
+            // Clear stale forms before charging their replacement. Responses
+            // already using those bytes remain valid outside cache retention.
+            if self
+                .latest
+                .load()
+                .as_ref()
+                .as_ref()
+                .is_some_and(|cached| cached.epoch != key.epoch())
+            {
+                self.latest.store(Arc::new(None));
+            }
+            let epoch = match self.class {
+                ManifestClass::Index => key.catalog_revision,
+                ManifestClass::Media => key.media_revision,
+            };
+            if let Some(handle) = self
+                .budget
+                .insert(self.class, epoch, bytes.clone(), gzip.clone())
+            {
+                let mut next = self.latest.load().as_ref().clone().unwrap_or_default();
+                next.store(key, Encoded { handle });
+                self.latest.store(Arc::new(Some(next)));
+            }
             return Ok(Rendered {
                 bytes,
                 gzip,
@@ -327,8 +360,9 @@ impl PlaylistCache {
 }
 
 /// Per-rendition playlist caches for one stream.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StreamPlaylistCache {
+    budget: MemoryBudget,
     uris: PlaylistUris,
     query_uris: PlaylistUris,
     multivariant: PlaylistCache,
@@ -336,12 +370,26 @@ pub struct StreamPlaylistCache {
     iframes: Mutex<Vec<(RenditionId, Arc<PlaylistCache>)>>,
 }
 
+impl Default for StreamPlaylistCache {
+    fn default() -> Self {
+        Self::new(PlaylistUris::default())
+    }
+}
+
 impl StreamPlaylistCache {
+    pub fn uses_budget(&self, budget: &MemoryBudget) -> bool {
+        self.budget.same_stream(budget)
+    }
+
     pub fn new(uris: PlaylistUris) -> Self {
+        Self::with_budget(uris, MemoryBudget::new(usize::MAX))
+    }
+    pub fn with_budget(uris: PlaylistUris, budget: MemoryBudget) -> Self {
         Self {
             query_uris: uris.with_query_variables(),
             uris,
-            multivariant: PlaylistCache::new(),
+            multivariant: PlaylistCache::with_budget(budget.clone(), ManifestClass::Index),
+            budget,
             renditions: Mutex::new(Vec::new()),
             iframes: Mutex::new(Vec::new()),
         }
@@ -360,14 +408,15 @@ impl StreamPlaylistCache {
     }
 
     pub fn rendition(&self, rendition: RenditionId) -> Arc<PlaylistCache> {
-        Self::rendition_cache(&self.renditions, rendition)
+        self.rendition_cache(&self.renditions, rendition)
     }
 
     pub fn iframe(&self, rendition: RenditionId) -> Arc<PlaylistCache> {
-        Self::rendition_cache(&self.iframes, rendition)
+        self.rendition_cache(&self.iframes, rendition)
     }
 
     fn rendition_cache(
+        &self,
         caches: &Mutex<Vec<(RenditionId, Arc<PlaylistCache>)>>,
         rendition: RenditionId,
     ) -> Arc<PlaylistCache> {
@@ -375,7 +424,16 @@ impl StreamPlaylistCache {
         if let Some((_, cache)) = renditions.iter().find(|(id, _)| *id == rendition) {
             return Arc::clone(cache);
         }
-        let cache = Arc::new(PlaylistCache::new());
+        // A logical stream can change topology forever. Cached ended playlists
+        // must not keep every historical rendition alive in this separate map.
+        // Eviction only costs a render; in-flight users own their cache Arc.
+        if renditions.len() == MAXIMUM_CACHED_RENDITIONS {
+            renditions.remove(0);
+        }
+        let cache = Arc::new(PlaylistCache::with_budget(
+            self.budget.clone(),
+            ManifestClass::Media,
+        ));
         renditions.push((rendition, Arc::clone(&cache)));
         cache
     }
@@ -395,6 +453,114 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn replacement_and_uncached_responses_have_exact_accounting() -> Result<(), ()> {
+        let budget = MemoryBudget::new(1024);
+        let cache = PlaylistCache::with_budget(budget.clone(), ManifestClass::Media);
+        let first = cache.get_or_render(PlaylistKey::default(), || Ok::<_, ()>("first".into()))?;
+        assert_eq!(budget.usage().1, first.bytes.len() + first.gzip.len());
+        let key = PlaylistKey {
+            media_revision: 1,
+            ..PlaylistKey::default()
+        };
+        let second = cache.get_or_render(key, || Ok::<_, ()>("second".into()))?;
+        assert_eq!(budget.usage().1, second.bytes.len() + second.gzip.len());
+        assert_eq!(first.bytes, "first", "evicted response remains readable");
+        budget.set_media(1024);
+        let uncached = cache.get_or_render(key, || Ok::<_, ()>("second".into()))?;
+        assert_eq!(uncached.bytes, second.bytes);
+        assert!(uncached.freshly_rendered);
+        assert!(cache.get(&key).is_none());
+        assert_eq!(budget.usage(), (1024, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn every_encoding_and_skip_form_shares_the_media_budget() -> Result<(), ()> {
+        let budget = MemoryBudget::new(4096);
+        let caches = StreamPlaylistCache::with_budget(PlaylistUris::default(), budget.clone());
+        let cache = caches.rendition(RenditionId(0));
+        let mut expected = 0;
+        for query_variables in [false, true] {
+            for skip in [
+                PlaylistDelta::Full,
+                PlaylistDelta::Skip,
+                PlaylistDelta::SkipV2,
+            ] {
+                let key = PlaylistKey {
+                    skip,
+                    query_variables,
+                    ..PlaylistKey::default()
+                };
+                let rendered = cache.get_or_render(key, || Ok::<_, ()>("manifest".into()))?;
+                expected += rendered.bytes.len() + rendered.gzip.len();
+            }
+        }
+        let iframe = caches.iframe(RenditionId(0));
+        for cache in [iframe.as_ref(), caches.multivariant()] {
+            let rendered =
+                cache.get_or_render(PlaylistKey::default(), || Ok::<_, ()>("index".into()))?;
+            expected += rendered.bytes.len() + rendered.gzip.len();
+            assert_eq!(budget.usage().1, expected);
+        }
+        drop(iframe);
+        drop(cache);
+        drop(caches);
+        assert_eq!(budget.usage().1, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn live_media_writes_reclaim_manifests_and_report_combined_usage() -> Result<(), ()> {
+        use crate::delivery::store::{RetentionPolicy, StoreLimits};
+        let store = StreamStore::new(StoreLimits {
+            retention: RetentionPolicy {
+                maximum_payload_bytes: 4096,
+                ..RetentionPolicy::default()
+            },
+            ..StoreLimits::default()
+        });
+        let lease = lease(&store, vec![video(0)]);
+        write(&lease, initialization(0, 1));
+        let caches =
+            StreamPlaylistCache::with_budget(PlaylistUris::default(), lease.live().memory_budget());
+        let rendered = caches
+            .multivariant()
+            .get_or_render(PlaylistKey::default(), || {
+                Ok::<_, ()>("manifest".repeat(100))
+            })?;
+        let depth = lease.live().retention_depth();
+        assert_eq!(
+            depth.manifest_bytes,
+            rendered.bytes.len() + rendered.gzip.len()
+        );
+        assert_eq!(depth.memory_bytes, depth.media_bytes + depth.manifest_bytes);
+        for index in 0..4 {
+            write(&lease, chunk(0, 0, index, i64::from(index)));
+        }
+        let depth = lease.live().retention_depth();
+        assert!(
+            depth.media_bytes > 4096,
+            "minimum live window still advances"
+        );
+        assert_eq!(depth.manifest_bytes, 0);
+        assert!(caches.multivariant().get(&PlaylistKey::default()).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn topology_churn_bounds_both_playlist_cache_maps() {
+        let caches = StreamPlaylistCache::default();
+        let held = caches.rendition(RenditionId(0));
+        for id in 0..1000 {
+            caches.rendition(RenditionId(id));
+            caches.iframe(RenditionId(id));
+        }
+        assert_eq!(caches.renditions.lock().len(), 128);
+        assert_eq!(caches.iframes.lock().len(), 128);
+        assert_eq!(Arc::strong_count(&held), 1);
+    }
 
     #[test]
     fn one_key_renders_once_however_many_viewers_ask() -> Result<(), ()> {

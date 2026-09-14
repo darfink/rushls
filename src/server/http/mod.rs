@@ -21,6 +21,7 @@
 
 mod body;
 mod cors;
+mod limits;
 pub mod playback;
 mod tls;
 
@@ -59,6 +60,7 @@ use crate::{
 };
 
 pub use cors::{AllowedOrigins, CorsConfig, OriginPattern, OriginPatternError, WildcardDepth};
+pub use limits::{HttpBudget, HttpLimits};
 pub use playback::{PlaybackGate, PlaybackSettings, PlaybackStartError};
 
 use body::{RangeOutcome, StoredMediaBody, parse_range};
@@ -74,6 +76,8 @@ const REVALIDATE: &str = "no-cache";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HttpConfig {
+    /// Aggregate HTTP capacity, shared across this node’s listeners.
+    pub limits: HttpLimits,
     /// Who may play this origin from a page it does not serve.
     pub cors: CorsConfig,
     /// Absent serves cleartext, which is the right answer behind a proxy.
@@ -98,6 +102,7 @@ pub struct HttpConfig {
 impl HttpConfig {
     /// Rejects a configuration that cannot work, before anything binds.
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.limits.validate()?;
         self.cors.validate()
     }
 }
@@ -247,12 +252,41 @@ where
     L::Addr: std::fmt::Debug,
     P: Application,
 {
-    axum::serve(
+    let budget = HttpBudget::new(config.limits);
+    serve_with_budget(
         listener,
-        router(application, &config, metrics, readiness, playback).into_make_service(),
+        application,
+        config,
+        metrics,
+        playback,
+        readiness,
+        budget,
+        shutdown,
     )
-    .with_graceful_shutdown(shutdown)
     .await
+}
+
+/// Shares admission across listeners rather than multiplying capacity per bind.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_budget<L, P>(
+    listener: L,
+    application: Arc<P>,
+    config: HttpConfig,
+    metrics: Option<MetricsEndpoint>,
+    playback: Option<Arc<PlaybackGate>>,
+    readiness: Readiness,
+    budget: HttpBudget,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()>
+where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+    P: Application,
+{
+    let router = router(application, &config, metrics, readiness, playback).layer(
+        axum::middleware::from_fn_with_state(budget.clone(), limits::admit),
+    );
+    limits::serve(listener, router, budget, shutdown).await
 }
 
 /// Binds and terminates TLS, loading the certificate and starting its watch.

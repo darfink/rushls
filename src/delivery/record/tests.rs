@@ -407,3 +407,44 @@ async fn filename_collisions_report_failure_without_stopping_publication() -> Re
     assert_eq!(recorder.shared.bytes.load(Ordering::Acquire), 0);
     Ok(())
 }
+
+#[test]
+fn a_stalled_export_queue_bounds_jobs_and_returns_rejected_byte_reservations() -> Result {
+    let (jobs, receiver) = mpsc::sync_channel(1);
+    let meters = ProcessMeters::default();
+    let shared = Arc::new(Shared {
+        maximum: 1024,
+        bytes: AtomicUsize::new(0),
+        jobs: AtomicUsize::new(0),
+        finished: Notify::new(),
+        events: Events::default(),
+        meters: meters.clone(),
+        lost: AtomicUsize::new(0),
+    });
+    let recorder = Recorder {
+        jobs,
+        shared: shared.clone(),
+        pattern: Pattern::parse("{stream}/{publication}/{rendition}_{segment}.mp4")?,
+    };
+    // No worker consumes the channel: this models a filesystem write stalled
+    // while publishers continue submitting, without relying on disk timing.
+    for segment in 0..100 {
+        recorder.submit(Job {
+            stream: StreamId::new("camera"),
+            path: PathBuf::from(format!("{segment}.mp4")),
+            payloads: vec![Payload::from(vec![0; 16])],
+            _reservations: vec![
+                shared
+                    .reserve(16)
+                    .ok_or("byte budget unexpectedly exhausted")?,
+            ],
+        });
+        assert_eq!(shared.jobs.load(Ordering::Acquire), 1);
+        assert_eq!(shared.bytes.load(Ordering::Acquire), 16);
+    }
+    assert_eq!(meters.snapshot().recording_segments_lost, 99);
+    drop(receiver.recv()?);
+    shared.jobs.fetch_sub(1, Ordering::AcqRel);
+    assert_eq!(shared.bytes.load(Ordering::Acquire), 0);
+    Ok(())
+}

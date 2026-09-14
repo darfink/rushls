@@ -624,6 +624,8 @@ impl Node {
         // them that same address. Matching HTTP or HTTPS is one transport, not
         // both: a scrape on 8443 must not appear on 8080.
         let metrics = self.metrics_endpoint();
+        let http_budget =
+            http::HttpBudget::new(self.config.http.limits).with_meters(self.metrics.http_meters());
 
         if let Some(listener) = http_listener {
             report_bound(events, Protocol::Http, listener.local_addr());
@@ -631,6 +633,7 @@ impl Node {
                 listener,
                 Arc::clone(&self.application),
                 self.config.http.clone(),
+                http_budget.clone(),
                 metrics
                     .clone()
                     .filter(|_| self.config.shares_metrics_with_http()),
@@ -665,6 +668,7 @@ impl Node {
                 listener,
                 Arc::clone(&self.application),
                 self.config.http.clone(),
+                http_budget.clone(),
                 metrics
                     .clone()
                     .filter(|_| self.config.shares_metrics_with_https()),
@@ -681,6 +685,7 @@ impl Node {
                 listener,
                 Arc::clone(&self.application),
                 self.config.http.clone(),
+                http_budget.clone(),
                 self.metrics_endpoint(),
                 playback,
                 readiness.clone(),
@@ -939,6 +944,7 @@ async fn run_http<L>(
     listener: L,
     application: Arc<ViewerApplication>,
     config: HttpConfig,
+    budget: http::HttpBudget,
     metrics: Option<MetricsEndpoint>,
     playback: Option<Arc<PlaybackGate>>,
     readiness: Readiness,
@@ -949,13 +955,14 @@ where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
 {
-    let served = http::serve(
+    let served = http::serve_with_budget(
         listener,
         application,
         config,
         metrics,
         playback,
         readiness,
+        budget,
         wait_for_stop(stop.clone()),
     );
     tokio::pin!(served);

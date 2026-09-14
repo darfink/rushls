@@ -236,7 +236,7 @@ impl PacketSource for RtmpPacketSource {
             }
 
             self.meters
-                .source_progress(payload_bytes as u64, packets as u64, 0);
+                .source_progress(payload_bytes as u64, packets as u64);
             // EOF discovered during probing must not hide later prefetch batches.
             Ok(if self.pending.is_empty() && self.prefetch.is_empty() {
                 self.terminal.unwrap_or(InputState::Open)

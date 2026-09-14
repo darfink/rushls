@@ -52,6 +52,7 @@ mod media;
 mod rendition;
 mod retention;
 mod stream;
+pub mod telemetry;
 
 #[cfg(test)]
 mod tests;
@@ -118,6 +119,8 @@ pub struct StreamStore {
     limits: StoreLimits,
     disk: Option<Arc<DiskTier>>,
     events: Events,
+    publication_totals: telemetry::PublicationTotals,
+    pub operations: crate::observe::OperationMeters,
 }
 
 impl fmt::Debug for StreamStore {
@@ -145,12 +148,17 @@ impl StreamStore {
             Some(disk) => Some(DiskTier::open(disk)?),
             None => None,
         };
+        let operations = disk
+            .as_ref()
+            .map_or_else(Default::default, |disk| disk.operations());
         Ok(Self {
             streams: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             mutations: Arc::new(Mutex::new(())),
             limits,
             disk,
             events: Events::default(),
+            publication_totals: telemetry::PublicationTotals::default(),
+            operations,
         })
     }
 
@@ -165,6 +173,14 @@ impl StreamStore {
 
     pub(crate) fn disk(&self) -> Option<&Arc<DiskTier>> {
         self.disk.as_ref()
+    }
+
+    pub fn spill_capacity(&self) -> usize {
+        self.disk.as_ref().map_or(0, |_| DiskTier::spill_capacity())
+    }
+
+    pub fn publication_totals(&self) -> telemetry::PublicationTotalSnapshot {
+        self.publication_totals.0.lock().clone()
     }
 
     pub fn limits(&self) -> &StoreLimits {
@@ -198,12 +214,16 @@ impl StreamStore {
                     maximum: self.limits.maximum_streams,
                 });
             }
-            let live = Arc::new(LiveStream::with_events(
-                stream.clone(),
-                self.limits.retention,
-                self.disk.clone(),
-                self.events.clone(),
-            ));
+            let live = Arc::new(
+                LiveStream::with_events(
+                    stream.clone(),
+                    self.limits.retention,
+                    self.disk.clone(),
+                    self.events.clone(),
+                )
+                .with_publication_totals(self.publication_totals.clone())
+                .with_operation_meters(self.operations.clone()),
+            );
             live.attach_handle(Arc::downgrade(&live));
             let mut next = (*current).clone();
             next.insert(stream.clone(), Arc::clone(&live));
@@ -295,6 +315,7 @@ impl StreamStore {
         let mut changed = Maintenance::default();
 
         for (stream, live) in current.iter() {
+            live.tick_publication();
             live.sweep_expired();
             if live.retire_if_idle_for(live.retention_depth().requested) {
                 // Only a stream viewers could reach becomes unreachable. One
@@ -349,6 +370,11 @@ impl StreamLease {
     }
 
     /// Which publisher generation this lease writes as.
+    /// Stops live-output expectations before tail draining starts.
+    pub fn publisher_disconnected(&self) {
+        self.live.publisher_disconnected(self.publication);
+    }
+
     pub fn publication(&self) -> u64 {
         self.publication
     }

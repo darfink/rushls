@@ -1,0 +1,53 @@
+groups:
+  - name: rushls-origin
+    rules:
+      - alert: RushlsOutputOverdue
+        expr: rushls_rendition_output_overdue_seconds > 0
+        for: 5s
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Rushls output is late for {{ $labels.stream }} / {{ $labels.rendition }}'
+          description: 'The publisher is active but output crossed its planned interval plus the exported tolerance. Check input progress and store waits.'
+      - alert: RushlsOutputFallingBehind
+        expr: rushls_rendition_output_lag_seconds > 5
+        for: 15s
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Rushls media output is behind wall time'
+          description: 'This is relative publication drift, not camera-to-viewer latency. Tune the threshold for the deployment.'
+      - alert: RushlsRenditionSkew
+        expr: rushls_stream_rendition_media_skew_seconds > 2
+        for: 10s
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Rushls renditions have different available media ends'
+          description: 'Inspect per-rendition output lag and behind-fastest metrics. Normal segment-only cadence can require a larger threshold.'
+      - alert: RushlsOriginErrors
+        expr: sum by (instance) (rate(rushls_http_responses_total{resource!="operator",status=~"5.."}[5m])) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Rushls is producing HTTP server errors'
+      - alert: RushlsAdmissionRefusals
+        expr: sum by (instance) (increase(rushls_http_admission_refusals_total[5m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Rushls refused work at its HTTP capacity limit'
+      - alert: RushlsProbeFailed
+        expr: rushls_probe_success == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: 'The public HLS path failed its latest probe'
+      - alert: RushlsProbeStale
+        expr: time() - rushls_probe_timestamp_seconds > 120
+        labels:
+          severity: warning
+        annotations:
+          summary: 'The public HLS probe has not produced a recent result'

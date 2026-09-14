@@ -2153,3 +2153,19 @@ fn secret_files_tolerate_a_trailing_newline() -> Result<(), Box<dyn Error>> {
     assert!(error.to_string().contains("base64"), "{error}");
     Ok(())
 }
+
+#[test]
+fn http_capacity_is_configurable_and_must_be_positive() -> Result<(), Box<dyn Error>> {
+    let defaults = resolve_toml("")??;
+    assert_eq!(
+        defaults.node.http.limits,
+        crate::server::http::HttpLimits::default()
+    );
+    let config = resolve_toml("[http]\nmaximum_connections = 32\nmaximum_requests = 48\n")??;
+    assert_eq!(config.node.http.limits.maximum_connections, 32);
+    assert_eq!(config.node.http.limits.maximum_requests, 48);
+    for field in ["maximum_connections", "maximum_requests"] {
+        assert!(resolve_toml(&format!("[http]\n{field} = 0\n"))?.is_err());
+    }
+    Ok(())
+}

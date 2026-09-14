@@ -147,6 +147,8 @@ pub struct RenditionState {
     /// Stable logical identity used to reconnect packaging output to the same
     /// media-playlist projection across publisher takeovers.
     pub rendition_id: RenditionId,
+    pub gaps: u64,
+    pub publication_totals: super::telemetry::PublicationTotals,
     /// Muxer-authored identity and attributes from the latest compatible
     /// publication. This remains available while retired media is fetchable.
     pub descriptor: PackagedRendition,
@@ -158,6 +160,7 @@ pub struct RenditionState {
     /// Once removed from an active topology, this playlist remains terminal.
     /// Reusing it later would make an ENDLIST disappear for existing viewers.
     pub retired: bool,
+    retirement_deadline: Option<Instant>,
     /// Last configuration advertised for this rendition. It survives a
     /// publisher so topology remains available while the stream is idle.
     pub advertised_config: Option<RenditionConfig>,
@@ -258,12 +261,15 @@ impl RenditionState {
         }));
         Self {
             rendition_id,
+            gaps: 0,
+            publication_totals: super::telemetry::PublicationTotals::default(),
             advertised_config: Some(descriptor.config),
             active_config: None,
             descriptor,
             contract,
             active: false,
             retired: false,
+            retirement_deadline: None,
             initializations: Arc::from([]),
             current_initialization: None,
             issued_initializations: 0,
@@ -382,6 +388,32 @@ impl RenditionState {
         let edge = self.advance_edge(ended);
         self.publish_snapshot();
         (self.edge_updates.clone(), edge)
+    }
+
+    /// A retired playlist receives no new media to drive ordinary window trim.
+    /// Keep its final window plus fetch grace, then remove the entire playlist.
+    pub fn retire(&mut self, now: Instant, retention: RetentionPolicy) {
+        if self.retired {
+            return; // Later reconnects must not renew an old playlist's lifetime.
+        }
+        self.retired = true;
+        let target = self.contract.target_duration();
+        let window = retention
+            .minimum_playlist_duration_for(target)
+            .max(self.visible_playlist_duration());
+        let grace = retention
+            .part_fetch_grace_period
+            .resolve(target)
+            .max(target);
+        self.retirement_deadline = now.checked_add(window.saturating_add(grace));
+    }
+
+    pub fn retirement_expired(&self, now: Instant) -> bool {
+        self.retired
+            && (self
+                .retirement_deadline
+                .is_some_and(|deadline| now >= deadline)
+                || (self.retained_object_counts() == (0, 0, 0) && self.open_segment.is_none()))
     }
 
     pub fn retained_object_counts(&self) -> (usize, usize, usize) {
@@ -984,6 +1016,8 @@ impl RenditionState {
         let Some(config) = self.advertised_config else {
             return;
         };
+        self.gaps += 1;
+        self.publication_totals.0.lock().gaps += 1;
         self.bitrate.break_contiguity();
         let msn = open.msn;
         self.unpick_visible_parts_from_back(msn);

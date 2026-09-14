@@ -398,7 +398,7 @@ impl PacketSource for MoqPacketSource {
             }
 
             self.meters
-                .source_progress(payload_bytes as u64, packets as u64, 0);
+                .source_progress(payload_bytes as u64, packets as u64);
             Ok(if self.prefetch.is_empty() {
                 self.terminal.unwrap_or(InputState::Open)
             } else {

@@ -19,17 +19,18 @@ use super::counters::counters;
 #[derive(Clone, Debug, Default)]
 pub struct OriginMeters {
     counters: Arc<OriginCounters>,
+    pub operations: super::OperationMeters,
 }
 
 counters! {
     OriginCounters => OriginSnapshot {
-        media_served: u64 = Counter(
-            "rushls_media_responses_served_total",
-            "Media responses served to viewers."
+        media_resolved: u64 = Counter(
+            "rushls_media_resolved_total",
+            "Media objects resolved before HTTP response processing."
         ),
-        bytes_served: u64 = Counter(
-            "rushls_bytes_served_total",
-            "Media bytes served to viewers."
+        bytes_resolved: u64 = Counter(
+            "rushls_media_resolved_bytes_total",
+            "Unencoded media bytes resolved before HTTP range and conditional processing."
         ),
         requests_rejected: u64 = Counter(
             "rushls_origin_requests_rejected_total",
@@ -43,9 +44,9 @@ counters! {
 }
 
 impl OriginMeters {
-    pub fn media_served(&self, bytes: u64) {
-        add(&self.counters.media_served, 1);
-        add(&self.counters.bytes_served, bytes);
+    pub fn media_resolved(&self, bytes: u64) {
+        add(&self.counters.media_resolved, 1);
+        add(&self.counters.bytes_resolved, bytes);
     }
 
     pub fn request_rejected(&self) {
@@ -68,41 +69,25 @@ pub struct HlsMeters {
 
 counters! {
     HlsCounters => HlsSnapshot {
-        playlists_served: u64 = Counter(
-            "rushls_hls_playlists_served_total",
-            "HLS playlist responses served to viewers."
+        playlists_resolved: u64 = Counter(
+            "rushls_hls_playlists_resolved_total",
+            "HLS playlists resolved before HTTP conditional response processing."
         ),
         /// Playlists actually projected, as opposed to reused from a cache.
-        playlists_rendered: u64 = Counter(
-            "rushls_hls_playlists_rendered_total",
+        playlist_projections: u64 = Counter(
+            "rushls_hls_playlist_projections_total",
             "HLS playlists projected instead of reused from the render cache."
         ),
-        blocking_reloads: u64 = Counter(
-            "rushls_hls_blocking_reloads_total",
-            "HLS blocking playlist reloads started."
-        ),
-        /// Blocking reloads that hit their deadline without the media arriving.
-        blocking_reloads_expired: u64 = Counter(
-            "rushls_hls_blocking_reloads_expired_total",
-            "HLS blocking playlist reloads that expired before media arrived."
-        ),
+
     }
 }
 
 impl HlsMeters {
-    pub fn playlist_served(&self, rendered: bool) {
-        add(&self.counters.playlists_served, 1);
+    pub fn playlist_resolved(&self, rendered: bool) {
+        add(&self.counters.playlists_resolved, 1);
         if rendered {
-            add(&self.counters.playlists_rendered, 1);
+            add(&self.counters.playlist_projections, 1);
         }
-    }
-
-    pub fn blocking_reload_started(&self) {
-        add(&self.counters.blocking_reloads, 1);
-    }
-
-    pub fn blocking_reload_expired(&self) {
-        add(&self.counters.blocking_reloads_expired, 1);
     }
 
     pub fn snapshot(&self) -> HlsSnapshot {
@@ -122,32 +107,15 @@ mod tests {
     fn cache_hits_are_distinguishable_from_renders() {
         let meters = HlsMeters::default();
 
-        meters.playlist_served(true);
-        meters.playlist_served(false);
-        meters.playlist_served(false);
+        meters.playlist_resolved(true);
+        meters.playlist_resolved(false);
+        meters.playlist_resolved(false);
 
         let snapshot = meters.snapshot();
-        assert_eq!(snapshot.playlists_served, 3);
+        assert_eq!(snapshot.playlists_resolved, 3);
         assert_eq!(
-            snapshot.playlists_rendered, 1,
+            snapshot.playlist_projections, 1,
             "two of the three were answered from the render cache"
-        );
-    }
-
-    #[test]
-    fn expired_waits_are_counted_apart_from_the_waits_themselves() {
-        let meters = HlsMeters::default();
-
-        meters.blocking_reload_started();
-        meters.blocking_reload_started();
-        meters.blocking_reload_expired();
-
-        let snapshot = meters.snapshot();
-        assert_eq!(
-            (snapshot.blocking_reloads, snapshot.blocking_reloads_expired),
-            (2, 1),
-            "waiting is the protocol working; expiring is the origin falling \
-             behind the cadence it advertised"
         );
     }
 }

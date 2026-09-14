@@ -11,6 +11,13 @@ duration_seconds=3600
 sample_interval=30
 post_stop_interval=5
 retention_wait_seconds=40
+viewer_count=2
+viewer_interval=2
+slow_viewer_count=1
+metrics_port=18081
+memory_per_stream="16MiB"
+disk_per_stream="64MiB"
+dvr_dir=""
 rtmp_port=11935
 srt_port=19000
 http_port=18080
@@ -19,6 +26,7 @@ release_build=false
 output_dir=""
 server_pid=""
 publisher_pids=()
+viewer_pids=()
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 cd "$repo_root"
@@ -27,8 +35,12 @@ usage() {
   cat <<'EOF'
 Usage: tools/soak.sh [options]
 
-Runs concurrent synthetic RTMP publishers against a local Rushls process,
-records RSS and Rushls metrics, then observes cleanup after publishers stop.
+Runs concurrent synthetic RTMP publishers plus playlist viewers against a
+local Rushls process, records RSS/CPU, playlist latency, and Rushls metrics,
+then observes cleanup after publishers stop.
+Runs concurrent synthetic RTMP publishers plus playlist viewers against a
+local Rushls process, records RSS/CPU, playlist latency, and Rushls metrics,
+then observes cleanup after publishers stop.
 
 Options:
   --publishers N          Number of concurrent publishers (default: 5)
@@ -36,15 +48,23 @@ Options:
   --sample-interval N     Seconds between steady-state samples (default: 30)
   --post-stop-interval N  Seconds between teardown samples (default: 5)
   --retention-wait N      Seconds to observe after publishers stop (default: 40)
+  --viewers N             Playlist viewers polling index.m3u8 (default: 2, 0 disables)
+  --slow-viewers N        Extra viewers throttled to 32kB/s (default: 1, 0 disables)
+  --viewer-interval N     Seconds between playlist polls per viewer (default: 2)
   --rtmp-port N           Local RTMP port (default: 11935)
   --srt-port N            Local SRT port (default: 19000)
   --http-port N           Local HTTP port (default: 18080)
+  --metrics-port N        Local metrics port (default: 18081)
+  --memory-per-stream S   Retained-media cap per stream (default: 16MiB)
+  --disk-per-stream S     DVR spill cap per stream (default: 64MiB)
+  --dvr-dir PATH          Spill directory (default: <output-dir>/dvr)
   --output-dir PATH       Directory for CSV, logs, and publisher output
   --no-build              Use the existing target/debug binary
   --release               Build and use target/release/rushls
   -h, --help              Show this help
 
-The default run is one hour with five publishers. Use --release for a more
+The default run is one hour with five publishers, two playlist viewers, and one
+slow viewer. Use --release for a more
 representative memory measurement, and set SOAK_OUTPUT_DIR or --output-dir to
 keep results in a known location.
 EOF
@@ -77,6 +97,12 @@ require_positive_integer() {
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$name must be a positive integer"
 }
 
+require_non_negative_integer() {
+  local name="$1"
+  local value="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer"
+}
+
 while (($# > 0)); do
   case "$1" in
     --publishers)
@@ -104,6 +130,21 @@ while (($# > 0)); do
       retention_wait_seconds="$(parse_duration "$2")"
       shift 2
       ;;
+    --viewers)
+      (($# >= 2)) || die "--viewers requires a value"
+      viewer_count="$2"
+      shift 2
+      ;;
+    --slow-viewers)
+      (($# >= 2)) || die "--slow-viewers requires a value"
+      slow_viewer_count="$2"
+      shift 2
+      ;;
+    --viewer-interval)
+      (($# >= 2)) || die "--viewer-interval requires a value"
+      viewer_interval="$2"
+      shift 2
+      ;;
     --rtmp-port)
       (($# >= 2)) || die "--rtmp-port requires a value"
       rtmp_port="$2"
@@ -117,6 +158,26 @@ while (($# > 0)); do
     --http-port)
       (($# >= 2)) || die "--http-port requires a value"
       http_port="$2"
+      shift 2
+      ;;
+    --metrics-port)
+      (($# >= 2)) || die "--metrics-port requires a value"
+      metrics_port="$2"
+      shift 2
+      ;;
+    --memory-per-stream)
+      (($# >= 2)) || die "--memory-per-stream requires a value"
+      memory_per_stream="$2"
+      shift 2
+      ;;
+    --disk-per-stream)
+      (($# >= 2)) || die "--disk-per-stream requires a value"
+      disk_per_stream="$2"
+      shift 2
+      ;;
+    --dvr-dir)
+      (($# >= 2)) || die "--dvr-dir requires a value"
+      dvr_dir="$2"
       shift 2
       ;;
     --output-dir)
@@ -147,6 +208,10 @@ require_positive_integer duration "$duration_seconds"
 require_positive_integer sample-interval "$sample_interval"
 require_positive_integer post-stop-interval "$post_stop_interval"
 require_positive_integer retention-wait "$retention_wait_seconds"
+require_non_negative_integer viewers "$viewer_count"
+require_non_negative_integer slow-viewers "$slow_viewer_count"
+require_positive_integer viewer-interval "$viewer_interval"
+require_positive_integer metrics-port "$metrics_port"
 require_positive_integer rtmp-port "$rtmp_port"
 require_positive_integer srt-port "$srt_port"
 require_positive_integer http-port "$http_port"
@@ -183,6 +248,7 @@ csv_path="$output_dir/samples.csv"
 server_log="$output_dir/rushls.log"
 publisher_log_prefix="$output_dir/publisher"
 printf 'phase,timestamp_utc,elapsed_seconds,rss_kib,physical_footprint,active_sessions,published_streams,idle_streams,ready_playlists,failed_sessions,live_publishers\n' >"$csv_path"
+printf 'phase,timestamp_utc,elapsed_seconds,rss_kib,physical_footprint,active_sessions,published_streams,idle_streams,ready_playlists,failed_sessions,live_publishers,cpu_percent,playlist_latency_max_s,live_viewers,retained_memory_bytes,retained_disk_bytes,disk_spill_pending,spills_failed_total,playlists_served_total\n' >"$csv_path"
 
 cleanup() {
   local exit_status=$?
@@ -194,6 +260,12 @@ cleanup() {
   done
   for publisher_pid in "${publisher_pids[@]}"; do
     wait "$publisher_pid" 2>/dev/null
+  done
+  for viewer_pid in "${viewer_pids[@]}"; do
+    kill "$viewer_pid" 2>/dev/null
+  done
+  for viewer_pid in "${viewer_pids[@]}"; do
+    wait "$viewer_pid" 2>/dev/null
   done
 
   if [[ -n "$server_pid" ]]; then
@@ -212,18 +284,25 @@ cleanup() {
 trap 'exit 130' INT TERM
 trap cleanup EXIT
 
-echo "starting Rushls on RTMP :$rtmp_port, SRT :$srt_port, HTTP :$http_port"
-RUSHLS_INGEST_RTMP_LISTEN="127.0.0.1:$rtmp_port" \
-RUSHLS_INGEST_SRT_LISTEN="127.0.0.1:$srt_port" \
+echo "starting Rushls on RTMP :$rtmp_port, SRT :$srt_port, HTTP :$http_port, metrics :$metrics_port"
+if [[ -z "$dvr_dir" ]]; then
+  dvr_dir="$output_dir/dvr"
+fi
+mkdir -p "$dvr_dir"
+RUSHLS_RTMP_LISTEN="127.0.0.1:$rtmp_port" \
+RUSHLS_SRT_LISTEN="127.0.0.1:$srt_port" \
 RUSHLS_HTTP_LISTEN="127.0.0.1:$http_port" \
-RUSHLS_METRICS_ENABLED=true \
-RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHERS="${RUSHLS_SERVER_MAXIMUM_CONCURRENT_PUBLISHERS:-$((publisher_count + 3))}" \
-RUSHLS_SERVER_MAXIMUM_PENDING_PUBLISHERS_PER_LISTENER="${RUSHLS_SERVER_MAXIMUM_PENDING_PUBLISHERS_PER_LISTENER:-$((publisher_count + 3))}" \
+RUSHLS_METRICS_LISTEN="127.0.0.1:$metrics_port" \
+RUSHLS_CAPACITY_PUBLISHERS="${RUSHLS_CAPACITY_PUBLISHERS:-$((publisher_count + 3))}" \
+RUSHLS_CAPACITY_STREAMS="${RUSHLS_CAPACITY_STREAMS:-$((publisher_count + 3))}" \
+RUSHLS_CAPACITY_MEMORY_PER_STREAM="$memory_per_stream" \
+RUSHLS_CAPACITY_DISK_PER_STREAM="$disk_per_stream" \
+RUSHLS_CAPACITY_DIR="$dvr_dir" \
   "$rushls_binary" >"$server_log" 2>&1 &
 server_pid=$!
 
 ready_url="http://127.0.0.1:$http_port/health/ready"
-metrics_url="http://127.0.0.1:$http_port/metrics"
+metrics_url="http://127.0.0.1:$metrics_port/metrics"
 for attempt in {1..30}; do
   if curl -fsS --max-time 2 -o /dev/null "$ready_url" 2>/dev/null; then
     break
@@ -248,6 +327,28 @@ for ((index = 1; index <= publisher_count; index++)); do
     -c:a aac -b:a 64k -f flv \
     "rtmp://127.0.0.1:$rtmp_port/live/soak-$index" >"$log_path" 2>&1 &
   publisher_pids+=("$!")
+done
+
+echo "starting $viewer_count playlist viewers and $slow_viewer_count slow viewers"
+for ((v = 1; v <= viewer_count; v++)); do
+  (
+  while :; do
+    curl -fsS --max-time 5 -o /dev/null \
+      "http://127.0.0.1:$http_port/live/soak-$((v % publisher_count + 1))/index.m3u8" 2>/dev/null || true
+    sleep "$viewer_interval"
+  done
+  ) >"$output_dir/viewer-$v.log" 2>&1 &
+  viewer_pids+=("$!")
+done
+for ((v = 1; v <= slow_viewer_count; v++)); do
+  (
+  while :; do
+    curl -fsS --max-time 20 --limit-rate 32k -o /dev/null \
+      "http://127.0.0.1:$http_port/live/soak-$((v % publisher_count + 1))/index.m3u8" 2>/dev/null || true
+    sleep "$viewer_interval"
+  done
+  ) >"$output_dir/slow-viewer-$v.log" 2>&1 &
+  viewer_pids+=("$!")
 done
 
 metric_value() {
@@ -279,6 +380,29 @@ live_publishers() {
   printf '%s\n' "$live"
 }
 
+live_viewers() {
+  local live=0
+  local viewer_state
+  for viewer_pid in "${viewer_pids[@]}"; do
+    viewer_state="$(ps -o stat= -p "$viewer_pid" 2>/dev/null)"
+    if [[ -n "$viewer_state" && "$viewer_state" != Z* ]]; then
+      ((live += 1))
+    fi
+  done
+  printf '%s\n' "$live"
+}
+
+playlist_latency_max() {
+  local max=0
+  local t
+  for ((index = 1; index <= publisher_count; index++)); do
+    t="$(curl -fsS --max-time 5 -o /dev/null -w '%{time_total}' \
+      "http://127.0.0.1:$http_port/live/soak-$index/index.m3u8" 2>/dev/null)" || continue
+    max="$(awk -v a="$max" -v b="$t" 'BEGIN { if (b+0 > a+0) print b; else print a }')"
+  done
+  printf '%s\n' "$max"
+}
+
 sample() {
   local phase="$1"
   local elapsed="$2"
@@ -291,6 +415,14 @@ sample() {
   local ready
   local failed
   local live
+  local cpu
+  local latency
+  local viewers
+  local retained_mem
+  local retained_disk
+  local spill_pending
+  local spills_failed
+  local playlists_served
 
   metrics="$(curl -fsS --max-time 2 "$metrics_url")"
   rss="$(ps -o rss= -p "$server_pid" | tr -d ' ')"
@@ -300,6 +432,14 @@ sample() {
   failed="$(metric_value "$metrics" rushls_sessions_failed_total)"
   ready="$(ready_playlists)"
   live="$(live_publishers)"
+  cpu="$(ps -o %cpu= -p "$server_pid" | tr -d ' ')"
+  latency="$(playlist_latency_max)"
+  viewers="$(live_viewers)"
+  retained_mem="$(metric_value "$metrics" rushls_retained_memory_bytes)"
+  retained_disk="$(metric_value "$metrics" rushls_retained_disk_bytes)"
+  spill_pending="$(metric_value "$metrics" rushls_disk_spill_pending)"
+  spills_failed="$(metric_value "$metrics" rushls_disk_spills_failed_total)"
+  playlists_served="$(metric_value "$metrics" rushls_hls_playlists_resolved_total)"
 
   if [[ "$phase" == steady-state && "$live" != "$publisher_count" ]]; then
     echo "a publisher exited during the soak (live=$live expected=$publisher_count)" >&2
@@ -314,9 +454,10 @@ sample() {
     physical_footprint="$(vmmap -summary "$server_pid" 2>/dev/null | awk '/^Physical footprint:/ { print $3; exit }')"
   fi
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "$phase" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$elapsed" "$rss" "$physical_footprint" \
-    "$active" "$published" "$idle" "$ready" "$failed" "$live" | tee -a "$csv_path"
+    "$active" "$published" "$idle" "$ready" "$failed" "$live" \
+    "$cpu" "$latency" "$viewers" "$retained_mem" "$retained_disk" "$spill_pending" "$spills_failed" "$playlists_served" | tee -a "$csv_path"
 }
 
 echo "waiting for all publishers and HLS playlists"

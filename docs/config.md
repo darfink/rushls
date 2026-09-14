@@ -78,6 +78,30 @@ defaults and no cipher knobs. HTTPS and MOQ share that rotation machinery, but
 not a `ServerConfig`: HTTP/3 requires TLS 1.3 and `h3` ALPN, so MOQ must not
 reuse the viewer HTTPS config.
 
+Direct exposure has two shared limits under `[http]`: `maximum_connections`
+and `maximum_requests`, both defaulting to 4096. HTTP, HTTPS, and a separate
+metrics listener share these budgets. Excess connections close immediately.
+Excess requests receive `503`, `Retry-After: 1`, and `Cache-Control: no-store`.
+A request keeps its slot while waiting for media and while sending its body.
+HTTP/2 streams use the same request budget. These are global capacity limits;
+per-IP policy belongs in auth or the deployment boundary.
+
+The first request must reach the handler within 30 seconds of connection
+admission, including protocol detection. Subsequent HTTP/1 headers also have
+a 30-second read deadline. HTTP/1 read buffers and HTTP/2 header lists are
+limited to 32 KiB. Each HTTP/2 connection permits up to 128 concurrent streams.
+HTTP/2 keepalive checks run every 30 seconds, with a 10-second response deadline.
+TLS retains its separate handshake budget and deadline.
+
+Incompatible reconnects keep at most 64 retired renditions per stream.
+Each final playlist stays for its retention window plus fetch grace, unless
+stream capacity requires earlier removal. Reconnecting again does not extend
+that lifetime. Empty retired renditions leave immediately; active renditions
+keep their existing retention rules. The render cache holds at most 128 regular
+and 128 I-frame playlist entries per stream. Their bytes share the
+`memory_per_stream` budget with media. Eviction preserves responses that
+already hold their media or rendered bytes.
+
 MOQ identity matches SRT's last-`/` split: `https://origin/live/camera` is
 namespace `live` and name `camera`; a single path component is a single-key
 publish. The credential is the `token` query parameter when present, otherwise
@@ -552,27 +576,44 @@ would turn a CDN sizing answer into an origin config field.
 
 ### What the node actually costs
 
-`memory_per_stream` bounds retained parts and segments. It does not cover what
-a publisher holds on the way there, and that is not small: transport framing,
-the demuxer queue, an in-flight batch, pre-roll, and container probing come to
-**120MiB per publisher**, held only while ingesting and released the moment a
-session ends.
+`memory_per_stream` budgets retained media and cached manifests together.
+Memory-only streams give media priority and use remaining space for manifests.
+With disk storage, one eighth of the RAM budget is reserved for plain and gzip
+manifest bytes. Media spilling starts above 81.25% of the budget and aims for 75%.
+The gap leaves room for incoming media while disk writes finish.
+For a 256 MiB budget, manifests get 32 MiB; spilling starts above 208 MiB and targets 192 MiB.
+These thresholds also apply when no viewer has requested a manifest yet.
+
+The cache cannot grow beyond its allowance on disk-backed streams.
+It evicts obsolete versions first, then the least recently accessed entries.
+A manifest that cannot fit is served without caching. The cache holds current
+playlist forms, including their DVR history, rather than past playlist versions.
+Moving media to disk does not invalidate manifests; changing playlist content does.
+Only media spills to disk.
+
+The budget excludes metadata, temporary rendering buffers, transport buffers,
+and bytes held only by responses already in flight. The minimum live media
+window can also exceed an undersized budget. In that case, no manifests are cached.
+This setting is a retention budget, not a hard process-memory ceiling.
+
+A publisher also holds transport framing, demux queues, an in-flight batch,
+pre-roll, and container probing buffers. These have a compiled bound of
+**120MiB per publisher**, held only while ingesting.
 
 ```
-worst case = streams x memory_per_stream      retained media, outlives the publisher
-           + publishers x 120MiB              ingest only, released on disconnect
+retention budget = streams x memory_per_stream   media and manifest caches
+pipeline bound   = publishers x 120MiB            ingest only
 ```
 
-The two terms have different lifetimes, which is the same seam `publishers` and
-`streams` already sit on. At the reference's own numbers that is 64GiB of
-retained media and 7.5GiB of pipeline.
+These terms have different lifetimes. At the reference settings, they give
+64GiB of retention budget and 7.5GiB of pipeline capacity, before the overhead above.
 
 The pipeline figure is a compiled constant rather than a setting, because an
 operator has no basis on which to choose one: it is driven by track count and
 group-of-pictures structure, which belong to the publisher rather than to the
 deployment, and a value chosen too low breaks discovery for multi-rendition
 contributors. What is owed instead is the guarantee and a way to check it, so
-it is exported per session as `rushls_session_pipeline_bytes`.
+it is exported per session as `rushls_session_pipeline_capacity_bytes`.
 
 A `memory_per_publisher` cap appears commented in the reference and is not
 built. Enforcing one shared budget means deciding what a stage does when
@@ -977,16 +1018,14 @@ Two scrape paths: `/metrics` for process totals and hook series,
 chooses, so unbounded cardinality is a second Prometheus job rather than a
 node-side flag.
 
-`/metrics/streams` is live sessions (`rushls_session_info`, per-session meters)
-and retention depth: configured `retain` versus the playlist duration actually
-named, plus bytes and cap per tier (`tier="memory"` then `tier="disk"`). Totals
-on `/metrics` include `rushls_retained_payload_bytes`,
-`rushls_retained_disk_bytes`, `rushls_retention_capacity_bytes` (same `tier`
-labels), `rushls_disk_spill_pending`, `rushls_disk_spills_failed_total`, and
-`rushls_retention_requested_seconds`. Idle streams still within `retain` are
-counted; a publisher leaving does not hide what viewers can still fetch.
-A full spill queue is when pending hits 32: the store sheds instead of
-spilling. Failed spills leave media in RAM.
+`/metrics/streams` includes live session and input-track progress, per-rendition
+output deadlines and wall-time lag, rendition comparisons, and retention.
+`/metrics` contains node totals, HTTP body and response measurements, operation
+durations, capacity, and hook delivery measurements.
+
+See [Metrics](metrics.md) for exact semantics, replacement names, queries,
+a Grafana dashboard, alert rules, and the public-playback probe.
+
 
 ## Secrets
 

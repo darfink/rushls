@@ -41,6 +41,9 @@ pub enum PublishOutcome {
 
 /// Accepts packaged media on behalf of one stream and makes it fetchable.
 pub trait HlsPublisher: Send {
+    /// Disarms cadence deadlines before the session flushes its accepted tail.
+    fn publisher_disconnected(&mut self) {}
+
     /// Fast path avoids allocating a wait future when the publisher is ready.
     fn is_backpressured(&self) -> bool {
         false
@@ -227,6 +230,10 @@ impl StorePublisher {
 }
 
 impl HlsPublisher for StorePublisher {
+    fn publisher_disconnected(&mut self) {
+        self.lease.publisher_disconnected();
+    }
+
     fn is_backpressured(&self) -> bool {
         self.lease.live().is_backpressured()
     }

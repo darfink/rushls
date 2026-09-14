@@ -20,11 +20,13 @@ use std::{
     time::Duration,
 };
 
+use super::telemetry::{PublicationSnapshot, PublicationTelemetry, PublicationTotals};
 use arc_swap::ArcSwap;
-use parking_lot::{RwLock, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use tokio::{sync::watch, time::Instant};
 
 use crate::{
+    delivery::memory::{ManifestClass, MemoryBudget},
     domain::{Payload, RenditionId, StreamId},
     mux::{ClosedCaptionService, PackagedMedia, PackagedPresentation, PackagingRenditionId},
     observe::{Events, RetentionClipReason, StreamEvent},
@@ -68,13 +70,44 @@ enum Media {
     Untouched,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpillState {
+    Idle,
+    /// Continue down to the low watermark, even after crossing below high.
+    Draining,
+    Failed,
+}
+
+/// Protect manifest reuse during sustained DVR spilling. The extra gap below
+/// the trigger amortizes disk work and absorbs incoming batches while it runs.
+#[derive(Clone, Copy, Debug)]
+struct SpillWatermarks {
+    manifests: usize,
+    high: usize,
+    low: usize,
+}
+impl SpillWatermarks {
+    fn new(capacity: usize) -> Self {
+        let manifests = capacity / 8;
+        let gap = capacity / 16;
+        let high = capacity - manifests - gap;
+        Self {
+            manifests,
+            high,
+            low: high - gap,
+        }
+    }
+}
+
 /// Live media for one logical stream, shared by publishers and readers.
 #[derive(Debug)]
 pub struct LiveStream {
     id: StreamId,
     limits: RetentionPolicy,
+    memory: MemoryBudget,
     disk: Option<Arc<DiskTier>>,
     disk_capacity: usize,
+    spill_watermarks: SpillWatermarks,
     /// Process-wide identity for this stream's spill paths. Not the public id.
     disk_epoch: u64,
     this: OnceLock<Weak<LiveStream>>,
@@ -92,10 +125,13 @@ pub struct LiveStream {
     /// point: a publisher reconnecting within the idle window resumes a stream
     /// viewers never lost, and announcing it again would say something untrue.
     announced: AtomicBool,
+    telemetry: Mutex<PublicationTelemetry>,
+    operations: crate::observe::OperationMeters,
 }
 
 #[derive(Debug)]
 pub struct StreamState {
+    memory: MemoryBudget,
     renditions: Vec<RenditionState>,
     active_presentation: Option<ResolvedPresentation>,
     publication_anchors: Vec<PublicationAnchor>,
@@ -112,11 +148,12 @@ pub struct StreamState {
     idle_since: Option<Instant>,
     retained_payload_bytes: usize,
     retained_disk_bytes: usize,
-    spill_failed: bool,
+    spill_state: SpillState,
     /// Whether the advertised window is currently shorter than `retain`
     /// because a byte or object cap shed history. Latched so a high-bitrate
     /// publisher does not warn on every parent.
     capacity_clipped: bool,
+    pending_observation: Option<(RenditionId, Option<(i64, u64)>)>,
 }
 
 impl LiveStream {
@@ -130,6 +167,15 @@ impl LiveStream {
         disk: Option<Arc<DiskTier>>,
         events: Events,
     ) -> Self {
+        let spill_watermarks = SpillWatermarks::new(limits.maximum_payload_bytes);
+        let memory = if disk.is_some() {
+            MemoryBudget::with_manifest_capacity(
+                limits.maximum_payload_bytes,
+                spill_watermarks.manifests,
+            )
+        } else {
+            MemoryBudget::new(limits.maximum_payload_bytes)
+        };
         let disk_capacity = disk.as_ref().map_or(0, |tier| tier.maximum_payload_bytes());
         let snapshot = StreamSnapshot {
             revision: 0,
@@ -143,12 +189,15 @@ impl LiveStream {
         Self {
             id,
             limits,
+            memory: memory.clone(),
             disk,
             disk_capacity,
+            spill_watermarks,
             disk_epoch: NEXT_DISK_EPOCH.fetch_add(1, Ordering::Relaxed),
             this: OnceLock::new(),
             events,
             state: RwLock::new(StreamState {
+                memory,
                 renditions: Vec::new(),
                 active_presentation: None,
                 publication_anchors: Vec::new(),
@@ -160,13 +209,71 @@ impl LiveStream {
                 idle_since: Some(Instant::now()),
                 retained_payload_bytes: 0,
                 retained_disk_bytes: 0,
-                spill_failed: false,
+                spill_state: SpillState::Idle,
                 capacity_clipped: false,
+                pending_observation: None,
             }),
             snapshot: ArcSwap::from_pointee(snapshot),
             media_revision: AtomicU64::new(0),
             announced: AtomicBool::new(false),
+            telemetry: Mutex::new(PublicationTelemetry::default()),
+            operations: crate::observe::OperationMeters::default(),
         }
+    }
+
+    /// This stream instance’s retained media and regenerable manifest budget.
+    #[must_use]
+    pub fn with_operation_meters(mut self, operations: crate::observe::OperationMeters) -> Self {
+        self.operations = operations;
+        self
+    }
+
+    #[must_use]
+    pub fn with_publication_totals(self, totals: PublicationTotals) -> Self {
+        self.telemetry.lock().totals = totals;
+        self
+    }
+
+    pub fn gap_counts(&self) -> Vec<(RenditionId, crate::domain::MediaKind, u64)> {
+        self.state
+            .read()
+            .renditions
+            .iter()
+            .map(|r| (r.rendition_id, r.descriptor.media.kind(), r.gaps))
+            .collect()
+    }
+
+    pub fn rendition_retention(&self) -> Vec<(RenditionId, crate::domain::MediaKind, Duration)> {
+        self.snapshot()
+            .renditions
+            .iter()
+            .filter(|r| r.active)
+            .map(|r| {
+                (
+                    r.rendition_id,
+                    r.media.kind(),
+                    advertised_duration(&r.snapshot()),
+                )
+            })
+            .collect()
+    }
+
+    pub fn publication_snapshot(&self) -> PublicationSnapshot {
+        self.telemetry.lock().snapshot()
+    }
+
+    pub fn tick_publication(&self) {
+        self.telemetry.lock().tick();
+    }
+
+    pub fn publisher_disconnected(&self, publication: u64) {
+        // Same lock order as media commits; an old lease cannot stop a successor.
+        let _state = self.state.read();
+        self.telemetry.lock().stop(publication);
+    }
+
+    pub fn memory_budget(&self) -> MemoryBudget {
+        self.memory.clone()
     }
 
     pub fn revision(&self) -> u64 {
@@ -246,6 +353,7 @@ impl LiveStream {
             .map(|entry| advertised_duration(&entry.snapshot()))
             .max()
             .unwrap_or(Duration::ZERO);
+        let (media_bytes, manifest_bytes) = self.memory.usage();
         RetentionDepth {
             requested: snapshot
                 .renditions
@@ -257,7 +365,9 @@ impl LiveStream {
                 .max()
                 .unwrap_or_else(|| self.limits.retain.resolve(Duration::ZERO)),
             held,
-            memory_bytes: self.retained_payload_bytes(),
+            memory_bytes: media_bytes.saturating_add(manifest_bytes),
+            media_bytes,
+            manifest_bytes,
             memory_capacity: self.limits.maximum_payload_bytes,
             disk_bytes: self.state.read().retained_disk_bytes,
             disk_capacity: self.disk_capacity,
@@ -357,7 +467,7 @@ impl LiveStream {
     /// produce identical bytes.
     fn commit_with(
         &self,
-        state: RwLockWriteGuard<'_, StreamState>,
+        mut state: RwLockWriteGuard<'_, StreamState>,
         catalog: Catalog,
         media: Media,
         edges: impl IntoIterator<Item = EdgeUpdate>,
@@ -368,12 +478,19 @@ impl LiveStream {
         if media == Media::Changed {
             self.advance_media_revision();
         }
+        if let Some((id, interval)) = state.pending_observation.take() {
+            self.telemetry
+                .lock()
+                .committed(state.publication, id, interval);
+        }
         drop(state);
 
         notify_edges(edges);
     }
 
     fn publish_catalog(&self, state: &StreamState) {
+        self.memory
+            .set_epoch(ManifestClass::Index, state.catalog_revision);
         let renditions: Arc<[RenditionCatalogEntry]> = state
             .renditions
             .iter()
@@ -472,6 +589,7 @@ impl LiveStream {
                 state.renditions.len() - 1
             };
             let rendition = &mut state.renditions[index];
+            rendition.publication_totals = self.telemetry.lock().totals.clone();
             rendition.descriptor = descriptor.clone();
             rendition.advertised_config = Some(descriptor.config);
             rendition.active_config = Some((publication, descriptor.config));
@@ -486,11 +604,11 @@ impl LiveStream {
             .iter_mut()
             .filter(|rendition| !rendition.active)
         {
-            rendition.retired = true;
+            rendition.retire(now, retention);
             edge_updates.push(rendition.commit(true));
         }
 
-        let resolved_groups = presentation
+        let resolved_groups: Arc<[ResolvedRenditionGroup]> = presentation
             .groups
             .iter()
             .map(|group| ResolvedRenditionGroup {
@@ -505,18 +623,58 @@ impl LiveStream {
             })
             .collect::<Vec<_>>()
             .into();
+        self.attach_telemetry(&state, presentation, &resolved_groups);
         state.active_presentation = Some(ResolvedPresentation {
             time_anchor: presentation.time_anchor,
             groups: resolved_groups,
             combinations: Arc::clone(&presentation.combinations),
             closed_captions: Arc::clone(&presentation.closed_captions),
         });
+        state.prune_retired(now, self.limits, self.disk_capacity);
         state.prune_publication_anchors();
         state.recalculate_retained_bytes();
         state.bump_catalog();
         state.bump_media_catalog();
         self.commit(state, Catalog::Republished, edge_updates);
         (publication, mapping)
+    }
+
+    fn attach_telemetry(
+        &self,
+        state: &StreamState,
+        presentation: &PackagedPresentation,
+        resolved_groups: &[ResolvedRenditionGroup],
+    ) {
+        let mut timing_groups: Vec<_> = resolved_groups
+            .iter()
+            .map(|g| {
+                (
+                    Arc::<str>::from(format!("group/{}", g.key.0)),
+                    g.renditions.to_vec(),
+                )
+            })
+            .collect();
+        for (index, combination) in presentation.combinations.iter().enumerate() {
+            let mut members: Vec<_> = resolved_groups
+                .iter()
+                .filter(|g| combination.groups.contains(&g.key))
+                .flat_map(|g| g.renditions.iter().copied())
+                .collect();
+            members.sort();
+            members.dedup();
+            timing_groups.push((Arc::from(format!("combination/{index}")), members));
+        }
+        self.telemetry.lock().attach(
+            state.publication,
+            state.renditions.iter().filter(|r| r.active).map(|r| {
+                (
+                    r.rendition_id,
+                    r.descriptor.clone(),
+                    r.contract.target_duration(),
+                )
+            }),
+            timing_groups,
+        );
     }
 
     /// Replaces the in-band caption services advertised by the live topology.
@@ -561,6 +719,7 @@ impl LiveStream {
         if state.publication != publication || state.idle_since.is_some() {
             return;
         }
+        self.telemetry.lock().stop(publication);
         state.idle_since = Some(Instant::now());
         let stream_ended = state.ended;
         let edge_updates: Vec<_> = state
@@ -596,6 +755,7 @@ impl LiveStream {
         // deliberate end uses. It may disappear from new catalog lookups, but
         // readers already holding its Arc still reach a terminal, internally
         // consistent state rather than waiting on media nobody will publish.
+        self.telemetry.lock().stop(state.publication);
         let edge_updates = state.end(now, self.limits);
         self.commit(state, Catalog::Republished, edge_updates);
         true
@@ -603,7 +763,13 @@ impl LiveStream {
 
     pub fn sweep_expired(&self) {
         let mut state = self.state.write();
-        if state.sweep_expired(Instant::now()) {
+        let now = Instant::now();
+        let changed = state.sweep_expired(now);
+        if state.prune_retired(now, self.limits, self.disk_capacity) {
+            state.bump_catalog();
+            state.bump_media_catalog();
+            self.commit(state, Catalog::Republished, []);
+        } else if changed {
             self.advance_media_revision();
         }
     }
@@ -696,19 +862,31 @@ impl LiveStream {
             }
         }
 
+        // Reserve headroom before publishing the new media. A concurrent
+        // render must not cache bytes that this write is about to displace.
+        self.memory
+            .set_media(state.retained_payload_bytes.saturating_add(additional));
         let advertised_before = state.renditions[index].bitrate.snapshot().advertised();
+        let observation = PublicationTelemetry::interval(&media);
         state.renditions[index].apply(publication, media, gzip, now, self.limits);
+        state.pending_observation = Some((rendition_id, observation));
         state.renditions[index].forget_unreachable_initializations();
         state.recalculate_retained_bytes();
         let advertised_after = state.renditions[index].bitrate.snapshot().advertised();
         let update = state.renditions[index].commit(false);
+        // Pruning can move Vec indices, so it belongs after the indexed write.
+        let retired_changed = state.prune_retired(now, self.limits, self.disk_capacity);
+        if retired_changed {
+            state.bump_media_catalog();
+        }
         let anchors_changed = state.prune_publication_anchors();
-        let catalog = if advertised_before == advertised_after && !anchors_changed {
-            Catalog::Unchanged
-        } else {
-            state.bump_catalog();
-            Catalog::Republished
-        };
+        let catalog =
+            if advertised_before == advertised_after && !anchors_changed && !retired_changed {
+                Catalog::Unchanged
+            } else {
+                state.bump_catalog();
+                Catalog::Republished
+            };
         let clip = self.take_clip_event(&mut state, dropped_for);
         self.commit(state, catalog, [update]);
         self.emit_clip(clip);
@@ -722,12 +900,17 @@ impl LiveStream {
         if state.publication != publication || state.ended {
             return false;
         }
+        self.telemetry.lock().stop(state.publication);
         let edge_updates = state.end(now, self.limits);
         self.commit(state, Catalog::Republished, edge_updates);
         true
     }
 
     fn advance_media_revision(&self) {
+        self.memory.set_epoch(
+            ManifestClass::Media,
+            self.media_revision().saturating_add(1),
+        );
         let _ =
             self.media_revision
                 .fetch_update(Ordering::Release, Ordering::Relaxed, |revision| {
@@ -789,12 +972,28 @@ impl LiveStream {
             return false;
         }
         let state = self.state.read();
-        state.spill_failed || state.retained_payload_bytes > self.limits.maximum_payload_bytes
+        state.spill_state == SpillState::Failed
+            || state.retained_payload_bytes > self.spill_watermarks.high
+            || (state.spill_state == SpillState::Draining
+                && state.retained_payload_bytes > self.spill_watermarks.low)
     }
 
     /// Waits outside all store locks. The session calls this before consuming
     /// another sample, so RAM can overshoot by one bounded mux output batch.
     pub async fn ready(&self, publication: u64) -> Result<(), StoreWriteError> {
+        let measurement = self
+            .operations
+            .start(crate::observe::Operation::StoreBackpressure);
+        let result = self.wait_ready(publication).await;
+        measurement.finish(if result.is_ok() {
+            crate::observe::OperationOutcome::Completed
+        } else {
+            crate::observe::OperationOutcome::Error
+        });
+        result
+    }
+
+    async fn wait_ready(&self, publication: u64) -> Result<(), StoreWriteError> {
         let Some(disk) = &self.disk else {
             return Ok(());
         };
@@ -808,10 +1007,13 @@ impl LiveStream {
                 if state.publication != publication {
                     return Ok(());
                 }
-                if state.spill_failed {
+                if state.spill_state == SpillState::Failed {
                     return Err(StoreWriteError::DiskSpillFailed);
                 }
-                if state.retained_payload_bytes <= self.limits.maximum_payload_bytes {
+                if state.retained_payload_bytes <= self.spill_watermarks.low
+                    || (state.retained_payload_bytes <= self.spill_watermarks.high
+                        && state.spill_state != SpillState::Draining)
+                {
                     return Ok(());
                 }
                 // An undersized cap cannot prevent the open/advertised part
@@ -839,13 +1041,22 @@ impl LiveStream {
         };
         loop {
             let mut state = self.state.write();
-            if state.spill_failed || disk.queue_is_full() {
+            if state.spill_state == SpillState::Failed || disk.queue_is_full() {
+                return;
+            }
+            if state.retained_payload_bytes > self.spill_watermarks.high {
+                state.spill_state = SpillState::Draining;
+            }
+            if state.retained_payload_bytes <= self.spill_watermarks.low {
+                state.spill_state = SpillState::Idle;
+            }
+            if state.spill_state != SpillState::Draining {
                 return;
             }
             let pending = state.pending_spill_bytes();
-            if state.retained_payload_bytes.saturating_sub(pending)
-                <= self.limits.maximum_payload_bytes
-            {
+            // Pending bytes still occupy RAM. They count only toward the
+            // scheduling target; ready() waits for the actual writes to finish.
+            if state.retained_payload_bytes.saturating_sub(pending) <= self.spill_watermarks.low {
                 return;
             }
             let Some((rendition, segment, objects)) = state.take_spill_candidate() else {
@@ -926,7 +1137,12 @@ impl LiveStream {
                 {
                     shed = true;
                 }
-                self.advance_media_revision();
+                // Moving identical bytes to disk does not change a manifest.
+                // Invalidating here would re-render every live playlist for
+                // each spill completion, even with protected cache capacity.
+                if shed {
+                    self.advance_media_revision();
+                }
                 self.take_clip_event(&mut state, shed.then_some(RetentionClipReason::Disk))
             } else {
                 super::disk::forget_spilled(&outcome.objects);
@@ -938,7 +1154,7 @@ impl LiveStream {
 
     pub fn fail_spill(&self, rendition: RenditionId, segment: SegmentId) {
         self.abort_spill(rendition, segment);
-        self.state.write().spill_failed = true;
+        self.state.write().spill_state = SpillState::Failed;
     }
 
     pub fn abort_spill(&self, rendition: RenditionId, segment: SegmentId) {
@@ -997,6 +1213,50 @@ impl StreamState {
         }
         self.prune_publication_anchors();
         self.recalculate_retained_bytes();
+        changed
+    }
+
+    /// Retired topology has a separate count bound because empty or tiny
+    /// generations can evade the payload budget during publication churn.
+    /// Capacity pressure removes a whole ended playlist: the live three-segment
+    /// floor must not protect every historical generation indefinitely.
+    fn prune_retired(
+        &mut self,
+        now: Instant,
+        limits: RetentionPolicy,
+        disk_capacity: usize,
+    ) -> bool {
+        const MAXIMUM_RETIRED_RENDITIONS: usize = 64;
+        let before = self.renditions.len();
+        self.renditions
+            .retain(|rendition| !rendition.retirement_expired(now));
+        self.recalculate_retained_bytes();
+        let mut retired = self
+            .renditions
+            .iter()
+            .filter(|rendition| rendition.retired)
+            .count();
+        while retired > 0
+            && (retired > MAXIMUM_RETIRED_RENDITIONS
+                || ((disk_capacity == 0 || self.spill_state == SpillState::Failed)
+                    && self.retained_payload_bytes > limits.maximum_payload_bytes)
+                || (disk_capacity > 0 && self.retained_disk_bytes > disk_capacity)
+                || self.memory_resident_parts() > limits.maximum_parts
+                || self.memory_resident_segments() > limits.maximum_segments)
+        {
+            let index = self
+                .renditions
+                .iter()
+                .position(|rendition| rendition.retired)
+                .expect("retired count matches renditions");
+            self.renditions.remove(index);
+            retired -= 1;
+            self.recalculate_retained_bytes();
+        }
+        let changed = self.renditions.len() != before;
+        if changed {
+            self.prune_publication_anchors();
+        }
         changed
     }
 
@@ -1065,6 +1325,7 @@ impl StreamState {
             .iter()
             .map(RenditionState::retained_payload_bytes)
             .sum();
+        self.memory.set_media(self.retained_payload_bytes);
         self.retained_disk_bytes = self
             .renditions
             .iter()

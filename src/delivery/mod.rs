@@ -7,6 +7,7 @@
 
 pub mod body;
 pub mod hls;
+pub mod memory;
 pub mod origin;
 pub mod record;
 pub mod response;

@@ -44,6 +44,8 @@ timeout = "5s"                           # idle limit for a peer; must exceed la
 [http]
 listen     = "[::]:8080"                 # "off" to serve HTTPS only
 public_url = ""                          # empty = relative playlist URLs
+maximum_connections = 4096               # shared across HTTP, HTTPS and metrics binds
+maximum_requests = 4096                  # includes blocked reloads and response bodies
 
 [http.cors]
 origins           = ["https://player.example.com"]
@@ -141,12 +143,14 @@ retain   = "1m"                          # how long media stays fetchable, live 
 [capacity]
 publishers        = 64                   # concurrent ingest sessions
 streams           = 256                  # live, plus those still held by retain; when full, a new stream is refused
-memory_per_stream = "256MiB"             # retained parts and segments; worst-case is streams x this,
+memory_per_stream = "256MiB"             # retained media and cached manifests
+                                         # excludes in-flight overhead and the minimum live-window exception
                                          # plus a fixed per-publisher pipeline cost while ingesting
 # memory_per_publisher = "128MiB"        # not yet implemented; today the pipeline cost is a
                                          # compiled per-publisher ceiling, reported per session
-                                         # as rushls_session_pipeline_bytes
+                                         # as rushls_session_pipeline_capacity_bytes
 # disk_per_stream = "8GiB"               # older media spills here; omit to stay in memory
+                                         # disk-backed: 1/8 RAM for manifests; media spills at 81.25% down to 75%
 # dir             = "/var/lib/rushls"    # optional; default is the platform cache (.../rushls/dvr)
 
 # Write a copy of every segment to a filesystem. Outlives the stream and is

@@ -1,3 +1,6 @@
+mod exposition;
+mod publication;
+
 use std::{fmt::Write, net::SocketAddr, sync::Arc, time::Duration};
 
 use cc_metrics::escape_label;
@@ -35,7 +38,10 @@ pub struct MetricsConfig {
 
 #[derive(Clone, Debug)]
 pub struct MetricsSnapshot {
+    pub http: crate::observe::http::HttpSnapshot,
     pub process: ProcessSnapshot,
+    pub publication: crate::delivery::store::telemetry::PublicationTotalSnapshot,
+    pub operations: [crate::observe::OperationSnapshot; 7],
     pub origin: OriginSnapshot,
     pub hls: HlsSnapshot,
     pub active_sessions: usize,
@@ -47,6 +53,8 @@ pub struct MetricsSnapshot {
     pub hooks: Vec<(Arc<str>, HookSnapshot)>,
     /// Payload bytes currently held for viewers, memory tier.
     pub retained_payload_bytes: usize,
+    /// Plain and gzip manifest bytes retained for reuse.
+    pub retained_manifest_bytes: usize,
     /// Payload bytes currently held for viewers on disk.
     pub retained_disk_bytes: usize,
     /// Sum of per-stream memory caps for streams this node currently retains.
@@ -55,6 +63,8 @@ pub struct MetricsSnapshot {
     pub retention_disk_capacity: usize,
     /// Spill jobs accepted and not yet finished.
     pub spill_pending: usize,
+    pub spill_capacity: usize,
+    pub session_capacity: usize,
     /// Spill writes that failed; media stayed in memory.
     pub spills_failed: u64,
     /// Configured `retain`, identical for every stream on this node today.
@@ -95,10 +105,18 @@ impl MetricsEndpoint {
     /// Served at `/metrics/streams` so the scraper chooses the unbounded
     /// cardinality, rather than a node-side flag.
     pub fn render_streams(&self) -> String {
-        render_labelled(
+        let mut output = render_labelled(
             &self.reader.sessions.snapshot(),
             &self.reader.retention_depths(),
-        )
+        );
+        let mut samples = exposition::Samples::default();
+        let mut streams = self.reader.store.live_streams();
+        streams.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        for (id, live) in streams {
+            publication::stream(&mut samples, &id, &live, &live.publication_snapshot());
+        }
+        output.push_str(&samples.finish());
+        output
     }
 }
 
@@ -109,6 +127,7 @@ impl MetricsEndpoint {
 /// the process wiring should need to know about both meters and sessions.
 #[derive(Clone, Debug)]
 pub struct MetricsReader {
+    http: crate::observe::http::HttpMeters,
     meters: ProcessMeters,
     origin: OriginMeters,
     hls: HlsMeters,
@@ -130,6 +149,7 @@ impl MetricsReader {
         store: StreamStore,
     ) -> Self {
         Self {
+            http: crate::observe::http::HttpMeters::default(),
             meters,
             origin,
             hls,
@@ -154,17 +174,34 @@ impl MetricsReader {
         self
     }
 
+    pub fn http_meters(&self) -> crate::observe::http::HttpMeters {
+        self.http.clone()
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         let retention = self.retention_depths();
-        let published = self.store.leased();
+        let (published, idle) =
+            self.store
+                .live_streams()
+                .iter()
+                .fold((0, 0), |(published, idle), (_, live)| {
+                    if live.is_idle() {
+                        (published, idle + 1)
+                    } else {
+                        (published + 1, idle)
+                    }
+                });
         MetricsSnapshot {
+            http: self.http.snapshot(),
             process: self.meters.snapshot(),
+            publication: self.store.publication_totals(),
+            operations: self.origin.operations.snapshot(),
             origin: self.origin.snapshot(),
             hls: self.hls.snapshot(),
             // Count only: cloning every session is the `/metrics/streams` scrape.
             active_sessions: self.sessions.len(),
             published_streams: published,
-            idle_streams: self.store.len() - published,
+            idle_streams: idle,
             // Bounded by what the operator configured, so this cannot grow the
             // way stream labels can and stays on the process scrape.
             hooks: self
@@ -172,13 +209,19 @@ impl MetricsReader {
                 .as_ref()
                 .map(Hooks::snapshots)
                 .unwrap_or_default(),
-            retained_payload_bytes: retention.iter().map(|(_, depth)| depth.memory_bytes).sum(),
+            retained_payload_bytes: retention.iter().map(|(_, depth)| depth.media_bytes).sum(),
+            retained_manifest_bytes: retention
+                .iter()
+                .map(|(_, depth)| depth.manifest_bytes)
+                .sum(),
             retained_disk_bytes: retention.iter().map(|(_, depth)| depth.disk_bytes).sum(),
             retention_memory_capacity: retention
                 .iter()
                 .map(|(_, depth)| depth.memory_capacity)
                 .sum(),
             retention_disk_capacity: retention.iter().map(|(_, depth)| depth.disk_capacity).sum(),
+            spill_capacity: self.store.spill_capacity(),
+            session_capacity: self.sessions.capacity(),
             spill_pending: self.store.disk().map_or(0, |disk| disk.spill_pending()),
             spills_failed: self.store.disk().map_or(0, |disk| disk.spills_failed()),
             retention_requested: retention
@@ -213,12 +256,22 @@ series! {
         Gauge("rushls_retained_payload_bytes",
             "Media payload bytes currently retained for viewers in the memory tier.")
             = |snapshot: &MetricsSnapshot| snapshot.retained_payload_bytes,
+        Gauge("rushls_retained_manifest_bytes",
+            "Plain and gzip manifest bytes retained in memory for reuse.")
+            = |snapshot: &MetricsSnapshot| snapshot.retained_manifest_bytes,
+        Gauge("rushls_retained_memory_bytes",
+            "Combined retained media and manifest bytes in memory, excluding in-flight overhead.")
+            = |snapshot: &MetricsSnapshot| snapshot.retained_payload_bytes.saturating_add(snapshot.retained_manifest_bytes),
         Gauge("rushls_retained_disk_bytes",
             "Media payload bytes currently retained for viewers in the disk tier.")
             = |snapshot: &MetricsSnapshot| snapshot.retained_disk_bytes,
         Gauge("rushls_retention_requested_seconds",
             "Largest effective retention request across stored streams, or the fixed setting when empty.")
             = |snapshot: &MetricsSnapshot| snapshot.retention_requested.as_secs_f64(),
+        Gauge("rushls_session_capacity", "Configured publishing session admission limit.")
+            = |snapshot: &MetricsSnapshot| snapshot.session_capacity,
+        Gauge("rushls_disk_spill_capacity", "Maximum accepted pending disk spill jobs, or zero without a disk tier.")
+            = |snapshot: &MetricsSnapshot| snapshot.spill_capacity,
         Gauge("rushls_disk_spill_pending",
             "Spill jobs accepted and not yet written. At capacity publishers wait for disk progress.")
             = |snapshot: &MetricsSnapshot| snapshot.spill_pending,
@@ -236,6 +289,17 @@ series! {
 pub fn render(snapshot: &MetricsSnapshot) -> String {
     let mut output = String::with_capacity(4_096);
 
+    let mut samples = exposition::Samples::default();
+    samples.gauge(
+        "rushls_build_info",
+        "Rushls build version.",
+        concat!("version=\"", env!("CARGO_PKG_VERSION"), "\""),
+        1,
+    );
+    publication::http(&mut samples, &snapshot.http);
+    publication::totals(&mut samples, &snapshot.publication);
+    publication::operations(&mut samples, &snapshot.operations);
+    output.push_str(&samples.finish());
     scalars(&mut output, ProcessSnapshot::SERIES, &snapshot.process);
     scalars(&mut output, OriginSnapshot::SERIES, &snapshot.origin);
     scalars(&mut output, HlsSnapshot::SERIES, &snapshot.hls);
@@ -257,6 +321,11 @@ fn render_labelled(
     let mut output = String::with_capacity(512 + retention.len() * 256 + sessions.len() * 2_048);
     render_retention_into(&mut output, retention);
     render_sessions(&mut output, sessions);
+    let mut samples = exposition::Samples::default();
+    for session in sessions {
+        publication::tracks(&mut samples, session);
+    }
+    output.push_str(&samples.finish());
     output
 }
 
@@ -367,7 +436,8 @@ fn render_sessions(output: &mut String, sessions: &[SessionSnapshot]) {
         let labels = session_labels(session);
         writeln!(
             output,
-            "{SESSION_INFO}{{{labels},phase=\"{}\"}} 1",
+            "{SESSION_INFO}{{{labels},principal=\"{}\",phase=\"{}\"}} 1",
+            escape_label(&session.principal.0),
             session.phase
         )
         .expect("writing to a String cannot fail");
@@ -401,20 +471,25 @@ const SESSION_TRACKS: &str = "rushls_session_tracks";
 
 fn session_labels(session: &SessionSnapshot) -> String {
     format!(
-        "session=\"{}\",stream=\"{}\",principal=\"{}\"",
+        "session=\"{}\",stream=\"{}\"",
         escape_label(&session.id.to_string()),
-        escape_label(session.stream.as_str()),
-        escape_label(&session.principal.0)
+        escape_label(session.stream.as_str())
     )
 }
 
 series! {
     STREAM_RETENTION_SERIES: RetentionDepth {
         Gauge("rushls_stream_retention_requested_seconds",
-            "Configured retain for this stream, in seconds.")
+            "Effective retention request after the protocol floor, in seconds.")
             = |depth: &RetentionDepth| depth.requested.as_secs_f64(),
-        Gauge("rushls_stream_retention_held_seconds",
-            "Advertised playlist duration currently named for this stream, in seconds.")
+        Gauge("rushls_stream_retained_media_bytes",
+            "Media bytes retained in memory for this stream.")
+            = |depth: &RetentionDepth| depth.media_bytes,
+        Gauge("rushls_stream_retained_manifest_bytes",
+            "Plain and gzip manifest bytes retained for this stream.")
+            = |depth: &RetentionDepth| depth.manifest_bytes,
+        Gauge("rushls_stream_retention_max_seconds",
+            "Longest advertised rendition duration for this stream, including open parts.")
             = |depth: &RetentionDepth| depth.held.as_secs_f64(),
     }
 }
@@ -494,7 +569,7 @@ mod tests {
         meters.session_started();
 
         let session_meters = SessionMeters::new(meters.clone());
-        session_meters.source_view().source_progress(512, 4, 0);
+        session_meters.source_view().source_progress(512, 4);
         let registration = sessions
             .register(&grant(), session_meters, StopToken::new())
             .expect("the registry has room");
@@ -528,7 +603,7 @@ mod tests {
         assert!(labelled.contains("stream=\"live/camera\""));
         assert!(labelled.contains("principal=\"publisher\""));
         assert!(labelled.contains("rushls_session_info{"));
-        assert!(labelled.contains("rushls_session_bytes_received_total{"));
+        assert!(labelled.contains("rushls_session_source_payload_bytes_total{"));
         assert!(labelled.contains(" 512\n"));
         assert!(
             labelled.contains("rushls_stream_retention_requested_seconds{stream=\"live/camera\"}")
@@ -592,6 +667,9 @@ mod tests {
                 bytes_received: 1_024,
                 ..ProcessSnapshot::default()
             },
+            http: crate::observe::http::HttpSnapshot::default(),
+            publication: crate::delivery::store::telemetry::PublicationTotalSnapshot::default(),
+            operations: Default::default(),
             origin: OriginSnapshot::default(),
             hls: HlsSnapshot::default(),
             active_sessions: 2,
@@ -599,9 +677,12 @@ mod tests {
             idle_streams: 4,
             hooks: Vec::new(),
             retained_payload_bytes: 0,
+            retained_manifest_bytes: 0,
             retained_disk_bytes: 0,
             retention_memory_capacity: 0,
             retention_disk_capacity: 0,
+            spill_capacity: 0,
+            session_capacity: 0,
             spill_pending: 0,
             spills_failed: 0,
             retention_requested: Duration::ZERO,
@@ -611,10 +692,12 @@ mod tests {
 
         assert!(output.contains("# TYPE rushls_sessions_started_total counter\n"));
         assert!(output.contains("rushls_sessions_started_total 3\n"));
-        assert!(output.contains("rushls_bytes_received_total 1024\n"));
+        assert!(output.contains("rushls_source_payload_bytes_total 1024\n"));
         assert!(output.contains("# TYPE rushls_active_sessions gauge\n"));
         assert!(output.contains("rushls_active_sessions 2\n"));
         assert!(output.contains("rushls_retained_payload_bytes 0\n"));
+        assert!(output.contains("rushls_retained_manifest_bytes 0\n"));
+        assert!(output.contains("rushls_retained_memory_bytes 0\n"));
         assert!(output.contains("rushls_retained_disk_bytes 0\n"));
         assert!(output.contains("rushls_retention_requested_seconds 0\n"));
         assert!(output.contains("rushls_disk_spill_pending 0\n"));
@@ -644,14 +727,12 @@ mod tests {
     #[test]
     fn every_delivery_meter_is_exported() {
         let origin = OriginMeters::default();
-        origin.media_served(2_048);
+        origin.media_resolved(2_048);
         origin.request_rejected();
         origin.request_not_found();
         let hls = HlsMeters::default();
-        hls.playlist_served(true);
-        hls.playlist_served(false);
-        hls.blocking_reload_started();
-        hls.blocking_reload_expired();
+        hls.playlist_resolved(true);
+        hls.playlist_resolved(false);
 
         let output = MetricsEndpoint::new(
             MetricsReader::new(
@@ -665,20 +746,21 @@ mod tests {
         )
         .render();
 
-        assert!(output.contains("rushls_media_responses_served_total 1\n"));
-        assert!(output.contains("rushls_bytes_served_total 2048\n"));
+        assert!(output.contains("rushls_media_resolved_total 1\n"));
+        assert!(output.contains("rushls_media_resolved_bytes_total 2048\n"));
         assert!(output.contains("rushls_origin_requests_rejected_total 1\n"));
         assert!(output.contains("rushls_origin_requests_not_found_total 1\n"));
-        assert!(output.contains("rushls_hls_playlists_served_total 2\n"));
-        assert!(output.contains("rushls_hls_playlists_rendered_total 1\n"));
-        assert!(output.contains("rushls_hls_blocking_reloads_total 1\n"));
-        assert!(output.contains("rushls_hls_blocking_reloads_expired_total 1\n"));
+        assert!(output.contains("rushls_hls_playlists_resolved_total 2\n"));
+        assert!(output.contains("rushls_hls_playlist_projections_total 1\n"));
     }
 
     #[test]
     fn every_way_a_hook_can_lose_an_event_is_exported_separately() {
         let output = render(&MetricsSnapshot {
             process: ProcessSnapshot::default(),
+            http: crate::observe::http::HttpSnapshot::default(),
+            publication: crate::delivery::store::telemetry::PublicationTotalSnapshot::default(),
+            operations: Default::default(),
             origin: OriginSnapshot::default(),
             hls: HlsSnapshot::default(),
             active_sessions: 0,
@@ -707,9 +789,12 @@ mod tests {
                 (Arc::from("audit"), HookSnapshot::default()),
             ],
             retained_payload_bytes: 0,
+            retained_manifest_bytes: 0,
             retained_disk_bytes: 0,
             retention_memory_capacity: 0,
             retention_disk_capacity: 0,
+            spill_capacity: 0,
+            session_capacity: 0,
             spill_pending: 0,
             spills_failed: 0,
             retention_requested: Duration::ZERO,
@@ -757,6 +842,8 @@ mod tests {
                     requested: Duration::from_mins(2),
                     held: Duration::from_secs(42),
                     memory_bytes: 4_096,
+                    media_bytes: 3_584,
+                    manifest_bytes: 512,
                     memory_capacity: 256 * 1024 * 1024,
                     disk_bytes: 0,
                     disk_capacity: 0,
@@ -770,7 +857,7 @@ mod tests {
             )
         );
         assert!(
-            output.contains("rushls_stream_retention_held_seconds{stream=\"live/camera\"} 42\n")
+            output.contains("rushls_stream_retention_max_seconds{stream=\"live/camera\"} 42\n")
         );
         assert!(output.contains(
             "rushls_stream_retained_bytes{stream=\"live/camera\",tier=\"memory\"} 4096\n"
@@ -795,6 +882,9 @@ mod tests {
     fn process_dvr_gauges_are_labelled_by_tier() {
         let output = render(&MetricsSnapshot {
             process: ProcessSnapshot::default(),
+            http: crate::observe::http::HttpSnapshot::default(),
+            publication: crate::delivery::store::telemetry::PublicationTotalSnapshot::default(),
+            operations: Default::default(),
             origin: OriginSnapshot::default(),
             hls: HlsSnapshot::default(),
             active_sessions: 0,
@@ -802,10 +892,13 @@ mod tests {
             idle_streams: 1,
             hooks: Vec::new(),
             retained_payload_bytes: 4_096,
+            retained_manifest_bytes: 512,
             retained_disk_bytes: 512,
             retention_memory_capacity: 256 * 1024 * 1024,
             retention_disk_capacity: 8 * 1024 * 1024 * 1024,
             spill_pending: 3,
+            spill_capacity: 32,
+            session_capacity: 256,
             spills_failed: 4,
             retention_requested: Duration::from_mins(2),
             retention: Vec::new(),
@@ -815,6 +908,8 @@ mod tests {
         assert!(output.contains("rushls_disk_spill_pending 3\n"));
         assert!(output.contains("rushls_disk_spills_failed_total 4\n"));
         assert!(output.contains("rushls_retention_capacity_bytes{tier=\"memory\"} 268435456\n"));
+        assert!(output.contains("rushls_retained_manifest_bytes 512\n"));
+        assert!(output.contains("rushls_retained_memory_bytes 4608\n"));
         assert!(output.contains("rushls_retention_capacity_bytes{tier=\"disk\"} 8589934592\n"));
         assert!(
             !output.contains("rushls_stream_retained_bytes"),
@@ -826,7 +921,7 @@ mod tests {
     fn an_empty_store_still_describes_the_labelled_series() {
         let output = render_labelled(&[], &[]);
 
-        assert!(output.contains("# TYPE rushls_stream_retention_held_seconds gauge\n"));
+        assert!(output.contains("# TYPE rushls_stream_retention_max_seconds gauge\n"));
         assert!(output.contains("# TYPE rushls_stream_retained_bytes gauge\n"));
         assert!(output.contains("# TYPE rushls_session_info gauge\n"));
         assert!(
@@ -835,3 +930,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod telemetry_tests;

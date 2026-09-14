@@ -164,6 +164,8 @@ impl SampleSource for MediaHead {
                 self.limits.maximum_samples_per_batch,
             );
             for packet in self.packets.drain(..) {
+                self.meters
+                    .track_input(packet.track_id, packet.retained_payload_bytes());
                 // Inspected before normalization, while the access unit is
                 // still exactly the bytes the publisher sent. Read-only: the
                 // packet continues into the pipeline untouched.
@@ -186,6 +188,8 @@ impl SampleSource for MediaHead {
             self.density
                 .admit(consumed.packets as u64, &self.normalized)?;
             for sample in self.normalized.drain(..) {
+                self.meters
+                    .track_normalized(sample.track_id(), sample.pts(), sample.duration());
                 out.push(sample);
             }
 
@@ -437,6 +441,9 @@ impl LiveSession {
     /// processed read.
     pub async fn pump(&mut self, events: &EventSink) -> Result<InputState, ExecutionError> {
         if !self.replayed {
+            if !self.input_state.is_open() {
+                self.tail.publisher.publisher_disconnected();
+            }
             // Pre-roll drove the same `MediaHead`, so its access units have
             // already been inspected and may have queued a declaration. It has
             // to be applied *before* the buffered media is written: the first
@@ -460,6 +467,9 @@ impl LiveSession {
 
         if self.samples.is_empty() {
             self.input_state = self.head.next_batch(&mut self.samples).await?;
+            if !self.input_state.is_open() {
+                self.tail.publisher.publisher_disconnected();
+            }
         }
 
         // Declared before the samples are written so the multivariant playlist
@@ -518,6 +528,7 @@ impl LiveSession {
     ///   the stream, so anything this produces afterwards is discarded rather
     ///   than interleaved. There is no overlap in which ownership is ambiguous.
     pub fn finish(&mut self, reason: FinishReason) -> Result<(), ExecutionError> {
+        self.tail.publisher.publisher_disconnected();
         // Flush before closing the muxer: samples held back for reordering are
         // media the publisher already sent and we already accepted, and a
         // cancellation is no reason to drop them on the floor.

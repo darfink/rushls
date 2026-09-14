@@ -1,0 +1,504 @@
+# Rushls metrics review
+
+Review date: 2026-09-14. Scope: the current working tree, including staged changes.
+This document records the original review and proposals. See [the implemented metric contract](metrics.md) for current behavior and limits.
+
+Rushls needs publication timing metrics to answer the reported stall question.
+Existing counters show throughput and activity, but they cannot establish timely output for every rendition.
+The highest priorities are publication deadlines, rendition skew, accurate HTTP accounting, and explicit loss-measurement coverage.
+
+Healthy publication metrics alone cannot prove that a viewer had a network problem.
+The remaining causes include origin serving faults, stale CDN playlists, delivery throughput, and player behavior.
+The investigation needs evidence from publication, HTTP delivery, and the player.
+
+## Findings and priorities
+
+| Priority | Finding | Consequence | Recommendation |
+|---|---|---|---|
+| P1 | No exported output timing per track or rendition | Aggregate activity can hide a stalled rendition | Add publication age, deadline lateness, and media progress |
+| P1 | No comparison of rendition progress | One quality level can fall behind without an explicit signal | Add media-edge skew and publication delay for matched boundaries |
+| P1 | Source implementations always report zero packet loss | Zero can suggest network health without a measurement | Report coverage and instrument transport-specific loss separately |
+| P1 | `rushls_bytes_served_total` counts resolved object size before HTTP processing | Ranges, conditional responses, and aborted transfers give misleading throughput | Separate resolved bytes from emitted HTTP body bytes |
+| P1 | Blocking wait starts and expirations cover different populations | Their ratio is not a reliable timeout percentage | Count starts and outcomes at the same wait boundary |
+| P2 | Backpressure gauge describes the pacer, not all publisher waits | Disk pressure can stop output without this gauge explaining it | Separate pacing and store backpressure |
+| P2 | HTTP admission, serving latency, and transfer outcomes lack metrics | An on-time origin can still fail viewers without clear evidence | Add bounded HTTP metrics and body-lifetime accounting |
+| P2 | Retention duration reports the longest rendition | A shorter audio or alternate rendition remains hidden | Add per-rendition depth and a minimum for required media |
+| P2 | Independent lifecycle reads feed unsigned subtraction | Concurrent removal can produce an invalid idle count or panic | Derive counts from one inventory without subtraction |
+| P2 | Short timing incidents can disappear between scrapes | A later scrape can show healthy output after a real interruption | Keep incident counters and timing distributions |
+
+P1 means necessary for reliable stall diagnosis. P2 means useful operational coverage or correctness work.
+These priorities describe the metrics review, not a claim that production currently stalls.
+
+## What exists, and what to keep
+
+The exporter separates `/metrics` from `/metrics/streams`.
+The first endpoint contains node totals and bounded labels. The second contains stream and session labels.
+This separation is useful and can remain.
+Metric declarations sit beside their counters, with a separate serialization layer. This structure can also remain.
+
+| Existing family | Assessment |
+|---|---|
+| Session starts, completions, failures, replacements, and rejections | Keep. Add bounded reasons for failures and rejections where the decision occurs. |
+| Contract failures, coordinator failures, codec changes, unhealthy terminations, and drain failures | Keep. These explain different failure paths. They overlap lifecycle outcomes and are not additive categories. |
+| Received bytes and packets | Keep as source payload and media-packet activity. They are not raw socket throughput or transport packet counts. |
+| Packet loss | Refine or deprecate until measurement exists. Current zero values do not establish loss-free transport. |
+| Normalized packets and samples | Keep for stage diagnosis. Add per-track last progress where a healthy sibling can hide a failure. |
+| Muxed chunks and segments | Keep. Muxed objects and successful publications describe different boundaries. |
+| Published parts and segments | Keep. Counts remain useful, but media duration and timing must accompany them. |
+| Peak packets and samples per batch | Keep as diagnostics. They are lifetime high-water marks, not current occupancy or stall alerts. |
+| Media lead and pacing delay | Keep with explicit pacing semantics. Neither measures published output lag. |
+| Publisher backpressured | Rename to pacing-specific semantics or replace with a bounded reason label. |
+| Session pipeline bytes | Rename to pipeline capacity bytes. This value is a fixed ceiling, not measured occupancy. |
+| Active sessions, published streams, idle streams | Keep. Add per-stream publisher state and derive node counts consistently. |
+| Memory payload, manifest, combined memory, disk, and tier capacity | Keep. Components and totals help explain capacity. Retention memory is not process RSS. |
+| Requested and held retention duration | Keep after clarifying effective request and maximum semantics. Add minimum and per-rendition duration. |
+| Pending spills and failed spills | Keep. Add queue capacity, wait duration, read errors, and read/write latency. |
+| Media responses and bytes served | Replace misleading serving semantics with resolved-object and HTTP-transfer metrics. |
+| Rejected and missing origin requests | Keep only with documented scope, or supersede with authoritative HTTP outcome counters. |
+| Playlists served and rendered | Keep as successful resolution and cache diagnostics. HTTP responses require their own accounting. |
+| Blocking reload starts and expirations | Refine to use a common population and bounded outcome labels. |
+| TLS handshakes and playback denials | Keep. Add bounded failure reasons only where they support action. |
+| Hook deliveries, retries, filtering, drops, queue depths, capacities, and in-flight work | Keep. These describe separate operational failure modes. Add oldest queued event age before more counters. |
+| Session info and track counts | Keep. Move descriptive principal identity to info metrics during a compatible migration. |
+
+No broad deletion is necessary. The main problems are missing timing and ambiguous semantics.
+A smaller metric count alone will not improve diagnosis.
+
+Some metric families overlap intentionally. Dashboards must not sum components with their totals.
+For example, retained memory includes payload and manifest bytes. Published segments also contain media already counted as parts.
+
+## Evidence behind the findings
+
+**Publication totals lack identity and time.** `DeliveryMeters::delivery_progress` accepts only part and segment counts.
+`MediaTail::publish` batches these counts after successful writes. The interface has no track, rendition, duration, or publication timestamp.
+See [meters.rs](../src/observe/meters.rs) and the publication loop in [live.rs](../src/session/live.rs).
+
+**Internal liveness has different semantics.** `LivenessMark` uses elapsed session time minus pacing delay.
+`MeterSnapshot` exports none of the source, media, or publication liveness marks.
+The health evaluator checks normalized-media inactivity. It deliberately does not enforce wall-time publication cadence.
+A healthy session does not establish timely HLS output.
+See [health.rs](../src/session/health.rs) and [meters.rs](../src/observe/meters.rs).
+
+**Loss is unmeasured here.** RTMP, MPEG-TS, and MoQ sources all pass `0` as the loss argument to `source_progress`.
+The byte argument measures source payload. The packet argument counts the source's media packets.
+These values are useful, but they cannot establish transport loss, retransmissions, or available network capacity.
+See the source implementations for [RTMP](../src/source/rtmp/source.rs), [MPEG-TS](../src/source/mpegts/source.rs), and [MoQ](../src/source/moq/source.rs).
+
+**Serving counters run too early.** `Origin::media` counts `object.body.len()` before the HTTP adapter processes ranges and conditional responses.
+A request for 100 bytes of a larger object counts the larger object. A subsequent 304 or failed transfer still leaves that count.
+The measurement is resolved media size, not bytes received by a viewer.
+See [origin.rs](../src/delivery/origin.rs) and `into_http` in [http/mod.rs](../src/server/http/mod.rs).
+
+**Wait accounting has asymmetric scope.** `media_playlist` increments starts for explicit blocking directives, including positions already available.
+Initial readiness waits do not increment starts. Both paths return `Unsatisfied` on timeout, which `serve` counts as a blocking-reload expiration.
+Hinted-part waits use the media origin path and do not enter this expiration counter.
+Thus, expirations can exist without a corresponding counted start.
+See [service.rs](../src/delivery/hls/service.rs) and `Origin::wait_for` in [origin.rs](../src/delivery/origin.rs).
+
+**Store pressure has a separate wait path.** `MediaTail::ready` awaits publisher readiness without a pacing observation.
+The existing backpressure gauge comes from pacing observations.
+See [live.rs](../src/session/live.rs), [pacer.rs](../src/media/pacer.rs), and [stream.rs](../src/delivery/store/stream.rs).
+
+**HTTP overload is largely invisible.** Request admission returns 503. Connection admission closes excess sockets.
+Neither path increments an operational metric. The body wrapper retains a request permit through body consumption, which provides a useful instrumentation point.
+See [limits.rs](../src/server/http/limits.rs).
+
+**Retention uses a maximum.** `retention_depth` selects the longest advertised rendition duration, including open parts.
+This does not establish a common playable window across required audio and video.
+See [stream.rs](../src/delivery/store/stream.rs) and [retention.rs](../src/delivery/store/retention.rs).
+
+**Lifecycle reads are not atomic together.** `MetricsReader::snapshot` reads leased streams, then subtracts that count from a separate inventory length.
+Concurrent release and retirement can make the second number smaller than the first.
+Saturating subtraction prevents underflow but still gives an inconsistent snapshot. One inventory with explicit classification is preferable.
+See [metrics.rs](../src/server/metrics.rs) and [store/mod.rs](../src/delivery/store/mod.rs).
+
+## Proposed publication measurements
+
+Input tracks and packaged renditions need separate identities.
+`PackagedRendition::source_tracks` already maps inputs to outputs. One input can feed multiple renditions.
+The output boundary belongs to the durable store rendition, not its temporary packaging ID.
+See [presentation.rs](../src/mux/presentation.rs).
+
+The proposed rendition families use `{stream, rendition, kind}` on `/metrics/streams`.
+An info family can carry group, source-track mapping, and codec identity without repeating them on every measurement.
+Publication generation remains internal state unless a diagnostic event needs it.
+No segment ID, timestamp, URL, or viewer ID becomes a metric label.
+
+| Proposed metric | Type | Meaning |
+|---|---|---|
+| `rushls_stream_publisher_active` | Gauge | Current publication ownership, 0 or 1 |
+| `rushls_rendition_output_expected` | Gauge | Current publisher is expected to produce this active rendition |
+| `rushls_rendition_output_started` | Gauge | At least one usable media interval committed in this publication |
+| `rushls_rendition_startup_elapsed_seconds` | Gauge | Elapsed time awaiting first usable output, while output is expected |
+| `rushls_rendition_last_publish_timestamp_seconds` | Gauge | Unix time of the latest successful usable media advancement |
+| `rushls_rendition_publish_interval_seconds` | Histogram | Monotonic elapsed time between successive usable media advances |
+| `rushls_rendition_output_overdue_seconds` | Gauge | Current elapsed time beyond the next expected publication deadline |
+| `rushls_rendition_output_deadline_misses_total` | Counter | Distinct missed expected deadlines, including incidents between scrapes |
+| `rushls_rendition_media_published_seconds_total` | Counter | Newly available usable media duration, counted once |
+| `rushls_rendition_output_lag_seconds` | Gauge | Signed wall-time progress minus available media-time progress |
+| `rushls_rendition_expected_publish_interval_seconds` | Gauge | Expected interval from the admitted output plan |
+| `rushls_rendition_target_duration_seconds` | Gauge | Actual advertised HLS segment target |
+| `rushls_rendition_part_target_seconds` | Gauge | Actual advertised part target, present for part-based output |
+| `rushls_rendition_gaps_total` | Counter | Advertised gaps, with a bounded reason |
+
+The histogram can start as a node aggregate by media kind and output mode.
+Per-rendition histograms are useful, but they multiply storage much faster than gauges.
+The first implementation can keep per-rendition deadline counters and gauges, with bounded aggregate histograms.
+
+**Cadence has three distinct meanings:**
+
+1. Time between output events shows burstiness and complete pauses.
+2. Media seconds produced per wall second shows sustained progress. Continuous live media usually needs approximately 1.0.
+3. Deadline lateness shows whether the origin met an explicit output expectation.
+
+A count of parts per second cannot substitute for these measurements. Parts have different durations and streams have different rendition counts.
+
+A histogram alone cannot show a pause that is still in progress.
+Its next observation arrives only after output resumes. The overdue gauge must increase during silence.
+A deadline counter must increment once per missed deadline, not on every scrape.
+A bounded watchdog can register the crossing. The commit path must also detect late arrivals that recover between watchdog ticks.
+Both paths must share a latch to prevent double counting.
+
+The expected deadline comes from the admitted part or segment schedule, plus an explicit publication tolerance.
+It must not follow an average of recent slow output, because that can normalize a fault.
+HLS target duration is a media-duration contract. It is not a complete model of publication jitter or player buffer depletion.
+Rushls' blocking reload timeout also serves a different purpose and is too coarse as the only cadence alarm.
+
+For the common output signal, parts advance part-based renditions and segments advance segment-only renditions.
+Segment completion must not count those same part durations again.
+A separate segment-completion metric can support players that consume complete segments.
+Initialization objects, metadata changes, and synthesized gaps must not count as usable media progress.
+
+## Wall-time lag and rendition skew
+
+Let `W(t)` be monotonic time in seconds since a publication baseline.
+Let `E_r(t)` be the usable media end for rendition `r`, converted to seconds on the shared presentation timeline.
+The baseline must preserve media offsets between renditions.
+
+```text
+lag_r(t) = [W(t) - W(t0)] - [E_r(t) - E0]
+media_edge_skew(t) = max_r(E_r(t)) - min_r(E_r(t))
+rendition_behind_fastest_r(t) = max_j(E_j(t)) - E_r(t)
+```
+
+`E0` is one shared media reference. Each rendition must not receive an independent zero that erases its initial delay.
+A signed lag distinguishes media ahead of real time from media behind it.
+The baseline defines relative output drift, not camera-to-viewer latency.
+Rushls creates its presentation wall-time anchor locally at muxer startup. It is not proof of source capture time.
+
+The current overdue gauge captures burst interruptions. Relative output lag captures cumulative slowdown, even with regular output events.
+An initial startup timer covers missing first output before the lag measurement becomes valid.
+Large timestamp jumps and gaps require separate discontinuity accounting. They must not appear as successful catch-up.
+
+**Two skew measurements answer different questions:**
+
+| Proposed metric | Question answered |
+|---|---|
+| `rushls_stream_rendition_media_skew_seconds` | How much farther along the presentation is the fastest available rendition? |
+| `rushls_rendition_behind_fastest_seconds` | Which rendition is behind, and by how much? |
+| `rushls_stream_rendition_publish_spread_seconds` | How far apart did renditions make the same media boundary available? |
+
+For a shared boundary `b`, let `A_r(b)` be the monotonic commit time at which rendition `r` first covers that boundary.
+Then the publication spread is `max_r(A_r(b)) - min_r(A_r(b))`.
+This measurement works with different part boundaries by comparing common media time, not part numbers.
+It requires bounded boundary history and a limit on unresolved comparisons.
+The newest resolved spread needs an observation timestamp. Aggregate histograms can preserve its distribution.
+
+If one rendition never covers a boundary, the resolved spread does not yet exist.
+An unresolved-boundary age or the per-rendition overdue metric must expose that case.
+Unresolved comparisons must not disappear silently at their history limit.
+
+The difference between the latest publication timestamps is not equivalent to either measurement.
+A fast audio cadence and a slower video cadence naturally publish at different instants.
+Healthy output can produce a timestamp difference without a missing media interval.
+
+Two scenarios show why both absolute progress and relative skew matter:
+
+| Scenario | Media skew | Wall-time output lag |
+|---|---|---|
+| Every rendition stops together | Can remain zero | Increases for all renditions |
+| One video rendition stops while others advance | Increases | Increases for the stopped rendition |
+
+Comparison sets must follow the current presentation topology.
+Video alternatives can share one group. Required audio and video can also form a playable-combination view.
+Sparse subtitles, optional tracks, retired renditions, and I-frame views need separate expectations.
+A single maximum across unrelated outputs can create false alarms.
+
+## Lifecycle and timing rules
+
+The publication state determines whether output is expected.
+A retained playlist without a publisher remains useful, but its age must not trigger a live-publication alarm.
+
+| State | Measurement behavior |
+|---|---|
+| Publisher accepted, no output topology yet | Track startup time through session state |
+| Rendition declared, first output absent | Expose expected=1 and started=0, with startup deadline coverage |
+| Publisher active, output started | Evaluate publication intervals, deadlines, lag, and skew |
+| Publisher disconnects | Disable live-output expectations and stop open deadline incidents |
+| Old publication drains | Count final useful media separately from active cadence expectations |
+| Publisher reconnects or takes over | Reset time baselines and comparison history for the new publication |
+| Rendition retires | Exclude it from current skew and deadline evaluation |
+| Stream remains retained | Keep retention and last-publication diagnostics until bounded removal |
+
+The existing lease is released after session cleanup. A strict disconnect boundary needs an explicit signal from the session lifecycle.
+Raw lease ownership alone can include tail draining.
+Superseded writes must not update the new publication's timing.
+
+Monotonic time must drive elapsed durations and deadline decisions. Intentional pacing remains visible in viewer-facing timing.
+Unix timestamps support graphs and correlation. Clock adjustments must not change monotonic deadline outcomes.
+Prometheus recommends event timestamps for externally calculated ages. See its [instrumentation guidance](https://prometheus.io/docs/practices/instrumentation/).
+
+Short incidents need durable observation counters even after gauges recover.
+Per-stream counters can persist across reconnects while the stream remains retained. A separate bounded node total preserves events after stream removal.
+Event records must carry exact stream, rendition, publication, boundary, expected time, actual time, and incident duration.
+Scraping cannot reconstruct every short publication event from gauges alone.
+
+## Instrumentation boundary and example queries
+
+The timing update belongs at the successful store commit that advances the request-facing rendition snapshot.
+It must share the committed media position and publication generation.
+The existing `Instant::now()` at `LiveStream::write` entry precedes lock acquisition and cannot measure final availability accurately.
+Commit timing must include lock wait and publication work.
+An update after releasing the lock also needs ordering protection against concurrent successor writes.
+
+Store commit establishes that media is fetchable and eligible for playlist projection.
+Rushls projects playlists on request. It does not proactively publish each rendered playlist to a CDN.
+Projection latency, projection errors, and public-path freshness remain separate measurements.
+
+These queries illustrate the proposed families. They do not work against the current exporter.
+The label `instance` keeps different origin nodes separate.
+
+```promql
+# Current age for active renditions that produced usable output.
+(time() - rushls_rendition_last_publish_timestamp_seconds)
+  and on(instance, stream, rendition, kind)
+    (rushls_rendition_output_expected == 1)
+  and on(instance, stream, rendition, kind)
+    (rushls_rendition_output_started == 1)
+
+# Worst current deadline lateness in each stream.
+max by (instance, stream) (
+  rushls_rendition_output_overdue_seconds
+    and on(instance, stream, rendition, kind)
+      (rushls_rendition_output_expected == 1)
+)
+
+# Media seconds made usable per wall second, per rendition.
+rate(rushls_rendition_media_published_seconds_total[1m])
+```
+
+The age query depends on clock agreement between exporter and Prometheus. The monotonic overdue gauge supplies the deadline decision.
+Missing series and failed scrapes must show unavailable data. They must not become healthy zeros.
+A rate window also needs enough scrape samples. It cannot diagnose every subsecond event.
+
+For example, 0.2 seconds of media every 0.4 seconds gives an output rate of 0.5.
+The publisher remains active, but the output loses approximately 30 seconds against wall time each minute.
+A session counter can continue increasing throughout this problem.
+
+## Input and serving measurements
+
+Per-track source and normalized-media timestamps establish which stage stopped.
+They need the same expected/started distinction as output timestamps.
+Useful additional measurements are normalized media end and the time from an eligible normalized interval to its usable output commit.
+For output readiness, eligibility must account for reorder delay and required keyframes.
+A lack of eligible input does not establish an origin processing failure.
+
+Candidate track families are `rushls_track_last_source_timestamp_seconds`, `rushls_track_last_normalized_timestamp_seconds`, and `rushls_track_normalized_media_seconds_total`.
+Their labels identify stream, session, track, and media kind. They must not duplicate every rendition that consumes a track.
+
+Transport measurements need explicit protocol semantics.
+TCP retransmissions, UDP continuity errors, and MoQ object loss are not interchangeable packet-loss counts.
+An unsupported measurement must be absent or marked unavailable, rather than represented as measured zero.
+Ingest bytes also cannot establish the viewer's download capacity.
+
+The HTTP layer needs bounded request classifications:
+
+| Proposed family | Dimensions or scope |
+|---|---|
+| HTTP requests and final status | Method, resource class, status |
+| Handler duration | Resource class and outcome, with intentional waits separated |
+| Body bytes emitted | Actual encoded and ranged bytes yielded to the HTTP stack |
+| Body lifetime and completion outcome | Complete, cancelled, error |
+| Requests and connections in flight | Current use with configured capacity |
+| Admission refusals | Request or connection capacity |
+| Wait starts, in-flight waits, duration, and outcomes | Blocking reload, initial readiness, hinted part |
+| Playlist projection duration and failures | Playlist class, with bounded failure reasons |
+| Disk read duration and failures | Media storage path |
+
+Body bytes yielded to the HTTP stack still do not prove receipt by a viewer.
+A proxy or CDN can supply downstream transfer evidence. Player telemetry supplies buffer and playback evidence.
+Request totals must include denials and errors before the origin handler, including admission refusals and invalid routes.
+One layer must own authoritative HTTP totals to prevent duplicate counting.
+
+Host and process telemetry supplies CPU use, RSS, file descriptors, disk capacity, and network saturation.
+These measurements can come from existing infrastructure exporters. Retained payload accounting cannot replace them.
+A build-info metric and exported session/admission capacities also help compare nodes and explain saturation.
+
+The shared HTTP budget also covers the metrics listener in the reviewed tree.
+Saturation can make scrapes fail during the incident that needs observation.
+Reserved operator capacity or a separate operator budget deserves consideration.
+
+An operator dashboard can use these signals as follows:
+
+| Observation | Supported interpretation | Next evidence |
+|---|---|---|
+| Eligible input stops, output becomes late | Upstream input starvation | Per-track input progress and transport diagnostics |
+| Eligible input advances, output becomes late | Delay within Rushls publication path | Mux timing, store waits, disk pressure, runtime scheduling |
+| Output advances, one rendition falls behind | Rendition-specific production or input delay | Source-track mapping and matched-boundary timing |
+| Output is timely, HTTP returns errors or stalls | Origin serving or downstream transfer problem | HTTP outcomes, body lifetime, admission, disk reads |
+| Origin publication and serving look healthy, CDN playlist is old | Delivery freshness problem | CDN age, cache key, cache status, playlist edge |
+| Delivery is timely, player still stalls | Player or playback compatibility remains possible | Buffer level, decode errors, selected rendition, rebuffer events |
+
+A synthetic client through the public playback path can measure playlist freshness and referenced-media availability without a real viewer.
+Player telemetry can correlate rebuffer times with request duration, downloaded bytes, buffer level, and selected rendition.
+Correlation needs stream, rendition, and media position. It must not depend on unrestricted viewer labels in Prometheus.
+
+## Export, cost, and migration
+
+The current `MetricKind` supports counters and gauges only.
+Histograms require correct bucket, sum, and count exposition, or a metrics library with supported histogram export.
+Prometheus recommends native histograms where supported. The existing text exporter needs an explicit compatibility decision.
+See [histogram guidance](https://prometheus.io/docs/practices/histograms/).
+
+Node aggregates must remain bounded. Detailed stream and rendition measurements belong on `/metrics/streams`.
+A rough budget illustrates the cost: 1,000 streams × 6 renditions × 10 gauges gives 60,000 active series.
+A classic histogram with 10 finite buckets adds 13 series per label set, including `+Inf`, sum, and count.
+Session and rendition churn increases historical series beyond the active count.
+
+Existing session metrics repeat `principal` on every family. Moving principal to `session_info` reduces repeated metadata, though not necessarily series count.
+Stable output labels prevent reconnects from creating unnecessary timing series.
+Per-track session labels remain useful because input IDs can restart on reconnect.
+Metric names need seconds, bytes, and counter suffixes with precise HELP text. See [Prometheus naming guidance](https://prometheus.io/docs/practices/naming/).
+
+The node scrape currently walks stream retention state, including playlist durations.
+Additional timing gauges must not require a full media-history scan on every scrape.
+Small per-rendition timing records can update at commit and provide coherent stream comparisons.
+A scrape must not render playlists, perform disk reads, or obtain long publication locks.
+
+Migration must preserve existing dashboards until replacements are available.
+New names are appropriate for changed meanings such as resolved bytes versus transferred bytes.
+Old HELP text can identify deprecated semantics during a transition.
+A documented removal window can then retire misleading aliases and redundant legacy request counters.
+
+## Suggested implementation order and acceptance cases
+
+1. Correct HELP text, loss coverage, wait accounting, and lifecycle snapshot arithmetic.
+2. Add publication state, per-rendition first/last progress, expected cadence, overdue time, and missed-deadline counters.
+3. Add shared-timeline output lag, per-track progress, and rendition media skew.
+4. Add HTTP outcomes, body accounting, wait distributions, and store backpressure measurements.
+5. Add matched-boundary publication spread, dashboards, alerts, and a public-path synthetic probe.
+
+The first dashboard needs worst active overdue time, worst active output lag, rendition skew, source progress, and HTTP outcomes.
+Alert thresholds require measured healthy jitter and the deployment's latency objective.
+Hold-back is useful context, but it is not the actual remaining buffer of every viewer.
+
+The implementation needs deterministic tests for these cases:
+
+| Case | Required result |
+|---|---|
+| Regular parts, then a complete pause | Overdue time increases before output resumes |
+| Brief pause and recovery between scrapes | Miss counter preserves the incident |
+| All renditions stall together | Lag or overdue alarm fires despite zero skew |
+| Only one rendition stalls | Healthy siblings cannot hide it |
+| Different timebases and chunk durations | Shared media-time comparison remains correct |
+| Timestamp jump or synthesized gap | No false usable-media catch-up |
+| Segment completion after parts | Published media duration is not counted twice |
+| First output never arrives | Startup alarm remains possible |
+| Disconnect, drain, reconnect, takeover | No idle alarms or cross-publication comparisons |
+| Sparse subtitles and retired outputs | No false continuous-media alarm |
+| Deliberate pacing or disk backpressure | Viewer-facing elapsed time includes the delay |
+| Range, gzip, 304, body cancellation, and 503 | HTTP counters reflect the actual response stage |
+| Initial wait, immediate reload, hinted part, and timeout | Starts and outcomes cover the same populations |
+| Concurrent retention removal during scrape | No unsigned underflow or invalid lifecycle totals |
+
+## Verification
+
+This review traces metric declarations, update sites, store commits, lifecycle transitions, and HTTP conversion in the current working tree.
+Existing local changes were preserved. No runtime implementation changed as part of this review.
+Existing focused tests passed: 16 observability tests, 8 metrics exporter tests, and 20 HLS service tests.
+Commands used `cargo test -p rushls --lib` with filters `observe::`, `server::metrics::tests`, and `delivery::hls::service::tests`.
+These tests establish the existing baseline. They do not validate the proposed metrics or reproduce every review finding.
+
+
+## Existing metric-name inventory
+
+The reviewed declarations contain 76 distinct metric names. This inventory excludes proposed names and test assertions.
+
+| Metric | Declaration |
+|---|---|
+| `rushls_sessions_started_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_sessions_completed_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_part_contract_failures_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_boundary_contract_failures_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_coordinator_limit_failures_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_sessions_failed_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_sessions_replaced_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_publishers_rejected_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_codec_parameter_changes_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_unhealthy_terminations_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_drain_failures_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_recording_segments_lost_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_bytes_received_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_packets_received_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_packets_lost_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_parts_published_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_segments_published_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_tls_handshakes_completed_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_tls_handshakes_failed_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_bytes_received_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_packets_received_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_packets_lost_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_packets_normalized_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_samples_normalized_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_chunks_muxed_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_segments_muxed_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_parts_published_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_segments_published_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_peak_packets_per_batch` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_peak_samples_per_batch` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_media_lead_seconds` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_pacing_delay_seconds_total` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_publisher_backpressured` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_session_pipeline_bytes` | [src/observe/meters.rs](../src/observe/meters.rs) |
+| `rushls_media_responses_served_total` | [src/observe/delivery.rs](../src/observe/delivery.rs) |
+| `rushls_bytes_served_total` | [src/observe/delivery.rs](../src/observe/delivery.rs) |
+| `rushls_origin_requests_rejected_total` | [src/observe/delivery.rs](../src/observe/delivery.rs) |
+| `rushls_origin_requests_not_found_total` | [src/observe/delivery.rs](../src/observe/delivery.rs) |
+| `rushls_hls_playlists_served_total` | [src/observe/delivery.rs](../src/observe/delivery.rs) |
+| `rushls_hls_playlists_rendered_total` | [src/observe/delivery.rs](../src/observe/delivery.rs) |
+| `rushls_hls_blocking_reloads_total` | [src/observe/delivery.rs](../src/observe/delivery.rs) |
+| `rushls_hls_blocking_reloads_expired_total` | [src/observe/delivery.rs](../src/observe/delivery.rs) |
+| `rushls_active_sessions` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_published_streams` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_idle_streams` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_retained_payload_bytes` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_retained_manifest_bytes` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_retained_memory_bytes` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_retained_disk_bytes` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_retention_requested_seconds` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_disk_spill_pending` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_disk_spills_failed_total` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_retention_capacity_bytes` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_playback_denied_total` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_session_info` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_session_tracks` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_stream_retention_requested_seconds` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_stream_retained_media_bytes` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_stream_retained_manifest_bytes` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_stream_retention_held_seconds` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_stream_retained_bytes` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_stream_retention_capacity_bytes` | [src/server/metrics.rs](../src/server/metrics.rs) |
+| `rushls_hook_deliveries_total` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_retries_total` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_filtered_total` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_dropped_ingress_total` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_dropped_overflow_total` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_dropped_rejected_total` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_dropped_exhausted_total` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_dropped_shutdown_total` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_outcome_unknown_shutdown_total` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_ingress_depth` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_ingress_capacity` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_queue_depth` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_queue_capacity` | [src/hooks.rs](../src/hooks.rs) |
+| `rushls_hook_in_flight` | [src/hooks.rs](../src/hooks.rs) |

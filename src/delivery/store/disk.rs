@@ -143,6 +143,7 @@ struct DiskShared {
     #[cfg(test)]
     write_gate: Mutex<()>,
     spills_failed: AtomicU64,
+    operations: crate::observe::OperationMeters,
     /// In-flight and retired epochs. A successor may reuse the public stream
     /// id, so retirement deletes one epoch and waits for its jobs first.
     epochs: Mutex<HashMap<(StreamId, u64), EpochJobs>>,
@@ -239,6 +240,7 @@ impl DiskTier {
             #[cfg(test)]
             write_gate: Mutex::new(()),
             spills_failed: AtomicU64::new(0),
+            operations: crate::observe::OperationMeters::default(),
             epochs: Mutex::new(HashMap::new()),
             read_bytes: Arc::new(Semaphore::new(MAX_IN_FLIGHT_READ_BYTES as usize)),
             _lock: lock,
@@ -274,6 +276,14 @@ impl DiskTier {
 
     pub fn queue_is_full(&self) -> bool {
         self.spill_pending() >= SPILL_QUEUE_BOUND
+    }
+
+    pub fn operations(&self) -> crate::observe::OperationMeters {
+        self.shared.operations.clone()
+    }
+
+    pub fn spill_capacity() -> usize {
+        SPILL_QUEUE_BOUND
     }
 
     pub fn spill_pending(&self) -> usize {
@@ -385,7 +395,16 @@ fn spill_loop(shared: &DiskShared, rx: &Receiver<SpillJob>) {
             if shared.is_reaping(&job.stream, job.epoch) {
                 live.abort_spill(job.rendition, job.segment);
             } else {
-                match write_job(shared, &job) {
+                let measurement = shared
+                    .operations
+                    .start(crate::observe::Operation::DiskWrite);
+                let result = write_job(shared, &job);
+                measurement.finish(if result.is_ok() {
+                    crate::observe::OperationOutcome::Completed
+                } else {
+                    crate::observe::OperationOutcome::Error
+                });
+                match result {
                     Ok(outcome) => live.finish_spill(&outcome),
                     Err(error) => {
                         shared.spills_failed.fetch_add(1, Ordering::Relaxed);

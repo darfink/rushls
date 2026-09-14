@@ -149,7 +149,7 @@ mod tests {
         let meters = meters();
         advance(4).await;
         // Bytes are still arriving; none of them are becoming media.
-        meters.source_view().source_progress(1_024, 4, 0);
+        meters.source_view().source_progress(1_024, 4);
         advance(3).await;
 
         assert_eq!(
@@ -167,7 +167,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn planning_phases_wait_rather_than_expect_publication() {
         let meters = meters();
-        meters.source_view().source_progress(1_024, 4, 0);
+        meters.source_view().source_progress(1_024, 4);
         meters.media_view().media_progress(4, 4);
         advance(1).await;
 
@@ -180,7 +180,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_running_session_still_producing_media_is_healthy() {
         let meters = meters();
-        meters.source_view().source_progress(1_024, 4, 0);
+        meters.source_view().source_progress(1_024, 4);
         meters.media_view().media_progress(4, 4);
         tokio::time::advance(Duration::from_millis(300)).await;
 
@@ -203,7 +203,7 @@ mod tests {
 
         for _ in 0..20 {
             advance(10).await;
-            meters.source_view().source_progress(1_024, 1, 0);
+            meters.source_view().source_progress(1_024, 1);
             meters.media_view().media_progress(1, 1);
             assert_eq!(
                 evaluate(&meters, Instant::now(), Phase::Running, policy),
@@ -219,7 +219,7 @@ mod tests {
         // the pacer slept. The clocks now exclude pacing sleeps instead, so the
         // alarm stays armed: media stops advancing and that is visible.
         let meters = meters();
-        meters.source_view().source_progress(1_024, 4, 0);
+        meters.source_view().source_progress(1_024, 4);
         meters.media_view().media_progress(4, 4);
         meters
             .media_view()

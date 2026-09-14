@@ -27,6 +27,7 @@ pub struct SessionSnapshot {
     pub phase: Phase,
     pub tracks: TrackCounts,
     pub meters: MeterSnapshot,
+    pub track_progress: Vec<crate::observe::tracks::TrackSnapshot>,
 }
 
 /// Identity and mutable status shared between a session and its observers.
@@ -83,6 +84,7 @@ impl SessionShared {
             phase: status.phase,
             tracks: status.tracks,
             meters: self.meters.snapshot(),
+            track_progress: self.meters.tracks().snapshot(),
         }
     }
 }

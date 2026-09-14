@@ -77,7 +77,7 @@ http-body = "1.1.0"
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 serde_json = "1"
 http = "1"
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio", "server-auto", "service"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "http1", "tls12", "logging"] }
 uuid = { version = "1.24.0", features = ["v7"] }
 base64 = "0.22"

@@ -365,6 +365,9 @@ impl RecordingPublisher {
     }
 }
 impl HlsPublisher for RecordingPublisher {
+    fn publisher_disconnected(&mut self) {
+        self.inner.publisher_disconnected();
+    }
     fn is_backpressured(&self) -> bool {
         self.inner.is_backpressured()
     }

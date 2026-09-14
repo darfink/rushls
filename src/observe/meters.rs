@@ -16,7 +16,7 @@ use super::counters::{counters, series};
 /// while it drains a socket read and calls this once, so the atomic traffic is
 /// per batch rather than per packet.
 pub trait SourceMeters: Send + Sync {
-    fn source_progress(&self, bytes: u64, packets: u64, lost: u64);
+    fn source_progress(&self, bytes: u64, packets: u64);
 
     /// Reported when the input changes codec parameters mid-stream.
     ///
@@ -29,6 +29,9 @@ pub trait SourceMeters: Send + Sync {
 
 /// Volume produced by normalization.
 pub trait MediaMeters: Send + Sync {
+    fn track_input(&self, _id: crate::domain::TrackId, _bytes: usize) {}
+    fn track_normalized(&self, _id: crate::domain::TrackId, _pts: i64, _duration: u64) {}
+
     fn media_progress(&self, packets: u64, samples: u64);
 
     /// Records the current normalized-media lead, accumulated pacing delay,
@@ -105,16 +108,12 @@ counters! {
             "Archive segments not written because recording failed."
         ),
         bytes_received: u64 = Counter(
-            "rushls_bytes_received_total",
-            "Bytes received from publishers."
+            "rushls_source_payload_bytes_total",
+            "Demultiplexed publisher payload bytes, excluding transport overhead."
         ),
         packets_received: u64 = Counter(
-            "rushls_packets_received_total",
-            "Packets received from publishers."
-        ),
-        packets_lost: u64 = Counter(
-            "rushls_packets_lost_total",
-            "Publisher packets reported lost."
+            "rushls_source_packets_total",
+            "Demultiplexed media packets from publishers, not transport packets."
         ),
         parts_published: u64 = Counter(
             "rushls_parts_published_total",
@@ -231,7 +230,6 @@ struct SessionCounters {
     process: ProcessMeters,
     bytes_received: AtomicU64,
     packets_received: AtomicU64,
-    packets_lost: AtomicU64,
     packets_normalized: AtomicU64,
     samples_normalized: AtomicU64,
     chunks_muxed: AtomicU64,
@@ -246,6 +244,7 @@ struct SessionCounters {
     media_lead_nanos: AtomicU64,
     pacing_delay_nanos: AtomicU64,
     publisher_backpressured: AtomicBool,
+    tracks: super::tracks::TrackMeters,
     source_seen: LivenessMark,
     media_seen: LivenessMark,
     publication_seen: LivenessMark,
@@ -255,7 +254,6 @@ struct SessionCounters {
 pub struct MeterSnapshot {
     pub bytes_received: u64,
     pub packets_received: u64,
-    pub packets_lost: u64,
     pub packets_normalized: u64,
     pub samples_normalized: u64,
     pub chunks_muxed: u64,
@@ -278,15 +276,15 @@ pub struct MeterSnapshot {
 // not.
 series! {
     MeterSnapshot {
-        Counter("rushls_session_bytes_received_total",
-            "Bytes received by an active session.")
+        Counter("rushls_session_source_payload_bytes_total",
+            "Demultiplexed payload bytes received by an active session.")
             = |snapshot: &MeterSnapshot| snapshot.bytes_received,
-        Counter("rushls_session_packets_received_total",
-            "Packets received by an active session.")
+        Counter("rushls_session_source_packets_total",
+            "Demultiplexed media packets received by an active session.")
             = |snapshot: &MeterSnapshot| snapshot.packets_received,
-        Counter("rushls_session_packets_lost_total",
-            "Packets reported lost by an active session.")
-            = |snapshot: &MeterSnapshot| snapshot.packets_lost,
+        Gauge("rushls_session_transport_loss_observable",
+            "Whether transport packet loss is measured. Current sources do not provide this measurement.")
+            = |_snapshot: &MeterSnapshot| false,
         Counter("rushls_session_packets_normalized_total",
             "Packets normalized by an active session.")
             = |snapshot: &MeterSnapshot| snapshot.packets_normalized,
@@ -317,10 +315,10 @@ series! {
         Counter("rushls_session_pacing_delay_seconds_total",
             "Pacing delay accumulated by an active session.")
             = |snapshot: &MeterSnapshot| snapshot.pacing_delay.as_secs_f64(),
-        Gauge("rushls_session_publisher_backpressured",
-            "Whether an active publisher is currently backpressured.")
+        Gauge("rushls_session_pacing_active",
+            "Whether the media pacer is currently withholding input; excludes store waits.")
             = |snapshot: &MeterSnapshot| snapshot.publisher_backpressured,
-        Gauge("rushls_session_pipeline_bytes",
+        Gauge("rushls_session_pipeline_capacity_bytes",
             "Bytes one publisher may hold before the store, which \
              `memory_per_stream` does not cover.")
             = |snapshot: &MeterSnapshot| snapshot.pipeline_bytes,
@@ -335,7 +333,6 @@ impl SessionMeters {
                 process,
                 bytes_received: AtomicU64::new(0),
                 packets_received: AtomicU64::new(0),
-                packets_lost: AtomicU64::new(0),
                 packets_normalized: AtomicU64::new(0),
                 samples_normalized: AtomicU64::new(0),
                 chunks_muxed: AtomicU64::new(0),
@@ -347,6 +344,7 @@ impl SessionMeters {
                 media_lead_nanos: AtomicU64::new(0),
                 pacing_delay_nanos: AtomicU64::new(0),
                 publisher_backpressured: AtomicBool::new(false),
+                tracks: super::tracks::TrackMeters::default(),
                 source_seen: LivenessMark::default(),
                 media_seen: LivenessMark::default(),
                 publication_seen: LivenessMark::default(),
@@ -358,6 +356,10 @@ impl SessionMeters {
     ///
     /// Every view is the same allocation; narrowing is about what a stage can
     /// see, not about creating separate sinks.
+    pub fn tracks(&self) -> &super::tracks::TrackMeters {
+        &self.counters.tracks
+    }
+
     pub fn source_view(&self) -> Arc<dyn SourceMeters> {
         Arc::clone(&self.counters) as Arc<dyn SourceMeters>
     }
@@ -387,7 +389,6 @@ impl SessionMeters {
         MeterSnapshot {
             bytes_received: get(&counters.bytes_received),
             packets_received: get(&counters.packets_received),
-            packets_lost: get(&counters.packets_lost),
             packets_normalized: get(&counters.packets_normalized),
             samples_normalized: get(&counters.samples_normalized),
             chunks_muxed: get(&counters.chunks_muxed),
@@ -493,13 +494,11 @@ impl SessionCounters {
 }
 
 impl SourceMeters for SessionCounters {
-    fn source_progress(&self, bytes: u64, packets: u64, lost: u64) {
+    fn source_progress(&self, bytes: u64, packets: u64) {
         add(&self.bytes_received, bytes);
         add(&self.packets_received, packets);
-        add(&self.packets_lost, lost);
         add(&self.process.counters.bytes_received, bytes);
         add(&self.process.counters.packets_received, packets);
-        add(&self.process.counters.packets_lost, lost);
         if bytes > 0 || packets > 0 {
             self.source_seen.mark(self.active_elapsed(Instant::now()));
         }
@@ -511,6 +510,13 @@ impl SourceMeters for SessionCounters {
 }
 
 impl MediaMeters for SessionCounters {
+    fn track_input(&self, id: crate::domain::TrackId, bytes: usize) {
+        self.tracks.input(id, bytes);
+    }
+    fn track_normalized(&self, id: crate::domain::TrackId, pts: i64, duration: u64) {
+        self.tracks.normalized(id, pts, duration);
+    }
+
     fn media_progress(&self, packets: u64, samples: u64) {
         add(&self.packets_normalized, packets);
         add(&self.samples_normalized, samples);
@@ -590,13 +596,12 @@ mod tests {
         let process = ProcessMeters::default();
         let meters = SessionMeters::new(process.clone());
 
-        meters.source_view().source_progress(1_024, 8, 1);
+        meters.source_view().source_progress(1_024, 8);
         meters.media_view().media_progress(8, 8);
         meters.delivery_view().delivery_progress(2, 1);
 
         let session = meters.snapshot();
         assert_eq!(session.bytes_received, 1_024);
-        assert_eq!(session.packets_lost, 1);
         assert_eq!(session.samples_normalized, 8);
         assert_eq!(session.parts_published, 2);
 
@@ -615,7 +620,7 @@ mod tests {
         assert_eq!(meters.source_idle_for(Instant::now()), None);
         assert_eq!(meters.publication_idle_for(Instant::now()), None);
 
-        meters.source_view().source_progress(1, 1, 0);
+        meters.source_view().source_progress(1, 1);
         tokio::time::advance(Duration::from_secs(1)).await;
 
         assert_eq!(
@@ -643,10 +648,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn zero_volume_updates_do_not_mark_liveness() {
         let meters = SessionMeters::new(ProcessMeters::default());
-        meters.source_view().source_progress(0, 0, 3);
+        meters.source_view().source_progress(0, 0);
         tokio::time::advance(Duration::from_secs(1)).await;
 
         assert_eq!(meters.source_idle_for(Instant::now()), None);
-        assert_eq!(meters.snapshot().packets_lost, 3);
     }
 }

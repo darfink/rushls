@@ -1136,10 +1136,10 @@ pub struct CapacityAppConfig {
     /// store. Once `retain` can be long the two decouple hard.
     #[conf(parameter, long, env, default_value = "1024")]
     streams: usize,
-    /// Retained parts and segments for one stream.
+    /// Retained media and cached manifests for one stream.
     ///
-    /// Bounds retained media only. A publisher also holds a fixed pipeline
-    /// cost while ingesting, reported as `rushls_session_pipeline_bytes`.
+    /// Disk-backed streams reserve one eighth for manifests. A publisher holds a fixed pipeline
+    /// cost while ingesting, reported as `rushls_session_pipeline_capacity_bytes`.
     #[conf(
         parameter,
         long,
@@ -2246,6 +2246,13 @@ fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct HttpAppConfig {
+    /// Maximum established HTTP connections across all HTTP listeners.
+    #[conf(parameter, long, env, default_value = "4096")]
+    maximum_connections: usize,
+    /// Maximum HTTP requests executing or streaming responses across all listeners.
+    #[conf(parameter, long, env, default_value = "4096")]
+    maximum_requests: usize,
+
     /// Address serving HLS and health probes, or `"off"` to serve HTTPS only.
     #[conf(
         parameter,
@@ -2269,6 +2276,10 @@ pub struct HttpAppConfig {
 impl HttpAppConfig {
     fn resolve(&self) -> Result<HttpConfig, ConfigError> {
         let config = HttpConfig {
+            limits: crate::server::http::HttpLimits {
+                maximum_connections: self.maximum_connections,
+                maximum_requests: self.maximum_requests,
+            },
             cors: self.cors.resolve()?,
             tls: self.tls.as_ref().map(TlsAppConfig::resolve).transpose()?,
             tls_address: self.tls.as_ref().map(|tls| tls.listen),

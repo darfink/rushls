@@ -365,7 +365,7 @@ async fn enabled_metrics_can_be_exposed_without_authentication() {
     assert!(body.contains("rushls_retention_capacity_bytes{tier=\"memory\"} 0\n"));
     assert!(body.contains("rushls_retention_capacity_bytes{tier=\"disk\"} 0\n"));
     assert!(
-        !body.contains("rushls_stream_retention_held_seconds{"),
+        !body.contains("rushls_stream_retention_max_seconds{"),
         "per-stream retention is a separate scrape"
     );
     assert!(
@@ -376,7 +376,7 @@ async fn enabled_metrics_can_be_exposed_without_authentication() {
     let streams = request(harness.address, "GET", "/metrics/streams", &[]).await;
     assert_eq!(streams.status, 200);
     let streams = String::from_utf8(streams.body).expect("metrics are UTF-8");
-    assert!(streams.contains("# TYPE rushls_stream_retention_held_seconds gauge\n"));
+    assert!(streams.contains("# TYPE rushls_stream_retention_max_seconds gauge\n"));
     assert!(streams.contains("# TYPE rushls_stream_retained_bytes gauge\n"));
     assert!(streams.contains("# TYPE rushls_session_info gauge\n"));
     harness.stop().await;

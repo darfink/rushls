@@ -2346,7 +2346,7 @@ async fn a_range_of_a_spilled_chunked_parent_keeps_byte_offsets() {
 
 #[tokio::test]
 async fn burst_spill_waits_without_discarding_history() -> Result<(), Box<dyn std::error::Error>> {
-    for (count, queued) in [(80, 16), (120, 32)] {
+    for (count, queued) in [(60, 12), (80, 32), (120, 32)] {
         let directory = scratch_disk("burst-spill");
         let mut limits = limits();
         limits.retention.retain = Duration::from_mins(15).into();
@@ -2382,7 +2382,7 @@ async fn burst_spill_waits_without_discarding_history() -> Result<(), Box<dyn st
         };
         assert_eq!(
             pending, queued,
-            "reserve only the overflow, bounded by queue slots"
+            "reserve down to the low watermark, bounded by queue slots"
         );
         assert_eq!(retained, usize::try_from(count)?);
         assert!(
@@ -2627,5 +2627,230 @@ async fn iframe_ranges_survive_disk_spill_and_remain_fetchable()
     drop(lease);
     drop(store);
     std::fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn retired_rendition_expires_without_renewal_on_reconnect()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = store();
+    let first = store.lease(
+        stream(),
+        &keyed_presentation(0, "old", false, SystemTime::UNIX_EPOCH),
+    )?;
+    write(&first, initialization(0, 1));
+    write(&first, direct(0, 0, 0, 6, 1));
+    let held = first.live().snapshot();
+    let second = store.lease(
+        stream(),
+        &keyed_presentation(0, "new", false, SystemTime::UNIX_EPOCH),
+    )?;
+    // retain=36s, target=6s, part grace=18s: final window lives for 54s.
+    tokio::time::advance(Duration::from_secs(53)).await;
+    let third = store.lease(
+        stream(),
+        &keyed_presentation(0, "new", false, SystemTime::UNIX_EPOCH),
+    )?;
+    third.live().sweep_expired();
+    assert!(third.live().segment(RenditionId(0), SegmentId(1)).is_some());
+    let before = third.live().snapshot();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    third.live().sweep_expired();
+    let after = third.live().snapshot();
+    assert_eq!(after.renditions.len(), 1);
+    assert!(after.renditions[0].active);
+    assert_eq!(after.renditions[0].rendition_id, RenditionId(1));
+    assert!(third.live().segment(RenditionId(0), SegmentId(1)).is_none());
+    assert!(after.revision > before.revision);
+    assert!(after.media_catalog_revision > before.media_catalog_revision);
+    assert_eq!(
+        held.renditions[0].snapshot().segments.len(),
+        1,
+        "existing readers keep their Arc-owned media"
+    );
+    drop(second);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_churn_bounds_retired_topology_without_reusing_ids()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = store();
+    for generation in 0..200 {
+        let lease = store.lease(
+            stream(),
+            &keyed_presentation(
+                0,
+                &format!("camera/{generation}"),
+                false,
+                SystemTime::UNIX_EPOCH,
+            ),
+        )?;
+        write(&lease, initialization(0, 1));
+        write(&lease, direct(0, 0, 0, 6, 1));
+        let snapshot = lease.live().snapshot();
+        assert!(snapshot.renditions.len() <= 65);
+        assert_eq!(
+            snapshot.renditions.last().unwrap().rendition_id,
+            RenditionId(generation)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn retired_playlist_floor_does_not_defeat_memory_capacity() -> Result<(), Box<dyn std::error::Error>>
+{
+    let store = StreamStore::new(StoreLimits {
+        retention: RetentionPolicy {
+            maximum_payload_bytes: 4,
+            ..limits().retention
+        },
+        ..limits()
+    });
+    for generation in 0..20 {
+        let lease = store.lease(
+            stream(),
+            &keyed_presentation(
+                0,
+                &format!("camera/{generation}"),
+                false,
+                SystemTime::UNIX_EPOCH,
+            ),
+        )?;
+        write(&lease, initialization(0, 1));
+        write(&lease, direct(0, 0, 0, 6, 1));
+        assert!(lease.live().retained_payload_bytes() <= 4);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sustained_dvr_spilling_keeps_current_playlists_cached()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::delivery::hls::{
+        project::PlaylistDelta,
+        service::{Config, Request, Service},
+        uri::Resource,
+    };
+    let directory = scratch_disk("dvr-cache");
+    let store = StreamStore::new(StoreLimits {
+        retention: RetentionPolicy {
+            retain: Duration::from_hours(2).into(),
+            maximum_payload_bytes: 1024 * 1024,
+            ..limits().retention
+        },
+        disk: Some(DiskLimits {
+            directory: directory.clone(),
+            maximum_payload_bytes: 8 * 1024 * 1024,
+        }),
+        ..limits()
+    });
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    let hls = Service::new(Arc::new(Origin::new(store.clone())), Config::default());
+    let full = Request::new(
+        Resource::MediaPlaylist(RenditionId(0), MediaKind::Video),
+        None,
+    );
+    let requests = [full, full.with_skip(PlaylistDelta::SkipV2)];
+    for segment in 0..100 {
+        write(
+            &lease,
+            direct(0, segment, i64::try_from(segment)? * 6, 6, 32 * 1024),
+        );
+        // Viewers fetch while any spill is still running. Moving media to disk
+        // must not evict these current versions or invalidate their cache keys.
+        for request in requests {
+            hls.serve(&stream(), request)
+                .await
+                .map_err(|failure| failure.error)?;
+        }
+        let rendered = hls.meters().snapshot().playlist_projections;
+        tokio::time::timeout(Duration::from_secs(5), lease.ready()).await??;
+        for _ in 0..10 {
+            for request in requests {
+                hls.serve(&stream(), request)
+                    .await
+                    .map_err(|failure| failure.error)?;
+            }
+        }
+        assert_eq!(hls.meters().snapshot().playlist_projections, rendered);
+        let depth = lease.live().retention_depth();
+        assert!(depth.manifest_bytes > 0);
+        assert!(depth.memory_bytes <= 1024 * 1024);
+    }
+    assert!(lease.live().retained_disk_bytes() > 2 * 1024 * 1024);
+    let snapshot = lease
+        .live()
+        .rendition(RenditionId(0))
+        .ok_or("missing rendition")?;
+    assert_eq!(
+        snapshot.segments.len(),
+        100,
+        "DVR history survives repeated spills"
+    );
+    assert_eq!(snapshot.segments[0].msn, Msn(0));
+    drop(hls);
+    drop(lease);
+    drop(store);
+    let _ = std::fs::remove_dir_all(directory);
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_allowance_survives_an_in_flight_spill_cycle()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::delivery::memory::ManifestClass;
+    use bytes::Bytes;
+    let directory = scratch_disk("spill-cache-allowance");
+    let store = StreamStore::new(StoreLimits {
+        retention: RetentionPolicy {
+            retain: Duration::from_hours(2).into(),
+            maximum_payload_bytes: 1024 * 1024,
+            ..limits().retention
+        },
+        disk: Some(DiskLimits {
+            directory: directory.clone(),
+            maximum_payload_bytes: 8 * 1024 * 1024,
+        }),
+        ..limits()
+    });
+    let lease = lease(&store, &[(0, false)]);
+    configure(&lease, 0, false);
+    let budget = lease.live().memory_budget();
+    let manifest = budget
+        .insert(
+            ManifestClass::Index,
+            0,
+            Bytes::from(vec![0; 128 * 1024]),
+            Bytes::new(),
+        )
+        .ok_or("manifest allowance")?;
+    {
+        let _pause = store.disk().ok_or("disk")?.pause_writes();
+        for segment in 0..26 {
+            write(
+                &lease,
+                direct(0, segment, i64::try_from(segment)? * 6, 6, 32 * 1024),
+            );
+        }
+        assert!(
+            store.disk().ok_or("disk")?.spill_pending() > 0,
+            "spill starts before RAM is saturated"
+        );
+        assert!(lease.live().is_backpressured());
+        assert!(
+            manifest.get().is_some(),
+            "the full manifest allowance remains during disk I/O"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(5), lease.ready()).await??;
+    assert!(lease.live().retained_payload_bytes() <= 768 * 1024);
+    assert!(manifest.get().is_some());
+    assert_eq!(budget.usage().1, 128 * 1024);
+    drop(lease);
+    drop(store);
+    let _ = std::fs::remove_dir_all(directory);
     Ok(())
 }

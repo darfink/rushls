@@ -19,7 +19,7 @@ use crate::{
         uri::MediaResource,
     },
     domain::{Payload, RenditionId, StreamId},
-    observe::OriginMeters,
+    observe::{Operation, OperationOutcome, OriginMeters},
 };
 
 /// Media retained under one durable resource identity.
@@ -61,10 +61,9 @@ pub struct Origin {
 
 impl Origin {
     pub fn new(store: StreamStore) -> Self {
-        Self {
-            store,
-            meters: OriginMeters::default(),
-        }
+        let mut meters = OriginMeters::default();
+        meters.operations = store.operations.clone();
+        Self { store, meters }
     }
 
     pub fn meters(&self) -> &OriginMeters {
@@ -87,7 +86,7 @@ impl Origin {
     ) -> Result<MediaObject, DeliveryError> {
         let result = self.resolve_media(stream, resource, deadline).await;
         match &result {
-            Ok(object) => self.meters.media_served(object.body.len()),
+            Ok(object) => self.meters.media_resolved(object.body.len()),
             Err(
                 DeliveryError::UnknownStream
                 | DeliveryError::UnknownRendition
@@ -150,7 +149,13 @@ impl Origin {
                         return Err(DeliveryError::UnknownResource);
                     }
                     let _outcome = self
-                        .wait_for(&live, rendition, deadline, PartPublished(part))
+                        .wait_for(
+                            &live,
+                            rendition,
+                            deadline,
+                            PartPublished(part),
+                            Operation::HintedPart,
+                        )
                         .await?;
                     let stored = live
                         .part(rendition, part)
@@ -174,10 +179,12 @@ impl Origin {
         rendition: RenditionId,
         deadline: Duration,
         condition: C,
+        operation: Operation,
     ) -> Result<WaitOutcome, DeliveryError> {
         let mut updates = live
             .subscribe_rendition(rendition)
             .ok_or(DeliveryError::UnknownRendition)?;
+        let measurement = self.meters.operations.start(operation);
         let wait = async {
             loop {
                 let edge = *updates.borrow_and_update();
@@ -192,9 +199,16 @@ impl Origin {
                 }
             }
         };
-        timeout(deadline, wait)
+        let result = timeout(deadline, wait)
             .await
-            .unwrap_or(Err(DeliveryError::Unsatisfied))
+            .unwrap_or(Err(DeliveryError::Unsatisfied));
+        measurement.finish(match &result {
+            Ok(WaitOutcome::Reached) => OperationOutcome::Completed,
+            Ok(WaitOutcome::Ended) => OperationOutcome::Ended,
+            Err(DeliveryError::Unsatisfied) => OperationOutcome::Expired,
+            Err(_) => OperationOutcome::Error,
+        });
+        result
     }
 
     pub fn rendition_for(
@@ -215,9 +229,17 @@ impl Origin {
             HeldBytes::Memory(payload) => Ok(payload.clone()),
             HeldBytes::Disk(locator) => {
                 let disk = self.store.disk().ok_or(DeliveryError::UnknownResource)?;
-                disk.read(locator)
+                let measurement = self.meters.operations.start(Operation::DiskRead);
+                let result = disk
+                    .read(locator)
                     .await
-                    .map_err(|_| DeliveryError::UnknownResource)
+                    .map_err(|_| DeliveryError::UnknownResource);
+                measurement.finish(if result.is_ok() {
+                    OperationOutcome::Completed
+                } else {
+                    OperationOutcome::Error
+                });
+                result
             }
         }
     }
@@ -388,7 +410,13 @@ mod tests {
 
         assert_eq!(
             origin
-                .wait_for(&live, RenditionId(0), Duration::from_secs(18), BeyondEnd,)
+                .wait_for(
+                    &live,
+                    RenditionId(0),
+                    Duration::from_secs(18),
+                    BeyondEnd,
+                    Operation::BlockingReload
+                )
                 .await?,
             WaitOutcome::Ended
         );

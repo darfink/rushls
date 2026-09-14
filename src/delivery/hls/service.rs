@@ -278,12 +278,19 @@ impl Service {
         before - caches.len()
     }
 
-    fn cache_for(&self, stream: &StreamId) -> Arc<StreamPlaylistCache> {
+    fn cache_for(&self, stream: &StreamId, live: &LiveStream) -> Arc<StreamPlaylistCache> {
         let mut caches = self.caches.lock();
-        if let Some(cache) = caches.get(stream) {
+        let budget = live.memory_budget();
+        if let Some(cache) = caches
+            .get(stream)
+            .filter(|cache| cache.uses_budget(&budget))
+        {
             return Arc::clone(cache);
         }
-        let cache = Arc::new(StreamPlaylistCache::new(self.config.uri_base.uris(stream)));
+        let cache = Arc::new(StreamPlaylistCache::with_budget(
+            self.config.uri_base.uris(stream),
+            budget,
+        ));
         caches.insert(stream.clone(), Arc::clone(&cache));
         cache
     }
@@ -301,7 +308,7 @@ impl Service {
                 | DeliveryError::UnknownRendition
                 | DeliveryError::UnknownResource,
             ) => self.origin.meters().request_not_found(),
-            Err(DeliveryError::Unsatisfied) => self.meters.blocking_reload_expired(),
+
             _ => {}
         }
         outcome.map_err(|error| self.failure(error, Some((stream, request))))
@@ -390,15 +397,31 @@ impl Service {
         if stream.presentation.is_none() {
             return Err(DeliveryError::UnknownResource);
         }
-        let caches = self.cache_for(stream_id);
+        let caches = self.cache_for(stream_id, live);
         let rendered = caches.multivariant().get_or_render(
             PlaylistKey::multivariant(&stream).with_query_variables(query_variables),
             || -> Result<String, DeliveryError> {
-                multivariant_playlist(&stream, &self.config.playlist, caches.uris(query_variables))?
-                    .ok_or(DeliveryError::UnknownResource)
+                let measurement = self
+                    .origin
+                    .meters()
+                    .operations
+                    .start(crate::observe::Operation::PlaylistProjection);
+                let result = multivariant_playlist(
+                    &stream,
+                    &self.config.playlist,
+                    caches.uris(query_variables),
+                )
+                .map_err(DeliveryError::from)
+                .and_then(|playlist| playlist.ok_or(DeliveryError::UnknownResource));
+                measurement.finish(if result.is_ok() {
+                    crate::observe::OperationOutcome::Completed
+                } else {
+                    crate::observe::OperationOutcome::Error
+                });
+                result
             },
         )?;
-        self.meters.playlist_served(rendered.freshly_rendered);
+        self.meters.playlist_resolved(rendered.freshly_rendered);
         // A multivariant playlist names no rendition of its own, so it is paced
         // by the widest cadence it points at, and it is never the target of a
         // blocking reload.
@@ -446,10 +469,15 @@ impl Service {
                         part: blocking.part,
                     }
                 };
-                self.meters.blocking_reload_started();
                 let _outcome = self
                     .origin
-                    .wait_for(live, rendition, deadline, condition)
+                    .wait_for(
+                        live,
+                        rendition,
+                        deadline,
+                        condition,
+                        crate::observe::Operation::BlockingReload,
+                    )
                     .await?;
             }
         } else {
@@ -463,12 +491,31 @@ impl Service {
                 // hold it rather than answer with a playlist naming no media.
                 let _outcome = self
                     .origin
-                    .wait_for(live, rendition, deadline, readiness)
+                    .wait_for(
+                        live,
+                        rendition,
+                        deadline,
+                        readiness,
+                        crate::observe::Operation::InitialReadiness,
+                    )
                     .await?;
             }
         }
 
-        let caches = self.cache_for(stream_id);
+        self.render_media_playlist(stream_id, live, rendition, request, iframe)
+    }
+
+    fn render_media_playlist(
+        &self,
+        stream_id: &StreamId,
+        live: &Arc<LiveStream>,
+        rendition: RenditionId,
+        request: Request,
+        iframe: bool,
+    ) -> Result<Response, DeliveryError> {
+        let snapshot = Self::rendition_for(live, request.resource)?;
+        let blocking = request.blocking;
+        let caches = self.cache_for(stream_id, live);
         let skip = request.skip;
         let cache = if iframe {
             caches.iframe(rendition)
@@ -493,17 +540,29 @@ impl Service {
                 } else {
                     media_playlist
                 };
-                Ok(render(
+                let measurement = self
+                    .origin
+                    .meters()
+                    .operations
+                    .start(crate::observe::Operation::PlaylistProjection);
+                let result = render(
                     stream,
                     snapshot,
                     control,
                     &self.config.playlist,
                     caches.uris(request.query_variables),
                     skip,
-                )?)
+                )
+                .map_err(DeliveryError::from);
+                measurement.finish(if result.is_ok() {
+                    crate::observe::OperationOutcome::Completed
+                } else {
+                    crate::observe::OperationOutcome::Error
+                });
+                result
             },
         )?;
-        self.meters.playlist_served(rendered.freshly_rendered);
+        self.meters.playlist_resolved(rendered.freshly_rendered);
         Ok(Response::manifest(
             rendered.bytes,
             rendered.gzip,
@@ -769,6 +828,25 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn initial_readiness_expiration_is_not_a_blocking_reload() {
+        use crate::observe::{Operation, OperationOutcome};
+        let store = StreamStore::default();
+        let service = origin(&store);
+        let _lease = lease(&store, vec![video(0)]);
+        let failure = service
+            .serve(&stream_id(), video_playlist(None))
+            .await
+            .expect_err("no media arrives");
+        assert_eq!(failure.error, DeliveryError::Unsatisfied);
+        let operations = store.operations.snapshot();
+        let initial = &operations[Operation::InitialReadiness as usize];
+        assert_eq!(initial.started, 1);
+        assert_eq!(initial.outcomes[OperationOutcome::Expired as usize], 1);
+        assert_eq!(initial.in_flight, 0);
+        assert_eq!(operations[Operation::BlockingReload as usize].started, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn iframe_routes_are_opt_in_and_have_separate_token_and_video_caches()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::delivery::hls::fixtures::write_cmaf_segment;
@@ -826,7 +904,7 @@ mod tests {
                 assert!(playlist(&normal).contains("#EXT-X-PART:"));
             }
         }
-        assert_eq!(service.meters().snapshot().playlists_rendered, 4);
+        assert_eq!(service.meters().snapshot().playlist_projections, 4);
         Ok(())
     }
 
@@ -1437,9 +1515,9 @@ mod cache_tests {
         }
 
         let before = origin.meters().snapshot();
-        assert_eq!(before.playlists_served, 5);
+        assert_eq!(before.playlists_resolved, 5);
         assert_eq!(
-            before.playlists_rendered, 1,
+            before.playlist_projections, 1,
             "nothing changed between the five requests, so four of them are \
              refcounts rather than renders"
         );
@@ -1452,7 +1530,7 @@ mod cache_tests {
             .expect("the playlist is servable");
 
         let after = origin.meters().snapshot();
-        assert_eq!(after.playlists_rendered, 2);
+        assert_eq!(after.playlist_projections, 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1481,7 +1559,7 @@ mod cache_tests {
 
         let before = origin.meters().snapshot();
         assert_eq!(
-            before.playlists_rendered, 2,
+            before.playlist_projections, 2,
             "full and delta of one epoch occupy sibling slots"
         );
 
@@ -1497,7 +1575,7 @@ mod cache_tests {
 
         let after = origin.meters().snapshot();
         assert_eq!(
-            after.playlists_rendered, 4,
+            after.playlist_projections, 4,
             "a live-edge advance invalidates both variants because each \
              carries EXT-X-RENDITION-REPORT"
         );
@@ -1549,6 +1627,25 @@ mod cache_tests {
             "a cache entry per stream retained forever is a leak with the \
              lifetime of the process"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recreated_stream_uses_a_fresh_cache_and_budget() {
+        let store = StreamStore::default();
+        let origin = Service::new(Arc::new(Origin::new(store.clone())), Config::default());
+        let first = lease(&store, vec![video(0)]);
+        let old_live = first.live().clone();
+        let old_cache = origin.cache_for(&stream_id(), &old_live);
+        drop(first);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        store.maintain();
+        assert!(store.is_empty());
+        // The cache cleanup notification has not reached the service yet.
+        let second = lease(&store, vec![video(0)]);
+        let new_cache = origin.cache_for(&stream_id(), second.live());
+        assert!(!Arc::ptr_eq(&old_cache, &new_cache));
+        assert!(new_cache.uses_budget(&second.live().memory_budget()));
+        assert!(!old_cache.uses_budget(&second.live().memory_budget()));
     }
 
     #[cfg(feature = "allocation-counting")]

@@ -44,7 +44,7 @@ impl MetricKind {
 ///
 /// Kept apart from `f64` so an integral counter prints as an integer. Every
 /// exposition format accepts a decimal point, but an operator reading
-/// `rushls_bytes_received_total 1024` should not be shown `1024.0`.
+/// `rushls_source_payload_bytes_total 1024` should not be shown `1024.0`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Reading {
     Integer(u64),

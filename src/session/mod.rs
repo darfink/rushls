@@ -271,6 +271,7 @@ async fn pipeline(
     let normalized = services.normalizers.start(&presentation, &timeline)?;
     let presentation = normalized.presentation;
     let timeline = normalized.timeline;
+    record_track_timing(context, &presentation, &timeline);
 
     let mut head = MediaHead::new(
         source,
@@ -366,6 +367,21 @@ async fn pipeline(
         });
     }
     Ok(outcome)
+}
+
+fn record_track_timing(
+    context: &SessionContext,
+    presentation: &media::PresentationPlan,
+    timeline: &media::TimelineCalibration,
+) {
+    context
+        .meters()
+        .tracks()
+        .register(presentation.tracks().iter().filter_map(|track| {
+            timeline
+                .get(track.id)
+                .map(|clock| (track.id, track.kind(), clock.timebase, clock.origin_pts))
+        }));
 }
 
 /// The language a caption service should advertise.

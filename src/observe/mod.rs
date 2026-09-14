@@ -18,8 +18,10 @@
 pub mod counters;
 mod delivery;
 mod events;
+mod histogram;
 pub mod lifecycle;
 mod meters;
+pub use histogram::{DURATION_BUCKETS, DurationHistogram};
 
 pub use counters::{MetricKind, Reading, Series};
 pub use delivery::{HlsMeters, HlsSnapshot, OriginMeters, OriginSnapshot};
@@ -31,3 +33,10 @@ pub use meters::{
     DeliveryMeters, MediaMeters, MeterSnapshot, MuxMeters, ProcessMeters, ProcessSnapshot,
     SessionMeters, SourceMeters,
 };
+
+mod operations;
+pub use operations::{Operation, OperationMeters, OperationOutcome, OperationSnapshot};
+
+pub mod http;
+
+pub mod tracks;

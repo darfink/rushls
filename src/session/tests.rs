@@ -138,7 +138,7 @@ impl PacketSource for FakeSource {
                 for packet in batch {
                     out.push(packet);
                 }
-                self.meters.source_progress(bytes, packets, 0);
+                self.meters.source_progress(bytes, packets);
                 self.delivered = self.delivered.saturating_add(1);
                 let state = if self.batches.is_empty() {
                     match self.ending {
