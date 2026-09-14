@@ -1183,4 +1183,59 @@ mod tests {
         assert!(matches!(events.last(), Some(NodeEvent::ShuttingDown)));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn an_occupied_rtmp_port_fails_with_the_address_attached() -> Result<(), RuntimeError> {
+        // Same class of failure as routmp's host-port collision: whatever the
+        // cause, startup must name the port instead of exiting opaquely.
+        let predecessor = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture binds");
+        let occupied = predecessor.local_addr().expect("fixture has an address");
+        let config = NodeConfig {
+            rtmp_address: occupied,
+            srt_address: "127.0.0.1:0".parse().expect("constant is valid"),
+            ..NodeConfig::default()
+        };
+        let node = node(config)?;
+        // RTMP binds first in serve, so nothing else is touched.
+        let error = node
+            .serve(async {})
+            .await
+            .expect_err("an occupied RTMP port must fail startup");
+        match &error {
+            RuntimeError::BindRtmp { address, source } => {
+                assert_eq!(*address, occupied);
+                assert_eq!(source.kind(), std::io::ErrorKind::AddrInUse);
+            }
+            other => panic!("must be BindRtmp, got: {other}"),
+        }
+        assert!(
+            error.to_string().contains(&occupied.to_string()),
+            "the operator-facing error must name the port: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_occupied_http_port_fails_with_the_address_attached() {
+        let predecessor = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture binds");
+        let occupied = predecessor.local_addr().expect("fixture has an address");
+        let error = bind_http(occupied)
+            .await
+            .expect_err("an occupied HTTP port must fail");
+        match &error {
+            RuntimeError::BindHttp { address, source } => {
+                assert_eq!(*address, occupied);
+                assert_eq!(source.kind(), std::io::ErrorKind::AddrInUse);
+            }
+            other => panic!("must be BindHttp, got: {other}"),
+        }
+        assert!(
+            error.to_string().contains(&occupied.to_string()),
+            "the operator-facing error must name the port: {error}"
+        );
+    }
 }

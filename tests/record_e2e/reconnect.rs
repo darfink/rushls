@@ -26,41 +26,66 @@ pub struct ReconnectOutcome {
     pub secs_a: u64,
     pub secs_b: u64,
 }
+#[allow(dead_code)]
+pub struct ChurnOutcome {
+    pub outcome: RecordOutcome,
+    pub sessions: Vec<SessionOutcome>,
+    pub secs: Vec<u64>,
+}
+
+/// Publish every file back to back into one archive, one session each. The
+/// pattern carries the publication id so the restarted segment numbers of
+/// each session land next to, not on top of, the earlier ones.
+pub async fn publish_many_halves(
+    cfg: &E2eConfig,
+    work: &WorkDir,
+    files: &[std::path::PathBuf],
+    secs: &[u64],
+) -> Result<ChurnOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    if files.is_empty() || files.len() != secs.len() {
+        return Err(format!("churn needs one duration per file, got {} files and {} durations", files.len(), secs.len()).into());
+    }
+    let rig = TestRig::start(work.archive(), "{publication}/{rendition}_{segment}.mp4", cfg)?;
+    let mut sessions = Vec::new();
+    for (index, (file, s)) in files.iter().zip(secs.iter()).enumerate() {
+        let bytes = std::fs::read(file)?;
+        eprintln!("record e2e churn: session {index} publishing {s}s of synthetic input");
+        let session = rig.run_burst(bytes).await?;
+        if session != SessionOutcome::Ended {
+            return Err(format!("burst session {index} did not end cleanly: {session:?}").into());
+        }
+        sessions.push(session);
+    }
+    let drained = rig.drain_and_collect().await?;
+    let last = sessions.last().copied().ok_or("churn published no sessions")?;
+    let outcome = RecordOutcome {
+        session: last,
+        node_events: drained.node_events,
+        recording_lost: drained.recording_lost,
+        files: drained.files,
+    };
+    Ok(ChurnOutcome { outcome, sessions, secs: secs.to_vec() })
+}
 
 /// Publish both halves back to back into one archive.
 pub async fn publish_two_halves(
+    cfg: &E2eConfig,
     work: &WorkDir,
     ts_a: &Path,
     ts_b: &Path,
     secs_a: u64,
     secs_b: u64,
 ) -> Result<ReconnectOutcome, Box<dyn std::error::Error + Send + Sync>> {
-    let bytes_a = std::fs::read(ts_a)?;
-    let bytes_b = std::fs::read(ts_b)?;
-    let rig = TestRig::start(work.archive(), "{publication}/{rendition}_{segment}.mp4")?;
-    let first = rig.run_burst(bytes_a).await?;
-    if first != SessionOutcome::Ended {
-        return Err(format!("first burst session did not end cleanly: {first:?}").into());
-    }
-    let second = rig.run_burst(bytes_b).await?;
-    if second != SessionOutcome::Ended {
-        return Err(format!("second burst session did not end cleanly: {second:?}").into());
-    }
-    let drained = rig.drain_and_collect().await?;
-    let outcome = RecordOutcome {
-        session: second,
-        node_events: drained.node_events,
-        recording_lost: drained.recording_lost,
-        files: drained.files,
-    };
-    Ok(ReconnectOutcome { outcome, first, second, secs_a, secs_b })
+    let files = vec![ts_a.to_path_buf(), ts_b.to_path_buf()];
+    let c = publish_many_halves(cfg, work, &files, &[secs_a, secs_b]).await?;
+    Ok(ReconnectOutcome { outcome: c.outcome, first: c.sessions[0], second: c.sessions[1], secs_a, secs_b })
 }
 
-/// The archive must hold both halves whole: exactly two publication
-/// prefixes, contiguous segments from zero under each, and combined plus
-/// per-publication frame totals matching the two synthetic sources.
-pub fn verify_reconnect(cfg: &E2eConfig, work: &WorkDir, r: &ReconnectOutcome) -> TestResult {
-    let outcome = &r.outcome;
+/// The archive must hold every session whole: exactly one publication prefix
+/// per session, contiguous segments from zero under each, and combined plus
+/// per-publication frame totals matching the synthetic sources.
+pub fn verify_many_halves(cfg: &E2eConfig, work: &WorkDir, outcome: &RecordOutcome, secs: &[u64]) -> TestResult {
+    let n = secs.len();
     for event in &outcome.node_events {
         let msg = format!("{event:?}");
         if msg.contains("RecordingFailed") || msg.contains("DrainExpired") {
@@ -71,7 +96,7 @@ pub fn verify_reconnect(cfg: &E2eConfig, work: &WorkDir, r: &ReconnectOutcome) -
         return Err(format!("recorder lost {} segments", outcome.recording_lost).into());
     }
     if outcome.files.is_empty() {
-        return Err("archive is empty after two successful sessions".into());
+        return Err(format!("archive is empty after {n} successful sessions").into());
     }
     verify::check_no_temp_files(work.archive())?;
 
@@ -85,8 +110,8 @@ pub fn verify_reconnect(cfg: &E2eConfig, work: &WorkDir, r: &ReconnectOutcome) -
         publications.insert(publication);
         by_rendition.entry(key).or_default().push(seg);
     }
-    if publications.len() != 2 {
-        return Err(format!("expected exactly 2 publication prefixes, found {}: {publications:?}", publications.len()).into());
+    if publications.len() != n {
+        return Err(format!("expected exactly {n} publication prefixes, found {}: {publications:?}", publications.len()).into());
     }
     for (rendition, segs) in &mut by_rendition {
         segs.sort_unstable();
@@ -95,7 +120,7 @@ pub fn verify_reconnect(cfg: &E2eConfig, work: &WorkDir, r: &ReconnectOutcome) -
                 return Err(format!("rendition {rendition}: gap, expected segment {i}, found {seg}").into());
             }
         }
-        eprintln!("record e2e reconnect: rendition {rendition}: {} segments", segs.len());
+        eprintln!("record e2e churn: rendition {rendition}: {} segments", segs.len());
     }
 
     // Per-file probe plus full decode, summed overall and per publication.
@@ -121,40 +146,45 @@ pub fn verify_reconnect(cfg: &E2eConfig, work: &WorkDir, r: &ReconnectOutcome) -
         verify::decode_clean(file)?;
     }
 
-    // Each half must have survived whole. Both sides are sorted because the
-    // two publication ids are random and carry no half order.
+    // Every session must have survived whole. Both sides are sorted because
+    // the publication ids are random and carry no session order.
     let mut got: Vec<u64> = video_by_pub.values().copied().collect();
     got.sort_unstable();
-    let mut want = vec![u64::from(cfg.fps) * r.secs_a, u64::from(cfg.fps) * r.secs_b];
+    let mut want: Vec<u64> = secs.iter().map(|s| u64::from(cfg.fps) * s).collect();
     want.sort_unstable();
     let slack = u64::from(cfg.gop_frames);
-    if got.len() != 2 {
-        return Err(format!("expected video under 2 publications, found {}", got.len()).into());
+    if got.len() != n {
+        return Err(format!("expected video under {n} publications, found {}", got.len()).into());
     }
     for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-        eprintln!("record e2e reconnect: publication {index}: video frames {g} vs expected {w}");
+        eprintln!("record e2e churn: publication {index}: video frames {g} vs expected {w}");
         if *g + slack < *w || *g > *w + slack {
             return Err(format!("publication {index}: video frames {g} far from expected {w}").into());
         }
     }
-    eprintln!("record e2e reconnect: video frames {video_frames} total");
+    eprintln!("record e2e churn: video frames {video_frames} total");
 
-    // Audio priming repeats per publication, so the expectation is the sum
-    // of the two half ceilings with a wider positive slack than the base test.
+    // Audio priming repeats per publication, so the expectation is the sum of
+    // the per-session ceilings with positive slack that grows with the count.
     if audio_frames > 0 || audio_sr > 0 {
         let sr = if audio_sr > 0 { audio_sr } else { 48_000 };
-        let expected_audio = (u64::from(sr) * r.secs_a).div_ceil(1024) + (u64::from(sr) * r.secs_b).div_ceil(1024);
-        eprintln!("record e2e reconnect: audio frames {audio_frames} vs expected {expected_audio}");
+        let expected_audio: u64 = secs.iter().map(|s| (u64::from(sr) * s).div_ceil(1024)).sum();
+        eprintln!("record e2e churn: audio frames {audio_frames} vs expected {expected_audio}");
         if audio_frames + 2 < expected_audio {
             return Err(format!("audio frame total {audio_frames} below expected {expected_audio}").into());
         }
-        if audio_frames > expected_audio + 10 {
+        if audio_frames > expected_audio + 4 * n as u64 + 4 {
             return Err(format!("audio frame total {audio_frames} far above expected {expected_audio}").into());
         }
     } else {
-        eprintln!("record e2e reconnect: no audio renditions found; skipping audio total");
+        eprintln!("record e2e churn: no audio renditions found; skipping audio total");
     }
-    let _ = cfg;
-    eprintln!("record e2e reconnect: PASS ({} files, {} renditions, 2 publications)", outcome.files.len(), by_rendition.len());
+    eprintln!("record e2e churn: PASS ({} files, {} renditions, {n} publications)", outcome.files.len(), by_rendition.len());
     Ok(())
+}
+
+/// The archive must hold both halves whole: exactly two publication prefixes.
+pub fn verify_reconnect(cfg: &E2eConfig, work: &WorkDir, r: &ReconnectOutcome) -> TestResult {
+    let secs = [r.secs_a, r.secs_b];
+    verify_many_halves(cfg, work, &r.outcome, &secs)
 }

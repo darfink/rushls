@@ -1,9 +1,9 @@
 //! Test composition root: temp dirs, Services with [record] on, burst run.
 //!
 //! Mirrors server/runtime.rs service assembly but keeps the Recorder handle so
-//! the test can drain and assert zero loss. Prod SessionConfig defaults are
-//! kept deliberately (6s / 1s cadence): this verifies the shipped cadence,
-//! not a test-only one.
+//! the test can drain and assert zero loss. The session cadence follows the
+//! e2e config, which defaults to the shipped 6s/1s cadence and only shortens
+//! it when RUSHLS_TEST_RECORD_E2E_SEGMENT_SECS says so.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -113,8 +113,10 @@ pub struct DrainedArchive {
 
 impl TestRig {
     /// Build Services exactly like Node::new does, but keep the Recorder
-    /// handle so the test can drain and assert zero loss afterwards.
-    pub fn start(archive: &Path, pattern: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    /// handle so the test can drain and assert zero loss afterwards. The
+    /// session cadence comes from the e2e config: prod 6s/1s unless the
+    /// segment-target override shortens it for rapid churn.
+    pub fn start(archive: &Path, pattern: &str, cfg: &E2eConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let log = Arc::new(Log::default());
         let events = Events::new(log.clone());
         let meters = ProcessMeters::default();
@@ -133,9 +135,11 @@ impl TestRig {
             meters: meters.clone(),
             events,
         };
-        // Prod defaults: 6s segments, 1s parts, permissive input. The burst comes
-        // from the input being fully buffered, not from a special ceiling.
-        let session_cfg = SessionConfig::default();
+        // Permissive input throughout; the burst comes from the input being
+        // fully buffered, not from a special ceiling. Only the segment
+        // cadence follows the e2e config.
+        let session_cfg = SessionConfig { segmentation: cfg.segmentation_policy(), ..SessionConfig::default() };
+        eprintln!("record e2e: session cadence {}s segments", cfg.segment_secs);
         Ok(Self { archive: archive.to_path_buf(), services, recorder, log, meters, session_cfg })
     }
 
@@ -171,7 +175,7 @@ pub async fn publish_and_record(
     ts_path: &Path,
 ) -> Result<RecordOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let bytes = std::fs::read(ts_path)?;
-    let rig = TestRig::start(work.archive(), "{rendition}_{segment}.mp4")?;
+    let rig = TestRig::start(work.archive(), "{rendition}_{segment}.mp4", cfg)?;
     let session = rig.run_burst(bytes).await?;
     if session != SessionOutcome::Ended {
         return Err(format!("burst session did not end cleanly: {session:?}").into());

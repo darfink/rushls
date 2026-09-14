@@ -23,8 +23,9 @@ pub fn missing_tools() -> Option<String> {
 
 /// Generate one MPEG-TS file with deterministic A+V and return its path.
 ///
-/// GOP is forced (no scene-cut IDRs) so every 6s segment boundary has a legal
-/// cut. ultrafast keeps a 10-minute 720p30 encode to roughly a minute on CI;
+/// GOP is forced (no scene-cut IDRs) so every segment boundary has a legal
+/// cut: the IDR interval in the config always divides the segment target.
+/// ultrafast keeps a 10-minute 720p30 encode to roughly a minute on CI;
 /// use 640x360 locally for an even faster loop.
 pub fn generate_mpegts(cfg: &E2eConfig, work: &WorkDir) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     generate_mpegts_named(cfg, work, "src.ts", cfg.duration_secs)

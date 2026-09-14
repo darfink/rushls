@@ -18,7 +18,7 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 pub async fn expect_rejected(bytes: Vec<u8>, label: &str) -> TestResult {
     let cfg = E2eConfig::from_env();
     let work = WorkDir::new(&cfg)?;
-    let rig = TestRig::start(work.archive(), "{rendition}_{segment}.mp4")?;
+    let rig = TestRig::start(work.archive(), "{rendition}_{segment}.mp4", &cfg)?;
     match rig.run_burst(bytes).await {
         Ok(outcome) => return Err(format!("{label}: expected rejection, got {outcome:?}").into()),
         Err(error) => eprintln!("record e2e malformed {label}: rejected as expected ({error:?})"),
