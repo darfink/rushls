@@ -28,6 +28,8 @@ mod tls;
 #[cfg(test)]
 pub mod fixtures;
 #[cfg(test)]
+mod telemetry_tests;
+#[cfg(test)]
 mod tests;
 
 use std::net::SocketAddr;
@@ -54,7 +56,7 @@ use crate::{
         Body as DeliveryBody, DeliveryError, DeliveryFailure, MediaBody,
         Response as DeliveryResponse, Reuse,
     },
-    observe::{Events, ProcessMeters},
+    observe::{Events, ProcessMeters, http::HttpFailure},
     server::http::playback::PlaybackDenial,
     server::metrics::MetricsEndpoint,
 };
@@ -112,6 +114,12 @@ impl HttpConfig {
 /// Owned by the transport that consumes it; implementations are composed in
 /// runtime so lower layers never name the HTTP server.
 pub trait Application: Send + Sync + 'static {
+    /// Attribute only recognized paths belonging to retained streams. Unknown
+    /// streams stay in node totals, preventing viewer-controlled cardinality.
+    fn http_meters(&self, _path: &str) -> Option<crate::observe::http::HttpMeters> {
+        None
+    }
+
     fn serve<'a>(
         &'a self,
         path: &'a str,
@@ -283,9 +291,17 @@ where
     L::Addr: std::fmt::Debug,
     P: Application,
 {
-    let router = router(application, &config, metrics, readiness, playback).layer(
-        axum::middleware::from_fn_with_state(budget.clone(), limits::admit),
-    );
+    let router = router(
+        Arc::clone(&application),
+        &config,
+        metrics,
+        readiness,
+        playback,
+    )
+    .layer(axum::middleware::from_fn_with_state(
+        (budget.clone(), application),
+        limits::admit_application::<P>,
+    ));
     limits::serve(listener, router, budget, shutdown).await
 }
 
@@ -878,6 +894,14 @@ fn error_response(failure: DeliveryFailure, shared: bool) -> Response {
         DeliveryError::Projection => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let mut response = (status, failure.error.to_string()).into_response();
+    response.extensions_mut().insert(match failure.error {
+        DeliveryError::UnknownStream => HttpFailure::UnknownStream,
+        DeliveryError::UnknownRendition => HttpFailure::UnknownRendition,
+        DeliveryError::UnknownResource => HttpFailure::UnknownResource,
+        DeliveryError::InvalidDirective(_) => HttpFailure::InvalidDirective,
+        DeliveryError::Unsatisfied => HttpFailure::Unsatisfied,
+        DeliveryError::Projection => HttpFailure::Projection,
+    });
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, reuse_header(failure.reuse, shared));
     if matches!(failure.error, DeliveryError::Unsatisfied) {

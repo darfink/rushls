@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::observe::http::{HttpMeters, HttpMethod, HttpObservation, HttpResource};
+use crate::observe::http::{HttpFailure, HttpMeters, HttpMethod, HttpObservation, HttpResource};
 use axum::{
     Router,
     body::Body,
@@ -105,13 +105,31 @@ fn resource(path: &str) -> HttpResource {
     }
 }
 
+pub async fn admit_application<P: super::Application>(
+    State((budget, application)): State<(HttpBudget, Arc<P>)>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if let Some(meters) = application.http_meters(request.uri().path()) {
+        request.extensions_mut().insert(meters);
+    }
+    admit(State(budget), request, next).await
+}
+
 pub async fn admit(State(budget): State<HttpBudget>, request: Request, next: Next) -> Response {
     let method = match request.method().as_str() {
         "GET" => HttpMethod::Get,
         "HEAD" => HttpMethod::Head,
         _ => HttpMethod::Other,
     };
-    let mut observation = budget.meters.start(resource(request.uri().path()), method);
+    let resource = resource(request.uri().path());
+    let mut observations = [
+        Some(budget.meters.start(resource, method)),
+        request
+            .extensions()
+            .get::<HttpMeters>()
+            .map(|meters| meters.start(resource, method)),
+    ];
     let permit = budget.requests.try_acquire_owned().ok();
     let response = if permit.is_some() {
         next.run(request).await
@@ -126,17 +144,37 @@ pub async fn admit(State(budget): State<HttpBudget>, request: Request, next: Nex
         )
             .into_response()
     };
-    observation.response(response.status().as_u16());
+    let reason = response
+        .extensions()
+        .get::<HttpFailure>()
+        .copied()
+        .or_else(|| match response.status() {
+            StatusCode::UNAUTHORIZED => Some(HttpFailure::Unauthorized),
+            StatusCode::FORBIDDEN => Some(HttpFailure::Forbidden),
+            StatusCode::SERVICE_UNAVAILABLE if permit.is_none() => Some(HttpFailure::Admission),
+            status if status.is_client_error() || status.is_server_error() => {
+                Some(HttpFailure::Other)
+            }
+            _ => None,
+        });
+    for observation in observations.iter_mut().flatten() {
+        observation.response(response.status().as_u16());
+        if let Some(reason) = reason {
+            observation.failure(reason);
+        }
+    }
     // Handler completion is not transfer completion. Keep the slot through
     // body consumption, including backpressure from a slow socket or H2 peer.
     response.map(|body| {
         if body.is_end_stream() {
-            observation.finish("completed");
+            for observation in observations.iter_mut().flatten() {
+                observation.finish("completed");
+            }
         }
         Body::new(AdmittedBody {
             body,
             _permit: permit,
-            observation,
+            observations,
         })
     })
 }
@@ -144,7 +182,7 @@ pub async fn admit(State(budget): State<HttpBudget>, request: Request, next: Nex
 struct AdmittedBody {
     body: Body,
     _permit: Option<OwnedSemaphorePermit>,
-    observation: HttpObservation,
+    observations: [Option<HttpObservation>; 2],
 }
 
 impl HttpBody for AdmittedBody {
@@ -159,14 +197,26 @@ impl HttpBody for AdmittedBody {
         match &result {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(bytes) = frame.data_ref() {
-                    self.observation.bytes(bytes.len());
+                    for observation in self.observations.iter().flatten() {
+                        observation.bytes(bytes.len());
+                    }
                 }
                 if self.body.is_end_stream() {
-                    self.observation.finish("completed");
+                    for observation in self.observations.iter_mut().flatten() {
+                        observation.finish("completed");
+                    }
                 }
             }
-            Poll::Ready(None) => self.observation.finish("completed"),
-            Poll::Ready(Some(Err(_))) => self.observation.finish("error"),
+            Poll::Ready(None) => {
+                for observation in self.observations.iter_mut().flatten() {
+                    observation.finish("completed");
+                }
+            }
+            Poll::Ready(Some(Err(_))) => {
+                for observation in self.observations.iter_mut().flatten() {
+                    observation.finish("error");
+                }
+            }
             Poll::Pending => {}
         }
         result

@@ -127,6 +127,9 @@ pub struct LiveStream {
     announced: AtomicBool,
     telemetry: Mutex<PublicationTelemetry>,
     operations: crate::observe::OperationMeters,
+    /// Lives only as long as this retained stream; arbitrary viewer paths
+    /// cannot allocate an entry in a process-wide stream-label registry.
+    http: crate::observe::http::HttpMeters,
 }
 
 #[derive(Debug)]
@@ -218,7 +221,12 @@ impl LiveStream {
             announced: AtomicBool::new(false),
             telemetry: Mutex::new(PublicationTelemetry::default()),
             operations: crate::observe::OperationMeters::default(),
+            http: crate::observe::http::HttpMeters::default(),
         }
+    }
+
+    pub fn http_meters(&self) -> crate::observe::http::HttpMeters {
+        self.http.clone()
     }
 
     /// This stream instance’s retained media and regenerable manifest budget.

@@ -53,6 +53,32 @@ async fn response_body_holds_capacity_during_overload_and_releases_on_drop()
 }
 
 #[tokio::test]
+async fn stream_http_admission_refusal_keeps_status_and_reason() -> Result<(), Box<dyn Error>> {
+    let budget = budget();
+    let scoped = HttpMeters::default();
+    let router = limited(Router::new().route("/", get(|| async { "media" })), &budget);
+    let held = router.clone().oneshot(request()).await?;
+    let mut refused = request();
+    refused.extensions_mut().insert(scoped.clone());
+    let response = router.oneshot(refused).await?;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let snapshot = scoped.snapshot();
+    assert_eq!(
+        snapshot.responses[&(HttpResource::Other, HttpMethod::Get, 503)],
+        1
+    );
+    assert_eq!(
+        snapshot.failures[&(HttpResource::Other, HttpFailure::Admission)],
+        1
+    );
+    assert_eq!(snapshot.classes[HttpResource::Other as usize].completed, 1);
+    assert_eq!(snapshot.classes[HttpResource::Other as usize].in_flight, 0);
+    assert_eq!(budget.meters.snapshot().requests_rejected, 1);
+    drop(held);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelled_blocking_request_releases_capacity() -> Result<(), Box<dyn Error>> {
     let budget = budget();
     let started = Arc::new(Notify::new());
@@ -216,14 +242,20 @@ async fn http2_multiplexing_obeys_the_request_budget() -> Result<(), Box<dyn Err
 #[tokio::test]
 async fn body_metrics_count_only_consumed_frames_and_cancellation() -> Result<(), Box<dyn Error>> {
     let budget = budget();
+    let scoped = HttpMeters::default();
+    let scoped_request = || {
+        let mut request = request();
+        request.extensions_mut().insert(scoped.clone());
+        request
+    };
     let router = limited(Router::new().route("/", get(|| async { "media" })), &budget);
-    let response = router.clone().oneshot(request()).await?;
+    let response = router.clone().oneshot(scoped_request()).await?;
     assert_eq!(
         budget.meters.snapshot().classes[HttpResource::Other as usize].body_bytes,
         0
     );
     drop(response);
-    let response = router.oneshot(request()).await?;
+    let response = router.oneshot(scoped_request()).await?;
     assert_eq!(response.into_body().collect().await?.to_bytes(), "media");
     let snapshot = budget.meters.snapshot();
     let class = &snapshot.classes[HttpResource::Other as usize];
@@ -235,6 +267,13 @@ async fn body_metrics_count_only_consumed_frames_and_cancellation() -> Result<()
         snapshot.responses[&(HttpResource::Other, HttpMethod::Get, 200)],
         2
     );
+    let stream = scoped.snapshot();
+    let stream_class = &stream.classes[HttpResource::Other as usize];
+    assert_eq!(stream_class.body_bytes, class.body_bytes);
+    assert_eq!(stream_class.cancelled, 1);
+    assert_eq!(stream_class.completed, 1);
+    assert_eq!(stream_class.in_flight, 0);
+    assert_eq!(stream_class.body_duration.count, 2);
     Ok(())
 }
 

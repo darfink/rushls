@@ -276,6 +276,14 @@ impl ViewerApplication {
 }
 
 impl Application for ViewerApplication {
+    fn http_meters(&self, path: &str) -> Option<crate::observe::http::HttpMeters> {
+        let stream = match parse_media_path(path) {
+            Ok(Some(named)) => named.stream,
+            _ => crate::delivery::hls::uri::parse_path(path).ok()?.stream,
+        };
+        self.origin.stream(&stream).map(|live| live.http_meters())
+    }
+
     async fn serve<'a>(
         &'a self,
         path: &'a str,

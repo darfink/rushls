@@ -314,7 +314,6 @@ pub fn kind_name(kind: crate::domain::MediaKind) -> &'static str {
 }
 
 pub fn http(output: &mut Samples, snapshot: &crate::observe::http::HttpSnapshot) {
-    use crate::observe::http::HttpResource;
     output.gauge(
         "rushls_http_connections",
         "Admitted HTTP connections currently open.",
@@ -345,23 +344,49 @@ pub fn http(output: &mut Samples, snapshot: &crate::observe::http::HttpSnapshot)
         "scope=\"connection\"",
         snapshot.connections_rejected,
     );
+    http_requests(output, snapshot, None);
+}
+
+/// Stream families are exported only on /metrics/streams. Retained stream
+/// ownership bounds their lifetime; unused resource classes add no series.
+pub fn http_requests(
+    output: &mut Samples,
+    snapshot: &crate::observe::http::HttpSnapshot,
+    stream: Option<&StreamId>,
+) {
+    use crate::observe::http::HttpResource;
+    macro_rules! metric {
+        ($suffix:literal) => {
+            if stream.is_some() {
+                concat!("rushls_stream_http_", $suffix)
+            } else {
+                concat!("rushls_http_", $suffix)
+            }
+        };
+    }
+    let prefix = stream.map_or_else(String::new, |id| {
+        format!("stream=\"{}\",", escape_label(id.as_str()))
+    });
     for resource in HttpResource::ALL {
         let class = &snapshot.classes[resource as usize];
-        let labels = format!("resource=\"{}\"", resource.name());
+        if stream.is_some() && class.started == 0 {
+            continue;
+        }
+        let labels = format!("{prefix}resource=\"{}\"", resource.name());
         output.counter(
-            "rushls_http_requests_started_total",
+            metric!("requests_started_total"),
             "HTTP requests entering admission, including refusals.",
             &labels,
             class.started,
         );
         output.gauge(
-            "rushls_http_requests_in_flight",
+            metric!("requests_in_flight"),
             "HTTP request handlers and bodies not yet finished.",
             &labels,
             class.in_flight,
         );
         output.counter(
-            "rushls_http_body_bytes_total",
+            metric!("body_bytes_total"),
             "Encoded and ranged response body bytes yielded to HTTP, not acknowledged by viewers.",
             &labels,
             class.body_bytes,
@@ -372,20 +397,20 @@ pub fn http(output: &mut Samples, snapshot: &crate::observe::http::HttpSnapshot)
             ("error", class.errors),
         ] {
             output.counter(
-                "rushls_http_requests_finished_total",
+                metric!("requests_finished_total"),
                 "Request and body lifetime outcomes.",
                 &format!("{labels},outcome=\"{outcome}\""),
                 count,
             );
         }
         output.histogram(
-            "rushls_http_handler_duration_seconds",
+            metric!("handler_duration_seconds"),
             "HTTP handler wall duration, including protocol waits.",
             &labels,
             &class.handler_duration,
         );
         output.histogram(
-            "rushls_http_body_duration_seconds",
+            metric!("body_duration_seconds"),
             "Response body lifetime until completion, error, or cancellation.",
             &labels,
             &class.body_duration,
@@ -393,13 +418,21 @@ pub fn http(output: &mut Samples, snapshot: &crate::observe::http::HttpSnapshot)
     }
     for ((resource, method, status), count) in &snapshot.responses {
         output.counter(
-            "rushls_http_responses_total",
+            metric!("responses_total"),
             "HTTP response headers produced, before body transfer.",
             &format!(
-                "resource=\"{}\",method=\"{}\",status=\"{status}\"",
+                "{prefix}resource=\"{}\",method=\"{}\",status=\"{status}\"",
                 resource.name(),
                 method.name()
             ),
+            count,
+        );
+    }
+    for ((resource, reason), count) in &snapshot.failures {
+        output.counter(
+            metric!("failures_total"),
+            "HTTP error responses by bounded cause; unknown_resource does not distinguish expired from nonexistent media.",
+            &format!("{prefix}resource=\"{}\",reason=\"{}\"", resource.name(), reason.name()),
             count,
         );
     }

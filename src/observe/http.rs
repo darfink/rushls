@@ -28,6 +28,38 @@ pub enum HttpMethod {
     Head,
     Other,
 }
+
+/// Bounded failure labels. Request paths, query strings and error text must
+/// never become labels: viewer input cannot create metric series.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum HttpFailure {
+    UnknownStream,
+    UnknownRendition,
+    UnknownResource,
+    InvalidDirective,
+    Unsatisfied,
+    Projection,
+    Unauthorized,
+    Forbidden,
+    Admission,
+    Other,
+}
+impl HttpFailure {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::UnknownStream => "unknown_stream",
+            Self::UnknownRendition => "unknown_rendition",
+            Self::UnknownResource => "unknown_resource",
+            Self::InvalidDirective => "invalid_directive",
+            Self::Unsatisfied => "unsatisfied",
+            Self::Projection => "projection",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::Admission => "admission",
+            Self::Other => "other",
+        }
+    }
+}
 impl HttpMethod {
     pub const fn name(self) -> &'static str {
         match self {
@@ -53,6 +85,7 @@ pub struct HttpSnapshot {
     pub classes: [HttpClassSnapshot; 4],
     /// Only enum keys and valid HTTP status codes enter this bounded map.
     pub responses: BTreeMap<(HttpResource, HttpMethod, u16), u64>,
+    pub failures: BTreeMap<(HttpResource, HttpFailure), u64>,
     pub requests_rejected: u64,
     pub connections_rejected: u64,
     pub connections: usize,
@@ -89,6 +122,15 @@ pub struct HttpObservation {
     finished: bool,
 }
 impl HttpObservation {
+    pub fn failure(&self, reason: HttpFailure) {
+        *self
+            .meters
+            .0
+            .lock()
+            .failures
+            .entry((self.resource, reason))
+            .or_default() += 1;
+    }
     pub fn response(&mut self, status: u16) {
         let mut state = self.meters.0.lock();
         *state

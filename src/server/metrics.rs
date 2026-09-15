@@ -114,6 +114,7 @@ impl MetricsEndpoint {
         streams.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         for (id, live) in streams {
             publication::stream(&mut samples, &id, &live, &live.publication_snapshot());
+            publication::http_requests(&mut samples, &live.http_meters().snapshot(), Some(&id));
         }
         output.push_str(&samples.finish());
         output

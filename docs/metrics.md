@@ -113,7 +113,7 @@ A zero skew does not establish progress: all renditions can stop together.
 Node histograms `rushls_output_publish_interval_seconds` and `rushls_output_publish_spread_seconds` preserve timing distributions without stream labels.
 Spread observations include both alternative groups and playable combinations. They are comparison observations, not unique media objects.
 Histograms use classic Prometheus buckets with `+Inf`, `_sum`, and `_count`.
-No stream or rendition histogram multiplies detailed scrape cardinality.
+Publication timing histograms stay node-wide; HTTP timing histograms are also available per retained stream.
 
 ## Input, operations, and HTTP
 
@@ -165,6 +165,43 @@ Paths, tokens, viewers, and arbitrary header values never become labels.
 | `rushls_http_connections` | Admitted HTTP connections currently open |
 | `rushls_http_connection_capacity` | Configured connection budget |
 | `rushls_http_request_capacity` | Configured request budget |
+
+Stream HTTP metrics are exposed only at `/metrics/streams` with the prefix `rushls_stream_http_`.
+They cover requests started, requests in flight, responses, failures, body bytes, request outcomes, and both duration histograms.
+Each family adds a `stream` label to the corresponding node metric labels.
+Only recognized playlist/media paths for an existing retained stream receive this label.
+Unknown streams remain in node totals; arbitrary request paths do not create stream entries.
+Counters survive compatible publisher reconnects while the stream is retained and disappear when the stream is retired.
+A later publication under the same name starts new counters; use `rate` or `increase` to handle resets.
+
+`rushls_http_failures_total` and `rushls_stream_http_failures_total` add a bounded `reason` label:
+`unknown_stream`, `unknown_rendition`, `unknown_resource`, `invalid_directive`, `unsatisfied`,
+`projection`, `unauthorized`, `forbidden`, `admission`, or `other`.
+A completed HTTP body can still carry a 404 or 503; use response status and failure reason alongside body outcomes.
+`unknown_resource` does not distinguish an expired object from an object that never existed.
+These metrics do not include request URLs, tokens, media sequence numbers, or viewer identities.
+Connection refusals occur before a request identifies a stream and remain node-wide.
+
+For a stall affecting one stream, first compare output progress with HTTP failures:
+
+```promql
+sum by (resource, status) (
+  increase(rushls_stream_http_responses_total{stream="live/STREAM_ID"}[5m])
+)
+sum by (resource, reason) (
+  increase(rushls_stream_http_failures_total{stream="live/STREAM_ID"}[5m])
+)
+histogram_quantile(0.95,
+  sum by (le, resource) (
+    rate(rushls_stream_http_body_duration_seconds_bucket{stream="live/STREAM_ID"}[5m])
+  )
+)
+```
+
+Handler time includes intentional blocking reload waits. A high value alone does not establish an incident.
+Compare body duration and cancellation with the stream's output lag and overdue metrics.
+HTTP histograms add 17 series each per observed resource class (14 finite buckets, `+Inf`, sum, and count).
+Unused resource classes are omitted from stream exports. Choose a scrape interval shorter than stream retention to capture final counters.
 
 HTTP body completion does not prove viewer receipt or playback.
 A client can disconnect after the server hands bytes to its HTTP stack.
