@@ -2169,3 +2169,43 @@ fn http_capacity_is_configurable_and_must_be_positive() -> Result<(), Box<dyn Er
     }
     Ok(())
 }
+
+#[test]
+fn cors_exposed_headers_resolve_from_file_env_and_cli() -> Result<(), Box<dyn Error>> {
+    let file = r#"[http.cors]
+expose_headers = "X-Request-Id, Date"
+"#;
+    let config = resolve_toml(file)??;
+    assert_eq!(
+        config.node.http.cors.expose_headers,
+        ["x-request-id", "date"]
+    );
+    let env = [("RUSHLS_HTTP_CORS_EXPOSE_HEADERS", "x-trace-id")];
+    let config = resolve_with(file, &[], &env)??;
+    assert_eq!(config.node.http.cors.expose_headers, ["x-trace-id"]);
+    let config = resolve_with(file, &["--http-cors-expose-headers", "x-debug-id"], &env)??;
+    assert_eq!(config.node.http.cors.expose_headers, ["x-debug-id"]);
+    let config = resolve_with_env(&[("RUSHLS_HTTP_CORS_EXPOSE_HEADERS", "")])??;
+    assert!(config.node.http.cors.expose_headers.is_empty());
+    let config = resolve_with_env(&[])??;
+    assert_eq!(
+        config.node.http.cors.expose_headers,
+        ["content-length", "content-range", "date"]
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_cors_exposed_headers_stop_startup() -> Result<(), Box<dyn Error>> {
+    for value in [
+        "bad name",
+        "x-header: value",
+        "date,",
+        "*",
+        "x-id\r\nx-injected",
+    ] {
+        let result = resolve_with_env(&[("RUSHLS_HTTP_CORS_EXPOSE_HEADERS", value)])?;
+        assert!(matches!(result, Err(ConfigError::Invalid(_))), "{value:?}");
+    }
+    Ok(())
+}

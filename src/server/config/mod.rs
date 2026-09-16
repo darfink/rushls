@@ -2306,6 +2306,15 @@ pub struct CorsAppConfig {
         default_help_str = "*"
     )]
     origins: OriginsValue,
+    /// Comma-separated response header names visible to cross-origin players.
+    /// Replaces the default list; an empty string exposes only browser-safelisted headers.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "content-length,content-range,date"
+    )]
+    expose_headers: String,
     /// Permit cookies or browser authorization on cross-origin requests.
     #[conf(parameter, long, env, default_value = "false")]
     allow_credentials: bool,
@@ -2325,6 +2334,20 @@ impl CorsAppConfig {
     fn resolve(&self) -> Result<CorsConfig, ConfigError> {
         Ok(CorsConfig {
             allowed_origins: self.origins.resolve()?,
+            expose_headers: if self.expose_headers.trim().is_empty() {
+                Vec::new()
+            } else {
+                self.expose_headers
+                    .split(',')
+                    .map(|name| {
+                        name.trim().parse().map_err(|_| {
+                            invalid(format!(
+                                "http.cors.expose_headers contains an invalid header name: {name:?}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            },
             allow_credentials: self.allow_credentials,
             max_age: self.max_age,
         })

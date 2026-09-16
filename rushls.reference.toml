@@ -55,6 +55,8 @@ origins           = ["https://player.example.com"]
 # origins        = "off"                        # no CORS headers, same-origin players only
 allow_credentials = false                # true requires an explicit origins list, never "*"
 max_age           = "10min"
+# Replaces the full exposure list. Use an empty string for browser-safelisted headers only.
+expose_headers    = "content-length,content-range,date"
 
 # HTTPS listener, independent of the cleartext one above. Comment out the whole
 # table to serve cleartext only, which is usual behind a proxy that ends TLS.

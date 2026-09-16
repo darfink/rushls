@@ -41,13 +41,6 @@ pub use pattern::{OriginPattern, OriginPatternError, WildcardDepth};
 
 use pattern::RequestOrigin;
 
-/// Headers a player needs to read to run its buffer accounting.
-///
-/// Not configurable because the list follows from what the origin serves: a
-/// player that cannot see `Content-Length` or `Content-Range` cannot tell a
-/// truncated transfer from a short resource.
-const EXPOSED: [HeaderName; 3] = [header::CONTENT_LENGTH, header::CONTENT_RANGE, header::DATE];
-
 /// Everything this origin answers, preflight included.
 ///
 /// Spelled as text because its other use is the `Allow` header on a 405, which
@@ -74,6 +67,9 @@ pub enum AllowedOrigins {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CorsConfig {
     pub allowed_origins: AllowedOrigins,
+    /// Response headers visible to cross-origin players. An empty list exposes none
+    /// beyond the browser safelist.
+    pub expose_headers: Vec<HeaderName>,
     /// Lets a player send cookies or an `Authorization` header.
     ///
     /// Requires an allowlist: see [`CorsConfig::validate`].
@@ -86,6 +82,7 @@ impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             allowed_origins: AllowedOrigins::Any,
+            expose_headers: vec![header::CONTENT_LENGTH, header::CONTENT_RANGE, header::DATE],
             allow_credentials: false,
             // Ten minutes: Chrome's ceiling is two hours, but a shorter window
             // keeps a policy change from lingering in browsers for a whole
@@ -103,6 +100,11 @@ impl CorsConfig {
     /// headers look present, and every credentialed fetch fails inside the
     /// browser.
     pub fn validate(&self) -> Result<(), &'static str> {
+        // Require explicit names so credentialed and anonymous requests share
+        // the same exposure semantics.
+        if self.expose_headers.iter().any(|name| name.as_str() == "*") {
+            return Err("CORS expose_headers requires explicit header names, not a wildcard");
+        }
         match (&self.allowed_origins, self.allow_credentials) {
             (AllowedOrigins::Any, true) => Err(
                 "credentialed CORS requires an explicit origin allowlist, because a browser \
@@ -154,7 +156,7 @@ pub fn layer(config: &CorsConfig) -> Option<CorsLayer> {
             // requirements of its own, and a player asking for `Range` should
             // not be refused because a fixed list did not anticipate it.
             .allow_headers(AllowHeaders::mirror_request())
-            .expose_headers(EXPOSED)
+            .expose_headers(config.expose_headers.clone())
             .allow_credentials(config.allow_credentials)
             .max_age(config.max_age)
             .vary(vary),
@@ -235,11 +237,32 @@ mod tests {
         let headers = get(&CorsConfig::default(), Some("https://player.example")).await;
 
         assert_eq!(header(&headers, "access-control-allow-origin"), Some("*"));
+        assert_eq!(
+            header(&headers, "access-control-expose-headers"),
+            Some("content-length,content-range,date")
+        );
         // A constant answer is the same for every caller, so there is nothing
         // for a cache to key on. Varying anyway would store one copy of every
         // segment per site that embeds a player, which is the default
         // configuration's busiest path.
         assert_eq!(header(&headers, "vary"), None);
+    }
+
+    #[tokio::test]
+    async fn configured_exposure_replaces_defaults_and_can_be_empty() {
+        let mut config = CorsConfig {
+            expose_headers: vec![HeaderName::from_static("x-request-id")],
+            allow_credentials: true,
+            ..allowlist()
+        };
+        let headers = get(&config, Some("https://player.example")).await;
+        assert_eq!(
+            header(&headers, "access-control-expose-headers"),
+            Some("x-request-id")
+        );
+        config.expose_headers.clear();
+        let headers = get(&config, Some("https://player.example")).await;
+        assert_eq!(header(&headers, "access-control-expose-headers"), None);
     }
 
     #[tokio::test]

@@ -1191,3 +1191,18 @@ the playlist type rather than as a second retention window.
 Structural, and honestly not designed for: **transcoding**. A rendition ladder
 needs named variants and per-variant constraints, which is a new top-level
 concept rather than a field.
+
+## CORS response headers
+
+`http.cors.expose_headers` sets the response headers that cross-origin players can read.
+It accepts comma-separated header names and defaults to `content-length,content-range,date`.
+An explicit value replaces that list. An empty string leaves only browser-safelisted headers readable.
+Invalid names and `*` stop startup. This keeps exposure explicit for credentialed requests.
+The setting has no effect when CORS is off.
+
+Use `RUSHLS_HTTP_CORS_EXPOSE_HEADERS` or `--http-cors-expose-headers` to override the file.
+For example, `--http-cors-expose-headers content-length,content-range,date,x-request-id` exposes an additional response header.
+This setting exposes names; it does not create those response headers.
+
+Keep CDN-specific exposure in the CDN response-header policy when the CDN owns those headers.
+Preserve the origin exposure list when you add CDN header names.
