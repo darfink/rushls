@@ -313,12 +313,8 @@ fn av1_without_declared_timing_uses_observed_steps_and_rejects_frozen_timestamps
     let error = frozen
         .normalizer
         .push(packet(0, Some(0), Some(0), None), &mut Vec::new())
-        .expect_err("no timing evidence");
-    assert!(
-        error
-            .to_string()
-            .contains("from access-unit timestamps or codec timing")
-    );
+        .expect_err("frozen DTS must fail before duration inference");
+    assert!(error.to_string().contains("video DTS must increase"));
     Ok(())
 }
 
@@ -685,4 +681,127 @@ fn finish_is_idempotent_after_releasing_a_held_video_packet() {
         .expect("second finish is harmless");
 
     assert_eq!(output.len(), 1);
+}
+
+#[test]
+fn audio_backward_timestamps_respect_the_sample_clock_tolerance() -> Result<(), NormalizeError> {
+    // A 48 kHz source clock gives an exact one-sample rounding tolerance.
+    for field in ["PTS", "DTS"] {
+        for lag in [1, 2, 1_025] {
+            let audio = TrackBuilder::new(0, MediaKind::Audio)
+                .timebase(Timebase::new(nz::u32!(1), nz::u32!(48_000)))
+                .build();
+            let (mut started, _, _) = start(vec![audio]);
+            let mut output = Vec::new();
+            started
+                .normalizer
+                .push(packet(0, Some(0), Some(0), Some(1_024)), &mut output)?;
+            let supplied = 1_024 - lag;
+            let (pts, dts) = if field == "PTS" {
+                (supplied, 1_024)
+            } else {
+                (1_024, supplied)
+            };
+            let result = started
+                .normalizer
+                .push(packet(0, Some(pts), Some(dts), Some(1_024)), &mut output);
+            if lag == 1 {
+                result?;
+                assert_eq!(output[1].pts(), 1_024);
+            } else {
+                let error = result.expect_err("backward timestamps outside tolerance must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("audio {field} discontinuity"))
+                );
+                assert_eq!(output.len(), 1, "invalid audio must not be emitted");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn video_rejects_backward_and_duplicate_dts_before_holding_the_packet() -> Result<(), NormalizeError>
+{
+    for video_delay in [0, 2] {
+        for invalid_dts in [-40, 0] {
+            for flush in [false, true] {
+                let (mut started, _, _) = start(vec![millisecond_video(25, video_delay)]);
+                let mut output = Vec::new();
+                started
+                    .normalizer
+                    .push(packet(0, Some(0), Some(0), Some(40)), &mut output)?;
+                let error = started
+                    .normalizer
+                    .push(
+                        packet(0, Some(40), Some(invalid_dts), Some(40)),
+                        &mut output,
+                    )
+                    .expect_err("invalid DTS must fail before duration fallback or buffering");
+                assert!(error.to_string().contains("video DTS must increase"));
+                if flush {
+                    started.normalizer.finish(&mut output)?;
+                } else {
+                    started
+                        .normalizer
+                        .push(packet(0, Some(80), Some(80), Some(40)), &mut output)?;
+                }
+                assert!(
+                    output.iter().all(|sample| sample.pts() == 0),
+                    "invalid packet must never be emitted"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn non_reordered_video_rejects_backward_and_duplicate_pts() -> Result<(), NormalizeError> {
+    for explicit_dts in [false, true] {
+        for invalid_pts in [-40, 0] {
+            let (mut started, _, _) = start(vec![millisecond_video(25, 0)]);
+            let mut output = Vec::new();
+            started.normalizer.push(
+                packet(0, Some(0), explicit_dts.then_some(0), Some(40)),
+                &mut output,
+            )?;
+            let error = started
+                .normalizer
+                .push(
+                    packet(0, Some(invalid_pts), explicit_dts.then_some(40), Some(40)),
+                    &mut output,
+                )
+                .expect_err("non-reordered PTS must increase even with valid DTS");
+            assert!(error.to_string().contains("video PTS must increase"));
+            started.normalizer.finish(&mut output)?;
+            assert_eq!(video_timing(&output), [(0, 0, 3_600)]);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn reordered_video_accepts_backward_pts_with_increasing_explicit_dts() -> Result<(), NormalizeError>
+{
+    let (mut started, _, _) = start(vec![millisecond_video(25, 2)]);
+    let mut output = Vec::new();
+    for (pts, dts) in [(0, -80), (80, -40), (40, 0), (120, 40)] {
+        started
+            .normalizer
+            .push(packet(0, Some(pts), Some(dts), Some(40)), &mut output)?;
+    }
+    started.normalizer.finish(&mut output)?;
+    assert_eq!(
+        video_timing(&output),
+        [
+            (0, -7_200, 3_600),
+            (7_200, -3_600, 3_600),
+            (3_600, 0, 3_600),
+            (10_800, 3_600, 3_600)
+        ]
+    );
+    Ok(())
 }

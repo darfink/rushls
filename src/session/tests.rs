@@ -1710,3 +1710,58 @@ async fn concurrent_takeovers_resolve_to_exactly_one_survivor() {
     );
     assert_eq!(harness.store.leased(), 0);
 }
+
+#[tokio::test]
+async fn backward_video_timestamps_fail_before_the_offending_sample_is_published()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut harness = Harness::healthy();
+    // Exercise the production normalizer through the real session and store;
+    // the test muxer publishes one part for every sample it receives.
+    harness.services.normalizers = Arc::new(crate::media::PassThroughNormalizerFactory);
+    let pending = Box::new(FakePending {
+        log: harness.log.clone(),
+        resource: "camera",
+        batches: vec![
+            vec![
+                packet(0, true),
+                packet(SECOND, true),
+                packet(2 * SECOND, true),
+            ],
+            vec![packet(SECOND, false)],
+        ],
+        ending: Ending::Eof,
+        panics_after: None,
+    });
+    let error = run_session(
+        pending,
+        &harness.services,
+        &config(),
+        PendingPermit::unlimited(),
+    )
+    .await
+    .expect_err("backward input must fail the live session");
+    assert!(matches!(
+        error,
+        SessionError::Supervision(SupervisionError::Execution(ExecutionError::Media(
+            crate::media::MediaError::Normalize(_)
+        )))
+    ));
+    assert!(error.to_string().contains("video DTS must increase"));
+    let totals = harness.meters.snapshot();
+    assert_eq!(totals.sessions_failed, 1);
+    assert_eq!(
+        totals.parts_published, 2,
+        "only valid pre-roll samples reach the publisher"
+    );
+    assert_eq!(harness.recorder.names().last(), Some(&"failed"));
+    assert!(
+        harness.finish_reasons().is_empty(),
+        "failure must not flush invalid media"
+    );
+    assert_eq!(harness.store.leased(), 0);
+    assert!(
+        !harness.live().is_ended(),
+        "previous media remains available for reconnect"
+    );
+    Ok(())
+}

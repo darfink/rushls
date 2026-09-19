@@ -105,6 +105,30 @@ impl VideoNormalizer {
                 self.track_id
             )));
         }
+        // Validate in the source clock before deriving a duration: fallback
+        // cadence must not conceal a duplicate/backward timestamp. Keep the
+        // valid held packet intact so a later flush cannot emit the bad one.
+        if let Some(previous) = &self.held {
+            if let (Some(previous), Some(current)) = (previous.dts, packet.dts)
+                && current <= previous
+            {
+                return Err(processing(format!(
+                    "{} video DTS must increase: previous {previous}, got {current}",
+                    self.track_id
+                )));
+            }
+            // PTS may go backwards only when presentation order differs from
+            // decode order. In that case DTS remains the ordering authority.
+            if self.video_delay == 0
+                && let (Some(previous), Some(current)) = (previous.pts, packet.pts)
+                && current <= previous
+            {
+                return Err(processing(format!(
+                    "{} video PTS must increase without reordering: previous {previous}, got {current}",
+                    self.track_id
+                )));
+            }
+        }
         if let Some(previous) = self.held.take() {
             let duration = self.resolve_duration(&previous, Some(&packet))?;
             self.accept_timed(previous, duration, out)?;
