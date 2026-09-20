@@ -338,6 +338,53 @@ impl RenditionState {
                 .is_some_and(|count| *count > 0)
     }
 
+    /// Capture durable identifiers under the write lock, before a takeover can
+    /// replace the active rendition. This copies metadata, never media bytes.
+    pub fn ready_segment(
+        &self,
+        stream: &crate::domain::StreamId,
+    ) -> Option<crate::observe::lifecycle::ReadySegment> {
+        use crate::delivery::uri::{MediaResource, PercentEncoded, append_media_leaf};
+        let id = self.visible_segments.back()?;
+        let segment = &self.segment_resources.get(id)?.segment;
+        let StoredSegmentKind::Media(body) = &segment.kind else {
+            return None;
+        };
+        let format = self.descriptor.config.segment_format;
+        let path = |resource| {
+            let mut leaf = String::new();
+            append_media_leaf(&mut leaf, resource)?;
+            Some(format!(
+                "/{}/{}/{}",
+                PercentEncoded(&stream.0),
+                self.rendition_id.0,
+                leaf
+            ))
+        };
+        Some(crate::observe::lifecycle::ReadySegment {
+            rendition_id: self.rendition_id.0,
+            segment_id: segment.id.0,
+            media_sequence: segment.msn.0,
+            publication: segment.publication,
+            path: path(MediaResource::Segment(
+                self.rendition_id,
+                segment.id,
+                format,
+            ))?,
+            initialization_path: path(MediaResource::Initialization(
+                self.rendition_id,
+                segment.initialization,
+                format,
+            )),
+            media_start: segment.media_start,
+            duration: segment.duration,
+            timebase: segment.timebase,
+            bytes: body.len(),
+            independent: segment.independent,
+            discontinuity: segment.discontinuity_before,
+        })
+    }
+
     fn snapshot(&self) -> RenditionSnapshot {
         let visible = |part: &Arc<StoredPart>| {
             self.part_resources

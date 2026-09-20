@@ -223,7 +223,7 @@ impl StreamLog {
             .lock()
             .iter()
             .filter_map(|(_, event)| {
-                matches!(event, StreamEvent::RetentionClipped { .. }).then_some(*event)
+                matches!(event, StreamEvent::RetentionClipped { .. }).then_some(event.clone())
             })
             .collect()
     }
@@ -2951,6 +2951,88 @@ fn malformed_explicit_gap_does_not_advance_the_playlist() -> Result<(), Box<dyn 
         let after = lease.live().rendition(RenditionId(0)).ok_or("rendition")?;
         assert_eq!(before.live_edge, after.live_edge);
         assert_eq!(before.segments, after.segments);
+    }
+    Ok(())
+}
+
+#[test]
+fn segment_ready_follows_commit_and_excludes_unavailable_media()
+-> Result<(), Box<dyn std::error::Error>> {
+    #[derive(Default)]
+    struct ReadyObserver {
+        live: parking_lot::Mutex<std::sync::Weak<LiveStream>>,
+        ready: parking_lot::Mutex<Vec<crate::observe::lifecycle::ReadySegment>>,
+    }
+    impl EventObserver for ReadyObserver {
+        fn observe(&self, _: SessionId, _: SessionEvent) {}
+        fn observe_stream(&self, _: StreamId, event: StreamEvent) {
+            if let StreamEvent::SegmentReady(ready) = event {
+                let live = self.live.lock().upgrade().expect("stream still exists");
+                // This read also proves observers run outside the store write lock.
+                let segment = live
+                    .segment(RenditionId(ready.rendition_id), SegmentId(ready.segment_id))
+                    .expect("resource already committed");
+                assert_eq!(segment.duration, ready.duration);
+                assert!(matches!(segment.kind, StoredSegmentKind::Media(_)));
+                self.ready.lock().push(ready);
+            }
+        }
+    }
+    for chunked in [true, false] {
+        let observer = Arc::new(ReadyObserver::default());
+        let store = store().with_events(Events::new(observer.clone()));
+        let name = StreamId::new("live/my camera");
+        let presentation = packaged_presentation(&[(7, chunked)]);
+        let first = store.lease(name.clone(), &presentation)?;
+        *observer.live.lock() = Arc::downgrade(first.live());
+        first.write(initialization(7, 1))?;
+        assert!(observer.ready.lock().is_empty());
+        if chunked {
+            first.write(chunk(7, 0, 0, 0, 1, 8))?;
+            assert!(observer.ready.lock().is_empty());
+            first.write(completion(7, 0, 0, 1))?;
+        } else {
+            first.write(direct(7, 0, 0, 1, 8))?;
+        }
+        assert!(
+            first.write(direct(7, 0, 0, 1, 8)).is_err(),
+            "duplicate rejected"
+        );
+        first.write(PackagedMedia::Gap(crate::mux::PackagedGap {
+            rendition_id: PackagingRenditionId(7),
+            packaging_segment_id: PackagingSegmentId(1),
+            media_start: 1,
+            duration: 1,
+            parts: if chunked { vec![1] } else { vec![] },
+        }))?;
+        assert_eq!(observer.ready.lock().len(), 1, "GAP is not ready media");
+        let second = store.lease(name, &presentation)?;
+        assert!(
+            !first.write(direct(7, 2, 2, 1, 8))?,
+            "revoked lease cannot emit"
+        );
+        second.write(initialization(7, 1))?;
+        if chunked {
+            second.write(chunk(7, 0, 0, 0, 1, 9))?;
+            second.write(completion(7, 0, 0, 1))?;
+        } else {
+            second.write(direct(7, 0, 0, 1, 9))?;
+        }
+        let ready = observer.ready.lock();
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].rendition_id, 0, "durable ID, not packaging ID");
+        assert_eq!(ready[0].bytes, 8);
+        assert_eq!(ready[0].path, "/live/my%20camera/0/segment/1.m4s");
+        assert!(
+            ready[0]
+                .initialization_path
+                .as_ref()
+                .is_some_and(|p| p.starts_with("/live/my%20camera/0/init/"))
+        );
+        assert_eq!(ready[1].segment_id, 3, "GAP consumed its durable ID");
+        assert_eq!(ready[1].media_sequence, 3);
+        assert_ne!(ready[0].publication, ready[1].publication);
+        assert!(ready[1].discontinuity);
     }
     Ok(())
 }

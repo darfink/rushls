@@ -59,6 +59,24 @@ impl Occurrence for Event {
 
     fn data(&self) -> serde_json::Value {
         match self {
+            Event::SegmentReady(event) => {
+                let segment = &event.segment;
+                serde_json::json!({
+                    "stream_id": event.stream.0.as_str(),
+                    "rendition_id": segment.rendition_id,
+                    "segment_id": segment.segment_id.to_string(),
+                    "media_sequence": segment.media_sequence.to_string(),
+                    "publication": segment.publication.to_string(),
+                    "path": segment.path,
+                    "initialization_path": segment.initialization_path,
+                    "media_start": segment.media_start.to_string(),
+                    "duration": segment.duration.to_string(),
+                    "timebase": {"numerator": segment.timebase.num().get(), "denominator": segment.timebase.den().get()},
+                    "bytes": segment.bytes.to_string(),
+                    "independent": segment.independent,
+                    "discontinuity": segment.discontinuity,
+                })
+            }
             Event::SessionDegraded(event) | Event::SessionRecovered(event) => serde_json::json!({
                 "stream_id": event.stream.0.as_str(), "session_id": session_id(event.session), "compensation": recovery_data(&event.status),
             }),
@@ -299,7 +317,7 @@ impl EventObserver for HookObserver {
     }
 
     fn observe_stream(&self, stream: StreamId, event: StreamEvent) {
-        if let Some(projected) = self.projector.project_stream(stream.clone(), event) {
+        if let Some(projected) = self.projector.project_stream(stream.clone(), event.clone()) {
             self.hooks.deliver(&projected);
         }
         self.inner.observe_stream(stream, event);

@@ -3,7 +3,7 @@
 # RFC: the Rushls configuration surface
 
 > **Status: implemented**, apart from the features named as not built below:
-> Payload-carrying hooks and `segment.ready`. Their keys are refused at startup
+> Payload-carrying hooks. Their keys are refused at startup
 > rather than silently accepted.
 >
 > **The goal was inverted on purpose.** This document does not describe how to
@@ -791,59 +791,66 @@ outcomes as unknown. Unsynced work does not survive a process crash.
 
 ## Hook delivery
 
-Lifecycle hooks use structured CloudEvents JSON. `segment.ready` and payload
-hooks are not implemented. The following two-mode design describes that future
-export feature:
+Hooks use structured CloudEvents JSON. Subscribe to `segment.ready` to receive
+`rushls.segment.ready.v1` after each completed media segment is committed to delivery.
+Each rendition emits its own events, including subtitle renditions.
+Initialization objects, partial segments, GAP entries, rejected writes, and superseded
+writes do not emit this event.
 
-In configuration you subscribe with the short name (`segment.ready`). On the wire
-the type is versioned (`rushls.segment.ready.v1`) so consumers can distinguish
-breaking changes. A subscription receives all versions of that event.
-
-**Structured** (`payload = false`, the default) — the whole event as JSON,
-including a `url` for the segment, fetchable while within `retain`.
-
-```http
-POST /rushls
-Content-Type: application/cloudevents+json
-
-{"specversion": "1.0", "id": "...", "source": "origin-1",
- "type": "rushls.segment.ready.v1", "subject": "live/camera",
- "time": "...", "data": {"rendition": "video-1080p", "segment": 412, ...}}
+```toml
+[hook.archive]
+url = "http://archive.example.internal/rushls"
+events = ["segment.ready"]
 ```
 
-**Binary** (`payload = true`) — context attributes become headers and the body
-is the segment itself.
+Example event data:
 
-```http
-POST /rushls
-Content-Type: video/mp4
-ce-specversion: 1.0
-ce-id: 01JAV9F2K3QX
-ce-source: origin-1
-ce-type: rushls.segment.ready.v1
-ce-subject: live/camera
-ce-time: 2026-09-03T10:14:22.481Z
-ce-rendition: video-1080p
-ce-segment: 412
-ce-duration: 6006
-ce-discontinuity: false
-
-<segment bytes, header prepended>
+```json
+{
+  "stream_id": "live/camera",
+  "rendition_id": 0,
+  "segment_id": "412",
+  "media_sequence": "412",
+  "publication": "1",
+  "path": "/live/camera/0/segment/412.m4s",
+  "initialization_path": "/live/camera/0/init/1.mp4",
+  "media_start": "222480000",
+  "duration": "540000",
+  "timebase": {"numerator": 1, "denominator": 90000},
+  "bytes": "1250000",
+  "independent": true,
+  "discontinuity": false
+}
 ```
 
-Four extension attributes, and no more: enough to name the file, order it, and
-rebuild a playlist. `ce-discontinuity` matters because moderate timestamp jumps
-become discontinuities rather than session failures, and an archive that loses
-that bit cannot reconstruct a correct timeline.
+Paths are relative to the origin's HTTP root. Use the externally reachable origin
+address and normal playback authorization to fetch them. Proxy prefixes must be
+added by the consumer. No credentials are included. `initialization_path` is null
+for formats without a separate initialization resource.
 
-Constraints the specification imposes, worth stating because they are
-surprising: attribute names are lowercase alphanumeric with no separators, an
-attribute may not be named `data`, there is no float type (hence duration in
-milliseconds), and `ce-datacontenttype` must be absent in binary mode because
-`Content-Type` carries it.
+`rendition_id` and `segment_id` identify retained delivery resources, not muxer-local
+identifiers. `media_sequence` identifies the HLS playlist position. `publication`
+identifies the publisher generation within this retained stream. A new stream after
+retirement or a process restart can reuse these identifiers.
 
-The two modes are not symmetric and should not pretend to be. Structured is the
-complete event; binary is the media plus enough identity to file it.
+`media_start` and `duration` are ticks in the supplied rational timebase.
+All 64-bit identifiers, tick values, and byte counts are decimal strings.
+`bytes` counts the uncompressed segment body, excluding initialization.
+`independent` reports the stored independence flag. `discontinuity` indicates a
+playlist discontinuity before this segment.
+
+This event reports live delivery availability, not successful recording or an
+independent decoding guarantee. It carries no session identity or media payload.
+Fetch the initialization separately when the format requires it.
+
+Hooks do not extend retention or pin media. A delayed notification can arrive
+after its resources expire. Delivery uses the existing bounded queues, retries,
+and failure reporting. Consumers must deduplicate retries by CloudEvent `id`.
+Use `[record]` for filesystem recording. Binary payload hooks remain unsupported.
+
+Segment events can produce substantial hook traffic. One rendition with six-second
+segments emits approximately 600 events per hour. Short segments around GAPs
+increase that rate. Subscribe only the destinations that need segment notifications.
 
 A hook destination takes the same `client_certificate`, `client_key`, and `ca`
 fields as `[auth.publish]`, with the same meaning and the same in-place

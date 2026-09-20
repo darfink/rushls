@@ -197,10 +197,10 @@ listen = "127.0.0.1:9090"
 # url    = "http://billing.example.internal/rushls"
 # events = ["session.ended"]
 
-# Not implemented: segment.ready and payload hooks are refused at startup.
-# Future design: fires once per completed segment, per rendition. Segment cadence: one stream
-# at segment.target = "6s" sends 600/hour.
+# Fires once per completed, fetchable segment in each rendition. No GAP events.
+# At segment.target = "6s", each rendition sends about 600/hour.
+# JSON metadata contains resource paths; retention is not extended.
 # [hook.archive]
 # url    = "http://archive.example.internal/rushls"
 # events = ["segment.ready"]
-# payload = true                         # attach the segment bytes; default sends its URL only
+# Binary payload hooks are not supported.

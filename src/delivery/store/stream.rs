@@ -833,6 +833,61 @@ impl LiveStream {
             &media,
             PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) | PackagedMedia::Gap(_)
         );
+        let dropped_for =
+            self.reclaim_for_write(&mut state, now, additional, additional_parts, adds_segment);
+
+        // Reserve headroom before publishing the new media. A concurrent
+        // render must not cache bytes that this write is about to displace.
+        self.memory
+            .set_media(state.retained_payload_bytes.saturating_add(additional));
+        let advertised_before = state.renditions[index].bitrate.snapshot().advertised();
+        let completes_media = matches!(
+            &media,
+            PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_)
+        );
+        let observation = PublicationTelemetry::interval(&media);
+        state.renditions[index].apply(publication, media, gzip, now, self.limits);
+        let ready = completes_media
+            .then(|| state.renditions[index].ready_segment(&self.id))
+            .flatten();
+        state.pending_observation = Some((rendition_id, observation));
+        state.renditions[index].forget_unreachable_initializations();
+        state.recalculate_retained_bytes();
+        let advertised_after = state.renditions[index].bitrate.snapshot().advertised();
+        let update = state.renditions[index].commit(false);
+        // Pruning can move Vec indices, so it belongs after the indexed write.
+        let retired_changed = state.prune_retired(now, self.limits, self.disk_capacity);
+        if retired_changed {
+            state.bump_media_catalog();
+        }
+        let anchors_changed = state.prune_publication_anchors();
+        let catalog =
+            if advertised_before == advertised_after && !anchors_changed && !retired_changed {
+                Catalog::Unchanged
+            } else {
+                state.bump_catalog();
+                Catalog::Republished
+            };
+        let clip = self.take_clip_event(&mut state, dropped_for);
+        self.commit(state, catalog, [update]);
+        self.emit_clip(clip);
+        if let Some(segment) = ready {
+            // Observers may immediately fetch the resource: never call them under the lock.
+            self.events
+                .stream(self.id.clone(), StreamEvent::SegmentReady(segment));
+        }
+        self.maybe_spill();
+        Ok(true)
+    }
+
+    fn reclaim_for_write(
+        &self,
+        state: &mut StreamState,
+        now: Instant,
+        additional: usize,
+        additional_parts: usize,
+        adds_segment: bool,
+    ) -> Option<RetentionClipReason> {
         // Make room rather than refuse. Every budget here bounds *retention*,
         // and the only honest way to hold a bound while media keeps arriving
         // is to drop the oldest media rather than the newest — which is what
@@ -872,11 +927,11 @@ impl LiveStream {
             }
         };
         let mut dropped_for = None;
-        if capacity_reason(&state).is_some() {
+        if capacity_reason(state).is_some() {
             let mut reclaimed = state.sweep_expired(now);
             // Expiry may satisfy a limit. Report only the limit that still
             // requires dropping media after that ordinary cleanup.
-            while let Some(reason) = capacity_reason(&state) {
+            while let Some(reason) = capacity_reason(state) {
                 if !state.shed_oldest() {
                     break;
                 }
@@ -887,37 +942,7 @@ impl LiveStream {
                 self.advance_media_revision();
             }
         }
-
-        // Reserve headroom before publishing the new media. A concurrent
-        // render must not cache bytes that this write is about to displace.
-        self.memory
-            .set_media(state.retained_payload_bytes.saturating_add(additional));
-        let advertised_before = state.renditions[index].bitrate.snapshot().advertised();
-        let observation = PublicationTelemetry::interval(&media);
-        state.renditions[index].apply(publication, media, gzip, now, self.limits);
-        state.pending_observation = Some((rendition_id, observation));
-        state.renditions[index].forget_unreachable_initializations();
-        state.recalculate_retained_bytes();
-        let advertised_after = state.renditions[index].bitrate.snapshot().advertised();
-        let update = state.renditions[index].commit(false);
-        // Pruning can move Vec indices, so it belongs after the indexed write.
-        let retired_changed = state.prune_retired(now, self.limits, self.disk_capacity);
-        if retired_changed {
-            state.bump_media_catalog();
-        }
-        let anchors_changed = state.prune_publication_anchors();
-        let catalog =
-            if advertised_before == advertised_after && !anchors_changed && !retired_changed {
-                Catalog::Unchanged
-            } else {
-                state.bump_catalog();
-                Catalog::Republished
-            };
-        let clip = self.take_clip_event(&mut state, dropped_for);
-        self.commit(state, catalog, [update]);
-        self.emit_clip(clip);
-        self.maybe_spill();
-        Ok(true)
+        dropped_for
     }
 
     pub fn end(&self, publication: u64) -> bool {

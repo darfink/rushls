@@ -179,6 +179,9 @@ impl EventObserver for TracingEvents {
 
     fn observe_stream(&self, stream: StreamId, event: StreamEvent) {
         match event {
+            StreamEvent::SegmentReady(segment) => {
+                debug!(stream = %stream, rendition = segment.rendition_id, segment = segment.segment_id, "segment ready");
+            }
             StreamEvent::Available => info!(stream = %stream, "playable"),
             StreamEvent::Retired => info!(stream = %stream, "no longer reachable"),
             StreamEvent::RetentionClipped {

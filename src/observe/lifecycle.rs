@@ -34,6 +34,9 @@ use super::{SessionEnd, SessionEvent, StreamEvent};
 /// writes in a hook's subscription list and what a consumer routes on.
 #[derive(Clone, Copy, Debug, Display, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Kind {
+    /// A completed media segment is fetchable.
+    #[display("segment.ready")]
+    SegmentReady,
     /// A publisher was admitted and registered.
     #[display("session.started")]
     SessionStarted,
@@ -54,7 +57,8 @@ pub enum Kind {
 
 impl Kind {
     /// Every kind, so a subscription list can be validated against one place.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
+        Self::SegmentReady,
         Self::SessionStarted,
         Self::SessionDegraded,
         Self::SessionRecovered,
@@ -187,9 +191,33 @@ pub struct SessionRecovery {
     pub status: crate::domain::CompensationStatus,
 }
 
+/// Metadata only: queued hooks must not pin retained media payloads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadySegment {
+    pub rendition_id: u32,
+    pub segment_id: u64,
+    pub media_sequence: u64,
+    pub publication: u64,
+    pub path: String,
+    pub initialization_path: Option<String>,
+    pub media_start: i64,
+    pub duration: u64,
+    pub timebase: crate::domain::Timebase,
+    pub bytes: usize,
+    pub independent: bool,
+    pub discontinuity: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SegmentReady {
+    pub stream: StreamId,
+    pub segment: ReadySegment,
+}
+
 /// One public fact about a stream or one of its publishers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
+    SegmentReady(SegmentReady),
     SessionDegraded(SessionRecovery),
     SessionRecovered(SessionRecovery),
     SessionStarted(SessionStarted),
@@ -201,6 +229,7 @@ pub enum Event {
 impl Event {
     pub fn kind(&self) -> Kind {
         match self {
+            Self::SegmentReady(_) => Kind::SegmentReady,
             Self::SessionStarted(_) => Kind::SessionStarted,
             Self::SessionDegraded(_) => Kind::SessionDegraded,
             Self::SessionRecovered(_) => Kind::SessionRecovered,
@@ -215,6 +244,7 @@ impl Event {
     /// Delivery orders events per subject, and this is that subject.
     pub fn stream(&self) -> &StreamId {
         match self {
+            Self::SegmentReady(event) => &event.stream,
             Self::SessionStarted(event) => &event.stream,
             Self::SessionDegraded(event) | Self::SessionRecovered(event) => &event.stream,
             Self::StreamAvailable(event) => &event.stream,
@@ -232,7 +262,7 @@ impl Event {
             Self::SessionStarted(event) => Some(event.session),
             Self::SessionDegraded(event) | Self::SessionRecovered(event) => Some(event.session),
             Self::SessionEnded(event) => Some(event.session),
-            Self::StreamAvailable(_) | Self::StreamUnavailable(_) => None,
+            Self::SegmentReady(_) | Self::StreamAvailable(_) | Self::StreamUnavailable(_) => None,
         }
     }
 }
@@ -273,6 +303,9 @@ impl Projector {
     /// event: capacity clipping the playlist is logged, not delivered.
     pub fn project_stream(&self, stream: StreamId, event: StreamEvent) -> Option<Event> {
         match event {
+            StreamEvent::SegmentReady(segment) => {
+                Some(Event::SegmentReady(SegmentReady { stream, segment }))
+            }
             StreamEvent::Available => Some(Event::StreamAvailable(StreamAvailable { stream })),
             StreamEvent::Retired => Some(Event::StreamUnavailable(StreamUnavailable { stream })),
             StreamEvent::RetentionClipped { .. } => None,

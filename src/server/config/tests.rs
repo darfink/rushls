@@ -1276,7 +1276,7 @@ name = "studio"
 
 [hook.automation]
 url = "http://automation:9000/events"
-events = ["session.started", "session.ended"]
+events = ["session.started", "session.ended", "segment.ready"]
 maximum_attempts = 2
 "#,
     )??;
@@ -1292,7 +1292,7 @@ maximum_attempts = 2
     assert_eq!(hook.maximum_attempts, 2);
     assert_eq!(
         hook.events,
-        [Kind::SessionStarted, Kind::SessionEnded]
+        [Kind::SessionStarted, Kind::SessionEnded, Kind::SegmentReady]
             .into_iter()
             .collect(),
         "a subscription is exactly what was asked for, never widened"

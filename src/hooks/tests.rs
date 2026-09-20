@@ -551,3 +551,54 @@ fn video_compensation_hook_preserves_scope_and_exact_duration() {
     assert_eq!(data["cadence"]["scope"], "progressive_frames");
     assert_eq!(data["cadence"]["interval"]["numerator"], 1001);
 }
+
+#[tokio::test]
+async fn segment_ready_delivers_metadata_with_exact_timing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let recorder = Recorder::default();
+    let address = start(recorder.clone()).await;
+    let event = Projector::new()
+        .project_stream(
+            StreamId::new("live/camera"),
+            StreamEvent::SegmentReady(lifecycle::ReadySegment {
+                rendition_id: 3,
+                segment_id: u64::MAX,
+                media_sequence: 42,
+                publication: 2,
+                path: "/live/camera/3/segment/18446744073709551615.m4s".into(),
+                initialization_path: Some("/live/camera/3/init/1.mp4".into()),
+                media_start: i64::MIN,
+                duration: 90_000,
+                timebase: crate::domain::Timebase::hz90k(),
+                bytes: 123,
+                independent: false,
+                discontinuity: true,
+            }),
+        )
+        .ok_or("segment projects without a session")?;
+    assert_eq!(event.session(), None);
+    deliver(
+        hook(address, &[lifecycle::Kind::SegmentReady]),
+        &[event],
+        1,
+        &recorder,
+    )
+    .await;
+    let bodies = recorder.bodies();
+    let body = bodies.first().ok_or("one hook arrived")?;
+    assert_eq!(body["type"], "rushls.segment.ready.v1");
+    assert_eq!(body["subject"], "live/camera");
+    assert_eq!(
+        body["data"],
+        serde_json::json!({
+            "stream_id": "live/camera", "rendition_id": 3,
+            "segment_id": u64::MAX.to_string(), "media_sequence": "42", "publication": "2",
+            "path": "/live/camera/3/segment/18446744073709551615.m4s",
+            "initialization_path": "/live/camera/3/init/1.mp4",
+            "media_start": i64::MIN.to_string(), "duration": "90000",
+            "timebase": {"numerator": 1, "denominator": 90000},
+            "bytes": "123", "independent": false, "discontinuity": true,
+        })
+    );
+    Ok(())
+}

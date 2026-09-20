@@ -313,8 +313,10 @@ pub trait EventObserver: Send + Sync {
 }
 
 /// What changed about a stream's own lifetime, rather than one publisher's.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StreamEvent {
+    /// A completed, non-GAP segment was committed to delivery.
+    SegmentReady(super::lifecycle::ReadySegment),
     /// The store has a presentation a viewer can play.
     Available,
     /// The reconnect window closed, so viewers can no longer reach it.

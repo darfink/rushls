@@ -338,23 +338,17 @@ the final name without replacement, remove the temporary name, sync the parent
 directory. The temporary path sharing the destination's filesystem
 is a correctness requirement, not a preference.
 
-**Initialization prepended to every export.** Both recorded files and hook
-payloads. Delivery over HLS is unchanged and keeps using `EXT-X-MAP`. The
+**Initialization prepended to every export.** Recorded files only. Segment hooks carry metadata. Delivery over HLS is unchanged and keeps using `EXT-X-MAP`. The
 recorder also prepends the WebVTT header to subtitle cue bodies.
 Exported codec configuration does not replace random-access or preroll media.
 
 ## Hooks
 
-**Binary-mode rendering** in the dispatcher, selected per destination by
-`payload`. Structured mode already exists.
-
-**Four extension attributes**: rendition, segment, duration in milliseconds,
-discontinuity.
-
-**A `segment.ready` event type**, at segment cadence — substantially noisier
-than the existing lifecycle events, and the first event whose body may be
-megabytes. Payload-carrying deliveries move real bandwidth through a queue
-sized for small JSON, so backpressure and drop behaviour need review.
+**`segment.ready` is implemented** as a structured JSON event after a completed
+media segment reaches the store. GAP entries do not emit it. Metadata includes
+durable resource paths, exact timing, byte count, independence, and discontinuity.
+The existing bounded hook queues handle delivery. Notifications do not pin media
+or extend retention. Binary payload delivery remains unimplemented.
 
 ## Configuration layer
 
