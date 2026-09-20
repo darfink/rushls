@@ -354,6 +354,28 @@ pub fn render(snapshot: &MetricsSnapshot) -> String {
             seconds,
         );
     }
+    #[cfg(feature = "allocation-counting")]
+    {
+        let (calls, allocated, freed) = crate::allocation::snapshot();
+        samples.counter(
+            "rushls_allocator_calls_total",
+            "Successful Rust allocation and reallocation calls.",
+            "",
+            calls,
+        );
+        samples.counter(
+            "rushls_allocator_allocated_bytes_total",
+            "Requested Rust allocation bytes, including replacement allocations.",
+            "",
+            allocated,
+        );
+        samples.counter(
+            "rushls_allocator_freed_bytes_total",
+            "Released Rust allocation bytes, including replaced allocations.",
+            "",
+            freed,
+        );
+    }
     publication::http(&mut samples, &snapshot.http);
     publication::totals(&mut samples, &snapshot.publication);
     publication::operations(&mut samples, &snapshot.operations);

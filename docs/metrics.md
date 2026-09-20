@@ -312,3 +312,17 @@ These observations do not prove packet loss.
 `rushls_video_compensation_seconds_total{codec,method}` counts accepted excess duration; its method is `gap`.
 Unavailable validation does not increment compensation counters.
 See [input modes](input-modes.md) for policy and hooks.
+
+## Optional allocator measurements
+
+Binaries built with `--features allocation-counting` expose three additional counters:
+
+| Metric | Meaning |
+|---|---|
+| `rushls_allocator_calls_total` | Successful Rust allocations and reallocations |
+| `rushls_allocator_allocated_bytes_total` | Requested bytes, including complete replacement allocations |
+| `rushls_allocator_freed_bytes_total` | Released bytes, including allocations replaced by reallocations |
+
+The difference between allocated and freed bytes approximates current requested Rust heap bytes.
+The counters exclude native-library allocations and allocator overhead. Their snapshots are not atomic as a group.
+Ordinary binaries omit this instrumentation. See [load validation](load-validation.md) for the measured workload and limits.

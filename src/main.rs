@@ -11,6 +11,12 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
+// Instrumentation is absent from ordinary production builds.
+#[cfg(feature = "allocation-counting")]
+#[global_allocator]
+static ALLOCATOR: rushls::allocation::CountingAllocator =
+    rushls::allocation::CountingAllocator;
+
 struct TracingEvents;
 
 impl EventObserver for TracingEvents {
