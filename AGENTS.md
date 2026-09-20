@@ -8,6 +8,9 @@
 ## Logging
 - Avoid `eprintln!` outside the event consumer; emit observe events instead.
 
+## Refactoring
+- Do not care about backwards compatibility unless explicitly asked to.
+
 ## Code Style & Comments Rule
 - **Move shared test code setups to fixtures.rs for duplicated code:** If test code is shared between files, move common code to fixtures.rs
 - Return `Result<(), Error>` from tests and use `?` for fallible setup; keep `expect`/`unwrap` for intentional failure assertions or invariants.
