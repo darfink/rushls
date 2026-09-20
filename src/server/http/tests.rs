@@ -302,6 +302,15 @@ impl Harness {
         }
     }
 
+    async fn advance_retention(&self, duration: Duration) {
+        // Advance between requests only; auto-advancing a real socket's
+        // timeout while the OS delivers its response would mask HTTP behavior.
+        tokio::time::pause();
+        tokio::time::advance(duration).await;
+        tokio::time::resume();
+        self.store.maintain();
+    }
+
     async fn stop(mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -3483,6 +3492,244 @@ async fn iframe_manifest_ranges_fetch_only_the_opening_avc_sample()
             .as_str()
         )
     );
+    harness.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconnect_keeps_resource_urls_until_their_fetch_deadlines()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = Harness::start().await;
+    let first = lease(&harness.store, vec![video(0)]);
+    write(&first, initialization(0, 1));
+    write_segment(&first, 0, 0, 0);
+    let paths = ["init/1.mp4", "part/1.m4s", "segment/1.m4s"];
+    let mut original = Vec::new();
+    for path in paths {
+        let reply = request(
+            harness.address,
+            "GET",
+            &format!("/live/camera/0/{path}"),
+            &[],
+        )
+        .await;
+        assert_eq!(reply.status, 200, "{path}");
+        original.push(reply.body);
+    }
+    let second = lease(&harness.store, vec![video(0)]);
+    // Reusing the publisher's local initialization version must not replace
+    // the bytes behind URLs already handed to viewers.
+    let mut successor_init = initialization(0, 1);
+    if let crate::mux::PackagedMedia::Initialization(init) = &mut successor_init {
+        init.payload = crate::domain::Payload::from(vec![9]);
+    }
+    write(&second, successor_init);
+    assert_eq!(
+        request(harness.address, "GET", "/live/camera/0/init/2.mp4", &[])
+            .await
+            .body,
+        [9]
+    );
+    for id in 0..11_u64 {
+        write_segment(&second, 0, id, i64::try_from(id)? * 6);
+    }
+    let manifest = request(harness.address, "GET", "/live/camera/0/video.m3u8", &[]).await;
+    let manifest = std::str::from_utf8(&manifest.body)?;
+    assert!(!manifest.lines().any(|line| line == "segment/1.m4s"));
+    assert!(!manifest.contains("URI=\"part/1.m4s\""));
+    for (path, bytes) in paths.into_iter().zip(&original) {
+        let reply = request(
+            harness.address,
+            "GET",
+            &format!("/live/camera/0/{path}"),
+            &[],
+        )
+        .await;
+        assert_eq!(reply.status, 200, "{path} remains fetchable after removal");
+        assert_eq!(&reply.body, bytes);
+    }
+    harness.advance_retention(Duration::from_secs(17)).await;
+    assert_eq!(
+        request(harness.address, "GET", "/live/camera/0/part/1.m4s", &[])
+            .await
+            .status,
+        200
+    );
+    harness.advance_retention(Duration::from_secs(2)).await;
+    assert_eq!(
+        request(harness.address, "GET", "/live/camera/0/part/1.m4s", &[])
+            .await
+            .status,
+        404
+    );
+    for path in ["init/1.mp4", "segment/1.m4s"] {
+        assert_eq!(
+            request(
+                harness.address,
+                "GET",
+                &format!("/live/camera/0/{path}"),
+                &[]
+            )
+            .await
+            .status,
+            200
+        );
+    }
+    // Segment expiry is max(publication + retain, removal + target),
+    // not retain + target. This burst removed the old segment immediately.
+    harness.advance_retention(Duration::from_secs(40)).await;
+    assert_eq!(
+        request(harness.address, "GET", "/live/camera/0/segment/1.m4s", &[])
+            .await
+            .status,
+        200
+    );
+    harness.advance_retention(Duration::from_secs(2)).await;
+    for path in paths {
+        assert_eq!(
+            request(
+                harness.address,
+                "GET",
+                &format!("/live/camera/0/{path}"),
+                &[]
+            )
+            .await
+            .status,
+            404,
+            "{path} expires"
+        );
+    }
+    harness.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn blocking_reload_survives_reconnect_or_ends_when_its_rendition_retires()
+-> Result<(), Box<dyn std::error::Error>> {
+    for retire in [false, true] {
+        let harness = Harness::start().await;
+        let first = lease(&harness.store, vec![video(0)]);
+        write(&first, initialization(0, 1));
+        write_segment(&first, 0, 0, 0);
+        let address = harness.address;
+        let held = tokio::spawn(async move {
+            request(
+                address,
+                "GET",
+                "/live/camera/0/video.m3u8?_HLS_msn=2&_HLS_part=0",
+                &[],
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!held.is_finished());
+        let local = if retire { 9 } else { 0 };
+        let second = lease(&harness.store, vec![video(local)]);
+        write(&second, initialization(local, 1));
+        write_segment(&second, local, 0, 0);
+        let reply = tokio::time::timeout(Duration::from_secs(2), held).await??;
+        assert_eq!(reply.status, 200);
+        let body = std::str::from_utf8(&reply.body)?;
+        if retire {
+            assert!(body.contains("#EXT-X-ENDLIST"), "{body}");
+            assert!(!body.contains("segment/2.m4s"), "{body}");
+        } else {
+            assert!(body.contains("#EXT-X-DISCONTINUITY\n"), "{body}");
+            assert!(body.contains("segment/2.m4s"), "{body}");
+            assert!(body.contains("URI=\"part/7.m4s\""), "{body}");
+            assert!(!body.contains("#EXT-X-ENDLIST"), "{body}");
+        }
+        harness.stop().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_cmaf_edit_lists_and_pdt_preserve_priming_and_av_offset()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{domain::Payload, mux::fixtures::edit_list};
+    use broadcast_common::Unpackage;
+    let harness = Harness::start().await;
+    let (presentation, media) = super::fixtures::offset_cmaf()?;
+    let lease = harness
+        .store
+        .lease(crate::delivery::hls::fixtures::stream_id(), &presentation)?;
+    for event in media {
+        write(&lease, event);
+    }
+    for (rendition, kind, pdt, edit, frame_ticks, count) in [
+        (0, "audio", "2023-11-14T22:13:20Z", 1_024, 1_024, 5),
+        (1, "video", "2023-11-14T22:13:20.5Z", 0, 8_192, 2),
+    ] {
+        let base = format!("/live/camera/{rendition}");
+        let reply = request(harness.address, "GET", &format!("{base}/{kind}.m3u8"), &[]).await;
+        assert_eq!(reply.status, 200);
+        let playlist = std::str::from_utf8(&reply.body)?;
+        assert!(
+            playlist.contains(&format!("#EXT-X-PROGRAM-DATE-TIME:{pdt}")),
+            "{playlist}"
+        );
+        let init_uri = playlist
+            .lines()
+            .find_map(|line| line.strip_prefix("#EXT-X-MAP:URI=\""))
+            .ok_or("missing map")?
+            .split('"')
+            .next()
+            .ok_or("missing map URI")?;
+        let segment_uri = playlist
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .ok_or("missing segment")?;
+        let init = request(harness.address, "GET", &format!("{base}/{init_uri}"), &[]).await;
+        assert_eq!(init.status, 200);
+        let edits = edit_list(&Payload::from(init.body.clone()));
+        if rendition == 0 {
+            assert_eq!(edits, [(0, edit)]);
+        } else {
+            assert_eq!(edits, [(8_192, -1), (0, edit)]);
+        }
+        let segment = request(
+            harness.address,
+            "GET",
+            &format!("{base}/{segment_uri}"),
+            &[],
+        )
+        .await;
+        assert_eq!(segment.status, 200);
+        let mut parts = Vec::new();
+        for line in playlist
+            .lines()
+            .filter(|line| line.starts_with("#EXT-X-PART:"))
+        {
+            let uri = line
+                .split("URI=\"")
+                .nth(1)
+                .ok_or("missing part URI")?
+                .split('"')
+                .next()
+                .ok_or("missing part URI")?;
+            let part = request(harness.address, "GET", &format!("{base}/{uri}"), &[]).await;
+            assert_eq!(part.status, 200);
+            parts.extend_from_slice(&part.body);
+        }
+        assert_eq!(
+            parts, segment.body,
+            "parts and complete segment contain identical timing"
+        );
+        let mut bytes = init.body;
+        bytes.extend_from_slice(&segment.body);
+        let demuxed = transmux::Fmp4Demux::new().unpackage(&bytes)?;
+        let samples = &demuxed.tracks[0].samples;
+        assert_eq!(samples.len(), count);
+        // Encoded clocks start at zero. ELST removes AAC priming and delays
+        // video by 8192/16384 s; PDT describes those presented positions.
+        for (index, sample) in samples.iter().enumerate() {
+            let pts = i64::try_from(index)? * frame_ticks;
+            assert_eq!(sample.pts, Some(pts));
+            assert_eq!(sample.dts, Some(pts));
+            assert_eq!(sample.duration, Some(u32::try_from(frame_ticks)?));
+        }
+    }
     harness.stop().await;
     Ok(())
 }

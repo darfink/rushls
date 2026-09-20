@@ -165,3 +165,114 @@ impl EventObserver for NodeEventRecorder {
         self.events.lock().push(event);
     }
 }
+
+/// Real CMAF bytes with one AAC priming frame and video starting 500 ms later.
+/// The shared presentation origin must survive both muxing and HTTP projection.
+pub fn offset_cmaf() -> Result<
+    (
+        Arc<crate::mux::PackagedPresentation>,
+        Vec<crate::mux::PackagedMedia>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    use crate::{
+        admission::StreamPolicy,
+        domain::{
+            AudioTiming, AudioTrim, Codec, FrameRate, MediaKind, MediaParameters, Payload,
+            Timebase, TrackId,
+            fixtures::{TrackBuilder, catalog},
+        },
+        media::{AudioSample, NormalizedMedia, VideoSample, validate},
+        mux::{
+            FinishReason, MuxerFactory, MuxerStartRequest, PassThroughMuxerFactory,
+            fixtures::{
+                AAC_EXTRADATA, AAC_FRAME, H264_EXTRADATA, H264_IDR, H264_P, discarded_events,
+            },
+        },
+        segment::{SegmentationPlan, fixtures::PlanBuilder},
+    };
+    let audio_base = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+    let video_base = Timebase::new(nz::u32!(1), nz::u32!(16_384));
+    let audio = TrackBuilder::new(0, MediaKind::Audio)
+        .timebase(audio_base)
+        .parameters(MediaParameters::Audio {
+            sample_rate: nz::u32!(48_000),
+            channels: nz::u16!(1),
+            frame_size: Some(nz::u32!(1_024)),
+            bit_depth: None,
+            timing: AudioTiming {
+                initial_padding_samples: 1_024,
+                ..AudioTiming::default()
+            },
+        })
+        .codec(Codec::Aac)
+        .codec_extradata(AAC_EXTRADATA.to_vec())
+        .build();
+    let video = TrackBuilder::new(1, MediaKind::Video)
+        .timebase(video_base)
+        .parameters(MediaParameters::Video {
+            width: nz::u32!(16),
+            height: nz::u32!(16),
+            frame_rate: Some(FrameRate::new(nz::u32!(2), nz::u32!(1))),
+            video_delay: 0,
+        })
+        .codec_extradata(H264_EXTRADATA.to_vec())
+        .build();
+    let input = validate(&catalog(vec![audio, video]), &StreamPolicy::permissive())?;
+    let segmentation = SegmentationPlan::new(
+        &input,
+        vec![
+            PlanBuilder::new(0, audio_base, nz::u64!(49_152))
+                .part(nz::u32!(2), nz::u64!(2_048))
+                .build(),
+            PlanBuilder::new(1, video_base, nz::u64!(16_384))
+                .part(nz::u32!(1), nz::u64!(8_192))
+                .presentation_origin(-8_192)
+                .build(),
+        ],
+    )?;
+    let events = discarded_events();
+    let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
+        presentation: &input,
+        segmentation: &segmentation,
+        time_anchor: crate::delivery::hls::fixtures::anchor(),
+        events: &events,
+    })?;
+    let mut media = Vec::new();
+    for frame in -1..4 {
+        started.muxer.push(
+            NormalizedMedia::Audio(AudioSample {
+                track_id: TrackId(0),
+                codec: Codec::Aac,
+                pts: frame * 1_024,
+                duration: 1_024,
+                trim: AudioTrim {
+                    leading_samples: if frame == -1 { 1_024 } else { 0 },
+                    trailing_samples: 0,
+                },
+                payload: Payload::from(AAC_FRAME.to_vec()),
+            }),
+            &mut media,
+        )?;
+    }
+    for frame in 0..2 {
+        started.muxer.push(
+            NormalizedMedia::Video(VideoSample {
+                track_id: TrackId(1),
+                codec: Codec::H264,
+                pts: frame * 8_192,
+                dts: frame * 8_192,
+                duration: 8_192,
+                random_access: frame == 0,
+                payload: Payload::from(if frame == 0 {
+                    H264_IDR.to_vec()
+                } else {
+                    H264_P.to_vec()
+                }),
+            }),
+            &mut media,
+        )?;
+    }
+    started.muxer.finish(FinishReason::Final, &mut media)?;
+    Ok((started.presentation, media))
+}

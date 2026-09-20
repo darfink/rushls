@@ -809,7 +809,7 @@ mod tests {
             InitializationSegment, MuxerStartRequest, PackagedMedia,
             fixtures::{
                 AAC_EXTRADATA, AAC_FRAME, AAC_FRAME_SAMPLES, H264_EXTRADATA, H264_IDR, H264_P,
-                RecordedEvents, discarded_events,
+                RecordedEvents, discarded_events, edit_list,
             },
         },
         observe::SessionEvent,
@@ -1079,60 +1079,6 @@ mod tests {
             offset += size;
         }
         boxes
-    }
-
-    fn edit_list(payload: &Payload) -> Vec<(u64, i64)> {
-        let bytes = payload.as_bytes();
-        let Some(type_offset) = bytes.windows(4).position(|window| window == b"elst") else {
-            return Vec::new();
-        };
-        let box_start = type_offset
-            .checked_sub(4)
-            .expect("box type follows its size");
-        let box_size = u32::from_be_bytes(
-            bytes[box_start..type_offset]
-                .try_into()
-                .expect("box size is four bytes"),
-        ) as usize;
-        let box_end = box_start + box_size;
-        assert!(box_size >= 16 && box_end <= bytes.len());
-        let body = &bytes[type_offset + 4..box_end];
-        let version = body[0];
-        let entries = u32::from_be_bytes(body[4..8].try_into().expect("entry count is four bytes"));
-        let mut cursor = 8;
-        (0..entries)
-            .map(|_| match version {
-                0 => {
-                    let duration = u64::from(u32::from_be_bytes(
-                        body[cursor..cursor + 4]
-                            .try_into()
-                            .expect("duration is four bytes"),
-                    ));
-                    let media_time = i64::from(i32::from_be_bytes(
-                        body[cursor + 4..cursor + 8]
-                            .try_into()
-                            .expect("media time is four bytes"),
-                    ));
-                    cursor += 12;
-                    (duration, media_time)
-                }
-                1 => {
-                    let duration = u64::from_be_bytes(
-                        body[cursor..cursor + 8]
-                            .try_into()
-                            .expect("duration is eight bytes"),
-                    );
-                    let media_time = i64::from_be_bytes(
-                        body[cursor + 8..cursor + 16]
-                            .try_into()
-                            .expect("media time is eight bytes"),
-                    );
-                    cursor += 20;
-                    (duration, media_time)
-                }
-                _ => panic!("unsupported edit-list version"),
-            })
-            .collect()
     }
 
     #[test]
