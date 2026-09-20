@@ -127,7 +127,7 @@ publish = false
 # Internal
 cc-outbound = { path = "crates/cc-outbound" }
 cc-hooks = { path = "crates/cc-hooks" }
-rtmpx = "3.0"
+rtmpx = "3.1"
 cc-tls = { path = "crates/cc-tls" }
 cc-metrics = { path = "crates/cc-metrics" }
 
