@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rushls::admission::{OpenStreamAuthenticator, StreamPolicy};
@@ -24,7 +24,7 @@ use rushls::session::{
 use super::config::E2eConfig;
 use super::publish::{BurstMpegTs, live_camera};
 
-/// Scratch root: <tmp>/rushls-record-e2e-<pid>-<nanos>/ with src.ts, archive/.
+/// Scratch root: <tmp>/rushls-record-e2e-<uuid>/ with src.ts, archive/.
 pub struct WorkDir {
     root: PathBuf,
     archive: PathBuf,
@@ -34,11 +34,9 @@ pub struct WorkDir {
 
 impl WorkDir {
     pub fn new(_cfg: &E2eConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)?
-            .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("rushls-record-e2e-{}-{nanos}", std::process::id()));
+        // Clock precision alone cannot isolate tests that start concurrently.
+        let root = std::env::temp_dir().join(format!("rushls-record-e2e-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root)?;
         let archive = root.join("archive");
         std::fs::create_dir_all(&archive)?;
         let keep = std::env::var("RUSHLS_TEST_RECORD_E2E_KEEP").is_ok();
@@ -177,8 +175,8 @@ impl TestRig {
     /// Publish one fully-buffered input as fast as the session demuxes.
     pub async fn run_burst(&self, bytes: Vec<u8>) -> Result<SessionOutcome, SessionError> {
         eprintln!(
-            "record e2e: publishing {:.1} MiB with no pacing",
-            bytes.len() as f64 / 1_048_576.0
+            "record e2e: publishing {} bytes with no pacing",
+            bytes.len()
         );
         let pending: Box<dyn rushls::source::PendingPublish> = Box::new(BurstMpegTs {
             request: live_camera(),
@@ -247,8 +245,7 @@ fn collect_files(archive: &Path) -> std::io::Result<Vec<PathBuf>> {
                 visit(&path, out)?;
             } else if !path
                 .file_name()
-                .map(|n| n.to_string_lossy().starts_with(".rushls-"))
-                .unwrap_or(false)
+                .is_some_and(|n| n.to_string_lossy().starts_with(".rushls-"))
             {
                 out.push(path);
             }

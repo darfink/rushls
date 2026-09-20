@@ -133,7 +133,7 @@ pub fn verify_many_halves(
     for file in &outcome.files {
         let (key, seg) = verify::split_key(work.archive(), file)
             .ok_or_else(|| format!("unexpected archive name: {}", file.display()))?;
-        let publication = key.split("/").next().unwrap_or("").to_string();
+        let publication = key.split('/').next().unwrap_or("").to_string();
         publications.insert(publication);
         by_rendition.entry(key).or_default().push(seg);
     }
@@ -168,7 +168,7 @@ pub fn verify_many_halves(
     for file in &outcome.files {
         let (key, _) = verify::split_key(work.archive(), file)
             .ok_or_else(|| format!("unexpected archive name: {}", file.display()))?;
-        let publication = key.split("/").next().unwrap_or("").to_string();
+        let publication = key.split('/').next().unwrap_or("").to_string();
         let info = verify::probe(file)?;
         if info.has_video {
             video_frames += info.video_frames;
@@ -183,24 +183,7 @@ pub fn verify_many_halves(
         verify::decode_clean(file)?;
     }
 
-    // Every session must have survived whole. Both sides are sorted because
-    // the publication ids are random and carry no session order.
-    let mut got: Vec<u64> = video_by_pub.values().copied().collect();
-    got.sort_unstable();
-    let mut want: Vec<u64> = secs.iter().map(|s| u64::from(cfg.fps) * s).collect();
-    want.sort_unstable();
-    let slack = u64::from(cfg.gop_frames);
-    if got.len() != n {
-        return Err(format!("expected video under {n} publications, found {}", got.len()).into());
-    }
-    for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
-        eprintln!("record e2e churn: publication {index}: video frames {g} vs expected {w}");
-        if *g + slack < *w || *g > *w + slack {
-            return Err(
-                format!("publication {index}: video frames {g} far from expected {w}").into(),
-            );
-        }
-    }
+    verify_publication_frames(cfg, secs, &video_by_pub)?;
     eprintln!("record e2e churn: video frames {video_frames} total");
 
     // Audio priming repeats per publication, so the expectation is the sum of
@@ -232,6 +215,33 @@ pub fn verify_many_halves(
         outcome.files.len(),
         by_rendition.len()
     );
+    Ok(())
+}
+
+fn verify_publication_frames(
+    cfg: &E2eConfig,
+    secs: &[u64],
+    video_by_pub: &BTreeMap<String, u64>,
+) -> TestResult {
+    let n = secs.len();
+    // Every session must have survived whole. Both sides are sorted because
+    // the publication ids are random and carry no session order.
+    let mut got: Vec<u64> = video_by_pub.values().copied().collect();
+    got.sort_unstable();
+    let mut want: Vec<u64> = secs.iter().map(|s| u64::from(cfg.fps) * s).collect();
+    want.sort_unstable();
+    let slack = u64::from(cfg.gop_frames);
+    if got.len() != n {
+        return Err(format!("expected video under {n} publications, found {}", got.len()).into());
+    }
+    for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        eprintln!("record e2e churn: publication {index}: video frames {g} vs expected {w}");
+        if *g + slack < *w || *g > *w + slack {
+            return Err(
+                format!("publication {index}: video frames {g} far from expected {w}").into(),
+            );
+        }
+    }
     Ok(())
 }
 

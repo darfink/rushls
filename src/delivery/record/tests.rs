@@ -92,7 +92,7 @@ fn a_segment_erased_by_the_subtitle_suffix_is_refused_at_parse() -> Result {
         "same.mp4",
         "{stream}/{publication}/{time:%Y%m%d}/{rendition}.mp4",
     ] {
-        assert!(Pattern::parse(good).is_ok(), "{good:?}");
+        Pattern::parse(good)?;
     }
     Ok(())
 }

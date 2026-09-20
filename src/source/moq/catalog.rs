@@ -224,7 +224,7 @@ fn decode_hex(text: &str) -> Option<Bytes> {
         return None;
     }
     let mut out = BytesMut::with_capacity(text.len() / 2);
-    for pair in text.as_bytes().chunks_exact(2) {
+    for pair in text.as_bytes().as_chunks::<2>().0 {
         out.put_u8((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?);
     }
     Some(out.freeze())

@@ -2220,7 +2220,7 @@ fn parse_duration_rule(value: &str) -> Result<DurationRule, String> {
 ///
 /// Bounded to nine fractional digits so the denominator always fits a `u32`.
 fn decimal_fraction(value: &str) -> Result<(u32, u32), String> {
-    let (whole, fraction) = value.split_once('.').map_or((value, ""), |parts| parts);
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
     let fraction_digits = fraction.len();
     if whole.is_empty()
         || fraction_digits > 9

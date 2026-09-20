@@ -812,10 +812,10 @@ impl IngestListener for SrtListener {
     }
 
     /// Already negotiated: rsrt completes its handshake inside `accept`.
-    async fn handshake(
+    fn handshake(
         connection: Self::Connection,
-    ) -> Result<Box<dyn PendingPublish>, TransportError> {
-        Ok(Box::new(connection))
+    ) -> impl Future<Output = Result<Box<dyn PendingPublish>, TransportError>> {
+        std::future::ready(Ok(Box::new(connection) as Box<dyn PendingPublish>))
     }
 }
 

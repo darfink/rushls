@@ -4,6 +4,8 @@
 //! in the default suite with no ffmpeg. The truncated-prefix case needs
 //! synthesis, so it stays ignored like the other end-to-end tests.
 
+use std::collections::BTreeMap;
+
 use rushls::session::{SessionError, SessionOutcome};
 
 use super::config::E2eConfig;
@@ -55,7 +57,9 @@ pub fn check_truncated_prefix(
     match result {
         Ok(outcome) => eprintln!("record e2e truncated: session {outcome:?}"),
         Err(error) => {
-            eprintln!("record e2e truncated: session errored ({error:?}), checking partial archive")
+            eprintln!(
+                "record e2e truncated: session errored ({error:?}), checking partial archive"
+            );
         }
     }
     for event in &drained.node_events {
@@ -72,7 +76,6 @@ pub fn check_truncated_prefix(
     }
     verify::check_no_temp_files(work.archive())?;
 
-    use std::collections::BTreeMap;
     let mut by_rendition: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for file in &drained.files {
         let (key, seg) = verify::split_key(work.archive(), file)

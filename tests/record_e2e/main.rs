@@ -106,14 +106,14 @@ async fn record_churn_keeps_every_sample() -> TestResult {
     if total < 2 * min_part {
         return Err(format!("record churn needs at least {}s total with {}s segments, got {}s; raise RUSHLS_TEST_RECORD_E2E_SECS or lower RUSHLS_TEST_RECORD_E2E_CHURN_COUNT", 2 * min_part, cfg.segment_secs, total).into());
     }
-    let max_n = (total / min_part) as usize;
-    let wanted = cfg.churn_count.min(cfg.duration_secs).max(2) as usize;
+    let max_n = usize::try_from(total / min_part)?;
+    let wanted = usize::try_from(cfg.churn_count.min(cfg.duration_secs).max(2))?;
     let n = wanted.min(max_n).max(2);
     let base = total / n as u64;
-    let rem = (total % n as u64) as usize;
+    let rem = usize::try_from(total % n as u64)?;
     let mut secs = Vec::with_capacity(n);
     for i in 0..n {
-        let extra = if i < rem { 1 } else { 0 };
+        let extra = u64::from(i < rem);
         secs.push(base + extra);
     }
     eprintln!(
@@ -126,7 +126,7 @@ async fn record_churn_keeps_every_sample() -> TestResult {
     }
     let mut files = Vec::with_capacity(n);
     for (i, s) in secs.iter().enumerate() {
-        let name = format!("src-churn-{:02}.ts", i);
+        let name = format!("src-churn-{i:02}.ts");
         files.push(generate::generate_mpegts_named(&cfg, &work, &name, *s)?);
     }
     let churn = reconnect::publish_many_halves(&cfg, &work, &files, &secs).await?;

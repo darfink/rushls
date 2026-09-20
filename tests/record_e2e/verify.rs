@@ -153,7 +153,6 @@ pub(crate) fn split_key(archive: &Path, file: &Path) -> Option<(String, u64)> {
 }
 
 pub(crate) fn check_no_temp_files(archive: &Path) -> TestResult {
-    let mut tmp = Vec::new();
     fn visit(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
         for item in std::fs::read_dir(dir)? {
             let p = item?.path();
@@ -161,14 +160,14 @@ pub(crate) fn check_no_temp_files(archive: &Path) -> TestResult {
                 visit(&p, out)?;
             } else if p
                 .file_name()
-                .map(|n| n.to_string_lossy().starts_with(".rushls-"))
-                .unwrap_or(false)
+                .is_some_and(|n| n.to_string_lossy().starts_with(".rushls-"))
             {
                 out.push(p);
             }
         }
         Ok(())
     }
+    let mut tmp = Vec::new();
     visit(archive, &mut tmp)?;
     if !tmp.is_empty() {
         return Err(format!("{} temp commit files left behind: {:?}", tmp.len(), tmp).into());
@@ -201,7 +200,7 @@ pub(crate) fn probe(file: &Path) -> Result<Probe, Box<dyn std::error::Error + Se
         .arg(file)
         .output()?;
     let video = kv_map(&String::from_utf8_lossy(&out.stdout));
-    let has_video = out.status.success() && video.get("codec_name").is_some();
+    let has_video = out.status.success() && video.contains_key("codec_name");
     let video_frames: u64 = video
         .get("nb_read_frames")
         .and_then(|s| s.parse().ok())
@@ -222,7 +221,7 @@ pub(crate) fn probe(file: &Path) -> Result<Probe, Box<dyn std::error::Error + Se
         .arg(file)
         .output()?;
     let audio = kv_map(&String::from_utf8_lossy(&out.stdout));
-    let has_audio = out.status.success() && audio.get("codec_name").is_some();
+    let has_audio = out.status.success() && audio.contains_key("codec_name");
     let audio_frames: u64 = audio
         .get("nb_read_frames")
         .and_then(|s| s.parse().ok())
@@ -249,7 +248,7 @@ pub(crate) fn probe(file: &Path) -> Result<Probe, Box<dyn std::error::Error + Se
 fn kv_map(text: &str) -> std::collections::BTreeMap<String, String> {
     let mut map = std::collections::BTreeMap::new();
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        if let Some((k, v)) = line.split_once("=") {
+        if let Some((k, v)) = line.split_once('=') {
             map.insert(k.trim().to_string(), v.trim().to_string());
         }
     }

@@ -110,11 +110,7 @@ pub fn generate_mpegts_named(
         return Err(format!("ffmpeg failed to synthesize {}", out.display()).into());
     }
     let bytes = std::fs::metadata(&out)?.len();
-    eprintln!(
-        "record e2e: synthesized {} ({:.1} MiB)",
-        out.display(),
-        bytes as f64 / 1_048_576.0
-    );
+    eprintln!("record e2e: synthesized {} ({bytes} bytes)", out.display());
     Ok(out)
 }
 

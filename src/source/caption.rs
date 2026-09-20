@@ -528,7 +528,7 @@ fn recognize_a53(
     let triplets = rest.get(CC_DATA_HEADER_LEN..CC_DATA_HEADER_LEN + cc_count * 3)?;
 
     let mut found = CaptionObservation::default();
-    for triplet in triplets.chunks_exact(3) {
+    for triplet in triplets.as_chunks::<3>().0 {
         // cc_valid distinguishes a carried pair from padding that only keeps
         // the caption clock running.
         if triplet[0] & 0x04 == 0 {

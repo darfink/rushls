@@ -2561,8 +2561,10 @@ mod tests {
             assert!((19_200..=19_848).contains(&(decoded.stdout.len() / 4)));
             // Float-to-PCM conversion can round by one least-significant bit.
             for (actual, expected) in decoded.stdout[..audible_reference.len()]
-                .chunks_exact(2)
-                .zip(audible_reference.chunks_exact(2))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(audible_reference.as_chunks::<2>().0)
             {
                 let actual = i16::from_le_bytes([actual[0], actual[1]]);
                 let expected = i16::from_le_bytes([expected[0], expected[1]]);

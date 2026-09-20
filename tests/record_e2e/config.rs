@@ -44,8 +44,8 @@ impl E2eConfig {
         // legal cut at the nominal boundary: even targets keep the usual 2s
         // GOP, odd targets drop to a 1s GOP which divides any whole-second
         // target.
-        let gop_secs = if segment_secs % 2 == 0 { 2 } else { 1 };
-        let gop_frames = fps * gop_secs as u32;
+        let gop_secs: u32 = if segment_secs.is_multiple_of(2) { 2 } else { 1 };
+        let gop_frames = fps * gop_secs;
         let churn_count = env_u64("RUSHLS_TEST_RECORD_E2E_CHURN_COUNT", 6).clamp(2, 32);
         Self {
             duration_secs,
