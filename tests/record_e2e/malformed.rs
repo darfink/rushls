@@ -25,10 +25,18 @@ pub async fn expect_rejected(bytes: Vec<u8>, label: &str) -> TestResult {
     }
     let drained = rig.drain_and_collect().await?;
     if !drained.files.is_empty() {
-        return Err(format!("{label}: archive holds {} files after rejected input", drained.files.len()).into());
+        return Err(format!(
+            "{label}: archive holds {} files after rejected input",
+            drained.files.len()
+        )
+        .into());
     }
     if drained.recording_lost != 0 {
-        return Err(format!("{label}: recorder lost {} segments on rejected input", drained.recording_lost).into());
+        return Err(format!(
+            "{label}: recorder lost {} segments on rejected input",
+            drained.recording_lost
+        )
+        .into());
     }
     Ok(())
 }
@@ -46,7 +54,9 @@ pub fn check_truncated_prefix(
 ) -> TestResult {
     match result {
         Ok(outcome) => eprintln!("record e2e truncated: session {outcome:?}"),
-        Err(error) => eprintln!("record e2e truncated: session errored ({error:?}), checking partial archive"),
+        Err(error) => {
+            eprintln!("record e2e truncated: session errored ({error:?}), checking partial archive")
+        }
     }
     for event in &drained.node_events {
         let msg = format!("{event:?}");
@@ -73,7 +83,10 @@ pub fn check_truncated_prefix(
         segs.sort_unstable();
         for (i, seg) in segs.iter().enumerate() {
             if *seg != i as u64 {
-                return Err(format!("rendition {rendition}: gap, expected segment {i}, found {seg}").into());
+                return Err(format!(
+                    "rendition {rendition}: gap, expected segment {i}, found {seg}"
+                )
+                .into());
             }
         }
     }
@@ -104,16 +117,27 @@ pub fn check_truncated_prefix(
         return Err("no video frames recorded from a 60 percent prefix".into());
     }
     if video_frames > expected_video + slack {
-        return Err(format!("video frame total {video_frames} above full-length {expected_video}").into());
+        return Err(
+            format!("video frame total {video_frames} above full-length {expected_video}").into(),
+        );
     }
     if audio_frames > 0 || audio_sr > 0 {
         let sr = if audio_sr > 0 { audio_sr } else { 48_000 };
         let expected_audio = (u64::from(sr) * cfg.duration_secs).div_ceil(1024);
-        eprintln!("record e2e truncated: audio frames {audio_frames} vs full-length {expected_audio}");
+        eprintln!(
+            "record e2e truncated: audio frames {audio_frames} vs full-length {expected_audio}"
+        );
         if audio_frames > expected_audio + 8 {
-            return Err(format!("audio frame total {audio_frames} above full-length {expected_audio}").into());
+            return Err(format!(
+                "audio frame total {audio_frames} above full-length {expected_audio}"
+            )
+            .into());
         }
     }
-    eprintln!("record e2e truncated: PASS ({} files, {} renditions)", drained.files.len(), by_rendition.len());
+    eprintln!(
+        "record e2e truncated: PASS ({} files, {} renditions)",
+        drained.files.len(),
+        by_rendition.len()
+    );
     Ok(())
 }

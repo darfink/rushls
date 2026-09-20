@@ -40,6 +40,11 @@ pub struct MetricsConfig {
 pub struct MetricsSnapshot {
     pub http: crate::observe::http::HttpSnapshot,
     pub process: ProcessSnapshot,
+    pub video_intervals: Vec<(String, crate::observe::DurationHistogram)>,
+    pub video_compensation: Vec<((String, String), (u64, f64))>,
+    pub cadence_violations: Vec<(String, u64)>,
+    pub audio_repairs: Vec<((String, String), (u64, f64))>,
+    pub timestamp_rejections: Vec<((String, String), u64)>,
     pub publication: crate::delivery::store::telemetry::PublicationTotalSnapshot,
     pub operations: [crate::observe::OperationSnapshot; 7],
     pub origin: OriginSnapshot,
@@ -195,6 +200,11 @@ impl MetricsReader {
         MetricsSnapshot {
             http: self.http.snapshot(),
             process: self.meters.snapshot(),
+            video_intervals: self.meters.video_intervals(),
+            video_compensation: self.meters.video_compensation(),
+            cadence_violations: self.meters.cadence_violations(),
+            audio_repairs: self.meters.audio_repairs(),
+            timestamp_rejections: self.meters.timestamp_rejections(),
             publication: self.store.publication_totals(),
             operations: self.origin.operations.snapshot(),
             origin: self.origin.snapshot(),
@@ -297,6 +307,53 @@ pub fn render(snapshot: &MetricsSnapshot) -> String {
         concat!("version=\"", env!("CARGO_PKG_VERSION"), "\""),
         1,
     );
+    for ((code, kind), count) in &snapshot.timestamp_rejections {
+        samples.counter(
+            "rushls_timestamp_rejections_total",
+            "Sessions rejected for invalid media timestamps.",
+            &format!("code=\"{code}\",media_kind=\"{kind}\""),
+            count,
+        );
+    }
+    for ((codec, method), (count, seconds)) in &snapshot.audio_repairs {
+        let labels = format!("codec=\"{codec}\",method=\"{method}\"");
+        samples.counter(
+            "rushls_audio_repairs_total",
+            "Audio holes compensated during normalization.",
+            &labels,
+            count,
+        );
+        samples.counter(
+            "rushls_audio_compensation_seconds_total",
+            "Audio duration synthesized during normalization.",
+            &labels,
+            seconds,
+        );
+    }
+    for (codec, histogram) in &snapshot.video_intervals {
+        samples.histogram(
+            "rushls_video_timestamp_step_seconds",
+            "Observed source video intervals, not evidence of packet loss.",
+            &format!("codec=\"{codec}\""),
+            histogram,
+        );
+    }
+    for (codec, count) in &snapshot.cadence_violations {
+        samples.counter(
+            "rushls_video_cadence_violations_total",
+            "Violations of explicitly declared video cadence.",
+            &format!("codec=\"{codec}\""),
+            count,
+        );
+    }
+    for ((codec, method), (_, seconds)) in &snapshot.video_compensation {
+        samples.counter(
+            "rushls_video_compensation_seconds_total",
+            "Accepted excess presentation duration.",
+            &format!("codec=\"{codec}\",method=\"{method}\""),
+            seconds,
+        );
+    }
     publication::http(&mut samples, &snapshot.http);
     publication::totals(&mut samples, &snapshot.publication);
     publication::operations(&mut samples, &snapshot.operations);
@@ -662,7 +719,14 @@ mod tests {
 
     #[test]
     fn prometheus_output_contains_typed_process_metrics() {
+        let mut intervals = crate::observe::DurationHistogram::default();
+        intervals.observe(Duration::from_millis(40));
         let output = render(&MetricsSnapshot {
+            video_intervals: vec![("h264".into(), intervals)],
+            video_compensation: vec![(("h264".into(), "gap".into()), (1, 0.25))],
+            cadence_violations: vec![("h264".into(), 2)],
+            audio_repairs: vec![(("aac".into(), "gap".into()), (2, 0.5))],
+            timestamp_rejections: vec![(("audio_gap".into(), "audio".into()), 1)],
             process: ProcessSnapshot {
                 sessions_started: 3,
                 bytes_received: 1_024,
@@ -691,6 +755,18 @@ mod tests {
             playback: None,
         });
 
+        assert!(output.contains("rushls_video_timestamp_step_seconds_count{codec=\"h264\"} 1\n"));
+        assert!(output.contains("rushls_video_cadence_violations_total{codec=\"h264\"} 2\n"));
+        assert!(output.contains(
+            "rushls_video_compensation_seconds_total{codec=\"h264\",method=\"gap\"} 0.25\n"
+        ));
+        assert!(output.contains(
+            "rushls_timestamp_rejections_total{code=\"audio_gap\",media_kind=\"audio\"} 1\n"
+        ));
+        assert!(output.contains("rushls_audio_repairs_total{codec=\"aac\",method=\"gap\"} 2\n"));
+        assert!(output.contains(
+            "rushls_audio_compensation_seconds_total{codec=\"aac\",method=\"gap\"} 0.5\n"
+        ));
         assert!(output.contains("# TYPE rushls_sessions_started_total counter\n"));
         assert!(output.contains("rushls_sessions_started_total 3\n"));
         assert!(output.contains("rushls_source_payload_bytes_total 1024\n"));
@@ -758,6 +834,11 @@ mod tests {
     #[test]
     fn every_way_a_hook_can_lose_an_event_is_exported_separately() {
         let output = render(&MetricsSnapshot {
+            video_intervals: Vec::new(),
+            video_compensation: Vec::new(),
+            cadence_violations: Vec::new(),
+            audio_repairs: Vec::new(),
+            timestamp_rejections: Vec::new(),
             process: ProcessSnapshot::default(),
             http: crate::observe::http::HttpSnapshot::default(),
             publication: crate::delivery::store::telemetry::PublicationTotalSnapshot::default(),
@@ -882,6 +963,11 @@ mod tests {
     #[test]
     fn process_dvr_gauges_are_labelled_by_tier() {
         let output = render(&MetricsSnapshot {
+            video_intervals: Vec::new(),
+            video_compensation: Vec::new(),
+            cadence_violations: Vec::new(),
+            audio_repairs: Vec::new(),
+            timestamp_rejections: Vec::new(),
             process: ProcessSnapshot::default(),
             http: crate::observe::http::HttpSnapshot::default(),
             publication: crate::delivery::store::telemetry::PublicationTotalSnapshot::default(),

@@ -1,18 +1,21 @@
 use crate::{
     domain::{
-        Appender, AudioTiming, Codec, DiscoveredTrack, MediaParameters, TickDuration,
-        TickTimestamp, Timebase, TimebaseProjection, TrackId,
+        Appender, AudioTiming, Codec, DiscoveredTrack, MediaKind, MediaParameters, TickDuration,
+        TickTimestamp, Timebase, TimebaseProjection, TimestampField, TimestampIssue,
+        TimestampIssueCode, TrackId,
     },
-    media::{AudioSample, NormalizeError, NormalizedSample},
+    media::{AudioSample, NormalizeError, NormalizedMedia},
     source::Packet,
 };
 
 use super::{invalid_plan, processing, project_interval, project_timestamp};
 
 pub(super) struct AudioNormalizer {
+    pub(super) recovery: super::recovery::Recovery,
     track_id: TrackId,
     codec: Codec,
     projection: TimebaseProjection,
+    timebase: Timebase,
     timestamp_tolerance: TickDuration,
     audible_start: TickTimestamp,
     frame_size: Option<TickDuration>,
@@ -30,6 +33,7 @@ impl AudioNormalizer {
     pub(super) fn new(
         track: &DiscoveredTrack,
         output_timebase: Timebase,
+        input_mode: crate::domain::InputMode,
     ) -> Result<Self, NormalizeError> {
         let MediaParameters::Audio {
             sample_rate,
@@ -45,9 +49,11 @@ impl AudioNormalizer {
             invalid_plan(format!("{} audio timestamp tolerance overflows", track.id))
         })?;
         Ok(Self {
+            recovery: super::recovery::Recovery::new(track, output_timebase, input_mode),
             track_id: track.id,
             codec: track.codec,
             projection,
+            timebase: output_timebase,
             // Enhanced RTMP Opus uses a 48 kHz clock to preserve pre-skip,
             // but its transport timestamps still have millisecond precision.
             timestamp_tolerance: if track.codec == Codec::Opus {
@@ -74,7 +80,7 @@ impl AudioNormalizer {
     pub(super) fn push(
         &mut self,
         packet: Packet,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError> {
         if self.pending_terminal.take().is_some() {
             return Err(processing(format!(
@@ -83,47 +89,11 @@ impl AudioNormalizer {
             )));
         }
         let (duration, inferred_trailing) = self.duration(&packet)?;
-        let supplied_pts = packet
-            .pts
-            .map(|pts| project_timestamp(self.projection, pts, self.track_id, "audio PTS"))
-            .transpose()?;
         let first = self.first;
-        let pts = if self.first {
-            let audible_start = project_timestamp(
-                self.projection,
-                self.audible_start,
-                self.track_id,
-                "audible start",
-            )?;
-            let leading = self.first_packet_padding(&packet)?;
-            let encoded_start = audible_start
-                .checked_sub_unsigned(leading)
-                .ok_or_else(|| processing(format!("{} audio priming overflows", self.track_id)))?;
-            if let Some(supplied) = supplied_pts {
-                self.ensure_near(supplied, encoded_start, "first audio PTS")?;
-            }
-            self.first = false;
-            encoded_start
-        } else {
-            let expected = self.next_pts.ok_or_else(|| {
-                processing(format!(
-                    "{} audio clock has no next timestamp",
-                    self.track_id
-                ))
-            })?;
-            if let Some(supplied) = supplied_pts {
-                self.ensure_near(supplied, expected, "audio PTS")?;
-            }
-            expected
-        };
-        if let Some(dts) = packet.dts {
-            let dts = project_timestamp(self.projection, dts, self.track_id, "audio DTS")?;
-            self.ensure_near(dts, pts, "audio DTS")?;
-        }
-        self.next_pts = Some(
-            pts.checked_add_unsigned(duration)
-                .ok_or_else(|| processing(format!("{} audio clock overflows", self.track_id)))?,
-        );
+        let (pts, repair) = self.packet_timing(&packet)?;
+        let next_pts = pts
+            .checked_add_unsigned(duration)
+            .ok_or_else(|| processing(format!("{} audio clock overflows", self.track_id)))?;
         let mut trim = packet.audio_trim;
         if first && trim.leading_samples == 0 {
             trim.leading_samples = self.timing.initial_padding_samples;
@@ -131,6 +101,30 @@ impl AudioNormalizer {
         if let Some(inferred) = inferred_trailing {
             trim.trailing_samples = self.terminal_trim(trim.trailing_samples, inferred)?;
         }
+        // Validate every part of the real packet before emitting any repair.
+        if self.codec == Codec::Opus && repair.is_some() {
+            let decoded = crate::media::opus::packet_samples(packet.payload.as_bytes())
+                .map_err(processing)?;
+            self.ensure_duration_near(u64::from(decoded), duration, "Opus packet duration")?;
+        }
+        if let Some(repair) = &repair {
+            out.push(NormalizedMedia::Gap(crate::media::MissingInterval {
+                track_id: self.track_id,
+                media_kind: MediaKind::Audio,
+                start: self
+                    .next_pts
+                    .ok_or_else(|| processing("gap has no prior clock"))?,
+                end: repair.end,
+                timebase: self.timebase,
+            }));
+            self.recovery.commit(repair);
+        }
+        self.next_pts = Some(next_pts);
+        self.first = false;
+        self.recovery
+            .real_audio(duration.saturating_sub(
+                u64::from(trim.leading_samples) + u64::from(trim.trailing_samples),
+            ));
         let sample = AudioSample {
             track_id: self.track_id,
             codec: self.codec,
@@ -142,14 +136,104 @@ impl AudioNormalizer {
         if inferred_trailing.is_some() {
             self.pending_terminal = Some(sample);
         } else {
-            out.push(NormalizedSample::Audio(sample));
+            out.push(NormalizedMedia::Audio(sample));
         }
         Ok(())
     }
 
-    pub(super) fn finish(&mut self, out: &mut dyn Appender<NormalizedSample>) {
+    fn packet_timing(
+        &self,
+        packet: &Packet,
+    ) -> Result<(TickTimestamp, Option<super::recovery::Repair>), NormalizeError> {
+        let supplied_pts = packet
+            .pts
+            .map(|pts| project_timestamp(self.projection, pts, self.track_id, "audio PTS"))
+            .transpose()?;
+        let supplied_dts = packet
+            .dts
+            .map(|dts| project_timestamp(self.projection, dts, self.track_id, "audio DTS"))
+            .transpose()?;
+        let first = self.first;
+        let mut repair = None;
+        let pts = if self.first {
+            let audible_start = project_timestamp(
+                self.projection,
+                self.audible_start,
+                self.track_id,
+                "audible start",
+            )?;
+            let leading = self.first_packet_padding(packet)?;
+            let encoded_start = audible_start
+                .checked_sub_unsigned(leading)
+                .ok_or_else(|| processing(format!("{} audio priming overflows", self.track_id)))?;
+            if let Some(supplied) = supplied_pts {
+                self.ensure_near(
+                    supplied,
+                    encoded_start,
+                    TimestampField::Pts,
+                    TimestampIssueCode::InitialTimestampMismatch,
+                )?;
+            }
+            encoded_start
+        } else {
+            let expected = self.next_pts.ok_or_else(|| {
+                processing(format!(
+                    "{} audio clock has no next timestamp",
+                    self.track_id
+                ))
+            })?;
+            if let Some(supplied) = supplied_pts {
+                // A contradictory DTS is malformed timing, not missing audio
+                // that a codec-specific repair can safely replace.
+                if i128::from(supplied) - i128::from(expected)
+                    > i128::from(self.timestamp_tolerance)
+                    && let Some(dts) = supplied_dts
+                {
+                    self.ensure_near(
+                        dts,
+                        supplied,
+                        TimestampField::Dts,
+                        TimestampIssueCode::AudioDtsMismatch,
+                    )?;
+                }
+                let code = if supplied > expected {
+                    TimestampIssueCode::AudioGap
+                } else {
+                    TimestampIssueCode::TimestampOverlap
+                };
+                if let Err(mut error) =
+                    self.ensure_near(supplied, expected, TimestampField::Pts, code)
+                {
+                    if code != TimestampIssueCode::AudioGap {
+                        return Err(error);
+                    }
+                    match self.recovery.prepare(expected, supplied) {
+                        Ok(prepared) => repair = Some(prepared),
+                        Err(reason) => {
+                            if let NormalizeError::Timestamp(issue) = &mut error {
+                                issue.recovery_rejection = Some(reason);
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            repair.as_ref().map_or(expected, |repair| repair.end)
+        };
+        if let Some(dts) = supplied_dts {
+            let code = if first {
+                TimestampIssueCode::InitialTimestampMismatch
+            } else {
+                TimestampIssueCode::AudioDtsMismatch
+            };
+            self.ensure_near(dts, pts, TimestampField::Dts, code)?;
+        }
+        Ok((pts, repair))
+    }
+
+    pub(super) fn finish(&mut self, out: &mut dyn Appender<NormalizedMedia>) {
         if let Some(sample) = self.pending_terminal.take() {
-            out.push(NormalizedSample::Audio(sample));
+            out.push(NormalizedMedia::Audio(sample));
         }
     }
 
@@ -236,16 +320,30 @@ impl AudioNormalizer {
         &self,
         actual: TickTimestamp,
         expected: TickTimestamp,
-        field: &'static str,
+        field: TimestampField,
+        code: TimestampIssueCode,
     ) -> Result<(), NormalizeError> {
         let distance = i128::from(actual)
             .checked_sub(i128::from(expected))
             .map_or(u128::MAX, i128::unsigned_abs);
         if distance > u128::from(self.timestamp_tolerance) {
-            return Err(processing(format!(
-                "{} {field} discontinuity: expected {expected}, got {actual}",
-                self.track_id
-            )));
+            return Err(NormalizeError::Timestamp(Box::new(TimestampIssue {
+                cadence: None,
+                recovery_rejection: None,
+                code,
+                track: self.track_id,
+                media_kind: MediaKind::Audio,
+                codec: self.codec,
+                field,
+                reference: i128::from(expected),
+                actual: i128::from(actual),
+                timebase: self.timebase,
+                tolerance_ticks: Some(self.timestamp_tolerance),
+                maximum: None,
+                // The difference between two i64 timestamps always fits u64.
+                missing_ticks: (code == TimestampIssueCode::AudioGap)
+                    .then(|| actual.abs_diff(expected)),
+            })));
         }
         Ok(())
     }

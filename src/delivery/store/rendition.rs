@@ -236,6 +236,10 @@ pub struct RenditionState {
     published: Arc<RenditionView>,
 }
 
+// hls.js 1.7.3 treats MSN zero as absent during part eviction checks. Starting
+// at one is legal HLS and avoids repeated part loads without changing media time.
+const INITIAL_MEDIA_SEQUENCE: u64 = 1;
+
 impl RenditionState {
     /// `contract` is supplied rather than derived: its target duration is a
     /// presentation-wide value that one descriptor cannot know.
@@ -251,7 +255,7 @@ impl RenditionState {
             media_kind: descriptor.media.kind(),
             config: Some(descriptor.config),
             contract,
-            media_sequence: 0,
+            media_sequence: INITIAL_MEDIA_SEQUENCE,
             discontinuity_sequence: 0,
             initializations: Arc::from([]),
             segments: PublishedSegments::default(),
@@ -286,9 +290,9 @@ impl RenditionState {
             open_segment: None,
             retained_payload_bytes: 0,
             retained_disk_bytes: 0,
-            next_msn: 0,
+            next_msn: INITIAL_MEDIA_SEQUENCE,
             next_iframe_msn: 0,
-            media_sequence: 0,
+            media_sequence: INITIAL_MEDIA_SEQUENCE,
             discontinuity_sequence: 0,
             last_parent_publication: None,
             issued_segments: 0,
@@ -440,7 +444,7 @@ impl RenditionState {
             }
             PackagedMedia::Chunk(chunk) => memory_len(chunk.payload.len(), gzip),
             PackagedMedia::Segment(segment) => memory_len(segment.payload.len(), gzip),
-            PackagedMedia::SegmentCompleted(_) => 0,
+            PackagedMedia::SegmentCompleted(_) | PackagedMedia::Gap(_) => 0,
         })
     }
 
@@ -481,6 +485,32 @@ impl RenditionState {
                 self.require_permitted_segment(
                     config.timebase.ticks_to_duration(segment.duration),
                 )?;
+            }
+            PackagedMedia::Gap(gap) => {
+                let config = self.require_media_ready()?;
+                if self.open_segment.is_some() {
+                    return Err(StoreWriteError::DirectSegmentDuringOpenSegment { rendition_id });
+                }
+                self.require_next_packaging_segment_id(gap.packaging_segment_id)?;
+                self.require_permitted_segment(config.timebase.ticks_to_duration(gap.duration))?;
+                let total = gap.parts.iter().try_fold(0_u64, |sum, duration| {
+                    if *duration == 0
+                        || config
+                            .chunk_target
+                            .is_some_and(|target| *duration > target.get())
+                    {
+                        None
+                    } else {
+                        sum.checked_add(*duration)
+                    }
+                });
+                if gap.duration == 0
+                    || gap.media_start.checked_add_unsigned(gap.duration).is_none()
+                    || (config.chunk_target.is_some() && total != Some(gap.duration))
+                    || (config.chunk_target.is_none() && !gap.parts.is_empty())
+                {
+                    return Err(StoreWriteError::SegmentTimingMismatch { rendition_id });
+                }
             }
             PackagedMedia::SegmentCompleted(completion) => {
                 let config = self.require_media_ready()?;
@@ -667,7 +697,91 @@ impl RenditionState {
             PackagedMedia::SegmentCompleted(completion) => {
                 self.complete_segment(completion, now, retention);
             }
+            PackagedMedia::Gap(gap) => self.push_gap(publication, &gap, now, retention),
         }
+    }
+
+    fn push_gap(
+        &mut self,
+        publication: u64,
+        gap: &crate::mux::PackagedGap,
+        now: Instant,
+        retention: RetentionPolicy,
+    ) {
+        let config = self.require_config().expect("validated configuration");
+        // Reuse part identity/retention bookkeeping, never the abandoned-parent
+        // operation: that operation replaces media and substitutes a target duration.
+        let mut start = gap.media_start;
+        for (index, duration) in gap.parts.iter().copied().enumerate() {
+            self.push_chunk(
+                publication,
+                PackagedChunk {
+                    rendition_id: gap.rendition_id,
+                    packaging_segment_id: gap.packaging_segment_id,
+                    chunk_index: u32::try_from(index).expect("bounded gap part count"),
+                    media_start: start,
+                    duration,
+                    independent: false,
+                    payload: Payload::default(),
+                },
+                None,
+                now,
+                retention,
+            );
+            let open = self.open_segment.as_mut().expect("gap opened parent");
+            let part = open.parts.last_mut().expect("gap appended part");
+            Arc::make_mut(part).gap = true;
+            self.part_resources
+                .get_mut(&part.id)
+                .expect("gap resource exists")
+                .part = Arc::clone(part);
+            start = start
+                .checked_add_unsigned(duration)
+                .expect("validated gap span");
+        }
+        let (id, msn, discontinuity_before, parts) = if let Some(open) = self.open_segment.take() {
+            (open.id, open.msn, open.discontinuity_before, open.parts)
+        } else {
+            self.issued_segments = self.issued_segments.saturating_add(1);
+            (
+                SegmentId(self.issued_segments),
+                Msn(self.next_msn),
+                self.opens_discontinuity(publication),
+                Vec::new(),
+            )
+        };
+        for part in &parts {
+            self.part_resources
+                .get_mut(&part.id)
+                .expect("gap resource exists")
+                .parent_retained = true;
+        }
+        self.last_parent_publication = Some(publication);
+        self.gaps += 1;
+        self.publication_totals.0.lock().gaps += 1;
+        self.bitrate.break_contiguity();
+        let segment = StoredSegment {
+            iframe_msn: 0,
+            iframes: [].into(),
+            id,
+            msn,
+            publication,
+            initialization: self
+                .current_initialization
+                .expect("validated initialization"),
+            media_start: gap.media_start,
+            duration: gap.duration,
+            timebase: config.timebase,
+            independent: false,
+            discontinuity_before,
+            kind: StoredSegmentKind::GapParts(parts.into()),
+            gzip: None,
+        };
+        self.advance_playlist(
+            gap.packaging_segment_id,
+            config.timebase.ticks_to_duration(gap.duration),
+        );
+        self.insert_segment(segment, now, retention);
     }
 
     fn set_initialization(&mut self, segment: InitializationSegment, gzip: Option<Payload>) {
@@ -731,6 +845,7 @@ impl RenditionState {
         };
         let id = PartId(self.issued_parts);
         let part = Arc::new(StoredPart {
+            gap: false,
             id,
             cursor,
             publication,
@@ -1304,7 +1419,8 @@ impl RenditionState {
         self.spilling.remove(&id);
         self.release_publication(resource.segment.publication);
         self.unpick_visible_parts(resource.segment.msn);
-        if let StoredSegmentKind::Media(SegmentBody::Chunked(chunk_parts)) = &resource.segment.kind
+        if let StoredSegmentKind::Media(SegmentBody::Chunked(chunk_parts))
+        | StoredSegmentKind::GapParts(chunk_parts) = &resource.segment.kind
         {
             for part in chunk_parts.iter() {
                 match parts {
@@ -1494,7 +1610,12 @@ impl RenditionState {
     pub fn memory_resident_segments(&self) -> usize {
         self.segment_resources
             .values()
-            .filter(|resource| segment_holds_memory(&resource.segment))
+            .filter(|resource| {
+                matches!(
+                    resource.segment.kind,
+                    StoredSegmentKind::Gap | StoredSegmentKind::GapParts(_)
+                ) || segment_holds_memory(&resource.segment)
+            })
             .count()
     }
 
@@ -1599,7 +1720,8 @@ impl RenditionState {
                 }
             }
             StoredSegmentKind::Media(SegmentBody::Contiguous(HeldBytes::Disk(_)))
-            | StoredSegmentKind::Gap => return None,
+            | StoredSegmentKind::Gap
+            | StoredSegmentKind::GapParts(_) => return None,
         }
         if objects.is_empty() {
             return None;
@@ -1763,14 +1885,16 @@ fn segment_holds_memory(segment: &StoredSegment) -> bool {
         StoredSegmentKind::Media(SegmentBody::Chunked(parts)) => {
             parts.iter().any(|part| part.payload.is_memory())
         }
-        StoredSegmentKind::Gap => false,
+        StoredSegmentKind::Gap | StoredSegmentKind::GapParts(_) => false,
     }
 }
 
 fn unlink_segment_files(segment: &StoredSegment) {
     match &segment.kind {
         StoredSegmentKind::Media(SegmentBody::Contiguous(held)) => held.unlink_disk(),
-        StoredSegmentKind::Media(SegmentBody::Chunked(_)) | StoredSegmentKind::Gap => {}
+        StoredSegmentKind::Media(SegmentBody::Chunked(_))
+        | StoredSegmentKind::Gap
+        | StoredSegmentKind::GapParts(_) => {}
     }
     if let Some(gzip) = &segment.gzip {
         gzip.unlink_disk();

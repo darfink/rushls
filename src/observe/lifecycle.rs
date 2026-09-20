@@ -1,6 +1,6 @@
 //! The small set of facts this node promises to anyone outside the process.
 //!
-//! [`SessionEvent`] is internal: fifteen variants, free to change with the
+//! [`SessionEvent`] is internal and free to change with the
 //! pipeline that emits them. What a webhook consumer subscribes to must not be.
 //! So this is a *projection* rather than a rename — [`Projector::project`] is
 //! the one place where an internal event becomes public, or deliberately does
@@ -37,6 +37,10 @@ pub enum Kind {
     /// A publisher was admitted and registered.
     #[display("session.started")]
     SessionStarted,
+    #[display("session.degraded")]
+    SessionDegraded,
+    #[display("session.recovered")]
+    SessionRecovered,
     /// The stream can be played.
     #[display("stream.available")]
     StreamAvailable,
@@ -50,8 +54,10 @@ pub enum Kind {
 
 impl Kind {
     /// Every kind, so a subscription list can be validated against one place.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::SessionStarted,
+        Self::SessionDegraded,
+        Self::SessionRecovered,
         Self::StreamAvailable,
         Self::StreamUnavailable,
         Self::SessionEnded,
@@ -149,6 +155,7 @@ pub struct StreamUnavailable {
 /// A publisher stopped.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionEnded {
+    pub compensation: Vec<crate::domain::CompensationStatus>,
     pub stream: StreamId,
     pub session: SessionId,
     pub principal: String,
@@ -169,11 +176,22 @@ pub struct SessionEnded {
     /// error types and changes with them. Anything a consumer branches on
     /// belongs in [`Self::outcome`].
     pub diagnostic: Option<String>,
+    /// Stable, machine-readable timing failure, when one ended this session.
+    pub timestamp_issue: Option<Box<crate::domain::TimestampIssue>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRecovery {
+    pub stream: StreamId,
+    pub session: SessionId,
+    pub status: crate::domain::CompensationStatus,
 }
 
 /// One public fact about a stream or one of its publishers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
+    SessionDegraded(SessionRecovery),
+    SessionRecovered(SessionRecovery),
     SessionStarted(SessionStarted),
     StreamAvailable(StreamAvailable),
     StreamUnavailable(StreamUnavailable),
@@ -184,6 +202,8 @@ impl Event {
     pub fn kind(&self) -> Kind {
         match self {
             Self::SessionStarted(_) => Kind::SessionStarted,
+            Self::SessionDegraded(_) => Kind::SessionDegraded,
+            Self::SessionRecovered(_) => Kind::SessionRecovered,
             Self::StreamAvailable(_) => Kind::StreamAvailable,
             Self::StreamUnavailable(_) => Kind::StreamUnavailable,
             Self::SessionEnded(_) => Kind::SessionEnded,
@@ -196,6 +216,7 @@ impl Event {
     pub fn stream(&self) -> &StreamId {
         match self {
             Self::SessionStarted(event) => &event.stream,
+            Self::SessionDegraded(event) | Self::SessionRecovered(event) => &event.stream,
             Self::StreamAvailable(event) => &event.stream,
             Self::StreamUnavailable(event) => &event.stream,
             Self::SessionEnded(event) => &event.stream,
@@ -209,6 +230,7 @@ impl Event {
     pub fn session(&self) -> Option<SessionId> {
         match self {
             Self::SessionStarted(event) => Some(event.session),
+            Self::SessionDegraded(event) | Self::SessionRecovered(event) => Some(event.session),
             Self::SessionEnded(event) => Some(event.session),
             Self::StreamAvailable(_) | Self::StreamUnavailable(_) => None,
         }
@@ -231,6 +253,7 @@ pub struct Projector {
 
 #[derive(Debug)]
 struct Tracked {
+    compensation: Vec<crate::domain::CompensationStatus>,
     stream: StreamId,
     principal: String,
     publisher: crate::domain::PublisherContext,
@@ -277,6 +300,7 @@ impl Projector {
                 live.insert(
                     session,
                     Tracked {
+                        compensation: Vec::new(),
                         stream: stream.clone(),
                         principal: principal.clone(),
                         publisher: publisher.clone(),
@@ -291,6 +315,34 @@ impl Projector {
                     publisher: publisher.clone(),
                 }))
             }
+            SessionEvent::Compensation { notice } => {
+                let mut live = self.live.lock();
+                let tracked = live.get_mut(&session)?;
+                if let Some(status) = tracked
+                    .compensation
+                    .iter_mut()
+                    .find(|status| status.track == notice.status.track)
+                {
+                    *status = notice.status.clone();
+                } else {
+                    tracked.compensation.push(notice.status.clone());
+                }
+                let event = SessionRecovery {
+                    stream: tracked.stream.clone(),
+                    session,
+                    status: notice.status.clone(),
+                };
+                match notice.transition {
+                    crate::domain::RecoveryTransition::Degraded
+                    | crate::domain::RecoveryTransition::Unavailable => {
+                        Some(Event::SessionDegraded(event))
+                    }
+                    crate::domain::RecoveryTransition::Recovered => {
+                        Some(Event::SessionRecovered(event))
+                    }
+                    crate::domain::RecoveryTransition::Compensated => None,
+                }
+            }
             SessionEvent::Running => {
                 // Recorded but not reported. Whether *viewers* can play is the
                 // store's answer, not the pipeline's, and it is reported
@@ -300,10 +352,17 @@ impl Projector {
                 self.live.lock().get_mut(&session)?.reached_running = true;
                 None
             }
-            SessionEvent::Ended { end } => self.finish(session, (*end).into(), None),
-            SessionEvent::Failed { reason, .. } => {
-                self.finish(session, Outcome::Failed, Some(reason.clone()))
-            }
+            SessionEvent::Ended { end } => self.finish(session, (*end).into(), None, None),
+            SessionEvent::Failed {
+                reason,
+                timestamp_issue,
+                ..
+            } => self.finish(
+                session,
+                Outcome::Failed,
+                Some(reason.clone()),
+                timestamp_issue.clone(),
+            ),
             // Everything else is pipeline detail. Listed as a catch-all rather
             // than variant by variant on purpose: a new internal event must be
             // added here deliberately to become public, and stays private until
@@ -325,9 +384,11 @@ impl Projector {
         session: SessionId,
         outcome: Outcome,
         diagnostic: Option<String>,
+        timestamp_issue: Option<Box<crate::domain::TimestampIssue>>,
     ) -> Option<Event> {
         let tracked = self.live.lock().remove(&session)?;
         Some(Event::SessionEnded(SessionEnded {
+            compensation: tracked.compensation,
             stream: tracked.stream,
             session,
             principal: tracked.principal,
@@ -336,6 +397,7 @@ impl Projector {
             duration: Instant::now().saturating_duration_since(tracked.started_at),
             was_available: tracked.reached_running,
             diagnostic,
+            timestamp_issue,
         }))
     }
 }
@@ -394,6 +456,7 @@ mod tests {
         let ended = projector.project(
             session,
             &SessionEvent::Failed {
+                timestamp_issue: None,
                 segmentation: None,
                 reason: "the input delivered nothing for 5s".into(),
             },

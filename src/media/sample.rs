@@ -1,18 +1,30 @@
 use crate::domain::{
-    AudioTrim, Codec, Payload, SubtitlePosition, TickDuration, TickTimestamp, TrackId,
-    WebVttCueMetadata,
+    AudioTrim, Codec, MediaKind, Payload, SubtitlePosition, TickDuration, TickTimestamp, Timebase,
+    TrackId, WebVttCueMetadata,
 };
 
-/// An access unit normalized onto its calibrated track-local timeline.
+/// An access unit or missing interval on its calibrated track-local timeline.
 ///
 /// PTS, DTS, and duration use the corresponding
 /// [`TrackTimeline::timebase`](super::TrackTimeline); they are not implicitly
 /// expressed in a global or canonical timebase.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum NormalizedSample {
+pub enum NormalizedMedia {
     Video(VideoSample),
     Audio(AudioSample),
     Subtitle(SubtitleSample),
+    Gap(MissingInterval),
+}
+
+/// Explicit absence on a calibrated track clock. End is exclusive.
+/// This is ordered with real samples but never passed to a codec writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MissingInterval {
+    pub track_id: TrackId,
+    pub media_kind: MediaKind,
+    pub start: TickTimestamp,
+    pub end: TickTimestamp,
+    pub timebase: Timebase,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,19 +59,22 @@ pub struct SubtitleSample {
     pub payload: Payload,
 }
 
-impl NormalizedSample {
+impl NormalizedMedia {
     pub fn track_id(&self) -> TrackId {
         match self {
             Self::Video(sample) => sample.track_id,
             Self::Audio(sample) => sample.track_id,
             Self::Subtitle(sample) => sample.track_id,
+            Self::Gap(gap) => gap.track_id,
         }
     }
 
     pub fn random_access(&self) -> bool {
         match self {
             Self::Video(sample) => sample.random_access,
-            // Every audio access unit and subtitle cue is independently enterable.
+            Self::Gap(_) => false,
+            // Audio packet boundaries permit ordinary segmentation. The packager
+            // checks decoder history before claiming part independence.
             Self::Audio(_) | Self::Subtitle(_) => true,
         }
     }
@@ -69,6 +84,7 @@ impl NormalizedSample {
             Self::Video(sample) => sample.pts,
             Self::Audio(sample) => sample.pts,
             Self::Subtitle(sample) => sample.pts,
+            Self::Gap(gap) => gap.start,
         }
     }
 
@@ -77,6 +93,7 @@ impl NormalizedSample {
             Self::Video(sample) => sample.duration,
             Self::Audio(sample) => sample.duration,
             Self::Subtitle(sample) => sample.duration,
+            Self::Gap(gap) => gap.end.abs_diff(gap.start),
         }
     }
 
@@ -84,6 +101,7 @@ impl NormalizedSample {
         match self {
             Self::Video(sample) => sample.payload.len(),
             Self::Audio(sample) => sample.payload.len(),
+            Self::Gap(_) => 0,
             Self::Subtitle(sample) => sample
                 .payload
                 .len()
@@ -109,7 +127,7 @@ mod tests {
 
     #[test]
     fn audio_and_subtitles_are_intrinsically_random_access() {
-        let audio = NormalizedSample::Audio(AudioSample {
+        let audio = NormalizedMedia::Audio(AudioSample {
             track_id: TrackId(1),
             codec: Codec::Aac,
             pts: 90_000,
@@ -117,7 +135,7 @@ mod tests {
             trim: AudioTrim::default(),
             payload: Payload::default(),
         });
-        let subtitle = NormalizedSample::Subtitle(SubtitleSample {
+        let subtitle = NormalizedMedia::Subtitle(SubtitleSample {
             track_id: TrackId(2),
             codec: Codec::WebVtt,
             pts: 90_000,
@@ -133,7 +151,7 @@ mod tests {
 
     #[test]
     fn video_preserves_its_random_access_marker() {
-        let video = NormalizedSample::Video(VideoSample {
+        let video = NormalizedMedia::Video(VideoSample {
             track_id: TrackId(0),
             codec: Codec::H264,
             pts: 90_000,

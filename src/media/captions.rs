@@ -291,6 +291,8 @@ mod tests {
         extradata: Vec<u8>,
     ) -> DiscoveredTrack {
         DiscoveredTrack {
+            decoder_config_origin: crate::domain::DecoderConfigOrigin::Publisher,
+            video_cadence: crate::domain::VideoCadence::Unknown,
             id: TrackId(id),
             source_key: None,
             codec,

@@ -43,9 +43,18 @@ pub async fn publish_many_halves(
     secs: &[u64],
 ) -> Result<ChurnOutcome, Box<dyn std::error::Error + Send + Sync>> {
     if files.is_empty() || files.len() != secs.len() {
-        return Err(format!("churn needs one duration per file, got {} files and {} durations", files.len(), secs.len()).into());
+        return Err(format!(
+            "churn needs one duration per file, got {} files and {} durations",
+            files.len(),
+            secs.len()
+        )
+        .into());
     }
-    let rig = TestRig::start(work.archive(), "{publication}/{rendition}_{segment}.mp4", cfg)?;
+    let rig = TestRig::start(
+        work.archive(),
+        "{publication}/{rendition}_{segment}.mp4",
+        cfg,
+    )?;
     let mut sessions = Vec::new();
     for (index, (file, s)) in files.iter().zip(secs.iter()).enumerate() {
         let bytes = std::fs::read(file)?;
@@ -57,14 +66,21 @@ pub async fn publish_many_halves(
         sessions.push(session);
     }
     let drained = rig.drain_and_collect().await?;
-    let last = sessions.last().copied().ok_or("churn published no sessions")?;
+    let last = sessions
+        .last()
+        .copied()
+        .ok_or("churn published no sessions")?;
     let outcome = RecordOutcome {
         session: last,
         node_events: drained.node_events,
         recording_lost: drained.recording_lost,
         files: drained.files,
     };
-    Ok(ChurnOutcome { outcome, sessions, secs: secs.to_vec() })
+    Ok(ChurnOutcome {
+        outcome,
+        sessions,
+        secs: secs.to_vec(),
+    })
 }
 
 /// Publish both halves back to back into one archive.
@@ -78,13 +94,24 @@ pub async fn publish_two_halves(
 ) -> Result<ReconnectOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let files = vec![ts_a.to_path_buf(), ts_b.to_path_buf()];
     let c = publish_many_halves(cfg, work, &files, &[secs_a, secs_b]).await?;
-    Ok(ReconnectOutcome { outcome: c.outcome, first: c.sessions[0], second: c.sessions[1], secs_a, secs_b })
+    Ok(ReconnectOutcome {
+        outcome: c.outcome,
+        first: c.sessions[0],
+        second: c.sessions[1],
+        secs_a,
+        secs_b,
+    })
 }
 
 /// The archive must hold every session whole: exactly one publication prefix
 /// per session, contiguous segments from zero under each, and combined plus
 /// per-publication frame totals matching the synthetic sources.
-pub fn verify_many_halves(cfg: &E2eConfig, work: &WorkDir, outcome: &RecordOutcome, secs: &[u64]) -> TestResult {
+pub fn verify_many_halves(
+    cfg: &E2eConfig,
+    work: &WorkDir,
+    outcome: &RecordOutcome,
+    secs: &[u64],
+) -> TestResult {
     let n = secs.len();
     for event in &outcome.node_events {
         let msg = format!("{event:?}");
@@ -111,16 +138,26 @@ pub fn verify_many_halves(cfg: &E2eConfig, work: &WorkDir, outcome: &RecordOutco
         by_rendition.entry(key).or_default().push(seg);
     }
     if publications.len() != n {
-        return Err(format!("expected exactly {n} publication prefixes, found {}: {publications:?}", publications.len()).into());
+        return Err(format!(
+            "expected exactly {n} publication prefixes, found {}: {publications:?}",
+            publications.len()
+        )
+        .into());
     }
     for (rendition, segs) in &mut by_rendition {
         segs.sort_unstable();
         for (i, seg) in segs.iter().enumerate() {
             if *seg != i as u64 {
-                return Err(format!("rendition {rendition}: gap, expected segment {i}, found {seg}").into());
+                return Err(format!(
+                    "rendition {rendition}: gap, expected segment {i}, found {seg}"
+                )
+                .into());
             }
         }
-        eprintln!("record e2e churn: rendition {rendition}: {} segments", segs.len());
+        eprintln!(
+            "record e2e churn: rendition {rendition}: {} segments",
+            segs.len()
+        );
     }
 
     // Per-file probe plus full decode, summed overall and per publication.
@@ -159,7 +196,9 @@ pub fn verify_many_halves(cfg: &E2eConfig, work: &WorkDir, outcome: &RecordOutco
     for (index, (g, w)) in got.iter().zip(want.iter()).enumerate() {
         eprintln!("record e2e churn: publication {index}: video frames {g} vs expected {w}");
         if *g + slack < *w || *g > *w + slack {
-            return Err(format!("publication {index}: video frames {g} far from expected {w}").into());
+            return Err(
+                format!("publication {index}: video frames {g} far from expected {w}").into(),
+            );
         }
     }
     eprintln!("record e2e churn: video frames {video_frames} total");
@@ -168,18 +207,31 @@ pub fn verify_many_halves(cfg: &E2eConfig, work: &WorkDir, outcome: &RecordOutco
     // the per-session ceilings with positive slack that grows with the count.
     if audio_frames > 0 || audio_sr > 0 {
         let sr = if audio_sr > 0 { audio_sr } else { 48_000 };
-        let expected_audio: u64 = secs.iter().map(|s| (u64::from(sr) * s).div_ceil(1024)).sum();
+        let expected_audio: u64 = secs
+            .iter()
+            .map(|s| (u64::from(sr) * s).div_ceil(1024))
+            .sum();
         eprintln!("record e2e churn: audio frames {audio_frames} vs expected {expected_audio}");
         if audio_frames + 2 < expected_audio {
-            return Err(format!("audio frame total {audio_frames} below expected {expected_audio}").into());
+            return Err(format!(
+                "audio frame total {audio_frames} below expected {expected_audio}"
+            )
+            .into());
         }
         if audio_frames > expected_audio + 4 * n as u64 + 4 {
-            return Err(format!("audio frame total {audio_frames} far above expected {expected_audio}").into());
+            return Err(format!(
+                "audio frame total {audio_frames} far above expected {expected_audio}"
+            )
+            .into());
         }
     } else {
         eprintln!("record e2e churn: no audio renditions found; skipping audio total");
     }
-    eprintln!("record e2e churn: PASS ({} files, {} renditions, {n} publications)", outcome.files.len(), by_rendition.len());
+    eprintln!(
+        "record e2e churn: PASS ({} files, {} renditions, {n} publications)",
+        outcome.files.len(),
+        by_rendition.len()
+    );
     Ok(())
 }
 

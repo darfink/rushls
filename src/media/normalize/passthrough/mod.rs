@@ -6,13 +6,16 @@ use crate::{
         TimebaseProjection, TrackId,
     },
     media::{
-        MediaNormalizer, NormalizeError, NormalizedSample, NormalizerFactory, PresentationPlan,
+        MediaNormalizer, NormalizeError, NormalizedMedia, NormalizerFactory, PresentationPlan,
         StartedNormalizer, TimelineCalibration, TrackTimeline,
     },
     source::Packet,
 };
 
 mod audio;
+mod cadence;
+mod compensation;
+pub(crate) mod recovery;
 mod subtitle;
 mod video;
 
@@ -29,6 +32,7 @@ impl NormalizerFactory for PassThroughNormalizerFactory {
         &self,
         presentation: &PresentationPlan,
         timeline: &TimelineCalibration,
+        input_mode: crate::domain::InputMode,
     ) -> Result<StartedNormalizer, NormalizeError> {
         let mut tracks = Vec::with_capacity(presentation.tracks().len());
         let mut projected_timelines = Vec::with_capacity(presentation.tracks().len());
@@ -48,11 +52,18 @@ impl NormalizerFactory for PassThroughNormalizerFactory {
             let projection = TimebaseProjection::new(track.timebase, output_timebase);
 
             let mut projected = track.clone();
+            projected.video_cadence = if track.video_cadence == crate::domain::VideoCadence::Unknown
+            {
+                crate::media::cadence::inspect(track)
+            } else {
+                track.video_cadence
+            };
             projected.timebase = output_timebase;
             projected.first_pts = track
                 .first_pts
                 .map(|pts| project_timestamp(projection, pts, track.id, "first PTS"))
                 .transpose()?;
+            let cadence = projected.video_cadence;
             tracks.push(projected);
             projected_timelines.push(TrackTimeline {
                 track_id: track.id,
@@ -64,7 +75,12 @@ impl NormalizerFactory for PassThroughNormalizerFactory {
                     "presentation origin",
                 )?,
             });
-            normalizers.push(TrackNormalizer::new(track, output_timebase)?);
+            normalizers.push(TrackNormalizer::new(
+                track,
+                output_timebase,
+                input_mode,
+                cadence,
+            )?);
         }
 
         let presentation = presentation
@@ -108,10 +124,43 @@ struct PassThroughNormalizer {
 }
 
 impl MediaNormalizer for PassThroughNormalizer {
+    fn take_video_intervals(&mut self) -> Vec<crate::domain::VideoTimestampObservation> {
+        let mut observations = Vec::new();
+        for track in &mut self.tracks {
+            if let TrackNormalizer::Video(video) = track {
+                observations.append(&mut video.observations);
+            }
+        }
+        observations
+    }
+    #[cfg(test)]
+    fn configure_audio_recovery(
+        &mut self,
+        policy: recovery::AudioRecoveryPolicy,
+    ) -> Result<(), NormalizeError> {
+        for track in &mut self.tracks {
+            if let TrackNormalizer::Audio(audio) = track {
+                audio.recovery.configure(policy)?;
+            }
+        }
+        Ok(())
+    }
+    fn take_notices(&mut self) -> Vec<crate::domain::NormalizationNotice> {
+        let mut notices = Vec::new();
+        for track in &mut self.tracks {
+            if let TrackNormalizer::Audio(audio) = track {
+                notices.append(&mut audio.recovery.notices);
+            } else if let TrackNormalizer::Video(video) = track {
+                notices.append(&mut video.cadence.notices);
+            }
+        }
+        notices
+    }
+
     fn push(
         &mut self,
         packet: Packet,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError> {
         if self.finished {
             return Err(processing("a packet arrived after normalization finished"));
@@ -124,7 +173,7 @@ impl MediaNormalizer for PassThroughNormalizer {
         track.push(packet, out)
     }
 
-    fn finish(&mut self, out: &mut dyn Appender<NormalizedSample>) -> Result<(), NormalizeError> {
+    fn finish(&mut self, out: &mut dyn Appender<NormalizedMedia>) -> Result<(), NormalizeError> {
         if self.finished {
             return Ok(());
         }
@@ -139,17 +188,24 @@ impl MediaNormalizer for PassThroughNormalizer {
 }
 
 enum TrackNormalizer {
-    Audio(AudioNormalizer),
+    Audio(Box<AudioNormalizer>),
     Subtitle(SubtitleNormalizer),
     Video(Box<VideoNormalizer>),
 }
 
 impl TrackNormalizer {
-    fn new(track: &DiscoveredTrack, output_timebase: Timebase) -> Result<Self, NormalizeError> {
+    fn new(
+        track: &DiscoveredTrack,
+        output_timebase: Timebase,
+        input_mode: crate::domain::InputMode,
+        cadence: crate::domain::VideoCadence,
+    ) -> Result<Self, NormalizeError> {
         match track.parameters {
-            MediaParameters::Audio { .. } => {
-                Ok(Self::Audio(AudioNormalizer::new(track, output_timebase)?))
-            }
+            MediaParameters::Audio { .. } => Ok(Self::Audio(Box::new(AudioNormalizer::new(
+                track,
+                output_timebase,
+                input_mode,
+            )?))),
             MediaParameters::Subtitle => Ok(Self::Subtitle(SubtitleNormalizer::new(
                 track,
                 output_timebase,
@@ -163,6 +219,8 @@ impl TrackNormalizer {
                 output_timebase,
                 frame_rate,
                 video_delay,
+                input_mode,
+                cadence,
             )?))),
         }
     }
@@ -178,7 +236,7 @@ impl TrackNormalizer {
     fn push(
         &mut self,
         packet: Packet,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError> {
         match self {
             Self::Audio(track) => track.push(packet, out),
@@ -187,7 +245,7 @@ impl TrackNormalizer {
         }
     }
 
-    fn finish(&mut self, out: &mut dyn Appender<NormalizedSample>) -> Result<(), NormalizeError> {
+    fn finish(&mut self, out: &mut dyn Appender<NormalizedMedia>) -> Result<(), NormalizeError> {
         match self {
             Self::Audio(track) => {
                 track.finish(out);

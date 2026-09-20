@@ -98,10 +98,17 @@ fn a_live_playlist_states_its_terms_before_any_media() -> Result<(), Box<dyn std
             "#EXT-X-TARGETDURATION:6",
             "#EXT-X-SERVER-CONTROL:HOLD-BACK=18,PART-HOLD-BACK=3.000001,CAN-BLOCK-RELOAD=YES,CAN-SKIP-UNTIL=36",
             "#EXT-X-PART-INF:PART-TARGET=1",
-            "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXT-X-MEDIA-SEQUENCE:1",
         ],
         "the target, the part target, and the hold-backs all come from the \
          locked plan, so they are known before a single segment exists"
+    );
+    assert!(!rendered.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
+    let master = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?
+        .ok_or("missing master")?;
+    assert!(
+        !master.contains("#EXT-X-INDEPENDENT-SEGMENTS"),
+        "cached video-only masters cannot promise independence before future gaps"
     );
     assert!(
         !rendered.contains("CAN-SKIP-DATERANGES"),
@@ -198,7 +205,7 @@ fn a_departed_discontinuity_survives_as_a_sequence_number() -> Result<(), Box<dy
 
     let rendered = render(&second, 0, &policy())?;
 
-    assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:2\n"));
+    assert!(rendered.contains("#EXT-X-MEDIA-SEQUENCE:3\n"));
     assert!(rendered.contains("#EXT-X-DISCONTINUITY-SEQUENCE:1\n"));
     assert!(
         !rendered.contains("#EXT-X-DISCONTINUITY\n"),
@@ -258,8 +265,8 @@ fn siblings_are_reported_so_a_switching_client_knows_where_to_resume()
 
     assert!(
         rendered
-            .contains("#EXT-X-RENDITION-REPORT:URI=\"../1/audio.m3u8\",LAST-MSN=1,LAST-PART=0\n"),
-        "the audio rendition has a part open in MSN 1, which is where a client \
+            .contains("#EXT-X-RENDITION-REPORT:URI=\"../1/audio.m3u8\",LAST-MSN=2,LAST-PART=0\n"),
+        "the audio rendition has a part open in MSN 2, which is where a client \
          switching to it should ask to continue: {rendered}"
     );
     assert!(
@@ -327,7 +334,7 @@ fn a_cueless_subtitle_rendition_is_still_reported_to_its_siblings()
     let rendered = render(&lease, 0, &policy())?;
 
     assert!(
-        rendered.contains("#EXT-X-RENDITION-REPORT:URI=\"../1/subtitles.m3u8\",LAST-MSN=0\n"),
+        rendered.contains("#EXT-X-RENDITION-REPORT:URI=\"../1/subtitles.m3u8\",LAST-MSN=1\n"),
         "a client toggling subtitles on needs somewhere to resume even before \
          the first cue exists, and a part-less rendition reports no LAST-PART: \
          {rendered}"
@@ -773,7 +780,7 @@ fn a_delta_keeps_media_sequence_skips_parents_and_reemits_the_map()
     let full = render(&lease, 0, &policy())?;
     let delta = render_delta(&lease, 0, &policy(), PlaylistDelta::Skip)?;
 
-    assert_eq!(playlist_media_sequence(&full), Some(0));
+    assert_eq!(playlist_media_sequence(&full), Some(1));
     assert_eq!(
         playlist_media_sequence(&delta),
         playlist_media_sequence(&full),
@@ -1187,7 +1194,10 @@ fn iframe_live_eviction_advances_sequence_and_marks_missing_sync_samples_as_gaps
         &uris(),
         PlaylistDelta::Full,
     )?;
-    assert!(manifest.contains(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", media.media_sequence)));
+    assert!(manifest.contains(&format!(
+        "#EXT-X-MEDIA-SEQUENCE:{}\n",
+        media.iframe_media_sequence()
+    )));
     assert_eq!(manifest.matches("#EXTINF:").count(), media.segments.len());
     assert_eq!(
         manifest.matches("#EXT-X-BYTERANGE:").count(),
@@ -1221,7 +1231,10 @@ fn dense_iframes_use_keyframe_sequences_for_delta_and_eviction()
     }
     let (stream, media) = snapshots(&lease, 0)?;
     assert!(media.media_sequence > 0);
-    assert_eq!(media.iframe_media_sequence(), media.media_sequence * 3);
+    assert_eq!(
+        media.iframe_media_sequence(),
+        (media.media_sequence - 1) * 3
+    );
     assert_eq!(media.live_edge.last_iframe, Some(35));
     let control = presentation_server_control(&stream, DeliveryTimingPolicy::default());
     let full = iframe_playlist(
@@ -1238,7 +1251,7 @@ fn dense_iframes_use_keyframe_sequences_for_delta_and_eviction()
     );
     assert!(full.contains(&format!(
         "#EXT-X-MEDIA-SEQUENCE:{}\n",
-        media.media_sequence * 3
+        (media.media_sequence - 1) * 3
     )));
     assert!(!full.contains("#EXT-X-PART:"));
     let delta = iframe_playlist(
@@ -1334,9 +1347,38 @@ fn rendition_reports_only_target_regular_playlists_including_from_iframe_senders
                     .find(|line| line.contains(&format!("URI=\"{expected}\"")))
                     .ok_or("missing regular target")?;
                 // The regular video's MSN is 0, even though its I-frame edge is 2.
-                assert!(report.contains("LAST-MSN=0"));
+                assert!(report.contains("LAST-MSN=1"));
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn explicit_gaps_have_part_and_parent_tags_without_a_discontinuity()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::mux::{PackagedGap, PackagedMedia, PackagingRenditionId, PackagingSegmentId};
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![audio(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+    write(
+        &lease,
+        PackagedMedia::Gap(PackagedGap {
+            rendition_id: PackagingRenditionId(0),
+            packaging_segment_id: PackagingSegmentId(1),
+            media_start: 6,
+            duration: 1,
+            parts: vec![1],
+        }),
+    );
+    write(&lease, chunk(0, 2, 0, 7));
+    let rendered = render(&lease, 0, &policy())?;
+    assert!(rendered.contains("#EXT-X-GAP\n#EXTINF:1,\nsegment/2.m4s"));
+    assert!(rendered.contains("#EXT-X-PART:DURATION=1,URI=\"part/7.m4s\",GAP=YES"));
+    assert!(!rendered.contains("#EXT-X-DISCONTINUITY"));
+    assert_eq!(rendered.matches("#EXT-X-MAP:").count(), 1);
+    assert!(rendered.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part/9.m4s\""));
+    assert!(rendered.contains("#EXT-X-TARGETDURATION:6"));
     Ok(())
 }

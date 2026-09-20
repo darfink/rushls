@@ -11,7 +11,7 @@
 use super::{FinishReason, MuxError, PackagedMedia};
 use crate::{
     domain::{Appender, MediaInstant, TickTimestamp, TrackId},
-    media::NormalizedSample,
+    media::NormalizedMedia,
 };
 
 /// Packages one input track's samples into container objects.
@@ -28,7 +28,7 @@ pub trait TrackPackager: Send {
 
     fn push(
         &mut self,
-        sample: NormalizedSample,
+        sample: NormalizedMedia,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError>;
 

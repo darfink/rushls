@@ -288,3 +288,27 @@ An external scheduler can run the probe and publish its output through a textfil
 That scheduler must replace the output atomically and retain failed results.
 Probe age must have its own alert, because an old success result does not establish current health.
 Program-date-time freshness is an origin timeline observation, not a trusted capture timestamp.
+
+## Timestamp rejections
+
+`rushls_timestamp_rejections_total{code,media_kind}` counts failed sessions with a typed timestamp issue.
+Each session increments one series once. Labels use fixed issue codes and media kinds.
+The series appears after its first rejection. Track IDs and timestamps are available in failure events, not metric labels.
+See [Timestamp failures](timestamp-failures.md) for configuration and hook fields.
+
+### Audio compensation
+
+`rushls_audio_repairs_total{codec,method}` counts compensated holes during normalization.
+`rushls_audio_compensation_seconds_total{codec,method}` counts exact missing audio duration for `method="gap"`.
+Labels use bounded codec and method values. They do not include track IDs or timestamps.
+These counters describe normalization, including media that a later pipeline failure prevents from reaching playback.
+See [Audio gap recovery](audio-recovery.md) for policy and host notifications.
+
+## Video cadence
+
+`rushls_video_timestamp_step_seconds{codec}` is a histogram of usable source intervals, including nominal and unknown cadence.
+These observations do not prove packet loss.
+`rushls_video_cadence_violations_total{codec}` counts violations of explicitly declared cadence, including rejected input.
+`rushls_video_compensation_seconds_total{codec,method}` counts accepted excess duration; its method is `gap`.
+Unavailable validation does not increment compensation counters.
+See [input modes](input-modes.md) for policy and hooks.

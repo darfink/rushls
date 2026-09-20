@@ -14,10 +14,10 @@ use crate::{
     delivery::store::StoreWriteError,
     domain::{
         Appender, BoxFuture, Codec, MediaKind, Payload, RenditionId, SessionId, StreamId, Timebase,
-        TrackCounts, TrackId, fixtures::video_catalog,
+        TrackCounts, TrackId,
     },
     media::{
-        MediaNormalizer, NormalizeError, NormalizedSample, NormalizerFactory, PresentationPlan,
+        MediaNormalizer, NormalizeError, NormalizedMedia, NormalizerFactory, PresentationPlan,
         StartedNormalizer, TimelineCalibration, VideoSample,
     },
     mux::{
@@ -114,7 +114,15 @@ impl PacketSource for FakeSource {
                 std::future::pending::<()>().await;
             }
             Ok(DiscoveryReport {
-                tracks: video_catalog(),
+                tracks: {
+                    let mut track = crate::domain::fixtures::track(0, MediaKind::Video);
+                    if let crate::domain::MediaParameters::Video { frame_rate, .. } =
+                        &mut track.parameters
+                    {
+                        *frame_rate = Some(crate::domain::FrameRate::new(nz::u32!(1), nz::u32!(1)));
+                    }
+                    crate::domain::fixtures::catalog(vec![track])
+                },
             })
         })
     }
@@ -267,6 +275,7 @@ impl NormalizerFactory for FakeNormalizerFactory {
         &self,
         presentation: &PresentationPlan,
         timeline: &TimelineCalibration,
+        _input_mode: crate::domain::InputMode,
     ) -> Result<StartedNormalizer, NormalizeError> {
         record(&self.log, "normalizer_start");
         Ok(StartedNormalizer {
@@ -283,19 +292,19 @@ impl NormalizerFactory for FakeNormalizerFactory {
 /// Optionally holds one sample back, standing in for a real reorder buffer.
 struct FakeNormalizer {
     reorders: bool,
-    held: Option<NormalizedSample>,
+    held: Option<NormalizedMedia>,
 }
 
 impl MediaNormalizer for FakeNormalizer {
     fn push(
         &mut self,
         packet: Packet,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError> {
         let pts = packet
             .pts
             .ok_or_else(|| NormalizeError::Processing("test packet has no PTS".into()))?;
-        let sample = NormalizedSample::Video(VideoSample {
+        let sample = NormalizedMedia::Video(VideoSample {
             track_id: packet.track_id,
             codec: Codec::H264,
             pts,
@@ -315,7 +324,7 @@ impl MediaNormalizer for FakeNormalizer {
         Ok(())
     }
 
-    fn finish(&mut self, out: &mut dyn Appender<NormalizedSample>) -> Result<(), NormalizeError> {
+    fn finish(&mut self, out: &mut dyn Appender<NormalizedMedia>) -> Result<(), NormalizeError> {
         if let Some(held) = self.held.take() {
             out.push(held);
         }
@@ -355,6 +364,8 @@ impl MuxerFactory for FakeMuxerFactory {
             muxer: Box::new(FakeMuxer {
                 initialized: false,
                 chunks: 0,
+                segment: 0,
+                segment_start: 0,
                 pushes: 0,
                 duration: 0,
                 finished: Arc::clone(&self.finished),
@@ -365,10 +376,12 @@ impl MuxerFactory for FakeMuxerFactory {
     }
 }
 
-/// Emits one part per sample and closes a single segment at end of stream.
+/// Emits one part per sample; gaps close the current segment before absence.
 struct FakeMuxer {
     initialized: bool,
     chunks: u32,
+    segment: u64,
+    segment_start: i64,
     pushes: u32,
     duration: u64,
     finished: FinishLog,
@@ -382,7 +395,7 @@ impl Muxer for FakeMuxer {
 
     fn push(
         &mut self,
-        sample: NormalizedSample,
+        sample: NormalizedMedia,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
         if self.faults.muxer_swallows_samples {
@@ -400,9 +413,34 @@ impl Muxer for FakeMuxer {
                 payload: Payload::from(vec![0]),
             }));
         }
+        if let NormalizedMedia::Gap(gap) = sample {
+            if self.chunks > 0 {
+                out.push(PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
+                    rendition_id: PackagingRenditionId(0),
+                    packaging_segment_id: PackagingSegmentId(self.segment),
+                    media_start: self.segment_start,
+                    duration: self.duration,
+                }));
+                self.segment += 1;
+            }
+            out.push(PackagedMedia::Gap(crate::mux::PackagedGap {
+                rendition_id: PackagingRenditionId(0),
+                packaging_segment_id: PackagingSegmentId(self.segment),
+                media_start: gap.start,
+                duration: gap.end.abs_diff(gap.start),
+                parts: vec![gap.end.abs_diff(gap.start)],
+            }));
+            self.segment += 1;
+            self.chunks = 0;
+            self.duration = 0;
+            return Ok(());
+        }
+        if self.chunks == 0 {
+            self.segment_start = sample.pts();
+        }
         out.push(PackagedMedia::Chunk(PackagedChunk {
             rendition_id: PackagingRenditionId(0),
-            packaging_segment_id: PackagingSegmentId(0),
+            packaging_segment_id: PackagingSegmentId(self.segment),
             // A skipping muxer emits index 2 where 1 belongs, which the store
             // must refuse before the segment can be assembled around a hole.
             chunk_index: self.chunks
@@ -431,11 +469,11 @@ impl Muxer for FakeMuxer {
         if matches!(reason, FinishReason::Superseded) {
             return Ok(());
         }
-        if self.initialized {
+        if self.chunks > 0 {
             out.push(PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
                 rendition_id: PackagingRenditionId(0),
-                packaging_segment_id: PackagingSegmentId(0),
-                media_start: 0,
+                packaging_segment_id: PackagingSegmentId(self.segment),
+                media_start: self.segment_start,
                 duration: self.duration,
             }));
         }
@@ -507,6 +545,7 @@ impl Recorder {
 
 fn name(event: &SessionEvent) -> &'static str {
     match event {
+        SessionEvent::Compensation { .. } => "compensation",
         SessionEvent::Accepted { .. } => "accepted",
         SessionEvent::Displaced { .. } => "displaced",
         SessionEvent::TracksDiscovered { .. } => "tracks_discovered",
@@ -1714,7 +1753,9 @@ async fn concurrent_takeovers_resolve_to_exactly_one_survivor() {
 #[tokio::test]
 async fn backward_video_timestamps_fail_before_the_offending_sample_is_published()
 -> Result<(), Box<dyn std::error::Error>> {
-    let mut harness = Harness::healthy();
+    let mut policy = StreamPolicy::permissive();
+    policy.input_mode = crate::domain::InputMode::Permissive;
+    let mut harness = Harness::new(None, policy, Faults::default());
     // Exercise the production normalizer through the real session and store;
     // the test muxer publishes one part for every sample it receives.
     harness.services.normalizers = Arc::new(crate::media::PassThroughNormalizerFactory);
@@ -1746,7 +1787,7 @@ async fn backward_video_timestamps_fail_before_the_offending_sample_is_published
             crate::media::MediaError::Normalize(_)
         )))
     ));
-    assert!(error.to_string().contains("video DTS must increase"));
+    assert!(error.to_string().contains("video_timestamp_order"));
     let totals = harness.meters.snapshot();
     assert_eq!(totals.sessions_failed, 1);
     assert_eq!(
@@ -1763,5 +1804,520 @@ async fn backward_video_timestamps_fail_before_the_offending_sample_is_published
         !harness.live().is_ended(),
         "previous media remains available for reconnect"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn timestamp_failures_report_once_during_preroll_and_live()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::domain::TimestampIssueCode;
+    use crate::observe::lifecycle::{Event, Outcome, Projector};
+    for live in [false, true] {
+        let mut policy = StreamPolicy::permissive();
+        // This lifecycle fixture supplies one frame per second.
+        policy.input_mode = crate::domain::InputMode::Permissive;
+        let mut harness = Harness::new(None, policy, Faults::default());
+        harness.services.normalizers = Arc::new(crate::media::PassThroughNormalizerFactory);
+        let batches = if live {
+            vec![
+                vec![
+                    packet(0, true),
+                    packet(SECOND, true),
+                    packet(2 * SECOND, true),
+                ],
+                vec![packet(4 * SECOND, true)],
+            ]
+        } else {
+            vec![vec![packet(0, true)], vec![packet(2 * SECOND, true)]]
+        };
+        let pending = Box::new(FakePending {
+            log: harness.log.clone(),
+            resource: "camera",
+            batches,
+            ending: Ending::Eof,
+            panics_after: None,
+        });
+        let error = run_session(
+            pending,
+            &harness.services,
+            &config(),
+            PendingPermit::unlimited(),
+        )
+        .await
+        .expect_err("jump must fail");
+        assert_eq!(
+            super::timestamp_issue(&error)
+                .expect("typed issue survives wrappers")
+                .code,
+            TimestampIssueCode::VideoTimestampJump
+        );
+        assert_eq!(
+            harness.meters.timestamp_rejections(),
+            vec![(("video_timestamp_jump".into(), "video".into()), 1)]
+        );
+        assert_eq!(
+            harness.meters.snapshot().parts_published,
+            if live { 2 } else { 0 }
+        );
+        assert_eq!(harness.store.leased(), 0);
+        let projector = Projector::new();
+        let ends: Vec<_> = harness
+            .recorder
+            .events
+            .lock()
+            .iter()
+            .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
+            .filter_map(|event| {
+                if let Event::SessionEnded(end) = event {
+                    Some(end)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(ends[0].outcome, Outcome::Failed);
+        assert_eq!(ends[0].was_available, live);
+        assert_eq!(
+            ends[0].timestamp_issue.as_ref().expect("host issue").code,
+            TimestampIssueCode::VideoTimestampJump
+        );
+    }
+    Ok(())
+}
+
+/// Keep admission and transport behavior identical to the other session
+/// fixtures while exposing an audio catalog to the production normalizer.
+struct AudioPending(FakePending);
+struct AudioSource(Box<dyn PacketSource>);
+impl PendingPublish for AudioPending {
+    fn publish_request(&self) -> Result<PublishRequest, TransportError> {
+        self.0.publish_request()
+    }
+    fn accept(
+        self: Box<Self>,
+        grant: PublishGrant,
+        meters: Arc<dyn SourceMeters>,
+    ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
+        Box::pin(async move {
+            let mut accepted = Box::new(self.0).accept(grant, meters).await?;
+            accepted.source = Box::new(AudioSource(accepted.source));
+            Ok(accepted)
+        })
+    }
+    fn reject(
+        self: Box<Self>,
+        rejection: PublishRejection,
+    ) -> BoxFuture<'static, Result<(), TransportError>> {
+        Box::new(self.0).reject(rejection)
+    }
+}
+impl PacketSource for AudioSource {
+    fn discover(
+        &mut self,
+        _limits: DiscoveryLimits,
+    ) -> BoxFuture<'_, Result<DiscoveryReport, SourceError>> {
+        Box::pin(async {
+            Ok(DiscoveryReport {
+                tracks: crate::domain::fixtures::catalog(vec![
+                    crate::domain::fixtures::TrackBuilder::new(0, MediaKind::Audio)
+                        .timebase(Timebase::new(nz::u32!(1), nz::u32!(48_000)))
+                        .codec_extradata(&[0x11, 0x90][..])
+                        .build(),
+                ]),
+            })
+        })
+    }
+    fn fill<'a>(
+        &'a mut self,
+        out: &'a mut dyn Appender<Packet>,
+    ) -> BoxFuture<'a, Result<InputState, SourceError>> {
+        self.0.fill(out)
+    }
+}
+
+#[tokio::test]
+async fn audio_repairs_report_during_preroll_and_live_and_survive_a_failing_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::observe::lifecycle::{Event, Outcome, Projector};
+    for live in [false, true] {
+        let mut harness = Harness::healthy();
+        harness.services.normalizers = Arc::new(crate::media::PassThroughNormalizerFactory);
+        harness.services.muxers = Arc::new(crate::mux::PassThroughMuxerFactory);
+        let start = if live { 220 } else { 10 };
+        let mut packets = Vec::new();
+        for index in 0..start + 22 {
+            if (start..start + 20).contains(&index) {
+                continue;
+            }
+            let pts = i64::from(index) * 1024 + if index == start + 21 { 48_000 } else { 0 };
+            packets.push(Packet {
+                track_id: TrackId(0),
+                pts: Some(pts),
+                dts: Some(pts),
+                duration: Some(1024),
+                random_access: false,
+                audio_trim: crate::domain::AudioTrim::default(),
+                webvtt: crate::domain::WebVttCueMetadata::default(),
+                subtitle_position: None,
+                payload: (&[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c][..]).into(),
+            });
+        }
+        // Put the repaired packet and the fatal successor in the same batch.
+        let tail = packets.split_off(packets.len() - 2);
+        let mut batches: Vec<_> = packets.into_iter().map(|packet| vec![packet]).collect();
+        batches.push(tail);
+        let pending = AudioPending(FakePending {
+            log: harness.log.clone(),
+            resource: "camera",
+            batches,
+            ending: Ending::Eof,
+            panics_after: None,
+        });
+        let error = run_session(
+            Box::new(pending),
+            &harness.services,
+            &config(),
+            PendingPermit::unlimited(),
+        )
+        .await
+        .expect_err("excessive gap");
+        assert_eq!(
+            super::timestamp_issue(&error)
+                .ok_or("timestamp issue")?
+                .recovery_rejection,
+            Some(crate::domain::RecoveryRejection::MaximumHole)
+        );
+        assert_eq!(harness.store.leased(), 0);
+        assert_eq!(
+            harness.meters.timestamp_rejections(),
+            vec![(("audio_gap".into(), "audio".into()), 1)]
+        );
+        let repairs = harness.meters.audio_repairs();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].1.0, 1);
+        let projector = Projector::new();
+        let events: Vec<_> = harness
+            .recorder
+            .events
+            .lock()
+            .iter()
+            .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::SessionDegraded(_)))
+                .count(),
+            1
+        );
+        let Event::SessionEnded(end) = events.last().ok_or("end event")? else {
+            panic!("ended");
+        };
+        assert_eq!(end.outcome, Outcome::Failed);
+        assert_eq!(end.was_available, live);
+        assert_eq!(end.compensation.len(), 1);
+        assert!(end.compensation[0].degraded);
+        assert_eq!(end.compensation[0].total_ticks, 20 * 1024);
+        if live {
+            assert!(harness.meters.snapshot().parts_published > 0);
+            assert!(!harness.live().is_ended());
+        } else {
+            assert_eq!(harness.meters.snapshot().parts_published, 0);
+        }
+    }
+    Ok(())
+}
+
+struct DeclaredCadenceFactory;
+impl NormalizerFactory for DeclaredCadenceFactory {
+    fn start(
+        &self,
+        presentation: &PresentationPlan,
+        timeline: &TimelineCalibration,
+        mode: crate::domain::InputMode,
+    ) -> Result<StartedNormalizer, NormalizeError> {
+        let mut tracks = presentation.tracks().to_vec();
+        tracks[0].video_cadence = crate::domain::VideoCadence::Fixed {
+            rate: crate::domain::FrameRate::new(nz::u32!(1), nz::u32!(1)),
+            source: crate::domain::CadenceSource::H264Vui,
+            scope: crate::domain::CadenceScope::ProgressiveFrames,
+        };
+        let presentation = presentation
+            .with_projected_tracks(tracks)
+            .map_err(|e| NormalizeError::InvalidPlan(e.to_string().into()))?;
+        crate::media::PassThroughNormalizerFactory.start(&presentation, timeline, mode)
+    }
+}
+// Keep the startup/live and strict/permissive assertions together.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn input_modes_report_cadence_holes_through_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::domain::{InputMode, TimestampIssueCode};
+    use crate::observe::lifecycle::{Event, Projector};
+    for mode in [InputMode::Strict, InputMode::Permissive] {
+        for live in [false, true] {
+            let mut policy = StreamPolicy::permissive();
+            policy.input_mode = mode;
+            let mut harness = Harness::new(None, policy, Faults::default());
+            harness.services.normalizers = Arc::new(DeclaredCadenceFactory);
+            let batches = if live {
+                vec![
+                    vec![
+                        packet(0, true),
+                        packet(SECOND, true),
+                        packet(2 * SECOND, true),
+                    ],
+                    vec![packet(3 * SECOND + SECOND / 4, true)],
+                ]
+            } else {
+                vec![
+                    vec![packet(0, true)],
+                    vec![packet(SECOND + SECOND / 4, true)],
+                ]
+            };
+            let pending = Box::new(FakePending {
+                log: harness.log.clone(),
+                resource: "camera",
+                batches,
+                ending: Ending::Eof,
+                panics_after: None,
+            });
+            let outcome = run_session(
+                pending,
+                &harness.services,
+                &config(),
+                PendingPermit::unlimited(),
+            )
+            .await;
+            let projector = Projector::new();
+            let events: Vec<_> = harness
+                .recorder
+                .events
+                .lock()
+                .iter()
+                .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
+                .collect();
+            let ended = events
+                .iter()
+                .find_map(|event| {
+                    if let Event::SessionEnded(end) = event {
+                        Some(end)
+                    } else {
+                        None
+                    }
+                })
+                .expect("session end reported");
+            if mode == InputMode::Strict {
+                let error = outcome.expect_err("strict cadence hole");
+                let issue = super::timestamp_issue(&error).expect("typed timestamp failure");
+                assert_eq!(issue.code, TimestampIssueCode::VideoCadenceViolation);
+                assert_eq!(issue.recovery_rejection, None);
+                assert!(
+                    ended
+                        .timestamp_issue
+                        .as_ref()
+                        .expect("hook issue")
+                        .cadence
+                        .is_some()
+                );
+                assert_eq!(
+                    harness.meters.snapshot().parts_published,
+                    if live { 2 } else { 0 }
+                );
+                assert!(ended.compensation.is_empty());
+                assert!(harness.meters.video_compensation().is_empty());
+            } else {
+                outcome?;
+                assert!(ended.timestamp_issue.is_none());
+                assert_eq!(ended.compensation.len(), 1);
+                assert_eq!(ended.compensation[0].total_ticks, 22500);
+                assert_eq!(ended.compensation[0].replacement_ticks, 0);
+                assert_eq!(
+                    harness.meters.video_compensation(),
+                    vec![(("h264".into(), "gap".into()), (1, 0.25))]
+                );
+            }
+            assert_eq!(
+                harness.meters.cadence_violations(),
+                vec![("h264".into(), 1)]
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e, Event::SessionEnded(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(harness.store.leased(), 0);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn audio_gaps_publish_during_preroll_and_live_then_report_clean_recovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::observe::lifecycle::{Event, Projector};
+    for start in [10, 220] {
+        let mut harness = Harness::healthy();
+        harness.services.normalizers = Arc::new(crate::media::PassThroughNormalizerFactory);
+        harness.services.muxers = Arc::new(crate::mux::PassThroughMuxerFactory);
+        let batches = (0..1800)
+            .filter(|index| !(start..start + 6).contains(index))
+            .map(|index| {
+                vec![Packet {
+                    track_id: TrackId(0),
+                    pts: Some(index * 1024),
+                    dts: Some(index * 1024),
+                    duration: Some(1024),
+                    random_access: false,
+                    audio_trim: crate::domain::AudioTrim::default(),
+                    webvtt: crate::domain::WebVttCueMetadata::default(),
+                    subtitle_position: None,
+                    payload: (&[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c][..]).into(),
+                }]
+            })
+            .collect();
+        let pending = AudioPending(FakePending {
+            log: harness.log.clone(),
+            resource: "camera",
+            batches,
+            ending: Ending::Eof,
+            panics_after: None,
+        });
+        run_session(
+            Box::new(pending),
+            &harness.services,
+            &config(),
+            PendingPermit::unlimited(),
+        )
+        .await?;
+        assert_eq!(harness.store.leased(), 0);
+        assert!(harness.meters.timestamp_rejections().is_empty());
+        assert_eq!(
+            harness.meters.audio_repairs(),
+            vec![(("aac".into(), "gap".into()), (1, 0.128))]
+        );
+        let projector = Projector::new();
+        let events: Vec<_> = harness
+            .recorder
+            .events
+            .lock()
+            .iter()
+            .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::SessionDegraded(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::SessionRecovered(_)))
+                .count(),
+            1
+        );
+        let Event::SessionEnded(end) = events.last().ok_or("ended event")? else {
+            panic!("ended");
+        };
+        assert_eq!(end.compensation[0].total_ticks, 6144);
+        assert_eq!(end.compensation[0].replacement_ticks, 0);
+        assert!(!end.compensation[0].degraded);
+        assert!(end.was_available);
+        assert!(harness.meters.snapshot().parts_published > 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn video_gap_notices_survive_later_batch_failure_in_preroll_and_live()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::observe::lifecycle::{Event, Projector};
+    for live in [false, true] {
+        let mut harness = Harness::healthy();
+        harness.services.normalizers = Arc::new(DeclaredCadenceFactory);
+        let first = if live {
+            vec![
+                packet(0, true),
+                packet(SECOND, true),
+                packet(2 * SECOND, true),
+            ]
+        } else {
+            vec![packet(0, true)]
+        };
+        let expected = if live { 3 * SECOND } else { SECOND };
+        let pending = FakePending {
+            log: harness.log.clone(),
+            resource: "camera",
+            batches: vec![
+                first,
+                vec![packet(expected + SECOND / 4, true), packet(expected, true)],
+            ],
+            ending: Ending::Eof,
+            panics_after: None,
+        };
+        let error = run_session(
+            Box::new(pending),
+            &harness.services,
+            &config(),
+            PendingPermit::unlimited(),
+        )
+        .await
+        .expect_err("later packet in the batch has backward DTS");
+        assert_eq!(
+            super::timestamp_issue(&error).ok_or("typed issue")?.code,
+            crate::domain::TimestampIssueCode::VideoTimestampOrder
+        );
+        assert_eq!(harness.store.leased(), 0);
+        assert_eq!(
+            harness.meters.video_compensation(),
+            vec![(("h264".into(), "gap".into()), (1, 0.25))]
+        );
+        let projector = Projector::new();
+        let events: Vec<_> = harness
+            .recorder
+            .events
+            .lock()
+            .iter()
+            .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::SessionDegraded(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::SessionEnded(_)))
+                .count(),
+            1
+        );
+        let Event::SessionEnded(end) = events.last().ok_or("end event")? else {
+            panic!("session ended")
+        };
+        assert_eq!(end.compensation.len(), 1);
+        assert_eq!(
+            end.compensation[0].method,
+            crate::domain::RecoveryMethod::Gap
+        );
+        assert_eq!(end.compensation[0].replacement_ticks, 0);
+        assert_eq!(end.compensation[0].total_ticks, 22_500);
+        assert!(end.compensation[0].degraded);
+        assert_eq!(end.was_available, live);
+        // The later invalid packet prevents publication of the whole batch.
+        // Previously published valid samples retain the existing lifecycle.
+        assert_eq!(
+            harness.meters.snapshot().parts_published,
+            if live { 2 } else { 0 }
+        );
+    }
     Ok(())
 }

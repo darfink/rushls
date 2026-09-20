@@ -311,6 +311,8 @@ async fn only_subscribed_events_are_delivered() {
     let recorder = Recorder::default();
     let address = start(recorder.clone()).await;
     let ended = Event::SessionEnded(lifecycle::SessionEnded {
+        compensation: Vec::new(),
+        timestamp_issue: None,
         stream: StreamId::new("live/camera"),
         session: SessionId(nz::u64!(1)),
         principal: "studio-camera".into(),
@@ -365,4 +367,187 @@ fn a_projected_session_reaches_the_hooks_it_subscribed_to() {
         ],
         "a session's events describe the publisher only; what viewers can +         reach is the store's to report"
     );
+}
+
+#[test]
+fn timestamp_issue_hook_preserves_exact_ticks_and_is_absent_for_other_failures() {
+    use crate::domain::{
+        Codec, MediaKind, Timebase, TimestampField, TimestampIssue, TimestampIssueCode, TrackId,
+    };
+    use cc_hooks::Occurrence;
+    let mut ended = lifecycle::SessionEnded {
+        compensation: Vec::new(),
+        stream: StreamId::new("live/camera"),
+        session: SessionId(nz::u64!(1)),
+        principal: "publisher".into(),
+        publisher: crate::domain::fixtures::publisher(),
+        outcome: lifecycle::Outcome::Failed,
+        duration: Duration::ZERO,
+        was_available: false,
+        diagnostic: Some("timing failed".into()),
+        timestamp_issue: None,
+    };
+    assert!(
+        Event::SessionEnded(ended.clone())
+            .data()
+            .get("timestamp_issue")
+            .is_none()
+    );
+    ended.timestamp_issue = Some(Box::new(TimestampIssue {
+        cadence: None,
+        recovery_rejection: Some(crate::domain::RecoveryRejection::MaximumHole),
+        code: TimestampIssueCode::AudioGap,
+        track: TrackId(3),
+        media_kind: MediaKind::Audio,
+        codec: Codec::Opus,
+        field: TimestampField::Pts,
+        reference: i128::from(i64::MIN),
+        actual: i128::from(i64::MAX),
+        timebase: Timebase::new(nz::u32!(1), nz::u32!(48000)),
+        tolerance_ticks: Some(48),
+        maximum: None,
+        missing_ticks: Some(u64::MAX),
+    }));
+    let data = Event::SessionEnded(ended).data();
+    let issue = &data["timestamp_issue"];
+    assert_eq!(issue["code"], "audio_gap");
+    assert_eq!(issue["recovery_rejection"], "maximum_hole");
+    assert_eq!(issue["reference"], i64::MIN.to_string());
+    assert_eq!(issue["actual"], i64::MAX.to_string());
+    assert_eq!(issue["missing_ticks"], u64::MAX.to_string());
+    assert_eq!(issue["timebase"]["denominator"], 48000);
+}
+
+#[test]
+fn recovery_hooks_preserve_exact_values_and_only_emit_episode_transitions()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::domain::{
+        Codec, CompensationStatus, NormalizationNotice, RecoveryMethod, RecoveryTransition,
+        Timebase, TrackId,
+    };
+    use cc_hooks::Occurrence;
+    let projector = Projector::new();
+    let session = SessionId(nz::u64!(1));
+    projector.project(
+        session,
+        &SessionEvent::Accepted {
+            stream: StreamId::new("live/audio"),
+            principal: "publisher".into(),
+            publisher: crate::domain::fixtures::publisher(),
+        },
+    );
+    let mut status = CompensationStatus {
+        media_kind: crate::domain::MediaKind::Audio,
+        cadence: None,
+        track: TrackId(4),
+        codec: Codec::Aac,
+        method: RecoveryMethod::Gap,
+        timebase: Timebase::new(nz::u32!(1), nz::u32!(48000)),
+        missing_ticks: 1024,
+        replacement_ticks: 1024,
+        episode_holes: 1,
+        episode_ticks: 1024,
+        total_holes: 1,
+        total_ticks: 9_007_199_254_740_993,
+        degraded: true,
+    };
+    let degraded = projector
+        .project(
+            session,
+            &SessionEvent::Compensation {
+                notice: NormalizationNotice {
+                    transition: RecoveryTransition::Degraded,
+                    status: status.clone(),
+                },
+            },
+        )
+        .ok_or("degraded event")?;
+    assert_eq!(degraded.kind().to_string(), "session.degraded");
+    assert_eq!(
+        degraded.data()["compensation"]["total_ticks"],
+        "9007199254740993"
+    );
+    assert_eq!(
+        degraded.data()["compensation"]["timebase"]["denominator"],
+        48000
+    );
+    status.episode_holes = 2;
+    assert!(
+        projector
+            .project(
+                session,
+                &SessionEvent::Compensation {
+                    notice: NormalizationNotice {
+                        transition: RecoveryTransition::Compensated,
+                        status: status.clone()
+                    }
+                }
+            )
+            .is_none()
+    );
+    status.degraded = false;
+    let recovered = projector
+        .project(
+            session,
+            &SessionEvent::Compensation {
+                notice: NormalizationNotice {
+                    transition: RecoveryTransition::Recovered,
+                    status,
+                },
+            },
+        )
+        .ok_or("recovered event")?;
+    assert_eq!(recovered.kind().to_string(), "session.recovered");
+    let ended = projector
+        .project(
+            session,
+            &SessionEvent::Ended {
+                end: SessionEnd::Ended,
+            },
+        )
+        .ok_or("ended")?;
+    assert_eq!(ended.data()["compensation"][0]["episode_holes"], "2");
+    assert_eq!(ended.data()["compensation"][0]["degraded"], false);
+    assert_eq!(
+        "session.degraded".parse::<lifecycle::Kind>()?,
+        lifecycle::Kind::SessionDegraded
+    );
+    assert_eq!(
+        "session.recovered".parse::<lifecycle::Kind>()?,
+        lifecycle::Kind::SessionRecovered
+    );
+    Ok(())
+}
+
+#[test]
+fn video_compensation_hook_preserves_scope_and_exact_duration() {
+    use crate::domain::{
+        CadenceScope, CadenceSource, Codec, CompensationStatus, FrameRate, MediaKind,
+        RecoveryMethod, Timebase, TrackId, VideoCadence,
+    };
+    let data = super::recovery_data(&CompensationStatus {
+        media_kind: MediaKind::Video,
+        cadence: Some(VideoCadence::Fixed {
+            rate: FrameRate::new(nz::u32!(30000), nz::u32!(1001)),
+            source: CadenceSource::H264Vui,
+            scope: CadenceScope::ProgressiveFrames,
+        }),
+        track: TrackId(2),
+        codec: Codec::H264,
+        method: RecoveryMethod::Gap,
+        timebase: Timebase::new(nz::u32!(1), nz::u32!(30000)),
+        missing_ticks: 499,
+        replacement_ticks: 0,
+        episode_holes: 1,
+        episode_ticks: 499,
+        total_holes: 1,
+        total_ticks: 499,
+        degraded: true,
+    });
+    assert_eq!(data["media_kind"], "video");
+    assert_eq!(data["method"], "gap");
+    assert_eq!(data["missing_ticks"], "499");
+    assert_eq!(data["cadence"]["source"], "h264_vui");
+    assert_eq!(data["cadence"]["scope"], "progressive_frames");
+    assert_eq!(data["cadence"]["interval"]["numerator"], 1001);
 }

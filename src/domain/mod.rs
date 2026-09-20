@@ -16,6 +16,8 @@ mod publisher;
 pub use publisher::{ClientInfo, IngestProtocol, PublishResource, PublisherContext};
 mod rfc6381;
 mod time;
+mod timestamp;
+pub use timestamp::{TimestampField, TimestampIssue, TimestampIssueCode};
 mod track;
 
 #[cfg(test)]
@@ -41,3 +43,14 @@ pub use track::{
 /// once per session for handshakes and planning, once per packet *batch* on the
 /// streaming path. No trait in this crate boxes a future per packet or sample.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+mod recovery;
+pub use recovery::{
+    CompensationStatus, NormalizationNotice, RecoveryMethod, RecoveryRejection, RecoveryTransition,
+};
+
+mod cadence;
+pub use cadence::{
+    CadenceScope, CadenceSource, CadenceUnavailable, DecoderConfigOrigin, InputMode, VideoCadence,
+    VideoTimestampObservation,
+};

@@ -5,7 +5,7 @@ use crate::{
     source::{DensityUnit, InputLimits, LimitError},
 };
 
-use super::{NormalizedSample, TimelineCalibration};
+use super::{NormalizedMedia, TimelineCalibration};
 
 /// Fixed media-time accounting for one publisher.
 ///
@@ -40,7 +40,7 @@ impl MediaDensityWindow {
     pub fn admit(
         &mut self,
         packets: u64,
-        samples: &[NormalizedSample],
+        samples: &[NormalizedMedia],
     ) -> Result<(), MediaDensityError> {
         for sample in samples {
             self.observe(sample)?;
@@ -66,9 +66,15 @@ impl MediaDensityWindow {
         }
 
         self.packets = self.packets.saturating_add(packets);
-        self.samples = self
-            .samples
-            .saturating_add(u64::try_from(samples.len()).unwrap_or(u64::MAX));
+        self.samples = self.samples.saturating_add(
+            u64::try_from(
+                samples
+                    .iter()
+                    .filter(|item| !matches!(item, NormalizedMedia::Gap(_)))
+                    .count(),
+            )
+            .unwrap_or(u64::MAX),
+        );
 
         check(
             self.packets,
@@ -90,7 +96,7 @@ impl MediaDensityWindow {
     /// Reordered access units and interleaved tracks both go backwards
     /// routinely; only the furthest point reached defines how much media time
     /// the publisher has actually spent.
-    fn observe(&mut self, sample: &NormalizedSample) -> Result<(), MediaDensityError> {
+    fn observe(&mut self, sample: &NormalizedMedia) -> Result<(), MediaDensityError> {
         let track_id = sample.track_id();
         let track = self
             .timeline
@@ -162,6 +168,21 @@ mod tests {
             media_density_window: Duration::from_secs(1),
             ..InputLimits::permissive()
         }
+    }
+
+    #[test]
+    fn missing_intervals_do_not_count_as_encoded_samples() -> Result<(), MediaDensityError> {
+        let mut density = MediaDensityWindow::new(limits(), &timeline());
+        let gap = NormalizedMedia::Gap(crate::media::MissingInterval {
+            track_id: TrackId(0),
+            media_kind: crate::domain::MediaKind::Video,
+            start: 3000,
+            end: 6000,
+            timebase: crate::domain::Timebase::hz90k(),
+        });
+        density.admit(1, &[sample(0), gap, sample(0)])?;
+        assert_eq!(density.samples, 2);
+        Ok(())
     }
 
     #[test]

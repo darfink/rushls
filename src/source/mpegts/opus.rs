@@ -52,6 +52,8 @@ pub fn track(spec: &TrackSpec) -> Result<Option<DiscoveredTrack>, SourceError> {
         channel_mapping: None,
     };
     Ok(Some(DiscoveredTrack {
+        decoder_config_origin: crate::domain::DecoderConfigOrigin::Synthesized,
+        video_cadence: crate::domain::VideoCadence::Unknown,
         id: TrackId(spec.track_id),
         source_key: spec
             .source_pid

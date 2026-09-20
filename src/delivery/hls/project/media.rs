@@ -151,7 +151,10 @@ fn render_media(
             writer.segment(Segment {
                 uri: names.segment(segment.id, &mut uri),
                 duration: timebase.ticks_to_duration(segment.duration),
-                gap: matches!(segment.kind, StoredSegmentKind::Gap),
+                gap: matches!(
+                    segment.kind,
+                    StoredSegmentKind::Gap | StoredSegmentKind::GapParts(_)
+                ),
             })?;
         }
     }
@@ -270,6 +273,9 @@ fn write_header(
     if rendition.discontinuity_sequence > 0 {
         writer.discontinuity_sequence(rendition.discontinuity_sequence)?;
     }
+
+    // Ordinary segments may resume after a GAP with decoder dependencies.
+    // Individual part flags and I-frame playlists retain their own semantics.
 
     Ok(())
 }
@@ -445,7 +451,7 @@ fn write_part(
         uri: names.part(part.id, uri),
         duration: timebase.ticks_to_duration(part.duration),
         independent: part.independent,
-        gap: false,
+        gap: part.gap,
     })?;
     Ok(())
 }

@@ -29,6 +29,8 @@ pub trait SourceMeters: Send + Sync {
 
 /// Volume produced by normalization.
 pub trait MediaMeters: Send + Sync {
+    fn video_interval(&self, _observation: crate::domain::VideoTimestampObservation) {}
+    fn compensation(&self, _notice: &crate::domain::NormalizationNotice) {}
     fn track_input(&self, _id: crate::domain::TrackId, _bytes: usize) {}
     fn track_normalized(&self, _id: crate::domain::TrackId, _pts: i64, _duration: u64) {}
 
@@ -54,10 +56,20 @@ pub trait DeliveryMeters: Send + Sync {
     fn delivery_progress(&self, parts: u64, segments: u64);
 }
 
+type AudioRepairCounters = std::collections::BTreeMap<(String, String), (u64, f64)>;
+
 /// Process-wide totals and session lifecycle tallies.
 #[derive(Clone, Debug, Default)]
 pub struct ProcessMeters {
+    video_intervals:
+        Arc<parking_lot::Mutex<std::collections::BTreeMap<String, super::DurationHistogram>>>,
+    video_compensation: Arc<parking_lot::Mutex<AudioRepairCounters>>,
+    cadence_violations: Arc<parking_lot::Mutex<std::collections::BTreeMap<String, u64>>>,
+    audio_repairs: Arc<parking_lot::Mutex<AudioRepairCounters>>,
     counters: Arc<ProcessCounters>,
+    // Keys come exclusively from closed enums, never publisher-supplied labels.
+    timestamp_rejections:
+        Arc<parking_lot::Mutex<std::collections::BTreeMap<(String, String), u64>>>,
 }
 
 counters! {
@@ -138,6 +150,62 @@ counters! {
 }
 
 impl ProcessMeters {
+    pub fn video_intervals(&self) -> Vec<(String, super::DurationHistogram)> {
+        self.video_intervals
+            .lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+    pub fn video_compensation(&self) -> Vec<((String, String), (u64, f64))> {
+        self.video_compensation
+            .lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+    pub fn cadence_violations(&self) -> Vec<(String, u64)> {
+        self.cadence_violations
+            .lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
+    pub fn audio_repairs(&self) -> Vec<((String, String), (u64, f64))> {
+        self.audio_repairs
+            .lock()
+            .iter()
+            .map(|(key, value)| (key.clone(), *value))
+            .collect()
+    }
+
+    pub fn timestamp_rejected(&self, issue: &crate::domain::TimestampIssue) {
+        if issue.code == crate::domain::TimestampIssueCode::VideoCadenceViolation {
+            *self
+                .cadence_violations
+                .lock()
+                .entry(format!("{:?}", issue.codec).to_lowercase())
+                .or_default() += 1;
+        }
+        let mut counts = self.timestamp_rejections.lock();
+        let value = counts
+            .entry((
+                issue.code.to_string(),
+                format!("{:?}", issue.media_kind).to_lowercase(),
+            ))
+            .or_default();
+        *value = value.saturating_add(1);
+    }
+
+    pub fn timestamp_rejections(&self) -> Vec<((String, String), u64)> {
+        self.timestamp_rejections
+            .lock()
+            .iter()
+            .map(|(key, value)| (key.clone(), *value))
+            .collect()
+    }
+
     pub fn session_started(&self) {
         add(&self.counters.sessions_started, 1);
     }
@@ -510,6 +578,46 @@ impl SourceMeters for SessionCounters {
 }
 
 impl MediaMeters for SessionCounters {
+    fn video_interval(&self, observation: crate::domain::VideoTimestampObservation) {
+        self.process
+            .video_intervals
+            .lock()
+            .entry(format!("{:?}", observation.codec).to_lowercase())
+            .or_default()
+            .observe(observation.timebase.ticks_to_duration(observation.ticks));
+    }
+
+    fn compensation(&self, notice: &crate::domain::NormalizationNotice) {
+        if matches!(
+            notice.transition,
+            crate::domain::RecoveryTransition::Recovered
+                | crate::domain::RecoveryTransition::Unavailable
+        ) {
+            return;
+        }
+        let status = &notice.status;
+        let mut counts = if status.media_kind == crate::domain::MediaKind::Video {
+            *self
+                .process
+                .cadence_violations
+                .lock()
+                .entry(format!("{:?}", status.codec).to_lowercase())
+                .or_default() += 1;
+            self.process.video_compensation.lock()
+        } else {
+            self.process.audio_repairs.lock()
+        };
+        let count = counts
+            .entry((
+                format!("{:?}", status.codec).to_lowercase(),
+                status.method.to_string(),
+            ))
+            .or_default();
+        count.0 = count.0.saturating_add(1);
+        let duration = status.timebase.ticks_to_duration(status.missing_ticks);
+        count.1 += duration.as_secs_f64();
+    }
+
     fn track_input(&self, id: crate::domain::TrackId, bytes: usize) {
         self.tracks.input(id, bytes);
     }

@@ -78,7 +78,7 @@ fn invalid(message: impl Into<Box<str>>) -> MuxError {
 pub fn validate_timing(
     presentation: &crate::media::PresentationPlan,
     segmentation: &crate::segment::SegmentationPlan,
-    samples: &[crate::media::NormalizedSample],
+    samples: &[crate::media::NormalizedMedia],
 ) -> Result<(), MuxError> {
     use super::Muxer;
     let events = crate::observe::Events::default().scoped(crate::domain::SessionId(nz::u64!(1)));
@@ -124,7 +124,7 @@ mod tests {
             AudioTrim, Codec, MediaKind, MediaParameters, Payload, SessionId, Timebase, TrackId,
             fixtures::{TrackBuilder, catalog},
         },
-        media::{AudioSample, NormalizedSample, SubtitleSample, validate},
+        media::{AudioSample, NormalizedMedia, SubtitleSample, validate},
         mux::{
             FinishReason, MediaSegmentFormat, MuxerFactory, PackagedMedia,
             fixtures::{AAC_EXTRADATA, AAC_FRAME, H264_EXTRADATA},
@@ -234,7 +234,7 @@ mod tests {
         // the third subtitle window to be sealed.
         for frame in 0..142 {
             started.muxer.push(
-                NormalizedSample::Audio(AudioSample {
+                NormalizedMedia::Audio(AudioSample {
                     track_id: TrackId(0),
                     codec: Codec::Aac,
                     pts: frame * 1_024,
@@ -313,7 +313,7 @@ mod tests {
         let mut output = Vec::new();
 
         started.muxer.push(
-            NormalizedSample::Audio(AudioSample {
+            NormalizedMedia::Audio(AudioSample {
                 track_id: TrackId(0),
                 codec: Codec::Aac,
                 pts: -1_056,
@@ -324,7 +324,7 @@ mod tests {
             &mut output,
         )?;
         started.muxer.push(
-            NormalizedSample::Subtitle(SubtitleSample {
+            NormalizedMedia::Subtitle(SubtitleSample {
                 track_id: TrackId(1),
                 codec: Codec::SubRip,
                 pts: 0,

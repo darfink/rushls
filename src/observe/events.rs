@@ -13,6 +13,9 @@ use super::lifecycle;
 /// [`SessionMeters`](super::SessionMeters) instead.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionEvent {
+    Compensation {
+        notice: crate::domain::NormalizationNotice,
+    },
     Accepted {
         stream: StreamId,
         principal: String,
@@ -146,6 +149,7 @@ pub enum SessionEvent {
         end: SessionEnd,
     },
     Failed {
+        timestamp_issue: Option<Box<crate::domain::TimestampIssue>>,
         reason: String,
         segmentation: Option<crate::mux::MuxError>,
     },

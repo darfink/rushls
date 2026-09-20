@@ -59,6 +59,9 @@ impl Occurrence for Event {
 
     fn data(&self) -> serde_json::Value {
         match self {
+            Event::SessionDegraded(event) | Event::SessionRecovered(event) => serde_json::json!({
+                "stream_id": event.stream.0.as_str(), "session_id": session_id(event.session), "compensation": recovery_data(&event.status),
+            }),
             Event::SessionStarted(started) => serde_json::json!({
                 "stream_id": started.stream.0.as_str(),
                 "session_id": session_id(started.session),
@@ -75,20 +78,61 @@ impl Occurrence for Event {
             Event::StreamUnavailable(unavailable) => serde_json::json!({
                 "stream_id": unavailable.stream.0.as_str(),
             }),
-            Event::SessionEnded(ended) => serde_json::json!({
-                "stream_id": ended.stream.0.as_str(),
-                "session_id": session_id(ended.session),
-                "principal": ended.principal,
-                "protocol": ended.publisher.protocol,
-                "resource": ended.publisher.resource,
-                "client": ended.publisher.client,
-                "outcome": ended.outcome.to_string(),
-                "duration_ms": u64::try_from(ended.duration.as_millis()).unwrap_or(u64::MAX),
-                "was_available": ended.was_available,
-                "diagnostic": ended.diagnostic,
-            }),
+            Event::SessionEnded(ended) => {
+                let mut body = serde_json::json!({
+                    "stream_id": ended.stream.0.as_str(),
+                    "session_id": session_id(ended.session),
+                    "principal": ended.principal,
+                    "protocol": ended.publisher.protocol,
+                    "resource": ended.publisher.resource,
+                    "client": ended.publisher.client,
+                    "outcome": ended.outcome.to_string(),
+                    "duration_ms": u64::try_from(ended.duration.as_millis()).unwrap_or(u64::MAX),
+                    "was_available": ended.was_available,
+                    "diagnostic": ended.diagnostic,
+                });
+                if !ended.compensation.is_empty() {
+                    body["compensation"] = ended
+                        .compensation
+                        .iter()
+                        .map(recovery_data)
+                        .collect::<Vec<_>>()
+                        .into();
+                }
+                if let Some(issue) = &ended.timestamp_issue {
+                    body["timestamp_issue"] = serde_json::json!({
+                        "code": issue.code.to_string(), "track_id": issue.track.0,
+                        "media_kind": format!("{:?}", issue.media_kind).to_lowercase(),
+                        "codec": format!("{:?}", issue.codec).to_lowercase(),
+                        "field": issue.field.to_string(),
+                        "reference": issue.reference.to_string(), "actual": issue.actual.to_string(),
+                        "timebase": {"numerator": issue.timebase.num().get(), "denominator": issue.timebase.den().get()},
+                        "tolerance_ticks": issue.tolerance_ticks.map(|value| value.to_string()),
+                        "maximum_ns": issue.maximum.map(|value| value.as_nanos().to_string()),
+                        "missing_ticks": issue.missing_ticks.map(|value| value.to_string()),
+                    });
+                    if let Some(cadence) = issue.cadence {
+                        body["timestamp_issue"]["cadence"] = cadence_data(cadence);
+                    }
+                    if let Some(reason) = issue.recovery_rejection {
+                        body["timestamp_issue"]["recovery_rejection"] = reason.to_string().into();
+                    }
+                }
+                body
+            }
         }
     }
+}
+
+fn recovery_data(status: &crate::domain::CompensationStatus) -> serde_json::Value {
+    serde_json::json!({
+        "media_kind": format!("{:?}", status.media_kind).to_lowercase(), "cadence": status.cadence.map(cadence_data),
+        "track_id": status.track.0, "codec": format!("{:?}", status.codec).to_lowercase(), "method": status.method.to_string(),
+        "timebase": {"numerator": status.timebase.num().get(), "denominator": status.timebase.den().get()},
+        "missing_ticks": status.missing_ticks.to_string(), "replacement_ticks": status.replacement_ticks.to_string(),
+        "episode_holes": status.episode_holes.to_string(), "episode_ticks": status.episode_ticks.to_string(),
+        "total_holes": status.total_holes.to_string(), "total_ticks": status.total_ticks.to_string(), "degraded": status.degraded,
+    })
 }
 
 /// Session ids are rendered as strings.
@@ -276,4 +320,27 @@ pub fn build(
     events: Events,
 ) -> (Hooks, Dispatchers) {
     cc_hooks::build(config, client, Arc::new(HookEvents::new(events)))
+}
+
+fn cadence_data(cadence: crate::domain::VideoCadence) -> serde_json::Value {
+    use crate::domain::VideoCadence as C;
+    let mut value = serde_json::json!({"source": cadence.source().map(|s| s.to_string())});
+    value["kind"] = match cadence {
+        C::Unknown => "unknown",
+        C::Nominal(_) => "nominal",
+        C::Fixed { .. } => "fixed",
+        C::Unverifiable { .. } => "unverifiable",
+        C::Conflicting { .. } => "conflicting",
+    }
+    .into();
+    if let Some(rate) = cadence.rate() {
+        value["interval"] = serde_json::json!({"numerator": rate.denominator().get(), "denominator": rate.numerator().get()});
+    }
+    if let C::Fixed { scope, .. } = cadence {
+        value["scope"] = scope.to_string().into();
+    }
+    if let C::Unverifiable { reason, .. } = cadence {
+        value["reason"] = reason.to_string().into();
+    }
+    value
 }

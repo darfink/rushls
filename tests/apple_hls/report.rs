@@ -370,6 +370,14 @@ fn unimplemented_feature(title: &str) -> Option<Verdict> {
         "no content steering is produced"
     } else if title.contains("loudness") {
         "no loudness metadata is carried through"
+    } else if title
+        .contains("you should use the ext-x-independent-segments tag in the multivariant playlist")
+        || title
+            == "if ext-x-independent-segments is not in the multivariant playlist, then you must use the ext-x-independent-segments tag in all video media playlists"
+    {
+        // Deliberate Apple-authoring exception, still printed in the report.
+        // Dependent GAP continuation cannot make this playlist-wide promise.
+        "GAP continuation can depend on earlier media; playlist independence is not asserted"
     } else if title.contains("ext-x-playlist-type") {
         "no EXT-X-PLAYLIST-TYPE is produced"
     } else if title.contains("in a vod playlist") {
@@ -654,6 +662,27 @@ fn decode_entities(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_independence_exception_does_not_hide_part_independence_defects() {
+        let mut finding = Finding {
+            source: Source::Authoring,
+            level: Level::MustFix,
+            context: "General requirements".into(),
+            title: "If EXT-X-INDEPENDENT-SEGMENTS is not in the multivariant playlist, then you MUST use the EXT-X-INDEPENDENT-SEGMENTS tag in all video media playlists".into(),
+            scopes: vec!["All Variants".into()],
+        };
+        assert!(matches!(
+            judge(&finding, &Expect::default()),
+            Verdict::Gap(_)
+        ));
+        finding.title =
+            "Partial segments that contain a sync frame SHOULD be marked INDEPENDENT".into();
+        assert!(matches!(
+            judge(&finding, &Expect::default()),
+            Verdict::Defect
+        ));
+    }
 
     #[test]
     fn unsupported_video_only_does_not_exempt_mixed_or_supported_presentations() {

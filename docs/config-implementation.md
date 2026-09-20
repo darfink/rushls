@@ -39,36 +39,13 @@ one to one, so every multiple other than 1x is new arithmetic.
 indefinitely. A burst is consumable and refills at `ceiling.pace`. Better
 semantics, but genuinely different behaviour rather than a rename.
 
-**The timestamp-jump guard must detach from pacing.** It currently lives inside
-one arm of the timing policy, so with no rate ceiling — the compiled default —
-there is no guard at all. Since a forward jump inflates the timeline, that is
-also the fastest route to exhausting a stream's byte budget.
-
-**A moderate jump should become a discontinuity, not a session failure.** RTMP
-publishers drop frames under network stress routinely; disconnecting a
-publisher for recovering from a gap is the wrong response. The delivery path
-already propagates a discontinuity flag into `EXT-X-DISCONTINUITY` and
-`EXT-X-DISCONTINUITY-SEQUENCE`, and emits `EXT-X-PROGRAM-DATE-TIME` at the same
-boundary, which is what re-anchors wall clock after a gap. Two sub-questions to
-settle when building: a discontinuity must fall on a segment boundary, and
-whether a fresh initialization segment is required after one.
-
-Only an implausible jump — hours, an epoch change — should remain fatal.
-
-**Not in the first adoption.** The intended end state, recorded so the pacing
-work does not foreclose it: a small forward jump is treated as *elapsed media
-time* — a three-second jump means the timeline advanced three seconds, and the
-token bucket is charged accordingly rather than counting the samples that did
-not arrive — while a large jump becomes a discontinuity that resets both the
-timeline and the pacing state. This falls out of a token bucket charged by
-media-time delta, so the initial implementation should charge that way even
-while every jump above the threshold stays fatal.
-
-The depth here is cross-track coherence. The pacer's watermark is the maximum
-across all tracks, so a discontinuity has to be applied to every track at one
-agreed point or they desynchronise at the splice. That, the segment-boundary
-requirement, and the initialization question are why this is deferred rather
-than folded in.
+**Input modes control compensation.** `accept.input_mode` defaults to permissive.
+Strict mode rejects real audio gaps and declared-cadence violations.
+Permissive mode uses bounded GAP handling for audio and progressive H.264 without presentation reordering.
+Unsupported video holes fail explicitly. Audio synthesis and video frame-hold recovery are removed.
+Codec declarations establish fixed cadence; nominal rates do not.
+Checks run during pre-roll and live processing, independently of pacing.
+See [input-modes.md](input-modes.md) for internal limits and host reporting.
 
 ## Health
 
@@ -545,3 +522,5 @@ per-hook rendition filtering, and transcoding with any rendition ladder.
 Everything else in this ledger is specified in `config.md` and pending
 implementation. Environment interpolation is designed, not deferred to a later
 design.
+
+Audio compensation policy and episode hooks are described in [Audio gap recovery](audio-recovery.md).

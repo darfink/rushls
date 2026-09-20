@@ -52,6 +52,8 @@ pub struct TrackBuilder(DiscoveredTrack);
 impl TrackBuilder {
     pub fn new(id: u32, kind: MediaKind) -> Self {
         Self(DiscoveredTrack {
+            decoder_config_origin: crate::domain::DecoderConfigOrigin::Publisher,
+            video_cadence: crate::domain::VideoCadence::Unknown,
             id: TrackId(id),
             source_key: None,
             codec: codec(kind),

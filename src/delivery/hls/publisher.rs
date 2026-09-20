@@ -223,7 +223,7 @@ impl StorePublisher {
             PackagedMedia::Initialization(segment) => &segment.payload,
             PackagedMedia::Chunk(chunk) => &chunk.payload,
             PackagedMedia::Segment(segment) => &segment.payload,
-            PackagedMedia::SegmentCompleted(_) => return None,
+            PackagedMedia::SegmentCompleted(_) | PackagedMedia::Gap(_) => return None,
         };
         Some(Payload::from_bytes(gzip(payload.bytes())))
     }

@@ -224,6 +224,8 @@ impl MediaParameters {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredTrack {
+    pub decoder_config_origin: super::DecoderConfigOrigin,
+    pub video_cadence: super::VideoCadence,
     pub id: TrackId,
     /// Stable source identity when the protocol or carried container has one.
     pub source_key: Option<SourceTrackKey>,

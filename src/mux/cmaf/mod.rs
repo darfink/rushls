@@ -10,7 +10,7 @@ use crate::{
         Appender, Codec, DiscoveredTrack, MediaKind, MediaParameters, TickDuration, TickTimestamp,
         TrackId, duration_since,
     },
-    media::{NormalizedSample, PresentedTiming, PresentedTimingCursor},
+    media::{NormalizedMedia, PresentedTiming, PresentedTimingCursor},
     observe::EventSink,
     segment::TrackSegmentationPlan,
 };
@@ -132,7 +132,7 @@ impl SegmentCursor {
 
 /// Timing is validated once on arrival; serialization waits for a committed cut.
 struct PendingSample {
-    sample: NormalizedSample,
+    sample: NormalizedMedia,
     pts: TickTimestamp,
     dts: TickTimestamp,
     presented_pts: TickTimestamp,
@@ -156,6 +156,7 @@ struct CmafTrack {
     fragment: Option<OpenFragment>,
     presented_timing: PresentedTimingCursor,
     initialized: bool,
+    after_gap: bool,
     last_dts: Option<TickTimestamp>,
     composition: crate::segment::cutter::CompositionGroups,
     published_presentation_end: Option<TickTimestamp>,
@@ -192,6 +193,7 @@ impl CmafTrack {
             fragment: None,
             presented_timing: PresentedTimingCursor::for_track(track),
             initialized: false,
+            after_gap: false,
             last_dts: None,
             composition: crate::segment::cutter::CompositionGroups::default(),
             published_presentation_end: None,
@@ -201,7 +203,7 @@ impl CmafTrack {
 
     fn push(
         &mut self,
-        sample: &NormalizedSample,
+        sample: &NormalizedMedia,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
         if self.last_dts.is_none() && self.kind == MediaKind::Video && !sample.random_access() {
@@ -236,7 +238,11 @@ impl CmafTrack {
                 .ok_or_else(|| mux_error("composition group timing overflows"))?;
         let cuts = self
             .partitioner
-            .push_with_boundary(partition_duration, sample.random_access(), can_end)
+            .push_with_boundary(
+                partition_duration,
+                sample.random_access() && !self.after_gap,
+                can_end,
+            )
             .map_err(|error| MuxError::Part {
                 track: self.track_id,
                 error,
@@ -255,6 +261,73 @@ impl CmafTrack {
             presented_pts,
             duration: presented.duration,
         });
+        Ok(())
+    }
+
+    fn gap(
+        &mut self,
+        gap: crate::media::MissingInterval,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
+        if gap.track_id != self.track_id
+            || gap.media_kind != self.kind
+            || gap.timebase != self.plan.timebase
+            || gap.end <= gap.start
+        {
+            return Err(mux_error("invalid missing interval"));
+        }
+        let start = gap
+            .start
+            .checked_sub(self.plan.presentation_origin_pts)
+            .ok_or_else(|| mux_error("gap origin overflows"))?;
+        let end = gap
+            .end
+            .checked_sub(self.plan.presentation_origin_pts)
+            .ok_or_else(|| mux_error("gap end overflows"))?;
+        let maximum = self.plan.maximum_segment_ticks(self.boundary_allowance);
+        let count = end.abs_diff(start).div_ceil(self.plan.part_duration.get());
+        if maximum == 0
+            || count > crate::source::InputLimits::permissive().maximum_samples_per_batch as u64
+        {
+            return Err(mux_error("gap partition exceeds bounded output capacity"));
+        }
+        self.prepare_tail(out)?;
+        self.flush_fragment(out)?;
+        if self.segment.filled_to()? != start {
+            return Err(mux_error("gap does not follow available media"));
+        }
+        if self.segment.filled > 0 {
+            TrackPackager::cut(self, gap.start, out)?;
+        }
+        self.after_gap = true;
+        if let Some(output) = &mut self.output {
+            output.gap();
+        }
+        while self.segment.start < end {
+            let duration = end.abs_diff(self.segment.start).min(maximum);
+            let mut remaining = duration;
+            let mut parts = Vec::new();
+            // Each item is bounded by the frozen part ceiling. No media bytes
+            // or fabricated access units are allocated for the absence.
+            while remaining > 0 {
+                let part = remaining.min(self.plan.part_duration.get());
+                parts.push(part);
+                remaining -= part;
+            }
+            if self.output.is_some() {
+                out.push(PackagedMedia::Gap(super::PackagedGap {
+                    rendition_id: self.rendition_id,
+                    packaging_segment_id: PackagingSegmentId(self.segment.id),
+                    media_start: self.segment.start,
+                    duration,
+                    parts,
+                }));
+            }
+            self.segment.filled = duration;
+            self.segment.advance(&self.plan)?;
+        }
+        self.partition_clock = crate::segment::cutter::PartClock::new(self.kind, end);
+        self.published_presentation_end = Some(end);
         Ok(())
     }
 
@@ -298,7 +371,7 @@ impl CmafTrack {
 
     fn rebase_sample(
         &mut self,
-        sample: &NormalizedSample,
+        sample: &NormalizedMedia,
     ) -> Result<(TickTimestamp, TickTimestamp, PresentedTiming), MuxError> {
         if sample_codec(sample) != self.codec {
             return Err(mux_error(format!(
@@ -329,7 +402,7 @@ impl CmafTrack {
 
     fn open_or_extend_fragment(
         &mut self,
-        sample: &NormalizedSample,
+        sample: &NormalizedMedia,
         presented_pts: TickTimestamp,
         presented_duration: TickDuration,
     ) -> Result<(), MuxError> {
@@ -378,13 +451,13 @@ impl CmafTrack {
                         end
                     },
                     presentation_end: end,
-                    independent: sample.random_access(),
+                    independent: sample.random_access() && !self.after_gap,
                 });
             }
         }
         if let Some(fragment) = &mut self.fragment {
             fragment.presentation_end = fragment.presentation_end.max(end);
-            fragment.independent |= sample.random_access();
+            fragment.independent |= sample.random_access() && !self.after_gap;
         }
         Ok(())
     }
@@ -511,6 +584,10 @@ impl TrackPackager for CmafTrack {
         self.close_fragment_at(pts)?;
         self.flush_fragment(out)?;
         if self.segment.filled == 0 {
+            // A missing interval may already have closed exactly at this cut.
+            if self.segment.start == pts {
+                return Ok(());
+            }
             return Err(mux_error("empty coordinated segment"));
         }
         out.push(PackagedMedia::SegmentCompleted(PackagedSegmentCompletion {
@@ -528,9 +605,12 @@ impl TrackPackager for CmafTrack {
 
     fn push(
         &mut self,
-        sample: NormalizedSample,
+        sample: NormalizedMedia,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
+        if let NormalizedMedia::Gap(gap) = sample {
+            return self.gap(gap, out);
+        }
         CmafTrack::push(self, &sample, out)
     }
 
@@ -669,19 +749,21 @@ fn packaged_rendition(
     })
 }
 
-fn sample_codec(sample: &NormalizedSample) -> Codec {
+fn sample_codec(sample: &NormalizedMedia) -> Codec {
     match sample {
-        NormalizedSample::Video(sample) => sample.codec,
-        NormalizedSample::Audio(sample) => sample.codec,
-        NormalizedSample::Subtitle(sample) => sample.codec,
+        NormalizedMedia::Video(sample) => sample.codec,
+        NormalizedMedia::Audio(sample) => sample.codec,
+        NormalizedMedia::Subtitle(sample) => sample.codec,
+        NormalizedMedia::Gap(_) => unreachable!("gaps are handled before sample writing"),
     }
 }
 
-fn sample_dts(sample: &NormalizedSample) -> TickTimestamp {
+fn sample_dts(sample: &NormalizedMedia) -> TickTimestamp {
     match sample {
-        NormalizedSample::Video(sample) => sample.dts,
-        NormalizedSample::Audio(sample) => sample.pts,
-        NormalizedSample::Subtitle(sample) => sample.pts,
+        NormalizedMedia::Video(sample) => sample.dts,
+        NormalizedMedia::Audio(sample) => sample.pts,
+        NormalizedMedia::Subtitle(sample) => sample.pts,
+        NormalizedMedia::Gap(gap) => gap.start,
     }
 }
 
@@ -715,7 +797,7 @@ mod tests {
             fixtures::{TrackBuilder, catalog},
         },
         media::{
-            NormalizedSample, NormalizerFactory, PassThroughNormalizerFactory, VideoSample,
+            NormalizedMedia, NormalizerFactory, PassThroughNormalizerFactory, VideoSample,
             calibrate, validate,
         },
         mux::{
@@ -777,7 +859,9 @@ mod tests {
                 PackagedMedia::Chunk(chunk) => {
                     bytes.extend_from_slice(chunk.payload.as_bytes());
                 }
-                PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) => {}
+                PackagedMedia::Segment(_)
+                | PackagedMedia::SegmentCompleted(_)
+                | PackagedMedia::Gap(_) => {}
             }
         }
         bytes
@@ -803,7 +887,9 @@ mod tests {
                     );
                     outputs[index].extend_from_slice(chunk.payload.as_bytes());
                 }
-                PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) => {}
+                PackagedMedia::Segment(_)
+                | PackagedMedia::SegmentCompleted(_)
+                | PackagedMedia::Gap(_) => {}
             }
         }
         outputs
@@ -825,16 +911,16 @@ mod tests {
         }
     }
 
-    fn sample(pts: i64, random_access: bool) -> NormalizedSample {
+    fn sample(pts: i64, random_access: bool) -> NormalizedMedia {
         sample_for(0, pts, random_access)
     }
 
-    fn sample_for(track_id: u32, pts: i64, random_access: bool) -> NormalizedSample {
+    fn sample_for(track_id: u32, pts: i64, random_access: bool) -> NormalizedMedia {
         sample_with_dts(track_id, pts, pts, random_access)
     }
 
-    fn sample_with_dts(track_id: u32, pts: i64, dts: i64, random_access: bool) -> NormalizedSample {
-        NormalizedSample::Video(VideoSample {
+    fn sample_with_dts(track_id: u32, pts: i64, dts: i64, random_access: bool) -> NormalizedMedia {
+        NormalizedMedia::Video(VideoSample {
             track_id: TrackId(track_id),
             codec: crate::domain::Codec::H264,
             pts,
@@ -849,8 +935,8 @@ mod tests {
         })
     }
 
-    fn audio_sample(pts: i64) -> NormalizedSample {
-        NormalizedSample::Audio(crate::media::AudioSample {
+    fn audio_sample(pts: i64) -> NormalizedMedia {
+        NormalizedMedia::Audio(crate::media::AudioSample {
             track_id: TrackId(0),
             codec: crate::domain::Codec::Aac,
             pts,
@@ -956,8 +1042,8 @@ mod tests {
         )
     }
 
-    fn trimmed_audio_sample(pts: i64, trim: AudioTrim) -> NormalizedSample {
-        NormalizedSample::Audio(crate::media::AudioSample {
+    fn trimmed_audio_sample(pts: i64, trim: AudioTrim) -> NormalizedMedia {
+        NormalizedMedia::Audio(crate::media::AudioSample {
             track_id: TrackId(0),
             codec: crate::domain::Codec::Aac,
             pts,
@@ -1353,7 +1439,7 @@ mod tests {
         let mut pts = 0_i64;
         for duration in access_units {
             let mut sample = audio_sample(pts);
-            if let NormalizedSample::Audio(sample) = &mut sample {
+            if let NormalizedMedia::Audio(sample) = &mut sample {
                 sample.duration = *duration;
             }
             started
@@ -1458,7 +1544,7 @@ mod tests {
         let mut expected_pts = Vec::new();
         for duration in [1_800, 6_300, 2_700, 4_500].into_iter().cycle().take(200) {
             let mut sample = sample_for(0, pts, pts == 0);
-            if let NormalizedSample::Video(video) = &mut sample {
+            if let NormalizedMedia::Video(video) = &mut sample {
                 video.duration = duration;
             }
             expected_pts.push(Some(pts));
@@ -1917,7 +2003,7 @@ mod tests {
     struct IngestFixture {
         presentation: crate::media::PresentationPlan,
         timeline: crate::media::TimelineCalibration,
-        samples: Vec<NormalizedSample>,
+        samples: Vec<NormalizedMedia>,
     }
 
     async fn ingest_fixture(mut source: impl PacketSource) -> IngestFixture {
@@ -1932,7 +2018,7 @@ mod tests {
             .expect("fixture tracks are admitted");
         let timeline = calibrate(&input).expect("fixture timeline calibrates");
         let mut normalized = PassThroughNormalizerFactory
-            .start(&input, &timeline)
+            .start(&input, &timeline, crate::domain::InputMode::Permissive)
             .expect("fixture normalization starts");
 
         let mut packets = Vec::new();
@@ -2064,7 +2150,7 @@ mod tests {
                     .next()
                     .expect("each discovered track produced media");
                 let longest = track_samples
-                    .map(NormalizedSample::duration)
+                    .map(NormalizedMedia::duration)
                     .fold(first.duration(), u64::max);
                 let segment_duration = track
                     .timebase
@@ -2515,11 +2601,11 @@ mod tests {
             fixture
                 .samples
                 .iter()
-                .any(|sample| matches!(sample, NormalizedSample::Video(_)))
+                .any(|sample| matches!(sample, NormalizedMedia::Video(_)))
                 && fixture
                     .samples
                     .iter()
-                    .any(|sample| matches!(sample, NormalizedSample::Audio(_)))
+                    .any(|sample| matches!(sample, NormalizedMedia::Audio(_)))
         );
     }
 
@@ -2535,11 +2621,11 @@ mod tests {
             fixture
                 .samples
                 .iter()
-                .any(|sample| matches!(sample, NormalizedSample::Video(_)))
+                .any(|sample| matches!(sample, NormalizedMedia::Video(_)))
                 && fixture
                     .samples
                     .iter()
-                    .any(|sample| matches!(sample, NormalizedSample::Audio(_)))
+                    .any(|sample| matches!(sample, NormalizedMedia::Audio(_)))
         );
     }
 
@@ -2577,7 +2663,7 @@ mod tests {
         assert_eq!(track.first_pts, Some(312));
         assert_eq!(track.timebase, Timebase::new(nz::u32!(1), nz::u32!(48_000)));
         assert_eq!(fixture.samples.len(), PACKETS);
-        let NormalizedSample::Audio(first) = &fixture.samples[0] else {
+        let NormalizedMedia::Audio(first) = &fixture.samples[0] else {
             panic!("audio sample")
         };
         assert_eq!(
@@ -2957,6 +3043,557 @@ mod tests {
             millisecond
         );
     }
+    /// Packaging experiment only: video normalization still uses its existing policy.
+    /// Replace a normalized P picture with an exact interval, without synthesizing
+    /// media or changing any surviving packet's duration or timestamps.
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and RUSHLS_GAP_FIXTURES for external browser tests"]
+    async fn ip_video_gap_playback_fixture() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = encoded_ip_video_fixture().await?;
+        assert_eq!(fixture.samples.len(), 200);
+        let track = &fixture.presentation.tracks()[0];
+        let origin = fixture.samples[0].pts();
+        let rate = u64::from(track.timebase.den().get());
+        for omit in [false, true] {
+            let plan = PlanBuilder::new(
+                track.id.0,
+                track.timebase,
+                NonZero::new(rate * 2).ok_or("rate")?,
+            )
+            .part(nz::u32!(1), NonZero::new(rate / 5).ok_or("rate")?)
+            .presentation_origin(origin)
+            .segmentation_origin(origin)
+            .build();
+            let sink = discarded_events();
+            let mut mux = started(&fixture.presentation, vec![plan], &sink);
+            let mut media = Vec::new();
+            for (index, sample) in fixture.samples.iter().enumerate() {
+                let NormalizedMedia::Video(video) = sample else {
+                    panic!("video fixture")
+                };
+                assert_eq!(video.pts, video.dts, "no presentation reordering");
+                assert_eq!(video.random_access, index % 50 == 0);
+                let item = if omit && index == 126 {
+                    assert!(!video.random_access);
+                    NormalizedMedia::Gap(crate::media::MissingInterval {
+                        track_id: video.track_id,
+                        media_kind: MediaKind::Video,
+                        start: video.pts,
+                        end: video.pts + i64::try_from(video.duration)?,
+                        timebase: track.timebase,
+                    })
+                } else {
+                    sample.clone()
+                };
+                mux.muxer.push(item, &mut media)?;
+            }
+            mux.muxer
+                .finish(crate::mux::FinishReason::Final, &mut media)?;
+            let gaps: Vec<_> = media
+                .iter()
+                .filter_map(|item| match item {
+                    PackagedMedia::Gap(gap) => Some(gap),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(gaps.len(), usize::from(omit));
+            if omit {
+                assert_eq!(gaps[0].media_start, i64::try_from(rate * 126 / 25)?);
+                assert_eq!(gaps[0].duration, rate / 25);
+            }
+            let demuxed = demux_cmaf(&concat_cmaf_bytes(&media));
+            let output = &demuxed.tracks[0].samples;
+            assert_eq!(output.len(), 200 - usize::from(omit));
+            let expected = fixture
+                .samples
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !omit || *index != 126)
+                .map(|(_, sample)| sample);
+            for (actual, expected) in output.iter().zip(expected) {
+                assert_eq!(actual.duration.map(u64::from), Some(expected.duration()));
+                assert_eq!(actual.dts, Some(super::sample_dts(expected) - origin));
+                assert_eq!(actual.pts, Some(expected.pts() - origin));
+            }
+            export_gap_fixture(&mux.presentation, &media, track, omit)?;
+        }
+        Ok(())
+    }
+
+    async fn encoded_ip_video_fixture() -> Result<IngestFixture, Box<dyn std::error::Error>> {
+        let encoded = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=25:duration=8",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-g",
+                "50",
+                "-bf",
+                "0",
+                "-x264-params",
+                "scenecut=0:ref=1",
+                "-an",
+                "-f",
+                "mpegts",
+                "-",
+            ])
+            .output()?;
+        assert!(
+            encoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+        Ok(ts_bytes_fixture(&encoded.stdout).await)
+    }
+
+    fn gap_fixture_as_cmaf(
+        fixture: &IngestFixture,
+        rate: u32,
+    ) -> Result<Vec<PackagedMedia>, Box<dyn std::error::Error>> {
+        if std::env::var_os("RUSHLS_GAP_FIXTURES").is_some() {
+            audio_fixture_as_cmaf(fixture, rate, false)?;
+        }
+        audio_fixture_as_cmaf(fixture, rate, true)
+    }
+
+    fn audio_fixture_as_cmaf(
+        fixture: &IngestFixture,
+        rate: u32,
+        omit_packets: bool,
+    ) -> Result<Vec<PackagedMedia>, Box<dyn std::error::Error>> {
+        let mut normalized = PassThroughNormalizerFactory.start(
+            &fixture.presentation,
+            &fixture.timeline,
+            crate::domain::InputMode::Permissive,
+        )?;
+        let mut samples = Vec::new();
+        for (index, sample) in fixture.samples.iter().enumerate() {
+            if omit_packets && (10..16).contains(&index) {
+                continue;
+            }
+            let NormalizedMedia::Audio(audio) = sample else {
+                panic!("audio fixture");
+            };
+            normalized.normalizer.push(
+                crate::source::Packet {
+                    track_id: audio.track_id,
+                    pts: Some(audio.pts),
+                    dts: Some(audio.pts),
+                    duration: Some(i64::try_from(audio.duration)?),
+                    random_access: false,
+                    audio_trim: audio.trim,
+                    webvtt: crate::domain::WebVttCueMetadata::default(),
+                    subtitle_position: None,
+                    payload: audio.payload.clone(),
+                },
+                &mut samples,
+            )?;
+        }
+        normalized.normalizer.finish(&mut samples)?;
+        let notices = normalized.normalizer.take_notices();
+        assert_eq!(notices.len(), usize::from(omit_packets));
+        assert_eq!(
+            samples.len(),
+            fixture.samples.len() - usize::from(omit_packets) * 5
+        );
+        let track = &normalized.presentation.tracks()[0];
+        let plan = PlanBuilder::new(
+            track.id.0,
+            track.timebase,
+            NonZero::new(
+                (u64::from(rate) * 2).div_ceil(samples[0].duration()) * samples[0].duration(),
+            )
+            .ok_or("rate")?,
+        )
+        .part(
+            nz::u32!(1),
+            NonZero::new(u64::from(rate) / 5).ok_or("rate")?,
+        )
+        .presentation_origin(fixture.timeline.get(track.id).ok_or("timeline")?.origin_pts)
+        .segmentation_origin(samples[0].pts())
+        .build();
+        let sink = discarded_events();
+        let mut mux = started(&normalized.presentation, vec![plan], &sink);
+        let mut media = Vec::new();
+        for sample in samples {
+            mux.muxer.push(sample, &mut media)?;
+        }
+        mux.muxer
+            .finish(crate::mux::FinishReason::Final, &mut media)?;
+        assert_eq!(
+            media
+                .iter()
+                .filter(|item| matches!(item, PackagedMedia::Initialization(_)))
+                .count(),
+            1
+        );
+        let chunks: Vec<_> = media
+            .iter()
+            .filter_map(|item| {
+                if let PackagedMedia::Chunk(chunk) = item {
+                    Some(chunk)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(chunks.len() > 3);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.duration <= u64::from(rate) / 5)
+        );
+        let mut cursor = chunks[0].media_start;
+        for item in &media {
+            let (start, duration) = match item {
+                PackagedMedia::Chunk(chunk) => (chunk.media_start, chunk.duration),
+                PackagedMedia::Gap(gap) => (gap.media_start, gap.duration),
+                _ => continue,
+            };
+            assert_eq!(start, cursor);
+            cursor = cursor
+                .checked_add_unsigned(duration)
+                .ok_or("interval overflow")?;
+        }
+        export_gap_fixture(&mux.presentation, &media, track, omit_packets)?;
+        Ok(media)
+    }
+
+    fn export_gap_fixture(
+        presentation: &std::sync::Arc<crate::mux::PackagedPresentation>,
+        media: &[PackagedMedia],
+        track: &crate::domain::DiscoveredTrack,
+        omit_packets: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::delivery::{
+            hls::{
+                project::{PlaylistDelta, PlaylistPolicy, media::media_playlist},
+                uri::PlaylistUris,
+            },
+            store::{SegmentBody, StoredSegmentKind, StreamStore},
+        };
+        let Some(root) = std::env::var_os("RUSHLS_GAP_FIXTURES") else {
+            return Ok(());
+        };
+        let mut asc = String::new();
+        for byte in track.codec_extradata.as_bytes() {
+            std::fmt::Write::write_fmt(&mut asc, format_args!("{byte:02x}"))?;
+        }
+        // Controls use the exact same encoded packets and initialization.
+        let suffix = if omit_packets { "" } else { "-control" };
+        let directory = std::path::PathBuf::from(root).join(format!(
+            "{:?}-{}-{asc}{suffix}",
+            track.codec,
+            track.timebase.den()
+        ));
+        std::fs::create_dir_all(&directory)?;
+        let store = StreamStore::default();
+        let lease = store.lease(crate::domain::StreamId::new("gap-fixture"), presentation)?;
+        for item in media {
+            assert!(lease.write(item.clone())?);
+        }
+        assert!(lease.end());
+        let stream = lease.live().snapshot();
+        let rendition = lease
+            .live()
+            .rendition(crate::domain::RenditionId(0))
+            .ok_or("rendition")?;
+        let uris = PlaylistUris::default();
+        let names = uris.within(
+            crate::domain::RenditionId(0),
+            super::MediaSegmentFormat::Cmaf,
+        );
+        let playlist = media_playlist(
+            &stream,
+            &rendition,
+            crate::delivery::hls::project::presentation_server_control(
+                &stream,
+                crate::delivery::hls::project::DeliveryTimingPolicy::default(),
+            ),
+            &PlaylistPolicy::default(),
+            &uris,
+            PlaylistDelta::Full,
+        )?;
+        std::fs::write(directory.join("index.m3u8"), &playlist)?;
+        let full = playlist
+            .lines()
+            .filter(|line| {
+                !line.starts_with("#EXT-X-PART") && !line.starts_with("#EXT-X-SERVER-CONTROL")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(directory.join("full.m3u8"), full)?;
+        let codec = track.rfc6381_codec().ok_or("fixture codec")?;
+        for (name, child) in [
+            ("master.m3u8", "index.m3u8"),
+            ("master-full.m3u8", "full.m3u8"),
+        ] {
+            std::fs::write(
+                directory.join(name),
+                format!(
+                    "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=256000,CODECS=\"{codec}\"\n{child}\n"
+                ),
+            )?;
+        }
+        let mut uri = String::new();
+        let write = |name: &str, bytes: &[u8]| -> std::io::Result<()> {
+            let path = directory.join(name);
+            std::fs::create_dir_all(path.parent().expect("fixture parent"))?;
+            std::fs::write(path, bytes)
+        };
+        for init in rendition.initializations.iter() {
+            write(
+                names
+                    .initialization(init.id, &mut uri)
+                    .ok_or("initialization URI")?,
+                init.payload.as_bytes(),
+            )?;
+        }
+        for segment in rendition.segments.iter() {
+            if let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) = &segment.kind {
+                let mut bytes = Vec::new();
+                for part in parts.iter() {
+                    write(names.part(part.id, &mut uri), part.payload.as_bytes())?;
+                    bytes.extend_from_slice(part.payload.as_bytes());
+                }
+                write(names.segment(segment.id, &mut uri), &bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires macOS ffmpeg aac_at encoder and AAC decoder"]
+    async fn he_aac_gaps_decode_and_resume_without_replacement_packets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("rushls-he-gap-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory)?;
+        let result = async {
+            for rate in [44_100_u32, 48_000] {
+                for (profile, channels, bitrate) in [(4, 1, 24000), (4, 2, 48000), (28, 2, 24000)] {
+                    let encoded = std::process::Command::new("ffmpeg")
+                        .args(["-v", "error", "-f", "lavfi", "-i"])
+                        .arg(format!("sine=frequency=440:sample_rate={rate}:duration=3"))
+                        .args([
+                            "-ac",
+                            &channels.to_string(),
+                            "-c:a",
+                            "aac_at",
+                            "-profile:a",
+                            &profile.to_string(),
+                            "-b:a",
+                            &bitrate.to_string(),
+                            "-f",
+                            "flv",
+                            "-",
+                        ])
+                        .output()?;
+                    assert!(
+                        encoded.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&encoded.stderr)
+                    );
+                    let fixture = flv_audio_fixture(&encoded.stdout).await;
+                    let media = gap_fixture_as_cmaf(&fixture, rate)?;
+                    let bytes = concat_cmaf_bytes(&media);
+                    let init = media
+                        .iter()
+                        .find_map(|item| match item {
+                            PackagedMedia::Initialization(init) => Some(init.payload.clone()),
+                            _ => None,
+                        })
+                        .ok_or("initialization")?;
+                    let gap_end = media
+                        .iter()
+                        .find_map(|item| match item {
+                            PackagedMedia::Gap(gap) => {
+                                Some(gap.media_start + i64::try_from(gap.duration).ok()?)
+                            }
+                            _ => None,
+                        })
+                        .ok_or("gap")?;
+                    let mut suffix = init.as_bytes().to_vec();
+                    for item in &media {
+                        if let PackagedMedia::Chunk(chunk) = item
+                            && chunk.media_start >= gap_end
+                        {
+                            suffix.extend_from_slice(chunk.payload.as_bytes());
+                        }
+                    }
+                    for (name, bytes) in [("continuous", bytes), ("fresh-resume", suffix)] {
+                        let path =
+                            directory.join(format!("{rate}-{profile}-{channels}-{name}.mp4"));
+                        std::fs::write(&path, bytes)?;
+                        let decoded = std::process::Command::new("ffmpeg")
+                            .args(["-v", "error", "-xerror", "-i"])
+                            .arg(&path)
+                            .args(["-f", "s16le", "-"])
+                            .output()?;
+                        assert!(
+                            decoded.status.success() && decoded.stderr.is_empty(),
+                            "{rate}/{profile}/{channels}/{name}: {}",
+                            String::from_utf8_lossy(&decoded.stderr)
+                        );
+                        assert!(!decoded.stdout.is_empty());
+                    }
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        std::fs::remove_dir_all(directory)?;
+        result
+    }
+
+    fn assert_clean_aac_tail(
+        decoded_audio: &[Vec<u8>],
+        missing_ticks: u64,
+        channels: usize,
+        rate: u32,
+    ) {
+        // Skip ten real AUs after the hole for filter overlap.
+        // A valid duration alone can hide persistent decoder damage.
+        let tail = 40 * 1024 * channels * 2;
+        let resumed_tail =
+            tail - usize::try_from(missing_ticks).expect("fixture hole fits usize") * channels * 2;
+        assert!(decoded_audio[0].len() > tail);
+        let mut signal_energy = 0.0;
+        let mut error_energy = 0.0;
+        for (original, repaired) in decoded_audio[0][tail..]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(decoded_audio[1][resumed_tail..].as_chunks::<2>().0)
+        {
+            let original = f64::from(i16::from_le_bytes(*original));
+            let repaired = f64::from(i16::from_le_bytes(*repaired));
+            signal_energy += original * original;
+            error_energy += (original - repaired).powi(2);
+        }
+        // PNS uses decoder-local noise state, so dropping real
+        // packets need not produce bit-identical PCM. Bound the
+        // residual error to 1% RMS of this audible tone instead.
+        assert!(signal_energy > 0.0);
+        assert!(
+            error_energy <= signal_energy * 0.0001,
+            "{rate}/{channels}: AAC tail relative RMS error {}",
+            (error_energy / signal_energy).sqrt()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg executable with AAC and libopus encoders"]
+    async fn gapped_audio_decodes_through_cmaf_for_each_supported_configuration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory =
+            std::env::temp_dir().join(format!("rushls-repair-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory)?;
+        let result = async {
+            for (codec, rate) in [("aac", 44_100u32), ("aac", 48_000), ("libopus", 48_000)] {
+                for channels in [1usize, 2] {
+                    let encoded = std::process::Command::new("ffmpeg")
+                        .args(["-v", "error", "-f", "lavfi", "-i"])
+                        .arg(format!(
+                            "sine=frequency=440:sample_rate={rate}:duration=1.5"
+                        ))
+                        .args([
+                            "-ac",
+                            &channels.to_string(),
+                            "-c:a",
+                            codec,
+                            "-f",
+                            "mpegts",
+                            "-",
+                        ])
+                        .output()?;
+                    assert!(
+                        encoded.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&encoded.stderr)
+                    );
+                    let fixture = ts_bytes_fixture(&encoded.stdout).await;
+                    let baseline = packages_as_demuxable_cmaf(IngestFixture {
+                        presentation: fixture.presentation.clone(),
+                        timeline: fixture.timeline.clone(),
+                        samples: fixture.samples.clone(),
+                    });
+                    let media = gap_fixture_as_cmaf(&fixture, rate)?;
+                    let repaired = concat_cmaf_bytes(&media);
+                    let missing_ticks: u64 = media
+                        .iter()
+                        .filter_map(|item| match item {
+                            PackagedMedia::Gap(gap) => Some(gap.duration),
+                            _ => None,
+                        })
+                        .sum();
+                    let output = demux_cmaf(&repaired);
+                    let original = demux_cmaf(&baseline[0]);
+                    assert_eq!(
+                        output.tracks[0].samples.len(),
+                        original.tracks[0].samples.len() - 6
+                    );
+                    for (actual, expected) in output.tracks[0].samples.iter().zip(
+                        original.tracks[0]
+                            .samples
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| !(10..16).contains(index))
+                            .map(|(_, sample)| sample),
+                    ) {
+                        assert_eq!(actual.duration, expected.duration);
+                    }
+                    let mut decoded_audio = Vec::new();
+                    for (name, bytes) in [
+                        ("baseline", baseline[0].as_slice()),
+                        ("repaired", repaired.as_slice()),
+                    ] {
+                        let path = directory.join(format!("{codec}-{rate}-{channels}-{name}.mp4"));
+                        std::fs::write(&path, bytes)?;
+                        let decoded = std::process::Command::new("ffmpeg")
+                            .args(["-v", "error", "-xerror", "-i"])
+                            .arg(path)
+                            .args(["-f", "s16le", "-"])
+                            .output()?;
+                        assert!(
+                            decoded.status.success(),
+                            "{codec}/{rate}/{channels}: {}",
+                            String::from_utf8_lossy(&decoded.stderr)
+                        );
+                        // AAC SBR failures can produce PCM and exit successfully,
+                        // even with -xerror. Diagnostics are also a release gate.
+                        assert!(
+                            decoded.stderr.is_empty(),
+                            "{codec}/{rate}/{channels}: {}",
+                            String::from_utf8_lossy(&decoded.stderr)
+                        );
+                        assert!(!decoded.stdout.is_empty());
+                        decoded_audio.push(decoded.stdout);
+                    }
+                    assert_eq!(
+                        decoded_audio[0].len(),
+                        decoded_audio[1].len() + usize::try_from(missing_ticks)? * channels * 2,
+                        "raw decoding contains only available samples"
+                    );
+                    if codec == "aac" {
+                        assert_clean_aac_tail(&decoded_audio, missing_ticks, channels, rate);
+                    }
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        std::fs::remove_dir_all(directory)?;
+        result
+    }
 }
 
 #[cfg(test)]
@@ -2991,6 +3628,142 @@ mod boundary_accounting_tests {
             })
         ));
         assert!(out.is_empty());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    use crate::{
+        domain::{Timebase, fixtures::TrackBuilder},
+        media::{
+            MissingInterval,
+            fixtures::{audio_sample, presentation, video_sample},
+        },
+        mux::{
+            Muxer,
+            coordinator::Coordinator,
+            fixtures::{H264_EXTRADATA, discarded_events},
+        },
+        segment::{SegmentationPlan, fixtures::PlanBuilder},
+    };
+
+    fn assert_gap_coverage(
+        out: &[PackagedMedia],
+        missing_frames: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut audio_end = 0;
+        let mut absent = 0;
+        for item in out {
+            match item {
+                PackagedMedia::Chunk(chunk) if chunk.rendition_id.0 == 0 => {
+                    assert_eq!(chunk.media_start, audio_end);
+                    assert!(chunk.duration <= 9600);
+                    audio_end += i64::try_from(chunk.duration)?;
+                }
+                PackagedMedia::Gap(gap) => {
+                    assert_eq!(gap.media_start, audio_end);
+                    assert_eq!(gap.parts.iter().sum::<u64>(), gap.duration);
+                    assert!(
+                        gap.parts
+                            .iter()
+                            .all(|duration| *duration > 0 && *duration <= 9600)
+                    );
+                    absent += gap.duration;
+                    audio_end += i64::try_from(gap.duration)?;
+                }
+                PackagedMedia::SegmentCompleted(segment) if segment.rendition_id.0 == 1 => {
+                    assert_eq!(segment.duration, 98_304);
+                    assert_eq!(segment.media_start % 98_304, 0);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(absent, u64::try_from(missing_frames * 1024)?);
+        assert_eq!(audio_end, 288 * 1024);
+        assert_eq!(out.iter().filter(|item| matches!(item, PackagedMedia::Initialization(init) if init.rendition_id.0 == 0)).count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn local_audio_gaps_preserve_global_boundaries_and_exact_coverage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for with_video in [false, true] {
+            for (first_missing, missing_frames) in [(1, 1), (9, 1), (90, 20), (96, 1)] {
+                let clock = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+                let mut tracks = vec![
+                    TrackBuilder::new(0, MediaKind::Audio)
+                        .timebase(clock)
+                        .codec_extradata(&[0x11, 0x90][..])
+                        .build(),
+                ];
+                if with_video {
+                    tracks.push(
+                        TrackBuilder::new(1, MediaKind::Video)
+                            .timebase(clock)
+                            .codec_extradata(H264_EXTRADATA)
+                            .build(),
+                    );
+                }
+                let input = presentation(tracks);
+                let plans: Vec<_> = input
+                    .tracks()
+                    .iter()
+                    .map(|track| {
+                        PlanBuilder::new(track.id.0, clock, nz::u64!(98_304))
+                            .part(nz::u32!(1), nz::u64!(9_600))
+                            .build()
+                    })
+                    .collect();
+                let plan = SegmentationPlan::new(&input, plans.clone())?;
+                let events = discarded_events();
+                let writers = input
+                    .tracks()
+                    .iter()
+                    .zip(plans)
+                    .map(|(track, plan)| {
+                        build_track(
+                            PackagingRenditionId(track.id.0),
+                            track,
+                            plan,
+                            Duration::ZERO,
+                            events.clone(),
+                        )
+                        .map(|(_, writer)| writer)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut mux = Coordinator::new(writers, &input, &plan, events)?;
+                let mut out = Vec::new();
+                for index in 0..288_i64 {
+                    if with_video && index % 4 == 0 {
+                        // The payload is opaque to timing; reuse the valid H.264 fixture access unit.
+                        let mut sample = video_sample(index * 1024, 4096, index % 96 == 0, 1);
+                        if let NormalizedMedia::Video(video) = &mut sample {
+                            video.track_id = TrackId(1);
+                        }
+                        mux.push(sample, &mut out)?;
+                    }
+                    if index == first_missing {
+                        mux.push(
+                            NormalizedMedia::Gap(MissingInterval {
+                                track_id: TrackId(0),
+                                media_kind: MediaKind::Audio,
+                                start: index * 1024,
+                                end: (index + missing_frames) * 1024,
+                                timebase: clock,
+                            }),
+                            &mut out,
+                        )?;
+                    }
+                    if !(first_missing..first_missing + missing_frames).contains(&index) {
+                        mux.push(audio_sample(0, index * 1024, 1024), &mut out)?;
+                    }
+                }
+                mux.finish(FinishReason::Final, &mut out)?;
+                assert_gap_coverage(&out, missing_frames)?;
+            }
+        }
         Ok(())
     }
 }

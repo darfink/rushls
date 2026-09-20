@@ -32,6 +32,7 @@ pub struct StoredInitialization {
 /// A partial segment retained for playlist and standalone-resource delivery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredPart {
+    pub gap: bool,
     pub id: PartId,
     pub cursor: PartCursor,
     /// Publisher generation that produced the media. A projection emits a
@@ -76,6 +77,7 @@ impl SegmentBody {
 pub enum StoredSegmentKind {
     Media(SegmentBody),
     Gap,
+    GapParts(Arc<[Arc<StoredPart>]>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,7 +146,8 @@ impl PublishedSegments {
         if self
             .parts_visible_from
             .is_some_and(|frontier| segment.msn >= frontier)
-            && let StoredSegmentKind::Media(SegmentBody::Chunked(parts)) = &segment.kind
+            && let StoredSegmentKind::Media(SegmentBody::Chunked(parts))
+            | StoredSegmentKind::GapParts(parts) = &segment.kind
         {
             return parts;
         }
@@ -161,7 +164,9 @@ impl PublishedSegments {
 pub fn segment_resource_bytes(segment: &StoredSegment) -> usize {
     let payload = match &segment.kind {
         StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) => payload.memory_bytes(),
-        StoredSegmentKind::Media(SegmentBody::Chunked(_)) | StoredSegmentKind::Gap => 0,
+        StoredSegmentKind::Media(SegmentBody::Chunked(_))
+        | StoredSegmentKind::Gap
+        | StoredSegmentKind::GapParts(_) => 0,
     };
     payload.saturating_add(segment.gzip.as_ref().map_or(0, HeldBytes::memory_bytes))
 }
@@ -169,7 +174,9 @@ pub fn segment_resource_bytes(segment: &StoredSegment) -> usize {
 pub fn segment_disk_bytes(segment: &StoredSegment) -> usize {
     let payload = match &segment.kind {
         StoredSegmentKind::Media(SegmentBody::Contiguous(payload)) => payload.disk_bytes(),
-        StoredSegmentKind::Media(SegmentBody::Chunked(_)) | StoredSegmentKind::Gap => 0,
+        StoredSegmentKind::Media(SegmentBody::Chunked(_))
+        | StoredSegmentKind::Gap
+        | StoredSegmentKind::GapParts(_) => 0,
     };
     payload.saturating_add(segment.gzip.as_ref().map_or(0, HeldBytes::disk_bytes))
 }
@@ -182,7 +189,7 @@ pub fn segment_disk_bytes(segment: &StoredSegment) -> usize {
 pub fn segment_byte_len(segment: &StoredSegment) -> usize {
     match &segment.kind {
         StoredSegmentKind::Media(body) => body.len(),
-        StoredSegmentKind::Gap => 0,
+        StoredSegmentKind::Gap | StoredSegmentKind::GapParts(_) => 0,
     }
 }
 

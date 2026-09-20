@@ -237,6 +237,26 @@ async fn admit(
 }
 
 /// The stages an admitted publication passes through.
+fn start_normalization(
+    context: &SessionContext,
+    presentation: &crate::media::PresentationPlan,
+    grant: &PublishGrant,
+    services: &Services,
+) -> Result<crate::media::StartedNormalizer, SessionError> {
+    context.enter(Phase::Calibrating);
+    let timeline = media::calibrate(presentation)?;
+    context.emit(SessionEvent::TimelineCalibrated {
+        authority: timeline.timing_authority,
+    });
+    let normalized =
+        services
+            .normalizers
+            .start(presentation, &timeline, grant.policy.input_mode)?;
+    record_track_timing(context, &normalized.presentation, &normalized.timeline);
+
+    Ok(normalized)
+}
+
 async fn pipeline(
     context: &SessionContext,
     mut source: Box<dyn PacketSource>,
@@ -263,15 +283,9 @@ async fn pipeline(
         counts: presentation.counts(),
     });
 
-    context.enter(Phase::Calibrating);
-    let timeline = media::calibrate(&presentation)?;
-    context.emit(SessionEvent::TimelineCalibrated {
-        authority: timeline.timing_authority,
-    });
-    let normalized = services.normalizers.start(&presentation, &timeline)?;
+    let normalized = start_normalization(context, &presentation, grant, services)?;
     let presentation = normalized.presentation;
     let timeline = normalized.timeline;
-    record_track_timing(context, &presentation, &timeline);
 
     let mut head = MediaHead::new(
         source,
@@ -287,6 +301,8 @@ async fn pipeline(
             video_language(&presentation),
         )),
     );
+
+    head.set_events(context.events().clone());
 
     context.enter(Phase::Segmenting);
     let preroll = segment::run_preroll(
@@ -304,7 +320,6 @@ async fn pipeline(
     let pacer = media::MediaPacer::after_preroll(
         grant.policy.ceiling,
         grant.policy.floor,
-        grant.policy.maximum_timestamp_jump,
         &timeline,
         &preroll.buffered,
         context.meters().media_view(),
@@ -355,6 +370,16 @@ async fn pipeline(
     context.enter(Phase::Draining);
     context.emit(SessionEvent::Draining);
 
+    finish_live(&mut live, outcome, context, services)?;
+    Ok(outcome)
+}
+
+fn finish_live(
+    live: &mut LiveSession,
+    outcome: SessionOutcome,
+    context: &SessionContext,
+    services: &Services,
+) -> Result<(), SessionError> {
     // A failed flush does not retract a session that ran. Media the publisher
     // sent was published; only the last few frames of tail are in doubt. It is
     // counted and reported so it cannot pass unnoticed, but a node that marked
@@ -365,8 +390,16 @@ async fn pipeline(
         context.emit(SessionEvent::DrainFailed {
             reason: error.to_string(),
         });
+        // A typed input timing failure is still a publisher fault when only
+        // final flushing exposes it. Preserve best-effort drain for other errors.
+        if let live::ExecutionError::Media(media::MediaError::Normalize(
+            error @ NormalizeError::Timestamp(_),
+        )) = error
+        {
+            return Err(SessionError::Normalize(error));
+        }
     }
-    Ok(outcome)
+    Ok(())
 }
 
 fn record_track_timing(
@@ -399,6 +432,21 @@ fn video_language(presentation: &media::PresentationPlan) -> Option<Arc<str>> {
         .map(Arc::from)
 }
 
+fn timestamp_issue(error: &SessionError) -> Option<&crate::domain::TimestampIssue> {
+    let (SessionError::Normalize(normalized)
+    | SessionError::Preroll(PrerollError::Media(media::MediaError::Normalize(normalized)))
+    | SessionError::Supervision(SupervisionError::Execution(live::ExecutionError::Media(
+        media::MediaError::Normalize(normalized),
+    )))) = error
+    else {
+        return None;
+    };
+    match normalized {
+        NormalizeError::Timestamp(issue) => Some(issue),
+        _ => None,
+    }
+}
+
 fn report(
     context: &SessionContext,
     services: &Services,
@@ -424,10 +472,18 @@ fn report(
             if let Some(error) = mux {
                 services.meters.segmentation_failed(error);
             }
+            let timestamp_issue = timestamp_issue(error).cloned().map(Box::new);
+            if let Some(issue) = &timestamp_issue {
+                services.meters.timestamp_rejected(issue);
+            }
             context.emit(SessionEvent::Failed {
+                timestamp_issue,
                 segmentation: mux.cloned(),
                 reason: error.to_string(),
             });
         }
     }
 }
+
+#[cfg(test)]
+mod gap_playback;

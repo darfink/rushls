@@ -7,7 +7,7 @@ use crate::{
     domain::{Appender, BoxFuture},
     media::{
         CaptionReconciliation, CaptionVerifier, MediaDensityWindow, MediaError, MediaNormalizer,
-        MediaPacer, NormalizedSample, PacingError, SampleSource, TimelineCalibration,
+        MediaPacer, NormalizedMedia, PacingError, SampleSource, TimelineCalibration,
     },
     mux::{CaptionChannel, ClosedCaptionService, FinishReason, MuxError, Muxer, PackagedMedia},
     observe::{DeliveryMeters, EventSink, MediaMeters, MuxMeters, SessionEvent},
@@ -46,6 +46,7 @@ const INITIAL_BATCH: usize = 256;
 /// into, so it is the only place that can tell a busy encoder from a hostile
 /// one.
 pub struct MediaHead {
+    events: Option<crate::observe::EventSink>,
     source: Box<dyn PacketSource>,
     normalizer: Box<dyn MediaNormalizer>,
     meters: Arc<dyn MediaMeters>,
@@ -61,7 +62,7 @@ pub struct MediaHead {
     /// carried across in the same batch that produced it.
     declared_captions: Option<Arc<[ClosedCaptionService]>>,
     packets: Vec<Packet>,
-    normalized: Vec<NormalizedSample>,
+    normalized: Vec<NormalizedMedia>,
     drained: bool,
 }
 
@@ -75,6 +76,7 @@ impl MediaHead {
         captions: Option<CaptionVerifier>,
     ) -> Self {
         Self {
+            events: None,
             source,
             normalizer,
             meters,
@@ -85,6 +87,26 @@ impl MediaHead {
             packets: Vec::with_capacity(INITIAL_BATCH.min(limits.maximum_packets_per_batch)),
             normalized: Vec::with_capacity(INITIAL_BATCH.min(limits.maximum_samples_per_batch)),
             drained: false,
+        }
+    }
+
+    pub fn set_events(&mut self, events: crate::observe::EventSink) {
+        self.events = Some(events);
+    }
+
+    fn report_notices(
+        normalizer: &mut dyn MediaNormalizer,
+        meters: &dyn MediaMeters,
+        events: Option<&EventSink>,
+    ) {
+        for interval in normalizer.take_video_intervals() {
+            meters.video_interval(interval);
+        }
+        for notice in normalizer.take_notices() {
+            meters.compensation(&notice);
+            if let Some(events) = events {
+                events.emit(SessionEvent::Compensation { notice });
+            }
         }
     }
 
@@ -128,12 +150,14 @@ impl MediaHead {
     ///
     /// Idempotent, so the natural end-of-input path having already flushed
     /// costs nothing.
-    pub fn flush(&mut self, out: &mut dyn Appender<NormalizedSample>) -> Result<(), MediaError> {
+    pub fn flush(&mut self, out: &mut dyn Appender<NormalizedMedia>) -> Result<(), MediaError> {
         if self.drained {
             return Ok(());
         }
         self.drained = true;
-        self.normalizer.finish(out)?;
+        let result = self.normalizer.finish(out);
+        Self::report_notices(&mut *self.normalizer, &*self.meters, self.events.as_ref());
+        result?;
         Ok(())
     }
 }
@@ -141,7 +165,7 @@ impl MediaHead {
 impl SampleSource for MediaHead {
     fn next_batch<'a>(
         &'a mut self,
-        out: &'a mut dyn Appender<NormalizedSample>,
+        out: &'a mut dyn Appender<NormalizedMedia>,
     ) -> BoxFuture<'a, Result<InputState, MediaError>> {
         Box::pin(async move {
             if self.drained {
@@ -175,21 +199,37 @@ impl SampleSource for MediaHead {
                 {
                     self.declared_captions = Some(services);
                 }
-                self.normalizer.push(packet, &mut samples)?;
+                let result = self.normalizer.push(packet, &mut samples);
+                // Drain before propagating failure: prior compensation in this
+                // batch is a fact even when no samples reach packaging.
+                Self::report_notices(&mut *self.normalizer, &*self.meters, self.events.as_ref());
+                result?;
             }
             if !state.is_open() {
                 // End of input is the only place trailing access units held for
                 // reordering can be flushed, so it happens here rather than in
                 // each of the two loops that drive this.
-                self.normalizer.finish(&mut samples)?;
+                let result = self.normalizer.finish(&mut samples);
+                Self::report_notices(&mut *self.normalizer, &*self.meters, self.events.as_ref());
+                result?;
                 self.drained = true;
             }
-            let produced = samples.produced()?;
+            samples.produced()?;
+            let produced = self
+                .normalized
+                .iter()
+                .filter(|item| !matches!(item, NormalizedMedia::Gap(_)))
+                .count();
             self.density
                 .admit(consumed.packets as u64, &self.normalized)?;
             for sample in self.normalized.drain(..) {
-                self.meters
-                    .track_normalized(sample.track_id(), sample.pts(), sample.duration());
+                if !matches!(sample, NormalizedMedia::Gap(_)) {
+                    self.meters.track_normalized(
+                        sample.track_id(),
+                        sample.pts(),
+                        sample.duration(),
+                    );
+                }
                 out.push(sample);
             }
 
@@ -234,17 +274,14 @@ impl MediaTail {
         Ok(())
     }
 
-    fn write_all(
-        &mut self,
-        samples: &mut VecDeque<NormalizedSample>,
-    ) -> Result<(), ExecutionError> {
+    fn write_all(&mut self, samples: &mut VecDeque<NormalizedMedia>) -> Result<(), ExecutionError> {
         while let Some(sample) = samples.pop_front() {
             self.muxer.push(sample, &mut self.media)?;
         }
         self.publish()
     }
 
-    fn write_one(&mut self, sample: NormalizedSample) -> Result<(), ExecutionError> {
+    fn write_one(&mut self, sample: NormalizedMedia) -> Result<(), ExecutionError> {
         self.muxer.push(sample, &mut self.media)?;
         self.publish()
     }
@@ -319,7 +356,9 @@ impl MediaCounts {
         let (chunks, segments) = match media {
             PackagedMedia::Initialization(_) => (0, 0),
             PackagedMedia::Chunk(_) => (1, 0),
-            PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) => (0, 1),
+            PackagedMedia::Segment(_)
+            | PackagedMedia::SegmentCompleted(_)
+            | PackagedMedia::Gap(_) => (0, 1),
         };
         Self { chunks, segments }
     }
@@ -337,7 +376,7 @@ pub struct LiveSession {
     head: MediaHead,
     tail: MediaTail,
     pacer: MediaPacer,
-    samples: VecDeque<NormalizedSample>,
+    samples: VecDeque<NormalizedMedia>,
     input_state: InputState,
     replayed: bool,
     drained: bool,
@@ -354,7 +393,7 @@ impl LiveSession {
         head: MediaHead,
         tail: MediaTail,
         pacer: MediaPacer,
-        buffered: Vec<NormalizedSample>,
+        buffered: Vec<NormalizedMedia>,
         input_state: InputState,
     ) -> Self {
         Self {
@@ -563,7 +602,7 @@ mod tests {
 
         fn push(
             &mut self,
-            _sample: NormalizedSample,
+            _sample: NormalizedMedia,
             _out: &mut dyn Appender<PackagedMedia>,
         ) -> Result<(), MuxError> {
             Ok(())
@@ -604,7 +643,7 @@ mod tests {
 
         fn push(
             &mut self,
-            _sample: NormalizedSample,
+            _sample: NormalizedMedia,
             _out: &mut dyn Appender<PackagedMedia>,
         ) -> Result<(), MuxError> {
             Ok(())
@@ -752,14 +791,14 @@ mod tests {
         fn push(
             &mut self,
             _packet: Packet,
-            _out: &mut dyn Appender<NormalizedSample>,
+            _out: &mut dyn Appender<NormalizedMedia>,
         ) -> Result<(), crate::media::NormalizeError> {
             Ok(())
         }
 
         fn finish(
             &mut self,
-            _out: &mut dyn Appender<NormalizedSample>,
+            _out: &mut dyn Appender<NormalizedMedia>,
         ) -> Result<(), crate::media::NormalizeError> {
             Ok(())
         }
@@ -801,7 +840,6 @@ mod tests {
         let pacer = MediaPacer::after_preroll(
             None,
             None,
-            std::time::Duration::from_mins(1),
             &crate::media::fixtures::video_timeline(),
             &[],
             session.media_view(),

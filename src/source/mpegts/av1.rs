@@ -77,6 +77,8 @@ pub fn track(
         cursor.set_position(end);
     }
     let track = DiscoveredTrack {
+        decoder_config_origin: crate::domain::DecoderConfigOrigin::Synthesized,
+        video_cadence: crate::domain::VideoCadence::Unknown,
         id: TrackId(spec.track_id),
         source_key: spec
             .source_pid
@@ -105,4 +107,30 @@ pub fn track(
 }
 fn error(message: &str) -> SourceError {
     SourceError::Demux(message.into())
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::*;
+    #[test]
+    fn av1g_in_band_sequence_retains_fixed_cadence() -> Result<(), SourceError> {
+        let config = crate::media::fixtures::AV1_FIXED_CADENCE;
+        let mut descriptors = vec![5, 4, b'A', b'V', b'1', b'G', 0x80, 4];
+        descriptors.extend_from_slice(&config[..4]);
+        let spec = TrackSpec::new(
+            1,
+            90000,
+            CodecConfig::Data {
+                stream_type: 6,
+                descriptors,
+                carriage: transmux::ir::DataCarriage::Pes,
+            },
+        );
+        let (track, _) = track(&spec, &config[4..])?.expect("sequence header available");
+        assert!(matches!(
+            crate::media::cadence::inspect(&track),
+            crate::domain::VideoCadence::Fixed { .. }
+        ));
+        Ok(())
+    }
 }

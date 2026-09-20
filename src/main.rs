@@ -155,11 +155,24 @@ impl EventObserver for TracingEvents {
                     info!(session = %session, end = %end, "ended");
                 }
             },
+            SessionEvent::Compensation { notice } => match notice.transition {
+                rushls::domain::RecoveryTransition::Unavailable => {
+                    warn!(session = %session, status = ?notice.status, "video cadence validation unavailable");
+                }
+                rushls::domain::RecoveryTransition::Degraded => {
+                    warn!(session = %session, track = %notice.status.track, media_kind = ?notice.status.media_kind, codec = ?notice.status.codec, method = %notice.status.method, missing_ticks = %notice.status.missing_ticks, episode_ticks = %notice.status.episode_ticks, total_ticks = %notice.status.total_ticks, timebase = ?notice.status.timebase, cadence = ?notice.status.cadence, "input compensation started");
+                }
+                rushls::domain::RecoveryTransition::Recovered => {
+                    info!(session = %session, status = ?notice.status, "input continuity recovered");
+                }
+                rushls::domain::RecoveryTransition::Compensated => {}
+            },
             SessionEvent::Failed {
                 reason,
                 segmentation,
+                timestamp_issue,
             } => {
-                warn!(session = %session, reason = %reason, ?segmentation, "failed");
+                warn!(session = %session, reason = %reason, ?segmentation, ?timestamp_issue, "failed");
             }
         }
     }

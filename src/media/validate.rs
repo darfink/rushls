@@ -247,7 +247,7 @@ mod tests {
             takeovers: crate::admission::TakeoverPolicy::Allow,
             ceiling: None,
             floor: None,
-            maximum_timestamp_jump: std::time::Duration::from_secs(10),
+            input_mode: crate::domain::InputMode::Permissive,
             video: crate::admission::VideoAccept {
                 codecs: crate::admission::Codecs::OneOf(vec![Codec::H264]),
                 resolution: crate::admission::Resolution::AtMost(FrameBox::new(3840, 2160)),

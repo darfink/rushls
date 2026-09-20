@@ -13,11 +13,13 @@ use parking_lot::Mutex;
 use rushls::admission::{OpenStreamAuthenticator, StreamPolicy};
 use rushls::delivery::hls::{StorePublisherFactory, StreamStore};
 use rushls::delivery::record::{Config as RecordConfig, Recorder, RecordingFactory};
+use rushls::domain::SessionId;
 use rushls::media::PassThroughNormalizerFactory;
 use rushls::mux::PassThroughMuxerFactory;
-use rushls::domain::SessionId;
 use rushls::observe::{EventObserver, Events, NodeEvent, ProcessMeters, SessionEvent};
-use rushls::session::{PendingPermit, Registry, Services, SessionConfig, SessionError, SessionOutcome, run_session};
+use rushls::session::{
+    PendingPermit, Registry, Services, SessionConfig, SessionError, SessionOutcome, run_session,
+};
 
 use super::config::E2eConfig;
 use super::publish::{BurstMpegTs, live_camera};
@@ -32,12 +34,20 @@ pub struct WorkDir {
 
 impl WorkDir {
     pub fn new(_cfg: &E2eConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?.as_nanos();
-        let root = std::env::temp_dir().join(format!("rushls-record-e2e-{}-{nanos}", std::process::id()));
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("rushls-record-e2e-{}-{nanos}", std::process::id()));
         let archive = root.join("archive");
         std::fs::create_dir_all(&archive)?;
         let keep = std::env::var("RUSHLS_TEST_RECORD_E2E_KEEP").is_ok();
-        Ok(Self { root, archive, keep, owned: true })
+        Ok(Self {
+            root,
+            archive,
+            keep,
+            owned: true,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -116,15 +126,26 @@ impl TestRig {
     /// handle so the test can drain and assert zero loss afterwards. The
     /// session cadence comes from the e2e config: prod 6s/1s unless the
     /// segment-target override shortens it for rapid churn.
-    pub fn start(archive: &Path, pattern: &str, cfg: &E2eConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn start(
+        archive: &Path,
+        pattern: &str,
+        cfg: &E2eConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let log = Arc::new(Log::default());
         let events = Events::new(log.clone());
         let meters = ProcessMeters::default();
         let store = StreamStore::new(rushls::delivery::hls::StoreLimits::default());
 
-        let recorder = Recorder::start(&record_config(archive, pattern), events.clone(), meters.clone())?;
+        let recorder = Recorder::start(
+            &record_config(archive, pattern),
+            events.clone(),
+            meters.clone(),
+        )?;
         let inner = StorePublisherFactory::new(store);
-        let publishers = RecordingFactory { inner: Arc::new(inner), recorder: recorder.clone() };
+        let publishers = RecordingFactory {
+            inner: Arc::new(inner),
+            recorder: recorder.clone(),
+        };
 
         let services = Services {
             authenticator: Arc::new(OpenStreamAuthenticator::new(StreamPolicy::permissive())),
@@ -138,32 +159,60 @@ impl TestRig {
         // Permissive input throughout; the burst comes from the input being
         // fully buffered, not from a special ceiling. Only the segment
         // cadence follows the e2e config.
-        let session_cfg = SessionConfig { segmentation: cfg.segmentation_policy(), ..SessionConfig::default() };
+        let session_cfg = SessionConfig {
+            segmentation: cfg.segmentation_policy(),
+            ..SessionConfig::default()
+        };
         eprintln!("record e2e: session cadence {}s segments", cfg.segment_secs);
-        Ok(Self { archive: archive.to_path_buf(), services, recorder, log, meters, session_cfg })
+        Ok(Self {
+            archive: archive.to_path_buf(),
+            services,
+            recorder,
+            log,
+            meters,
+            session_cfg,
+        })
     }
 
     /// Publish one fully-buffered input as fast as the session demuxes.
     pub async fn run_burst(&self, bytes: Vec<u8>) -> Result<SessionOutcome, SessionError> {
-        eprintln!("record e2e: publishing {:.1} MiB with no pacing", bytes.len() as f64 / 1_048_576.0);
+        eprintln!(
+            "record e2e: publishing {:.1} MiB with no pacing",
+            bytes.len() as f64 / 1_048_576.0
+        );
         let pending: Box<dyn rushls::source::PendingPublish> = Box::new(BurstMpegTs {
             request: live_camera(),
             bytes,
         });
         let started = std::time::Instant::now();
-        let session = run_session(pending, &self.services, &self.session_cfg, PendingPermit::unlimited()).await?;
-        eprintln!("record e2e: session {session:?} after {:?}", started.elapsed());
+        let session = run_session(
+            pending,
+            &self.services,
+            &self.session_cfg,
+            PendingPermit::unlimited(),
+        )
+        .await?;
+        eprintln!(
+            "record e2e: session {session:?} after {:?}",
+            started.elapsed()
+        );
         Ok(session)
     }
 
     /// Drain the recorder and hand back files + health signals.
-    pub async fn drain_and_collect(self) -> Result<DrainedArchive, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn drain_and_collect(
+        self,
+    ) -> Result<DrainedArchive, Box<dyn std::error::Error + Send + Sync>> {
         self.recorder.drain(Duration::from_secs(30)).await;
         let files = collect_files(&self.archive)?;
         eprintln!("record e2e: archive holds {} files", files.len());
         let node_events = std::mem::take(&mut *self.log.0.lock());
         let recording_lost = self.meters.snapshot().recording_segments_lost;
-        Ok(DrainedArchive { node_events, recording_lost, files })
+        Ok(DrainedArchive {
+            node_events,
+            recording_lost,
+            files,
+        })
     }
 }
 
@@ -182,7 +231,12 @@ pub async fn publish_and_record(
     }
     let drained = rig.drain_and_collect().await?;
     let _ = cfg;
-    Ok(RecordOutcome { session, node_events: drained.node_events, recording_lost: drained.recording_lost, files: drained.files })
+    Ok(RecordOutcome {
+        session,
+        node_events: drained.node_events,
+        recording_lost: drained.recording_lost,
+        files: drained.files,
+    })
 }
 
 fn collect_files(archive: &Path) -> std::io::Result<Vec<PathBuf>> {
@@ -191,7 +245,11 @@ fn collect_files(archive: &Path) -> std::io::Result<Vec<PathBuf>> {
             let path = item?.path();
             if path.is_dir() {
                 visit(&path, out)?;
-            } else if !path.file_name().map(|n| n.to_string_lossy().starts_with(".rushls-")).unwrap_or(false) {
+            } else if !path
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with(".rushls-"))
+                .unwrap_or(false)
+            {
                 out.push(path);
             }
         }

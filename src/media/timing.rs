@@ -4,7 +4,7 @@ use crate::domain::{
     DiscoveredTrack, MediaParameters, TickDuration, TickTimestamp, Timebase, TrackId,
 };
 
-use super::NormalizedSample;
+use super::NormalizedMedia;
 
 /// The portion of an encoded access unit that belongs on the presentation
 /// timeline after codec padding is removed.
@@ -75,21 +75,24 @@ impl PresentedTimingCursor {
     ///
     /// Access units must arrive in the order the track produced them: the
     /// leading skip carried between calls is meaningless out of order.
-    pub fn next(
-        &mut self,
-        sample: &NormalizedSample,
-    ) -> Result<PresentedTiming, SampleTimingError> {
+    pub fn next(&mut self, sample: &NormalizedMedia) -> Result<PresentedTiming, SampleTimingError> {
         if sample.track_id() != self.track_id {
             return Err(SampleTimingError::WrongTrack);
         }
+        if let NormalizedMedia::Gap(gap) = sample {
+            return Ok(PresentedTiming {
+                start: gap.start,
+                duration: gap.end.abs_diff(gap.start),
+            });
+        }
         let (packet_leading, trailing) = match (sample, self.audio) {
-            (NormalizedSample::Audio(sample), Some(scale)) => (
+            (NormalizedMedia::Audio(sample), Some(scale)) => (
                 scale.ticks(sample.trim.leading_samples)?,
                 scale.ticks(sample.trim.trailing_samples)?,
             ),
             // An audio sample on a track discovered as another kind: its trim
             // has no scale to convert through, so its timing cannot be trusted.
-            (NormalizedSample::Audio(_), None) => return Err(SampleTimingError::WrongTrack),
+            (NormalizedMedia::Audio(_), None) => return Err(SampleTimingError::WrongTrack),
             _ => (0, 0),
         };
         let leading = self
@@ -156,7 +159,7 @@ mod tests {
         let track = TrackBuilder::new(1, MediaKind::Audio)
             .timebase(Timebase::new(nz::u32!(1), nz::u32!(48_000)))
             .build();
-        let priming = NormalizedSample::Audio(AudioSample {
+        let priming = NormalizedMedia::Audio(AudioSample {
             track_id: TrackId(1),
             codec: Codec::Aac,
             pts: -1_024,
@@ -167,7 +170,7 @@ mod tests {
             },
             payload: Payload::default(),
         });
-        let tail = NormalizedSample::Audio(AudioSample {
+        let tail = NormalizedMedia::Audio(AudioSample {
             track_id: TrackId(1),
             codec: Codec::Aac,
             pts: 0,
@@ -206,7 +209,7 @@ mod tests {
             trailing_samples: 0,
         };
         let samples = [
-            NormalizedSample::Audio(AudioSample {
+            NormalizedMedia::Audio(AudioSample {
                 track_id: track.id,
                 codec: Codec::Aac,
                 pts: -2_112,
@@ -214,7 +217,7 @@ mod tests {
                 trim: original_trim,
                 payload: Payload::default(),
             }),
-            NormalizedSample::Audio(AudioSample {
+            NormalizedMedia::Audio(AudioSample {
                 track_id: track.id,
                 codec: Codec::Aac,
                 pts: -1_088,
@@ -222,7 +225,7 @@ mod tests {
                 trim: AudioTrim::default(),
                 payload: Payload::default(),
             }),
-            NormalizedSample::Audio(AudioSample {
+            NormalizedMedia::Audio(AudioSample {
                 track_id: track.id,
                 codec: Codec::Aac,
                 pts: -64,
@@ -256,7 +259,7 @@ mod tests {
         );
         assert_eq!(
             match &samples[0] {
-                NormalizedSample::Audio(sample) => sample.trim,
+                NormalizedMedia::Audio(sample) => sample.trim,
                 _ => unreachable!("fixture is audio"),
             },
             original_trim,

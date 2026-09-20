@@ -43,6 +43,22 @@ const VERSION: u8 = 6;
 /// groups to reach one of them.
 const CLOSED_CAPTION_GROUP: &str = "cc";
 
+fn write_header(
+    writer: &mut MultivariantPlaylistWriter<'_>,
+    uris: &PlaylistUris,
+) -> Result<(), ProjectionError> {
+    let version = if uris.query_variables() {
+        VERSION.max(QUERYPARAM_VERSION)
+    } else {
+        VERSION
+    };
+    writer.version(version.try_into().unwrap_or(std::num::NonZeroU8::MIN))?;
+    if uris.query_variables() {
+        writer.define_queryparam(TOKEN_QUERYPARAM)?;
+    }
+    Ok(())
+}
+
 /// Renders the multivariant playlist, or `None` if there is no topology yet.
 ///
 /// Absence means the stream has never had a publisher attach, not that it is
@@ -77,19 +93,9 @@ pub fn multivariant_playlist(
 
     let mut out = String::with_capacity(512);
     let mut writer = MultivariantPlaylistWriter::new(&mut out)?;
-    let version = if uris.query_variables() {
-        VERSION.max(QUERYPARAM_VERSION)
-    } else {
-        VERSION
-    };
-    writer.version(version.try_into().unwrap_or(std::num::NonZeroU8::MIN))?;
-    if uris.query_variables() {
-        writer.define_queryparam(TOKEN_QUERYPARAM)?;
-    }
-    // Every segment this origin publishes begins at a boundary that is
-    // independently decodable in its own rendition, which is what this asserts
-    // and what makes switching between variants seamless.
-    writer.independent_segments()?;
+    write_header(&mut writer, uris)?;
+    // GAP recovery can resume on dependent audio or video. A cached master
+    // must not promise independence before a future gap is known.
 
     let playable: Vec<Playable<'_>> = presentation
         .combinations

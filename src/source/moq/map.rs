@@ -159,6 +159,8 @@ pub fn tracks_from_catalog(
             },
         );
         tracks.push(DiscoveredTrack {
+            decoder_config_origin: configuration_origin(config.description.as_ref()),
+            video_cadence: crate::domain::VideoCadence::Unknown,
             id,
             source_key: Some(key),
             codec,
@@ -192,6 +194,8 @@ pub fn tracks_from_catalog(
             },
         );
         tracks.push(DiscoveredTrack {
+            decoder_config_origin: configuration_origin(config.description.as_ref()),
+            video_cadence: crate::domain::VideoCadence::Unknown,
             id,
             source_key: Some(key),
             codec,
@@ -338,7 +342,17 @@ fn video_track(
         )
         })?;
     let mut parameters = video_parameters(codec, &extradata, config)?;
-    if let MediaParameters::Video { video_delay, .. } = &mut parameters {
+    if let MediaParameters::Video {
+        video_delay,
+        frame_rate,
+        ..
+    } = &mut parameters
+    {
+        *frame_rate = frame_rate.or_else(|| {
+            config
+                .framerate
+                .and_then(crate::media::cadence::nominal_rate)
+        });
         *video_delay = crate::media::video_config::properties(codec, &extradata).reorder_depth;
     }
     Ok((codec, parameters, extradata))
@@ -387,7 +401,13 @@ fn video_parameters(
     let height = config.coded_height.ok_or(DiscoveryProblem::Missing {
         field: "video height",
     })?;
-    video_size(width, height)
+    let mut parameters = video_size(width, height)?;
+    if let MediaParameters::Video { frame_rate, .. } = &mut parameters {
+        *frame_rate = config
+            .framerate
+            .and_then(crate::media::cadence::nominal_rate);
+    }
+    Ok(parameters)
 }
 
 fn video_size(width: u32, height: u32) -> Result<MediaParameters, SourceError> {
@@ -465,6 +485,14 @@ fn opus_head(config: &AudioConfig) -> Result<Bytes, SourceError> {
 
 fn nonzero_u32(value: u32, field: &'static str) -> Result<NonZeroU32, SourceError> {
     NonZeroU32::new(value).ok_or_else(|| DiscoveryProblem::NotPositive { field }.into())
+}
+
+fn configuration_origin(description: Option<&Bytes>) -> crate::domain::DecoderConfigOrigin {
+    if description.is_some_and(|bytes| !bytes.is_empty()) {
+        crate::domain::DecoderConfigOrigin::Publisher
+    } else {
+        crate::domain::DecoderConfigOrigin::Synthesized
+    }
 }
 
 #[cfg(test)]
@@ -745,6 +773,35 @@ mod tests {
         assert_eq!(mapped.tracks[0], discovered_video);
         mapped.refine(tracks_from_catalog(&video, &audio)?)?;
         assert_eq!(mapped.tracks[0], discovered_video);
+        Ok(())
+    }
+    #[test]
+    fn catalog_video_preserves_codec_cadence_for_all_supported_codecs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::media::fixtures::{AV1_FIXED_CADENCE, H264_FIXED_CADENCE, HEVC_FIXED_CADENCE};
+        for (codec, bytes) in [
+            ("avc1.64000a", H264_FIXED_CADENCE),
+            ("hvc1.1.6.L60.90", HEVC_FIXED_CADENCE),
+            ("av01.0.00M.08", AV1_FIXED_CADENCE),
+        ] {
+            let mut config: VideoConfig = serde_json::from_value(
+                serde_json::json!({"codec":codec,"codedWidth":64,"codedHeight":64,"framerate":30.0}),
+            )?;
+            config.description = Some(Bytes::from_static(bytes));
+            let mapped = tracks_from_catalog(
+                &BTreeMap::from([("video".into(), config)]),
+                &BTreeMap::new(),
+            )?;
+            let cadence = crate::media::cadence::inspect(&mapped.tracks[0]);
+            assert!(
+                matches!(cadence, crate::domain::VideoCadence::Fixed { .. }),
+                "{codec}: {cadence:?}"
+            );
+            assert_eq!(
+                cadence.rate(),
+                Some(crate::domain::FrameRate::new(nz::u32!(25), nz::u32!(1)))
+            );
+        }
         Ok(())
     }
 }

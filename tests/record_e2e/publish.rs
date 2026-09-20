@@ -4,7 +4,9 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use rushls::admission::{ClientInfo, IngestProtocol, PresentedCredential, PublishRequest, PublishResource};
+use rushls::admission::{
+    ClientInfo, IngestProtocol, PresentedCredential, PublishRequest, PublishResource,
+};
 use rushls::domain::BoxFuture;
 use rushls::observe::SourceMeters;
 use rushls::source::{
@@ -15,7 +17,10 @@ use rushls::source::{
 pub fn live_camera() -> PublishRequest {
     PublishRequest {
         protocol: IngestProtocol::Srt,
-        resource: PublishResource { namespace: Some("live".into()), name: "camera".into() },
+        resource: PublishResource {
+            namespace: Some("live".into()),
+            name: "camera".into(),
+        },
         credential: PresentedCredential::new("secret"),
         client: ClientInfo {
             remote_address: "127.0.0.1:1935".parse().expect("constant is valid"),
@@ -56,12 +61,17 @@ impl PendingPublish for BurstMpegTs {
             // want to measure. Close the input only at EOF (ReadInput::closed
             // already models that: the cursor ends, the source ends).
             let _ = InputState::Closed;
-            Ok(AcceptedPublish { source: Box::new(source), grant })
+            Ok(AcceptedPublish {
+                source: Box::new(source),
+                grant,
+            })
         })
     }
 
-    fn reject(self: Box<Self>, _rejection: PublishRejection) -> BoxFuture<'static, Result<(), TransportError>> {
+    fn reject(
+        self: Box<Self>,
+        _rejection: PublishRejection,
+    ) -> BoxFuture<'static, Result<(), TransportError>> {
         Box::pin(async { Ok(()) })
     }
 }
-

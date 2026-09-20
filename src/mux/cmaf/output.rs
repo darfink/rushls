@@ -18,7 +18,7 @@ use crate::{
     domain::{
         Codec, DiscoveredTrack, MediaParameters, Payload, TickDuration, TickTimestamp, Timebase,
     },
-    media::NormalizedSample,
+    media::NormalizedMedia,
 };
 
 /// ISOBMFF track id for a one-rendition CMAF output. The number is arbitrary
@@ -79,14 +79,14 @@ impl CmafOutput {
 
     pub(super) fn write(
         &mut self,
-        sample: &NormalizedSample,
+        sample: &NormalizedMedia,
         pts: TickTimestamp,
         dts: TickTimestamp,
     ) {
         if self.first_decode.is_none() {
             self.first_decode = Some(dts);
             self.first_pts = Some(pts);
-            if let NormalizedSample::Audio(audio) = sample {
+            if let NormalizedMedia::Audio(audio) = sample {
                 // Normalized audio uses one tick per decoded sample.
                 self.padding_ticks = self
                     .padding_ticks
@@ -103,7 +103,7 @@ impl CmafOutput {
         // Opus permits shortening the final sample duration to discard end padding.
         // Keep startup trim in elst so decode timestamps retain the encoder history.
         let duration = match sample {
-            NormalizedSample::Audio(audio) if self.codec == Codec::Opus => sample
+            NormalizedMedia::Audio(audio) if self.codec == Codec::Opus => sample
                 .duration()
                 .saturating_sub(u64::from(audio.trim.trailing_samples)),
             _ => sample.duration(),
@@ -124,6 +124,14 @@ impl CmafOutput {
             return Ok(payload);
         }
         self.build_media()
+    }
+
+    pub(super) fn gap(&mut self) {
+        // Pre-gap packets do not provide contiguous roll history after absence.
+        // Keep the initialization/edit list; initial padding is never reapplied.
+        if let Some(roll) = &mut self.roll {
+            *roll = super::roll::RollRecovery::default();
+        }
     }
 
     pub(super) fn finalize(&mut self) {
@@ -516,11 +524,12 @@ fn u16_dim(value: NonZeroU32, field: &str) -> Result<u16, Box<str>> {
         .map_err(|_| format!("{field} exceeds the ISOBMFF sample-entry range").into())
 }
 
-fn sample_payload(sample: &NormalizedSample) -> &Payload {
+fn sample_payload(sample: &NormalizedMedia) -> &Payload {
     match sample {
-        NormalizedSample::Video(sample) => &sample.payload,
-        NormalizedSample::Audio(sample) => &sample.payload,
-        NormalizedSample::Subtitle(sample) => &sample.payload,
+        NormalizedMedia::Video(sample) => &sample.payload,
+        NormalizedMedia::Audio(sample) => &sample.payload,
+        NormalizedMedia::Subtitle(sample) => &sample.payload,
+        NormalizedMedia::Gap(_) => unreachable!("gaps have no codec payload"),
     }
 }
 

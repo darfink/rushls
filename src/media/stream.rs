@@ -5,7 +5,7 @@ use crate::{
     source::{InputState, LimitError, SourceError},
 };
 
-use super::{MediaDensityError, NormalizeError, NormalizedSample};
+use super::{MediaDensityError, NormalizeError, NormalizedMedia};
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum MediaError {
@@ -53,6 +53,6 @@ pub trait SampleSource: Send {
     /// exhausted input closed deliberately or was interrupted.
     fn next_batch<'a>(
         &'a mut self,
-        out: &'a mut dyn Appender<NormalizedSample>,
+        out: &'a mut dyn Appender<NormalizedMedia>,
     ) -> BoxFuture<'a, Result<InputState, MediaError>>;
 }

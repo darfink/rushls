@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     domain::{Appender, Payload, TickDuration, TickTimestamp, Timebase},
-    media::NormalizedSample,
+    media::NormalizedMedia,
 };
 
 mod cmaf;
@@ -75,6 +75,7 @@ pub enum PackagedMedia {
     Segment(PackagedSegment),
     /// Closes the segment assembled from the chunks that preceded it.
     SegmentCompleted(PackagedSegmentCompletion),
+    Gap(PackagedGap),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +117,16 @@ pub struct PackagedSegmentCompletion {
     pub duration: TickDuration,
 }
 
+/// A closed, unavailable parent. Part durations partition its complete interval.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackagedGap {
+    pub rendition_id: PackagingRenditionId,
+    pub packaging_segment_id: PackagingSegmentId,
+    pub media_start: TickTimestamp,
+    pub duration: TickDuration,
+    pub parts: Vec<TickDuration>,
+}
+
 impl PackagedMedia {
     pub fn rendition_id(&self) -> PackagingRenditionId {
         match self {
@@ -123,6 +134,7 @@ impl PackagedMedia {
             Self::Chunk(media) => media.rendition_id,
             Self::Segment(media) => media.rendition_id,
             Self::SegmentCompleted(media) => media.rendition_id,
+            Self::Gap(media) => media.rendition_id,
         }
     }
 }
@@ -205,7 +217,7 @@ pub trait Muxer: Send {
 
     fn push(
         &mut self,
-        sample: NormalizedSample,
+        sample: NormalizedMedia,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError>;
 

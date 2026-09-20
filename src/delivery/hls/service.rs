@@ -1122,7 +1122,7 @@ mod tests {
         write(&lease, chunk(0, 1, 0, 6));
 
         let request = video_playlist(
-            BlockingReload::from_directives(Some(1), Some(1))
+            BlockingReload::from_directives(Some(2), Some(1))
                 .expect("the directive is well formed"),
         );
         let held = tokio::spawn({
@@ -1132,7 +1132,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(
             !held.is_finished(),
-            "part 1 of MSN 1 has not been published"
+            "part 1 of MSN 2 has not been published"
         );
 
         write(&lease, chunk(0, 1, 1, 7));
@@ -1472,8 +1472,8 @@ mod tests {
 
         assert!(!playlist(&full).contains("#EXT-X-SKIP"));
         assert!(playlist(&delta).contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=3"));
-        assert!(playlist(&full).contains("#EXT-X-MEDIA-SEQUENCE:0"));
-        assert!(playlist(&delta).contains("#EXT-X-MEDIA-SEQUENCE:0"));
+        assert!(playlist(&full).contains("#EXT-X-MEDIA-SEQUENCE:1"));
+        assert!(playlist(&delta).contains("#EXT-X-MEDIA-SEQUENCE:1"));
     }
 }
 

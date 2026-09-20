@@ -2,7 +2,7 @@ use tokio::time::{Instant, timeout};
 
 use crate::{
     domain::{TickTimestamp, TrackId},
-    media::{NormalizedSample, PresentationPlan, Rounding, SampleSource, TimelineCalibration},
+    media::{NormalizedMedia, PresentationPlan, Rounding, SampleSource, TimelineCalibration},
     observe::{EventSink, SessionEvent},
     source::InputState,
 };
@@ -34,7 +34,7 @@ pub struct Preroll {
     ///
     /// Replayed into the live tail once it exists, so boundary discovery costs
     /// startup latency but never media.
-    pub buffered: Vec<NormalizedSample>,
+    pub buffered: Vec<NormalizedMedia>,
 }
 
 /// Observes media until segmentation cadence can be fixed for the session.
@@ -164,7 +164,7 @@ fn admit(
     buffered_bytes: &mut usize,
     retained: usize,
     limits: PrerollLimits,
-    sample: &NormalizedSample,
+    sample: &NormalizedMedia,
 ) -> Result<(), PrerollError> {
     if retained > limits.maximum_buffered_samples {
         return Err(PrerollError::LimitExceeded);
@@ -202,7 +202,7 @@ fn admit(
 fn select(
     observer: &CadenceObserver,
     presentation: &PresentationPlan,
-    buffered: &[NormalizedSample],
+    buffered: &[NormalizedMedia],
     policy: SegmentationPolicy,
     limits: PrerollLimits,
     work: &mut usize,
@@ -245,7 +245,7 @@ fn select(
 
 fn lock(
     segmentation: SegmentationPlan,
-    buffered: Vec<NormalizedSample>,
+    buffered: Vec<NormalizedMedia>,
     input_state: InputState,
     events: &EventSink,
 ) -> Preroll {
@@ -286,7 +286,7 @@ mod tests {
     impl SampleSource for Stalled {
         fn next_batch<'a>(
             &'a mut self,
-            _out: &'a mut dyn Appender<NormalizedSample>,
+            _out: &'a mut dyn Appender<NormalizedMedia>,
         ) -> BoxFuture<'a, Result<InputState, MediaError>> {
             Box::pin(std::future::pending())
         }
@@ -304,7 +304,7 @@ mod tests {
     }
 
     /// One second of video starting at `start_seconds`.
-    fn sample(start_seconds: i64, random_access: bool, payload_bytes: usize) -> NormalizedSample {
+    fn sample(start_seconds: i64, random_access: bool, payload_bytes: usize) -> NormalizedMedia {
         crate::media::fixtures::video_sample(
             start_seconds * VIDEO_SECOND,
             VIDEO_SECOND as u64,
@@ -320,10 +320,10 @@ mod tests {
     /// A byte budget expressed as room for `slots` single-byte samples.
     ///
     /// Written this way because the budget is charged at retained cost, so a
-    /// raw byte count would encode `size_of::<NormalizedSample>()` into every
+    /// raw byte count would encode `size_of::<NormalizedMedia>()` into every
     /// expectation and break whenever a field is added.
     fn budget(slots: usize) -> usize {
-        slots * (size_of::<NormalizedSample>() + 1)
+        slots * (size_of::<NormalizedMedia>() + 1)
     }
 
     fn limits(slots: usize, maximum_media_duration: Duration) -> PrerollLimits {
@@ -631,7 +631,7 @@ mod admission_tests {
                         },
                         0,
                     );
-                    if let NormalizedSample::Video(video) = &mut sample {
+                    if let NormalizedMedia::Video(video) = &mut sample {
                         video.track_id = TrackId(u32::try_from(id)?);
                     }
                     samples.push(sample);
@@ -931,7 +931,7 @@ mod admission_tests {
             for frame in 0..=181 {
                 samples.push(video_sample(frame * 3000, 3000, frame % 60 == 0, 0));
                 let mut second = video_sample(frame * 1000, 1000, frame % 60 == 0, 0);
-                if let NormalizedSample::Video(video) = &mut second {
+                if let NormalizedMedia::Video(video) = &mut second {
                     video.track_id = crate::domain::TrackId(2);
                 }
                 samples.push(second);
@@ -940,7 +940,7 @@ mod admission_tests {
                 let mut sample =
                     fixtures::audio_sample(1, delay - i64::from(padding) + frame * 1024, 1024);
                 if frame == 0
-                    && let NormalizedSample::Audio(audio) = &mut sample
+                    && let NormalizedMedia::Audio(audio) = &mut sample
                 {
                     audio.trim = AudioTrim {
                         leading_samples: padding,
@@ -1025,7 +1025,7 @@ mod admission_tests {
         .into_iter()
         .map(|(pts, duration, rap)| {
             let mut sample = video_sample(pts * 90, duration * 90, rap, 0);
-            if let NormalizedSample::Video(video) = &mut sample {
+            if let NormalizedMedia::Video(video) = &mut sample {
                 video.payload = Payload::from(if rap { H264_IDR } else { H264_P });
             }
             sample
@@ -1054,7 +1054,7 @@ mod admission_tests {
             Duration::from_millis(100)
         );
         let mut corrupt = admitted.buffered.clone();
-        if let NormalizedSample::Video(video) = &mut corrupt[0] {
+        if let NormalizedMedia::Video(video) = &mut corrupt[0] {
             video.codec = crate::domain::Codec::Hevc;
         }
         let error = run(

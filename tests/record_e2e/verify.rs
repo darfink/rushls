@@ -56,10 +56,18 @@ pub fn verify_archive(cfg: &E2eConfig, work: &WorkDir, outcome: &RecordOutcome) 
         // byte-budget path does by design under overload - and must be zero here.
         for (i, seg) in segs.iter().enumerate() {
             if *seg != i as u64 {
-                return Err(format!("rendition {rendition}: gap, expected segment {i}, found {seg} (have {} total)", segs.len()).into());
+                return Err(format!(
+                    "rendition {rendition}: gap, expected segment {i}, found {seg} (have {} total)",
+                    segs.len()
+                )
+                .into());
             }
         }
-        eprintln!("record e2e: rendition {rendition}: {} segments (0..{})", segs.len(), segs.len() - 1);
+        eprintln!(
+            "record e2e: rendition {rendition}: {} segments (0..{})",
+            segs.len(),
+            segs.len() - 1
+        );
     }
 
     // --- per-file: probe + full decode. Slowest step, but it is the actual proof.
@@ -71,7 +79,11 @@ pub fn verify_archive(cfg: &E2eConfig, work: &WorkDir, outcome: &RecordOutcome) 
         eprintln!(
             "record e2e: {} v={} ({} frames) a={} ({} frames, {} Hz)",
             file.strip_prefix(work.archive()).unwrap_or(file).display(),
-            info.has_video, info.video_frames, info.has_audio, info.audio_frames, info.sample_rate
+            info.has_video,
+            info.video_frames,
+            info.has_audio,
+            info.audio_frames,
+            info.sample_rate
         );
         if info.has_video {
             // count_frames via ffprobe is authoritative; decode below proves clean.
@@ -96,7 +108,8 @@ pub fn verify_archive(cfg: &E2eConfig, work: &WorkDir, outcome: &RecordOutcome) 
         return Err(format!(
             "video frame total {video_frames} far from expected {expected_frames} (fps {} x {}s)",
             cfg.fps, cfg.duration_secs
-        ).into());
+        )
+        .into());
     }
     eprintln!("record e2e: video frames {video_frames} vs expected {expected_frames}");
 
@@ -108,21 +121,33 @@ pub fn verify_archive(cfg: &E2eConfig, work: &WorkDir, outcome: &RecordOutcome) 
         let expected_audio = (u64::from(sr) * cfg.duration_secs).div_ceil(1024);
         eprintln!("record e2e: audio frames {audio_frames} vs expected {expected_audio}");
         if audio_frames + 2 < expected_audio {
-            return Err(format!("audio frame total {audio_frames} below expected {expected_audio}").into());
+            return Err(format!(
+                "audio frame total {audio_frames} below expected {expected_audio}"
+            )
+            .into());
         }
         if audio_frames > expected_audio + 8 {
-            return Err(format!("audio frame total {audio_frames} far above expected {expected_audio}").into());
+            return Err(format!(
+                "audio frame total {audio_frames} far above expected {expected_audio}"
+            )
+            .into());
         }
     } else {
         eprintln!("record e2e: no audio renditions found; skipping audio total");
     }
-    eprintln!("record e2e: PASS ({} files, {} renditions)", outcome.files.len(), by_rendition.len());
+    eprintln!(
+        "record e2e: PASS ({} files, {} renditions)",
+        outcome.files.len(),
+        by_rendition.len()
+    );
     Ok(())
 }
 
 pub(crate) fn split_key(archive: &Path, file: &Path) -> Option<(String, u64)> {
     let rel = file.strip_prefix(archive).ok()?.to_str()?;
-    let stem = rel.strip_suffix(".mp4").or_else(|| rel.strip_suffix(".vtt"))?;
+    let stem = rel
+        .strip_suffix(".mp4")
+        .or_else(|| rel.strip_suffix(".vtt"))?;
     let (rendition, seg) = stem.rsplit_once('_')?;
     Some((rendition.to_string(), seg.parse().ok()?))
 }
@@ -134,7 +159,11 @@ pub(crate) fn check_no_temp_files(archive: &Path) -> TestResult {
             let p = item?.path();
             if p.is_dir() {
                 visit(&p, out)?;
-            } else if p.file_name().map(|n| n.to_string_lossy().starts_with(".rushls-")).unwrap_or(false) {
+            } else if p
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with(".rushls-"))
+                .unwrap_or(false)
+            {
                 out.push(p);
             }
         }
@@ -158,30 +187,61 @@ pub(crate) struct Probe {
 /// ffprobe without JSON (no new deps): one --show_entries query per kind.
 pub(crate) fn probe(file: &Path) -> Result<Probe, Box<dyn std::error::Error + Send + Sync>> {
     let out = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=codec_name,nb_read_frames",
-            "-count_frames", "-of", "default=nw=1"])
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,nb_read_frames",
+            "-count_frames",
+            "-of",
+            "default=nw=1",
+        ])
         .arg(file)
         .output()?;
     let video = kv_map(&String::from_utf8_lossy(&out.stdout));
     let has_video = out.status.success() && video.get("codec_name").is_some();
-    let video_frames: u64 = video.get("nb_read_frames").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let video_frames: u64 = video
+        .get("nb_read_frames")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let out = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "a:0",
-            "-show_entries", "stream=codec_name,nb_read_frames,sample_rate",
-            "-count_frames", "-of", "default=nw=1"])
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name,nb_read_frames,sample_rate",
+            "-count_frames",
+            "-of",
+            "default=nw=1",
+        ])
         .arg(file)
         .output()?;
     let audio = kv_map(&String::from_utf8_lossy(&out.stdout));
     let has_audio = out.status.success() && audio.get("codec_name").is_some();
-    let audio_frames: u64 = audio.get("nb_read_frames").and_then(|s| s.parse().ok()).unwrap_or(0);
-    let sample_rate: u32 = audio.get("sample_rate").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let audio_frames: u64 = audio
+        .get("nb_read_frames")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let sample_rate: u32 = audio
+        .get("sample_rate")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     if !has_video && !has_audio {
         return Err(format!("{}: ffprobe found neither audio nor video", file.display()).into());
     }
-    Ok(Probe { has_video, video_frames, has_audio, audio_frames, sample_rate })
+    Ok(Probe {
+        has_video,
+        video_frames,
+        has_audio,
+        audio_frames,
+        sample_rate,
+    })
 }
 
 /// Key=value map for one ffprobe response. Needed because ffprobe prints
@@ -209,7 +269,8 @@ pub(crate) fn decode_clean(file: &Path) -> Result<(), Box<dyn std::error::Error 
             "{} failed to decode: {}",
             file.display(),
             String::from_utf8_lossy(&out.stderr).trim()
-        ).into());
+        )
+        .into());
     }
     Ok(())
 }

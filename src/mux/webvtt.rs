@@ -15,7 +15,7 @@ use crate::{
         Appender, DiscoveredTrack, MediaInstant, MediaKind, Payload, TickDuration, TickTimestamp,
         Timebase, TimebaseProjection, TrackId, duration_since,
     },
-    media::{NormalizedSample, SubtitleSample},
+    media::{NormalizedMedia, SubtitleSample},
     observe::{EventSink, SessionEvent},
     segment::TrackSegmentationPlan,
 };
@@ -895,13 +895,13 @@ impl TrackPackager for WebVttTrack {
 
     fn push(
         &mut self,
-        sample: NormalizedSample,
+        sample: NormalizedMedia,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
         if self.finished {
             return Err(mux_error("cannot push WebVTT media after finish"));
         }
-        let NormalizedSample::Subtitle(sample) = sample else {
+        let NormalizedMedia::Subtitle(sample) = sample else {
             return Err(mux_error(format!(
                 "{} received a non-subtitle sample",
                 self.track_id
@@ -1192,8 +1192,8 @@ mod tests {
             .build()
     }
 
-    fn sample(codec: Codec, start: i64, duration: u64, text: &[u8]) -> NormalizedSample {
-        NormalizedSample::Subtitle(SubtitleSample {
+    fn sample(codec: Codec, start: i64, duration: u64, text: &[u8]) -> NormalizedMedia {
+        NormalizedMedia::Subtitle(SubtitleSample {
             track_id: TrackId(0),
             codec,
             pts: start,
@@ -1297,12 +1297,12 @@ mod tests {
     fn round_trip(codec: Codec, text: &[u8], metadata: WebVttCueMetadata) -> RenderedCue {
         let mut mux = mux(codec, 2);
         let mut output = Vec::new();
-        let NormalizedSample::Subtitle(cue) = sample(codec, 0, SECOND, text) else {
+        let NormalizedMedia::Subtitle(cue) = sample(codec, 0, SECOND, text) else {
             unreachable!()
         };
         let mut cue = cue;
         cue.webvtt = metadata;
-        mux.push(NormalizedSample::Subtitle(cue), &mut output)
+        mux.push(NormalizedMedia::Subtitle(cue), &mut output)
             .expect("cue is accepted");
         mux.finish(FinishReason::Final, &mut output)
             .expect("tail flushes");
@@ -1357,7 +1357,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut mux = mux(Codec::WebVtt, 2);
         let mut output = Vec::new();
-        let NormalizedSample::Subtitle(first) = sample(Codec::WebVtt, 0, 3 * SECOND, b"first")
+        let NormalizedMedia::Subtitle(first) = sample(Codec::WebVtt, 0, 3 * SECOND, b"first")
         else {
             unreachable!()
         };
@@ -1366,7 +1366,7 @@ mod tests {
             identifier: Some(Arc::from("cue-one")),
             settings: Some(Arc::from("align:start")),
         };
-        mux.push(NormalizedSample::Subtitle(first), &mut output)?;
+        mux.push(NormalizedMedia::Subtitle(first), &mut output)?;
         mux.finish(FinishReason::Final, &mut output)?;
 
         assert!(matches!(
@@ -1937,7 +1937,7 @@ mod tests {
             &mut output,
         )?;
         let output_before_error = output.len();
-        let NormalizedSample::Subtitle(positioned) = sample(
+        let NormalizedMedia::Subtitle(positioned) = sample(
             Codec::SubRip,
             i64::try_from(SECOND).expect("second fits i64"),
             SECOND,
@@ -1953,7 +1953,7 @@ mod tests {
             y2: 4,
         });
         assert!(
-            mux.push(NormalizedSample::Subtitle(positioned), &mut output)
+            mux.push(NormalizedMedia::Subtitle(positioned), &mut output)
                 .is_err()
         );
         assert_eq!(output.len(), output_before_error);
@@ -2054,7 +2054,7 @@ mod tests {
     }
 
     /// An open-ended cue, as FLV script data delivers one: a start and no end.
-    fn text_cue(start: i64, text: &[u8]) -> NormalizedSample {
+    fn text_cue(start: i64, text: &[u8]) -> NormalizedMedia {
         sample(Codec::Text, start, 0, text)
     }
 

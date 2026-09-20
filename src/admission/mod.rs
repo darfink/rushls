@@ -175,10 +175,8 @@ pub struct StreamPolicy {
     pub ceiling: Option<Ceiling>,
     /// Absent means no minimum rate.
     pub floor: Option<Floor>,
-    /// A forward jump beyond this is a broken timeline rather than media to
-    /// wait for. Enforced whether or not a ceiling is configured, because a
-    /// jump inflates the timeline regardless of who is pacing it.
-    pub maximum_timestamp_jump: Duration,
+    /// Strict enforces declared timing; permissive permits bounded, reported compensation.
+    pub input_mode: crate::domain::InputMode,
     pub video: VideoAccept,
     pub audio: AudioAccept,
     pub subtitles: SubtitleAccept,
@@ -207,7 +205,7 @@ impl StreamPolicy {
             // allows is taken to be asking for exactly that.
             ceiling: None,
             floor: None,
-            maximum_timestamp_jump: Duration::from_secs(10),
+            input_mode: crate::domain::InputMode::Permissive,
             // Codecs are the muxable set rather than `Any`: they name what
             // this origin can package, which is a capability rather than a
             // policy, and a track it cannot mux must be refused at admission

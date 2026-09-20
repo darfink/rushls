@@ -286,7 +286,7 @@ fn a_retain_below_the_protocol_floor_is_raised_to_it() {
 
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
     assert_eq!(snapshot.segments.len(), 3);
-    assert_eq!(snapshot.segments[0].msn, Msn(0));
+    assert_eq!(snapshot.segments[0].msn, Msn(1));
 }
 
 #[test]
@@ -582,7 +582,7 @@ fn durable_part_ids_and_cursors_advance_independently() {
             last_iframe: None,
             last_part: Some((
                 PartCursor {
-                    msn: Msn(0),
+                    msn: Msn(1),
                     part_index: PartIndex(0)
                 },
                 PartId(1)
@@ -596,12 +596,12 @@ fn durable_part_ids_and_cursors_advance_independently() {
     write(&lease, chunk(0, 1, 0, 1, 1, 1));
 
     let edge = lease.live().rendition_live_edge(RenditionId(0)).unwrap();
-    assert_eq!(edge.last_segment, Some((Msn(0), SegmentId(1))));
+    assert_eq!(edge.last_segment, Some((Msn(1), SegmentId(1))));
     assert_eq!(
         edge.last_part,
         Some((
             PartCursor {
-                msn: Msn(1),
+                msn: Msn(2),
                 part_index: PartIndex(0)
             },
             PartId(2)
@@ -624,7 +624,7 @@ fn takeover_consumes_an_observed_open_msn_as_a_gap() {
 
     let snapshot = second.live().rendition(RenditionId(0)).unwrap();
     assert!(matches!(snapshot.segments[0].kind, StoredSegmentKind::Gap));
-    assert_eq!(snapshot.segments[0].msn, Msn(0));
+    assert_eq!(snapshot.segments[0].msn, Msn(1));
     assert!(
         snapshot.segments.parts(&snapshot.segments[0]).is_empty(),
         "a gap beyond the visibility frontier cannot expose the parts it replaced"
@@ -634,7 +634,7 @@ fn takeover_consumes_an_observed_open_msn_as_a_gap() {
         "the hidden part remains independently fetchable during its grace period"
     );
     let open = snapshot.open_segment.as_ref().unwrap();
-    assert_eq!(open.msn, Msn(1));
+    assert_eq!(open.msn, Msn(2));
     assert_eq!(open.parts[0].id, PartId(2));
     assert_eq!(open.parts[0].cursor.part_index, PartIndex(0));
 }
@@ -674,7 +674,7 @@ fn reconnect_matches_exact_keys_even_when_local_ids_change() {
     assert_eq!(catalog.publication_anchors[1].time_anchor, second_anchor);
     let media = catalog.renditions[0].snapshot();
     assert_eq!(media.segments.len(), 2);
-    assert_eq!(media.segments[1].msn, Msn(1));
+    assert_eq!(media.segments[1].msn, Msn(2));
 }
 
 #[test]
@@ -984,7 +984,7 @@ fn live_window_never_falls_below_three_target_durations() {
         "the six-segment count is only a floor when segments are shorter \
          than the target duration"
     );
-    assert_eq!(snapshot.segments[0].msn, Msn(1));
+    assert_eq!(snapshot.segments[0].msn, Msn(2));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1088,7 +1088,7 @@ fn a_stream_over_its_segment_budget_sheds_rather_than_failing_the_write() {
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
     assert_eq!(
         snapshot.live_edge.last_segment,
-        Some((Msn(6), SegmentId(7))),
+        Some((Msn(7), SegmentId(7))),
         "the newest media is kept and the oldest is what gives way"
     );
 }
@@ -1365,7 +1365,7 @@ fn ending_and_releasing_a_rendition_keeps_it_terminal() {
     let edge = live.rendition_live_edge(RenditionId(0)).unwrap();
     assert!(edge.ended);
     assert_eq!(edge.next_part_id, None);
-    assert_eq!(edge.last_segment, Some((Msn(0), SegmentId(1))));
+    assert_eq!(edge.last_segment, Some((Msn(1), SegmentId(1))));
     assert_eq!(
         live.rendition(RenditionId(0))
             .unwrap()
@@ -1495,7 +1495,7 @@ fn a_takeover_marks_the_open_segment_before_any_of_its_parts_is_tagged() {
     );
     assert_eq!(
         (snapshot.media_sequence, snapshot.discontinuity_sequence),
-        (0, 0),
+        (1, 0),
         "a tag still inside the window has not been removed from it"
     );
 }
@@ -1523,7 +1523,7 @@ fn an_evicted_discontinuity_becomes_a_sequence_number_rather_than_nothing() {
     let snapshot = second.live().rendition(RenditionId(0)).unwrap();
     assert_eq!(snapshot.segments.len(), 6);
     assert_eq!(
-        snapshot.media_sequence, 2,
+        snapshot.media_sequence, 3,
         "the window head is the gap and the discontinuous segment behind it"
     );
     assert_eq!(
@@ -2397,7 +2397,7 @@ async fn burst_spill_waits_without_discarding_history() -> Result<(), Box<dyn st
             lease.live().retention_depth().held,
             Duration::from_secs(count * 6)
         );
-        assert_eq!(snapshot.segments[0].msn, Msn(0));
+        assert_eq!(snapshot.segments[0].msn, Msn(1));
         drop(lease);
         drop(store);
         let _ = std::fs::remove_dir_all(directory);
@@ -2790,7 +2790,7 @@ async fn sustained_dvr_spilling_keeps_current_playlists_cached()
         100,
         "DVR history survives repeated spills"
     );
-    assert_eq!(snapshot.segments[0].msn, Msn(0));
+    assert_eq!(snapshot.segments[0].msn, Msn(1));
     drop(hls);
     drop(lease);
     drop(store);
@@ -2852,5 +2852,105 @@ async fn manifest_allowance_survives_an_in_flight_spill_cycle()
     drop(lease);
     drop(store);
     let _ = std::fs::remove_dir_all(directory);
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_gap_preserves_parts_and_exposes_unavailable_resources()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = store();
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    write(&lease, chunk(0, 0, 0, 0, 1, 1));
+    write(&lease, completion(0, 0, 0, 1));
+    write(
+        &lease,
+        PackagedMedia::Gap(crate::mux::PackagedGap {
+            rendition_id: PackagingRenditionId(0),
+            packaging_segment_id: PackagingSegmentId(1),
+            media_start: 1,
+            duration: 2,
+            parts: vec![1, 1],
+        }),
+    );
+    write(&lease, chunk(0, 2, 0, 3, 1, 1));
+    write(&lease, completion(0, 2, 3, 1));
+    let snapshot = lease.live().rendition(RenditionId(0)).ok_or("rendition")?;
+    assert_eq!(snapshot.segments.len(), 3);
+    assert_eq!(
+        snapshot
+            .segments
+            .iter()
+            .map(|s| (s.media_start, s.duration))
+            .collect::<Vec<_>>(),
+        [(0, 1), (1, 2), (3, 1)]
+    );
+    assert!(snapshot.segments.iter().all(|s| !s.discontinuity_before));
+    let gap = &snapshot.segments[1];
+    let parts = snapshot.segments.parts(gap);
+    assert_eq!(parts.len(), 2);
+    assert!(
+        parts
+            .iter()
+            .all(|p| p.gap && !p.independent && p.payload.is_empty())
+    );
+    assert_eq!(snapshot.segments.parts(&snapshot.segments[0]).len(), 1);
+    let origin = Origin::new(store.clone());
+    for resource in [
+        MediaResource::Segment(RenditionId(0), gap.id, MediaSegmentFormat::Cmaf),
+        MediaResource::Part(RenditionId(0), parts[0].id, MediaSegmentFormat::Cmaf),
+    ] {
+        assert!(matches!(
+            origin.media(&stream(), resource, Duration::ZERO).await,
+            Err(crate::delivery::DeliveryError::UnknownResource)
+        ));
+    }
+    assert!(
+        origin
+            .media(
+                &stream(),
+                MediaResource::Part(RenditionId(0), PartId(1), MediaSegmentFormat::Cmaf),
+                Duration::ZERO
+            )
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        snapshot.live_edge.last_segment.map(|(msn, _)| msn),
+        Some(Msn(3))
+    );
+    Ok(())
+}
+
+#[test]
+fn malformed_explicit_gap_does_not_advance_the_playlist() -> Result<(), Box<dyn std::error::Error>>
+{
+    let store = store();
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    write(&lease, chunk(0, 0, 0, 0, 1, 1));
+    write(&lease, completion(0, 0, 0, 1));
+    let before = lease.live().rendition(RenditionId(0)).ok_or("rendition")?;
+    for (start, duration, parts) in [
+        (1, 0, vec![]),
+        (1, 2, vec![1]),
+        (1, 2, vec![2]),
+        (i64::MAX, 1, vec![1]),
+    ] {
+        assert!(
+            lease
+                .write(PackagedMedia::Gap(crate::mux::PackagedGap {
+                    rendition_id: PackagingRenditionId(0),
+                    packaging_segment_id: PackagingSegmentId(1),
+                    media_start: start,
+                    duration,
+                    parts,
+                }))
+                .is_err()
+        );
+        let after = lease.live().rendition(RenditionId(0)).ok_or("rendition")?;
+        assert_eq!(before.live_edge, after.live_edge);
+        assert_eq!(before.segments, after.segments);
+    }
     Ok(())
 }

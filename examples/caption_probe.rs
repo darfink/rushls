@@ -21,6 +21,8 @@ fn main() {
         .unwrap_or_default();
 
     let track = DiscoveredTrack {
+        decoder_config_origin: rushls::domain::DecoderConfigOrigin::Publisher,
+        video_cadence: rushls::domain::VideoCadence::Unknown,
         id: TrackId(0),
         source_key: None,
         codec: Codec::H264,

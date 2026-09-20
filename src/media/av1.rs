@@ -39,6 +39,32 @@ pub fn keyframe(bytes: &[u8], reduced: bool) -> Option<bool> {
     None
 }
 
+/// Count shown pictures without treating hidden reference frames as intervals.
+/// More complex temporal/spatial mappings remain explicitly unverified.
+pub fn displayed_pictures(bytes: &[u8]) -> Option<usize> {
+    let mut cursor = Cursor::new(bytes);
+    let mut shown = 0;
+    while usize::try_from(cursor.position()).ok()? < bytes.len() {
+        let header = ObuHeader::parse(&mut cursor).ok()?;
+        if header
+            .extension_header
+            .is_some_and(|extension| extension.temporal_id != 0 || extension.spatial_id != 0)
+        {
+            return None;
+        }
+        let start = usize::try_from(cursor.position()).ok()?;
+        let end = start.checked_add(usize::try_from(header.size?).ok()?)?;
+        let body = bytes.get(start..end)?;
+        if matches!(header.obu_type, ObuType::Frame | ObuType::FrameHeader) {
+            let first = *body.first()?;
+            if first & 0x80 != 0 || first & 0x10 != 0 {
+                shown += 1;
+            }
+        }
+        cursor.set_position(u64::try_from(end).ok()?);
+    }
+    Some(shown)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

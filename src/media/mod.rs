@@ -30,10 +30,14 @@ pub use normalize::{
     StartedNormalizer,
 };
 pub use pacer::{MediaPacer, PacingError};
-pub use sample::{AudioSample, NormalizedSample, SubtitleSample, VideoSample};
+pub use sample::{AudioSample, MissingInterval, NormalizedMedia, SubtitleSample, VideoSample};
 pub use stream::{MediaError, SampleSource};
 pub use timeline::{
     Rounding, TimelineCalibration, TimelineCalibrationError, TrackTimeline, calibrate,
 };
 pub use timing::{PresentedTiming, PresentedTimingCursor, SampleTimingError};
 pub use validate::{PresentationPlan, ValidationError, validate};
+
+pub mod cadence;
+mod cadence_hevc;
+mod picture_mapping;

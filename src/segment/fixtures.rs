@@ -106,18 +106,18 @@ pub fn plan(
 
 use crate::{
     domain::{Appender, BoxFuture},
-    media::{MediaError, NormalizedSample, SampleSource},
+    media::{MediaError, NormalizedMedia, SampleSource},
     source::InputState,
 };
 use std::collections::VecDeque;
 
 /// Replays prepared batches, then reports the input as exhausted.
 pub struct SampleBatches {
-    batches: VecDeque<Vec<NormalizedSample>>,
+    batches: VecDeque<Vec<NormalizedMedia>>,
 }
 
 impl SampleBatches {
-    pub fn new(batches: Vec<Vec<NormalizedSample>>) -> Self {
+    pub fn new(batches: Vec<Vec<NormalizedMedia>>) -> Self {
         Self {
             batches: batches.into(),
         }
@@ -127,7 +127,7 @@ impl SampleBatches {
 impl SampleSource for SampleBatches {
     fn next_batch<'a>(
         &'a mut self,
-        out: &'a mut dyn Appender<NormalizedSample>,
+        out: &'a mut dyn Appender<NormalizedMedia>,
     ) -> BoxFuture<'a, Result<InputState, MediaError>> {
         Box::pin(async move {
             match self.batches.pop_front() {

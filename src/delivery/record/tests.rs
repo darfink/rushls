@@ -254,7 +254,7 @@ async fn real_cmaf_recordings_demux_individually_with_all_samples() -> Result {
             AudioTiming, AudioTrim, Codec, FrameRate, MediaKind, MediaParameters, Timebase,
             TrackId, fixtures::TrackBuilder,
         },
-        media::{AudioSample, NormalizedSample, VideoSample},
+        media::{AudioSample, NormalizedMedia, VideoSample},
         mux::{
             MuxerFactory, MuxerStartRequest, PassThroughMuxerFactory,
             fixtures::{
@@ -318,7 +318,7 @@ async fn real_cmaf_recordings_demux_individually_with_all_samples() -> Result {
         let mut media = Vec::new();
         for frame in 0..3 * frames_per_segment {
             let sample = if video {
-                NormalizedSample::Video(VideoSample {
+                NormalizedMedia::Video(VideoSample {
                     track_id: TrackId(0),
                     codec: Codec::H264,
                     pts: frame,
@@ -328,7 +328,7 @@ async fn real_cmaf_recordings_demux_individually_with_all_samples() -> Result {
                     payload: Payload::from(if frame % 2 == 0 { H264_IDR } else { H264_P }),
                 })
             } else {
-                NormalizedSample::Audio(AudioSample {
+                NormalizedMedia::Audio(AudioSample {
                     track_id: TrackId(0),
                     codec: Codec::Aac,
                     pts: frame * 1024,
@@ -446,5 +446,36 @@ fn a_stalled_export_queue_bounds_jobs_and_returns_rejected_byte_reservations() -
     drop(receiver.recv()?);
     shared.jobs.fetch_sub(1, Ordering::AcqRel);
     assert_eq!(shared.bytes.load(Ordering::Acquire), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn input_gaps_create_no_recording_file_or_filesystem_failure() -> Result {
+    let temp = Temp::new();
+    let log = Arc::new(Log::default());
+    let recorder = Recorder::start(
+        &temp.config(),
+        Events::new(log.clone()),
+        ProcessMeters::default(),
+    )?;
+    let mut publisher =
+        factory(recorder.clone()).start(&StreamId::new("camera"), presentation())?;
+    publisher.write(hls::initialization(0, 1))?;
+    publisher.write(hls::chunk(0, 0, 0, 0))?;
+    publisher.write(complete(0, 0, 1))?;
+    publisher.write(PackagedMedia::Gap(crate::mux::PackagedGap {
+        rendition_id: crate::mux::PackagingRenditionId(0),
+        packaging_segment_id: PackagingSegmentId(1),
+        media_start: 1,
+        duration: 1,
+        parts: vec![1],
+    }))?;
+    publisher.write(hls::chunk(0, 2, 0, 2))?;
+    publisher.write(complete(2, 2, 1))?;
+    publisher.finish(FinishReason::Final)?;
+    drop(publisher);
+    recorder.drain(Duration::from_secs(5)).await;
+    assert_eq!(temp.files()?.len(), 2);
+    assert!(log.0.lock().is_empty());
     Ok(())
 }

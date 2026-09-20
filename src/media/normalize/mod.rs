@@ -2,14 +2,16 @@ use thiserror::Error;
 
 use crate::{domain::Appender, source::Packet};
 
-use super::{NormalizedSample, PresentationPlan, TimelineCalibration};
+use super::{NormalizedMedia, PresentationPlan, TimelineCalibration};
 
-mod passthrough;
+pub(crate) mod passthrough;
 
 pub use passthrough::PassThroughNormalizerFactory;
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum NormalizeError {
+    #[error(transparent)]
+    Timestamp(Box<crate::domain::TimestampIssue>),
     #[error(
         "{track}: unsupported random-access picture for {codec:?}; configure closed GOPs with IDR frames (AVC recovery-point SEI does not make an independent segment)"
     )]
@@ -37,10 +39,26 @@ pub enum NormalizeError {
 /// measured across a whole batch of packets rather than per push, so holding
 /// samples back for reordering and releasing them in a burst is fine.
 pub trait MediaNormalizer: Send {
+    fn take_video_intervals(&mut self) -> Vec<crate::domain::VideoTimestampObservation> {
+        Vec::new()
+    }
+    #[cfg(test)]
+    fn configure_audio_recovery(
+        &mut self,
+        _policy: passthrough::recovery::AudioRecoveryPolicy,
+    ) -> Result<(), NormalizeError> {
+        Ok(())
+    }
+    /// Drains compensation facts, including those produced before a later error.
+    /// Callers must drain these even when `push` returns an error.
+    fn take_notices(&mut self) -> Vec<crate::domain::NormalizationNotice> {
+        Vec::new()
+    }
+
     fn push(
         &mut self,
         packet: Packet,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError>;
 
     /// Flushes any access unit still held for reordering or duration inference.
@@ -49,7 +67,7 @@ pub trait MediaNormalizer: Send {
     /// short, so it must complete promptly from state already in hand: it is
     /// synchronous precisely so it cannot wait for input that will never come.
     /// Repeated calls must be harmless and produce nothing further.
-    fn finish(&mut self, out: &mut dyn Appender<NormalizedSample>) -> Result<(), NormalizeError>;
+    fn finish(&mut self, out: &mut dyn Appender<NormalizedMedia>) -> Result<(), NormalizeError>;
 }
 
 /// A normalizer together with the representation it actually produces.
@@ -73,5 +91,6 @@ pub trait NormalizerFactory: Send + Sync {
         &self,
         presentation: &PresentationPlan,
         timeline: &TimelineCalibration,
+        input_mode: crate::domain::InputMode,
     ) -> Result<StartedNormalizer, NormalizeError>;
 }

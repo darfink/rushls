@@ -69,6 +69,8 @@ pub struct VideoConfig {
     #[serde(default)]
     pub coded_height: Option<u32>,
     #[serde(default)]
+    pub framerate: Option<f64>,
+    #[serde(default)]
     pub container: Container,
 }
 

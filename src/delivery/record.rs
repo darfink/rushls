@@ -300,6 +300,7 @@ impl RecordingPublisher {
             PackagedMedia::Segment(segment) => {
                 (segment.packaging_segment_id, Some(segment.payload), true)
             }
+            PackagedMedia::Gap(_) => return,
             PackagedMedia::SegmentCompleted(segment) => (segment.packaging_segment_id, None, true),
         };
         if track.open.as_ref().is_none_or(|open| open.id != id) {

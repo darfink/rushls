@@ -1,7 +1,7 @@
 //! Explicit admission through the live coordinator and timing-only CMAF writers.
 use super::{CadenceError, PrerollError, SegmentationPlan, SegmentationPolicy};
 use crate::{
-    media::{NormalizedSample, PresentationPlan, PresentedTimingCursor},
+    media::{NormalizedMedia, PresentationPlan, PresentedTimingCursor},
     mux::{self, MuxError},
 };
 use std::{collections::BTreeSet, num::NonZero};
@@ -11,7 +11,7 @@ use std::{collections::BTreeSet, num::NonZero};
 pub fn admit(
     presentation: &PresentationPlan,
     plan: &mut SegmentationPlan,
-    samples: &[NormalizedSample],
+    samples: &[NormalizedMedia],
     policy: SegmentationPolicy,
     work: &mut usize,
 ) -> Result<(), PrerollError> {
@@ -53,6 +53,10 @@ pub fn admit(
                 let mut clock =
                     super::cutter::PartClock::new(source.kind(), selected.segmentation_origin_pts);
                 for sample in samples.iter().filter(|s| s.track_id() == track) {
+                    if let NormalizedMedia::Gap(gap) = sample {
+                        clock = super::cutter::PartClock::new(source.kind(), gap.end);
+                        continue;
+                    }
                     let timing = cursor.next(sample).map_err(|source| {
                         CadenceError::InvalidSampleTiming {
                             track_id: track,
@@ -100,7 +104,7 @@ pub fn admit(
 
 fn reserve_composition_groups(
     plan: &mut SegmentationPlan,
-    samples: &[NormalizedSample],
+    samples: &[NormalizedMedia],
     policy: SegmentationPolicy,
     work: &mut usize,
 ) -> Result<(), PrerollError> {
@@ -113,7 +117,7 @@ fn reserve_composition_groups(
             .iter()
             .filter(|sample| sample.track_id() == track.track_id)
         {
-            if let NormalizedSample::Video(video) = sample {
+            if let NormalizedMedia::Video(video) = sample {
                 *work = work.saturating_add(1);
                 if *work > 1_000_000 {
                     return Err(PrerollError::LimitExceeded);

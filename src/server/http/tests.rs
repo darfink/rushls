@@ -1192,7 +1192,7 @@ async fn a_query_token_still_honours_a_blocking_reload() {
         request(
             address,
             "GET",
-            &format!("/live/camera/0/video.m3u8?token={jwt}&_HLS_msn=1&_HLS_part=1"),
+            &format!("/live/camera/0/video.m3u8?token={jwt}&_HLS_msn=2&_HLS_part=1"),
             &[],
         )
         .await
@@ -1540,7 +1540,7 @@ async fn a_blocking_reload_holds_the_connection_until_its_part_arrives() {
         request(
             address,
             "GET",
-            "/live/camera/0/video.m3u8?_HLS_msn=1&_HLS_part=1",
+            "/live/camera/0/video.m3u8?_HLS_msn=2&_HLS_part=1",
             &[],
         )
         .await

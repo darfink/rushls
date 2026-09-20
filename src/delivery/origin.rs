@@ -132,6 +132,9 @@ impl Origin {
             }
             MediaResource::Part(_, part, _) => {
                 if let Some(stored) = live.part(rendition, part) {
+                    if stored.gap {
+                        return Err(DeliveryError::UnknownResource);
+                    }
                     MediaObject {
                         body: MediaBody::single(self.load_held(&stored.payload).await?),
                         gzip: self.load_optional_gzip(stored.gzip.as_ref()).await?,
@@ -270,7 +273,9 @@ impl Origin {
                     Ok(MediaBody::from_payloads(frames))
                 }
             }
-            StoredSegmentKind::Gap => Ok(MediaBody::default()),
+            StoredSegmentKind::Gap | StoredSegmentKind::GapParts(_) => {
+                Err(DeliveryError::UnknownResource)
+            }
         }
     }
 }

@@ -47,7 +47,15 @@ impl E2eConfig {
         let gop_secs = if segment_secs % 2 == 0 { 2 } else { 1 };
         let gop_frames = fps * gop_secs as u32;
         let churn_count = env_u64("RUSHLS_TEST_RECORD_E2E_CHURN_COUNT", 6).clamp(2, 32);
-        Self { duration_secs, fps, size, segment_secs, gop_frames, audio_hz: 440, churn_count }
+        Self {
+            duration_secs,
+            fps,
+            size,
+            segment_secs,
+            gop_frames,
+            audio_hz: 440,
+            churn_count,
+        }
     }
 
     /// Session cadence for the rig: prod 6s/1s by default, or the short
@@ -56,7 +64,11 @@ impl E2eConfig {
     pub fn segmentation_policy(&self) -> rushls::segment::SegmentationPolicy {
         use std::time::Duration;
         let segment = Duration::from_secs(self.segment_secs);
-        let part = if self.segment_secs >= 4 { Duration::from_secs(1) } else { Duration::from_millis(500) };
+        let part = if self.segment_secs >= 4 {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_millis(500)
+        };
         rushls::segment::SegmentationPolicy::latency_first(segment, part)
     }
 
@@ -73,18 +85,31 @@ impl E2eConfig {
     }
 
     pub fn segment_expectation(&self) -> String {
-        format!("~{} x {}s segments", self.duration_secs.div_ceil(self.segment_secs), self.segment_secs)
+        format!(
+            "~{} x {}s segments",
+            self.duration_secs.div_ceil(self.segment_secs),
+            self.segment_secs
+        )
     }
 }
 
 fn env_u64(key: &str, fallback: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(fallback)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(fallback)
 }
 
 fn env_size(key: &str, fallback: Size) -> Size {
     let raw = std::env::var(key).unwrap_or_default();
     let mut parts = raw.split('x');
-    let w = parts.next().and_then(|s| s.parse().ok()).unwrap_or(fallback.w);
-    let h = parts.next().and_then(|s| s.parse().ok()).unwrap_or(fallback.h);
+    let w = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(fallback.w);
+    let h = parts
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(fallback.h);
     Size { w, h }
 }

@@ -31,7 +31,7 @@
 //!
 //! ```text
 //! source.fill      -> Vec<Packet>          one await per batch
-//! normalizer.push  -> Vec<NormalizedSample>
+//! normalizer.push  -> Vec<NormalizedMedia>
 //! muxer.push       -> Vec<PackagedMedia>
 //! publisher.write  -> StreamStore
 //! ```

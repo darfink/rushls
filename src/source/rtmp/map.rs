@@ -45,10 +45,21 @@ pub fn track(
             return Err(SourceError::Demux("unsupported elementary codec".into()));
         }
     };
-    if let MediaParameters::Video { video_delay, .. } = &mut parameters {
+    if let MediaParameters::Video {
+        video_delay,
+        frame_rate,
+        ..
+    } = &mut parameters
+    {
+        *frame_rate = frame_rate.or_else(|| {
+            hint.and_then(|h| h.framerate)
+                .and_then(crate::media::cadence::nominal_rate)
+        });
         *video_delay = crate::media::video_config::properties(mapped, &extradata).reorder_depth;
     }
     Ok(DiscoveredTrack {
+        decoder_config_origin: crate::domain::DecoderConfigOrigin::Publisher,
+        video_cadence: crate::domain::VideoCadence::Unknown,
         id,
         source_key: Some(source_key(codec, track_id)),
         codec: mapped,
@@ -119,6 +130,8 @@ pub fn packet(
 /// duration: the cue shows until the next one replaces it.
 pub fn text_track(id: TrackId) -> DiscoveredTrack {
     DiscoveredTrack {
+        decoder_config_origin: crate::domain::DecoderConfigOrigin::Publisher,
+        video_cadence: crate::domain::VideoCadence::Unknown,
         id,
         source_key: Some(SourceTrackKey::new("script/text")),
         codec: Codec::Text,
@@ -251,5 +264,116 @@ pub fn codec(codec: ElementaryCodec) -> Codec {
         // numeric identity here, so it compares unequal to every discovered
         // codec and the live path rejects it as changed parameters.
         _ => Codec::Unknown(u32::MAX),
+    }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+    use super::*;
+    #[test]
+    fn legacy_and_enhanced_rtmp_preserve_codec_cadence() -> Result<(), SourceError> {
+        use crate::media::fixtures::{AV1_FIXED_CADENCE, H264_FIXED_CADENCE, HEVC_FIXED_CADENCE};
+        let mut hint = EncoderSummary::default();
+        hint.width = Some(64);
+        hint.height = Some(64);
+        hint.framerate = Some(30.0);
+        for (codec, bytes) in [
+            (ElementaryCodec::Avc, H264_FIXED_CADENCE),
+            (ElementaryCodec::Hevc, HEVC_FIXED_CADENCE),
+            (ElementaryCodec::Av1, AV1_FIXED_CADENCE),
+        ] {
+            let track = track(
+                TrackId(0),
+                codec,
+                Bytes::from_static(bytes),
+                None,
+                Some(&hint),
+            )?;
+            let cadence = crate::media::cadence::inspect(&track);
+            assert!(matches!(cadence, crate::domain::VideoCadence::Fixed { .. }));
+            assert_eq!(
+                cadence.rate(),
+                Some(FrameRate::new(nz::u32!(25), nz::u32!(1)))
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    use crate::media::{NormalizedMedia, NormalizerFactory};
+
+    #[test]
+    fn rtmp_packet_loss_reaches_exact_video_gap_detection() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let units = crate::media::fixtures::H264_CFR_FLV_UNITS;
+        let config = rtmpx::ValidatedMedia::parse_video(
+            Bytes::from_static(units[0].1),
+            rtmpx::EnhancedValidationMode::Strict,
+        )?;
+        let Some(ElementaryUnit::Configuration {
+            codec,
+            extradata,
+            track_id,
+            ..
+        }) = config.elementary_unit()?
+        else {
+            panic!("sequence header")
+        };
+        let mut track = track(TrackId(0), codec, extradata, track_id, None)?;
+        track.first_pts = Some(0);
+        let presentation = crate::media::fixtures::presentation(vec![track]);
+        let timeline = crate::media::calibrate(&presentation)?;
+        for mode in [
+            crate::domain::InputMode::Strict,
+            crate::domain::InputMode::Permissive,
+        ] {
+            let mut started =
+                crate::media::PassThroughNormalizerFactory.start(&presentation, &timeline, mode)?;
+            assert!(matches!(
+                started.presentation.tracks()[0].video_cadence,
+                crate::domain::VideoCadence::Fixed { .. }
+            ));
+            let mut out = Vec::new();
+            for &(timestamp, payload) in &units[1..] {
+                if timestamp == 40 {
+                    continue;
+                }
+                let media = rtmpx::ValidatedMedia::parse_video(
+                    Bytes::from_static(payload),
+                    rtmpx::EnhancedValidationMode::Strict,
+                )?;
+                let packet = packet(
+                    TrackId(0),
+                    timestamp,
+                    media.elementary_unit()?.expect("coded picture"),
+                    1024,
+                )?;
+                let result = started.normalizer.push(packet, &mut out);
+                if mode == crate::domain::InputMode::Strict && timestamp == 80 {
+                    assert!(matches!(
+                        result,
+                        Err(crate::media::NormalizeError::Timestamp(_))
+                    ));
+                    assert!(out.is_empty());
+                    break;
+                }
+                result?;
+            }
+            if mode == crate::domain::InputMode::Permissive {
+                started.normalizer.finish(&mut out)?;
+                assert_eq!(out.len(), 4);
+                assert!(
+                    matches!(&out[1], NormalizedMedia::Gap(g) if g.start == 3600 && g.end == 7200)
+                );
+                assert!(
+                    matches!(&out[2], NormalizedMedia::Video(v) if v.pts == 7200 && v.dts == 7200 && v.duration == 3600 && v.payload.as_bytes() == &units[3].1[5..])
+                );
+                assert_eq!(started.normalizer.take_notices().len(), 1);
+            }
+        }
+        Ok(())
     }
 }

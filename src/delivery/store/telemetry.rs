@@ -288,7 +288,9 @@ impl PublicationTelemetry {
         match media {
             PackagedMedia::Chunk(c) => Some((c.media_start, c.duration)),
             PackagedMedia::Segment(s) => Some((s.media_start, s.duration)),
-            PackagedMedia::Initialization(_) | PackagedMedia::SegmentCompleted(_) => None,
+            PackagedMedia::Initialization(_)
+            | PackagedMedia::SegmentCompleted(_)
+            | PackagedMedia::Gap(_) => None,
         }
     }
 

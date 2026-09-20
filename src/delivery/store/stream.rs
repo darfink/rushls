@@ -782,6 +782,15 @@ impl LiveStream {
         }
     }
 
+    fn require_part_capacity(&self, additional: usize) -> Result<(), StoreWriteError> {
+        if additional > self.limits.maximum_parts {
+            return Err(StoreWriteError::PartCapacityExceeded {
+                maximum: self.limits.maximum_parts,
+            });
+        }
+        Ok(())
+    }
+
     pub fn write(
         &self,
         publication: u64,
@@ -814,10 +823,15 @@ impl LiveStream {
             self.advance_media_revision();
         }
         let additional = state.renditions[index].additional_bytes_for(&media, gzip.as_ref())?;
-        let adds_part = matches!(&media, PackagedMedia::Chunk(_));
+        let additional_parts = match &media {
+            PackagedMedia::Chunk(_) => 1,
+            PackagedMedia::Gap(gap) => gap.parts.len(),
+            _ => 0,
+        };
+        self.require_part_capacity(additional_parts)?;
         let adds_segment = matches!(
             &media,
-            PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_)
+            PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) | PackagedMedia::Gap(_)
         );
         // Make room rather than refuse. Every budget here bounds *retention*,
         // and the only honest way to hold a bound while media keeps arriving
@@ -828,7 +842,11 @@ impl LiveStream {
         // operation: bytes first at a high bitrate, the segment count first at
         // a short cadence. All three therefore shed.
         let over_objects = |state: &StreamState| {
-            (adds_part && state.memory_resident_parts() >= self.limits.maximum_parts)
+            (additional_parts > 0
+                && state
+                    .memory_resident_parts()
+                    .saturating_add(additional_parts)
+                    > self.limits.maximum_parts)
                 || (adds_segment
                     && state.memory_resident_segments() >= self.limits.maximum_segments)
         };

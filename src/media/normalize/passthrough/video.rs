@@ -2,22 +2,28 @@ use std::collections::VecDeque;
 
 use crate::{
     domain::{
-        Appender, Codec, DiscoveredTrack, FrameRate, RationalTickAccumulator, TickDuration,
-        TickTimestamp, Timebase, TimebaseProjection, TrackId,
+        Appender, Codec, DiscoveredTrack, FrameRate, MediaKind, RationalTickAccumulator,
+        TickDuration, TickTimestamp, Timebase, TimebaseProjection, TimestampField, TimestampIssue,
+        TimestampIssueCode, TrackId,
     },
-    media::{NormalizeError, NormalizedSample, VideoSample},
+    media::{NormalizeError, NormalizedMedia, VideoSample},
     source::Packet,
 };
 
 use super::{invalid_plan, processing, project_interval, project_timestamp};
 
 const MAXIMUM_VIDEO_REORDER_DEPTH: u32 = 64;
-
 pub(super) struct VideoNormalizer {
+    pub(super) observations: Vec<crate::domain::VideoTimestampObservation>,
+    previous_input: Option<(Option<i64>, Option<i64>)>,
+    pub(super) cadence: super::cadence::CadenceValidator,
     track_id: TrackId,
     codec: Codec,
     extradata: crate::domain::Payload,
     projection: TimebaseProjection,
+    input_timebase: Timebase,
+    output_timebase: Timebase,
+    maximum_timestamp_jump: std::time::Duration,
     declared_clock: Option<RationalTickAccumulator>,
     video_delay: usize,
     held: Option<Packet>,
@@ -39,6 +45,8 @@ impl VideoNormalizer {
         output_timebase: Timebase,
         frame_rate: Option<FrameRate>,
         video_delay: u32,
+        input_mode: crate::domain::InputMode,
+        cadence: crate::domain::VideoCadence,
     ) -> Result<Self, NormalizeError> {
         if video_delay > MAXIMUM_VIDEO_REORDER_DEPTH {
             return Err(invalid_plan(format!(
@@ -46,11 +54,39 @@ impl VideoNormalizer {
                 track.id
             )));
         }
-        Ok(Self {
+        let frame_rate = cadence.rate().or(frame_rate);
+        let allowance = track.timebase.ticks_to_duration(1) + output_timebase.ticks_to_duration(1);
+        let interval = frame_rate.map(|r| {
+            std::time::Duration::from_nanos(
+                (u64::from(r.denominator().get()) * 1_000_000_000)
+                    .div_ceil(u64::from(r.numerator().get())),
+            )
+        });
+        let maximum_timestamp_jump = if matches!(cadence, crate::domain::VideoCadence::Fixed { .. })
+        {
+            interval.unwrap_or_default()
+                + super::compensation::CompensationPolicy::default().maximum_hole
+                + allowance
+        } else {
+            std::time::Duration::from_millis(500).max(interval.unwrap_or_default() + allowance)
+        };
+        let this = Self {
+            observations: Vec::new(),
+            previous_input: None,
+            cadence: super::cadence::CadenceValidator::new(
+                track,
+                output_timebase,
+                input_mode,
+                cadence,
+                video_delay as usize,
+            )?,
             track_id: track.id,
             codec: track.codec,
             extradata: track.codec_extradata.clone(),
             projection: TimebaseProjection::new(track.timebase, output_timebase),
+            input_timebase: track.timebase,
+            output_timebase,
+            maximum_timestamp_jump,
             declared_clock: frame_rate
                 .map(|rate| video_cadence(output_timebase, rate, track.id))
                 .transpose()?,
@@ -60,7 +96,8 @@ impl VideoNormalizer {
             next_dts: None,
             last_duration: None,
             finished: false,
-        })
+        };
+        Ok(this)
     }
 
     pub(super) fn track_id(&self) -> TrackId {
@@ -69,8 +106,191 @@ impl VideoNormalizer {
 
     pub(super) fn push(
         &mut self,
+        packet: Packet,
+        out: &mut dyn Appender<NormalizedMedia>,
+    ) -> Result<(), NormalizeError> {
+        if let Some((pts, dts)) = self.previous_input {
+            let pair = match (dts, packet.dts) {
+                (Some(a), Some(b)) => Some((a, b)),
+                (None, None) if self.video_delay == 0 => pts.zip(packet.pts),
+                _ => None,
+            };
+            if let Some((a, b)) = pair
+                && b > a
+            {
+                self.observations
+                    .push(crate::domain::VideoTimestampObservation {
+                        codec: self.codec,
+                        ticks: b.abs_diff(a),
+                        timebase: self.input_timebase,
+                    });
+            }
+        }
+        // Decode order must remain valid even while presentation validation
+        // holds packets for reordering. Invalid DTS cannot trigger compensation.
+        if let Some((pts, dts)) = self.previous_input {
+            if let (Some(a), Some(b)) = (dts, packet.dts) {
+                self.check_step(a, b, TimestampField::Dts, true)?;
+            }
+            if self.video_delay == 0
+                && let (Some(a), Some(b)) = (pts, packet.pts)
+            {
+                self.check_step(
+                    a,
+                    b,
+                    TimestampField::Pts,
+                    dts.is_none() && packet.dts.is_none(),
+                )?;
+            }
+        }
+        if !packet.audio_trim.is_empty() {
+            return Err(processing("video packet carries audio trim metadata"));
+        }
+        if let Some(gap) = self.cadence.gap_before(&packet)? {
+            return self.push_gap(packet, gap, out);
+        }
+        self.previous_input = Some((packet.pts, packet.dts));
+        for packet in self.cadence.push(packet)? {
+            self.push_timed(packet, out)?;
+        }
+        Ok(())
+    }
+
+    fn push_gap(
+        &mut self,
+        packet: Packet,
+        gap: crate::media::MissingInterval,
+        out: &mut dyn Appender<NormalizedMedia>,
+    ) -> Result<(), NormalizeError> {
+        // Prepare everything before cadence accounting, clock advancement, or
+        // output. A rejected packet must not leave half a repair in the batch.
+        if self.finished || !self.pending_clock.is_empty() {
+            return Err(processing("video gap has no usable decode clock"));
+        }
+        if packet.duration.is_some_and(|duration| duration < 0) {
+            return Err(processing("video duration is negative"));
+        }
+        if let Some(duration) = packet.duration.filter(|duration| *duration > 0) {
+            self.check_duration(duration.unsigned_abs(), self.input_timebase)?;
+        }
+        if packet.random_access
+            && crate::media::video_config::closed_random_access(
+                self.codec,
+                self.extradata.as_bytes(),
+                packet.payload.as_bytes(),
+            ) == Some(false)
+        {
+            return Err(NormalizeError::UnsupportedRandomAccess {
+                track: self.track_id,
+                codec: self.codec,
+            });
+        }
+        let (sample, next_dts) = self.prepare_gap_sample(&packet, gap)?;
+        let mut declared_clock = self.declared_clock;
+        let nominal = declared_clock
+            .as_mut()
+            .and_then(|clock| clock.advance(1))
+            .filter(|v| *v > 0)
+            .ok_or_else(|| processing("video gap has no representable cadence"))?;
+        gap.end
+            .checked_add_unsigned(nominal)
+            .ok_or_else(|| processing("resumed video presentation endpoint overflow"))?;
+        next_dts
+            .checked_add_unsigned(nominal)
+            .ok_or_else(|| processing("resumed video decode endpoint overflow"))?;
+        // At depth zero the accepted packet is immediately ready. No decode-
+        // order buffer or hidden-picture mapping can straddle this interval.
+        let ready = self.cadence.push(packet.clone())?;
+        debug_assert_eq!(ready.len(), 1);
+        self.previous_input = Some((packet.pts, packet.dts));
+        self.held = Some(packet);
+        self.declared_clock = declared_clock;
+        self.last_duration = Some(nominal);
+        self.next_dts = Some(next_dts);
+        out.push(NormalizedMedia::Video(sample));
+        out.push(NormalizedMedia::Gap(gap));
+        Ok(())
+    }
+
+    fn prepare_gap_sample(
+        &self,
+        packet: &Packet,
+        gap: crate::media::MissingInterval,
+    ) -> Result<(VideoSample, i64), NormalizeError> {
+        let previous = self
+            .held
+            .as_ref()
+            .ok_or_else(|| processing("video gap has no preceding picture"))?;
+        if previous.duration.is_some_and(|duration| duration < 0) {
+            return Err(processing("preceding video duration is negative"));
+        }
+        if let Some(duration) = previous.duration.filter(|duration| *duration > 0) {
+            self.check_duration(duration.unsigned_abs(), self.input_timebase)?;
+        }
+        let pts = project_timestamp(
+            self.projection,
+            previous
+                .pts
+                .ok_or_else(|| processing("video packet has no PTS"))?,
+            self.track_id,
+            "video PTS",
+        )?;
+        let duration = gap
+            .start
+            .checked_sub(pts)
+            .and_then(|v| u64::try_from(v).ok())
+            .filter(|v| *v > 0)
+            .ok_or_else(|| processing("video gap leaves no preceding picture duration"))?;
+        let dts = previous
+            .dts
+            .map(|v| project_timestamp(self.projection, v, self.track_id, "video DTS"))
+            .transpose()?
+            .or(self.next_dts)
+            .unwrap_or(pts);
+        if let Some(expected) = self.next_dts
+            && dts != expected
+        {
+            return Err(self.timing_error(
+                TimestampIssueCode::VideoDtsMismatch,
+                TimestampField::Dts,
+                i128::from(expected),
+                i128::from(dts),
+                self.output_timebase,
+            ));
+        }
+        let next_dts = dts
+            .checked_add_unsigned(gap.end.abs_diff(pts))
+            .ok_or_else(|| processing("video gap decode endpoint overflow"))?;
+        if let Some(actual) = packet
+            .dts
+            .map(|v| project_timestamp(self.projection, v, self.track_id, "video DTS"))
+            .transpose()?
+            && actual != next_dts
+        {
+            return Err(self.timing_error(
+                TimestampIssueCode::VideoDtsMismatch,
+                TimestampField::Dts,
+                i128::from(next_dts),
+                i128::from(actual),
+                self.output_timebase,
+            ));
+        }
+        let sample = VideoSample {
+            track_id: self.track_id,
+            codec: self.codec,
+            pts,
+            dts,
+            duration,
+            random_access: previous.random_access,
+            payload: previous.payload.clone(),
+        };
+        Ok((sample, next_dts))
+    }
+
+    fn push_timed(
+        &mut self,
         mut packet: Packet,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError> {
         if self.finished {
             return Err(processing(format!(
@@ -109,24 +329,17 @@ impl VideoNormalizer {
         // cadence must not conceal a duplicate/backward timestamp. Keep the
         // valid held packet intact so a later flush cannot emit the bad one.
         if let Some(previous) = &self.held {
-            if let (Some(previous), Some(current)) = (previous.dts, packet.dts)
-                && current <= previous
-            {
-                return Err(processing(format!(
-                    "{} video DTS must increase: previous {previous}, got {current}",
-                    self.track_id
-                )));
+            if let (Some(previous), Some(current)) = (previous.dts, packet.dts) {
+                self.check_step(previous, current, TimestampField::Dts, true)?;
             }
-            // PTS may go backwards only when presentation order differs from
-            // decode order. In that case DTS remains the ordering authority.
-            if self.video_delay == 0
-                && let (Some(previous), Some(current)) = (previous.pts, packet.pts)
-                && current <= previous
-            {
-                return Err(processing(format!(
-                    "{} video PTS must increase without reordering: previous {previous}, got {current}",
-                    self.track_id
-                )));
+            // Reordered PTS is never evidence of a decode-clock jump.
+            if self.video_delay == 0 {
+                self.check_step(
+                    previous.pts.expect("validated PTS"),
+                    packet.pts.expect("validated PTS"),
+                    TimestampField::Pts,
+                    previous.dts.is_none() && packet.dts.is_none(),
+                )?;
             }
         }
         if let Some(previous) = self.held.take() {
@@ -139,10 +352,13 @@ impl VideoNormalizer {
 
     pub(super) fn finish(
         &mut self,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError> {
         if self.finished {
             return Ok(());
+        }
+        for packet in self.cadence.finish()? {
+            self.push_timed(packet, out)?;
         }
         self.finished = true;
         if let Some(packet) = self.held.take() {
@@ -151,6 +367,82 @@ impl VideoNormalizer {
         }
         if !self.pending_clock.is_empty() {
             self.start_missing_clock(out)?;
+        }
+        Ok(())
+    }
+
+    fn timing_error(
+        &self,
+        code: TimestampIssueCode,
+        field: TimestampField,
+        reference: i128,
+        actual: i128,
+        timebase: Timebase,
+    ) -> NormalizeError {
+        NormalizeError::Timestamp(Box::new(TimestampIssue {
+            cadence: Some(self.cadence.declaration()),
+            recovery_rejection: None,
+            code,
+            track: self.track_id,
+            media_kind: MediaKind::Video,
+            codec: self.codec,
+            field,
+            reference,
+            actual,
+            timebase,
+            tolerance_ticks: None,
+            maximum: matches!(
+                code,
+                TimestampIssueCode::VideoTimestampJump | TimestampIssueCode::VideoDurationLimit
+            )
+            .then_some(self.maximum_timestamp_jump),
+            missing_ticks: None,
+        }))
+    }
+
+    fn exceeds_limit(&self, ticks: u64, timebase: Timebase) -> bool {
+        // Cross multiplication preserves sub-nanosecond boundary precision.
+        u128::from(ticks) * u128::from(timebase.num().get()) * 1_000_000_000
+            > self.maximum_timestamp_jump.as_nanos() * u128::from(timebase.den().get())
+    }
+
+    fn check_step(
+        &self,
+        previous: i64,
+        current: i64,
+        field: TimestampField,
+        check_forward: bool,
+    ) -> Result<(), NormalizeError> {
+        let code = if current <= previous {
+            Some(TimestampIssueCode::VideoTimestampOrder)
+        } else if check_forward
+            && self.exceeds_limit(current.abs_diff(previous), self.input_timebase)
+        {
+            Some(TimestampIssueCode::VideoTimestampJump)
+        } else {
+            None
+        };
+        if let Some(code) = code {
+            return Err(self.timing_error(
+                code,
+                field,
+                i128::from(previous),
+                i128::from(current),
+                self.input_timebase,
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_duration(&self, duration: u64, timebase: Timebase) -> Result<(), NormalizeError> {
+        if self.exceeds_limit(duration, timebase) {
+            return Err(self.timing_error(
+                TimestampIssueCode::VideoDurationLimit,
+                TimestampField::Duration,
+                0,
+                i128::from(duration),
+                timebase,
+            ));
         }
         Ok(())
     }
@@ -223,6 +515,11 @@ impl VideoNormalizer {
             })
         });
         let source_interval = stepped_by_dts.or(stepped_by_pts).or(declared_by_packet);
+        // Compare source evidence before projection: endpoint rounding into
+        // 90 kHz must not turn an exactly permitted interval into a rejection.
+        if let Some((_, duration)) = source_interval {
+            self.check_duration(duration, self.input_timebase)?;
+        }
         let observed = source_interval
             .map(|(start, duration)| {
                 project_interval(self.projection, start, duration, self.track_id)
@@ -243,6 +540,9 @@ impl VideoNormalizer {
                     }
                 ))
             })?;
+        if source_interval.is_none() {
+            self.check_duration(duration, self.output_timebase)?;
+        }
         self.last_duration = Some(duration);
         Ok(duration)
     }
@@ -251,7 +551,7 @@ impl VideoNormalizer {
         &mut self,
         packet: Packet,
         duration: TickDuration,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError> {
         let pts = project_timestamp(
             self.projection,
@@ -266,10 +566,13 @@ impl VideoNormalizer {
         match (dts, self.next_dts) {
             (Some(anchor), Some(expected)) => {
                 if anchor != expected {
-                    return Err(processing(format!(
-                        "{} video DTS discontinuity: expected {expected}, got {anchor}",
-                        self.track_id
-                    )));
+                    return Err(self.timing_error(
+                        TimestampIssueCode::VideoDtsMismatch,
+                        TimestampField::Dts,
+                        i128::from(expected),
+                        i128::from(anchor),
+                        self.output_timebase,
+                    ));
                 }
                 self.emit(packet, pts, anchor, duration, out)?;
             }
@@ -317,7 +620,7 @@ impl VideoNormalizer {
 
     fn start_missing_clock(
         &mut self,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError> {
         let first_pts = self
             .pending_clock
@@ -349,13 +652,13 @@ impl VideoNormalizer {
         pts: TickTimestamp,
         dts: TickTimestamp,
         duration: TickDuration,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError> {
         let next_dts = dts.checked_add_unsigned(duration).ok_or_else(|| {
             processing(format!("{} synthesized video DTS overflows", self.track_id))
         })?;
         self.next_dts = Some(next_dts);
-        out.push(NormalizedSample::Video(VideoSample {
+        out.push(NormalizedMedia::Video(VideoSample {
             track_id: self.track_id,
             codec: self.codec,
             pts,
@@ -393,7 +696,14 @@ mod access_tests {
         let track = crate::domain::fixtures::TrackBuilder::new(0, crate::domain::MediaKind::Video)
             .codec_extradata(crate::mux::fixtures::H264_EXTRADATA)
             .build();
-        let mut normalizer = VideoNormalizer::new(&track, track.timebase, None, 0)?;
+        let mut normalizer = VideoNormalizer::new(
+            &track,
+            track.timebase,
+            None,
+            0,
+            crate::domain::InputMode::Permissive,
+            crate::domain::VideoCadence::Unknown,
+        )?;
         let packet = Packet {
             track_id: track.id,
             pts: Some(0),

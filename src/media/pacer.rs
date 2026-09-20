@@ -9,7 +9,7 @@ use crate::{
     observe::{EventSink, MediaMeters, SessionEvent},
 };
 
-use super::{NormalizedSample, TimelineCalibration};
+use super::{NormalizedMedia, TimelineCalibration};
 
 struct PacingWait<'a> {
     meters: &'a dyn MediaMeters,
@@ -76,7 +76,7 @@ impl MediaPoint {
 }
 
 fn point(
-    sample: &NormalizedSample,
+    sample: &NormalizedMedia,
     timeline: &TimelineCalibration,
 ) -> Result<MediaPoint, PacingError> {
     let track_id = sample.track_id();
@@ -96,7 +96,7 @@ pub(crate) struct MediaWatermark(Option<MediaPoint>);
 impl MediaWatermark {
     pub(crate) fn observe(
         &mut self,
-        sample: &NormalizedSample,
+        sample: &NormalizedMedia,
         timeline: &TimelineCalibration,
     ) -> Result<bool, PacingError> {
         let candidate = point(sample, timeline)?;
@@ -120,8 +120,6 @@ pub enum PacingError {
     UnknownTrack(TrackId),
     #[error("timestamp arithmetic overflowed while pacing {0}")]
     TimestampOverflow(TrackId),
-    #[error("normalized media jumped forward by {jump:?}, above the permitted {maximum:?}")]
-    TimestampJump { maximum: Duration, jump: Duration },
     #[error(
         "publisher advanced {media:?} of media across {window:?} of wall clock, below the \
          required minimum of {required:?}"
@@ -320,7 +318,6 @@ pub struct MediaPacer {
     floor: Option<FloorWindow>,
     /// Always present: drift is reported whether or not a bound is set.
     drift: DriftMonitor,
-    maximum_timestamp_jump: Duration,
     timeline: TimelineCalibration,
     watermark: MediaWatermark,
     meters: Arc<dyn MediaMeters>,
@@ -332,9 +329,8 @@ impl MediaPacer {
     pub fn after_preroll(
         ceiling: Option<Ceiling>,
         floor: Option<Floor>,
-        maximum_timestamp_jump: Duration,
         timeline: &TimelineCalibration,
-        buffered: &[NormalizedSample],
+        buffered: &[NormalizedMedia],
         meters: Arc<dyn MediaMeters>,
     ) -> Result<Self, PacingError> {
         let mut watermark = MediaWatermark::default();
@@ -346,7 +342,6 @@ impl MediaPacer {
             ceiling: ceiling.map(|ceiling| CeilingClock::new(ceiling, now)),
             floor: floor.map(|floor| FloorWindow::new(floor, now)),
             drift: DriftMonitor::new(now),
-            maximum_timestamp_jump,
             timeline: timeline.clone(),
             watermark,
             meters,
@@ -360,7 +355,7 @@ impl MediaPacer {
     /// cannot push media into the process faster than this returns.
     pub async fn pace(
         &mut self,
-        sample: &NormalizedSample,
+        sample: &NormalizedMedia,
         events: &EventSink,
     ) -> Result<(), PacingError> {
         let previous = self.watermark.get();
@@ -384,17 +379,6 @@ impl MediaPacer {
             Some(previous) => current.elapsed_since(previous)?,
             None => Duration::ZERO,
         };
-
-        // Checked before anything is charged, and independently of whether a
-        // ceiling exists: a forward jump inflates the timeline whether or not
-        // anyone is pacing it, and charging one to the bucket would sleep for
-        // what is probably a broken clock.
-        if advance > self.maximum_timestamp_jump {
-            return Err(PacingError::TimestampJump {
-                maximum: self.maximum_timestamp_jump,
-                jump: advance,
-            });
-        }
 
         let now = Instant::now();
         if let Some(ceiling) = self.ceiling {
@@ -477,7 +461,6 @@ mod tests {
         MediaPacer::after_preroll(
             ceiling,
             floor,
-            Duration::from_secs(10),
             &timeline(),
             &[sample(0)],
             meters.media_view(),
@@ -559,8 +542,6 @@ mod tests {
         let mut pacer = MediaPacer::after_preroll(
             Some(ceiling(5)),
             None,
-            // Generous, so the jump guard plays no part in what is under test.
-            Duration::from_mins(10),
             &timeline(),
             &[sample(0)],
             meters.media_view(),
@@ -637,31 +618,6 @@ mod tests {
         assert_eq!(
             Instant::now().saturating_duration_since(started),
             Duration::ZERO
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_forward_jump_is_refused_even_without_a_ceiling() {
-        let meters = meters();
-        let events = discard();
-        let mut pacer = MediaPacer::after_preroll(
-            None,
-            None,
-            Duration::from_secs(1),
-            &timeline(),
-            &[sample(0)],
-            meters.media_view(),
-        )
-        .expect("pre-roll establishes the watermark");
-
-        assert_eq!(
-            pacer.pace(&sample(3), &events).await,
-            Err(PacingError::TimestampJump {
-                maximum: Duration::from_secs(1),
-                jump: Duration::from_secs(3),
-            }),
-            "the jump guard is independent of pacing, which is the point of \
-             detaching it"
         );
     }
 

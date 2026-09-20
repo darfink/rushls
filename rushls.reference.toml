@@ -98,6 +98,8 @@ url = "http://auth.example.internal/v1/publish/admit"
 # tier = "premium"
 
 [accept]
+input_mode = "permissive"                     # strict rejects declared timing violations; permissive permits bounded compensation
+
 ceiling  = { pace = "1x", burst = "10s" }     # throttle: at most realtime, with a ten-second head start; omit burst for no head start, omit the table for no cap
 # floor    = { pace = "0.5x", window = "30s" }  # disconnect: below half realtime across any 30s window; omit for no floor
 stall    = "12s"                                # disconnect: nothing usable arrived for this long; "off" = no idle cap
@@ -178,7 +180,7 @@ listen = "127.0.0.1:9090"
 
 # [hook.automation]
 # url        = "http://automation.example.internal/rushls"
-# events     = ["session.started", "stream.available", "stream.unavailable", "session.ended"]
+# events     = ["session.started", "stream.available", "stream.unavailable", "session.degraded", "session.recovered", "session.ended"]
 # token_file = "/run/secrets/rushls-webhook-token"
 # token      = "${WEBHOOK_TOKEN}"        # inline form; prefer token_file
 # signing_secret_file = "/run/secrets/rushls-webhook-signing"

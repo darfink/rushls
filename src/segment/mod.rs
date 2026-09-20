@@ -44,9 +44,9 @@ pub use preroll::{Preroll, PrerollRequest, run as run_preroll};
 /// faster than it advances its clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrerollLimits {
-    /// Retained size, charged per [`NormalizedSample::retained_bytes`].
+    /// Retained size, charged per [`NormalizedMedia::retained_bytes`].
     ///
-    /// [`NormalizedSample::retained_bytes`]: crate::media::NormalizedSample::retained_bytes
+    /// [`NormalizedMedia::retained_bytes`]: crate::media::NormalizedMedia::retained_bytes
     pub maximum_buffered_bytes: usize,
     /// Retained sample count.
     ///

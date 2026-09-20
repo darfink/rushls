@@ -16,7 +16,7 @@ use crate::{
     domain::{
         DiscoveredTrack, MediaKind, TickDuration, TickTimestamp, Timebase, TrackId, duration_since,
     },
-    media::{NormalizedSample, PresentationPlan, PresentedTimingCursor, TimelineCalibration},
+    media::{NormalizedMedia, PresentationPlan, PresentedTimingCursor, TimelineCalibration},
 };
 
 use super::{CadenceError, SegmentationPolicy, TrackSegmentationPlan, part::AccessUnitCadence};
@@ -131,7 +131,10 @@ impl CadenceObserver {
         self.input_closed = true;
     }
 
-    pub fn observe(&mut self, sample: &NormalizedSample) -> Result<(), CadenceError> {
+    pub fn observe(&mut self, sample: &NormalizedMedia) -> Result<(), CadenceError> {
+        if matches!(sample, NormalizedMedia::Gap(_)) {
+            return Ok(());
+        }
         let track_id = sample.track_id();
         // Validated presentations have few tracks; a linear scan avoids a
         // second index and keeps the hot state contiguous.
@@ -689,8 +692,8 @@ mod tests {
             .expect("test observer is valid")
     }
 
-    fn video(track_id: u32, pts: i64, duration: u64, random_access: bool) -> NormalizedSample {
-        NormalizedSample::Video(VideoSample {
+    fn video(track_id: u32, pts: i64, duration: u64, random_access: bool) -> NormalizedMedia {
+        NormalizedMedia::Video(VideoSample {
             track_id: TrackId(track_id),
             codec: Codec::H264,
             pts,
@@ -930,7 +933,7 @@ mod tests {
             .expect("test observer is valid");
             for frame in 0..=240_u64 {
                 observer
-                    .observe(&NormalizedSample::Audio(AudioSample {
+                    .observe(&NormalizedMedia::Audio(AudioSample {
                         track_id: TrackId(0),
                         codec: Codec::Aac,
                         pts: first_pts + i64::try_from(frame * AUDIO_FRAME).expect("PTS fits"),

@@ -1,6 +1,6 @@
 use crate::{
     domain::{Appender, Codec, DiscoveredTrack, Timebase, TimebaseProjection, TrackId},
-    media::{NormalizeError, NormalizedSample, SubtitleSample},
+    media::{NormalizeError, NormalizedMedia, SubtitleSample},
     source::Packet,
 };
 
@@ -28,7 +28,7 @@ impl SubtitleNormalizer {
     pub(super) fn push(
         &self,
         packet: Packet,
-        out: &mut dyn Appender<NormalizedSample>,
+        out: &mut dyn Appender<NormalizedMedia>,
     ) -> Result<(), NormalizeError> {
         if !packet.audio_trim.is_empty() {
             return Err(processing(format!(
@@ -58,7 +58,7 @@ impl SubtitleNormalizer {
             let duration = positive_duration(packet.duration, self.track_id, "subtitle duration")?;
             project_interval(self.projection, pts, duration, self.track_id)?
         };
-        out.push(NormalizedSample::Subtitle(SubtitleSample {
+        out.push(NormalizedMedia::Subtitle(SubtitleSample {
             track_id: self.track_id,
             codec: self.codec,
             pts,

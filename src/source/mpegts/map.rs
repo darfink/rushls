@@ -36,6 +36,8 @@ pub fn track(spec: &TrackSpec) -> Result<Option<DiscoveredTrack>, SourceError> {
         field: "MPEG-TS media timescale",
     })?;
     Ok(Some(DiscoveredTrack {
+        decoder_config_origin: crate::domain::DecoderConfigOrigin::Synthesized,
+        video_cadence: crate::domain::VideoCadence::Unknown,
         id: TrackId(spec.track_id),
         source_key: spec
             .source_pid
@@ -263,5 +265,41 @@ mod tests {
             language_from_es_info(&[0x0a, 0x04, b'e', b'n', b'1', 0x00]),
             None
         );
+    }
+    #[test]
+    fn transport_stream_headers_preserve_codec_cadence() -> Result<(), Box<dyn std::error::Error>> {
+        use super::track;
+        use crate::media::fixtures::{AV1_FIXED_CADENCE, H264_FIXED_CADENCE, HEVC_FIXED_CADENCE};
+        use broadcast_common::Parse;
+        use transmux::{CodecConfig, TrackSpec};
+        let configs = [
+            CodecConfig::Avc {
+                config: transmux::AVCConfigurationBox::parse_body(H264_FIXED_CADENCE)?,
+                width: 64,
+                height: 64,
+            },
+            CodecConfig::Hevc {
+                config: transmux::HEVCConfigurationBox::parse_body(HEVC_FIXED_CADENCE)?,
+                width: 64,
+                height: 64,
+            },
+            CodecConfig::Av1 {
+                config: transmux::Av1ConfigurationBox::parse(AV1_FIXED_CADENCE)?,
+                width: 64,
+                height: 64,
+            },
+        ];
+        for config in configs {
+            let track = track(&TrackSpec::new(1, 90000, config))?.expect("supported video");
+            assert_eq!(
+                track.decoder_config_origin,
+                crate::domain::DecoderConfigOrigin::Synthesized
+            );
+            assert!(matches!(
+                crate::media::cadence::inspect(&track),
+                crate::domain::VideoCadence::Fixed { .. }
+            ));
+        }
+        Ok(())
     }
 }

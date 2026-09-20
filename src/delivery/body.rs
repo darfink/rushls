@@ -71,7 +71,8 @@ impl MediaBody {
             StoredSegmentKind::Media(
                 SegmentBody::Contiguous(HeldBytes::Disk(_)) | SegmentBody::Chunked(_),
             )
-            | StoredSegmentKind::Gap => None,
+            | StoredSegmentKind::Gap
+            | StoredSegmentKind::GapParts(_) => None,
         }
     }
 
@@ -200,6 +201,7 @@ mod tests {
 
     fn part(id: u64, payload: HeldBytes) -> Arc<StoredPart> {
         Arc::new(StoredPart {
+            gap: false,
             id: PartId(id),
             cursor: PartCursor {
                 msn: Msn(1),

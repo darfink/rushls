@@ -2,7 +2,7 @@
 use super::{FinishReason, MuxError, Muxer, PackagedMedia, TrackPackager};
 use crate::{
     domain::{Appender, MediaInstant, MediaKind, TickTimestamp},
-    media::{NormalizedSample, PresentationPlan},
+    media::{NormalizedMedia, PresentationPlan},
     segment::{PrerollLimits, SegmentationPlan, TrackSegmentationPlan},
 };
 use std::{cmp::Ordering, collections::VecDeque, time::Duration};
@@ -11,7 +11,7 @@ struct Track {
     plan: TrackSegmentationPlan,
     kind: MediaKind,
     writer: Box<dyn TrackPackager>,
-    pending: VecDeque<NormalizedSample>,
+    pending: VecDeque<NormalizedMedia>,
     start: TickTimestamp,
 }
 impl Track {
@@ -143,7 +143,14 @@ impl Coordinator {
             self.samples -= 1;
             self.bytes -= sample.retained_bytes();
             let now = self.tracks[index].instant(sample.pts());
+            let gap_end = match &sample {
+                NormalizedMedia::Gap(gap) => Some(gap.end),
+                _ => None,
+            };
             self.tracks[index].writer.push(sample, out)?;
+            if let Some(end) = gap_end {
+                self.tracks[index].start = end;
+            }
             for track in &mut self.tracks {
                 if track.kind == MediaKind::Subtitle {
                     track.writer.tick(now, out)?;
@@ -155,10 +162,16 @@ impl Coordinator {
 
     fn select(&self, early: MediaInstant, late: MediaInstant) -> Result<Option<Cuts>, MuxError> {
         for candidate in &self.tracks[self.authority].pending {
-            if !candidate.random_access() {
-                continue;
-            }
-            let instant = self.tracks[self.authority].instant(candidate.pts());
+            let candidate_pts = match candidate {
+                NormalizedMedia::Gap(gap)
+                    if self.tracks[self.authority].kind == MediaKind::Audio =>
+                {
+                    self.nominal.clamp(gap.start, gap.end)
+                }
+                _ if candidate.random_access() => candidate.pts(),
+                _ => continue,
+            };
+            let instant = self.tracks[self.authority].instant(candidate_pts);
             if Self::compare(instant, early)? == Ordering::Less
                 || Self::compare(instant, late)? == Ordering::Greater
             {
@@ -172,6 +185,32 @@ impl Coordinator {
                 }
                 let mut found = None;
                 for (index, sample) in track.pending.iter().enumerate() {
+                    if let NormalizedMedia::Gap(gap) = sample {
+                        if Self::compare(track.instant(gap.start), instant)? != Ordering::Greater
+                            && Self::compare(track.instant(gap.end), instant)? != Ordering::Less
+                        {
+                            // Round the cross-track boundary upward by at most one audio tick.
+                            // Only absence is split; no encoded sample is shortened.
+                            let numerator = instant
+                                .offset()
+                                .checked_mul(i128::from(instant.timebase().num().get()))
+                                .and_then(|v| {
+                                    v.checked_mul(i128::from(track.plan.timebase.den().get()))
+                                })
+                                .ok_or_else(|| MuxError::Mux("gap boundary overflowed".into()))?;
+                            let denominator = i128::from(instant.timebase().den().get())
+                                * i128::from(track.plan.timebase.num().get());
+                            let ticks = numerator.div_euclid(denominator)
+                                + i128::from(numerator.rem_euclid(denominator) != 0);
+                            let pts = ticks
+                                .checked_add(i128::from(track.plan.presentation_origin_pts))
+                                .and_then(|v| i64::try_from(v).ok())
+                                .ok_or_else(|| MuxError::Mux("gap boundary overflowed".into()))?;
+                            found = Some((index, pts));
+                            break;
+                        }
+                        continue;
+                    }
                     let order = Self::compare(track.instant(sample.pts()), instant)?;
                     if (track.kind == MediaKind::Video
                         && sample.random_access()
@@ -202,7 +241,7 @@ impl Coordinator {
             .pending
             .iter()
             .map(|sample| match sample {
-                NormalizedSample::Video(video) => video.dts,
+                NormalizedMedia::Video(video) => video.dts,
                 _ => sample.pts(),
             })
             .max()
@@ -239,7 +278,7 @@ impl Coordinator {
             && !common_video
             && videos.iter().all(|track| {
                 track.pending.iter().any(|sample| match sample {
-                    NormalizedSample::Video(video) => {
+                    NormalizedMedia::Video(video) => {
                         Self::compare(track.instant(video.dts), late) == Ok(Ordering::Greater)
                     }
                     _ => false,
@@ -256,7 +295,7 @@ impl Coordinator {
             // DTS is a conservative progress watermark for reordered
             // pictures; PTS alone cannot prove a missing earlier RAP.
             if track.pending.iter().any(|sample| match sample {
-                NormalizedSample::Video(video) => {
+                NormalizedMedia::Video(video) => {
                     Self::compare(track.instant(video.dts), late) == Ok(Ordering::Greater)
                 }
                 _ => false,
@@ -271,20 +310,28 @@ impl Coordinator {
         Ok(())
     }
 
-    fn commit(
-        &mut self,
-        cuts: Cuts,
-        out: &mut dyn Appender<PackagedMedia>,
-    ) -> Result<(), MuxError> {
-        for (index, cut) in cuts.into_iter().enumerate() {
+    fn validate_cuts(&self, cuts: &Cuts) -> Result<(), MuxError> {
+        for (track, cut) in self.tracks.iter().zip(cuts) {
             if let Some((count, pts)) = cut {
-                let track = &self.tracks[index];
+                // Local gap closures replace the current audio parent. All
+                // ordinary cuts, especially video, are checked before release.
+                let start = track
+                    .pending
+                    .iter()
+                    .take(*count)
+                    .filter_map(|item| match item {
+                        NormalizedMedia::Gap(gap) => Some(gap.end),
+                        _ => None,
+                    })
+                    .next_back()
+                    .unwrap_or(track.start);
                 let actual = pts
-                    .checked_sub(track.start)
-                    .and_then(|ticks| u64::try_from(ticks).ok())
+                    .checked_sub(start)
+                    .and_then(|span| u64::try_from(span).ok())
                     .ok_or_else(|| MuxError::Mux("invalid coordinated segment span".into()))?;
                 let maximum = track.plan.maximum_segment_ticks(self.boundary_budget);
-                if actual > maximum {
+                let cuts_gap = matches!(track.pending.get(*count), Some(NormalizedMedia::Gap(gap)) if *pts >= gap.start && *pts <= gap.end);
+                if actual > maximum && !cuts_gap {
                     return Err(MuxError::Boundary {
                         track: track.plan.track_id,
                         reason: "segment ceiling exhausted",
@@ -292,7 +339,42 @@ impl Coordinator {
                         maximum,
                     });
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit(
+        &mut self,
+        cuts: Cuts,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
+        self.validate_cuts(&cuts)?;
+        for (index, cut) in cuts.into_iter().enumerate() {
+            if let Some((count, pts)) = cut {
                 self.release(index, count, out)?;
+                // A selected cut can lie inside the next missing interval.
+                // Publish its prefix and retain its suffix in the same queue slot.
+                if let Some(NormalizedMedia::Gap(gap)) = self.tracks[index].pending.front().cloned()
+                    && pts > gap.start
+                    && pts <= gap.end
+                {
+                    let mut prefix = gap;
+                    prefix.end = pts;
+                    self.tracks[index]
+                        .writer
+                        .push(NormalizedMedia::Gap(prefix), out)?;
+                    self.tracks[index].start = pts;
+                    if pts == gap.end {
+                        let removed = self.tracks[index].pending.pop_front().expect("gap exists");
+                        self.samples -= 1;
+                        self.bytes -= removed.retained_bytes();
+                    } else if let Some(NormalizedMedia::Gap(remaining)) =
+                        self.tracks[index].pending.front_mut()
+                    {
+                        remaining.start = pts;
+                    }
+                }
                 self.tracks[index].writer.cut(pts, out)?;
                 let track = &mut self.tracks[index];
                 let actual = pts
@@ -329,8 +411,11 @@ impl Coordinator {
                     .pending
                     .iter()
                     .take_while(|sample| {
-                        Self::compare(self.tracks[index].instant(sample.pts()), early)
-                            == Ok(Ordering::Less)
+                        let pts = match sample {
+                            NormalizedMedia::Gap(gap) => gap.end,
+                            _ => sample.pts(),
+                        };
+                        Self::compare(self.tracks[index].instant(pts), early) == Ok(Ordering::Less)
                     })
                     .count();
                 self.release(index, count, out)?;
@@ -375,7 +460,7 @@ impl Muxer for Coordinator {
     }
     fn push(
         &mut self,
-        sample: NormalizedSample,
+        sample: NormalizedMedia,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
         if self.finished {
@@ -476,7 +561,7 @@ mod tests {
         }
         fn push(
             &mut self,
-            sample: NormalizedSample,
+            sample: NormalizedMedia,
             _: &mut dyn Appender<PackagedMedia>,
         ) -> Result<(), MuxError> {
             self.actions
@@ -547,8 +632,8 @@ mod tests {
             crate::observe::Events::default().scoped(crate::domain::SessionId(nz::u64!(1)));
         Ok((Coordinator::new(writers, &input, &plan, events)?, actions))
     }
-    fn sample(id: u32, pts: i64, key: bool) -> NormalizedSample {
-        NormalizedSample::Video(VideoSample {
+    fn sample(id: u32, pts: i64, key: bool) -> NormalizedMedia {
+        NormalizedMedia::Video(VideoSample {
             track_id: TrackId(id),
             codec: Codec::H264,
             pts,
@@ -703,7 +788,7 @@ mod tests {
     /// depending on codec bytes or the container serializer.
     struct HoldingWriter {
         id: crate::domain::TrackId,
-        samples: Vec<NormalizedSample>,
+        samples: Vec<NormalizedMedia>,
     }
     impl TrackPackager for HoldingWriter {
         fn track_id(&self) -> crate::domain::TrackId {
@@ -713,14 +798,14 @@ mod tests {
             (
                 self.samples
                     .iter()
-                    .map(NormalizedSample::retained_bytes)
+                    .map(NormalizedMedia::retained_bytes)
                     .sum(),
                 self.samples.len(),
             )
         }
         fn push(
             &mut self,
-            sample: NormalizedSample,
+            sample: NormalizedMedia,
             _: &mut dyn Appender<PackagedMedia>,
         ) -> Result<(), MuxError> {
             self.samples.push(sample);

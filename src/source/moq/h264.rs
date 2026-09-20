@@ -106,6 +106,7 @@ impl Inline {
                     crate::media::video_config::properties(track.codec, &config).reorder_depth;
             }
             track.codec_extradata = Payload::from_bytes(Bytes::from(config));
+            track.decoder_config_origin = crate::domain::DecoderConfigOrigin::Synthesized;
         }
         Ok(())
     }
@@ -127,8 +128,9 @@ mod tests {
             &BTreeMap::from([("video".into(), config)]),
             &BTreeMap::new(),
         )?;
-        let record =
-            transmux::AVCDecoderConfigurationRecord::parse(crate::mux::fixtures::H264_EXTRADATA)?;
+        let record = transmux::AVCDecoderConfigurationRecord::parse(
+            crate::media::fixtures::H264_FIXED_CADENCE,
+        )?;
         let mut annexb = Vec::new();
         for nal in [&record.sps[0].0[..], &record.pps[0].0[..], &[0x65, 0x88]] {
             annexb.extend_from_slice(&[0, 0, 0, 1]);
@@ -144,6 +146,14 @@ mod tests {
         inline.convert(&mut frame, track.id, 1_000_000)?;
         inline.configure(track)?;
         assert!(!track.codec_extradata.is_empty());
+        assert_eq!(
+            track.decoder_config_origin,
+            crate::domain::DecoderConfigOrigin::Synthesized
+        );
+        assert!(matches!(
+            crate::media::cadence::inspect(track),
+            crate::domain::VideoCadence::Fixed { .. }
+        ));
         assert_eq!(frame.payload.as_ref(), &[0, 0, 0, 2, 0x65, 0x88]);
         // A later SPS change must not silently reuse the original init segment.
         annexb[5] ^= 1;
