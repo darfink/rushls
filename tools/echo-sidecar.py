@@ -36,7 +36,7 @@ import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# Rushls refuses a response body over `maximum_response_bytes`, and reading an
+# Rushls refuses a response body over `max_response_bytes`, and reading an
 # unbounded request would let a bug here become a memory problem.
 MAXIMUM_BODY = 1 << 20
 

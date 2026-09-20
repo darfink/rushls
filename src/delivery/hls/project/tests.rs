@@ -1050,17 +1050,18 @@ fn siblings_are_still_reported_on_a_delta() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn iframe_multivariant_tags_are_opt_in_and_video_only() -> Result<(), Box<dyn std::error::Error>> {
+fn iframe_multivariant_tags_default_to_video_only_and_can_be_disabled()
+-> Result<(), Box<dyn std::error::Error>> {
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0), video(1), audio(2), subtitle(3)]);
     let stream = lease.live().snapshot();
-    let plain = multivariant_playlist(&stream, &policy(), &uris())?.ok_or("no index")?;
-    assert!(!plain.contains("I-FRAME"));
-    let enabled = PlaylistPolicy {
-        iframe_playlists: true,
+    let disabled = PlaylistPolicy {
+        iframe_playlists: false,
         ..policy()
     };
-    let manifest = multivariant_playlist(&stream, &enabled, &uris().with_query_variables())?
+    let plain = multivariant_playlist(&stream, &disabled, &uris())?.ok_or("no index")?;
+    assert!(!plain.contains("I-FRAME"));
+    let manifest = multivariant_playlist(&stream, &policy(), &uris().with_query_variables())?
         .ok_or("no index")?;
     let tags: Vec<_> = manifest
         .lines()
@@ -1380,5 +1381,32 @@ fn explicit_gaps_have_part_and_parent_tags_without_a_discontinuity()
     assert_eq!(rendered.matches("#EXT-X-MAP:").count(), 1);
     assert!(rendered.contains("#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part/9.m4s\""));
     assert!(rendered.contains("#EXT-X-TARGETDURATION:6"));
+    Ok(())
+}
+
+#[test]
+fn scrubbing_advertises_measured_keyframe_bandwidth_instead_of_full_video()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::delivery::hls::fixtures::write_cmaf_segment;
+    let store = StreamStore::default();
+    let lease = lease(&store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    let before = lease.live().revision();
+    write_cmaf_segment(&lease, 0, 0, 0)?;
+    let (stream, media) = snapshots(&lease, 0)?;
+    let segment = media.segments.iter().next().ok_or("missing segment")?;
+    let expected = segment.iframes[0].length.get() * 8 / 6;
+    assert_eq!(
+        stream.renditions[0].iframe_bandwidth.peak_bits_per_second,
+        Some(expected)
+    );
+    assert!(stream.renditions[0].bandwidth.peak_bits_per_second.unwrap() > expected);
+    assert!(lease.live().revision() > before);
+    let playlist = multivariant_playlist(&stream, &policy(), &uris())?.ok_or("missing playlist")?;
+    let tag = playlist
+        .lines()
+        .find(|line| line.starts_with("#EXT-X-I-FRAME-STREAM-INF:"))
+        .ok_or("missing scrubbing entry")?;
+    assert!(tag.contains(&format!("BANDWIDTH={expected},")), "{tag}");
     Ok(())
 }

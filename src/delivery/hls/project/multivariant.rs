@@ -218,9 +218,12 @@ fn write_iframe_variants(
             continue;
         };
         writer.iframe_variant(IFrameVariant {
-            // Use the full video rendition's advertised rate as the estimate
-            // until dedicated I-frame bandwidth measurements are available.
-            bandwidth: effective_bandwidth(entry, policy),
+            bandwidth: entry
+                .iframe_bandwidth
+                .peak_bits_per_second
+                .or(entry.iframe_bandwidth.average_bits_per_second)
+                .and_then(NonZeroU64::new)
+                .unwrap_or_else(|| effective_bandwidth(entry, policy)),
             codecs: Some(&entry.codecs),
             resolution: Some((width, height)),
             video_range: video_range.map(video_range_of),

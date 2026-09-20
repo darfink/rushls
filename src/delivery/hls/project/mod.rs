@@ -98,7 +98,7 @@ pub struct PlaylistPolicy {
 impl Default for PlaylistPolicy {
     fn default() -> Self {
         Self {
-            iframe_playlists: false,
+            iframe_playlists: true,
             program_date_time: ProgramDateTimePolicy::default(),
             // Deliberately high: unknown is not the same as small, and the cost
             // of guessing high is one conservative segment.

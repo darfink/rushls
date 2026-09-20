@@ -87,6 +87,8 @@ pub struct RenditionCatalogEntry {
     pub is_default: bool,
     pub declared_bandwidth: Option<u64>,
     pub bandwidth: RenditionBandwidth,
+    /// Measured keyframe byte-range rates, independent of the full video stream.
+    pub iframe_bandwidth: RenditionBandwidth,
     pub view: Arc<RenditionView>,
 }
 

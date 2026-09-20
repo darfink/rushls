@@ -527,7 +527,7 @@ fn a_wildcard_cors_pattern_is_accepted() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn credentialed_wildcard_cors_is_rejected() -> Result<(), Box<dyn Error>> {
-    let result = resolve_with_env(&[("RUSHLS_HTTP_CORS_ALLOW_CREDENTIALS", "true")])?;
+    let result = resolve_with_env(&[("RUSHLS_HTTP_CORS_CREDENTIALS", "true")])?;
 
     assert!(matches!(result, Err(ConfigError::Invalid(_))));
     Ok(())
@@ -652,7 +652,7 @@ listen = "127.0.0.1:9000"
 
 [moq]
 listen = "127.0.0.1:4433"
-certificate = "{}"
+cert = "{}"
 key = "{}"
 timeout = "8s"
 "#,
@@ -691,7 +691,7 @@ listen = "127.0.0.1:9000"
 
 [moq]
 listen = "0.0.0.0:4433"
-certificate = "{}"
+cert = "{}"
 key = "{}"
 "#,
         settings.certificate.display(),
@@ -724,7 +724,7 @@ listen = "127.0.0.1:9000"
 
 [moq]
 listen = "127.0.0.1:4433"
-certificate = "{}"
+cert = "{}"
 key = "{}"
 timeout = "off"
 "#,
@@ -770,7 +770,7 @@ fn tls_requires_both_the_certificate_and_key() -> Result<(), Box<dyn Error>> {
     let result = load_with(
         BASE_CONFIG,
         &[],
-        &[("RUSHLS_HTTP_TLS_CERTIFICATE", "/tmp/certificate.pem")],
+        &[("RUSHLS_HTTP_TLS_CERT", "/tmp/certificate.pem")],
     )?;
 
     assert!(result.is_err());
@@ -868,7 +868,7 @@ async fn mutual_tls_material_resolves_for_the_admission_service() -> Result<(), 
         r#"
 [auth.publish]
 url = "https://auth.internal/admit"
-client_certificate = "{}"
+client_cert = "{}"
 client_key = "{}"
 ca = "{}"
 "#,
@@ -897,15 +897,12 @@ async fn half_a_client_certificate_pair_is_refused() -> Result<(), Box<dyn Error
 
     for (line, missing) in [
         (
-            format!(
-                "client_certificate = \"{}\"",
-                settings.certificate.display()
-            ),
+            format!("client_cert = \"{}\"", settings.certificate.display()),
             "client_key",
         ),
         (
             format!("client_key = \"{}\"", settings.key.display()),
-            "client_certificate",
+            "client_cert",
         ),
     ] {
         let error = resolve_toml(&format!(
@@ -926,7 +923,7 @@ async fn an_unreadable_client_certificate_stops_startup() -> Result<(), Box<dyn 
         r#"
 [auth.publish]
 url = "https://auth.internal/admit"
-client_certificate = "{}"
+client_cert = "{}"
 client_key = "{}"
 "#,
         directory.join("absent.pem").display(),
@@ -955,7 +952,7 @@ async fn a_hook_may_present_its_own_identity() -> Result<(), Box<dyn Error>> {
 [hook.archive]
 url = "https://archive.internal/rushls"
 events = ["session.started"]
-client_certificate = "{}"
+client_cert = "{}"
 client_key = "{}"
 ca = "{}"
 "#,
@@ -1007,7 +1004,7 @@ async fn half_a_client_certificate_pair_is_refused_for_a_hook_too() -> Result<()
 [hook.archive]
 url = "https://archive.internal/rushls"
 events = ["session.started"]
-client_certificate = "{}"
+client_cert = "{}"
 "#,
         settings.certificate.display(),
     ))?
@@ -1027,7 +1024,7 @@ fn keys_for_unbuilt_features_are_refused_by_name() -> Result<(), Box<dyn Error>>
     // the silent-misconfiguration failure the whole design is against.
     for configuration in [
         // Mutual TLS to the admission service.
-        "[auth.publish]\nurl = \"http://auth\"\nclient_certificate = \"/x.pem\"\n",
+        "[auth.publish]\nurl = \"http://auth\"\nclient_cert = \"/x.pem\"\n",
         // Payload-carrying hooks.
         "[hook.archive]\nurl = \"http://archive\"\nevents = [\"session.started\"]\npayload = true\n",
     ] {
@@ -1113,7 +1110,7 @@ fn configured_http_auth_resolves_and_guards_its_own_settings() -> Result<(), Box
     let valid = r#"
 [auth.publish]
 url = "http://auth-sidecar:8081/v1/publish/admit"
-maximum_response_bytes = "64KiB"
+max_response_bytes = "64KiB"
 "#;
     assert!(
         resolve_toml(valid)?.is_ok(),
@@ -1126,7 +1123,7 @@ maximum_response_bytes = "64KiB"
     let outlives_admission = r#"
 [auth.publish]
 url = "http://auth-sidecar:8081/admit"
-request_timeout = "30s"
+timeout = "30s"
 "#;
     // A response may only name a policy this node actually has.
     let unknown_default = r#"
@@ -1277,7 +1274,7 @@ name = "studio"
 [hook.automation]
 url = "http://automation:9000/events"
 events = ["session.started", "session.ended", "segment.ready"]
-maximum_attempts = 2
+max_attempts = 2
 "#,
     )??;
 
@@ -1316,13 +1313,13 @@ events = []
 [hook.automation]
 url = "http://automation:9000/events"
 events = ["session.ended"]
-maximum_attempts = 0
+max_attempts = 0
 "#;
     let no_queue = r#"
 [hook.automation]
 url = "http://automation:9000/events"
 events = ["session.ended"]
-queue_capacity = 0
+queue_size = 0
 "#;
     let unusable_url = r#"
 [hook.automation]
@@ -1582,10 +1579,10 @@ fn tls_admission_limits_are_configurable() -> Result<(), Box<dyn Error>> {
     let resolved = resolve_toml(&format!(
         r#"
 [http.tls]
-certificate = "{}"
+cert = "{}"
 key = "{}"
 handshake_timeout = "2s"
-maximum_pending_handshakes = 32
+max_handshakes = 32
 "#,
         certificate.path.display(),
         key.path.display()
@@ -1898,12 +1895,10 @@ impl Drop for TempConfig {
 fn an_unknown_enumerated_value_names_the_alternatives() -> Result<(), Box<dyn Error>> {
     // The point of these messages is that an operator who typos one does not
     // have to go and read the reference file to find out what was allowed.
-    let key_length = load_toml(&format!(
-        "{BASE_CONFIG}\n[srt]\nencryption_key_length = \"aes999\"\n"
-    ))?
-    .err()
-    .ok_or("an unknown key length is refused")?
-    .to_string();
+    let key_length = load_toml(&format!("{BASE_CONFIG}\n[srt]\nencryption = \"aes999\"\n"))?
+        .err()
+        .ok_or("an unknown key length is refused")?
+        .to_string();
     assert!(key_length.contains("aes128"), "{key_length}");
     assert!(key_length.contains("aes256"), "{key_length}");
     Ok(())
@@ -2037,31 +2032,31 @@ fn nested_hls_sources_preserve_precedence() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn iframe_playlistss_are_disabled_by_default_and_configurable() -> Result<(), Box<dyn Error>> {
-    assert!(!resolve_toml("")??.node.hls.playlist.iframe_playlists);
+fn scrubbing_is_enabled_by_default_and_configurable() -> Result<(), Box<dyn Error>> {
+    assert!(resolve_toml("")??.node.hls.playlist.iframe_playlists);
     assert!(
-        !load_shipped("rushls.reference.toml")?
+        load_shipped("rushls.reference.toml")?
             .node
             .hls
             .playlist
             .iframe_playlists
     );
     assert!(
-        resolve_toml("[hls]\niframe_playlists = true")??
+        !resolve_toml("[hls]\nscrubbing = false")??
             .node
             .hls
             .playlist
             .iframe_playlists
     );
     assert!(
-        resolve_with_env(&[("RUSHLS_HLS_IFRAME_PLAYLISTS", "true")])??
+        !resolve_with_env(&[("RUSHLS_HLS_SCRUBBING", "false")])??
             .node
             .hls
             .playlist
             .iframe_playlists
     );
     assert!(
-        resolve_with("", &["--hls-iframe-playlists", "true"], &[])??
+        resolve_with("", &["--hls-scrubbing", "true"], &[])??
             .node
             .hls
             .playlist
@@ -2069,8 +2064,8 @@ fn iframe_playlistss_are_disabled_by_default_and_configurable() -> Result<(), Bo
     );
     assert!(
         !resolve_with(
-            "[hls]\niframe_playlists = true",
-            &["--hls-iframe-playlists", "false"],
+            "[hls]\nscrubbing = true",
+            &["--hls-scrubbing", "false"],
             &[]
         )??
         .node
@@ -2078,9 +2073,9 @@ fn iframe_playlistss_are_disabled_by_default_and_configurable() -> Result<(), Bo
         .playlist
         .iframe_playlists
     );
-    assert!(load_toml("[hls]\niframe_playlists = 1")?.is_err());
+    assert!(load_toml("[hls]\nscrubbing = 1")?.is_err());
     assert!(
-        resolve_with("", &["--hls-iframe-playlists"], &[])??
+        resolve_with("", &["--hls-scrubbing"], &[])??
             .node
             .hls
             .playlist
@@ -2109,8 +2104,8 @@ fn recording_patterns_and_hook_signing_are_validated_at_startup() -> Result<(), 
         // The `.vtt` suffix of a subtitle rendition replaces everything after
         // the last dot, so this would name one file for every subtitle segment.
         "[record]\ndir = '/archive'\npattern = '{rendition}.{segment}'",
-        "[record]\ndir = '/archive'\nqueue_capacity = 0",
-        "[record]\ndir = '/archive'\nmaximum_pending_bytes = 0",
+        "[record]\ndir = '/archive'\nqueue_size = 0",
+        "[record]\ndir = '/archive'\nmax_pending_bytes = 0",
         "[record]\ndir = '/archive'\nunknown = 1",
         "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = 'bad-secret'",
         "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = 'bad-secret'\nsigning_secret_file = '/missing'",
@@ -2161,10 +2156,10 @@ fn http_capacity_is_configurable_and_must_be_positive() -> Result<(), Box<dyn Er
         defaults.node.http.limits,
         crate::server::http::HttpLimits::default()
     );
-    let config = resolve_toml("[http]\nmaximum_connections = 32\nmaximum_requests = 48\n")??;
+    let config = resolve_toml("[http]\nmax_connections = 32\nmax_requests = 48\n")??;
     assert_eq!(config.node.http.limits.maximum_connections, 32);
     assert_eq!(config.node.http.limits.maximum_requests, 48);
-    for field in ["maximum_connections", "maximum_requests"] {
+    for field in ["max_connections", "max_requests"] {
         assert!(resolve_toml(&format!("[http]\n{field} = 0\n"))?.is_err());
     }
     Ok(())
@@ -2173,18 +2168,27 @@ fn http_capacity_is_configurable_and_must_be_positive() -> Result<(), Box<dyn Er
 #[test]
 fn cors_exposed_headers_resolve_from_file_env_and_cli() -> Result<(), Box<dyn Error>> {
     let file = r#"[http.cors]
-expose_headers = "X-Request-Id, Date"
+expose_headers = ["X-Request-Id", "Date"]
 "#;
     let config = resolve_toml(file)??;
     assert_eq!(
         config.node.http.cors.expose_headers,
         ["x-request-id", "date"]
     );
-    let env = [("RUSHLS_HTTP_CORS_EXPOSE_HEADERS", "x-trace-id")];
+    let env = [("RUSHLS_HTTP_CORS_EXPOSE_HEADERS", "x-trace-id, date")];
     let config = resolve_with(file, &[], &env)??;
-    assert_eq!(config.node.http.cors.expose_headers, ["x-trace-id"]);
-    let config = resolve_with(file, &["--http-cors-expose-headers", "x-debug-id"], &env)??;
-    assert_eq!(config.node.http.cors.expose_headers, ["x-debug-id"]);
+    assert_eq!(config.node.http.cors.expose_headers, ["x-trace-id", "date"]);
+    let config = resolve_with(
+        file,
+        &["--http-cors-expose-headers", "x-debug-id,date"],
+        &env,
+    )??;
+    assert_eq!(config.node.http.cors.expose_headers, ["x-debug-id", "date"]);
+    let config = resolve_toml("[http.cors]\nexpose_headers = []")??;
+    assert!(config.node.http.cors.expose_headers.is_empty());
+    let config = resolve_with(file, &["--http-cors-expose-headers="], &env)??;
+    assert!(config.node.http.cors.expose_headers.is_empty());
+    assert!(load_toml("[http.cors]\nexpose_headers = 'date'")?.is_err());
     let config = resolve_with_env(&[("RUSHLS_HTTP_CORS_EXPOSE_HEADERS", "")])??;
     assert!(config.node.http.cors.expose_headers.is_empty());
     let config = resolve_with_env(&[])??;
@@ -2197,6 +2201,17 @@ expose_headers = "X-Request-Id, Date"
 
 #[test]
 fn invalid_cors_exposed_headers_stop_startup() -> Result<(), Box<dyn Error>> {
+    for value in [
+        r#"["bad name"]"#,
+        r#"["date,content-range"]"#,
+        r#"[""]"#,
+        r#"["*"]"#,
+    ] {
+        assert!(
+            resolve_toml(&format!("[http.cors]\nexpose_headers = {value}"))?.is_err(),
+            "{value}"
+        );
+    }
     for value in [
         "bad name",
         "x-header: value",
@@ -2254,5 +2269,134 @@ async fn strict_default_and_overrides() -> Result<(), Box<dyn Error>> {
         InputMode::Permissive
     );
     assert!(resolve_toml("[accept]\nstrict = 'invalid'")?.is_err());
+    Ok(())
+}
+
+const CONCISE_SETTINGS: &str = r#"
+[http]
+max_connections = 12
+max_requests = 13
+[http.cors]
+credentials = true
+[http.tls]
+cert = "/tls.pem"
+key = "/tls.key"
+max_handshakes = 14
+[moq]
+cert = "/moq.pem"
+[srt]
+encryption = "aes128"
+[auth.publish]
+url = "http://auth"
+timeout = "1s"
+max_response_bytes = "32KiB"
+client_cert = "/client.pem"
+[hook.example]
+url = "http://hook"
+events = ["session.ended"]
+queue_size = 15
+max_in_flight = 2
+max_attempts = 3
+client_cert = "/hook.pem"
+[record]
+dir = "/archive"
+queue_size = 16
+max_pending_bytes = 1024
+"#;
+
+#[test]
+fn concise_settings_match_file_environment_and_cli_names() -> Result<(), Box<dyn Error>> {
+    // Loading is sufficient here: certificate paths are deliberately not read.
+    // Resolution and certificate validation have their own integration coverage.
+
+    let config = load_toml(CONCISE_SETTINGS)??;
+    assert_eq!(config.http.max_connections, 12);
+    assert_eq!(config.http.max_requests, 13);
+    assert!(config.http.cors.credentials);
+    assert_eq!(config.http.tls.as_ref().unwrap().max_handshakes, 14);
+    assert_eq!(
+        config.http.tls.as_ref().unwrap().cert,
+        PathBuf::from("/tls.pem")
+    );
+    assert_eq!(config.moq.cert, Some(PathBuf::from("/moq.pem")));
+    let auth = config.auth.publish.as_ref().unwrap();
+    assert_eq!(auth.timeout, Duration::from_secs(1));
+    assert_eq!(auth.client_cert, Some(PathBuf::from("/client.pem")));
+    assert_eq!(
+        super::nonzero_bytes("test", auth.max_response_bytes)?,
+        32 * 1024
+    );
+    let hook = &config.hook.as_ref().unwrap().0["example"];
+    assert_eq!(
+        (hook.queue_size, hook.max_in_flight, hook.max_attempts),
+        (15, 2, 3)
+    );
+    assert_eq!(hook.client_cert, Some(PathBuf::from("/hook.pem")));
+    let record = &config.record.as_ref().unwrap().0;
+    assert_eq!(
+        (record.queue_capacity, record.maximum_pending_bytes),
+        (16, 1024)
+    );
+
+    let environment = [
+        ("RUSHLS_HTTP_MAX_CONNECTIONS", "21"),
+        ("RUSHLS_HTTP_MAX_REQUESTS", "22"),
+        ("RUSHLS_HTTP_CORS_CREDENTIALS", "false"),
+        ("RUSHLS_HTTP_TLS_CERT", "/env.pem"),
+        ("RUSHLS_HTTP_TLS_MAX_HANDSHAKES", "23"),
+        ("RUSHLS_MOQ_CERT", "/env-moq.pem"),
+        ("RUSHLS_AUTH_PUBLISH_CLIENT_CERT", "/env-client.pem"),
+        ("RUSHLS_AUTH_PUBLISH_TIMEOUT", "500ms"),
+        ("RUSHLS_AUTH_PUBLISH_MAX_RESPONSE_BYTES", "16KiB"),
+        ("RUSHLS_SRT_ENCRYPTION", "aes256"),
+    ];
+    let env = load_with(CONCISE_SETTINGS, &[], &environment)??;
+    assert_eq!((env.http.max_connections, env.http.max_requests), (21, 22));
+    assert!(!env.http.cors.credentials);
+    assert_eq!(env.http.tls.as_ref().unwrap().max_handshakes, 23);
+    assert_eq!(
+        env.http.tls.as_ref().unwrap().cert,
+        PathBuf::from("/env.pem")
+    );
+    assert_eq!(env.moq.cert, Some(PathBuf::from("/env-moq.pem")));
+    let auth = env.auth.publish.unwrap();
+    assert_eq!(auth.client_cert, Some(PathBuf::from("/env-client.pem")));
+    assert_eq!(auth.timeout, Duration::from_millis(500));
+    assert_eq!(
+        super::nonzero_bytes("test", auth.max_response_bytes)?,
+        16 * 1024
+    );
+
+    let cli = load_with(
+        CONCISE_SETTINGS,
+        &[
+            "--http-max-connections=31",
+            "--http-max-requests=32",
+            "--http-cors-credentials=true",
+            "--http-tls-cert=/cli.pem",
+            "--http-tls-max-handshakes=33",
+            "--moq-cert=/cli-moq.pem",
+            "--auth-publish-client-cert=/cli-client.pem",
+            "--auth-publish-timeout=250ms",
+            "--auth-publish-max-response-bytes=8KiB",
+            "--srt-encryption=aes128",
+        ],
+        &environment,
+    )??;
+    assert_eq!((cli.http.max_connections, cli.http.max_requests), (31, 32));
+    assert!(cli.http.cors.credentials);
+    assert_eq!(cli.http.tls.as_ref().unwrap().max_handshakes, 33);
+    assert_eq!(
+        cli.http.tls.as_ref().unwrap().cert,
+        PathBuf::from("/cli.pem")
+    );
+    assert_eq!(cli.moq.cert, Some(PathBuf::from("/cli-moq.pem")));
+    let auth = cli.auth.publish.unwrap();
+    assert_eq!(auth.client_cert, Some(PathBuf::from("/cli-client.pem")));
+    assert_eq!(auth.timeout, Duration::from_millis(250));
+    assert_eq!(
+        super::nonzero_bytes("test", auth.max_response_bytes)?,
+        8 * 1024
+    );
     Ok(())
 }

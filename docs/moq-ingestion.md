@@ -48,7 +48,7 @@ Replace the certificate paths in this configuration:
 [moq]
 listen = "127.0.0.1:4443"
 timeout = "30s"
-certificate = "/absolute/path/cert.pem"
+cert = "/absolute/path/cert.pem"
 key = "/absolute/path/key.pem"
 
 [rtmp]
@@ -107,7 +107,7 @@ From `.`, create a development certificate and start the origin:
 ./tools/mint-dev-cert.sh
 cargo run -- \
   --moq-listen 127.0.0.1:18080 --moq-timeout 30s \
-  --moq-certificate ~/.rushls/dev-tls/cert.pem \
+  --moq-cert ~/.rushls/dev-tls/cert.pem \
   --moq-key ~/.rushls/dev-tls/key.pem \
   --http-listen 127.0.0.1:18080 \
   --rtmp-listen 127.0.0.1:0 --srt-listen 127.0.0.1:0

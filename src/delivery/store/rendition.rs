@@ -227,6 +227,7 @@ pub struct RenditionState {
     /// Media-time position at the end of completed playlist segments.
     playlist_position: Duration,
     pub bitrate: BitrateTracker,
+    pub iframe_bitrate: BitrateTracker,
     /// Authoritative committed edge. The watch sender mirrors it only after
     /// the state lock is released.
     live_edge: super::RenditionLiveEdge,
@@ -300,6 +301,7 @@ impl RenditionState {
             last_packaging_segment_id: None,
             playlist_position: Duration::ZERO,
             bitrate: BitrateTracker::default(),
+            iframe_bitrate: BitrateTracker::default(),
             live_edge,
             edge_updates,
             published,
@@ -807,6 +809,7 @@ impl RenditionState {
         self.gaps += 1;
         self.publication_totals.0.lock().gaps += 1;
         self.bitrate.break_contiguity();
+        self.iframe_bitrate.break_contiguity();
         let segment = StoredSegment {
             iframe_msn: 0,
             iframes: [].into(),
@@ -1070,6 +1073,24 @@ impl RenditionState {
         now: Instant,
         retention: RetentionPolicy,
     ) {
+        // Trick-play downloads only indexed byte ranges, not the full video.
+        // Observe exactly the durations and ranges exposed in its playlist.
+        if segment.discontinuity_before || segment.iframes.is_empty() {
+            self.iframe_bitrate.break_contiguity();
+        }
+        for (index, frame) in segment.iframes.iter().enumerate() {
+            let end = segment
+                .iframes
+                .get(index + 1)
+                .map_or(segment.duration, |next| next.start);
+            if let Ok(bytes) = usize::try_from(frame.length.get()) {
+                self.iframe_bitrate.observe(
+                    bytes,
+                    segment.timebase.ticks_to_duration(end - frame.start),
+                    Duration::from_secs(self.contract.target_duration.get()),
+                );
+            }
+        }
         segment.iframe_msn = self.next_iframe_msn;
         self.next_iframe_msn = self.next_iframe_msn.saturating_add(segment.iframe_count());
         let id = segment.id;
@@ -1181,6 +1202,7 @@ impl RenditionState {
         self.gaps += 1;
         self.publication_totals.0.lock().gaps += 1;
         self.bitrate.break_contiguity();
+        self.iframe_bitrate.break_contiguity();
         let msn = open.msn;
         self.unpick_visible_parts_from_back(msn);
         for part in &open.parts {

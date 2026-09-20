@@ -42,9 +42,11 @@ pub struct Config {
     #[serde(default = "default_pattern")]
     pub pattern: String,
     #[serde(default = "default_queue")]
+    #[serde(rename = "queue_size")]
     pub queue_capacity: usize,
     /// Includes open segments, queued jobs, and the active filesystem write.
     #[serde(default = "default_bytes")]
+    #[serde(rename = "max_pending_bytes")]
     pub maximum_pending_bytes: usize,
 }
 fn default_pattern() -> String {
@@ -63,7 +65,7 @@ impl Config {
             return Err("record.dir must be a filesystem path, not a URL".into());
         }
         if self.queue_capacity == 0 || self.maximum_pending_bytes == 0 {
-            return Err("record queue_capacity and maximum_pending_bytes must be nonzero".into());
+            return Err("record queue_size and max_pending_bytes must be nonzero".into());
         }
         Pattern::parse(&self.pattern).map(|_| ())
     }

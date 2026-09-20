@@ -847,7 +847,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn iframe_routes_are_opt_in_and_have_separate_token_and_video_caches()
+    async fn iframe_routes_can_be_disabled_and_have_separate_token_and_video_caches()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::delivery::hls::fixtures::write_cmaf_segment;
         let store = StreamStore::default();
@@ -856,11 +856,20 @@ mod tests {
         write_cmaf_segment(&lease, 0, 0, 0)?;
         let iframe = Resource::IFramePlaylist(RenditionId(0));
         assert_eq!(
-            origin(&store)
-                .serve(&stream_id(), fetch(iframe))
-                .await
-                .unwrap_err()
-                .error,
+            Service::new(
+                Arc::new(Origin::new(store.clone())),
+                Config {
+                    playlist: PlaylistPolicy {
+                        iframe_playlists: false,
+                        ..PlaylistPolicy::default()
+                    },
+                    ..Config::default()
+                }
+            )
+            .serve(&stream_id(), fetch(iframe))
+            .await
+            .unwrap_err()
+            .error,
             DeliveryError::UnknownResource
         );
         let service = Service::new(

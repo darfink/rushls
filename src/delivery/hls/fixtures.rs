@@ -257,7 +257,7 @@ pub fn write_cmaf_segment_with_keyframes(
         else {
             unreachable!()
         };
-        part.payload = cmaf_fragment(keys.contains(&index))?;
+        part.payload = cmaf_fragment_at(keys.contains(&index), start + i64::from(index), 0)?;
         write(lease, PackagedMedia::Chunk(part));
     }
     write(

@@ -2,6 +2,12 @@
 
 # RFC: the Rushls configuration surface
 
+Setting names use `max_*` for upper limits, `*_bytes` for byte counts, and
+`*_file` for secret files. Service deadlines use `timeout`. TLS paths use
+`cert`, `key`, and `client_cert`. Queue counts use `queue_size`.
+Enable `[hls].scrubbing` to publish keyframe playlists for fast seeking.
+
+
 > **Status: implemented**, apart from the features named as not built below:
 > Payload-carrying hooks. Their keys are refused at startup
 > rather than silently accepted.
@@ -26,7 +32,7 @@ default, an essay per field — pretending to be the file a new administrator
 opens. Three consequences:
 
 1. **The altitude is flat.** `listen` sits beside `publication_stall_multiplier`
-   and hook `queue_capacity`.
+   and hook `queue_size`.
 2. **Limits are a scavenger hunt.** Hardening an untrusted edge means touching
    six tables, and several caps have no "unlimited" form.
 3. **The file speaks pipeline.** `faster_than_realtime`, `maximum_lead`,
@@ -80,8 +86,8 @@ defaults and no cipher knobs. HTTPS and MOQ share that rotation machinery, but
 not a `ServerConfig`: HTTP/3 requires TLS 1.3 and `h3` ALPN, so MOQ must not
 reuse the viewer HTTPS config.
 
-Direct exposure has two shared limits under `[http]`: `maximum_connections`
-and `maximum_requests`, both defaulting to 4096. HTTP, HTTPS, and a separate
+Direct exposure has two shared limits under `[http]`: `max_connections`
+and `max_requests`, both defaulting to 4096. HTTP, HTTPS, and a separate
 metrics listener share these budgets. Excess connections close immediately.
 Excess requests receive `503`, `Retry-After: 1`, and `Cache-Control: no-store`.
 A request keeps its slot while waiting for media and while sending its body.
@@ -443,9 +449,10 @@ memory" has no fixed byte meaning at a variable bitrate, so it would be a
 second, weaker way of writing `retain` — and the number an operator needs for
 capacity planning is the one that multiplies by `streams`.
 
-### `iframe_playlists`
+### `scrubbing`
 
-`iframe_playlists = false` is the default. With `true`, the multivariant playlist
+`scrubbing = true` is the default. Set it to `false` to disable keyframe playlists.
+When enabled, the multivariant playlist
 advertises an `EXT-X-I-FRAME-STREAM-INF` entry for each CMAF video rendition.
 Each entry references `<rendition>/iframe.m3u8`.
 Audio and subtitle renditions have no I-frame playlist.
@@ -455,6 +462,7 @@ Each keyframe has its own duration, byte range, and media sequence number.
 At 24 fps, a GOP of 48 provides one keyframe every two seconds.
 Use a GOP of 24 for the recommended one-frame-per-second density.
 It uses byte ranges into existing segments and the same initialization sections.
+Its advertised bandwidth uses measured keyframe ranges, independently of the full video bitrate.
 It follows the normal live retention window, including media on disk.
 A segment without an opening sync sample appears as a gap.
 
@@ -468,9 +476,9 @@ Its server-control values match the other playlists.
 See draft-pantos-hls-rfc8216bis-22, sections 3.3, 4.4.3.6, 4.4.4.9,
 4.4.6.3, 6.2.4, and Appendix B.1.
 
-The environment variable is `RUSHLS_HLS_IFRAME_PLAYLISTS`.
-The CLI parameter is `--hls-iframe-playlists`. A bare flag means `true`;
-an explicit `--hls-iframe-playlists true` or `--hls-iframe-playlists false`
+The environment variable is `RUSHLS_HLS_SCRUBBING`.
+The CLI parameter is `--hls-scrubbing`. A bare flag means `true`;
+an explicit `--hls-scrubbing true` or `--hls-scrubbing false`
 also works.
 
 ### `hold_back`
@@ -736,8 +744,8 @@ The default configuration is:
 [record]
 dir = "/archive"
 pattern = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
-queue_capacity = 128
-maximum_pending_bytes = 268435456
+queue_size = 128
+max_pending_bytes = 268435456
 ```
 
 The placeholders have these meanings:
@@ -775,8 +783,8 @@ New subdirectory entries are also synced. A final filename means the entire
 file was written. Scanners must ignore `.rushls-*.tmp` files. A crash can leave
 these temporary files behind.
 
-One background thread performs filesystem writes. `queue_capacity` bounds
-waiting segments. `maximum_pending_bytes` bounds retained bytes for open
+One background thread performs filesystem writes. `queue_size` bounds
+waiting segments. `max_pending_bytes` bounds retained bytes for open
 segments, queued files, and the active write. Small payloads also incur a
 minimum metadata charge. An open segment has a separate 16,384-handle limit.
 
@@ -852,7 +860,7 @@ Segment events can produce substantial hook traffic. One rendition with six-seco
 segments emits approximately 600 events per hour. Short segments around GAPs
 increase that rate. Subscribe only the destinations that need segment notifications.
 
-A hook destination takes the same `client_certificate`, `client_key`, and `ca`
+A hook destination takes the same `client_cert`, `client_key`, and `ca`
 fields as `[auth.publish]`, with the same meaning and the same in-place
 rotation. Nothing about them is specific to admission: both are operator-run
 services reached over a network the operator may not consider private, and
@@ -1204,12 +1212,19 @@ concept rather than a field.
 ## CORS response headers
 
 `http.cors.expose_headers` sets the response headers that cross-origin players can read.
-It accepts comma-separated header names and defaults to `content-length,content-range,date`.
-An explicit value replaces that list. An empty string leaves only browser-safelisted headers readable.
+TOML accepts an array of header names:
+
+```toml
+[http.cors]
+expose_headers = ["content-length", "content-range", "date"]
+```
+
+These are the defaults. An explicit array replaces the list; `[]` leaves only browser-safelisted headers readable.
 Invalid names and `*` stop startup. This keeps exposure explicit for credentialed requests.
 The setting has no effect when CORS is off.
 
-Use `RUSHLS_HTTP_CORS_EXPOSE_HEADERS` or `--http-cors-expose-headers` to override the file.
+Use comma-separated values with `RUSHLS_HTTP_CORS_EXPOSE_HEADERS` or `--http-cors-expose-headers` to override the file.
+An empty CLI or environment value clears the list.
 For example, `--http-cors-expose-headers content-length,content-range,date,x-request-id` exposes an additional response header.
 This setting exposes names; it does not create those response headers.
 

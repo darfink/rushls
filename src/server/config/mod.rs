@@ -569,10 +569,10 @@ pub struct HttpAuthAppConfig {
         value_parser = humantime::parse_duration,
         serde(use_value_parser)
     )]
-    request_timeout: Duration,
+    timeout: Duration,
     /// Largest decision this node will read.
     #[conf(parameter, long, env, default_value = "64KiB", serde(use_value_parser))]
-    maximum_response_bytes: ByteSize,
+    max_response_bytes: ByteSize,
     /// Bearer credential presented to the service.
     #[conf(parameter, env, secret)]
     token: Option<String>,
@@ -581,7 +581,7 @@ pub struct HttpAuthAppConfig {
     token_file: Option<PathBuf>,
     /// Path to a PEM certificate chain this node presents to the service.
     #[conf(parameter, long, env)]
-    client_certificate: Option<PathBuf>,
+    client_cert: Option<PathBuf>,
     /// Path to the PEM private key for that chain.
     #[conf(parameter, long, env)]
     client_key: Option<PathBuf>,
@@ -602,10 +602,10 @@ impl HttpAuthAppConfig {
         // A call allowed to outlive the admission deadline never gets to fail
         // on its own terms: the session times out first and reports a stage
         // rather than the service that did not answer.
-        if self.request_timeout >= admission_deadline {
+        if self.timeout >= admission_deadline {
             return Err(invalid(format!(
                 "the auth request timeout ({:?}) must be shorter than the admission deadline ({admission_deadline:?})",
-                self.request_timeout
+                self.timeout
             )));
         }
         let token = resolve_optional_text_secret(
@@ -628,24 +628,22 @@ impl HttpAuthAppConfig {
                     .map_err(|error| invalid(error.to_string()))?,
             },
             {
-                let limit = nonzero_bytes(
-                    "the maximum auth response size",
-                    self.maximum_response_bytes,
-                )?;
+                let limit =
+                    nonzero_bytes("the maximum auth response size", self.max_response_bytes)?;
                 let tls = OutboundTlsAppConfig {
-                    certificate: self.client_certificate.clone(),
+                    certificate: self.client_cert.clone(),
                     key: self.client_key.clone(),
                     ca: self.ca.clone(),
                 };
                 if tls.is_configured() {
                     let tls = tls.resolve("[auth.publish]")?;
-                    let built = tls.client(self.request_timeout, limit)?;
+                    let built = tls.client(self.timeout, limit)?;
                     // The watch lives as long as the resolved configuration,
                     // because dropping it stops rotations being noticed.
                     outbound_tls.push(tls);
                     built
                 } else {
-                    client.with_limits(self.request_timeout, limit)?
+                    client.with_limits(self.timeout, limit)?
                 }
             },
         ))
@@ -734,15 +732,15 @@ pub struct HookEndpointAppConfig {
     /// today cannot be sent an event type added after it.
     events: Vec<String>,
     /// Events held for this endpoint before the oldest is dropped.
-    #[serde(default = "default_queue_capacity")]
-    queue_capacity: usize,
+    #[serde(default = "default_queue_size")]
+    queue_size: usize,
     /// Distinct streams delivered at once. One request per stream is the
     /// ordering rule, so this is also the concurrency.
-    #[serde(default = "default_maximum_in_flight")]
-    maximum_in_flight: usize,
+    #[serde(default = "default_max_in_flight")]
+    max_in_flight: usize,
     /// Attempts per event, the first included.
-    #[serde(default = "default_maximum_attempts")]
-    maximum_attempts: u32,
+    #[serde(default = "default_max_attempts")]
+    max_attempts: u32,
     /// Bearer credential presented to this endpoint.
     token: Option<String>,
     /// Reads the bearer credential from a mounted secret instead.
@@ -750,22 +748,22 @@ pub struct HookEndpointAppConfig {
     signing_secret: Option<String>,
     signing_secret_file: Option<PathBuf>,
     /// Path to a PEM certificate chain this node presents to this endpoint.
-    client_certificate: Option<PathBuf>,
+    client_cert: Option<PathBuf>,
     /// Path to the PEM private key for that chain.
     client_key: Option<PathBuf>,
     /// Path to a PEM authority to trust instead of the platform store.
     ca: Option<PathBuf>,
 }
 
-fn default_queue_capacity() -> usize {
+fn default_queue_size() -> usize {
     1_000
 }
 
-fn default_maximum_in_flight() -> usize {
+fn default_max_in_flight() -> usize {
     8
 }
 
-fn default_maximum_attempts() -> u32 {
+fn default_max_attempts() -> u32 {
     5
 }
 
@@ -789,16 +787,16 @@ impl HookEndpointAppConfig {
             );
         }
         for (label, value) in [
-            ("queue_capacity", self.queue_capacity),
-            ("maximum_in_flight", self.maximum_in_flight),
+            ("queue_size", self.queue_size),
+            ("max_in_flight", self.max_in_flight),
         ] {
             if value == 0 {
                 return Err(invalid(format!("hook `{name}` sets {label} to zero")));
             }
         }
-        if self.maximum_attempts == 0 {
+        if self.max_attempts == 0 {
             return Err(invalid(format!(
-                "hook `{name}` sets maximum_attempts to zero, so nothing would be sent"
+                "hook `{name}` sets max_attempts to zero, so nothing would be sent"
             )));
         }
         let token = resolve_optional_text_secret(
@@ -821,7 +819,7 @@ impl HookEndpointAppConfig {
         // The material is held in `outbound_tls` for the same reason
         // admission's is: dropping it stops rotations being noticed.
         let tls = OutboundTlsAppConfig {
-            certificate: self.client_certificate.clone(),
+            certificate: self.client_cert.clone(),
             key: self.client_key.clone(),
             ca: self.ca.clone(),
         };
@@ -841,9 +839,9 @@ impl HookEndpointAppConfig {
             name: Arc::from(name),
             endpoint: Endpoint::parse(&self.url).map_err(|error| invalid(error.to_string()))?,
             events,
-            queue_capacity: self.queue_capacity,
-            maximum_in_flight: self.maximum_in_flight,
-            maximum_attempts: self.maximum_attempts,
+            queue_capacity: self.queue_size,
+            maximum_in_flight: self.max_in_flight,
+            maximum_attempts: self.max_attempts,
             bearer: token
                 .map(|token| BearerToken::new(&token))
                 .transpose()
@@ -900,12 +898,12 @@ impl OutboundTlsAppConfig {
             (None, None) => None,
             (Some(_), None) => {
                 return Err(invalid(format!(
-                    "{label} sets client_certificate without client_key"
+                    "{label} sets client_cert without client_key"
                 )));
             }
             (None, Some(_)) => {
                 return Err(invalid(format!(
-                    "{label} sets client_key without client_certificate"
+                    "{label} sets client_key without client_cert"
                 )));
             }
         };
@@ -1901,7 +1899,7 @@ pub struct SrtAppConfig {
         default_value = "aes256",
         serde(use_value_parser)
     )]
-    encryption_key_length: SrtKeyLengthValue,
+    encryption: SrtKeyLengthValue,
 }
 
 impl SrtAppConfig {
@@ -1926,9 +1924,7 @@ impl SrtAppConfig {
         node.srt.peer_idle_timeout = self.timeout;
         node.srt.encryption = passphrase
             .as_ref()
-            .map(|passphrase| {
-                SrtEncryption::new(passphrase.clone(), self.encryption_key_length.into())
-            })
+            .map(|passphrase| SrtEncryption::new(passphrase.clone(), self.encryption.into()))
             .transpose()
             .map_err(ConfigError::SrtEncryption)?;
         Ok(())
@@ -1969,8 +1965,8 @@ pub struct MoqAppConfig {
     /// Path to a PEM certificate chain, leaf first. Required when `listen` is
     /// on: WebTransport has no cleartext form.
     #[conf(parameter, long, env)]
-    certificate: Option<PathBuf>,
-    /// Path to a PEM private key. Required with `certificate` when `listen` is
+    cert: Option<PathBuf>,
+    /// Path to a PEM private key. Required with `cert` when `listen` is
     /// on.
     #[conf(parameter, long, env)]
     key: Option<PathBuf>,
@@ -2005,16 +2001,16 @@ impl MoqAppConfig {
         }
 
         if node.moq_address.is_some() {
-            let (certificate, key) = match (&self.certificate, &self.key) {
+            let (certificate, key) = match (&self.cert, &self.key) {
                 (Some(certificate), Some(key)) => (certificate.clone(), key.clone()),
                 (None, None) => {
                     return Err(invalid("a MOQ listener needs a certificate and key"));
                 }
                 (Some(_), None) => {
-                    return Err(invalid("[moq] sets certificate without key"));
+                    return Err(invalid("[moq] sets cert without key"));
                 }
                 (None, Some(_)) => {
-                    return Err(invalid("[moq] sets key without certificate"));
+                    return Err(invalid("[moq] sets key without cert"));
                 }
             };
             // handshake_timeout / maximum_pending_handshakes are unused by the
@@ -2036,15 +2032,15 @@ impl MoqAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct HlsAppConfig {
-    /// Publish I-frame playlists for CMAF video, using one frame per completed segment.
+    /// Publish keyframe playlists for fast seeking and scrubbing through CMAF video.
     #[conf(
         parameter,
         long,
         env,
         default_if_missing = "true",
-        default_value = "false"
+        default_value = "true"
     )]
-    iframe_playlists: bool,
+    scrubbing: bool,
     /// Preferred cadence and maximum admitted segment ceiling.
     #[conf(flatten, prefix)]
     segment: HlsSegmentConfig,
@@ -2188,7 +2184,7 @@ impl HlsAppConfig {
             ));
         }
         node.hls.timing.part_hold_back = self.hold_back;
-        node.hls.playlist.iframe_playlists = self.iframe_playlists;
+        node.hls.playlist.iframe_playlists = self.scrubbing;
         Ok(())
     }
 }
@@ -2262,10 +2258,10 @@ fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
 pub struct HttpAppConfig {
     /// Maximum established HTTP connections across all HTTP listeners.
     #[conf(parameter, long, env, default_value = "4096")]
-    maximum_connections: usize,
+    max_connections: usize,
     /// Maximum HTTP requests executing or streaming responses across all listeners.
     #[conf(parameter, long, env, default_value = "4096")]
-    maximum_requests: usize,
+    max_requests: usize,
 
     /// Address serving HLS and health probes, or `"off"` to serve HTTPS only.
     #[conf(
@@ -2291,8 +2287,8 @@ impl HttpAppConfig {
     fn resolve(&self) -> Result<HttpConfig, ConfigError> {
         let config = HttpConfig {
             limits: crate::server::http::HttpLimits {
-                maximum_connections: self.maximum_connections,
-                maximum_requests: self.maximum_requests,
+                maximum_connections: self.max_connections,
+                maximum_requests: self.max_requests,
             },
             cors: self.cors.resolve()?,
             tls: self.tls.as_ref().map(TlsAppConfig::resolve).transpose()?,
@@ -2303,6 +2299,24 @@ impl HttpAppConfig {
         };
         config.validate().map_err(invalid)?;
         Ok(config)
+    }
+}
+
+/// File input is a list; shell input uses a comma-separated value.
+/// Keep validation in resolution so all sources report the same invalid-name error.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(transparent)]
+struct HeaderNames(Vec<String>);
+
+impl FromStr for HeaderNames {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(if value.trim().is_empty() {
+            Vec::new()
+        } else {
+            value.split(',').map(str::to_owned).collect()
+        }))
     }
 }
 
@@ -2320,18 +2334,19 @@ pub struct CorsAppConfig {
         default_help_str = "*"
     )]
     origins: OriginsValue,
-    /// Comma-separated response header names visible to cross-origin players.
-    /// Replaces the default list; an empty string exposes only browser-safelisted headers.
+    /// Response header names visible to cross-origin players.
+    /// TOML uses an array; CLI and environment values use comma-separated names.
+    /// Replaces the default list; an empty list exposes only browser-safelisted headers.
     #[conf(
         parameter,
         long,
         env,
         default_value = "content-length,content-range,date"
     )]
-    expose_headers: String,
+    expose_headers: HeaderNames,
     /// Permit cookies or browser authorization on cross-origin requests.
     #[conf(parameter, long, env, default_value = "false")]
-    allow_credentials: bool,
+    credentials: bool,
     /// How long browsers may cache a successful CORS preflight.
     #[conf(
         parameter,
@@ -2348,21 +2363,19 @@ impl CorsAppConfig {
     fn resolve(&self) -> Result<CorsConfig, ConfigError> {
         Ok(CorsConfig {
             allowed_origins: self.origins.resolve()?,
-            expose_headers: if self.expose_headers.trim().is_empty() {
-                Vec::new()
-            } else {
-                self.expose_headers
-                    .split(',')
-                    .map(|name| {
-                        name.trim().parse().map_err(|_| {
-                            invalid(format!(
-                                "http.cors.expose_headers contains an invalid header name: {name:?}"
-                            ))
-                        })
+            expose_headers: self
+                .expose_headers
+                .0
+                .iter()
+                .map(|name| {
+                    name.trim().parse().map_err(|_| {
+                        invalid(format!(
+                            "http.cors.expose_headers contains an invalid header name: {name:?}"
+                        ))
                     })
-                    .collect::<Result<Vec<_>, _>>()?
-            },
-            allow_credentials: self.allow_credentials,
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            allow_credentials: self.credentials,
             max_age: self.max_age,
         })
     }
@@ -2376,7 +2389,7 @@ pub struct TlsAppConfig {
     listen: SocketAddr,
     /// Path to a PEM certificate chain, leaf first.
     #[conf(parameter, long, env)]
-    certificate: PathBuf,
+    cert: PathBuf,
     /// Path to a PEM private key.
     #[conf(parameter, long, env)]
     key: PathBuf,
@@ -2401,24 +2414,24 @@ pub struct TlsAppConfig {
     /// peer can impose is the product of the two, so tightening one while
     /// leaving the other untouched buys less than it appears to.
     #[conf(parameter, long, env, default_value = "256")]
-    maximum_pending_handshakes: usize,
+    max_handshakes: usize,
 }
 
 impl TlsAppConfig {
     fn resolve(&self) -> Result<TlsSettings, ConfigError> {
-        if self.maximum_pending_handshakes == 0 {
+        if self.max_handshakes == 0 {
             return Err(ConfigError::Invalid(
-                "http.tls.maximum_pending_handshakes must be at least one, or no \
+                "http.tls.max_handshakes must be at least one, or no \
                  TLS connection can be admitted"
                     .to_owned(),
             ));
         }
 
         Ok(TlsSettings {
-            certificate: self.certificate.clone(),
+            certificate: self.cert.clone(),
             key: self.key.clone(),
             handshake_timeout: self.handshake_timeout,
-            maximum_pending_handshakes: self.maximum_pending_handshakes,
+            maximum_pending_handshakes: self.max_handshakes,
         })
     }
 }

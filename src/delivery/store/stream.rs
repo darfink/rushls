@@ -515,6 +515,7 @@ impl LiveStream {
                 is_default: rendition.descriptor.is_default,
                 declared_bandwidth: rendition.descriptor.declared_bandwidth,
                 bandwidth: rendition.bitrate.snapshot().advertised(),
+                iframe_bandwidth: rendition.iframe_bitrate.snapshot().advertised(),
                 view: Arc::clone(rendition.view()),
             })
             .collect::<Vec<_>>()
@@ -551,6 +552,7 @@ impl LiveStream {
         for rendition in &mut state.renditions {
             rendition.finish_open_as_gap(now, retention);
             rendition.bitrate.break_contiguity();
+            rendition.iframe_bitrate.break_contiguity();
             rendition.active_config = None;
             rendition.active = false;
             rendition.current_initialization = None;
@@ -840,7 +842,13 @@ impl LiveStream {
         // render must not cache bytes that this write is about to displace.
         self.memory
             .set_media(state.retained_payload_bytes.saturating_add(additional));
-        let advertised_before = state.renditions[index].bitrate.snapshot().advertised();
+        let advertised_before = (
+            state.renditions[index].bitrate.snapshot().advertised(),
+            state.renditions[index]
+                .iframe_bitrate
+                .snapshot()
+                .advertised(),
+        );
         let completes_media = matches!(
             &media,
             PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_)
@@ -853,7 +861,13 @@ impl LiveStream {
         state.pending_observation = Some((rendition_id, observation));
         state.renditions[index].forget_unreachable_initializations();
         state.recalculate_retained_bytes();
-        let advertised_after = state.renditions[index].bitrate.snapshot().advertised();
+        let advertised_after = (
+            state.renditions[index].bitrate.snapshot().advertised(),
+            state.renditions[index]
+                .iframe_bitrate
+                .snapshot()
+                .advertised(),
+        );
         let update = state.renditions[index].commit(false);
         // Pruning can move Vec indices, so it belongs after the indexed write.
         let retired_changed = state.prune_retired(now, self.limits, self.disk_capacity);

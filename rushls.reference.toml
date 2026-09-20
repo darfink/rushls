@@ -2,6 +2,8 @@
 #
 # Uncommented lines are what a public origin should set. Commented lines are
 # the rest of the surface, shown at their default or with an example value.
+# Names use max_* for upper limits, *_bytes for byte counts, and *_file for
+# secret files. Service tables use timeout; TLS paths use cert and key.
 # Every table is optional; omit one to take the compiled default, which is
 # permissive: open publish, no stream cap, media as fast as the link allows.
 
@@ -38,32 +40,34 @@ timeout = "5s"                           # idle limit for a peer; must exceed la
 # timeout     = "10s"                    # idle limit for an established session;
 #                                        # SETUP/CONNECT gets a tighter one. "off"
 #                                        # on a trusted link only
-# certificate = "/etc/rushls/tls/fullchain.pem"
+# cert        = "/etc/rushls/tls/fullchain.pem"
 # key         = "/etc/rushls/tls/private-key.pem"
 
 [http]
-listen     = "[::]:8080"                 # "off" to serve HTTPS only
-public_url = ""                          # empty = relative playlist URLs
-maximum_connections = 4096               # shared across HTTP, HTTPS and metrics binds
-maximum_requests = 4096                  # includes blocked reloads and response bodies
+listen          = "[::]:8080"                 # "off" to serve HTTPS only
+public_url      = ""                          # empty = relative playlist URLs
+max_connections = 4096                   # shared across HTTP, HTTPS and metrics binds
+max_requests    = 4096                   # includes blocked reloads and response bodies
 
 [http.cors]
 origins           = ["https://player.example.com"]
 # origins        = ["https://*.example.com"]    # one label, like a TLS wildcard
 # origins        = ["https://**.example.com"]   # any depth, only where you own the subtree
-# origins        = "*"                          # any origin; incompatible with allow_credentials = true
+# origins        = "*"                          # any origin; incompatible with credentials = true
 # origins        = "off"                        # no CORS headers, same-origin players only
-allow_credentials = false                # true requires an explicit origins list, never "*"
+credentials       = false                # true requires an explicit origins list, never "*"
 max_age           = "10min"
-# Replaces the full exposure list. Use an empty string for browser-safelisted headers only.
-expose_headers    = "content-length,content-range,date"
+# Replaces the full exposure list. Use [] for browser-safelisted headers only.
+expose_headers    = ["content-length", "content-range", "date"]
 
 # HTTPS listener, independent of the cleartext one above. Comment out the whole
 # table to serve cleartext only, which is usual behind a proxy that ends TLS.
 # [http.tls]
 # listen      = "[::]:8443"
-# certificate = "/etc/rushls/tls/fullchain.pem"
+# cert        = "/etc/rushls/tls/fullchain.pem"
 # key         = "/etc/rushls/tls/private-key.pem"
+# handshake_timeout = "5s"
+# max_handshakes = 256                    # concurrent pending TLS handshakes
 
 # Who may publish. Omit this table and anyone may. Do not omit it on the
 # internet. Each publisher is checked once, when it connects.
@@ -74,10 +78,11 @@ url = "http://auth.example.internal/v1/publish/admit"
 # This service may widen what this node accepts, so it is trusted. On an
 # untrusted network, prove the origin to it and pin the issuer in return.
 # Certificates reload in place on rotation, as the TLS listener's do.
-# client_certificate = "/etc/rushls/auth/client.pem"
-# client_key         = "/etc/rushls/auth/client-key.pem"
-# ca                 = "/etc/rushls/auth/ca.pem"   # pin the service's issuer
-# maximum_response_bytes = "64KiB"       # largest decision this node will read
+# client_cert = "/etc/rushls/auth/client.pem"
+# client_key  = "/etc/rushls/auth/client-key.pem"
+# ca          = "/etc/rushls/auth/ca.pem"   # pin the service's issuer
+# timeout = "2s"                         # entire admission request, including connection
+# max_response_bytes = "64KiB"           # largest decision this node will read
 
 # Who may watch. Omit this table and anyone with the URL may. Viewers present a
 # JWT, which is verified locally: no request leaves this node per playlist
@@ -130,8 +135,8 @@ tracks = { max = 8 }
 # audio = { channels = { max = 6 } }
 
 [hls]
-# Optional scrubbing playlists for CMAF video. Compatible with live LL-HLS.
-iframe_playlists = false                 # index all keyframes in completed segments
+# Scrubbing playlists for CMAF video. Compatible with live LL-HLS; false disables them.
+scrubbing = true                        # index all keyframes in completed segments
 segment = { target = "6s", max = "2x", jitter = "0s" }
 part    = { target = "1s", max = "2x" }
 # max and jitter accept durations or multiples of their configured target.
@@ -150,21 +155,19 @@ streams           = 256                  # live, plus those still held by retain
 memory_per_stream = "256MiB"             # retained media and cached manifests
                                          # excludes in-flight overhead and the minimum live-window exception
                                          # plus a fixed per-publisher pipeline cost while ingesting
-# memory_per_publisher = "128MiB"        # not yet implemented; today the pipeline cost is a
-                                         # compiled per-publisher ceiling, reported per session
-                                         # as rushls_session_pipeline_capacity_bytes
+# Pipeline capacity is reported as rushls_session_pipeline_capacity_bytes.
 # disk_per_stream = "8GiB"               # older media spills here; omit to stay in memory
                                          # disk-backed: 1/8 RAM for manifests; media spills at 81.25% down to 75%
 # dir             = "/var/lib/rushls"    # optional; default is the platform cache (.../rushls/dvr)
 
 # Write a copy of every segment to a filesystem. Outlives the stream and is
-# never served by this origin, so it is unrelated to retain. For sending
-# segments elsewhere requires the future payload-hook feature; this table is local only.
+# never served by this origin, so it is unrelated to retain.
+# Segment hooks provide fetchable resource paths for remote consumers.
 # [record]
 # dir     = "/archive"
 # pattern = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
-# queue_capacity = 128
-# maximum_pending_bytes = 268435456
+# queue_size = 128
+# max_pending_bytes = 268435456
 # Completed segments only, never parts. Each file carries its own header, so it
 # contains its decoder configuration. Source random access and codec preroll
 # still apply. Final filenames appear only after all bytes are written.
@@ -180,6 +183,9 @@ listen = "127.0.0.1:9090"
 
 # [hook.automation]
 # url        = "http://automation.example.internal/rushls"
+# queue_size = 1000                       # queued events per destination
+# max_in_flight = 8                       # concurrent deliveries
+# max_attempts = 5                        # total attempts, including the first
 # events     = ["session.started", "stream.available", "stream.unavailable", "session.degraded", "session.recovered", "session.ended"]
 # token_file = "/run/secrets/rushls-webhook-token"
 # token      = "${WEBHOOK_TOKEN}"        # inline form; prefer token_file
@@ -189,9 +195,9 @@ listen = "127.0.0.1:9090"
 # issuer in return. Same three fields as [auth.publish], and the same reload
 # behaviour: certificates rotate in place. A hook setting any of these gets a
 # connection pool of its own, so only the ones that ask pay for it.
-# client_certificate = "/etc/rushls/hooks/client.pem"
-# client_key         = "/etc/rushls/hooks/client-key.pem"
-# ca                 = "/etc/rushls/hooks/ca.pem"
+# client_cert = "/etc/rushls/hooks/client.pem"
+# client_key  = "/etc/rushls/hooks/client-key.pem"
+# ca          = "/etc/rushls/hooks/ca.pem"
 
 # [hook.billing]
 # url    = "http://billing.example.internal/rushls"

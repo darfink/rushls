@@ -25,8 +25,9 @@ pub fn ranges<'a>(
     }
     let mut frames = Vec::new();
     let mut base = 0u64;
+    let mut origin = None;
     for (bytes, start) in chunks {
-        let Some(mut indexed) = chunk_ranges(bytes, start, base) else {
+        let Some(mut indexed) = chunk_ranges(bytes, start, base, &mut origin) else {
             return [].into();
         };
         frames.append(&mut indexed);
@@ -49,9 +50,13 @@ pub fn ranges<'a>(
     frames.into()
 }
 
-fn chunk_ranges(bytes: &[u8], start: i64, base: u64) -> Option<Vec<IFrameRange>> {
+fn chunk_ranges(
+    bytes: &[u8],
+    start: i64,
+    base: u64,
+    origin: &mut Option<i64>,
+) -> Option<Vec<IFrameRange>> {
     let mut offset = 0;
-    let mut origin = None;
     let mut frames = Vec::new();
     while offset < bytes.len() {
         let (atom, size) = transmux::parse_box(bytes.get(offset..)?).ok()?;
@@ -66,14 +71,16 @@ fn chunk_ranges(bytes: &[u8], start: i64, base: u64) -> Option<Vec<IFrameRange>>
                 .checked_add(i64::from(
                     sample.sample_composition_time_offset.unwrap_or(0),
                 ))?;
-            let first = *origin.get_or_insert(pts);
+            // Parts can open on reordered pictures. Keep one composition
+            // origin for the whole parent rather than rebasing each part.
+            let first = *origin.get_or_insert(pts.checked_sub(start)?);
             if let Some(length) =
                 prefix_len(MediaKind::Video, MediaSegmentFormat::Cmaf, &bytes[offset..])
             {
                 frames.push(IFrameRange {
                     offset: base.checked_add(u64::try_from(offset).ok()?)?,
                     length,
-                    start: u64::try_from(start.checked_add(pts.checked_sub(first)?)?).ok()?,
+                    start: u64::try_from(pts.checked_sub(first)?).ok()?,
                 });
             }
         }
@@ -174,6 +181,30 @@ mod tests {
             assert_eq!(&bytes[start + 4..start + 8], b"moof");
             assert_eq!(&bytes[end - H264_IDR.len()..end], H264_IDR);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reordered_part_openers_do_not_shift_later_keyframes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::delivery::hls::fixtures::cmaf_fragment_at;
+        let first = cmaf_fragment_at(true, 100, 2)?;
+        let dependent = cmaf_fragment_at(false, 102, 3)?;
+        let key = cmaf_fragment_at(true, 106, 0)?;
+        let mut second = dependent.as_bytes().to_vec();
+        second.extend_from_slice(key.as_bytes());
+        let frames = ranges(
+            MediaKind::Video,
+            MediaSegmentFormat::Cmaf,
+            [(first.as_bytes(), 0), (second.as_slice(), 2)].into_iter(),
+            6,
+        );
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].start, 0);
+        assert_eq!(
+            frames[1].start, 4,
+            "composition time is relative to the first picture, not the part opener"
+        );
         Ok(())
     }
 
