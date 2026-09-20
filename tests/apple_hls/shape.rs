@@ -17,10 +17,10 @@
 //! track id, which is exactly what a second language track would look like to
 //! everything downstream of discovery.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use rushls::{
-    domain::{Appender, BoxFuture, DiscoveredTrack, MediaKind, TrackCatalog, TrackId},
+    domain::{Appender, BoxFuture, DiscoveredTrack, MediaKind, Timebase, TrackCatalog, TrackId},
     observe::SourceMeters,
     source::{
         AcceptedPublish, DiscoveryLimits, DiscoveryReport, InputState, Packet, PacketSource,
@@ -35,6 +35,8 @@ use rushls::admission::{PublishGrant, PublishRequest};
 pub struct Shape {
     /// Kinds to drop entirely. Used for audio-only and video-only cases.
     pub drop: Vec<MediaKind>,
+    /// Remove one packet per selected track after 2.44 seconds, before normalization.
+    pub holes: Vec<MediaKind>,
     /// Extra language tags to duplicate the first subtitle track under.
     ///
     /// The original keeps its own language; one clone is added per entry.
@@ -73,6 +75,7 @@ impl Shape {
 
     fn is_identity(&self) -> bool {
         self.drop.is_empty()
+            && self.holes.is_empty()
             && self.extra_subtitle_languages.is_empty()
             && self.extra_audio_languages.is_empty()
             && !self.label_languages
@@ -106,6 +109,7 @@ impl PendingPublish for ShapedPublish {
                 shape: self.shape,
                 clones: Vec::new(),
                 dropped: Vec::new(),
+                holes: BTreeMap::new(),
             });
             Ok(accepted)
         })
@@ -125,6 +129,7 @@ struct ShapedSource {
     /// `(source track, clone track)` pairs, applied to every packet.
     clones: Vec<(TrackId, TrackId)>,
     dropped: Vec<TrackId>,
+    holes: BTreeMap<TrackId, (MediaKind, Timebase, Option<i64>, bool)>,
 }
 
 impl PacketSource for ShapedSource {
@@ -145,6 +150,13 @@ impl PacketSource for ShapedSource {
                 .map(|track| track.id)
                 .collect();
             tracks.retain(|track| !self.shape.drop.contains(&track.kind()));
+
+            for track in &tracks {
+                if self.shape.holes.contains(&track.kind()) {
+                    self.holes
+                        .insert(track.id, (track.kind(), track.timebase, None, false));
+                }
+            }
 
             // Clone before labelling so a clone's explicit language is not
             // overwritten by the "first audio is English" default below.
@@ -193,7 +205,7 @@ impl PacketSource for ShapedSource {
         out: &'a mut dyn Appender<Packet>,
     ) -> BoxFuture<'a, Result<InputState, SourceError>> {
         Box::pin(async move {
-            if self.clones.is_empty() && self.dropped.is_empty() {
+            if self.clones.is_empty() && self.dropped.is_empty() && self.holes.is_empty() {
                 return self.inner.fill(out).await;
             }
             // Buffered because a packet has to be seen before it can be
@@ -203,6 +215,21 @@ impl PacketSource for ShapedSource {
             for packet in batch {
                 if self.dropped.contains(&packet.track_id) {
                     continue;
+                }
+                if let Some((kind, clock, first, removed)) = self.holes.get_mut(&packet.track_id) {
+                    let pts = packet.pts.expect("fixture supplies PTS");
+                    let origin = *first.get_or_insert(pts);
+                    if !*removed
+                        && clock.ticks_to_duration(pts.abs_diff(origin))
+                            >= Duration::from_millis(2440)
+                    {
+                        assert!(
+                            !packet.random_access || *kind == MediaKind::Audio,
+                            "video loss must remove a dependent picture"
+                        );
+                        *removed = true;
+                        continue;
+                    }
                 }
                 for (source, clone) in &self.clones {
                     if packet.track_id == *source {

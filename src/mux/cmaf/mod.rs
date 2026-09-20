@@ -215,6 +215,11 @@ impl CmafTrack {
             });
         }
         let (pts, dts, presented) = self.rebase_sample(sample)?;
+        // A verified video restart ends dependencies across the missing interval.
+        // Audio packet sync flags do not provide the same decoder guarantee.
+        if self.kind == MediaKind::Video && sample.random_access() {
+            self.after_gap = false;
+        }
         let presented_pts = presented
             .start
             .checked_sub(self.plan.presentation_origin_pts)
@@ -2801,6 +2806,59 @@ mod tests {
             [PackagedMedia::Initialization(_), PackagedMedia::Chunk(chunk)]
                 if chunk.media_start == 0 && chunk.duration == FRAME
         ));
+    }
+
+    #[test]
+    fn video_parts_regain_independence_at_idr_after_gap() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let timebase = Timebase::new(nz::u32!(1), nz::u32!(16_384));
+        let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())?;
+        let mut mux = started(
+            &input,
+            vec![
+                PlanBuilder::new(0, timebase, nz::u64!(65_536))
+                    .part(nz::u32!(2), nz::u64!(16_384))
+                    .build(),
+            ],
+            &discarded_events(),
+        );
+        let frame_ticks = i64::try_from(FRAME)?;
+        let mut out = Vec::new();
+        mux.muxer.push(sample(0, true), &mut out)?;
+        mux.muxer.push(
+            NormalizedMedia::Gap(crate::media::MissingInterval {
+                track_id: TrackId(0),
+                media_kind: MediaKind::Video,
+                start: i64::try_from(FRAME)?,
+                end: i64::try_from(2 * FRAME)?,
+                timebase,
+            }),
+            &mut out,
+        )?;
+        for frame in 2..8 {
+            mux.muxer
+                .push(sample(frame * i64::try_from(FRAME)?, frame == 4), &mut out)?;
+        }
+        mux.muxer
+            .finish(crate::mux::FinishReason::Final, &mut out)?;
+        let parts: Vec<_> = out
+            .iter()
+            .filter_map(|m| match m {
+                PackagedMedia::Chunk(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        let resumed = parts
+            .iter()
+            .find(|p| p.media_start == 2 * frame_ticks)
+            .expect("resumed part");
+        assert!(!resumed.independent);
+        assert!(
+            parts
+                .iter()
+                .any(|p| p.media_start >= 4 * frame_ticks && p.independent)
+        );
+        Ok(())
     }
 
     #[test]

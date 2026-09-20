@@ -107,6 +107,9 @@ def main():
     parser.add_argument('--browser', choices=('safari', 'chrome'), default='safari')
     parser.add_argument('--modes', nargs='+', choices=('native', 'hls.js'))
     parser.add_argument('--start', type=float, action='append', help='Explicit start position; repeat for multiple positions')
+    parser.add_argument('--seek-at', type=float, help='Seek after playback reaches this position')
+    parser.add_argument('--seek-to', type=float, help='Target for --seek-at')
+    parser.add_argument('--expect-premature-end', action='store_true', help='Track a known failure; require playback to advance and end before the advertised endpoint')
     parser.add_argument('--repeat', type=int, default=1)
     parser.add_argument('--hls-config', type=json.loads, default={})
     parser.add_argument('--output', type=Path, required=True)
@@ -114,6 +117,8 @@ def main():
     parser.add_argument('--deadline', type=float, default=12)
     parser.add_argument('--playlist', default='index.m3u8')
     args = parser.parse_args()
+    if (args.seek_at is None) != (args.seek_to is None):
+        parser.error('--seek-at and --seek-to must be provided together')
     if args.video:
         PAGE = PAGE.replace(b'<audio id="video" controls></audio>', b'<video id="video" controls width="640" muted></video>')
         PAGE = PAGE.replace(b" const record=(event)", b""" result.frames=[];
@@ -164,14 +169,25 @@ def main():
                         command(base, '/element/' + next(iter(element.values())) + '/click', {})
                         command(base, '/execute/sync', {'script': "document.querySelector('#start').click()", 'args': []})
                     started = time.monotonic()
+                    playback_started = None
+                    seek_performed = False
                     while True:
                         time.sleep(.25)
                         state = command(base, '/execute/sync', {'script': 'return snapshot()', 'args': []})
-                        if state['ended'] or state.get('fatal') or state.get('error') or time.monotonic() - started >= args.deadline:
+                        if playback_started is None and not state['paused']:
+                            playback_started = time.monotonic()
+                        if args.seek_at is not None and not seek_performed and state['time'] >= args.seek_at:
+                            command(base, '/execute/sync', {'script': "document.querySelector('#video').currentTime=arguments[0]", 'args': [args.seek_to]})
+                            seek_performed = True
+                        budget_start = playback_started if playback_started is not None else started
+                        budget = args.deadline if playback_started is not None else max(60, args.deadline)
+                        if state['ended'] or state.get('fatal') or state.get('error') or time.monotonic() - budget_start >= budget:
                             break
                     expected_end = sum(float(line.split(':')[1].split(',')[0]) for line in timeline.read_text().splitlines() if line.startswith('#EXTINF:'))
                     state.update(expected_end=expected_end, fixture=playlist.parent.name, seek=seek, attempt=attempt, browser=args.browser, elapsed=time.monotonic()-started,
-                                 ok=state['time'] >= expected_end - .08 and state['time'] > seek + .1 and any(event['event'] == 'playing' for event in state['events']) and not state.get('fatal') and not state.get('error'))
+                                 ok=state['ended'] and state['time'] >= expected_end - .08 and state['time'] > seek + .1 and any(event['event'] == 'playing' for event in state['events']) and not state.get('fatal') and not state.get('error'))
+                    state['seek_performed'] = seek_performed
+                    state['ok'] = state['ok'] and (args.seek_at is None or seek_performed)
                     if args.video:
                         frames = state.get('frames', [])
                         state['presented_frames'] = len(frames)
@@ -180,8 +196,14 @@ def main():
                     state['requests'] = server.requests[requests_start:]
                     state['classification'] = ('passed' if state['ok'] else
                         'playback_permission_denied' if 'NotAllowedError' in str(state.get('fatal')) else
+                        'startup_inconclusive' if not any(event['time'] > seek + .1 for event in state['events']) and state['time'] <= seek + .1 else
                         'paused_before_end' if state['paused'] and not state['ended'] else
                         'playback_failed')
+                    state['expected_failure'] = args.expect_premature_end
+                    state['expectation_met'] = state['ok'] if not args.expect_premature_end else (
+                        state['ended'] and state['time'] > seek + .5
+                        and state['time'] < expected_end - .5
+                        and not state.get('fatal') and not state.get('error'))
                     results.append(state)
                     args.output.write_text(json.dumps(results, indent=2))
                     print(json.dumps(state), flush=True)
@@ -189,7 +211,7 @@ def main():
         server.shutdown()
         if not args.session:
             command(base, '', method='DELETE')
-    return int(not results or any(not result['ok'] for result in results))
+    return int(not results or any(not result['expectation_met'] for result in results))
 
 
 if __name__ == '__main__':

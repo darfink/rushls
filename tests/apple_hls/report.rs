@@ -165,7 +165,7 @@ pub enum Verdict {
     Defect,
     /// True of this origin, but a deliberate scope decision rather than a bug.
     /// Printed on every run so the gap stays visible; never fails.
-    Gap(&'static str),
+    CompatibilityException(&'static str),
     /// An artefact of how the test publishes or is served, not of the origin.
     NotApplicable(&'static str),
 }
@@ -217,7 +217,7 @@ const PACKAGER_DUTIES: [&str; 18] = [
 
 /// Decides what a finding means for the case that produced it.
 ///
-/// Unrecognised findings are [`Verdict::Gap`] rather than [`Verdict::Defect`]:
+/// Unrecognised findings are [`Verdict::CompatibilityException`] rather than [`Verdict::Defect`]:
 /// Apple ships new authoring rules between tool releases, and a rule nobody has
 /// read yet should make a run noisy rather than red. `RUSHLS_TEST_HLSREPORT`
 /// set to `strict` promotes every unrecognised authoring finding to a defect,
@@ -312,7 +312,9 @@ fn conditional(title: &str, scopes: &str, expect: &Expect) -> Option<Verdict> {
         .any(|needle| title.contains(needle))
     {
         return Some(if expect.ladder {
-            Verdict::Gap("what to encode is the publisher's choice, not this origin's")
+            Verdict::CompatibilityException(
+                "what to encode is the publisher's choice, not this origin's",
+            )
         } else {
             Verdict::NotApplicable("the case deliberately publishes one encoding")
         });
@@ -332,7 +334,7 @@ fn conditional(title: &str, scopes: &str, expect: &Expect) -> Option<Verdict> {
     if title.contains("mime type") {
         return Some(
             if scopes.contains("subtitle") && !scopes.contains("audio") {
-                Verdict::Gap(
+                Verdict::CompatibilityException(
                     "hlsreport expects text/plain for WebVTT; Apple's own table says text/vtt",
                 )
             } else {
@@ -387,19 +389,21 @@ fn unimplemented_feature(title: &str) -> Option<Verdict> {
     } else {
         return None;
     };
-    Some(Verdict::Gap(reason))
+    Some(Verdict::CompatibilityException(reason))
 }
 
 fn unrecognised(finding: &Finding) -> Verdict {
     if finding.level == Level::NotChecked {
-        return Verdict::Gap("Apple performed no validation for this requirement");
+        return Verdict::CompatibilityException(
+            "Apple performed no validation for this requirement",
+        );
     }
     match finding.source {
         // Specification conformance: unrecognised means unreviewed, and this
         // origin is answerable for the whole document.
         Source::Validator => Verdict::Defect,
         Source::Authoring if authoring_mode() == AuthoringMode::Strict => Verdict::Defect,
-        Source::Authoring => Verdict::Gap("unclassified authoring finding"),
+        Source::Authoring => Verdict::CompatibilityException("unclassified authoring finding"),
     }
 }
 
@@ -462,13 +466,19 @@ impl Judgement {
             text.push_str("no findings\n");
             return text;
         }
-        for wanted in [Label::Defect, Label::Gap, Label::NotApplicable] {
+        for wanted in [
+            Label::Defect,
+            Label::CompatibilityException,
+            Label::NotApplicable,
+        ] {
             for (finding, verdict) in &self.findings {
                 if Label::of(verdict) != wanted {
                     continue;
                 }
                 let reason = match verdict {
-                    Verdict::Gap(reason) | Verdict::NotApplicable(reason) => format!(" — {reason}"),
+                    Verdict::CompatibilityException(reason) | Verdict::NotApplicable(reason) => {
+                        format!(" — {reason}")
+                    }
                     Verdict::Defect => String::new(),
                 };
                 let _ = writeln!(
@@ -487,7 +497,7 @@ impl Judgement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Label {
     Defect,
-    Gap,
+    CompatibilityException,
     NotApplicable,
 }
 
@@ -495,7 +505,7 @@ impl Label {
     fn of(verdict: &Verdict) -> Self {
         match verdict {
             Verdict::Defect => Self::Defect,
-            Verdict::Gap(_) => Self::Gap,
+            Verdict::CompatibilityException(_) => Self::CompatibilityException,
             Verdict::NotApplicable(_) => Self::NotApplicable,
         }
     }
@@ -503,7 +513,7 @@ impl Label {
     fn text(self) -> &'static str {
         match self {
             Self::Defect => "DEFECT",
-            Self::Gap => "GAP",
+            Self::CompatibilityException => "COMPATIBILITY EXCEPTION",
             Self::NotApplicable => "N/A",
         }
     }
@@ -674,7 +684,7 @@ mod tests {
         };
         assert!(matches!(
             judge(&finding, &Expect::default()),
-            Verdict::Gap(_)
+            Verdict::CompatibilityException(_)
         ));
         finding.title =
             "Partial segments that contain a sync frame SHOULD be marked INDEPENDENT".into();

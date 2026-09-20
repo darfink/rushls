@@ -95,3 +95,5 @@ Safari video-only continuation and some hls.js startup or completion cases remai
 See [video validation](video-gap-validation.md) and [audio validation](audio-gap-validation.md) for measured results.
 HEVC, AV1, and reordered-video GAP recovery remain unsupported.
 Use strict mode when accepting missing input is inappropriate.
+
+See [GAP regressions](gap-regressions.md) for packaging and browser checks.

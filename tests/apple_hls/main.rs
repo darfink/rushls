@@ -15,6 +15,7 @@
 //! A case with no such comment is not pulling its weight.
 
 mod certs;
+mod export;
 mod flv;
 mod harness;
 mod observe;
@@ -582,6 +583,90 @@ async fn dump_playlists() -> TestResult {
         );
         for (uri, playlist) in origin.media_playlists()? {
             eprintln!("--- {uri} ---\n{playlist}");
+        }
+    }
+    Ok(())
+}
+
+// Matched controls retain identical encoded input; loss occurs before normalization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gap_audio_only_with_control() -> TestResult {
+    gap_case(
+        "gap_audio_only",
+        vec![MediaKind::Audio],
+        Some(MediaKind::Video),
+    )
+    .await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gap_video_with_audio_control() -> TestResult {
+    gap_case("gap_video_with_audio", vec![MediaKind::Video], None).await
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gap_overlapping_av_with_control() -> TestResult {
+    gap_case(
+        "gap_overlapping_av",
+        vec![MediaKind::Video, MediaKind::Audio],
+        None,
+    )
+    .await
+}
+
+// Packaging remains testable even though native Safari continuation is a known failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gap_video_only_with_control() -> TestResult {
+    gap_case(
+        "gap_video_only",
+        vec![MediaKind::Video],
+        Some(MediaKind::Audio),
+    )
+    .await
+}
+
+async fn gap_case(
+    name: &'static str,
+    holes: Vec<MediaKind>,
+    drop: Option<MediaKind>,
+) -> TestResult {
+    const FIXTURE: &[u8] = include_bytes!("fixtures/h264_fixed_aac.ts");
+    for damaged in [false, true] {
+        let setup = Setup::default().named(name).expect(|e| match drop {
+            Some(MediaKind::Video) => e.audio_only(),
+            Some(MediaKind::Audio) => e.video_only(),
+            _ => e,
+        });
+        let Some(origin) = harness::Origin::start_with(setup).await? else {
+            return Ok(());
+        };
+        let shape = Shape {
+            holes: if damaged { holes.clone() } else { Vec::new() },
+            drop: drop.into_iter().collect(),
+            ..Shape::labelled()
+        };
+        origin
+            .publish(publish::mpegts_shaped(FIXTURE, shape))
+            .await?;
+        assert!(origin.reported_failures().is_empty());
+        let playlists = origin.media_playlists()?;
+        let mut gap_count = 0;
+        for (_, playlist) in &playlists {
+            gap_count += playlist.matches("#EXT-X-GAP\n").count();
+            assert!(!playlist.contains("#EXT-X-DISCONTINUITY"));
+            assert!(playlist.contains("#EXT-X-ENDLIST"));
+            assert!(!playlist.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
+        }
+        assert_eq!(
+            gap_count,
+            if damaged { holes.len() } else { 0 },
+            "loss must reach publication, not merely make a permissive test pass"
+        );
+        origin.validate_playlist()?;
+        if let Some(directory) = std::env::var_os("RUSHLS_TEST_GAP_EXPORT_DIR") {
+            let case = format!("{name}{}", if damaged { "" } else { "-control" });
+            export::save(
+                origin.url(),
+                &std::path::PathBuf::from(directory).join(case),
+            )?;
         }
     }
     Ok(())
