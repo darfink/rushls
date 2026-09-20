@@ -246,17 +246,6 @@ impl AppConfig {
     ) -> Result<(Self, Option<PathBuf>), ConfigError> {
         let args: Vec<OsString> = args.into_iter().collect();
         let env: Vec<(OsString, OsString)> = env.into_iter().collect();
-        if let Some((name, _)) = env.iter().find(|(name, _)| {
-            name.to_str().is_some_and(|name| {
-                name == "RUSHLS_ACCEPT_MAXIMUM_TIMESTAMP_JUMP"
-                    || name.starts_with("RUSHLS_ACCEPT_AUDIO_RECOVERY_")
-            })
-        }) {
-            return Err(ConfigError::Invalid(format!(
-                "{} was removed; use RUSHLS_ACCEPT_INPUT_MODE=strict or permissive",
-                name.to_string_lossy()
-            )));
-        }
         let path = explicit_config_path(&args, &env).or_else(|| match search {
             paths::ConfigSearch::ExplicitOnly => None,
             paths::ConfigSearch::WellKnown => {
@@ -1060,9 +1049,9 @@ fn startup_warnings(node: &NodeConfig, open_admission: bool) -> Vec<String> {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct AcceptAppConfig {
-    /// How input timing violations are handled.
-    #[conf(parameter, long, env, default_value = "permissive")]
-    input_mode: crate::domain::InputMode,
+    /// Reject timing violations instead of accepting bounded, reported gaps.
+    #[conf(parameter, long, env, default_value = "false")]
+    strict: bool,
     /// Throttle applied to a publisher offering media faster than `pace`.
     ///
     /// Omit the table for no ceiling, which is the compiled default: a
@@ -1126,7 +1115,7 @@ impl AcceptAppConfig {
 
     fn base(&self) -> Result<StreamPolicy, ConfigError> {
         let policy = PolicyValue {
-            input_mode: Some(self.input_mode),
+            strict: Some(self.strict),
             ceiling: self.ceiling.as_ref().map(CeilingValue::from),
             floor: self.floor.as_ref().map(FloorValue::from),
             takeover: Some(self.takeover),
@@ -1580,7 +1569,7 @@ struct SubtitleAcceptValue {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyValue {
-    input_mode: Option<crate::domain::InputMode>,
+    strict: Option<bool>,
     ceiling: Option<CeilingValue>,
     floor: Option<FloorValue>,
     takeover: Option<bool>,
@@ -1590,10 +1579,18 @@ struct PolicyValue {
 }
 
 impl PolicyValue {
+    fn input_mode(&self) -> crate::domain::InputMode {
+        if self.strict.unwrap_or(false) {
+            crate::domain::InputMode::Strict
+        } else {
+            crate::domain::InputMode::Permissive
+        }
+    }
+
     fn resolve(&self, name: &str) -> Result<StreamPolicy, ConfigError> {
         let where_ = |error: String| invalid(format!("{name}: {error}"));
         let mut policy = StreamPolicy::permissive();
-        policy.input_mode = self.input_mode.unwrap_or_default();
+        policy.input_mode = self.input_mode();
 
         if let Some(ceiling) = &self.ceiling {
             let burst = match &ceiling.burst {

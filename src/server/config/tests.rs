@@ -2211,44 +2211,48 @@ fn invalid_cors_exposed_headers_stop_startup() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn input_modes_default_and_overrides() -> Result<(), Box<dyn Error>> {
+async fn strict_default_and_overrides() -> Result<(), Box<dyn Error>> {
     use crate::domain::InputMode;
     assert_eq!(
         default_policy(&resolve_toml("")??).await?.input_mode,
         InputMode::Permissive
     );
     assert_eq!(
-        default_policy(&resolve_toml("[accept]\ninput_mode = 'strict'")??)
+        default_policy(&resolve_toml("[accept]\nstrict = true")??)
             .await?
             .input_mode,
         InputMode::Strict
     );
     assert_eq!(
-        default_policy(&resolve_with("", &["--accept-input-mode", "strict"], &[])??)
+        default_policy(&resolve_with("", &["--accept-strict", "true"], &[])??)
             .await?
             .input_mode,
         InputMode::Strict
     );
     assert_eq!(
-        default_policy(&resolve_with_env(&[(
-            "RUSHLS_ACCEPT_INPUT_MODE",
-            "strict"
-        )])??)
-        .await?
-        .input_mode,
+        default_policy(&resolve_with_env(&[("RUSHLS_ACCEPT_STRICT", "true")])??)
+            .await?
+            .input_mode,
         InputMode::Strict
     );
     let named: super::PolicyValue = toml::from_str("")?;
     assert_eq!(named.resolve("named")?.input_mode, InputMode::Permissive);
-    assert!(resolve_toml("[accept]\ninput_mode = 'invalid'")?.is_err());
-    assert!(resolve_toml("[accept]\nmaximum_timestamp_jump = '2s'")?.is_err());
-    assert!(resolve_toml("[accept.audio_recovery]\nenabled = false")?.is_err());
-    for key in [
-        "RUSHLS_ACCEPT_MAXIMUM_TIMESTAMP_JUMP",
-        "RUSHLS_ACCEPT_AUDIO_RECOVERY_ENABLED",
-    ] {
-        assert!(resolve_with_env(&[(key, "1")])?.is_err());
-    }
-    assert!(resolve_with("", &["--accept-maximum-timestamp-jump", "2s"], &[])?.is_err());
+    assert_eq!(
+        toml::from_str::<super::PolicyValue>("strict = true")?
+            .resolve("named")?
+            .input_mode,
+        InputMode::Strict
+    );
+    assert_eq!(
+        default_policy(&resolve_with(
+            "[accept]\nstrict = true",
+            &["--accept-strict=false"],
+            &[]
+        )??)
+        .await?
+        .input_mode,
+        InputMode::Permissive
+    );
+    assert!(resolve_toml("[accept]\nstrict = 'invalid'")?.is_err());
     Ok(())
 }

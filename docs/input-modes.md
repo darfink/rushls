@@ -4,15 +4,14 @@ Rushls offers two input modes. Permissive mode is the default.
 
 ```toml
 [accept]
-input_mode = "permissive" # or "strict"
+strict = false # true rejects timing violations
 ```
 
-Use `--accept-input-mode strict` or `RUSHLS_ACCEPT_INPUT_MODE=strict` to override the file.
-Named `[accept.policy.NAME]` tables accept `input_mode`. Each named policy defaults independently to permissive.
-Resolved configuration includes the selected mode.
+Use `--accept-strict=true` or `RUSHLS_ACCEPT_STRICT=true` to override the file.
+Named `[accept.policy.NAME]` tables accept `strict`. Each named policy defaults independently to strict = false.
+Resolution translates the boolean to the internal timing policy.
 
-This unreleased configuration replaces `maximum_timestamp_jump` and all `audio_recovery` options.
-Rushls rejects the removed file, CLI, and environment options. Recovery limits are internal.
+Recovery limits are internal.
 
 ## Timing contracts
 

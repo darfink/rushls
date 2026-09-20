@@ -16,7 +16,7 @@ Activation does not establish seamless playback or CMAF conformance for damaged 
 
 ```toml
 [accept]
-input_mode = "permissive"
+strict = false
 ```
 
 Strict mode requires continuous audio within existing timestamp tolerance.

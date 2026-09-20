@@ -98,7 +98,7 @@ url = "http://auth.example.internal/v1/publish/admit"
 # tier = "premium"
 
 [accept]
-input_mode = "permissive"                     # strict rejects declared timing violations; permissive permits bounded compensation
+strict = false                     # strict rejects declared timing violations; permissive permits bounded compensation
 
 ceiling  = { pace = "1x", burst = "10s" }     # throttle: at most realtime, with a ten-second head start; omit burst for no head start, omit the table for no cap
 # floor    = { pace = "0.5x", window = "30s" }  # disconnect: below half realtime across any 30s window; omit for no floor

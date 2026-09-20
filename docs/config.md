@@ -30,7 +30,7 @@ opens. Three consequences:
 2. **Limits are a scavenger hunt.** Hardening an untrusted edge means touching
    six tables, and several caps have no "unlimited" form.
 3. **The file speaks pipeline.** `faster_than_realtime`, `maximum_lead`,
-   `input_mode`, `source_stall` vs `media_stall`,
+   `strict`, `source_stall` vs `media_stall`,
    `maximum_pending_publishers_per_listener`. These are internal type names
    transcribed into TOML.
 
@@ -1209,4 +1209,4 @@ This setting exposes names; it does not create those response headers.
 Keep CDN-specific exposure in the CDN response-header policy when the CDN owns those headers.
 Preserve the origin exposure list when you add CDN header names.
 
-Audio gaps use [bounded codec recovery](audio-recovery.md), enabled by default. Select permissive or strict behavior with `[accept].input_mode`. See [input modes](input-modes.md).
+Audio gaps use [bounded GAP handling](audio-recovery.md), enabled by default. Select permissive or strict behavior with `[accept].strict`. See [input modes](input-modes.md).

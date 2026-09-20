@@ -2,23 +2,12 @@
 use super::FrameRate;
 use derive_more::Display;
 
-#[derive(Clone, Copy, Debug, Default, Display, Eq, PartialEq, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Default, Display, Eq, PartialEq)]
 #[display(rename_all = "lowercase")]
 pub enum InputMode {
     #[default]
     Permissive,
     Strict,
-}
-impl std::str::FromStr for InputMode {
-    type Err = String;
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "permissive" => Ok(Self::Permissive),
-            "strict" => Ok(Self::Strict),
-            _ => Err("input_mode must be permissive or strict".into()),
-        }
-    }
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DecoderConfigOrigin {
