@@ -1,9 +1,9 @@
 //! Maps elementary RTMP units onto rushls tracks and packets.
 //!
-//! Opus timestamps use 48 kHz to preserve exact pre-skip. Other tracks keep
-//! the RTMP millisecond clock. Decoder configuration is
+//! Opus and FLAC use decoded sample clocks for exact durations. Other tracks
+//! keep the RTMP millisecond clock. Decoder configuration is
 //! parsed only far enough to fill [`DiscoveredTrack`] parameters; the payload
-//! bytes themselves are already length-prefixed video or raw AAC/Opus.
+//! bytes themselves are already length-prefixed video or raw audio.
 
 use crate::media::video_config::{h264_frame_rate, hevc_frame_rate};
 use std::num::NonZeroU32;
@@ -37,6 +37,10 @@ pub fn track(
             Codec::Aac,
             crate::media::aac::parameters(&extradata).map_err(SourceError::Demux)?,
         ),
+        ElementaryCodec::Flac => (
+            Codec::Flac,
+            crate::media::flac::parameters(&extradata).map_err(SourceError::Demux)?,
+        ),
         ElementaryCodec::Opus => (
             Codec::Opus,
             crate::media::opus::parameters(&extradata).map_err(SourceError::Demux)?,
@@ -64,7 +68,12 @@ pub fn track(
         source_key: Some(source_key(codec, track_id)),
         codec: mapped,
         parameters,
-        timebase: if codec == ElementaryCodec::Opus {
+        timebase: if codec == ElementaryCodec::Flac {
+            let MediaParameters::Audio { sample_rate, .. } = parameters else {
+                unreachable!()
+            };
+            Timebase::new(nz::u32!(1), sample_rate)
+        } else if codec == ElementaryCodec::Opus {
             Timebase::new(nz::u32!(1), nz::u32!(48_000))
         } else {
             TIMEBASE
@@ -260,6 +269,7 @@ pub fn codec(codec: ElementaryCodec) -> Codec {
         ElementaryCodec::Av1 => Codec::Av1,
         ElementaryCodec::Aac => Codec::Aac,
         ElementaryCodec::Opus => Codec::Opus,
+        ElementaryCodec::Flac => Codec::Flac,
         // `ElementaryCodec` is non-exhaustive: a future rtmpx codec has no
         // numeric identity here, so it compares unequal to every discovered
         // codec and the live path rejects it as changed parameters.
@@ -374,6 +384,121 @@ mod gap_tests {
                 assert_eq!(started.normalizer.take_notices().len(), 1);
             }
         }
+        Ok(())
+    }
+}
+
+/// Split a complete message before returning any packets. FLAC durations use
+/// decoded sample ticks, while the first timestamp retains RTMP quantization.
+pub fn packets(
+    track: &DiscoveredTrack,
+    timestamp: u32,
+    unit: ElementaryUnit,
+    limits: crate::source::InputLimits,
+) -> Result<impl Iterator<Item = Packet> + use<>, SourceError> {
+    if track.codec != Codec::Flac {
+        return packet(
+            track.id,
+            timestamp,
+            unit,
+            limits.maximum_payload_bytes_per_packet,
+        )
+        .map(|p| Some(p).into_iter().chain(Vec::new()));
+    }
+    let ElementaryUnit::Sample { payload, .. } = unit else {
+        return Err(SourceError::Demux("expected FLAC coded frames".into()));
+    };
+    if payload.len() > limits.maximum_payload_bytes_per_packet {
+        return Err(SourceError::PacketPayloadTooLarge {
+            limit: limits.maximum_payload_bytes_per_packet,
+            found: payload.len(),
+        });
+    }
+    let (info, _) = crate::media::flac::configuration(track.codec_extradata.as_bytes())
+        .map_err(SourceError::Demux)?;
+    let frames = crate::media::flac::frames(&payload, info, limits.maximum_packets_per_batch)
+        .map_err(SourceError::Demux)?;
+    let mut pts = i64::from(timestamp) * i64::from(info.rate) / 1000;
+    let mut packets = Vec::with_capacity(frames.len());
+    for frame in frames {
+        packets.push(Packet {
+            track_id: track.id,
+            pts: Some(pts),
+            dts: Some(pts),
+            duration: Some(i64::from(frame.samples)),
+            random_access: true,
+            audio_trim: crate::domain::AudioTrim::default(),
+            webvtt: crate::domain::WebVttCueMetadata::default(),
+            subtitle_position: None,
+            payload: Payload::from_bytes(payload.slice(frame.range)),
+        });
+        pts = pts
+            .checked_add(i64::from(frame.samples))
+            .ok_or_else(|| SourceError::Demux("FLAC timestamp overflows".into()))?;
+    }
+    Ok(None.into_iter().chain(packets))
+}
+
+#[cfg(test)]
+mod flac_tests {
+    use super::*;
+    use crate::media::fixtures::{FLAC_MONO, flac_parts};
+
+    #[test]
+    fn packed_flac_validation_is_atomic_and_bounded() -> Result<(), SourceError> {
+        let (header, coded) = flac_parts(FLAC_MONO);
+        let track = track(
+            TrackId(0),
+            ElementaryCodec::Flac,
+            Bytes::copy_from_slice(header),
+            Some(9),
+            None,
+        )?;
+        let sample = |data: Bytes| {
+            let mut raw = b"\x91fLaC".to_vec();
+            raw.extend_from_slice(&data);
+            rtmpx::ValidatedMedia::parse_audio(
+                Bytes::from(raw),
+                rtmpx::EnhancedValidationMode::Strict,
+            )
+            .expect("tag")
+            .elementary_unit()
+            .expect("mapping")
+            .expect("sample")
+        };
+        let mut corrupt = coded.to_vec();
+        *corrupt.last_mut().expect("footer") ^= 1;
+        assert!(
+            packets(
+                &track,
+                0,
+                sample(Bytes::from(corrupt)),
+                crate::source::InputLimits::permissive()
+            )
+            .is_err()
+        );
+        let mut limits = crate::source::InputLimits::permissive();
+        limits.maximum_packets_per_batch = 1;
+        assert!(packets(&track, 0, sample(Bytes::copy_from_slice(coded)), limits).is_err());
+        limits.maximum_packets_per_batch = 4096;
+        limits.maximum_payload_bytes_per_packet = coded.len() - 1;
+        assert!(matches!(
+            packets(&track, 0, sample(Bytes::copy_from_slice(coded)), limits),
+            Err(SourceError::PacketPayloadTooLarge { .. })
+        ));
+        let packets = packets(
+            &track,
+            u32::MAX,
+            sample(Bytes::copy_from_slice(coded)),
+            crate::source::InputLimits::permissive(),
+        )?
+        .collect::<Vec<_>>();
+        assert_eq!(packets[0].pts, Some(i64::from(u32::MAX) * 44100 / 1000));
+        assert!(
+            packets
+                .windows(2)
+                .all(|pair| pair[1].pts == pair[0].pts.zip(pair[0].duration).map(|(p, d)| p + d))
+        );
         Ok(())
     }
 }

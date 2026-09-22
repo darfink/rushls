@@ -215,7 +215,7 @@ impl StreamPolicy {
                 ..VideoAccept::default()
             },
             audio: AudioAccept {
-                codecs: Codecs::OneOf(vec![Codec::Aac, Codec::Opus]),
+                codecs: Codecs::OneOf(vec![Codec::Aac, Codec::Opus, Codec::Flac]),
                 ..AudioAccept::default()
             },
             subtitles: SubtitleAccept {

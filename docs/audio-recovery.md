@@ -40,7 +40,7 @@ A new publishing session resets the budget. A recovered notification does not.
 
 Gaps need not contain a whole number of codec frames. The next real packet retains its accepted timestamp.
 No timestamps are rebased, and priming is not reapplied.
-Continuous-publication codec support remains unchanged, including supported AAC-LC, HE-AAC, HE-AAC v2, and Opus configurations.
+Continuous-publication codec support remains unchanged, including supported AAC-LC, HE-AAC, HE-AAC v2, and Opus configurations. FLAC over Enhanced RTMP also uses this policy; see [FLAC support](flac.md).
 
 ## Segment model
 

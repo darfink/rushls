@@ -10,6 +10,7 @@ pub mod aac;
 pub mod av1;
 mod captions;
 mod density;
+pub mod flac;
 mod normalize;
 pub mod opus;
 mod pacer;

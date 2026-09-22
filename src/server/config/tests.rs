@@ -2400,3 +2400,25 @@ fn concise_settings_match_file_environment_and_cli_names() -> Result<(), Box<dyn
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn flac_is_an_audio_policy_codec() -> Result<(), Box<dyn Error>> {
+    let config = resolve_toml("[auth]\n[accept.audio]\ncodecs = ['flac']\n")??;
+    let grant = config
+        .authenticator
+        .authenticate(&request("flac-key"))
+        .await?;
+    assert_eq!(
+        grant.policy.audio.codecs,
+        crate::admission::Codecs::OneOf(vec![Codec::Flac])
+    );
+    assert!(matches!(
+        resolve_toml("[accept.video]\ncodecs = ['flac']\n")?,
+        Err(ConfigError::Invalid(_))
+    ));
+    assert_eq!(
+        crate::domain::rfc6381(Codec::Flac, None).as_deref(),
+        Some("fLaC")
+    );
+    Ok(())
+}

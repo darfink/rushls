@@ -288,6 +288,23 @@ fn codec_config(track: &DiscoveredTrack) -> Result<CodecConfig, Box<str>> {
                 sample_size: bit_depth.map_or(16, std::num::NonZeroU16::get),
             })
         }
+        (
+            Codec::Flac,
+            MediaParameters::Audio {
+                sample_rate,
+                channels,
+                bit_depth,
+                ..
+            },
+        ) => {
+            let (_, config) = crate::media::flac::configuration(extra)?;
+            Ok(CodecConfig::Flac {
+                config,
+                channel_count: channels.get(),
+                sample_rate: sample_rate.get(),
+                sample_size: bit_depth.map_or(16, std::num::NonZeroU16::get),
+            })
+        }
         (Codec::MovText | Codec::SubRip | Codec::Text | Codec::WebVtt, _) => {
             Err("subtitle codecs are not supported by the CMAF muxer".into())
         }

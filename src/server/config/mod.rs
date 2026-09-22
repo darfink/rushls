@@ -1659,7 +1659,7 @@ impl PolicyValue {
                     name,
                     "audio codecs",
                     codecs.clone(),
-                    &[Codec::Aac, Codec::Opus],
+                    &[Codec::Aac, Codec::Opus, Codec::Flac],
                 )?);
             }
             if let Some(sample_rate) = &audio.sample_rate {
@@ -2591,6 +2591,7 @@ impl From<SrtKeyLengthValue> for SrtKeyLength {
 #[display(rename_all = "lowercase")]
 enum CodecValue {
     Aac,
+    Flac,
     Av1,
     H264,
     Hevc,
@@ -2601,8 +2602,9 @@ enum CodecValue {
 }
 
 impl CodecValue {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Aac,
+        Self::Flac,
         Self::Av1,
         Self::H264,
         Self::Hevc,
@@ -2651,6 +2653,7 @@ impl From<CodecValue> for Codec {
     fn from(value: CodecValue) -> Self {
         match value {
             CodecValue::Aac => Self::Aac,
+            CodecValue::Flac => Self::Flac,
             CodecValue::Av1 => Self::Av1,
             CodecValue::H264 => Self::H264,
             CodecValue::Hevc => Self::Hevc,

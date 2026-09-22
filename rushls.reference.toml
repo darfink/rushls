@@ -118,7 +118,7 @@ frame_rate = { min = 24, max = 60 }      # or [23.976, 25, "30000/1001", 30]: de
 tracks     = { max = 8 }
 
 [accept.audio]
-codecs      = ["aac", "opus"]
+codecs      = ["aac", "opus", "flac"]
 sample_rate = { min = 44100, max = 48000 }   # Hz
 channels    = { max = 2 }
 tracks      = { max = 8 }

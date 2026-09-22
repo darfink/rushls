@@ -418,14 +418,11 @@ impl CatalogBuilder {
                             "RTMP coded frames arrived before a sequence header".into(),
                         )
                     })?;
-                let packet = map::packet(
-                    track.id,
-                    timestamp,
-                    sample,
-                    limits.maximum_payload_bytes_per_packet,
-                )?;
-                crate::source::record_first_pts(track, &packet)?;
-                self.prefetch.push_back(packet);
+                let packets = map::packets(track, timestamp, sample, limits)?;
+                for packet in packets {
+                    crate::source::record_first_pts(track, &packet)?;
+                    self.prefetch.push_back(packet);
+                }
                 Ok(())
             }
             _ => Err(SourceError::Demux(
@@ -611,7 +608,7 @@ fn live_samples(
     visit(&mut |unit| {
         if result.is_ok() {
             match live_sample(timestamp, unit, tracks, limits) {
-                Ok(Some(packet)) => packets.push_back(packet),
+                Ok(Some(mapped)) => packets.extend(mapped),
                 Ok(None) => {}
                 Err(error) => result = Err(error),
             }
@@ -627,7 +624,7 @@ fn live_sample(
     unit: ElementaryUnit,
     tracks: &LiveTracks,
     limits: InputLimits,
-) -> Result<Option<Packet>, SourceError> {
+) -> Result<Option<impl Iterator<Item = Packet> + use<>>, SourceError> {
     let key = map::source_key(unit.codec(), unit.track_id());
     match unit {
         ElementaryUnit::Configuration {
@@ -652,13 +649,7 @@ fn live_sample(
             if map::codec(codec) != track.codec {
                 return Err(SourceError::CodecParametersChanged { track_id: track.id });
             }
-            map::packet(
-                track.id,
-                timestamp,
-                sample,
-                limits.maximum_payload_bytes_per_packet,
-            )
-            .map(Some)
+            map::packets(track, timestamp, sample, limits).map(Some)
         }
         _ => Err(SourceError::Demux(
             "RTMP elementary unit is not recognized".into(),
@@ -1331,6 +1322,100 @@ mod tests {
             .await
             .expect_err("a new Enhanced track after freeze is not admitted");
         assert!(matches!(error, SourceError::TrackSetChanged), "{error}");
+        Ok(())
+    }
+    #[tokio::test]
+    async fn flac_live_timestamps_round_and_gaps_follow_input_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::media::fixtures::{FLAC_MONO, FLAC_STEREO, flac_event, flac_parts};
+        use crate::media::{NormalizedMedia, NormalizerFactory, PassThroughNormalizerFactory};
+        for bytes in [FLAC_MONO, FLAC_STEREO] {
+            let (header, coded) = flac_parts(bytes);
+            let (info, _) =
+                crate::media::flac::configuration(header).map_err(SourceError::Demux)?;
+            let frames =
+                crate::media::flac::frames(coded, info, 128).map_err(SourceError::Demux)?;
+            for missing in [false, true] {
+                let session = SessionMeters::new(ProcessMeters::default());
+                let (reader, writer) = channel(nz::usize!(128 * 1024));
+                writer.send(flac_event(0, 0, header)).await?;
+                writer
+                    .send(flac_event(0, 1, &coded[frames[0].range.clone()]))
+                    .await?;
+                let mut limits = InputLimits::permissive();
+                limits.maximum_packets_per_batch = 2;
+                let mut source = RtmpPacketSource::new(reader, limits, session.source_view())?;
+                let discovery = source.discover(discovery_limits()).await?;
+                let mut elapsed = u64::from(frames[0].samples);
+                for (index, frame) in frames.iter().enumerate().skip(1) {
+                    if !missing || index != 2 {
+                        writer
+                            .send(flac_event(
+                                u32::try_from(elapsed * 1000 / u64::from(info.rate))?,
+                                1,
+                                &coded[frame.range.clone()],
+                            ))
+                            .await?;
+                    }
+                    elapsed += u64::from(frame.samples);
+                }
+                writer.finish(InputState::Closed);
+                let mut packets = Vec::new();
+                loop {
+                    let mut batch = Vec::new();
+                    let state = source.fill(&mut batch).await?;
+                    assert!(batch.len() <= 2);
+                    packets.extend(batch);
+                    if !state.is_open() {
+                        break;
+                    }
+                }
+                assert_eq!(packets.len(), frames.len() - usize::from(missing));
+                let presentation = crate::media::validate(
+                    &discovery.tracks,
+                    &crate::admission::StreamPolicy::permissive(),
+                )?;
+                let timeline = crate::media::calibrate(&presentation)?;
+                for mode in [
+                    crate::domain::InputMode::Strict,
+                    crate::domain::InputMode::Permissive,
+                ] {
+                    let mut normalized =
+                        PassThroughNormalizerFactory.start(&presentation, &timeline, mode)?;
+                    let mut out = Vec::new();
+                    let mut failed = false;
+                    for packet in &packets {
+                        if let Err(error) = normalized.normalizer.push(packet.clone(), &mut out) {
+                            assert!(missing && mode == crate::domain::InputMode::Strict);
+                            assert!(matches!(error, crate::media::NormalizeError::Timestamp(_)));
+                            assert_eq!(out.len(), 2);
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if !failed {
+                        normalized.normalizer.finish(&mut out)?;
+                        assert_eq!(
+                            out.iter()
+                                .filter(|m| matches!(m, NormalizedMedia::Gap(_)))
+                                .count(),
+                            usize::from(missing)
+                        );
+                        assert_eq!(
+                            normalized.normalizer.take_notices().len(),
+                            usize::from(missing)
+                        );
+                        if !missing {
+                            assert_eq!(
+                                out.iter().map(NormalizedMedia::duration).sum::<u64>(),
+                                elapsed
+                            );
+                        }
+                    }
+                    assert_eq!(failed, missing && mode == crate::domain::InputMode::Strict);
+                }
+            }
+        }
         Ok(())
     }
 }

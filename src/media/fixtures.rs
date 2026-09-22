@@ -173,3 +173,35 @@ pub const H264_CFR_FLV_UNITS: &[(u32, &[u8])] = &[
         ],
     ),
 ];
+
+/// Native FLAC metadata and concatenated frames for RTMP framing tests.
+pub fn flac_parts(bytes: &[u8]) -> (&[u8], &[u8]) {
+    assert_eq!(&bytes[..4], b"fLaC");
+    let mut offset = 4;
+    loop {
+        let last = bytes[offset] & 0x80 != 0;
+        let len = u32::from_be_bytes([0, bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]])
+            as usize;
+        offset += 4 + len;
+        if last {
+            return bytes.split_at(offset);
+        }
+    }
+}
+
+pub const FLAC_MONO: &[u8] = include_bytes!("../../tests/fixtures/flac/mono-44100.flac");
+pub const FLAC_STEREO: &[u8] = include_bytes!("../../tests/fixtures/flac/stereo-48000.flac");
+
+pub fn flac_event(timestamp: u32, packet_type: u8, bytes: &[u8]) -> crate::source::IngressEvent {
+    let mut raw = vec![0x90 | packet_type];
+    raw.extend_from_slice(b"fLaC");
+    raw.extend_from_slice(bytes);
+    crate::source::IngressEvent::Audio {
+        timestamp,
+        media: rtmpx::ValidatedMedia::parse_audio(
+            bytes::Bytes::from(raw),
+            rtmpx::EnhancedValidationMode::Strict,
+        )
+        .expect("FLAC tag"),
+    }
+}

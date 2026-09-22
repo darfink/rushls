@@ -32,6 +32,7 @@ pub fn rfc6381(codec: Codec, config: Option<&[u8]>) -> Option<Arc<str>> {
         Codec::Hevc => Some(hevc(config)),
         Codec::Av1 => av1(config),
         Codec::Aac => Some(aac(config)),
+        Codec::Flac => Some(Arc::from("fLaC")),
         Codec::Opus => Some(Arc::from("opus")),
         Codec::WebVtt => Some(Arc::from("wvtt")),
         Codec::MovText => Some(Arc::from("tx3g")),

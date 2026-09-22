@@ -912,6 +912,7 @@ mod tests {
             transmux::CodecConfig::Av1 { .. } => crate::domain::Codec::Av1,
             transmux::CodecConfig::Aac { .. } => crate::domain::Codec::Aac,
             transmux::CodecConfig::Opus { .. } => crate::domain::Codec::Opus,
+            transmux::CodecConfig::Flac { .. } => crate::domain::Codec::Flac,
             _ => panic!("unexpected CMAF codec"),
         }
     }
@@ -3591,6 +3592,135 @@ mod tests {
                     );
                     if codec == "aac" {
                         assert_clean_aac_tail(&decoded_audio, missing_ticks, channels, rate);
+                    }
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+        .await;
+        std::fs::remove_dir_all(directory)?;
+        result
+    }
+    async fn flac_fixture(bytes: &[u8]) -> IngestFixture {
+        use crate::media::fixtures::{flac_event, flac_parts};
+        let (header, frames) = flac_parts(bytes);
+        let session = crate::observe::SessionMeters::new(crate::observe::ProcessMeters::default());
+        let (reader, writer) = channel(nz::usize!(128 * 1024));
+        writer
+            .send(flac_event(0, 0, header))
+            .await
+            .expect("config queues");
+        writer
+            .send(flac_event(0, 1, frames))
+            .await
+            .expect("packed frames queue");
+        writer.finish(InputState::Closed);
+        ingest_fixture(
+            RtmpPacketSource::new(reader, InputLimits::permissive(), session.source_view())
+                .expect("source"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn flac_rtmp_frames_package_with_exact_sample_clock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (bytes, rate) in [
+            (crate::media::fixtures::FLAC_MONO, 44100),
+            (crate::media::fixtures::FLAC_STEREO, 48000),
+        ] {
+            let fixture = flac_fixture(bytes).await;
+            assert_eq!(
+                fixture.presentation.tracks()[0].codec,
+                crate::domain::Codec::Flac
+            );
+            assert_eq!(
+                fixture
+                    .samples
+                    .iter()
+                    .map(NormalizedMedia::duration)
+                    .sum::<u64>(),
+                rate * 71 / 100
+            );
+            let output = packages_as_demuxable_cmaf(fixture);
+            let demuxed = demux_cmaf(&output[0]);
+            assert!(matches!(
+                demuxed.tracks[0].spec.config,
+                transmux::CodecConfig::Flac { .. }
+            ));
+            assert_eq!(
+                demuxed.tracks[0]
+                    .samples
+                    .iter()
+                    .map(|s| u64::from(s.duration.expect("duration")))
+                    .sum::<u64>(),
+                rate * 71 / 100
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg FLAC decoder"]
+    async fn flac_mp4_decodes_losslessly_and_resumes_after_gaps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!("rushls-flac-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory)?;
+        let result = async {
+            for (bytes, rate, channels) in [
+                (crate::media::fixtures::FLAC_MONO, 44100, 1),
+                (crate::media::fixtures::FLAC_STEREO, 48000, 2),
+            ] {
+                let source = directory.join("source.flac");
+                std::fs::write(&source, bytes)?;
+                let decode =
+                    |path: &std::path::Path| -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                        let output = std::process::Command::new("ffmpeg")
+                            .args(["-v", "error", "-xerror", "-i"])
+                            .arg(path)
+                            .args(["-f", "s32le", "-acodec", "pcm_s32le", "-"])
+                            .output()?;
+                        assert!(
+                            output.status.success(),
+                            "{}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        Ok(output.stdout)
+                    };
+                let reference = decode(&source)?;
+                let fixture = flac_fixture(bytes).await;
+                let output = packages_as_demuxable_cmaf(fixture);
+                let path = directory.join("output.mp4");
+                std::fs::write(&path, &output[0])?;
+                assert_eq!(decode(&path)?, reference);
+                let fixture = flac_fixture(bytes).await;
+                let media = audio_fixture_as_cmaf(&fixture, rate, true)?;
+                assert!(media.iter().any(|m| matches!(m, PackagedMedia::Gap(_))));
+                let outputs = collect_rendition_bytes(&media);
+                std::fs::write(&path, &outputs[0])?;
+                let decoded = decode(&path)?;
+                let start = 10 * 1024 * channels * 4;
+                let end = 16 * 1024 * channels * 4;
+                let mut expected = reference[..start].to_vec();
+                expected.extend_from_slice(&reference[end..]);
+                assert_eq!(decoded, expected);
+                let init = media
+                    .iter()
+                    .find_map(|item| match item {
+                        PackagedMedia::Initialization(init) => Some(init.payload.as_bytes()),
+                        _ => None,
+                    })
+                    .ok_or("FLAC initialization")?;
+                // Every part, including the first after a gap, must decode from
+                // a fresh decoder without preceding FLAC frames.
+                for item in &media {
+                    if let PackagedMedia::Chunk(chunk) = item {
+                        let mut bytes = init.to_vec();
+                        bytes.extend_from_slice(chunk.payload.as_bytes());
+                        std::fs::write(&path, bytes)?;
+                        let start = usize::try_from(chunk.media_start)? * channels * 4;
+                        let end = start + usize::try_from(chunk.duration)? * channels * 4;
+                        assert_eq!(decode(&path)?, reference[start..end]);
                     }
                 }
             }

@@ -81,6 +81,7 @@ pub enum MediaKind {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Codec {
     Aac,
+    Flac,
     Av1,
     H264,
     Hevc,

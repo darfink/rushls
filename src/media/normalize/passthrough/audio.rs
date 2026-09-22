@@ -58,6 +58,10 @@ impl AudioNormalizer {
             // but its transport timestamps still have millisecond precision.
             timestamp_tolerance: if track.codec == Codec::Opus {
                 timestamp_tolerance.max(48)
+            } else if track.codec == Codec::Flac {
+                // FLAC frames are split on the decoded clock; the first frame
+                // of each RTMP message still has millisecond precision.
+                timestamp_tolerance.max(u64::from(sample_rate.get().div_ceil(1000)))
             } else {
                 timestamp_tolerance
             },
