@@ -2289,7 +2289,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rsrt",
- "rtmpx 3.1.0",
+ "rtmpx",
  "rustls",
  "scuffle-av1",
  "scuffle-h265",

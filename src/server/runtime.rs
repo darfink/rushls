@@ -1201,7 +1201,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_occupied_rtmp_port_fails_with_the_address_attached() -> Result<(), RuntimeError> {
-        // Same class of failure as routmp's host-port collision: whatever the
+        // A host-port collision must fail at startup: whatever the
         // cause, startup must name the port instead of exiting opaquely.
         let predecessor = TcpListener::bind("127.0.0.1:0")
             .await

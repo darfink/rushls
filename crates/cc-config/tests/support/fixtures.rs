@@ -1,4 +1,4 @@
-//! The same startup contract runs against both application binaries.
+//! Reusable startup contract assertions for application binaries.
 
 use std::{error::Error, process::Command};
 

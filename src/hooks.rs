@@ -2,7 +2,7 @@
 //!
 //! The delivery machinery — CloudEvents rendering, per-stream ordering,
 //! drop-oldest overflow, retry, and the bounded drain at shutdown — lives in
-//! `cc-hooks`, which the Routmp shares. What stays here is everything that
+//! `cc-hooks`. What stays here is everything that
 //! is about *this* node: which facts it promises, how a stream is spelled as a
 //! subject, what each event carries, and how delivery failures are reported
 //! through the observer the rest of the process already uses.

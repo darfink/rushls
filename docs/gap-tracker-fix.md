@@ -56,5 +56,5 @@ The [MSE comparison](gap-mse-comparison.md) investigates media-element progress 
 
 The combined patch (`target/rushls-validation/tracker-fix-2026-09-20/hlsjs-v1.7.3.patch`) includes the selector, tracker, loader, and regression changes against v1.7.3.
 The archive retains browser reports, player hashes, session events, test logs, and probe snapshots.
-The worktree is `/Users/atomen/Projects/hls-endlist-fix`, branch `el-codex/endlist-pending-parts`.
+The player investigation used a separate hls.js worktree on branch `el-codex/endlist-pending-parts`.
 Nothing was submitted upstream or added to the Rushls player distribution.

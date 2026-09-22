@@ -1,6 +1,6 @@
 //! Delivery mechanics, exercised through a vocabulary that belongs to nobody.
 //!
-//! The event type here is deliberately not either application's. If these tests
+//! The event type here is deliberately independent of the application. If these tests
 //! can be written against a toy `Occurrence`, the crate is reusable; if they
 //! start needing streams or sessions, something application-shaped has leaked
 //! back in.

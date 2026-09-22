@@ -12,9 +12,7 @@ RUN apt-get update \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
-COPY apps ./apps
+COPY . .
 
 # `.dockerignore` omits `.git`, so bake the commit in from the host:
 #   docker build -f Dockerfile \
@@ -40,9 +38,9 @@ RUN apt-get update \
 
 # The builder copies the artifact out of its persistent Cargo target cache.
 COPY --from=builder /usr/local/bin/rushls /usr/local/bin/rushls
-COPY rushls.toml /etc/rushls/rushls.toml
+COPY examples/container/rushls.toml /etc/rushls/rushls.toml
 
-# The bundled file is the complete reference and carries the built-in defaults.
+# The development configuration listens on container interfaces and permits publishing.
 # Replace it with a bind mount or select another path with RUSHLS_CONFIG.
 ENV RUSHLS_CONFIG=/etc/rushls/rushls.toml
 

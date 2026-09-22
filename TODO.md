@@ -1,7 +1,7 @@
 # Rushls TODO
 
 The core media pipeline is implemented within the limits documented here.
-Production readiness still requires operational validation and CI/CD.
+Production readiness still requires operational validation.
 Future features are not release requirements unless a deployment needs them.
 
 ## Release validation and hardening

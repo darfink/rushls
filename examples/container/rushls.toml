@@ -1,0 +1,11 @@
+# Container development configuration. Publishing is open by default.
+# For public deployments, mount a configuration with publisher authorization.
+
+[rtmp]
+listen = "0.0.0.0:1935"
+
+[srt]
+listen = "0.0.0.0:9000"
+
+[http]
+listen = "0.0.0.0:8080"

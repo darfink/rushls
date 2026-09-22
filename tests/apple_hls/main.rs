@@ -542,17 +542,11 @@ async fn a_graceful_publication_finalizes_every_playlist() -> TestResult {
 
 // ---------------------------------------------------------------------------
 
-async fn run(
-    name: &'static str,
-    pending: Box<dyn rushls::source::PendingPublish>,
-) -> TestResult {
+async fn run(name: &'static str, pending: Box<dyn rushls::source::PendingPublish>) -> TestResult {
     run_with(Setup::default().named(name), pending).await
 }
 
-async fn run_with(
-    setup: Setup,
-    pending: Box<dyn rushls::source::PendingPublish>,
-) -> TestResult {
+async fn run_with(setup: Setup, pending: Box<dyn rushls::source::PendingPublish>) -> TestResult {
     let Some(origin) = harness::Origin::start_with(setup).await? else {
         return Ok(());
     };

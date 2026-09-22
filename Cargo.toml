@@ -1,7 +1,12 @@
 [package]
 name = "rushls"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "A low-latency HLS origin with RTMP, SRT, and Media over QUIC ingest"
+readme = "README.md"
 
 [features]
 allocation-counting = []
@@ -121,9 +126,7 @@ rust-version = "1.97"
 license = "UNLICENSED"
 publish = false
 
-# Shared across both applications. Anything listed here is a version both apps
-# agree on; a crate needing something different keeps it in its own manifest
-# rather than forcing the other to move.
+# Common dependency versions for the application and its infrastructure crates.
 [workspace.dependencies]
 # Internal
 cc-config = { path = "crates/cc-config" }
@@ -152,9 +155,6 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
   "logging",
 ] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-# Order-preserving map: AMF object property order is part of the wire encoding,
-# and a std HashMap randomises iteration per process, which makes the bytes we
-# emit differ between runs.
 notify = "8"
 notify-debouncer-full = "0.7"
 parking_lot = "0.12"
@@ -184,5 +184,6 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 ] }
 url = "2"
 uuid = { version = "1", features = ["v4", "v7"] }
+
 [profile.release]
 lto = "thin"

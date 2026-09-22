@@ -1,9 +1,8 @@
 //! TLS termination with certificates that rotate underneath a running origin.
 //!
-//! The implementation moved to `cc-tls` so the Routmp shares it. What stays
-//! here is the adapter from that crate's [`TlsObserver`] to this node's
-//! reporting: the shared crate has no opinion about how an application counts
-//! or logs, and neither application should have to adopt the other's.
+//! `cc-tls` owns certificate loading, rotation, and TLS listeners. This module
+//! adapts its [`TlsObserver`] to node reporting, keeping application metrics
+//! and events independent of the certificate machinery.
 
 use std::{path::Path, sync::Arc};
 

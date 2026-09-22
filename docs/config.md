@@ -1082,7 +1082,7 @@ open namespace, and there is no flag for a name chosen at runtime.
 
 ## Configuration mechanics
 
-Both Rushls and Routmp use `cc-config` for source loading, interpolation, and
+Rushls uses `cc-config` for source loading, interpolation, and
 file discovery. Unknown `RUSHLS_` environment variables produce startup warnings
 and are ignored as configuration overrides. Warnings include names, never values.
 Variables outside that prefix produce no warning. All environment variables remain

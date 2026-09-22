@@ -1,6 +1,6 @@
 # cc-config
 
-Shared configuration loading for Rushls and Routmp. Application schemas use
+Configuration loading independent of application policy. Application schemas use
 `conf::Conf` with Serde support. The loader owns file discovery, interpolation,
 source precedence, environment warnings, and source metadata.
 
@@ -109,7 +109,7 @@ Applications own diagnostic output and exit handling.
 ## Dependencies and tests
 
 This crate depends on parsing and filesystem libraries. It has no dependency
-on HTTP, hooks, TLS, or either application.
+on HTTP, hooks, TLS, or the application.
 
 ```sh
 cargo test -p cc-config --locked

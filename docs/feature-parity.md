@@ -145,7 +145,7 @@ avformat path we replaced.
 This API removes FLV framing and preserves decoder configuration bytes.
 It does not choose a media container or write CMAF boxes.
 Rushls owns codec interpretation, timestamp normalization, and packaging.
-Both Rushls and Routmp use RTMPX 3 from crates.io through the shared workspace dependency.
+Rushls uses RTMPX 3 from crates.io through the workspace dependency.
 The transport pulls one session output at a time and writes control packets with a resumable cursor.
 Socket reads become owned buffers; the decoder retains their slices while it assembles messages.
 Rushls coalesces fragmented media once at its contiguous codec-input boundary.

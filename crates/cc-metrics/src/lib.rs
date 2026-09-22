@@ -1,10 +1,8 @@
 //! Small, transport-independent pieces shared by metrics endpoints.
 //!
-//! Metric collection and HTTP serving stay in each application. Rushls and
-//! Routmp measure different domains and use different HTTP stacks, so a
-//! shared registry would couple unrelated runtime code. These helpers are the
-//! stable overlap: bearer-token parsing, constant-time comparison, and
-//! Prometheus label escaping.
+//! Metric collection and HTTP serving stay in the application. These helpers
+//! provide bearer-token parsing, constant-time comparison, and Prometheus
+//! label escaping without coupling callers to a registry or HTTP framework.
 
 use std::fmt;
 

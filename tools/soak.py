@@ -19,7 +19,7 @@ import urllib.request
 import urllib.error
 from urllib.parse import urljoin
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def duration(value):

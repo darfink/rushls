@@ -58,7 +58,7 @@ They are superseded. The final byte capture is necessary evidence: an ended even
 
 ## Scope and review
 
-The worktree is `/Users/atomen/Projects/hls-endlist-fix`, branch `el-codex/endlist-pending-parts`.
+The player investigation used a separate hls.js worktree on branch `el-codex/endlist-pending-parts`.
 The archived patch includes the earlier selector, tracker, and loader corrections against hls.js v1.7.3.
 No patch was submitted upstream, and no Rushls player dependency was changed.
 
