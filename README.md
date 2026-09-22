@@ -37,8 +37,9 @@ ffmpeg -re -i input.mp4 -c copy -f flv rtmp://127.0.0.1:1935/live/demo
 Open `http://127.0.0.1:8080/live/demo/index.m3u8` in an HLS player.
 FFmpeg is a publisher in this example; it is not a server dependency.
 
-For public deployments, start from [rushls.reference.toml](rushls.reference.toml).
-Configure authorization, listener addresses, TLS, and capacity limits before exposing the service.
+[rushls.example.toml](rushls.example.toml) documents every supported TOML field.
+Its active settings match the local starter; optional features stay commented.
+For public deployments, configure authorization, listener addresses, TLS, and capacity limits before exposing the service.
 
 ## Configuration
 
@@ -51,6 +52,16 @@ TOML strings support `${NAME}` and `${NAME:-fallback}` interpolation.
 ./target/release/rushls --help
 ./target/release/rushls --config /etc/rushls/rushls.toml
 ```
+
+Print the same annotated example from the installed binary:
+
+```sh
+./target/release/rushls --print-config-example > rushls.toml
+```
+
+This command prints the embedded file and exits. It does not load configuration,
+read secret files, or start listeners. Output matches the installed binary version.
+`rushls.toml` is the short starter; `rushls.example.toml` is the complete annotated example.
 
 See the [configuration guide](docs/config.md) and the
 [configuration loader contract](crates/cc-config/README.md).

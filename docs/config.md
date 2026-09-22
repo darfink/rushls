@@ -21,9 +21,9 @@ Enable `[hls].scrubbing` to publish keyframe playlists for fast seeking.
 > Replaces the earlier open discussion in `CONFIG.md`, now removed. That
 > document contradicted this design in several places.
 
-The surface is [rushls.reference.toml](../rushls.reference.toml).
-That file is the contract. This document is why it is shaped that way, and it
-records the promises the file makes but cannot explain in a one-line comment.
+The surface is [rushls.example.toml](../rushls.example.toml).
+That file documents every supported TOML field. Its active settings form a local starter;
+commented sections describe optional features and deployment-specific examples.
 
 ## What this is reacting to
 
@@ -52,12 +52,12 @@ without touching the config? If not, the config is leaking.
 
 1. **Compiled defaults are permissive.** No file at all yields a working local
    origin. Hardening is what you *add*, not what you dismantle.
-2. **Two shipped files, not a `mode` field.** The file is the stance.
+2. **A short starter and an annotated example.** Optional features remain explicit.
 3. **Operator vocabulary only.** *publisher*, *stream*, *listener*. Never
    *publication*, *policy*, or a pipeline stage.
 4. **One config field may fan out to several internal ones.** That is the
    translation layer earning its keep.
-5. **`"off"` is legal for every operator limit.**
+5. **`"off"` is accepted only by settings that explicitly support it.**
 6. **Durations an administrator can read**, not multipliers to decode.
 7. **Essays live here, not in the file.**
 
@@ -160,14 +160,9 @@ on ranges would leave no honest way to spell them.
 
 ### Units and ordering
 
-Omitting `codecs` and writing `{ preset = "common" }` are **not** the same
-thing, and the difference is what makes the preset worth having. Omitting the
-field admits every codec this origin can mux, including ones added by a later
-release. The preset is **frozen** to the set as it stands today, so a stream
-using a newly supported codec is refused until an operator opts in.
-
-Omit when the admitted set should track what the software can do; name the
-preset when it is part of a contract that should not widen underneath it.
+Omitting `codecs` admits every codec the origin can mux, including codecs added in later releases.
+An explicit list fixes the admitted set until the operator changes it.
+Codec preset tables such as `{ preset = "common" }` are not supported.
 
 Sample rate is **Hz as an integer**: `48000`, or `{ min = 44100, max = 48000 }`.
 The friendly `"48kHz"` alias is accepted **anywhere a rate is written**,
@@ -217,9 +212,8 @@ form `{ max = { width = 3840, height = 2160 } }` is always legal.
   parser and its error messages, and collide with real values.
 - **Dash strings** — `"-8"` reads as minus eight.
 - **`exact` as a keyword** — only needed to rescue an implicit-ceiling rule.
-- **`codecs = "common"`** — a preset name in the scalar slot is a fourth
-  constructor. Omit the field for the muxable set, or write
-  `{ preset = "common" }`.
+- **Codec presets** — neither `codecs = "common"` nor `{ preset = "common" }` is supported.
+  Omit `codecs` for the muxable set, or provide an explicit codec list.
 - **`max_tracks` as a parallel key** — sibling min/max under another name.
 
 ### Layering
@@ -237,8 +231,9 @@ audio = { channels = { max = 6 } }
 `{"policy": "premium"}` selects it. A policy **replaces `[accept]` wholesale**
 for that publisher: it does not inherit the top-level tables, so anything it
 leaves unsaid takes the compiled default rather than the file's value. Each
-entry holds the same schema as `[accept]` itself, including the pacing bounds,
-and is resolved at startup — so a name no policy defines fails the node, not
+entry supports `strict`, `ceiling`, `floor`, `takeover`, `video`, `audio`, and `subtitles`.
+`accept.stall` remains node-wide, and policies cannot contain other policies.
+Each entry is resolved at startup — so a name no policy defines fails the node, not
 the publisher, and admission costs a map lookup rather than a parse.
 
 Omitting `policy` applies `[accept]`, which is the common case.
@@ -615,7 +610,7 @@ retention budget = streams x memory_per_stream   media and manifest caches
 pipeline bound   = publishers x 120MiB            ingest only
 ```
 
-These terms have different lifetimes. At the reference settings, they give
+These terms have different lifetimes. For example, 64 publishers, 256 streams, and 256MiB per stream give
 64GiB of retention budget and 7.5GiB of pipeline capacity, before the overhead above.
 
 The pipeline figure is a compiled constant rather than a setting, because an
@@ -625,8 +620,7 @@ deployment, and a value chosen too low breaks discovery for multi-rendition
 contributors. What is owed instead is the guarantee and a way to check it, so
 it is exported per session as `rushls_session_pipeline_capacity_bytes`.
 
-A `memory_per_publisher` cap appears commented in the reference and is not
-built. Enforcing one shared budget means deciding what a stage does when
+A `memory_per_publisher` cap is not implemented or accepted as a configuration field. Enforcing one shared budget means deciding what a stage does when
 another holds the bytes it wants — failing the session kills a healthy
 publisher on a transient peak, blocking turns a memory cap into a stall — and
 that is a decision worth making against real numbers from the metric.
@@ -1097,8 +1091,8 @@ Unknown keys refuse. A misspelled table or field fails startup with its path,
 because silently ignoring it would run an open node the operator thought was
 closed. This is the same fail-closed instinct as an unknown policy name.
 
-**Two tables are open namespaces**, and are the only exceptions: `[hook.*]`
-and `[accept.policy.*]`, whose sub-table names the operator chooses. The names
+**Named hooks and policies are open namespaces**: `[hook.*]` and `[accept.policy.*]`.
+The operator chooses their sub-table names. `[auth.playback.claims]` also accepts operator-defined claim names. The names
 are keys rather than values — a hook's name identifies it in logs and metrics,
 and a policy's is what an auth response selects — so a table keyed by name
 makes uniqueness structural, since TOML rejects a duplicate key for us. The
@@ -1124,26 +1118,23 @@ Which **file** is loaded is a separate walk, first match wins:
 
 The process logs the path it used, or that it used compiled defaults.
 
-An environment value is **a TOML fragment**, not a second grammar. A scalar
-needs no ceremony, because a bare scalar is already valid TOML on the
-right-hand side:
+Environment variables use the parser for their corresponding field:
 
-```
+```sh
 RUSHLS_HLS_SEGMENT_TARGET=6s
-RUSHLS_ACCEPT_VIDEO_FRAME_RATE='{ min = 24, max = 60 }'
+RUSHLS_ACCEPT_STRICT=true
 ```
 
-Structured predicates therefore stay overridable, which a scalars-only rule
-would have prevented for much of `[accept]`, and they are parsed by the same
-code that parses the file, so a predicate means exactly one thing in both
-places. JSON was the alternative and is rejected for being a second grammar
-for values the file already spells.
+`rushls --help` lists the available CLI arguments and environment variables.
+Structured media predicates, named policies, hooks, recording, and playback claims are TOML-only.
+For example, `RUSHLS_ACCEPT_VIDEO_FRAME_RATE` is not a supported override; it produces an unknown-variable warning.
+Use TOML strings with interpolation where a structured field accepts a string value.
 
 The file is read at startup. New certificates and rotated JWKS keys take effect
 without a restart; anything else requires one. There is deliberately no reload
 signal for `accept`, `capacity`, or `hls`: retuning cadence or capacity under a
-live edge is a restart, sized by `shutdown`. `rushls check` validates the file,
-its directories, and its secret paths without booting.
+live edge is a restart, sized by `shutdown`. Configuration validation runs at startup.
+There is no `rushls check` subcommand.
 
 ## What "off" and omission mean
 
@@ -1157,38 +1148,45 @@ is lifted.
 - `[http.tls]` omitted — no HTTPS listener.
 - `[moq]` omitted, or `listen = "off"` — no WebTransport ingest. The compiled
   default; turning it on requires a certificate and key.
-- `[capacity]` omitted — no stream count cap, though the compiled per-stream byte
-  backstop remains.
+- `[capacity]` omitted — defaults to 256 publishers, 1,024 streams, and 512 MiB of retained memory per stream.
 
 - `[http] listen = "off"` — no cleartext listener. Both listeners off refuses to
   boot.
 - `ceiling` omitted — no publish rate ceiling. This is the compiled default.
-- `stall`, `[rtmp] timeout`, `[moq] timeout`, and every numeric `[accept]` predicate accept `"off"` to
-  mean no cap. Omitting a predicate already admits everything; `codecs = "off"` is
-  refused rather than given a second spelling for omission.
-- `memory_per_stream = "off"` — the explicit "fill memory", and one of the
-  conditions the public-bind warning keys off.
+- `accept.stall`, `[rtmp] timeout`, and `[moq] timeout` accept `"off"` or `"none"` to disable their deadlines.
+- Numeric `[accept]` predicates and codec lists do not accept `"off"`. Omit a predicate for no restriction.
+- Capacity counts and byte limits must be positive. `memory_per_stream = "off"` is not supported.
 
-`shutdown` is the one duration with no `"off"`, for the reasons above.
+`shutdown`, SRT deadlines, TLS handshake deadlines, and other duration fields do not accept `"off"`.
 
 ### Shipped files
 
-Two files, and the file is the stance:
+The two files serve different purposes:
 
 - `rushls.toml` — the local starter. Loopback listeners, everything else
   compiled defaults. Push a file, watch it play.
-- `rushls.reference.toml` — the complete surface, hardened for a public origin.
-  Copy this one to deploy.
+- `rushls.example.toml` — every supported TOML field, with optional settings commented.
+  Active settings match the local starter. Examples distinguish defaults from deployment choices.
 
-The container image ships the reference, so a default container is not an open
-origin.
+Print the example that matches the installed binary:
+
+```sh
+rushls --print-config-example > rushls.toml
+```
+
+The binary embeds the same file that lives in the repository. Printing bypasses configuration loading,
+including invalid files and environment overrides. It does not resolve credentials or start the server.
+The flag is CLI-only; it is not a TOML field or environment setting.
+
+The container image ships [examples/container/rushls.toml](../examples/container/rushls.toml).
+It listens on container interfaces and permits publishing without authentication.
+For public deployment, mount a configuration with publisher authorization at `/etc/rushls/rushls.toml`.
 
 ## Startup warnings
 
-Legal but probably unintended, warned rather than refused: an ingest listener
-on a non-loopback address combined with open auth, an uncapped stream count,
-`memory_per_stream = "off"`, or an omitted `ceiling`. A disabled RTMP or MOQ
-timeout on a bound listener is a second warning.
+Warnings cover public ingest without authorization, an effectively uncapped stream count,
+and disabled stall or RTMP/MOQ idle deadlines. Configuration may also warn about HLS timing relationships.
+Unknown `RUSHLS_` environment variables warn without blocking startup.
 
 Hard refusals are kept for the genuinely unbootable. Rules that bounce an
 administrator over a relationship they did not know existed should warn.

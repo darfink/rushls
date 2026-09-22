@@ -23,6 +23,49 @@ use crate::{
 
 use super::{AppConfig, ConfigError, decimal_fraction, parse_duration_rule};
 
+mod fixtures;
+
+#[test]
+fn the_example_covers_every_toml_option() -> Result<(), Box<dyn Error>> {
+    use conf::{Conf, introspection::ProgramOptionMeta};
+
+    let reference = fixtures::Example::read()?;
+    for option in AppConfig::program_options().filter(ProgramOptionMeta::has_serde_source) {
+        let id = option.id().to_string();
+        // Server fields flatten into the document root; their Rust IDs retain `node`.
+        let path = id.strip_prefix("node.").unwrap_or(&id);
+        assert!(
+            fixtures::contains(&reference.document, path),
+            "rushls.example.toml does not document {path}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn all_documented_examples_match_the_configuration_schema() -> Result<(), Box<dyn Error>> {
+    use conf::Conf;
+
+    let reference = fixtures::Example::read()?;
+    for (path, value) in &reference.examples {
+        let mut document = reference.document.clone();
+        fixtures::set(&mut document, path, value.clone())?;
+        // Parse each alternative, including commented fields. Do not resolve
+        // placeholder certificates or mutually exclusive credential examples.
+        let config = AppConfig::conf_builder()
+            .args(["rushls"])
+            .env(std::iter::empty::<(OsString, OsString)>())
+            .doc("rushls.example.toml", document)
+            .try_parse()
+            .map_err(|error| format!("reference example {path}: {error}"))?;
+        config.accept.resolve()?;
+        if let Some(record) = config.record {
+            record.0.validate()?;
+        }
+    }
+    Ok(())
+}
+
 const BASE_CONFIG: &str = "";
 
 /// Loads one shipped file exactly as the binary would, without searching
@@ -86,68 +129,21 @@ async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults() -> Resul
 }
 
 #[tokio::test]
-async fn the_reference_file_resolves_to_the_hardened_configuration() -> Result<(), Box<dyn Error>> {
-    // This replaces a test that read the library defaults back out and
-    // asserted the file matched them, which asserts nothing once the file and
-    // the code are independent. Every value below is written in the file, so
-    // this fails if either side moves without the other.
-    let config = load_shipped("rushls.reference.toml")?;
-
-    assert_eq!(config.node.shutdown, Duration::from_secs(10));
-    assert_eq!(
-        config.node.rtmp_address,
-        "[::]:1935".parse().expect("constant is valid")
-    );
-    assert_eq!(
-        config.node.srt_address,
-        "0.0.0.0:9000".parse().expect("constant is valid")
-    );
-    assert_eq!(
-        config.node.moq_address, None,
-        "the reference leaves MOQ commented out"
-    );
-    assert_eq!(
-        config.node.http_address,
-        Some("[::]:8080".parse().expect("constant is valid"))
-    );
-    assert_eq!(
-        config.node.metrics.listen,
-        Some("127.0.0.1:9090".parse().expect("constant is valid")),
-        "metrics get their own loopback listener, never the viewer port"
-    );
-
-    assert_eq!(config.node.maximum_sessions, 64);
-    assert_eq!(config.node.store.maximum_streams, 256);
-    assert_eq!(
-        config.node.store.retention.maximum_payload_bytes,
-        256 * 1024 * 1024
-    );
-    assert_eq!(
-        config.node.store.retention.retain,
-        Duration::from_mins(1).into()
-    );
-    assert_eq!(
-        config.node.session.segmentation.desired_segment_duration,
-        Duration::from_secs(6)
-    );
-    assert_eq!(
-        config.node.session.segmentation.late_boundary,
-        Duration::ZERO
-    );
-    assert_eq!(
-        config.node.session.supervision.health.stall,
-        Duration::from_secs(12)
-    );
-
-    // The reference configures an admission service, so the node is closed.
-    assert!(
-        config
-            .authenticator
-            .authenticate(&request("ignored"))
-            .await
-            .is_err(),
-        "the reference points at an admission service that is not running here"
-    );
+async fn the_example_file_is_the_starter_with_optional_documentation() -> Result<(), Box<dyn Error>>
+{
+    let starter: toml::Value = toml::from_str(include_str!("../../../rushls.toml"))?;
+    let example: toml::Value = toml::from_str(include_str!("../../../rushls.example.toml"))?;
+    assert_eq!(example, starter, "only the loopback listeners are active");
+    let config = load_shipped("rushls.example.toml")?;
+    assert!(config.hooks.is_none());
+    assert!(config.playback.is_none());
+    assert!(config.node.metrics.listen.is_none());
+    assert!(config.node.moq_address.is_none());
+    let grant = config
+        .authenticator
+        .authenticate(&request("ignored"))
+        .await?;
+    assert_eq!(grant.principal, Principal("anonymous".into()));
     Ok(())
 }
 
@@ -2034,7 +2030,7 @@ fn nested_hls_sources_preserve_precedence() -> Result<(), Box<dyn Error>> {
 fn scrubbing_is_enabled_by_default_and_configurable() -> Result<(), Box<dyn Error>> {
     assert!(resolve_toml("")??.node.hls.playlist.iframe_playlists);
     assert!(
-        load_shipped("rushls.reference.toml")?
+        load_shipped("rushls.example.toml")?
             .node
             .hls
             .playlist

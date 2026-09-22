@@ -9,8 +9,8 @@
 # a key; compiled defaults stay cert-free.
 # Anyone may publish, at any speed, in any codec this origin can mux. A file
 # pushed as fast as the link allows is packaged that fast, which is what
-# setting no ceiling asks for. For a public deployment start from
-# rushls.reference.toml instead.
+# setting no ceiling asks for. See rushls.example.toml for optional settings.
+# Configure authorization and deployment limits before exposing ingest publicly.
 
 [rtmp]
 listen = "127.0.0.1:1935"

@@ -127,6 +127,9 @@ pub struct AppConfig {
     /// TOML configuration file to load.
     #[conf(parameter, long, env = "CONFIG", serde(skip))]
     pub config: Option<PathBuf>,
+    /// Print the annotated configuration example and exit without loading configuration.
+    #[conf(flag, long, serde(skip))]
+    pub print_config_example: bool,
 
     #[conf(flatten, serde(flatten))]
     pub node: ServerAppConfig,

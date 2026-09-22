@@ -1,11 +1,21 @@
-# Rushls reference configuration: every operator setting, once.
+# Rushls configuration example: every supported TOML field.
 #
-# Uncommented lines are what a public origin should set. Commented lines are
-# the rest of the surface, shown at their default or with an example value.
-# Names use max_* for upper limits, *_bytes for byte counts, and *_file for
-# secret files. Service tables use timeout; TLS paths use cert and key.
-# Every table is optional; omit one to take the compiled default, which is
-# permissive: open publish, no stream cap, media as fast as the link allows.
+# This file runs as a local origin: only loopback listeners are enabled.
+# Publishing and playback require no authentication. Use real authorization,
+# certificates, and deployment limits before exposing the service publicly.
+#
+# Commented settings are optional. Scalar values show compiled defaults unless
+# labeled as examples. Paths, service URLs, names, credentials, and media
+# restrictions are examples. Disabled features stay disabled until configured.
+# Do not uncomment everything: some settings require external services, and
+# inline credentials and their *_file alternatives are mutually exclusive.
+#
+# Print this same file from the installed binary:
+#   rushls --print-config-example > rushls.toml
+# The command does not read configuration files or environment overrides.
+# --config / RUSHLS_CONFIG select the input file; they are not TOML fields.
+# --help lists CLI/environment overrides; structured fields can be TOML-only.
+# See docs/config.md for precedence, interpolation, and validation rules.
 
 # Identifies this node in its own logs and metrics, and as the producer of
 # hook events. Defaults to the hostname. Several nodes may share one name, in
@@ -14,21 +24,21 @@
 
 # How long a restart waits for parked viewer requests and queued hook events
 # before exiting anyway. Keep it below the grace period your scheduler allows.
-shutdown = "10s"
+# shutdown = "10s"
 
 [rtmp]
-listen  = "[::]:1935"                    # dual-stack; use 0.0.0.0 for IPv4 only
-timeout = "10s"                          # idle limit for an established publisher;
+listen = "127.0.0.1:1935"             # local example; default: 0.0.0.0:1935
+# timeout = "10s"                          # idle limit for an established publisher;
                                          # an unauthenticated handshake gets a
                                          # tighter one. "off" on a trusted link only
 
 [srt]
-listen  = "0.0.0.0:9000"                 # IPv4; rsrt has no IPv6 listener yet
-latency = "120ms"                        # raise on lossy or long-haul links
-timeout = "5s"                           # idle limit for a peer; must exceed latency
+listen = "127.0.0.1:9000"             # local example; default: 0.0.0.0:9000
+# latency = "120ms"                        # raise on lossy or long-haul links
+# timeout = "5s"                           # idle limit for a peer; must exceed latency
 # passphrase_file = "/run/secrets/rushls-srt-passphrase"
 # passphrase      = "..."                # inline form; prefer passphrase_file
-# encryption      = "aes256"
+# encryption      = "aes256"            # aes128, aes192, or aes256
 
 # WebTransport ingest. Off until certificates exist: there is no cleartext
 # form. One connection is one publication. The URL path is the resource
@@ -44,24 +54,25 @@ timeout = "5s"                           # idle limit for a peer; must exceed la
 # key         = "/etc/rushls/tls/private-key.pem"
 
 [http]
-listen          = "[::]:8080"                 # "off" to serve HTTPS only
-public_url      = ""                          # empty = relative playlist URLs
-max_connections = 4096                   # shared across HTTP, HTTPS and metrics binds
-max_requests    = 4096                   # includes blocked reloads and response bodies
+listen = "127.0.0.1:8080"             # local example; default: 0.0.0.0:8080
+# public_url      = ""                          # empty = relative playlist URLs
+# max_connections = 4096                   # shared across HTTP, HTTPS and metrics binds
+# max_requests    = 4096                   # includes blocked reloads and response bodies
 
-[http.cors]
-origins           = ["https://player.example.com"]
+# [http.cors]
+# origins           = "*"                # default: any origin, without credentials
+# origins           = ["https://player.example.com"] # example: restrict player origins
 # origins        = ["https://*.example.com"]    # one label, like a TLS wildcard
 # origins        = ["https://**.example.com"]   # any depth, only where you own the subtree
 # origins        = "*"                          # any origin; incompatible with credentials = true
 # origins        = "off"                        # no CORS headers, same-origin players only
-credentials       = false                # true requires an explicit origins list, never "*"
-max_age           = "10min"
+# credentials       = false                # true requires an explicit origins list, never "*"
+# max_age           = "10min"
 # Replaces the full exposure list. Use [] for browser-safelisted headers only.
-expose_headers    = ["content-length", "content-range", "date"]
+# expose_headers    = ["content-length", "content-range", "date"]
 
-# HTTPS listener, independent of the cleartext one above. Comment out the whole
-# table to serve cleartext only, which is usual behind a proxy that ends TLS.
+# HTTPS is disabled by default. Enable this table with real certificate paths.
+# It is independent of cleartext HTTP; set http.listen = "off" for HTTPS only.
 # [http.tls]
 # listen      = "[::]:8443"
 # cert        = "/etc/rushls/tls/fullchain.pem"
@@ -69,10 +80,11 @@ expose_headers    = ["content-length", "content-range", "date"]
 # handshake_timeout = "5s"
 # max_handshakes = 256                    # concurrent pending TLS handshakes
 
-# Who may publish. Omit this table and anyone may. Do not omit it on the
-# internet. Each publisher is checked once, when it connects.
-[auth.publish]
-url = "http://auth.example.internal/v1/publish/admit"
+# Publisher authorization is disabled by default. This service URL is an example.
+# Configure authorization before exposing ingest publicly. Each publisher is
+# checked once, when it connects.
+# [auth.publish]
+# url = "http://auth.example.internal/v1/publish/admit"
 # token_file = "/run/secrets/rushls-auth-token"
 # token      = "..."                     # inline form; prefer token_file
 # This service may widen what this node accepts, so it is trusted. On an
@@ -84,6 +96,7 @@ url = "http://auth.example.internal/v1/publish/admit"
 # timeout = "2s"                         # entire admission request, including connection
 # max_response_bytes = "64KiB"           # largest decision this node will read
 
+# Playback authorization is disabled by default; key paths and claims are examples.
 # Who may watch. Omit this table and anyone with the URL may. Viewers present a
 # JWT, which is verified locally: no request leaves this node per playlist
 # reload. Set exactly one of public_key, jwks_url, or secret.
@@ -102,57 +115,75 @@ url = "http://auth.example.internal/v1/publish/admit"
 # aud  = "rushls-origin"
 # tier = "premium"
 
-[accept]
-strict = false                     # strict rejects declared timing violations; permissive permits bounded compensation
+# Media restrictions are examples, not defaults. Omitted predicates allow all supported media.
+# [accept]
+# strict = false                     # strict rejects declared timing violations; permissive permits bounded compensation
 
-ceiling  = { pace = "1x", burst = "10s" }     # throttle: at most realtime, with a ten-second head start; omit burst for no head start, omit the table for no cap
+# ceiling  = { pace = "1x", burst = "10s" }     # throttle: at most realtime, with a ten-second head start; omit burst for no head start, omit the table for no cap
 # floor    = { pace = "0.5x", window = "30s" }  # disconnect: below half realtime across any 30s window; omit for no floor
-stall    = "12s"                                # disconnect: nothing usable arrived for this long; "off" = no idle cap
-takeover = false                                # true lets a new publisher replace the current one; the old session is closed
+# stall    = "12s"                                # disconnect: nothing usable arrived for this long; "off" = no idle cap
+# takeover = false                                # true lets a new publisher replace the current one; the old session is closed
 
-[accept.video]
-codecs     = ["h264", "hevc", "av1"]     # omit for every codec this origin can mux
-# codecs   = { preset = "common" }       # frozen set; omitting codecs also admits ones added later
-resolution = { max = "4k" }              # fits a 3840x2160 box, either orientation
-frame_rate = { min = 24, max = 60 }      # or [23.976, 25, "30000/1001", 30]: decimals and quotients mix, both exact
-tracks     = { max = 8 }
+# [accept.video]
+# codecs     = ["h264", "hevc", "av1"]     # omit for every codec this origin can mux
+# Explicit codec lists stay fixed; omission also admits codecs added later.
+# Codec preset tables are not supported. Aliases: avc = h264, h265 = hevc.
+# resolution = { max = "4k" }              # fits a 3840x2160 box, either orientation
+# resolution = "1080p"                   # exact dimensions; aliases: sd/480p, hd/720p, fhd/1080p, qhd/1440p, 4k/2160p, 8k/4320p
+# resolution = { width = 1920, height = 1080 } # exact explicit dimensions; "1920x1080" also works
+# resolution = { max = { width = 3840, height = 2160 } }
+# frame_rate = { min = 24, max = 60 }      # or [23.976, 25, "30000/1001", 30]: decimals and quotients mix, both exact
+# tracks     = { max = 8 }
+# Numeric predicates accept an exact value, a list, or { min = ..., max = ... }.
+# Either range bound can be omitted. Omit the predicate for no restriction.
+# frame_rate = 30
+# frame_rate = [23.976, 25, "30000/1001", 30]
+# tracks = { min = 1, max = 8 }
 
-[accept.audio]
-codecs      = ["aac", "opus", "flac"]
-sample_rate = { min = 44100, max = 48000 }   # Hz
-channels    = { max = 2 }
-tracks      = { max = 8 }
+# [accept.audio]
+# codecs      = ["aac", "opus", "flac"]
+# sample_rate = { min = 44100, max = 48000 }   # Hz; "44.1kHz" and "48kHz" also work
+# sample_rate = ["44.1kHz", "48kHz"]
+# channels    = { max = 2 }
+# tracks      = { max = 8 }
 
-[accept.subtitles]
-codecs = ["webvtt", "subrip", "text"]
-tracks = { max = 8 }
+# [accept.subtitles]
+# codecs = ["webvtt", "subrip", "text"]     # aliases: vtt = webvtt, srt = subrip
+# tracks = { max = 8 }
 
 # Named alternatives to the predicates above, selected by an auth response
-# returning {"policy": "premium"}. Each holds the same schema as [accept] and
-# replaces it wholesale for that publisher. Omit unless a service names one.
+# returning {"policy": "premium"}. Each replaces the default policy wholesale.
+# Supported fields: strict, ceiling, floor, takeover, video, audio, subtitles.
+# accept.stall is node-wide; policies cannot override it or contain policies.
+# Omit unless an admission service names one.
 # [accept.policy.premium]
-# video = { resolution = { max = "4k" }, frame_rate = { max = 60 } }
-# audio = { channels = { max = 6 } }
+# strict = true
+# ceiling = { pace = "1x", burst = "10s" }
+# floor = { pace = "0.5x", window = "30s" }
+# takeover = false
+# video = { codecs = ["h264", "hevc", "av1"], resolution = { max = "4k" }, frame_rate = { max = 60 }, tracks = { max = 8 } }
+# audio = { codecs = ["aac", "opus", "flac"], sample_rate = { min = 44100, max = 48000 }, channels = { max = 6 }, tracks = { max = 8 } }
+# subtitles = { codecs = ["webvtt", "subrip", "text"], tracks = { max = 8 } }
 
-[hls]
+# [hls]
 # Scrubbing playlists for CMAF video. Compatible with live LL-HLS; false disables them.
-scrubbing = true                        # index all keyframes in completed segments
-segment = { target = "6s", max = "2x", jitter = "0s" }
-part    = { target = "1s", max = "2x" }
+# scrubbing = true                        # index all keyframes in completed segments
+# segment = { target = "6s", max = "2x", jitter = "0s" }
+# part    = { target = "1s", max = "2x" }
 # max and jitter accept durations or multiples of their configured target.
 # Equal target and max forbid growth during admission.
 # Segment ceilings include both jitter endpoints and timestamp quantization.
 # Admission freezes the selected targets. Runtime cannot enlarge them.
 # Fixed hold_back and retain must cover the maximum admission targets.
-hold_back = "3x"                         # live-edge latency floor, as a multiple of part
-#          = "3s"                        # or an absolute duration; both forms are accepted
-retain   = "1m"                          # how long media stays fetchable, live and after a drop
+# hold_back = "3x"                         # live-edge latency floor, as a multiple of part
+# hold_back = "3s"                        # or an absolute duration; both forms are accepted
+# retain   = "6x"                          # default: six segment targets; an absolute duration such as "1m" also works
 # retain is clipped by memory_per_stream. At 5 Mbps, 256MiB holds about 7m.
 
-[capacity]
-publishers        = 64                   # concurrent ingest sessions
-streams           = 256                  # live, plus those still held by retain; when full, a new stream is refused
-memory_per_stream = "256MiB"             # retained media and cached manifests
+# [capacity]
+# publishers        = 256                   # concurrent ingest sessions
+# streams           = 1024                  # live, plus those still held by retain; when full, a new stream is refused
+# memory_per_stream = "512MiB"             # retained media and cached manifests
                                          # excludes in-flight overhead and the minimum live-window exception
                                          # plus a fixed per-publisher pipeline cost while ingesting
 # Pipeline capacity is reported as rushls_session_pipeline_capacity_bytes.
@@ -160,6 +191,7 @@ memory_per_stream = "256MiB"             # retained media and cached manifests
                                          # disk-backed: 1/8 RAM for manifests; media spills at 81.25% down to 75%
 # dir             = "/var/lib/rushls"    # optional; default is the platform cache (.../rushls/dvr)
 
+# Recording is disabled by default; /archive is an example destination.
 # Write a copy of every segment to a filesystem. Outlives the stream and is
 # never served by this origin, so it is unrelated to retain.
 # Segment hooks provide fetchable resource paths for remote consumers.
@@ -175,12 +207,14 @@ memory_per_stream = "256MiB"             # retained media and cached manifests
 
 # Omit this whole table to serve no metrics at all. Present, they get their own
 # listener; set listen to the [http] address to serve them on that port instead.
-[metrics]
-listen = "127.0.0.1:9090"
+# [metrics]
+# listen = "127.0.0.1:9090"
 # token_file = "/run/secrets/rushls-metrics-token"
 # token      = "${METRICS_TOKEN}"        # inline form; prefer token_file
 # Totals at /metrics. Sessions and per-stream retention at /metrics/streams.
 
+# Hooks are disabled by default. Destination names, URLs, credentials, and
+# event subscriptions below are examples. Queue and retry numbers are defaults.
 # [hook.automation]
 # url        = "http://automation.example.internal/rushls"
 # queue_size = 1000                       # queued events per destination

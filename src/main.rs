@@ -1,4 +1,6 @@
-use std::{error::Error, sync::Arc};
+use std::{error::Error, io::Write, sync::Arc};
+
+use conf::Conf;
 
 use rushls::{
     domain::{SessionId, StreamId},
@@ -309,6 +311,30 @@ fn init_tracing() {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<_> = std::env::args_os().collect();
+    if args
+        .iter()
+        .skip(1)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--print-config-example")
+    {
+        // Use the schema's argument parser to distinguish flags from values,
+        // without loading environment overrides, TOML, or runtime resources.
+        let matches = AppConfig::get_parser(
+            &conf::ParsedEnv::default(),
+            AppConfig::PROGRAM_OPTIONS.iter().collect(),
+        )?
+        .into_command()
+        .try_get_matches_from(args)
+        .unwrap_or_else(|error| error.exit());
+        if matches.get_flag("print_config_example") {
+            std::io::stdout()
+                .lock()
+                .write_all(include_bytes!("../rushls.example.toml"))?;
+            return Ok(());
+        }
+    }
+
     // Initialize before configuration so startup failures also carry timestamps.
     init_tracing();
     let resolved = AppConfig::load_and_resolve().unwrap_or_else(|error| error.exit());
