@@ -94,6 +94,7 @@ tools/     Local publishing, load, and playback validation tools
 
 All local dependencies are included under `crates/`. A fresh clone requires no sibling repositories.
 The [architecture guide](docs/architecture.md) explains the crate boundaries.
+The [protocol resources](docs/resources/README.md) include the HLS draft used by the implementation.
 
 ## License
 
