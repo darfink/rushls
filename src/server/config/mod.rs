@@ -6,8 +6,8 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::{OsStr, OsString},
-    fmt, fs,
+    ffi::OsString,
+    fmt,
     net::SocketAddr,
     num::{NonZeroU16, NonZeroU32},
     path::PathBuf,
@@ -17,9 +17,9 @@ use std::{
 };
 
 use crate::source::transport::rtmp::RtmpTimeouts;
-use bytesize::ByteSize;
+use cc_config::{ByteSize, ConfigSearch, Loader};
 use cc_tls::{ClientIdentity, load_roots};
-use conf::{Conf, find_parameter, introspection::ProgramOptionMeta};
+use conf::Conf;
 use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use thiserror::Error;
@@ -46,6 +46,8 @@ use crate::{
     },
     source::transport::srt::{SrtEncryption, SrtKeyLength},
 };
+
+const LOADER: Loader = Loader::new("rushls", "RUSHLS_");
 
 /// Configuration after all external values have been validated and translated.
 pub struct ResolvedAppConfig {
@@ -89,29 +91,8 @@ pub struct ResolvedHooks {
 /// Failures while locating, reading, parsing, or resolving configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("could not read configuration file {path}: {source}")]
-    Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("could not parse configuration file {path}: {source}")]
-    Toml {
-        path: PathBuf,
-        source: toml::de::Error,
-    },
-    #[error("could not interpolate {path}: {source}")]
-    Interpolation {
-        path: PathBuf,
-        source: interpolate::InterpolationError,
-    },
-    #[error("could not read {secret} from {path}: {source}")]
-    SecretRead {
-        secret: String,
-        path: PathBuf,
-        source: std::io::Error,
-    },
     #[error(transparent)]
-    Sources(#[from] conf::Error),
+    Loading(#[from] cc_config::ConfigError),
     #[error("could not build outbound client: {0}")]
     Outbound(#[from] cc_outbound::OutboundError),
     #[error("invalid configuration: {0}")]
@@ -125,7 +106,7 @@ impl ConfigError {
     /// exit status. In particular, `--help` and `--version` remain successful.
     pub fn exit(self) -> ! {
         match self {
-            Self::Sources(error) => error.exit(),
+            Self::Loading(cc_config::ConfigError::Sources(error)) => error.exit(),
             // Configuration is resolved before a `Node` exists, so this cannot
             // use the observer. The binary initializes tracing before loading
             // configuration, which keeps this startup diagnostic timestamped.
@@ -180,7 +161,7 @@ pub struct AppConfig {
     /// tables with a `name` field would turn that into a validation rule that
     /// can be forgotten, and demote the name from the heading to a line inside
     /// the block. Unknown keys *within* one still refuse.
-    #[conf(parameter, value_parser = TomlTable::<HookEndpointAppConfig>::from_str)]
+    #[conf(parameter, secret, value_parser = TomlTable::<HookEndpointAppConfig>::from_str)]
     pub hook: Option<TomlTable<HookEndpointAppConfig>>,
 }
 
@@ -194,7 +175,7 @@ impl AppConfig {
         Self::load_from_with(
             std::env::args_os(),
             std::env::vars_os(),
-            paths::ConfigSearch::WellKnown,
+            ConfigSearch::WellKnown,
         )
         .map(|(config, _)| config)
     }
@@ -205,7 +186,7 @@ impl AppConfig {
         Self::load_and_resolve_from_with(
             std::env::args_os(),
             std::env::vars_os(),
-            paths::ConfigSearch::WellKnown,
+            ConfigSearch::WellKnown,
         )
     }
 
@@ -217,13 +198,13 @@ impl AppConfig {
         args: impl IntoIterator<Item = OsString>,
         env: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> Result<ResolvedAppConfig, ConfigError> {
-        Self::load_and_resolve_from_with(args, env, paths::ConfigSearch::ExplicitOnly)
+        Self::load_and_resolve_from_with(args, env, ConfigSearch::ExplicitOnly)
     }
 
     fn load_and_resolve_from_with(
         args: impl IntoIterator<Item = OsString>,
         env: impl IntoIterator<Item = (OsString, OsString)>,
-        search: paths::ConfigSearch,
+        search: ConfigSearch,
     ) -> Result<ResolvedAppConfig, ConfigError> {
         let env: Vec<(OsString, OsString)> = env.into_iter().collect();
         let (config, config_file) = Self::load_from_with(args, env.iter().cloned(), search)?;
@@ -238,53 +219,16 @@ impl AppConfig {
         args: impl IntoIterator<Item = OsString>,
         env: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> Result<Self, ConfigError> {
-        Self::load_from_with(args, env, paths::ConfigSearch::ExplicitOnly).map(|(config, _)| config)
+        Self::load_from_with(args, env, ConfigSearch::ExplicitOnly).map(|(config, _)| config)
     }
 
     fn load_from_with(
         args: impl IntoIterator<Item = OsString>,
         env: impl IntoIterator<Item = (OsString, OsString)>,
-        search: paths::ConfigSearch,
+        search: ConfigSearch,
     ) -> Result<(Self, Option<PathBuf>), ConfigError> {
-        let args: Vec<OsString> = args.into_iter().collect();
-        let env: Vec<(OsString, OsString)> = env.into_iter().collect();
-        let path = explicit_config_path(&args, &env).or_else(|| match search {
-            paths::ConfigSearch::ExplicitOnly => None,
-            paths::ConfigSearch::WellKnown => {
-                paths::first_existing_file(paths::well_known_config_paths())
-            }
-        });
-        let builder = Self::conf_builder().args(args).env(env.clone());
-
-        match path {
-            Some(path) => {
-                let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-                    path: path.clone(),
-                    source,
-                })?;
-                let mut document =
-                    toml::from_str::<toml::Value>(&text).map_err(|source| ConfigError::Toml {
-                        path: path.clone(),
-                        source,
-                    })?;
-                // Before the settings layer sees the tree, so `${VAR}` in the
-                // file and a `RUSHLS_` override compose rather than compete:
-                // the reference is resolved here and an override still
-                // replaces the result.
-                interpolate::Environment::new(env)
-                    .interpolate(&mut document)
-                    .map_err(|source| ConfigError::Interpolation {
-                        path: path.clone(),
-                        source,
-                    })?;
-                let config = builder
-                    .doc(path.display().to_string(), document)
-                    .try_parse()
-                    .map_err(ConfigError::from)?;
-                Ok((config, Some(path)))
-            }
-            None => Ok((builder.try_parse().map_err(ConfigError::from)?, None)),
-        }
+        let loaded = Loader { search, ..LOADER }.load_from::<Self>(args, env)?;
+        Ok((loaded.config, loaded.path))
     }
 
     /// Applies supported operator choices to independently evolving runtime
@@ -304,8 +248,8 @@ impl AppConfig {
     ) -> Result<ResolvedAppConfig, ConfigError> {
         let defaults = NodeConfig::default();
         let mut client = LazyHttpClient::default();
-        let mut warnings = Vec::new();
-        warnings.extend(Self::unrecognized_environment(env));
+        let mut warnings =
+            LOADER.environment_warnings::<Self>(&env.into_iter().collect::<Vec<_>>());
 
         let (default_policy, policies) = self.accept.resolve()?;
         let stall = self.accept.stall;
@@ -387,29 +331,6 @@ impl AppConfig {
             config_file: None,
         })
     }
-
-    /// `RUSHLS_`-prefixed environment variables that no option reads.
-    ///
-    /// An override that misses its name by a typo falls back to the compiled
-    /// default silently, so the misspelling is named at startup rather than
-    /// left to be discovered in the behavior it never controlled.
-    fn unrecognized_environment(
-        env: impl IntoIterator<Item = (OsString, OsString)>,
-    ) -> Vec<String> {
-        let known: BTreeSet<String> = Self::program_options()
-            .filter_map(|option| option.env_form().map(ToString::to_string))
-            .collect();
-        let mut unrecognized: Vec<String> = env
-            .into_iter()
-            .filter_map(|(key, _)| key.into_string().ok())
-            .filter(|key| key.starts_with("RUSHLS_") && !known.contains(key))
-            .map(|key| format!("unrecognized environment variable {key} is ignored"))
-            .collect();
-        // Environment iteration order is unspecified; startup warnings should
-        // read the same way run to run.
-        unrecognized.sort();
-        unrecognized
-    }
 }
 
 #[derive(Conf)]
@@ -433,7 +354,7 @@ pub struct ServerAppConfig {
         long,
         env,
         default_value = "10s",
-        value_parser = humantime::parse_duration,
+        value_parser = cc_config::parse_duration,
         serde(use_value_parser)
     )]
     pub shutdown: Duration,
@@ -462,13 +383,23 @@ impl AuthAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct PlaybackAuthAppConfig {
-    #[conf(parameter, env, secret)]
+    #[conf(
+        parameter,
+        env,
+        secret,
+        serde(deserialize_with = "cc_config::deserialize_secret")
+    )]
     public_key: Option<String>,
     #[conf(parameter, long, env)]
     public_key_file: Option<PathBuf>,
     #[conf(parameter, long, env)]
     jwks_url: Option<String>,
-    #[conf(parameter, env, secret)]
+    #[conf(
+        parameter,
+        env,
+        secret,
+        serde(deserialize_with = "cc_config::deserialize_secret")
+    )]
     secret: Option<String>,
     #[conf(parameter, long, env)]
     secret_file: Option<PathBuf>,
@@ -479,7 +410,7 @@ pub struct PlaybackAuthAppConfig {
         long,
         env,
         default_value = "30s",
-        value_parser = humantime::parse_duration,
+        value_parser = cc_config::parse_duration,
         serde(use_value_parser)
     )]
     leeway: Duration,
@@ -568,7 +499,7 @@ pub struct HttpAuthAppConfig {
         long,
         env,
         default_value = "2s",
-        value_parser = humantime::parse_duration,
+        value_parser = cc_config::parse_duration,
         serde(use_value_parser)
     )]
     timeout: Duration,
@@ -576,7 +507,12 @@ pub struct HttpAuthAppConfig {
     #[conf(parameter, long, env, default_value = "64KiB", serde(use_value_parser))]
     max_response_bytes: ByteSize,
     /// Bearer credential presented to the service.
-    #[conf(parameter, env, secret)]
+    #[conf(
+        parameter,
+        env,
+        secret,
+        serde(deserialize_with = "cc_config::deserialize_secret")
+    )]
     token: Option<String>,
     /// File containing the bearer credential presented to the service.
     #[conf(parameter, long, env)]
@@ -719,7 +655,11 @@ impl<T: serde::de::DeserializeOwned> FromStr for TomlTable<T> {
     type Err = toml::de::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        toml::from_str(value)
+        toml::from_str(value).map_err(|mut error| {
+            // A hook table can contain credentials beside the invalid field.
+            error.set_input(None);
+            error
+        })
     }
 }
 
@@ -744,9 +684,11 @@ pub struct HookEndpointAppConfig {
     #[serde(default = "default_max_attempts")]
     max_attempts: u32,
     /// Bearer credential presented to this endpoint.
+    #[serde(default, deserialize_with = "cc_config::deserialize_secret")]
     token: Option<String>,
     /// Reads the bearer credential from a mounted secret instead.
     token_file: Option<PathBuf>,
+    #[serde(default, deserialize_with = "cc_config::deserialize_secret")]
     signing_secret: Option<String>,
     signing_secret_file: Option<PathBuf>,
     /// Path to a PEM certificate chain this node presents to this endpoint.
@@ -1237,7 +1179,7 @@ pub struct CeilingAppConfig {
         parameter,
         long,
         env,
-        value_parser = humantime::parse_duration,
+        value_parser = cc_config::parse_duration,
         serde(use_value_parser)
     )]
     burst: Option<Duration>,
@@ -1284,7 +1226,7 @@ pub struct FloorAppConfig {
         parameter,
         long,
         env,
-        value_parser = humantime::parse_duration,
+        value_parser = cc_config::parse_duration,
         serde(use_value_parser)
     )]
     window: Duration,
@@ -1821,7 +1763,7 @@ pub struct SrtAppConfig {
         long,
         env,
         default_value = "120ms",
-        value_parser = humantime::parse_duration,
+        value_parser = cc_config::parse_duration,
         serde(use_value_parser)
     )]
     latency: Duration,
@@ -1841,12 +1783,17 @@ pub struct SrtAppConfig {
         long,
         env,
         default_value = "5s",
-        value_parser = humantime::parse_duration,
+        value_parser = cc_config::parse_duration,
         serde(use_value_parser)
     )]
     timeout: Duration,
     /// Optional passphrase; absent accepts unencrypted SRT.
-    #[conf(parameter, env, secret)]
+    #[conf(
+        parameter,
+        env,
+        secret,
+        serde(deserialize_with = "cc_config::deserialize_secret")
+    )]
     passphrase: Option<String>,
     /// File containing the optional SRT passphrase.
     #[conf(parameter, long, env)]
@@ -2044,7 +1991,7 @@ pub struct HlsAppConfig {
 #[conf(serde)]
 pub struct HlsSegmentConfig {
     /// Preferred segment cadence.
-    #[conf(parameter, long, env, default_value = "6s", value_parser = humantime::parse_duration, serde(use_value_parser))]
+    #[conf(parameter, long, env, default_value = "6s", value_parser = cc_config::parse_duration, serde(use_value_parser))]
     target: Duration,
     /// Maximum segment ceiling, including rounding and both jitter endpoints.
     #[conf(parameter, long, env, default_value = "2x", value_parser = parse_duration_rule, serde(use_value_parser))]
@@ -2058,7 +2005,7 @@ pub struct HlsSegmentConfig {
 #[conf(serde)]
 pub struct HlsPartConfig {
     /// Preferred advertised partial-segment target.
-    #[conf(parameter, long, env, default_value = "1s", value_parser = humantime::parse_duration, serde(use_value_parser))]
+    #[conf(parameter, long, env, default_value = "1s", value_parser = cc_config::parse_duration, serde(use_value_parser))]
     target: Duration,
     /// Largest part target admission may select; runtime never enlarges it.
     #[conf(parameter, long, env, default_value = "2x", value_parser = parse_duration_rule, serde(use_value_parser))]
@@ -2313,7 +2260,7 @@ pub struct CorsAppConfig {
         long,
         env,
         default_value = "10min",
-        value_parser = humantime::parse_duration,
+        value_parser = cc_config::parse_duration,
         serde(use_value_parser)
     )]
     max_age: Duration,
@@ -2363,7 +2310,7 @@ pub struct TlsAppConfig {
         long,
         env,
         default_value = "5s",
-        value_parser = humantime::parse_duration,
+        value_parser = cc_config::parse_duration,
         serde(use_value_parser)
     )]
     handshake_timeout: Duration,
@@ -2410,7 +2357,12 @@ pub struct MetricsAppConfig {
     #[conf(parameter, long, env)]
     listen: Option<SocketAddr>,
     /// Optional bearer token required to scrape `/metrics` and `/metrics/streams`.
-    #[conf(parameter, env, secret)]
+    #[conf(
+        parameter,
+        env,
+        secret,
+        serde(deserialize_with = "cc_config::deserialize_secret")
+    )]
     token: Option<String>,
     /// File containing the optional metrics bearer token.
     #[conf(parameter, long, env)]
@@ -2625,46 +2577,18 @@ impl From<CodecValue> for Codec {
     }
 }
 
-fn env_value<'a>(env: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsStr> {
-    env.iter()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.as_os_str())
-}
-
-fn explicit_config_path(args: &[OsString], env: &[(OsString, OsString)]) -> Option<PathBuf> {
-    find_parameter("config", args.iter().cloned())
-        .map(PathBuf::from)
-        .or_else(|| env_value(env, "RUSHLS_CONFIG").map(PathBuf::from))
-}
-
+// Labels and schema field names belong to this app; secret reading is shared.
 fn resolve_optional_text_secret(
     label: &str,
     inline: Option<&String>,
     file: Option<&PathBuf>,
 ) -> Result<Option<String>, ConfigError> {
-    match (inline, file) {
-        (Some(_), Some(_)) => Err(invalid(format!(
-            "{label} must configure only one of its inline value and `_file`"
-        ))),
-        (Some(value), None) => Ok(Some(value.clone())),
-        (None, Some(path)) => {
-            // Secrets are routinely written with a trailing newline: shell
-            // redirection, a heredoc, or a Kubernetes secret projection all
-            // leave one behind. That newline is an artifact of how the file
-            // was produced, never part of the value, and downstream consumers
-            // (base64 decoding in particular) reject it outright. Inline
-            // values are left untouched: TOML and the command line can state
-            // surrounding whitespace deliberately, and have no such artifact.
-            fs::read_to_string(path)
-                .map(|value| Some(value.trim().to_owned()))
-                .map_err(|source| ConfigError::SecretRead {
-                    secret: label.to_owned(),
-                    path: path.clone(),
-                    source,
-                })
-        }
-        (None, None) => Ok(None),
-    }
+    cc_config::resolve_optional_text_secret(
+        label,
+        inline.map(String::as_str),
+        file.map(PathBuf::as_path),
+    )
+    .map_err(ConfigError::from)
 }
 
 fn nonzero_bytes(label: &str, value: ByteSize) -> Result<usize, ConfigError> {
@@ -2720,7 +2644,6 @@ fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
 }
 
-mod interpolate;
 mod paths;
 
 #[cfg(test)]

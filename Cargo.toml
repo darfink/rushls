@@ -7,6 +7,7 @@ edition = "2024"
 allocation-counting = []
 
 [dependencies]
+cc-config.workspace = true
 # `chrono` only for operator-facing strftime patterns in `record.pattern`:
 # validation via `StrftimeItems` and formatting with `%Y/%m/%d` vocabulary.
 # `time` (workspace) stays the runtime clock; its formatting syntax is
@@ -20,9 +21,9 @@ cc-tls = { workspace = true, features = ["axum"] }
 arc-swap = "1"
 derive_more = { version = "2", features = ["debug", "deref", "display"] }
 bytes = "1.12.1"
-bytesize = "2"
-conf = "0.4"
-directories = "6"
+bytesize.workspace = true
+conf.workspace = true
+directories.workspace = true
 # Streaming MPEG-TS demux and codec-config records. CENC and playlist
 # spokes stay off: this crate only consumes the TS event source.
 transmux = { version = "0.24", default-features = false, features = ["std"] }
@@ -67,7 +68,7 @@ url.workspace = true
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 time.workspace = true
-toml = "1"
+toml.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 urlencoding = "2"
@@ -125,6 +126,7 @@ publish = false
 # rather than forcing the other to move.
 [workspace.dependencies]
 # Internal
+cc-config = { path = "crates/cc-config" }
 cc-outbound = { path = "crates/cc-outbound" }
 cc-hooks = { path = "crates/cc-hooks" }
 rtmpx = "3.1"
@@ -132,11 +134,16 @@ cc-tls = { path = "crates/cc-tls" }
 cc-metrics = { path = "crates/cc-metrics" }
 
 # External
+conf = "0.4"
+directories = "6"
+toml = "1"
+bytesize = "2"
 arc-swap = "1"
 bytes = "1"
 derive_more = { version = "2", features = ["debug", "deref", "display"] }
 http = "1"
 http-body-util = "0.1"
+humantime = "2"
 hyper-rustls = { version = "0.27", default-features = false, features = [
   "ring",
   "native-tokio",

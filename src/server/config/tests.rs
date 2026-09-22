@@ -284,7 +284,7 @@ fn a_missing_config_file_is_an_error() -> Result<(), Box<dyn Error>> {
         .err()
         .ok_or("a missing --config path must fail")?;
     assert!(
-        matches!(error, ConfigError::Read { ref path, .. } if *path == missing),
+        matches!(error, ConfigError::Loading(cc_config::ConfigError::Read { ref path, .. }) if *path == missing),
         "unexpected error: {error}"
     );
     Ok(())
@@ -300,32 +300,26 @@ fn compiled_defaults_do_not_search_well_known_files() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn unknown_rushls_environment_variables_warn_instead_of_failing() -> Result<(), Box<dyn Error>> {
+fn unknown_rushls_environment_variables_warn_without_blocking_startup() -> Result<(), Box<dyn Error>>
+{
     let env = [
-        // A recognized override and a variable outside the namespace stay quiet.
         ("RUSHLS_CAPACITY_PUBLISHERS", "20"),
         ("PAGER", "less"),
-        // Two misspellings are named, in a stable order.
+        ("RUSHLS_TLS_CERTIFICATE", "do-not-print-this"),
         ("RUSHLS_CAPACITY_MAXIMUM_CONCURRENT_PUBLISHER", "20"),
-        ("RUSHLS_TLS_CERTIFICATE", "/tmp/certificate.pem"),
     ]
-    .into_iter()
     .map(|(key, value)| (OsString::from(key), OsString::from(value)));
     let resolved = AppConfig::load_and_resolve_from(os(["rushls"]), env)?;
-
     assert_eq!(resolved.node.maximum_sessions, 20);
-    let unrecognized: Vec<&String> = resolved
+    let warnings: Vec<_> = resolved
         .warnings
         .iter()
         .filter(|warning| warning.starts_with("unrecognized"))
         .collect();
-    assert_eq!(
-        unrecognized,
-        [
-            "unrecognized environment variable RUSHLS_CAPACITY_MAXIMUM_CONCURRENT_PUBLISHER is ignored",
-            "unrecognized environment variable RUSHLS_TLS_CERTIFICATE is ignored",
-        ]
-    );
+    assert_eq!(warnings.len(), 2);
+    assert!(warnings[0].contains("RUSHLS_CAPACITY_MAXIMUM_CONCURRENT_PUBLISHER"));
+    assert!(warnings[1].contains("RUSHLS_TLS_CERTIFICATE"));
+    assert!(!format!("{warnings:?}").contains("do-not-print-this"));
     Ok(())
 }
 
@@ -605,7 +599,12 @@ token_file = "{}"
         secret.path.display(),
     ))?;
 
-    assert!(matches!(result, Err(ConfigError::Invalid(_))));
+    assert!(matches!(
+        result,
+        Err(ConfigError::Loading(
+            cc_config::ConfigError::SecretConflict(_)
+        ))
+    ));
     Ok(())
 }
 
@@ -2420,5 +2419,21 @@ async fn flac_is_an_audio_policy_codec() -> Result<(), Box<dyn Error>> {
         crate::domain::rfc6381(Codec::Flac, None).as_deref(),
         Some("fLaC")
     );
+    Ok(())
+}
+
+#[test]
+fn malformed_secret_documents_do_not_print_credentials() -> Result<(), Box<dyn Error>> {
+    for text in [
+        "[metrics]\ntoken = 918273645",
+        "[auth.publish]\ntoken = 918273645",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\ntoken = 918273645",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\ntoken = 'sensitive-token'\nqueue_size = 'bad'",
+    ] {
+        let error = load_toml(text)?.err().ok_or("invalid document accepted")?;
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains("918273645"), "{diagnostic}");
+        assert!(!diagnostic.contains("sensitive-token"), "{diagnostic}");
+    }
     Ok(())
 }

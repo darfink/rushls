@@ -1082,6 +1082,17 @@ open namespace, and there is no flag for a name chosen at runtime.
 
 ## Configuration mechanics
 
+Both Rushls and Routmp use `cc-config` for source loading, interpolation, and
+file discovery. Unknown `RUSHLS_` environment variables produce startup warnings
+and are ignored as configuration overrides. Warnings include names, never values.
+Variables outside that prefix produce no warning. All environment variables remain
+available for interpolation. Custom interpolation inputs can use a separate
+namespace to avoid warnings.
+
+Mounted secret files lose trailing CR/LF characters only. Leading and trailing
+spaces remain part of the credential. Inline credentials remain unchanged.
+
+
 Unknown keys refuse. A misspelled table or field fails startup with its path,
 because silently ignoring it would run an open node the operator thought was
 closed. This is the same fail-closed instinct as an unknown policy name.

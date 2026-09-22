@@ -1,19 +1,5 @@
-//! Environment interpolation over the string leaves of a parsed document.
-//!
-//! Runs on the value tree before the settings layer sees it, which is why it
-//! composes with `RUSHLS_` overrides rather than competing with them: a `${VAR}`
-//! in the file is resolved first, and an override still replaces the result.
-//!
-//! `${VAR}` is the canonical spelling because its boundaries are unambiguous,
-//! so a value can be built from more than one variable and a name can sit
-//! against surrounding text. A bare `$VAR` would have to guess where the name
-//! ends.
-//!
-//! It deliberately does not collide with `[record] pattern`, whose `{stream}`
-//! and `{time:...}` placeholders carry no `$` and are expanded per segment by a
-//! different layer. One is resolved once at startup from the environment; the
-//! other is resolved per file from media. Keeping the sigils distinct is what
-//! stops a pattern from being silently eaten here.
+//! Environment substitution in TOML string values, before source overrides.
+//! Keys are never interpolated. Inserted values are literal, not TOML source.
 
 use std::{collections::BTreeMap, ffi::OsString};
 
@@ -21,12 +7,12 @@ use thiserror::Error;
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum InterpolationError {
-    #[error("`{0}` is not closed; a variable is written as ${{NAME}}")]
-    Unclosed(String),
+    #[error("unclosed environment reference; a variable is written as ${{NAME}}")]
+    Unclosed,
     #[error("${{{0}}} names no variable, and no `:-` fallback was given")]
     Undefined(String),
-    #[error("${{{0}}} is not a variable name")]
-    Malformed(String),
+    #[error("invalid environment variable name in interpolation")]
+    Malformed,
 }
 
 /// The environment a document is interpolated against.
@@ -92,7 +78,7 @@ impl Environment {
                 continue;
             };
             let Some(end) = tail.find('}') else {
-                return Err(InterpolationError::Unclosed(value.to_owned()));
+                return Err(InterpolationError::Unclosed);
             };
             out.push_str(&self.lookup(&tail[..end])?);
             rest = &tail[end + 1..];
@@ -109,8 +95,10 @@ impl Environment {
             None => (reference, None),
         };
         let name = name.trim();
-        if name.is_empty() {
-            return Err(InterpolationError::Malformed(reference.to_owned()));
+        if !name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(InterpolationError::Malformed);
         }
 
         match self.0.get(name) {
@@ -205,7 +193,7 @@ mod tests {
     fn an_unclosed_reference_is_refused() {
         assert!(matches!(
             expand("${NAME", &[("NAME", "x")]),
-            Err(InterpolationError::Unclosed(_))
+            Err(InterpolationError::Unclosed)
         ));
     }
 
