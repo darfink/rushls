@@ -295,3 +295,32 @@ fn a_token_never_prints_itself() {
 
     assert_eq!(format!("{token:?}"), "BearerToken([REDACTED])");
 }
+
+#[tokio::test]
+async fn lazy_pool_consumers_keep_independent_response_limits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let address = start().await;
+    let mut pool = super::LazyHttpClient::default();
+    assert!(pool.0.is_none());
+    let small = pool.with_limits(Duration::from_secs(2), 1024)?;
+    let large = pool.with_limits(Duration::from_secs(2), 512 * 1024)?;
+    let endpoint = endpoint(address, "/enormous");
+    assert!(matches!(
+        small.post(&endpoint, JSON, None, Bytes::new()).await,
+        Err(OutboundError::ResponseTooLarge { limit: 1024 })
+    ));
+    assert_eq!(
+        large
+            .post(&endpoint, JSON, None, Bytes::new())
+            .await?
+            .body
+            .len(),
+        256 * 1024
+    );
+    // Building another consumer cannot overwrite the first consumer's ceiling.
+    assert!(matches!(
+        small.post(&endpoint, JSON, None, Bytes::new()).await,
+        Err(OutboundError::ResponseTooLarge { limit: 1024 })
+    ));
+    Ok(())
+}

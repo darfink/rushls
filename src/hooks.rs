@@ -336,7 +336,7 @@ pub fn build(
     config: HooksConfig,
     client: crate::outbound::HttpClient,
     events: Events,
-) -> (Hooks, Dispatchers) {
+) -> Result<(Hooks, Dispatchers), cc_hooks::ConfigError> {
     cc_hooks::build(config, client, Arc::new(HookEvents::new(events)))
 }
 

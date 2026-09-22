@@ -34,7 +34,7 @@ use crate::{
     domain::{Codec, FrameRate},
     hooks::{HookConfig, HooksConfig},
     observe::lifecycle::Kind,
-    outbound::{BearerToken, ClientConfig, Endpoint, HttpClient},
+    outbound::{BearerToken, ClientConfig, Endpoint, HttpClient, LazyHttpClient},
     segment::SegmentationPolicy,
     server::{
         NodeConfig,
@@ -112,6 +112,8 @@ pub enum ConfigError {
     },
     #[error(transparent)]
     Sources(#[from] conf::Error),
+    #[error("could not build outbound client: {0}")]
+    Outbound(#[from] cc_outbound::OutboundError),
     #[error("invalid configuration: {0}")]
     Invalid(String),
     #[error("invalid SRT encryption configuration: {0}")]
@@ -774,30 +776,12 @@ impl HookEndpointAppConfig {
         client: &mut LazyHttpClient,
         outbound_tls: &mut Vec<OutboundTls>,
     ) -> Result<HookConfig, ConfigError> {
-        if self.events.is_empty() {
-            return Err(invalid(format!(
-                "hook `{name}` subscribes to no events, so it would never be called"
-            )));
-        }
         let mut events = BTreeSet::new();
         for event in &self.events {
             events.insert(
                 Kind::from_str(event)
                     .map_err(|error| invalid(format!("hook `{name}`: {error}")))?,
             );
-        }
-        for (label, value) in [
-            ("queue_size", self.queue_size),
-            ("max_in_flight", self.max_in_flight),
-        ] {
-            if value == 0 {
-                return Err(invalid(format!("hook `{name}` sets {label} to zero")));
-            }
-        }
-        if self.max_attempts == 0 {
-            return Err(invalid(format!(
-                "hook `{name}` sets max_attempts to zero, so nothing would be sent"
-            )));
         }
         let token = resolve_optional_text_secret(
             &format!("the token for hook `{name}`"),
@@ -835,7 +819,7 @@ impl HookEndpointAppConfig {
             None
         };
 
-        Ok(HookConfig {
+        let config = HookConfig {
             name: Arc::from(name),
             endpoint: Endpoint::parse(&self.url).map_err(|error| invalid(error.to_string()))?,
             events,
@@ -848,7 +832,11 @@ impl HookEndpointAppConfig {
                 .map_err(|error| invalid(error.to_string()))?,
             client,
             signing_secret,
-        })
+        };
+        config
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
+        Ok(config)
     }
 }
 
@@ -944,34 +932,6 @@ impl OutboundTls {
         )
         .map(|client| client.with_limits(request_timeout, maximum_response_bytes))
         .map_err(|error| invalid(error.to_string()))
-    }
-}
-
-/// Builds at most one outbound client, and only if something needs it.
-///
-/// Reading the platform trust store and building a TLS configuration is real
-/// work, and a node that calls nothing out should not pay for it — nor should
-/// the tests covering those configurations. Callers ask for their own deadline
-/// and response ceiling, which are per-request and so cost nothing to vary;
-/// what they share is the connector underneath.
-#[derive(Default)]
-pub struct LazyHttpClient(Option<HttpClient>);
-
-impl LazyHttpClient {
-    /// A client with the caller's limits, over the shared connector.
-    fn with_limits(
-        &mut self,
-        request_timeout: Duration,
-        maximum_response_bytes: usize,
-    ) -> Result<HttpClient, ConfigError> {
-        let shared = if let Some(client) = &self.0 {
-            client
-        } else {
-            let client = HttpClient::new(ClientConfig::default())
-                .map_err(|error| invalid(error.to_string()))?;
-            self.0.insert(client)
-        };
-        Ok(shared.with_limits(request_timeout, maximum_response_bytes))
     }
 }
 

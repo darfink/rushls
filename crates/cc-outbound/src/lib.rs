@@ -1,6 +1,6 @@
 //! Requests this node makes to services an administrator configured.
 //!
-//! The mirror of [`server::http`](crate::server::http), which answers viewers.
+//! Inbound HTTP serving remains the responsibility of each application.
 //! Both admission and lifecycle hooks talk to operator-supplied endpoints, and
 //! they share exactly this much: a pooled connection, bounded time, a bounded
 //! response, and a bearer credential. What they do with the answer is entirely
@@ -170,6 +170,31 @@ pub enum OutboundError {
     ResponseTooLarge { limit: usize },
 }
 
+/// Builds at most one outbound client, and only if something needs it.
+///
+/// Reading the platform trust store and building a TLS configuration is real
+/// work, and a node that calls nothing out should not pay for it — nor should
+/// the tests covering those configurations. Callers ask for their own deadline
+/// and response ceiling, which are per-request and so cost nothing to vary;
+/// what they share is the connector underneath.
+#[derive(Default)]
+pub struct LazyHttpClient(Option<HttpClient>);
+
+impl LazyHttpClient {
+    /// A client with the caller's limits, over the shared connector.
+    pub fn with_limits(
+        &mut self,
+        request_timeout: Duration,
+        maximum_response_bytes: usize,
+    ) -> Result<HttpClient, OutboundError> {
+        let shared = match &mut self.0 {
+            Some(client) => client,
+            slot @ None => slot.insert(HttpClient::new(ClientConfig::default())?),
+        };
+        Ok(shared.with_limits(request_timeout, maximum_response_bytes))
+    }
+}
+
 /// A pooled HTTP client shared by everything that calls out.
 ///
 /// Cloning shares the connection pool, which is the point: a per-publisher
@@ -223,6 +248,8 @@ impl HttpClient {
     ) -> Result<Self, OutboundError> {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(config.connect_timeout));
+        // The TLS layer wraps this one, so it must not reject an https URL
+        // before ever seeing it.
         connector.enforce_http(false);
 
         let builder = rustls::ClientConfig::builder();
@@ -281,22 +308,7 @@ impl HttpClient {
     /// an internal certificate authority works once that authority is installed
     /// the way everything else on the host already expects.
     pub fn new(config: ClientConfig) -> Result<Self, OutboundError> {
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(Some(config.connect_timeout));
-        // The TLS layer wraps this one, so it must not reject an https URL
-        // before ever seeing it.
-        connector.enforce_http(false);
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|error| OutboundError::Unreachable(error.to_string()))?
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(connector);
-
-        Ok(Self {
-            inner: Client::builder(TokioExecutor::new()).build(connector),
-            config,
-        })
+        Self::with_identity(config, None, None)
     }
 
     /// Fetches one URL and reads the whole response.

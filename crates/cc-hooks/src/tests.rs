@@ -231,7 +231,8 @@ async fn deliver_reporting(
         ..ClientConfig::default()
     })
     .expect("a client builds");
-    let (producer, dispatchers) = build(config(vec![hooks]), client, Arc::new(reported));
+    let (producer, dispatchers) =
+        build(config(vec![hooks]), client, Arc::new(reported)).expect("valid fixture");
     let (stop_tx, stop_rx) = watch::channel(false);
     let running = tokio::spawn(dispatchers.run(stop_rx));
 
@@ -317,7 +318,7 @@ fn producer_ingress_is_bounded_and_never_waits_for_the_dispatcher() -> Result<()
         config(vec![hook]),
         client,
         Arc::new(crate::IgnoreHookEvents),
-    );
+    )?;
 
     hooks.deliver(&began("workshop/first", 1));
     hooks.deliver(&began("workshop/second", 2));
@@ -348,7 +349,7 @@ async fn shutdown_distinguishes_never_sent_from_unknown_outcomes() -> Result<(),
         },
         client,
         Arc::new(reported.clone()),
-    );
+    )?;
     let (stop, stopped) = watch::channel(false);
     let running = tokio::spawn(dispatchers.run(stopped));
 
@@ -550,5 +551,40 @@ async fn signed_retries_cover_the_exact_wire_body_and_stable_event_id() -> Resul
             .is_err()
         );
     }
+    Ok(())
+}
+
+#[test]
+fn invalid_destinations_fail_before_channels_are_created() -> Result<(), Box<dyn Error>> {
+    let valid = hook("127.0.0.1:1".parse()?, &[Happening::Began]);
+    let client = HttpClient::new(ClientConfig::default())?;
+    for case in 0..5 {
+        let mut invalid = valid.clone();
+        match case {
+            0 => invalid.queue_capacity = 0,
+            1 => invalid.maximum_in_flight = 0,
+            2 => invalid.maximum_attempts = 0,
+            3 => invalid.events.clear(),
+            _ => invalid.queue_capacity = usize::MAX,
+        }
+        let result = build::<Happened>(
+            config(vec![valid.clone(), invalid]),
+            client.clone(),
+            Arc::new(crate::IgnoreHookEvents),
+        );
+        assert!(
+            result.is_err(),
+            "invalid configuration {case} must not panic or start"
+        );
+    }
+    let result = build::<Happened>(
+        config(vec![valid.clone(), valid]),
+        client,
+        Arc::new(crate::IgnoreHookEvents),
+    );
+    assert_eq!(
+        result.err().map(|error| error.reason),
+        Some("duplicate destination name")
+    );
     Ok(())
 }

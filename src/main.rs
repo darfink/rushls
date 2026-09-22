@@ -328,7 +328,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let base: Arc<dyn EventObserver> = Arc::new(TracingEvents);
     let (observer, dispatchers, exported) = match resolved.hooks {
         Some(ResolvedHooks { config, client }) => {
-            let (hooks, dispatchers) = hooks::build(config, client, Events::new(Arc::clone(&base)));
+            let (hooks, dispatchers) =
+                hooks::build(config, client, Events::new(Arc::clone(&base)))?;
             (
                 Arc::new(HookObserver::new(hooks.clone(), base)) as Arc<dyn EventObserver>,
                 Some(dispatchers),

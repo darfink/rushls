@@ -176,6 +176,40 @@ pub struct HookConfig<K> {
     pub client: Option<HttpClient>,
 }
 
+/// A destination that cannot deliver must fail before any dispatcher starts.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("hook `{hook}`: {reason}")]
+pub struct ConfigError {
+    pub hook: Arc<str>,
+    pub reason: &'static str,
+}
+
+impl<K> HookConfig<K> {
+    /// Checks transport invariants independently of the application's parser.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let reason = if self.events.is_empty() {
+            Some("subscribes to no events")
+        } else if self.queue_capacity == 0 {
+            Some("queue capacity must be nonzero")
+        } else if self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+            Some("queue capacity exceeds the channel limit")
+        } else if self.maximum_in_flight == 0 {
+            Some("maximum in-flight requests must be nonzero")
+        } else if self.maximum_attempts == 0 {
+            Some("maximum attempts must be nonzero")
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => Err(ConfigError {
+                hook: self.name.clone(),
+                reason,
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Process-wide hook settings.
 #[derive(Clone, Debug)]
 pub struct HooksConfig<K> {
@@ -429,11 +463,22 @@ pub struct Dispatchers<E: Occurrence> {
 ///
 /// Split so the caller owns where the dispatchers run: they belong in the
 /// application's task set, alongside the listeners they outlive.
+/// Every destination is validated before any channel is allocated.
 pub fn build<E: Occurrence>(
     config: HooksConfig<E::Kind>,
     client: HttpClient,
     observer: Arc<dyn HookObserver<E::Kind>>,
-) -> (Hooks<E>, Dispatchers<E>) {
+) -> Result<(Hooks<E>, Dispatchers<E>), ConfigError> {
+    let mut names = BTreeSet::new();
+    for hook in &config.hooks {
+        hook.validate()?;
+        if !names.insert(hook.name.clone()) {
+            return Err(ConfigError {
+                hook: hook.name.clone(),
+                reason: "duplicate destination name",
+            });
+        }
+    }
     let dispatchers: Vec<Dispatcher<E>> = config
         .hooks
         .into_iter()
@@ -455,7 +500,7 @@ pub fn build<E: Occurrence>(
         .map(|dispatcher| Arc::clone(&dispatcher.shared))
         .collect();
 
-    (
+    Ok((
         Hooks {
             renderer: Renderer::new(config.source, config.schema_version),
             shared: Arc::new(shared),
@@ -467,5 +512,5 @@ pub fn build<E: Occurrence>(
             drain_timeout: config.drain_timeout,
             observer,
         },
-    )
+    ))
 }

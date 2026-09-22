@@ -177,22 +177,8 @@ impl ResolvesClientCert for CertificateResolver {
 /// its `SubjectPublicKeyInfo` against the leaf certificate's, so a rotation
 /// caught half-written is rejected here rather than at the next handshake.
 fn load(settings: &TlsSettings, provider: &CryptoProvider) -> Result<CertifiedKey, TlsError> {
-    let chain = CertificateDer::pem_file_iter(&settings.certificate)
-        .and_then(std::iter::Iterator::collect::<Result<Vec<_>, _>>)
-        .map_err(|source| TlsError::Unreadable {
-            path: settings.certificate.clone(),
-            source,
-        })?;
-    if chain.is_empty() {
-        return Err(TlsError::Empty {
-            path: settings.certificate.clone(),
-        });
-    }
-    let key =
-        PrivateKeyDer::from_pem_file(&settings.key).map_err(|source| TlsError::Unreadable {
-            path: settings.key.clone(),
-            source,
-        })?;
+    let chain = load_certificates(&settings.certificate)?;
+    let key = load_private_key(&settings.key)?;
     CertifiedKey::from_der(chain, key, provider).map_err(TlsError::Unusable)
 }
 
@@ -261,6 +247,11 @@ impl ClientIdentity {
 /// so it turns over on a different and far slower schedule than the leaf it
 /// signs; treating it as hot-reloadable would suggest otherwise.
 pub fn load_roots(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    load_certificates(path)
+}
+
+/// Reads a nonempty PEM chain, preserving leaf-first certificate order.
+pub fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let roots = CertificateDer::pem_file_iter(path)
         .and_then(std::iter::Iterator::collect::<Result<Vec<_>, _>>)
         .map_err(|source| TlsError::Unreadable {
@@ -273,6 +264,14 @@ pub fn load_roots(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError>
         });
     }
     Ok(roots)
+}
+
+/// Reads a PKCS#8, PKCS#1, or SEC1 PEM private key.
+pub fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
+    PrivateKeyDer::from_pem_file(path).map_err(|source| TlsError::Unreadable {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// A bound TLS listener plus the watch that keeps its certificate current.

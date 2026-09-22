@@ -140,7 +140,8 @@ async fn deliver_reporting(
         },
         client,
         reported,
-    );
+    )
+    .expect("valid hook fixture");
     let (stop_tx, stop_rx) = watch::channel(false);
     let running = tokio::spawn(dispatchers.run(stop_rx));
 
@@ -203,7 +204,8 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
         },
         client,
         Events::default(),
-    );
+    )
+    .expect("valid hook fixture");
     let observer = HookObserver::new(hooks, Arc::new(seen.clone()));
     let (stop, stopped) = watch::channel(false);
     let running = tokio::spawn(dispatchers.run(stopped));
