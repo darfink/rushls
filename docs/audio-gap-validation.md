@@ -6,12 +6,15 @@ Production GAP handling is now active for audio and declared fixed, progressive 
 The test-only activation paths and blanket playlist independence claims have been removed.
 Unsupported video mappings still reject cadence holes. Strict mode still rejects holes.
 This activation does not resolve the player failures recorded below or establish CMAF conformance.
-Earlier gate statements below describe the historical experiments.
+The [GAP player matrix](gap-player-matrix.md) records current evidence and pending checks.
+The experiment log below preserves historical results. Its gate decisions and test counts are not current release status.
 
 
-## Release decision
+## Historical experiment log
 
-The production gate remains closed. Decoder checks and completed-playlist checks do not establish safe live LL-HLS or A/V rendition behavior.
+### Initial release decision (superseded)
+
+At this stage, the production gate remained closed. Decoder checks and completed-playlist checks do not establish safe live LL-HLS or A/V rendition behavior.
 See [Audio gaps](audio-recovery.md) for the policy and reproduction commands.
 
 ## Automated checks
@@ -212,7 +215,7 @@ The JSON report includes controller state, loaded parts, playback samples, switc
 
 Completed fixtures cover the wider codec set. The new live fixture covers H.264 with AAC-LC only.
 Live HE-AAC, HE-AAC v2, and Opus checks remain outstanding.
-Do not open `AUDIO_GAP_PLAYBACK_VALIDATED` until the remaining checks pass.
+The historical activation gate was later removed. Remaining player checks are tracked in the current matrix.
 Do not substitute synthesis if a player fails to resume.
 
 ## Live fixture correction

@@ -1,5 +1,8 @@
 # GAP regression checks
 
+The [GAP player matrix](gap-player-matrix.md) lists current evidence, support limits, and the remaining execution order.
+Store generated captures under `target/rushls-validation/`; see [validation artifacts](validation-artifacts.md).
+
 These checks distinguish packaging correctness from player continuation.
 The browser results do not prove seamless concealment or perceptual A/V synchronization.
 
@@ -57,6 +60,20 @@ Keep Safari visible and click Start playback. Startup has a separate deadline.
 Use the audio-only and overlapping A/V fixtures for the remaining matrix.
 Omit --video for audio-only playback.
 The existing live probe covers ongoing publication and rendition switching; completed fixtures cannot replace it.
+The probe records every scheduled switch, including requests that never occur or cannot select a track.
+A switch requires a distinct previous selection and a matching event after the request.
+An event after the next request for that media kind cannot satisfy the earlier request.
+If ABR already selected the planned video target, the probe requests the other variant and records the actual target.
+For hls.js isolation, use `--fixed-level 0 --switches none --trace-endlist`.
+The trace retains playlist response text, load events, and fragment-selection decisions.
+It records a dropped-entry count if its 6,000-entry limit is exceeded.
+A pinned run requires observed selection of the requested variant without another variant transition.
+These diagnostics use hls.js internals. Check them again when changing the tested player version.
+Native Safari runs use `--switches audio`. Unsupported native video switches cannot count as passing checks.
+Run the probe regressions with:
+
+    python3 -m unittest discover -s tools -p 'test*playback.py'
+
 
 Track the Safari video-only failure separately:
 

@@ -21,7 +21,8 @@ Complete these checks before a broad production rollout:
   and blocking reloads across successor publication and rendition retirement.
 - [ ] Complete the supported codec/player matrix for startup, seeking, live playback,
   and rendition switching around GAPs. Record transient freezes and skips separately
-  from persistent stalls. Use the [GAP regression checks](docs/gap-regressions.md).
+  from persistent stalls. Track results in the [player matrix](docs/gap-player-matrix.md)
+  and use the [GAP regression checks](docs/gap-regressions.md).
 - [ ] Aggregate hook failure logs into unhealthy/recovered transitions and periodic
   totals. Preserve per-event counters. Include a rejecting endpoint under
   `segment.ready` traffic in the load tests.

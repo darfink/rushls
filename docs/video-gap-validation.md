@@ -6,8 +6,11 @@ Production GAP handling is now active for audio and declared fixed, progressive 
 The test-only activation paths and blanket playlist independence claims have been removed.
 Unsupported video mappings still reject cadence holes. Strict mode still rejects holes.
 This activation does not resolve the player failures recorded below or establish CMAF conformance.
-Earlier gate statements below describe the historical experiments.
+The [GAP player matrix](gap-player-matrix.md) records current evidence and pending checks.
+The experiment log below preserves historical results. Its gate decisions and test counts are not current release status.
 
+
+## Historical experiment log
 
 Date: 2026-09-20.
 
@@ -15,7 +18,7 @@ This experiment supports exact video GAPs as a limited permissive-mode option.
 Chrome with unmodified hls.js continued after a missing reference picture.
 Native Safari ended prematurely in video-only tests. With continuous alternate audio, the exact GAP completed without a discontinuity.
 See the independent-control follow-up below; the video-only result does not establish a general discontinuity requirement.
-Production video normalization and release gates remain unchanged.
+At this stage, the experiment did not change production normalization or release gates.
 
 ## Fixture and packaging
 
