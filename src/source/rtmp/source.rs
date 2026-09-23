@@ -191,7 +191,11 @@ impl PacketSource for RtmpPacketSource {
                     if events == self.limits.maximum_packets_per_batch {
                         // Non-media tags must not monopolize a worker while
                         // the publisher continuously refills the queue.
-                        tokio::task::yield_now().await;
+                        // Once packets are appended, return without yielding:
+                        // a caller may cancel a pending fill and discard its batch.
+                        if packets == 0 {
+                            tokio::task::yield_now().await;
+                        }
                         break;
                     }
                     events += 1;
@@ -518,13 +522,13 @@ impl CatalogBuilder {
 
     fn freeze(&mut self) -> Result<DiscoveryReport, SourceError> {
         let mut tracks = self.tracks.clone();
+        if let Some(track) = self.text.clone() {
+            tracks.push(track);
+        }
         if let Some(metadata) = &self.metadata {
             for track in &mut tracks {
                 super::metadata::apply(track, metadata);
             }
-        }
-        if let Some(track) = self.text.clone() {
-            tracks.push(track);
         }
         if tracks.is_empty() {
             return Err(SourceError::Demux(
@@ -909,6 +913,40 @@ mod tests {
             .await
             .expect_err("coded frames need a sequence header");
         assert!(error.to_string().contains("sequence header"), "{error}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_full_media_batch_returns_before_a_cancellation_point() -> Result<(), SourceError> {
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let (reader, writer) = channel(nz::usize!(64 * 1024));
+        writer
+            .send(video_config(crate::mux::fixtures::H264_EXTRADATA))
+            .await
+            .expect("config queues");
+        writer
+            .send(video_sample(0, crate::mux::fixtures::H264_IDR))
+            .await
+            .expect("sample queues");
+        let mut limits = InputLimits::permissive();
+        limits.maximum_packets_per_batch = 1;
+        let mut source = RtmpPacketSource::new(reader, limits, meters.source_view())?;
+        source.discover(discovery_limits()).await?;
+        source.fill(&mut Vec::new()).await?;
+        writer
+            .send(video_sample(33, crate::mux::fixtures::H264_IDR))
+            .await
+            .expect("sample queues");
+        let mut packets = Vec::new();
+        let outcome = {
+            let mut fill = source.fill(&mut packets);
+            std::future::poll_fn(|cx| std::task::Poll::Ready(fill.as_mut().poll(cx))).await
+        };
+        assert!(
+            matches!(outcome, std::task::Poll::Ready(Ok(_))),
+            "a completed batch must not become cancellable"
+        );
+        assert_eq!(packets.len(), 1);
         Ok(())
     }
 

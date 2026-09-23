@@ -8,7 +8,12 @@ pub fn apply(track: &mut DiscoveredTrack, metadata: &ParsedMetadata) {
     let (tracks, language, title) = match track.kind() {
         MediaKind::Audio => (&metadata.audio_tracks, "audiolanguage", "audiotitle"),
         MediaKind::Video => (&metadata.video_tracks, "videolanguage", "videotitle"),
-        MediaKind::Subtitle => return,
+        MediaKind::Subtitle => {
+            // Script captions have no Enhanced RTMP track-id map. Their
+            // language is the publication-wide language supplied by the encoder.
+            track.language = text(&metadata.properties, "language");
+            return;
+        }
     };
     let numbered = track
         .source_key
