@@ -1,0 +1,35 @@
+name: Renew Apple HLS certificate
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-hls-certificate-renewal
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install certificate tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y certbot dnsutils
+      - name: Check expiry and renew when needed
+        env:
+          LOCALCERT_CREDENTIALS: ${{ secrets.LOCALCERT_CREDENTIALS }}
+          APPLE_HLS_ACME_ACCOUNT: ${{ secrets.APPLE_HLS_ACME_ACCOUNT }}
+          APPLE_HLS_TLS: ${{ secrets.APPLE_HLS_TLS }}
+          APPLE_HLS_TLS_HOST: ${{ vars.APPLE_HLS_TLS_HOST }}
+          GH_TOKEN: ${{ secrets.CERT_RENEWAL_GH_TOKEN }}
+        run: python3 tools/renew-apple-hls-cert.py
