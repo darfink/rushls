@@ -110,12 +110,14 @@ fn load() -> Result<Option<Arc<SharedHttps>>, Box<dyn std::error::Error + Send +
     )?)))
 }
 
-fn tls_version(name: &str) -> Result<cc_tls::TlsVersion, Box<dyn std::error::Error + Send + Sync>> {
+fn tls_version(
+    name: &str,
+) -> Result<rushls_tls::TlsVersion, Box<dyn std::error::Error + Send + Sync>> {
     match std::env::var(name) {
         Ok(value) => value
             .parse()
             .map_err(|error| format!("{name}: {error}").into()),
-        Err(std::env::VarError::NotPresent) => Ok(cc_tls::TlsVersion::Tls13),
+        Err(std::env::VarError::NotPresent) => Ok(rushls_tls::TlsVersion::Tls13),
         Err(error) => Err(error.into()),
     }
 }

@@ -1,4 +1,4 @@
-# cc-config
+# rushls-config
 
 Configuration loading independent of application policy. Application schemas use
 `conf::Conf` with Serde support. The loader owns file discovery, interpolation,
@@ -9,7 +9,7 @@ source precedence, environment warnings, and source metadata.
 ```rust
 use std::path::PathBuf;
 use conf::Conf;
-use cc_config::{Loader, SecretString};
+use rushls_config::{Loader, SecretString};
 
 #[derive(Conf)]
 #[conf(serde, name = "example", env_prefix = "EXAMPLE_")]
@@ -92,7 +92,7 @@ when another source overrides the field.
 
 Secret fields use `#[conf(env, secret)]` and `SecretString` for redacted Debug
 output and Serde type errors. Existing string fields can use
-`serde(deserialize_with = "cc_config::deserialize_secret")` for error redaction. `conf` disallows inline CLI arguments on fields marked secret.
+`serde(deserialize_with = "rushls_config::deserialize_secret")` for error redaction. `conf` disallows inline CLI arguments on fields marked secret.
 Applications expose CLI file paths instead and resolve credentials with
 `resolve_optional_text_secret`.
 
@@ -112,5 +112,5 @@ This crate depends on parsing and filesystem libraries. It has no dependency
 on HTTP, hooks, TLS, or the application.
 
 ```sh
-cargo test -p cc-config --locked
+cargo test -p rushls-config --locked
 ```

@@ -1,6 +1,6 @@
 //! What this node promises consumers, as distinct from how delivery works.
 //!
-//! Ordering, overflow, retry, and the drain are `cc-hooks`' contract and are
+//! Ordering, overflow, retry, and the drain are `rushls-hooks`' contract and are
 //! tested there against a vocabulary belonging to no application. What is left
 //! here is the part a fork of this node would have to keep: the event names on
 //! the wire, the shape of each payload, and the fact that projecting a real
@@ -376,7 +376,7 @@ fn timestamp_issue_hook_preserves_exact_ticks_and_is_absent_for_other_failures()
     use crate::domain::{
         Codec, MediaKind, Timebase, TimestampField, TimestampIssue, TimestampIssueCode, TrackId,
     };
-    use cc_hooks::Occurrence;
+    use rushls_hooks::Occurrence;
     let mut ended = lifecycle::SessionEnded {
         compensation: Vec::new(),
         stream: StreamId::new("live/camera"),
@@ -427,7 +427,7 @@ fn recovery_hooks_preserve_exact_values_and_only_emit_episode_transitions()
         Codec, CompensationStatus, NormalizationNotice, RecoveryMethod, RecoveryTransition,
         Timebase, TrackId,
     };
-    use cc_hooks::Occurrence;
+    use rushls_hooks::Occurrence;
     let projector = Projector::new();
     let session = SessionId(nz::u64!(1));
     projector.project(

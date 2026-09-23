@@ -4,7 +4,7 @@ use std::{error::Error, process::Command};
 
 pub fn cli_contract(binary: &str, prefix: &str) -> Result<(), Box<dyn Error>> {
     let missing = std::env::temp_dir()
-        .join(format!("cc-config-absent-{}", std::process::id()))
+        .join(format!("rushls-config-absent-{}", std::process::id()))
         .join("absent.toml");
     let config_var = format!("{prefix}CONFIG");
     let typo_var = format!("{prefix}UNKNOWN_CONFIG_OPTION");

@@ -1,5 +1,5 @@
 [package]
-name = "cc-hooks"
+name = "rushls-hooks"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ description = "Best-effort, per-subject-ordered delivery of lifecycle events to 
 ring = "0.17"
 base64 = "0.22"
 bytes.workspace = true
-cc-outbound.workspace = true
+rushls-outbound.workspace = true
 # Redacts the bearer token from `Debug`, so a credential cannot reach a log
 # through a derived formatter.
 derive_more.workspace = true

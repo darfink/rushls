@@ -1,11 +1,11 @@
 [package]
-name = "cc-config"
+name = "rushls-config"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Shared configuration loading for Crowdcast applications"
+description = "Configuration loading for Rushls"
 
 [dependencies]
 conf.workspace = true

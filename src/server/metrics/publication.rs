@@ -7,7 +7,7 @@ use crate::{
     domain::StreamId,
     observe::{Operation, OperationOutcome, OperationSnapshot},
 };
-use cc_metrics::escape_label;
+use rushls_metrics::escape_label;
 
 pub fn totals(output: &mut Samples, totals: &PublicationTotalSnapshot) {
     output.counter(

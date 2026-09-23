@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use cc_tls::CertificateWatch;
+use rushls_tls::CertificateWatch;
 use rustls::ServerConfig;
 use tokio::task::JoinHandle;
 use web_transport_quinn::http::StatusCode;
@@ -37,7 +37,7 @@ pub struct MoqConfig {
     pub idle_timeout: Option<Duration>,
     /// Unauthenticated SETUP/CONNECT budget, derived from [`Self::idle_timeout`].
     pub handshake_timeout: Duration,
-    pub tls: Option<cc_tls::TlsSettings>,
+    pub tls: Option<rushls_tls::TlsSettings>,
     pub input_limits: InputLimits,
 }
 

@@ -282,7 +282,7 @@ fn a_missing_config_file_is_an_error() -> Result<(), Box<dyn Error>> {
         .err()
         .ok_or("a missing --config path must fail")?;
     assert!(
-        matches!(error, ConfigError::Loading(cc_config::ConfigError::Read { ref path, .. }) if *path == missing),
+        matches!(error, ConfigError::Loading(rushls_config::ConfigError::Read { ref path, .. }) if *path == missing),
         "unexpected error: {error}"
     );
     Ok(())
@@ -601,7 +601,7 @@ token_file = "{}"
     assert!(matches!(
         result,
         Err(ConfigError::Loading(
-            cc_config::ConfigError::SecretConflict(_)
+            rushls_config::ConfigError::SecretConflict(_)
         ))
     ));
     Ok(())
@@ -1601,7 +1601,7 @@ max_handshakes = 32
 
 #[test]
 fn tls_version_bounds_resolve_and_reject_invalid_ranges() -> Result<(), Box<dyn Error>> {
-    use cc_tls::TlsVersion::{Tls12, Tls13};
+    use rushls_tls::TlsVersion::{Tls12, Tls13};
     let certificate = TempConfig::new("certificate")?;
     let key = TempConfig::new("key")?;
     let base = format!(

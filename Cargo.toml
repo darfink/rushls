@@ -12,17 +12,17 @@ readme = "README.md"
 allocation-counting = []
 
 [dependencies]
-cc-config.workspace = true
+rushls-config.workspace = true
 # `chrono` only for operator-facing strftime patterns in `record.pattern`:
 # validation via `StrftimeItems` and formatting with `%Y/%m/%d` vocabulary.
 # `time` (workspace) stays the runtime clock; its formatting syntax is
 # different, so it cannot validate strftime strings.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-cc-hooks.workspace = true
-cc-metrics.workspace = true
-cc-outbound.workspace = true
+rushls-hooks.workspace = true
+rushls-metrics.workspace = true
+rushls-outbound.workspace = true
 rtmpx.workspace = true
-cc-tls = { workspace = true, features = ["axum"] }
+rushls-tls = { workspace = true, features = ["axum"] }
 arc-swap = "1"
 derive_more = { version = "2", features = ["debug", "deref", "display"] }
 bytes = "1.12.1"
@@ -131,12 +131,12 @@ publish = false
 # Common dependency versions for the application and its infrastructure crates.
 [workspace.dependencies]
 # Internal
-cc-config = { path = "crates/cc-config" }
-cc-outbound = { path = "crates/cc-outbound" }
-cc-hooks = { path = "crates/cc-hooks" }
+rushls-config = { path = "crates/rushls-config" }
+rushls-outbound = { path = "crates/rushls-outbound" }
+rushls-hooks = { path = "crates/rushls-hooks" }
 rtmpx = "3.1"
-cc-tls = { path = "crates/cc-tls" }
-cc-metrics = { path = "crates/cc-metrics" }
+rushls-tls = { path = "crates/rushls-tls" }
+rushls-metrics = { path = "crates/rushls-metrics" }
 
 # External
 conf = "0.4"

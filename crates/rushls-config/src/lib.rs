@@ -234,7 +234,7 @@ impl Loader {
         if let Ok(cwd) = std::env::current_dir() {
             paths.push(cwd.join(&filename));
         }
-        if let Some(dirs) = directories::ProjectDirs::from("com", "crowdcast", self.name) {
+        if let Some(dirs) = directories::ProjectDirs::from("", "", self.name) {
             for directory in [dirs.config_local_dir(), dirs.config_dir()] {
                 let path = directory.join(&filename);
                 if !paths.contains(&path) {

@@ -626,7 +626,7 @@ mod tests {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let unique = NEXT.fetch_add(1, Ordering::Relaxed);
         let directory =
-            std::env::temp_dir().join(format!("cc-tls-{name}-{}-{unique}", std::process::id()));
+            std::env::temp_dir().join(format!("rushls-tls-{name}-{}-{unique}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).expect("the scratch directory is created");
         directory

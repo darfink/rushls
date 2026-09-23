@@ -5,13 +5,13 @@ All five crates are direct application dependencies. Cargo resolves their versio
 
 | Crate | Responsibility |
 | --- | --- |
-| `cc-config` | TOML discovery, interpolation, environment and CLI overrides, secret files, and source diagnostics |
-| `cc-outbound` | HTTP connection pools, credentials, deadlines, and response limits |
-| `cc-hooks` | Lifecycle envelopes, signing, ordering, retries, and bounded delivery queues |
-| `cc-tls` | PEM loading, certificate rotation, client identities, and TLS listeners |
-| `cc-metrics` | Metrics credentials and Prometheus label escaping |
+| `rushls-config` | TOML discovery, interpolation, environment and CLI overrides, secret files, and source diagnostics |
+| `rushls-outbound` | HTTP connection pools, credentials, deadlines, and response limits |
+| `rushls-hooks` | Lifecycle envelopes, signing, ordering, retries, and bounded delivery queues |
+| `rushls-tls` | PEM loading, certificate rotation, client identities, and TLS listeners |
+| `rushls-metrics` | Metrics credentials and Prometheus label escaping |
 
-`cc-hooks` depends on `cc-outbound`. Admission and JWKS requests use HTTP transport
+`rushls-hooks` depends on `rushls-outbound`. Admission and JWKS requests use HTTP transport
 without hook delivery. Separate crates keep those dependencies explicit.
 
 The application owns its configuration schema and semantic validation.
@@ -26,5 +26,5 @@ The RTMP protocol implementation comes from the `rtmpx` registry dependency.
 The application uses `rsrt` for SRT and Rust media libraries for demuxing and packaging.
 
 Shared configuration startup assertions live in
-[`crates/cc-config/tests/support/fixtures.rs`](../crates/cc-config/tests/support/fixtures.rs).
+[`crates/rushls-config/tests/support/fixtures.rs`](../crates/rushls-config/tests/support/fixtures.rs).
 Application integration tests call those assertions against the built executable.

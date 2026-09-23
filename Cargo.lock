@@ -377,7 +377,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cc-config"
+name = "rushls-config"
 version = "0.1.0"
 dependencies = [
  "bytesize",
@@ -391,13 +391,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "cc-hooks"
+name = "rushls-hooks"
 version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
- "cc-outbound",
+ "rushls-outbound",
  "derive_more",
  "http",
  "parking_lot",
@@ -411,14 +411,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "cc-metrics"
+name = "rushls-metrics"
 version = "0.1.0"
 dependencies = [
  "subtle",
 ]
 
 [[package]]
-name = "cc-outbound"
+name = "rushls-outbound"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -435,7 +435,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cc-tls"
+name = "rushls-tls"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
@@ -2364,11 +2364,11 @@ dependencies = [
  "bytesize",
  "cap-fs-ext",
  "cap-std",
- "cc-config",
- "cc-hooks",
- "cc-metrics",
- "cc-outbound",
- "cc-tls",
+ "rushls-config",
+ "rushls-hooks",
+ "rushls-metrics",
+ "rushls-outbound",
+ "rushls-tls",
  "chrono",
  "conf",
  "derive_more",

@@ -54,7 +54,7 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use cc_outbound::{BearerToken, Endpoint, HttpClient};
+use rushls_outbound::{BearerToken, Endpoint, HttpClient};
 
 pub use envelope::{CONTENT_TYPE, Envelope, RenderError, Renderer};
 

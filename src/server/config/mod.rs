@@ -17,9 +17,9 @@ use std::{
 };
 
 use crate::source::transport::rtmp::RtmpTimeouts;
-use cc_config::{ByteSize, ConfigSearch, Loader};
-use cc_tls::{ClientIdentity, TlsVersion, load_roots};
 use conf::Conf;
+use rushls_config::{ByteSize, ConfigSearch, Loader};
+use rushls_tls::{ClientIdentity, TlsVersion, load_roots};
 use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use thiserror::Error;
@@ -92,9 +92,9 @@ pub struct ResolvedHooks {
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error(transparent)]
-    Loading(#[from] cc_config::ConfigError),
+    Loading(#[from] rushls_config::ConfigError),
     #[error("could not build outbound client: {0}")]
-    Outbound(#[from] cc_outbound::OutboundError),
+    Outbound(#[from] rushls_outbound::OutboundError),
     #[error("invalid configuration: {0}")]
     Invalid(String),
     #[error("invalid SRT encryption configuration: {0}")]
@@ -106,7 +106,7 @@ impl ConfigError {
     /// exit status. In particular, `--help` and `--version` remain successful.
     pub fn exit(self) -> ! {
         match self {
-            Self::Loading(cc_config::ConfigError::Sources(error)) => error.exit(),
+            Self::Loading(rushls_config::ConfigError::Sources(error)) => error.exit(),
             // Configuration is resolved before a `Node` exists, so this cannot
             // use the observer. The binary initializes tracing before loading
             // configuration, which keeps this startup diagnostic timestamped.
@@ -364,7 +364,7 @@ pub struct ServerAppConfig {
         long,
         env,
         default_value = "10s",
-        value_parser = cc_config::parse_duration,
+        value_parser = rushls_config::parse_duration,
         serde(use_value_parser)
     )]
     pub shutdown: Duration,
@@ -397,7 +397,7 @@ pub struct PlaybackAuthAppConfig {
         parameter,
         env,
         secret,
-        serde(deserialize_with = "cc_config::deserialize_secret")
+        serde(deserialize_with = "rushls_config::deserialize_secret")
     )]
     public_key: Option<String>,
     #[conf(parameter, long, env)]
@@ -408,7 +408,7 @@ pub struct PlaybackAuthAppConfig {
         parameter,
         env,
         secret,
-        serde(deserialize_with = "cc_config::deserialize_secret")
+        serde(deserialize_with = "rushls_config::deserialize_secret")
     )]
     secret: Option<String>,
     #[conf(parameter, long, env)]
@@ -420,7 +420,7 @@ pub struct PlaybackAuthAppConfig {
         long,
         env,
         default_value = "30s",
-        value_parser = cc_config::parse_duration,
+        value_parser = rushls_config::parse_duration,
         serde(use_value_parser)
     )]
     leeway: Duration,
@@ -509,7 +509,7 @@ pub struct HttpAuthAppConfig {
         long,
         env,
         default_value = "2s",
-        value_parser = cc_config::parse_duration,
+        value_parser = rushls_config::parse_duration,
         serde(use_value_parser)
     )]
     timeout: Duration,
@@ -521,7 +521,7 @@ pub struct HttpAuthAppConfig {
         parameter,
         env,
         secret,
-        serde(deserialize_with = "cc_config::deserialize_secret")
+        serde(deserialize_with = "rushls_config::deserialize_secret")
     )]
     token: Option<String>,
     /// File containing the bearer credential presented to the service.
@@ -694,11 +694,11 @@ pub struct HookEndpointAppConfig {
     #[serde(default = "default_max_attempts")]
     max_attempts: u32,
     /// Bearer credential presented to this endpoint.
-    #[serde(default, deserialize_with = "cc_config::deserialize_secret")]
+    #[serde(default, deserialize_with = "rushls_config::deserialize_secret")]
     token: Option<String>,
     /// Reads the bearer credential from a mounted secret instead.
     token_file: Option<PathBuf>,
-    #[serde(default, deserialize_with = "cc_config::deserialize_secret")]
+    #[serde(default, deserialize_with = "rushls_config::deserialize_secret")]
     signing_secret: Option<String>,
     signing_secret_file: Option<PathBuf>,
     /// Path to a PEM certificate chain this node presents to this endpoint.
@@ -746,7 +746,7 @@ impl HookEndpointAppConfig {
             self.signing_secret.as_ref(),
             self.signing_secret_file.as_ref(),
         )?
-        .map(|secret| cc_hooks::SigningSecret::parse(&secret))
+        .map(|secret| rushls_hooks::SigningSecret::parse(&secret))
         .transpose()
         .map_err(|error| invalid(error.to_string()))?;
 
@@ -831,7 +831,7 @@ impl OutboundTlsAppConfig {
                 ClientIdentity::new(
                     certificate.clone(),
                     key.clone(),
-                    Arc::new(cc_tls::IgnoreTlsEvents),
+                    Arc::new(rushls_tls::IgnoreTlsEvents),
                 )
                 .map_err(|error| invalid(format!("{label}: {error}")))?,
             ),
@@ -1190,7 +1190,7 @@ pub struct CeilingAppConfig {
         parameter,
         long,
         env,
-        value_parser = cc_config::parse_duration,
+        value_parser = rushls_config::parse_duration,
         serde(use_value_parser)
     )]
     burst: Option<Duration>,
@@ -1237,7 +1237,7 @@ pub struct FloorAppConfig {
         parameter,
         long,
         env,
-        value_parser = cc_config::parse_duration,
+        value_parser = rushls_config::parse_duration,
         serde(use_value_parser)
     )]
     window: Duration,
@@ -1774,7 +1774,7 @@ pub struct SrtAppConfig {
         long,
         env,
         default_value = "120ms",
-        value_parser = cc_config::parse_duration,
+        value_parser = rushls_config::parse_duration,
         serde(use_value_parser)
     )]
     latency: Duration,
@@ -1794,7 +1794,7 @@ pub struct SrtAppConfig {
         long,
         env,
         default_value = "5s",
-        value_parser = cc_config::parse_duration,
+        value_parser = rushls_config::parse_duration,
         serde(use_value_parser)
     )]
     timeout: Duration,
@@ -1803,7 +1803,7 @@ pub struct SrtAppConfig {
         parameter,
         env,
         secret,
-        serde(deserialize_with = "cc_config::deserialize_secret")
+        serde(deserialize_with = "rushls_config::deserialize_secret")
     )]
     passphrase: Option<String>,
     /// File containing the optional SRT passphrase.
@@ -2003,7 +2003,7 @@ pub struct HlsAppConfig {
 #[conf(serde)]
 pub struct HlsSegmentConfig {
     /// Preferred segment cadence.
-    #[conf(parameter, long, env, default_value = "6s", value_parser = cc_config::parse_duration, serde(use_value_parser))]
+    #[conf(parameter, long, env, default_value = "6s", value_parser = rushls_config::parse_duration, serde(use_value_parser))]
     target: Duration,
     /// Maximum segment ceiling, including rounding and both jitter endpoints.
     #[conf(parameter, long, env, default_value = "2x", value_parser = parse_duration_rule, serde(use_value_parser))]
@@ -2017,7 +2017,7 @@ pub struct HlsSegmentConfig {
 #[conf(serde)]
 pub struct HlsPartConfig {
     /// Preferred advertised partial-segment target.
-    #[conf(parameter, long, env, default_value = "1s", value_parser = cc_config::parse_duration, serde(use_value_parser))]
+    #[conf(parameter, long, env, default_value = "1s", value_parser = rushls_config::parse_duration, serde(use_value_parser))]
     target: Duration,
     /// Largest part target admission may select; runtime never enlarges it.
     #[conf(parameter, long, env, default_value = "2x", value_parser = parse_duration_rule, serde(use_value_parser))]
@@ -2272,7 +2272,7 @@ pub struct CorsAppConfig {
         long,
         env,
         default_value = "10min",
-        value_parser = cc_config::parse_duration,
+        value_parser = rushls_config::parse_duration,
         serde(use_value_parser)
     )]
     max_age: Duration,
@@ -2325,7 +2325,7 @@ pub struct TlsAppConfig {
         long,
         env,
         default_value = "5s",
-        value_parser = cc_config::parse_duration,
+        value_parser = rushls_config::parse_duration,
         serde(use_value_parser)
     )]
     handshake_timeout: Duration,
@@ -2394,7 +2394,7 @@ pub struct MetricsAppConfig {
         parameter,
         env,
         secret,
-        serde(deserialize_with = "cc_config::deserialize_secret")
+        serde(deserialize_with = "rushls_config::deserialize_secret")
     )]
     token: Option<String>,
     /// File containing the optional metrics bearer token.
@@ -2616,7 +2616,7 @@ fn resolve_optional_text_secret(
     inline: Option<&String>,
     file: Option<&PathBuf>,
 ) -> Result<Option<String>, ConfigError> {
-    cc_config::resolve_optional_text_secret(
+    rushls_config::resolve_optional_text_secret(
         label,
         inline.map(String::as_str),
         file.map(PathBuf::as_path),

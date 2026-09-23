@@ -21,7 +21,7 @@ use axum::{Router, body::Bytes, extract::State, http::StatusCode, routing::post}
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
-use cc_outbound::{ClientConfig, Endpoint, HttpClient};
+use rushls_outbound::{ClientConfig, Endpoint, HttpClient};
 
 use crate::{
     HookConfig, HookObserver, HooksConfig, Loss, Occurrence, Queue, Renderer, Subject, build,
@@ -509,7 +509,7 @@ async fn signed_retries_cover_the_exact_wire_body_and_stable_event_id() -> Resul
         "whsec_{}",
         STANDARD.encode([7; 32])
     ))?);
-    destination.bearer = Some(cc_outbound::BearerToken::new("shared-token")?);
+    destination.bearer = Some(rushls_outbound::BearerToken::new("shared-token")?);
     deliver(destination, &[began("camera", 1)], 2, &recorder).await;
     let wire = recorder.wire.lock();
     assert_eq!(wire.len(), 2);

@@ -399,7 +399,7 @@ operator-run service as the admission one, reached over the same networks, so
 the shape is identical rather than merely similar.
 
 What made this a dispatcher change rather than a configuration field is that
-`cc-hooks` held *one* client for every destination. `HookConfig` now carries an
+`rushls-hooks` held *one* client for every destination. `HookConfig` now carries an
 optional client of its own, and the dispatcher prefers it over the shared one.
 Optional rather than required because the default is worth keeping: a node with
 four plain endpoints reads the platform trust store once and shares one

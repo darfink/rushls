@@ -1092,7 +1092,7 @@ open namespace, and there is no flag for a name chosen at runtime.
 
 ## Configuration mechanics
 
-Rushls uses `cc-config` for source loading, interpolation, and
+Rushls uses `rushls-config` for source loading, interpolation, and
 file discovery. Unknown `RUSHLS_` environment variables produce startup warnings
 and are ignored as configuration overrides. Warnings include names, never values.
 Variables outside that prefix produce no warning. All environment variables remain
@@ -1131,6 +1131,10 @@ Which **file** is loaded is a separate walk, first match wins:
 3. `./rushls.toml` in the working directory
 4. the platform local config directory (`rushls.toml`)
 5. the platform config directory (`rushls.toml`)
+
+Platform directories use the application name `rushls`, without an organization prefix.
+If an earlier build stored configuration elsewhere, move the file or select it with `--config`.
+Set `capacity.dir` to keep an existing custom DVR location.
 
 The process logs the path it used, or that it used compiled defaults.
 

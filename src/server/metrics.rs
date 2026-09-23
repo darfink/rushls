@@ -3,7 +3,7 @@ mod publication;
 
 use std::{fmt::Write, net::SocketAddr, sync::Arc, time::Duration};
 
-use cc_metrics::escape_label;
+use rushls_metrics::escape_label;
 
 use crate::{
     delivery::hls::{RetentionDepth, StreamStore},
@@ -17,7 +17,7 @@ use crate::{
     session::{Registry, SessionSnapshot},
 };
 
-pub use cc_metrics::MetricsToken;
+pub use rushls_metrics::MetricsToken;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MetricsConfig {

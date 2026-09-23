@@ -73,7 +73,7 @@ read secret files, or start listeners. Output matches the installed binary versi
 `rushls.toml` is the short starter; `rushls.example.toml` is the complete annotated example.
 
 See the [configuration guide](docs/config.md) and the
-[configuration loader contract](crates/cc-config/README.md).
+[configuration loader contract](crates/rushls-config/README.md).
 
 ## Container
 

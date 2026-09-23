@@ -2,7 +2,7 @@
 //!
 //! The delivery machinery — CloudEvents rendering, per-stream ordering,
 //! drop-oldest overflow, retry, and the bounded drain at shutdown — lives in
-//! `cc-hooks`. What stays here is everything that
+//! `rushls-hooks`. What stays here is everything that
 //! is about *this* node: which facts it promises, how a stream is spelled as a
 //! subject, what each event carries, and how delivery failures are reported
 //! through the observer the rest of the process already uses.
@@ -16,7 +16,7 @@ mod tests;
 
 use std::sync::Arc;
 
-use cc_hooks::{HookObserver as HookReporter, Loss, Occurrence};
+use rushls_hooks::{HookObserver as HookReporter, Loss, Occurrence};
 
 use crate::{
     domain::{SessionId, StreamId},
@@ -27,15 +27,17 @@ use crate::{
     },
 };
 
-pub use cc_hooks::{CONTENT_TYPE, Envelope, HookSnapshot, Loss as HookLoss, RenderError, Renderer};
+pub use rushls_hooks::{
+    CONTENT_TYPE, Envelope, HookSnapshot, Loss as HookLoss, RenderError, Renderer,
+};
 
 /// This node's hooks, with its own event vocabulary bound in.
-pub type Hooks = cc_hooks::Hooks<Event>;
-pub type Dispatchers = cc_hooks::Dispatchers<Event>;
-pub type HookConfig = cc_hooks::HookConfig<lifecycle::Kind>;
-pub type HooksConfig = cc_hooks::HooksConfig<lifecycle::Kind>;
+pub type Hooks = rushls_hooks::Hooks<Event>;
+pub type Dispatchers = rushls_hooks::Dispatchers<Event>;
+pub type HookConfig = rushls_hooks::HookConfig<lifecycle::Kind>;
+pub type HooksConfig = rushls_hooks::HooksConfig<lifecycle::Kind>;
 
-impl cc_hooks::Subject for StreamId {
+impl rushls_hooks::Subject for StreamId {
     fn as_str(&self) -> &str {
         &self.0
     }
@@ -226,7 +228,7 @@ impl HookReporter<lifecycle::Kind> for HookEvents {
 // configured, and are filled in by `Hooks::snapshots` from the config rather
 // than read from a counter.
 //
-// Declared here rather than in `cc-hooks` because the names are this node's
+// Declared here rather than in `rushls-hooks` because the names are this node's
 // metric contract: the shared crate exports the numbers, and each application
 // decides what to call them.
 series! {
@@ -330,14 +332,14 @@ impl EventObserver for HookObserver {
 
 /// Builds the enqueue side and the dispatchers that drain it.
 ///
-/// Thin over [`cc_hooks::build`], binding this node's event vocabulary and
+/// Thin over [`rushls_hooks::build`], binding this node's event vocabulary and
 /// routing the subsystem's own failures into `events`.
 pub fn build(
     config: HooksConfig,
     client: crate::outbound::HttpClient,
     events: Events,
-) -> Result<(Hooks, Dispatchers), cc_hooks::ConfigError> {
-    cc_hooks::build(config, client, Arc::new(HookEvents::new(events)))
+) -> Result<(Hooks, Dispatchers), rushls_hooks::ConfigError> {
+    rushls_hooks::build(config, client, Arc::new(HookEvents::new(events)))
 }
 
 fn cadence_data(cadence: crate::domain::VideoCadence) -> serde_json::Value {

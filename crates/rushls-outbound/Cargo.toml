@@ -1,5 +1,5 @@
 [package]
-name = "cc-outbound"
+name = "rushls-outbound"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true

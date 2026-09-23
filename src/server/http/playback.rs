@@ -17,11 +17,11 @@ use std::{
 
 use arc_swap::ArcSwap;
 use axum::http::{HeaderMap, StatusCode, header};
-use cc_metrics::bearer_token;
 use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
     jwk::{AlgorithmParameters, EllipticCurve, Jwk, JwkSet, KeyAlgorithm},
 };
+use rushls_metrics::bearer_token;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::task::AbortHandle;

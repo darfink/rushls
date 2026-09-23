@@ -1,4 +1,4 @@
-#[path = "../crates/cc-config/tests/support/fixtures.rs"]
+#[path = "../crates/rushls-config/tests/support/fixtures.rs"]
 mod fixtures;
 
 #[test]
