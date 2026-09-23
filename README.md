@@ -17,9 +17,9 @@ for protocol details and remaining work.
 
 ## Releases and platform support
 
-Tagged releases provide native Linux and macOS archives for AMD64 and ARM64, with SHA-256 checksums.
+Tagged releases provide native Linux and macOS archives for AMD64 and ARM64, plus a Windows AMD64 ZIP, with SHA-256 checksums.
 See [release procedures and platform requirements](docs/releases.md).
-Windows is not currently supported because recording and disk retention use Unix APIs.
+Windows builds use the same recording confinement and retention ownership checks. See the release guide for filesystem requirements and durability differences.
 
 Chrome's required compatibility check currently uses a local hls.js correction pending upstream submission.
 The official hls.js failure also affects valid media; see [player compatibility](docs/releases.md#player-compatibility).

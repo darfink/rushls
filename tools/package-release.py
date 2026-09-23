@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import tarfile
@@ -13,6 +14,7 @@ import tempfile
 import time
 import tomllib
 import urllib.request
+import zipfile
 
 
 def port(kind=socket.SOCK_STREAM):
@@ -22,7 +24,7 @@ def port(kind=socket.SOCK_STREAM):
 
 
 def smoke(root, version):
-    binary = root / 'rushls'
+    binary = root / ('rushls.exe' if os.name == 'nt' else 'rushls')
     env = {k: v for k, v in os.environ.items() if not k.startswith('RUSHLS_')}
     actual = subprocess.check_output([str(binary), '--version'], env=env, text=True)
     if f' {version} (' not in actual:
@@ -38,7 +40,8 @@ def smoke(root, version):
                           f'[srt]\nlisten = "127.0.0.1:{port(socket.SOCK_DGRAM)}"\n')
         with (root / 'smoke.log').open('w') as log:
             process = subprocess.Popen([str(binary), '--config', str(config)], cwd=temporary,
-                                       env=env, stdout=log, stderr=subprocess.STDOUT)
+                                       env=env, stdout=log, stderr=subprocess.STDOUT,
+                                       creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
             try:
                 deadline = time.monotonic() + 20
                 while True:
@@ -54,7 +57,10 @@ def smoke(root, version):
                         raise RuntimeError('Packaged binary did not become ready')
                     time.sleep(.1)
             finally:
-                process.terminate()
+                if os.name == "nt":
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    process.terminate()
                 try:
                     process.wait(timeout=15)
                 except subprocess.TimeoutExpired:
@@ -102,19 +108,29 @@ def main():
     with tempfile.TemporaryDirectory() as temporary:
         stage = Path(temporary) / name
         stage.mkdir()
-        shutil.copy2(Path('target') / args.target / 'release/rushls', stage / 'rushls')
+        binary = 'rushls.exe' if os.name == 'nt' else 'rushls'
+        shutil.copy2(Path('target') / args.target / 'release' / binary, stage / binary)
         for filename in ('README.md', 'LICENSE', 'rushls.toml', 'rushls.example.toml'):
             shutil.copyfile(filename, stage / filename)
         shutil.copytree('docs', stage / 'docs')
         shutil.copytree('tools/patches/hls.js', stage / 'tools/patches/hls.js')
         shutil.copyfile('tools/build-hls-player.py', stage / 'tools/build-hls-player.py')
         notices(stage / 'THIRD-PARTY-NOTICES.md')
-        archive = output / f'{name}.tar.gz'
-        with tarfile.open(archive, 'w:gz') as tar:
-            tar.add(stage, arcname=name)
         unpacked = Path(temporary) / 'unpacked'
-        with tarfile.open(archive) as tar:
-            tar.extractall(unpacked, filter='data')
+        if os.name == 'nt':
+            archive = output / f'{name}.zip'
+            with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as zipped:
+                for path in sorted(stage.rglob('*')):
+                    if path.is_file():
+                        zipped.write(path, path.relative_to(stage.parent))
+            with zipfile.ZipFile(archive) as zipped:
+                zipped.extractall(unpacked)
+        else:
+            archive = output / f'{name}.tar.gz'
+            with tarfile.open(archive, 'w:gz') as tar:
+                tar.add(stage, arcname=name)
+            with tarfile.open(archive) as tar:
+                tar.extractall(unpacked, filter='data')
         smoke(unpacked / name, version)
         checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
         (output / f'{name}.sha256').write_text(f'{checksum}  {archive.name}\n')

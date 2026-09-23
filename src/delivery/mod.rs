@@ -5,6 +5,8 @@
 //! nothing about how those bytes were produced or which manifest protocol will
 //! describe them.
 
+mod filesystem;
+
 pub mod body;
 pub mod hls;
 pub mod memory;

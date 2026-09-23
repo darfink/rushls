@@ -34,7 +34,7 @@ Complete these checks before a broad production rollout:
   See [release procedures](docs/releases.md).
 - [x] Add MIT licensing and scan tracked files and reachable Git history for credentials.
   See the [review scope and findings](docs/credential-review.md).
-- [ ] Publish the first version tag after the four-platform archive matrix passes.
+- [ ] Publish the first version tag after the five-target archive matrix passes.
 - [ ] Submit the hls.js pending-part correction upstream and track its release.
   The official player's clean control also fails; this is not limited to faulty publishers.
 
@@ -43,8 +43,8 @@ Complete these checks before a broad production rollout:
 
 These limits remain explicit in the supported scope:
 
-- Windows does not currently build: recording and disk retention depend on Unix filesystem and process APIs.
-  Release binaries cover Linux and macOS on x86-64 and ARM64.
+- Release binaries cover Linux and macOS on x86-64 and ARM64, plus Windows x86-64.
+  Windows recording requires hard-link support and has the documented directory-metadata durability limitation.
 - Official hls.js 1.7.3 can stall on valid live streams around rendition switches and ENDLIST.
   Required Chrome validation uses the documented local player patch pending upstream adoption.
 - GStreamer 1.28 passes clean live playback. GAP recovery remains a failing diagnostic;
@@ -71,7 +71,7 @@ These limits remain explicit in the supported scope:
 
 Evaluate these separately from release validation:
 
-- [ ] Port recording and store ownership to Windows without weakening filesystem safety.
+- [x] Port recording and store ownership to Windows, with native tests and ZIP packaging.
 - [ ] Add signed/notarized release binaries and evaluate static Linux builds.
 - [ ] Add multi-architecture container publication.
 

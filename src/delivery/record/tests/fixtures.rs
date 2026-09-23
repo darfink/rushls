@@ -73,3 +73,16 @@ pub fn complete(id: u64, start: i64, duration: u64) -> PackagedMedia {
         duration,
     })
 }
+
+/// A Windows junction exercises reparse-point confinement without requiring
+/// Developer Mode or the privilege needed to create symbolic links.
+pub fn directory_link(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        junction::create(target, link)
+    }
+}

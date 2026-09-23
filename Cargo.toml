@@ -93,6 +93,8 @@ scuffle-h265 = "0.2.2"
 scuffle-av1 = "0.1.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "std", "time"] }
+cap-std = "4"
+cap-fs-ext = "4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
@@ -187,3 +189,6 @@ uuid = { version = "1", features = ["v4", "v7"] }
 
 [profile.release]
 lto = "thin"
+
+[target."cfg(windows)".dev-dependencies]
+junction = "2"

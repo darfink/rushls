@@ -80,6 +80,7 @@ pub fn write_atomically(path: &Path, contents: &[u8]) {
 /// Rotation writes a fresh timestamped directory and atomically swaps
 /// `..data`, so no filesystem event ever names `tls.crt`. Calling this twice
 /// on the same directory rotates it the way kubelet does.
+#[cfg(unix)]
 pub fn write_projected_pair(directory: &Path, name: &str) -> (TlsSettings, Vec<u8>) {
     let certified = rcgen::generate_simple_self_signed([name.to_owned()])
         .expect("a self-signed certificate is generated");

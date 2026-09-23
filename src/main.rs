@@ -402,8 +402,13 @@ async fn shutdown_signal() {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        let mut terminate =
+            tokio::signal::windows::ctrl_break().expect("console break handler installs");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
     }
 }

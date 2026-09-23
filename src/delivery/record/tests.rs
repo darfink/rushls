@@ -201,7 +201,7 @@ fn atomic_commit_refuses_overwrite_and_symlink_escape() -> Result {
     );
     let outside = Temp::new();
     std::fs::create_dir_all(&outside.0)?;
-    std::os::unix::fs::symlink(&outside.0, temp.0.join("escape"))?;
+    directory_link(&outside.0, &temp.0.join("escape"))?;
     assert!(filesystem::write(&root, std::path::Path::new("escape/stolen.mp4"), &body).is_err());
     assert!(outside.files()?.is_empty());
     assert_eq!(
@@ -477,5 +477,66 @@ async fn input_gaps_create_no_recording_file_or_filesystem_failure() -> Result {
     recorder.drain(Duration::from_secs(5)).await;
     assert_eq!(temp.files()?.len(), 2);
     assert!(log.0.lock().is_empty());
+    Ok(())
+}
+
+#[test]
+fn recording_rejects_root_links_and_windows_aliases() -> Result {
+    let temp = Temp::new();
+    let outside = Temp::new();
+    std::fs::create_dir_all(&outside.0)?;
+    directory_link(&outside.0, &temp.0)?;
+    assert!(filesystem::root(&temp.0).is_err());
+    let root = filesystem::root(&outside.0)?;
+    for path in [
+        "CON.mp4",
+        "nul",
+        "COM1.mp4",
+        "LPT².txt",
+        "file:stream",
+        "trail./x",
+        "trail /x",
+        "../x",
+    ] {
+        assert!(
+            filesystem::write(
+                &root,
+                std::path::Path::new(path),
+                &[Payload::from(b"data".as_slice())]
+            )
+            .is_err(),
+            "{path}"
+        );
+    }
+    assert!(outside.files()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn concurrent_recorders_commit_exactly_one_complete_payload() -> Result {
+    let temp = Temp::new();
+    let root = Arc::new(filesystem::root(&temp.0)?);
+    let writers: Vec<_> = (0..8u8)
+        .map(|value| {
+            let root = Arc::clone(&root);
+            std::thread::spawn(move || {
+                filesystem::write(
+                    &root,
+                    std::path::Path::new("same/segment.mp4"),
+                    &[Payload::from(vec![value; 4096])],
+                )
+                .is_ok()
+            })
+        })
+        .collect();
+    let successes = writers
+        .into_iter()
+        .map(|writer| usize::from(writer.join().expect("writer did not panic")))
+        .sum::<usize>();
+    assert_eq!(successes, 1);
+    let bytes = std::fs::read(temp.0.join("same/segment.mp4"))?;
+    assert_eq!(bytes.len(), 4096);
+    assert!(bytes.iter().all(|byte| *byte == bytes[0]));
+    assert_eq!(temp.files()?.len(), 1);
     Ok(())
 }

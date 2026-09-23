@@ -45,6 +45,9 @@ jobs:
           - runner: macos-15-intel
             target: x86_64-apple-darwin
             platform: darwin_amd64
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            platform: windows_amd64
           - runner: macos-15
             target: aarch64-apple-darwin
             platform: darwin_arm64
@@ -64,6 +67,9 @@ jobs:
             ~/.cargo/git
             target
           key: rushls-release-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+      - name: Test Windows libraries and storage
+        if: runner.os == 'Windows'
+        run: cargo test --workspace --all-features --locked --lib
       - name: Build native release binary
         run: cargo build --release --locked --bin rushls --target ${{ matrix.target }}
       - name: Package and test extracted archive
@@ -275,12 +281,12 @@ jobs:
         working-directory: release-assets
         run: |
           cat ./*.sha256 | sort > checksums.sha256
-          test "$(wc -l < checksums.sha256)" -eq 4
+          test "$(wc -l < checksums.sha256)" -eq 5
           sha256sum --check checksums.sha256
           if gh release view "$RELEASE_TAG" --json isDraft > release-state.json; then
             python3 -c 'import json; assert json.load(open("release-state.json"))["isDraft"], "Refusing to overwrite a published release"'
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes --title "Rushls $RELEASE_TAG"
           fi
-          gh release upload "$RELEASE_TAG" ./*.tar.gz checksums.sha256 --clobber
+          gh release upload "$RELEASE_TAG" ./*.tar.gz ./*.zip checksums.sha256 --clobber
           gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE" --latest="$([ "$PRERELEASE" = false ] && echo true || echo false)"

@@ -3036,7 +3036,6 @@ mod tls {
         server::{
             http::fixtures::{
                 NodeEventRecorder, application, scratch, write_atomically, write_pair,
-                write_projected_pair,
             },
             metrics::{MetricsEndpoint, MetricsReader},
         },
@@ -3347,14 +3346,17 @@ mod tls {
     /// events by path — the obvious implementation — silently never reloads
     /// here while passing every test that writes files directly.
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_projected_secret_rotates_even_though_no_event_names_the_certificate() {
         let directory = scratch("projected");
-        let (settings, first) = write_projected_pair(&directory, "origin.test");
+        let (settings, first) =
+            crate::server::http::fixtures::write_projected_pair(&directory, "origin.test");
         let harness = TlsHarness::start(settings).await;
 
         assert_eq!(harness.handshake(&[b"http/1.1"]).await.0, first);
 
-        let (_, second) = write_projected_pair(&directory, "origin.test");
+        let (_, second) =
+            crate::server::http::fixtures::write_projected_pair(&directory, "origin.test");
         assert_ne!(first, second, "the rotation produced a new certificate");
 
         assert!(

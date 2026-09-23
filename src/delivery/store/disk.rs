@@ -5,16 +5,14 @@
 //! Playlist projection never comes here. A restart does not rehydrate the
 //! catalog: generation directories are process-lifetime. The directory lock
 //! refuses a second process, so cutover is stop-then-start. Reap on open
-//! removes crash leftovers that still have `owner.pid`; a generation whose
-//! owner pid is still alive is left alone so a reused pid cannot delete files
-//! still in use. Directories without `owner.pid` are not generations and are
-//! not removed.
+//! removes generations whose `owner.lock` is no longer held. Ownership does
+//! not depend on process IDs. Unmarked directories and legacy PID-marked
+//! generations are left untouched.
 
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -151,6 +149,7 @@ struct DiskShared {
     /// Exclusive lock on `dir`. Dropped with the generation so a peer cannot
     /// reap files while a spill is still finishing.
     _lock: File,
+    owner: Option<File>,
 }
 
 #[derive(Default)]
@@ -229,7 +228,20 @@ impl DiskTier {
             path: generation.clone(),
             source,
         })?;
-        write_owner_pid(&generation)?;
+        let owner_path = generation.join("owner.lock");
+        let owner = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&owner_path)
+            .map_err(|source| DiskError::Create {
+                path: owner_path.clone(),
+                source,
+            })?;
+        owner.lock().map_err(|source| DiskError::Create {
+            path: owner_path,
+            source,
+        })?;
 
         let (jobs, rx) = mpsc::sync_channel(SPILL_QUEUE_BOUND);
         let shared = Arc::new(DiskShared {
@@ -244,6 +256,7 @@ impl DiskTier {
             epochs: Mutex::new(HashMap::new()),
             read_bytes: Arc::new(Semaphore::new(MAX_IN_FLIGHT_READ_BYTES as usize)),
             _lock: lock,
+            owner: Some(owner),
         });
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
@@ -382,6 +395,7 @@ impl Drop for DiskTier {
 
 impl Drop for DiskShared {
     fn drop(&mut self) {
+        drop(self.owner.take());
         let _ = fs::remove_dir_all(&self.generation);
     }
 }
@@ -588,16 +602,17 @@ fn write_atomic_inner<'a>(
     tmp: &Path,
     slices: impl Iterator<Item = &'a [u8]>,
 ) -> Result<(), DiskError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o644)
-        .open(tmp)
-        .map_err(|source| DiskError::Write {
-            path: tmp.to_path_buf(),
-            source,
-        })?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o644);
+    }
+    let mut file = options.open(tmp).map_err(|source| DiskError::Write {
+        path: tmp.to_path_buf(),
+        source,
+    })?;
     for bytes in slices {
         file.write_all(bytes).map_err(|source| DiskError::Write {
             path: tmp.to_path_buf(),
@@ -613,11 +628,12 @@ fn write_atomic_inner<'a>(
         source,
     })?;
     if let Some(parent) = path.parent() {
-        let dir = File::open(parent).map_err(|source| DiskError::Write {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-        dir.sync_all().map_err(|source| DiskError::Write {
+        let dir = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())
+            .map_err(|source| DiskError::Write {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        crate::delivery::filesystem::sync_directory(&dir).map_err(|source| DiskError::Write {
             path: parent.to_path_buf(),
             source,
         })?;
@@ -645,11 +661,12 @@ fn lock_directory(root: &Path) -> Result<File, DiskError> {
             path: path.clone(),
             source,
         })?;
-    // Safety: `flock` on a file we exclusively opened; LOCK_NB fails rather
-    // than blocking a second node on the same directory.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result != 0 {
-        return Err(DiskError::InUse { path });
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(DiskError::InUse { path }),
+        Err(std::fs::TryLockError::Error(source)) => {
+            return Err(DiskError::Create { path, source });
+        }
     }
     Ok(file)
 }
@@ -661,56 +678,42 @@ fn unique_generation(root: &Path) -> PathBuf {
     root.join(format!("{}-{nanos}", std::process::id()))
 }
 
-fn write_owner_pid(generation: &Path) -> Result<(), DiskError> {
-    let path = generation.join("owner.pid");
-    fs::write(&path, format!("{}\n", std::process::id()))
-        .map_err(|source| DiskError::Write { path, source })
-}
-
+/// Called only while holding the root lock. A generation without an owner
+/// marker is never ours to delete; errors and held locks conservatively keep it.
 fn reap_dead_generations(root: &Path) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
         let path = entry.path();
-        if !path.is_dir() {
+        if !fs::symlink_metadata(path.join("owner.lock")).is_ok_and(|metadata| metadata.is_file()) {
             continue;
         }
-        // Only a directory this process created (one that has owner.pid) is a
-        // generation. Anything else under dir is left alone.
-        if !path.join("owner.pid").is_file() {
+        let Ok(owner) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.join("owner.lock"))
+        else {
+            continue;
+        };
+        if owner.try_lock().is_err() {
             continue;
         }
-        if generation_is_live(&path) {
-            continue;
-        }
+        // Windows cannot remove an open locked owner file. The root lock still
+        // excludes another Rushls opener while we release this stale handle.
+        drop(owner);
         let _ = fs::remove_dir_all(path);
     }
-}
-
-fn generation_is_live(generation: &Path) -> bool {
-    let Ok(contents) = fs::read_to_string(generation.join("owner.pid")) else {
-        return false;
-    };
-    let Ok(pid) = contents.trim().parse::<i32>() else {
-        return false;
-    };
-    pid_is_live(pid)
-}
-
-fn pid_is_live(pid: i32) -> bool {
-    // Safety: `kill(pid, 0)` probes existence and never delivers a signal.
-    // ESRCH means the process is gone; EPERM means it exists but we cannot
-    // signal it, which still makes its generation live.
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn stream_relative(stream: &StreamId) -> Result<PathBuf, DiskError> {
     let mut path = PathBuf::from("streams");
     let mut any = false;
     for segment in stream.as_str().split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
+        if !crate::delivery::filesystem::safe_component(std::ffi::OsStr::new(segment)) {
             return Err(DiskError::UnsafeStream(stream.clone()));
         }
         if Path::new(segment).is_absolute() {
@@ -753,6 +756,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     fn fifo(root: &Path, name: &str) -> PathBuf {
         use std::os::unix::ffi::OsStrExt;
         let path = root.join(name);
@@ -781,17 +785,87 @@ mod tests {
             .join(format!("epoch-{epoch}"))
     }
 
+    /// This helper is also an ordinary no-op test unless invoked by the parent
+    /// with a private directory. Exiting bypasses Drop to model a crashed writer.
+    #[test]
+    fn ownership_child() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(root) = std::env::var_os("RUSHLS_TEST_OWNER_DIRECTORY") else {
+            return Ok(());
+        };
+        let root = PathBuf::from(root);
+        let tier = DiskTier::open(&DiskLimits {
+            directory: root,
+            maximum_payload_bytes: 1024,
+        });
+        if std::env::var_os("RUSHLS_TEST_OWNER_BUSY").is_some() {
+            assert!(matches!(tier, Err(DiskError::InUse { .. })));
+            return Ok(());
+        }
+        let tier = tier?;
+        fs::write(tier.shared.generation.join("crash-evidence"), b"orphan")?;
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn process_locks_reject_live_writers_and_reap_crashed_writers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = scratch("process-ownership");
+        let limits = DiskLimits {
+            directory: root.clone(),
+            maximum_payload_bytes: 1024,
+        };
+        let tier = DiskTier::open(&limits)?;
+        let run_child = |busy: bool| -> std::io::Result<std::process::ExitStatus> {
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .args([
+                    "--exact",
+                    "delivery::store::disk::tests::ownership_child",
+                    "--nocapture",
+                ])
+                .env("RUSHLS_TEST_OWNER_DIRECTORY", &root);
+            if busy {
+                child.env("RUSHLS_TEST_OWNER_BUSY", "1");
+            } else {
+                child.env_remove("RUSHLS_TEST_OWNER_BUSY");
+            }
+            child.status()
+        };
+        assert!(run_child(true)?.success());
+        drop(tier);
+        assert!(run_child(false)?.success());
+        let stale = fs::read_dir(&root)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.join("crash-evidence").exists())
+            .ok_or("child left no crash evidence")?;
+        let reopened = DiskTier::open(&limits)?;
+        assert!(
+            !stale.exists(),
+            "an exited process must release its generation lock"
+        );
+        drop(reopened);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn reap_removes_a_dead_generation_and_leaves_a_live_one() {
         let root = scratch("reap");
         let dead = root.join("dead-gen");
         fs::create_dir_all(&dead).unwrap();
-        fs::write(dead.join("owner.pid"), "999999999\n").unwrap();
+        fs::write(dead.join("owner.lock"), "").unwrap();
         fs::write(dead.join("orphan.bin"), b"x").unwrap();
 
         let peer = root.join("peer-gen");
         fs::create_dir_all(&peer).unwrap();
-        fs::write(peer.join("owner.pid"), format!("{}\n", std::process::id())).unwrap();
+        let peer_owner = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(peer.join("owner.lock"))
+            .unwrap();
+        peer_owner.lock().unwrap();
 
         let unrelated = root.join("not-a-generation");
         fs::create_dir_all(&unrelated).unwrap();
@@ -803,24 +877,22 @@ mod tests {
         })
         .expect("open");
 
-        assert!(
-            !dead.exists(),
-            "pid 999999999 is not running; the leftover generation is reaped"
-        );
+        assert!(!dead.exists(), "an unheld owner lock permits crash cleanup");
         assert!(
             peer.exists(),
-            "a generation whose owner pid is still live is left alone"
+            "a generation with a held owner lock is left alone"
         );
         assert!(
             unrelated.exists(),
-            "a directory without owner.pid is not a generation and is left alone"
+            "a directory without owner.lock is not a generation and is left alone"
         );
         assert!(live.shared.generation.exists());
         assert!(
-            live.shared.generation.join("owner.pid").exists(),
+            live.shared.generation.join("owner.lock").exists(),
             "the live generation keeps its lock file"
         );
         drop(live);
+        drop(peer_owner);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -979,6 +1051,43 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
+    async fn disk_reads_wait_for_capacity_on_every_platform()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = scratch("portable-read-budget");
+        let tier = DiskTier::open(&DiskLimits {
+            directory: root.clone(),
+            maximum_payload_bytes: 1024,
+        })?;
+        let path = root.join("payload.bin");
+        fs::write(&path, b"payload")?;
+        let held = Arc::clone(&tier.shared.read_bytes)
+            .acquire_many_owned(MAX_IN_FLIGHT_READ_BYTES)
+            .await?;
+        let reader = Arc::clone(&tier);
+        let mut pending = tokio::spawn(async move {
+            reader
+                .read(&DiskRef {
+                    path: Arc::new(path),
+                    offset: 0,
+                    len: 7,
+                })
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut pending)
+                .await
+                .is_err()
+        );
+        drop(held);
+        let payload = tokio::time::timeout(std::time::Duration::from_secs(5), pending).await???;
+        assert_eq!(payload.as_bytes(), b"payload");
+        drop(tier);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn in_flight_disk_reads_wait_on_the_byte_semaphore() {
         let root = scratch("sem");

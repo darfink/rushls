@@ -16,7 +16,7 @@ Rust toolchain installation uses a composite action, with no JavaScript runtime.
 Code, media, Chrome, and GStreamer checks run on pull requests and main-branch pushes.
 Apple validation runs through a reusable workflow on main-branch pushes, version tags, and manual main-branch runs.
 Pull requests do not receive the Apple installer and certificate secrets.
-**Publish container image** requires all five validation jobs and all four native archive smoke tests to succeed for the same commit.
+**Publish container image** requires all five validation jobs and all five native archive smoke tests to succeed for the same commit.
 A failed or skipped Apple validation blocks publication.
 The reusable Apple workflow also supports manual validation without image publication.
 Each ignored Rust test has a job or driver that supplies its external dependencies.
