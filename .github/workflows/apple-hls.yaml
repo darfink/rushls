@@ -1,0 +1,99 @@
+name: Apple HLS validation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apple-hls-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apple:
+    # Apple distributes these tools through authenticated Developer downloads.
+    # Manual runs fail with setup instructions if the installer is unavailable.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (vars.APPLE_HLS_TOOLS_URL != '' || vars.APPLE_HLS_RUNNER != '' || github.event_name == 'workflow_dispatch')
+    # The compact ladder uses a 5 GiB DVR budget. The audit checks for 6 GiB
+    # free after compilation, leaving space for reports and filesystem overhead.
+    runs-on: ${{ vars.APPLE_HLS_RUNNER || 'macos-15' }}
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUSHLS_TEST_REQUIRE_APPLE_TOOLS: '1'
+      RUSHLS_TEST_REPORT_DIR: ${{ github.workspace }}/target/apple-reports
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install GnuPG
+        run: brew install gnupg
+      - name: Install Apple HLS tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPLE_HLS_TOOLS_URL: ${{ vars.APPLE_HLS_TOOLS_URL }}
+          APPLE_HLS_TOOLS_SHA256: ${{ vars.APPLE_HLS_TOOLS_SHA256 }}
+          APPLE_HLS_TOOLS_PASSPHRASE: ${{ secrets.APPLE_HLS_TOOLS_PASSPHRASE }}
+        run: tools/install-apple-hls-tools.sh
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: rushls-apple-compact-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Configure optional publicly trusted TLS
+        env:
+          TLS_BUNDLE: ${{ secrets.APPLE_HLS_TLS }}
+          TLS_HOST: ${{ vars.APPLE_HLS_TLS_HOST }}
+        run: |
+          if test -n "$TLS_BUNDLE$TLS_HOST"; then
+            test -n "$TLS_BUNDLE" && test -n "$TLS_HOST"
+            tls_dir="$RUNNER_TEMP/apple-hls-tls"
+            mkdir -p "$tls_dir"
+            chmod 700 "$tls_dir"
+            umask 077
+            python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          bundle = json.loads(os.environ['TLS_BUNDLE'])
+          root = Path(os.environ['RUNNER_TEMP']) / 'apple-hls-tls'
+          (root / 'cert.pem').write_text(bundle['certificate'])
+          (root / 'key.pem').write_text(bundle['private_key'])
+          PYTHON
+            {
+              echo "RUSHLS_TEST_TLS_CERT=$tls_dir/cert.pem"
+              echo "RUSHLS_TEST_TLS_KEY=$tls_dir/key.pem"
+              echo "RUSHLS_TEST_TLS_HOST=$TLS_HOST"
+              # The current tools report TLS incorrectly under both protocol versions.
+              echo "RUSHLS_TEST_TLS_MIN_VERSION=1.3"
+              echo "RUSHLS_TEST_TLS_MAX_VERSION=1.3"
+            } >> "$GITHUB_ENV"
+          fi
+      - name: Packaging suite and playlist diagnostics
+        id: packaging
+        run: cargo test --locked --test apple_hls -- --include-ignored --skip authoring::two_hour_live_authoring --test-threads=2
+      - name: Two-hour live authoring audit
+        if: ${{ !cancelled() && steps.packaging.outcome != 'skipped' }}
+        run: tools/check-apple-authoring.sh
+      - name: Upload original and compatibility Apple reports
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: apple-hls-reports
+          path: |
+            target/apple-reports/*.html
+            target/apple-reports/*.json
+            target/apple-reports/*.jsonl
+            target/apple-reports/*.m3u8
+            target/apple-reports/*.vtt
+          if-no-files-found: error
+      - name: Remove temporary TLS files
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/apple-hls-tls"

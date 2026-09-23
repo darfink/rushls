@@ -18,11 +18,11 @@ jobs:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -39,22 +39,82 @@ jobs:
       - name: Python tools
         run: python3 -m unittest discover -s tools -p 'test_*.py'
 
+  media:
+    name: External decoders and ingest
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rushls-media-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: External decoder tests
+        run: cargo test --locked --lib --all-features -- --ignored --skip live_av_gap_browser_origin --skip ip_video_gap_playback_fixture
+      - name: Recording and RTMP ingest
+        run: cargo test --locked --test record_e2e --test rtmp_ingest -- --include-ignored
+      - name: Export video GAP fixtures
+        env:
+          RUSHLS_GAP_FIXTURES: ${{ runner.temp }}/gap-fixtures
+        run: cargo test --locked --lib ip_video_gap_playback_fixture -- --ignored
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: video-gap-fixtures
+          path: ${{ runner.temp }}/gap-fixtures
+          if-no-files-found: error
+
+  browser:
+    name: Live Chrome playback and rendition switching
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install playback dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python3 tools/install-chrome-driver.py --output "$RUNNER_TEMP/chromedriver"
+          curl --fail --location https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js -o "$RUNNER_TEMP/hls.min.js"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: rushls-browser-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Live control and GAP playback
+        run: python3 tools/run-live-gap-ci.py --driver "$RUNNER_TEMP/chromedriver" --hls-js "$RUNNER_TEMP/hls.min.js" --output target/live-gap-reports
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: live-gap-playback
+          path: target/live-gap-reports
+          if-no-files-found: error
+
   image:
-    needs: ci
+    needs: [ci, media, browser]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
