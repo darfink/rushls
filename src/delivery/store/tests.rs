@@ -2648,9 +2648,17 @@ async fn iframe_ranges_survive_disk_spill_and_remain_fetchable()
         assert!(clipped.ends_with(crate::mux::fixtures::H264_IDR));
         assert_eq!(clipped.len(), usize::try_from(frame.length.get())?);
     }
+    let disk = Arc::clone(store.disk().ok_or("missing disk tier")?);
     drop(origin);
     drop(lease);
     drop(store);
+    // A spill worker can briefly retain the last live stream. Keep the tier
+    // here until it releases that stream, then join it before deleting locked
+    // files (Windows correctly refuses deletion while they are still owned).
+    wait_until("disk worker releases stream", || {
+        Arc::strong_count(&disk) == 1
+    });
+    drop(disk);
     std::fs::remove_dir_all(directory)?;
     Ok(())
 }
