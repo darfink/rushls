@@ -24,6 +24,8 @@ CI extracts the archive and runs the extracted executable on its native platform
 It checks version output, exact example-config output, HTTP readiness, and graceful shutdown.
 The full media and player tests run separately in the same workflow.
 
+In TOML, write Windows paths with forward slashes or literal single-quoted strings, such as `dir = 'C:\Rushls\recordings'`.
+
 Windows archives include `rushls.exe`. Windows library tests and archive smoke tests run on a native runner.
 Use a local filesystem with hard-link support, such as NTFS, for recording.
 Recording traverses directory handles without following symlinks or junctions and commits without overwriting an existing name.

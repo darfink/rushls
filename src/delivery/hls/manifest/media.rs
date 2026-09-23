@@ -341,12 +341,16 @@ mod tests {
 
         writer.program_date_time(timestamp)?;
 
+        // Windows SystemTime stores 100 ns ticks; the input is rounded down
+        // before the writer sees it. Unix retains all nine fractional digits.
+        let fraction = if cfg!(windows) {
+            "1234567"
+        } else {
+            "123456789"
+        };
         assert_eq!(
             rendered,
-            concat!(
-                "#EXTM3U\n",
-                "#EXT-X-PROGRAM-DATE-TIME:2023-11-14T22:13:20.123456789Z\n",
-            )
+            format!("#EXTM3U\n#EXT-X-PROGRAM-DATE-TIME:2023-11-14T22:13:20.{fraction}Z\n")
         );
         Ok(())
     }

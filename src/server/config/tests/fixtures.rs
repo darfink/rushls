@@ -76,3 +76,10 @@ pub fn contains(document: &toml::Table, path: &str) -> bool {
     }
     value.is_some()
 }
+
+/// Escape a path before inserting it inside a double-quoted TOML string.
+/// JSON string escaping covers the escapes needed by these fixture paths.
+pub fn toml_path_contents(path: &std::path::Path) -> String {
+    let quoted = serde_json::to_string(&path.to_string_lossy()).expect("a string serializes");
+    quoted[1..quoted.len() - 1].to_owned()
+}

@@ -24,6 +24,13 @@ def port(kind=socket.SOCK_STREAM):
 
 
 def smoke(root, version):
+    if os.name == 'nt':
+        # Headless Windows runners may have no console. The child needs a
+        # shared console for a targeted CTRL_BREAK_EVENT, not TerminateProcess.
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        if kernel.GetConsoleCP() == 0 and not kernel.AllocConsole():
+            raise ctypes.WinError()
     binary = root / ('rushls.exe' if os.name == 'nt' else 'rushls')
     env = {k: v for k, v in os.environ.items() if not k.startswith('RUSHLS_')}
     actual = subprocess.check_output([str(binary), '--version'], env=env, text=True)
@@ -75,7 +82,7 @@ def notices(destination):
     # Include resolved dependency notices verbatim; the project's MIT license
     # does not replace licenses supplied with dependencies.
     metadata = json.loads(subprocess.check_output(['cargo', 'metadata', '--locked', '--format-version=1']))
-    with destination.open('w') as output:
+    with destination.open('w', encoding='utf-8') as output:
         output.write('# Dependency licenses and notices\n\n')
         for package in sorted(metadata['packages'], key=lambda p: (p['name'], p['version'])):
             if package['source'] is None:
@@ -92,7 +99,7 @@ def notices(destination):
             for path in sorted(files):
                 if path.is_file():
                     output.write(f'### {path.relative_to(directory)}\n\n')
-                    output.write(path.read_text(errors='replace') + '\n\n')
+                    output.write(path.read_text(encoding='utf-8', errors='replace') + '\n\n')
 
 
 def main():
@@ -101,7 +108,7 @@ def main():
     parser.add_argument('--platform', required=True)
     parser.add_argument('--output', type=Path, default=Path('target/release-assets'))
     args = parser.parse_args()
-    version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+    version = tomllib.loads(Path('Cargo.toml').read_text(encoding='utf-8'))['package']['version']
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     name = f'rushls_v{version}_{args.platform}'

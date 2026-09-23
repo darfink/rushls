@@ -55,6 +55,8 @@ jobs:
     timeout-minutes: 40
     env:
       GIT_SHA: ${{ github.sha }}
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

@@ -575,8 +575,8 @@ passphrase_file = "{}"
 [metrics]
 token_file = "{}"
 "#,
-        secret.path.display(),
-        secret.path.display(),
+        fixtures::toml_path_contents(&secret.path),
+        fixtures::toml_path_contents(&secret.path),
     ))??;
 
     assert!(config.node.srt.encryption.is_some());
@@ -595,7 +595,7 @@ fn an_inline_secret_and_its_file_are_mutually_exclusive() -> Result<(), Box<dyn 
 token = "inline"
 token_file = "{}"
 "#,
-        secret.path.display(),
+        fixtures::toml_path_contents(&secret.path),
     ))?;
 
     assert!(matches!(
@@ -654,8 +654,8 @@ cert = "{}"
 key = "{}"
 timeout = "8s"
 "#,
-        settings.certificate.display(),
-        settings.key.display()
+        fixtures::toml_path_contents(&settings.certificate),
+        fixtures::toml_path_contents(&settings.key)
     ))?
     .unwrap_or_else(|error| panic!("MOQ with certificates must resolve: {error}"));
 
@@ -692,8 +692,8 @@ listen = "0.0.0.0:4433"
 cert = "{}"
 key = "{}"
 "#,
-        settings.certificate.display(),
-        settings.key.display()
+        fixtures::toml_path_contents(&settings.certificate),
+        fixtures::toml_path_contents(&settings.key)
     ))?
     .unwrap_or_else(|error| panic!("public MOQ must still resolve: {error}"));
 
@@ -726,8 +726,8 @@ cert = "{}"
 key = "{}"
 timeout = "off"
 "#,
-        settings.certificate.display(),
-        settings.key.display()
+        fixtures::toml_path_contents(&settings.certificate),
+        fixtures::toml_path_contents(&settings.key)
     ))?
     .unwrap_or_else(|error| panic!("a disabled MOQ timeout must resolve: {error}"));
 
@@ -870,9 +870,9 @@ client_cert = "{}"
 client_key = "{}"
 ca = "{}"
 "#,
-        settings.certificate.display(),
-        settings.key.display(),
-        settings.certificate.display(),
+        fixtures::toml_path_contents(&settings.certificate),
+        fixtures::toml_path_contents(&settings.key),
+        fixtures::toml_path_contents(&settings.certificate),
     );
 
     let resolved = resolve_toml(&configuration)??;
@@ -895,11 +895,17 @@ async fn half_a_client_certificate_pair_is_refused() -> Result<(), Box<dyn Error
 
     for (line, missing) in [
         (
-            format!("client_cert = \"{}\"", settings.certificate.display()),
+            format!(
+                "client_cert = \"{}\"",
+                fixtures::toml_path_contents(&settings.certificate)
+            ),
             "client_key",
         ),
         (
-            format!("client_key = \"{}\"", settings.key.display()),
+            format!(
+                "client_key = \"{}\"",
+                fixtures::toml_path_contents(&settings.key)
+            ),
             "client_cert",
         ),
     ] {
@@ -924,8 +930,8 @@ url = "https://auth.internal/admit"
 client_cert = "{}"
 client_key = "{}"
 "#,
-        directory.join("absent.pem").display(),
-        directory.join("absent.key").display(),
+        fixtures::toml_path_contents(&directory.join("absent.pem")),
+        fixtures::toml_path_contents(&directory.join("absent.key")),
     ))?
     .err()
     .ok_or("an unreadable identity is refused")?
@@ -954,9 +960,9 @@ client_cert = "{}"
 client_key = "{}"
 ca = "{}"
 "#,
-        settings.certificate.display(),
-        settings.key.display(),
-        settings.certificate.display(),
+        fixtures::toml_path_contents(&settings.certificate),
+        fixtures::toml_path_contents(&settings.key),
+        fixtures::toml_path_contents(&settings.certificate),
     ))??;
 
     assert_eq!(
@@ -1004,7 +1010,7 @@ url = "https://archive.internal/rushls"
 events = ["session.started"]
 client_cert = "{}"
 "#,
-        settings.certificate.display(),
+        fixtures::toml_path_contents(&settings.certificate),
     ))?
     .err()
     .ok_or("half a pair is refused")?
@@ -1040,7 +1046,7 @@ fn disk_tier_defaults_the_directory_and_refuses_a_path_without_a_cap() -> Result
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/rushls-disk-config-test");
     let both = format!(
         "[capacity]\ndisk_per_stream = \"8GiB\"\ndir = \"{}\"\n",
-        dir.display()
+        fixtures::toml_path_contents(&dir)
     );
     let config = resolve_toml(&both)??;
     let disk = config
@@ -1066,7 +1072,7 @@ fn disk_tier_defaults_the_directory_and_refuses_a_path_without_a_cap() -> Result
     assert!(
         super::paths::is_under_cache_dir(&defaulted.directory),
         "default overflow is the platform cache, not a required dir key: {}",
-        defaulted.directory.display()
+        fixtures::toml_path_contents(&defaulted.directory)
     );
 
     for configuration in [
@@ -1582,8 +1588,8 @@ key = "{}"
 handshake_timeout = "2s"
 max_handshakes = 32
 "#,
-        certificate.path.display(),
-        key.path.display()
+        fixtures::toml_path_contents(&certificate.path),
+        fixtures::toml_path_contents(&key.path)
     ))?
     .unwrap_or_else(|error| panic!("TLS admission limits must resolve: {error}"));
 
@@ -2187,8 +2193,8 @@ fn secret_files_tolerate_a_trailing_newline() -> Result<(), Box<dyn Error>> {
     let token = TempConfig::new("hunter2\n")?;
     let resolved = resolve_toml(&format!(
         "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret_file = '{}'\ntoken_file = '{}'\n",
-        signing.path.display(),
-        token.path.display(),
+        fixtures::toml_path_contents(&signing.path),
+        fixtures::toml_path_contents(&token.path),
     ))??;
     assert!(resolved.hooks.is_some());
 
@@ -2197,7 +2203,7 @@ fn secret_files_tolerate_a_trailing_newline() -> Result<(), Box<dyn Error>> {
     let malformed = TempConfig::new("whsec_not+base64!\n")?;
     let Err(error) = resolve_toml(&format!(
         "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret_file = '{}'\n",
-        malformed.path.display(),
+        fixtures::toml_path_contents(&malformed.path),
     ))?
     else {
         panic!("a malformed signing secret must be refused");
@@ -2523,5 +2529,16 @@ fn strict_policies_configure_the_independence_contract() -> Result<(), Box<dyn E
             .store
             .independent_segments
     );
+    Ok(())
+}
+
+#[test]
+fn fixture_paths_escape_windows_separators_and_quotes() -> Result<(), Box<dyn Error>> {
+    let path = std::path::Path::new(r#"C:\folder with "quotes"\file.pem"#);
+    let document: toml::Value = toml::from_str(&format!(
+        "path = \"{}\"",
+        fixtures::toml_path_contents(path)
+    ))?;
+    assert_eq!(document["path"].as_str(), path.to_str());
     Ok(())
 }

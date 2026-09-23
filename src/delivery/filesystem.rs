@@ -8,7 +8,14 @@ use std::{ffi::OsStr, io};
 pub fn sync_directory(directory: &Dir) -> io::Result<()> {
     #[cfg(unix)]
     {
-        directory.try_clone()?.into_std_file().sync_all()
+        use cap_fs_ext::Reopen;
+        // cap-std may hold O_PATH descriptors on Linux. Reopen the same inode
+        // for reading before fsync; cloning alone preserves O_PATH and fails.
+        directory
+            .try_clone()?
+            .into_std_file()
+            .reopen(cap_std::fs::OpenOptions::new().read(true))?
+            .sync_all()
     }
     #[cfg(windows)]
     {
