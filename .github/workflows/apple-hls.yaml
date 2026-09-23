@@ -1,8 +1,7 @@
-name: Apple HLS validation
+name: Validate Apple HLS
 
 on:
-  push:
-    branches: [main]
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -14,9 +13,10 @@ concurrency:
 
 jobs:
   apple:
+    name: Packaging and authoring
     # Apple distributes these tools through authenticated Developer downloads.
-    # Manual runs fail with setup instructions if the installer is unavailable.
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (vars.APPLE_HLS_TOOLS_URL != '' || vars.APPLE_HLS_RUNNER != '' || github.event_name == 'workflow_dispatch')
+    # Missing tools fail validation and block publication in the calling workflow.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     # The compact ladder uses a 5 GiB DVR budget. The audit checks for 6 GiB
     # free after compilation, leaving space for reports and filesystem overhead.
     runs-on: ${{ vars.APPLE_HLS_RUNNER || 'macos-26' }}

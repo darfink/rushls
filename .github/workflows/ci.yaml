@@ -1,4 +1,4 @@
-name: build-and-tag
+name: CI and release
 
 on:
   pull_request:
@@ -10,12 +10,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-and-tag-${{ github.ref }}
+  group: ci-and-release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  ci:
-    name: fmt / clippy / test
+  code:
+    name: Validate code
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -30,17 +30,17 @@ jobs:
             target
           key: rushls-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: rushls-${{ runner.os }}-
-      - name: Format
+      - name: Check Rust formatting
         run: cargo fmt --all -- --check
-      - name: Clippy
+      - name: Check Rust lints
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Test
+      - name: Run Rust tests
         run: cargo test --workspace --all-features --locked
-      - name: Python tools
+      - name: Test Python tools
         run: python3 -m unittest discover -s tools -p 'test_*.py'
 
   media:
-    name: External decoders and ingest
+    name: Validate media
     runs-on: macos-15
     timeout-minutes: 30
     steps:
@@ -70,8 +70,8 @@ jobs:
           path: ${{ runner.temp }}/gap-fixtures
           if-no-files-found: error
 
-  browser:
-    name: Live Chrome playback and rendition switching
+  chrome:
+    name: Validate Chrome playback (patched hls.js)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -131,9 +131,43 @@ jobs:
           path: target/live-gap-reports
           if-no-files-found: error
 
-  image:
-    needs: [ci, media, browser]
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+  gstreamer:
+    name: Validate GStreamer playback
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install GStreamer and FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+          key: rushls-gstreamer-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Decode live audio and video
+        run: /usr/bin/python3 tools/run-gstreamer-ci.py --case control --output target/gstreamer-reports
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gstreamer-playback
+          path: target/gstreamer-reports
+          if-no-files-found: error
+
+  apple:
+    name: Validate Apple HLS
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    uses: ./.github/workflows/apple-hls.yaml
+    secrets: inherit
+
+  publish:
+    name: Publish container image
+    needs: [code, media, chrome, gstreamer, apple]
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     permissions:
       contents: read

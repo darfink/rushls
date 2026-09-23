@@ -1,19 +1,24 @@
 # CI validation
 
-The build workflow uses Node 24 actions. Dependabot checks for action updates each week.
+The **CI and release** workflow uses Node 24 actions. Dependabot checks for action updates each week.
 Rust toolchain installation uses a composite action, with no JavaScript runtime.
 
 ## Checks and prerequisites
 
 | Job | Checks | Prerequisites |
 | --- | --- | --- |
-| Linux CI | Workspace tests, all features, Clippy, formatting, Python unit tests | Rust and Python |
-| macOS media | Ignored decoder tests, recording, RTMP ingest, video GAP fixture export | FFmpeg, including AudioToolbox AAC |
-| Chrome playback | Patched-player unit tests; live control and GAP streams, rendition switches, completion; official-release compatibility | Chrome, matching ChromeDriver, Node.js 24, pinned hls.js source and patch |
-| Apple HLS | Packaging cases, playlist diagnostics, two-hour live authoring audit | macOS, Apple HLS tools, FFmpeg, trusted localhost TLS |
+| Validate code | Workspace tests, all features, Clippy, formatting, Python unit tests | Rust and Python |
+| Validate media | Ignored decoder tests, recording, RTMP ingest, video GAP fixture export | FFmpeg, including AudioToolbox AAC |
+| Validate Chrome playback (patched hls.js) | Patched-player unit tests; live control and GAP streams, rendition switches, completion; official-release compatibility | Chrome, matching ChromeDriver, Node.js 24, pinned hls.js source and patch |
+| Validate Apple HLS | Packaging cases, playlist diagnostics, two-hour live authoring audit | macOS, Apple HLS tools, FFmpeg, trusted localhost TLS |
+| Validate GStreamer playback | Live control stream; decoded audio/video and end-of-stream | FFmpeg, GStreamer hlsdemux2, PyGObject |
 
-The macOS and browser jobs run on pull requests and main-branch pushes.
-Image publication depends on the Linux, macOS media, and browser jobs.
+Code, media, Chrome, and GStreamer checks run on pull requests and main-branch pushes.
+Apple validation runs through a reusable workflow on main-branch pushes and manual main-branch runs.
+Pull requests do not receive the Apple installer and certificate secrets.
+**Publish container image** requires all five validation jobs to succeed for the same commit.
+A failed or skipped Apple validation blocks publication.
+The reusable Apple workflow also supports manual validation without image publication.
 Each ignored Rust test has a job or driver that supplies its external dependencies.
 Interactive Safari investigations, load benchmarks, and manual diagnostic tools remain separate from the automated test suite.
 
@@ -27,7 +32,7 @@ Apple directs users to authenticated [Developer downloads](https://developer.app
 The tools support CLI installation after download. They are not part of the Xcode command-line tools.
 Installer 1.26.143.14 requires macOS 26, despite the macOS 15 requirement in its bundled README.
 
-Set these repository variables to enable automatic Apple jobs:
+Configure these repository variables for Apple validation:
 
 - `APPLE_HLS_TOOLS_URL`: The download URL for an installer or its GPG-encrypted copy.
 - `APPLE_HLS_TOOLS_SHA256`: The SHA-256 of the decrypted installer.
@@ -44,8 +49,7 @@ The `APPLE_HLS_TOOLS_PASSPHRASE` Actions secret contains its decryption key.
 The workflow decrypts the installer in a private temporary directory and checks the original SHA-256 before installation.
 The installer and key are excluded from caches and report artifacts. Temporary installer files are removed when the script exits.
 If no installer URL is configured, the script accepts tools already installed on `PATH`.
-Without an installer URL or a configured runner, automatic Apple jobs show as skipped.
-A manual dispatch fails with setup instructions if tools are unavailable.
+If tools are unavailable, both automatic and manual runs fail with setup instructions.
 No missing-tool run counts as conformance evidence.
 
 The workflow and local tests do not modify Keychain or require sudo for TLS.
@@ -312,3 +316,26 @@ The audit keeps its two-hour assertion and 5 GiB disk cap; it does not waive ret
 The faster burst exposed an RTMP batch cancellation bug before validation.
 RTMP reading now returns completed batches without yielding after packets have been consumed.
 A regression test covers the cancellation boundary.
+
+## GStreamer playback
+
+`tools/run-gstreamer-ci.py` uses the same live Rust origin as the Chrome probe.
+It plays the control case through `playbin3` and `hlsdemux2`.
+The stream must reach end-of-stream without a pipeline error.
+Both audio and video must produce decoded raw buffers spanning at least 12 seconds of the 24-second fixture.
+The artifact includes buffer counts, timestamps, negotiated formats, warnings, and origin logs.
+This check covers independent client decoding and completion; Chrome covers explicit rendition switching.
+
+On Linux, install the packages listed in `.github/workflows/ci.yaml`, then run:
+
+```sh
+/usr/bin/python3 tools/run-gstreamer-ci.py --output target/gstreamer-reports
+```
+
+GAP recovery is available separately with `--case gaps` or `--case all`; failures return a nonzero exit code.
+It is not yet part of the required GStreamer check.
+GStreamer 1.28.6 failed the local GAP case with consecutive fragment download errors near 5.3 seconds.
+Its [playlist parser](https://github.com/GStreamer/gstreamer/blob/1.28.6/subprojects/gst-plugins-good/ext/adaptivedemux2/hls/m3u8.c#L1108) expects `EXT-X-GAP:` instead of the valid `EXT-X-GAP` tag.
+This is a likely cause, not yet confirmed by a corrected GStreamer build.
+The clean control decoded 600 video buffers and reached end-of-stream.
+Chrome's required patched-player check continues to cover GAP playback.
