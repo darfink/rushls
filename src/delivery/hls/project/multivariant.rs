@@ -164,13 +164,12 @@ pub fn multivariant_playlist(
         })?;
     }
 
-    // Section 4.4.6.2 requires the same value on every variant, so it is
-    // decided once here rather than per variant. Absent — rather than NONE —
-    // when nothing was detected, because NONE is a positive assertion that no
-    // variant carries captions, and this origin only knows what it has
-    // observed so far.
-    let closed_captions =
-        (!captions.is_empty()).then_some(ClosedCaptions::Group(CLOSED_CAPTION_GROUP));
+    let closed_captions = caption_reference(
+        &presentation.closed_captions,
+        groups
+            .iter()
+            .any(|group| group.media_kind == MediaKind::Video),
+    );
 
     let mut written = BTreeSet::new();
     for playable in &playable {
@@ -346,6 +345,25 @@ fn write_variant(
         uri: &uris.media_playlist(primary.rendition_id, primary.media.kind()),
     })?;
     Ok(())
+}
+
+// Every variant must agree. Advertise NONE until caption detection adds a
+// service, then replace it with the group reference on the next snapshot.
+// Do not claim absence when a detected service cannot be named by HLS.
+fn caption_reference(
+    services: &[ClosedCaptionService],
+    has_video: bool,
+) -> Option<ClosedCaptions<'static>> {
+    if services
+        .iter()
+        .any(|service| instream_id(service.channel).is_some())
+    {
+        Some(ClosedCaptions::Group(CLOSED_CAPTION_GROUP))
+    } else if services.is_empty() && has_video {
+        Some(ClosedCaptions::None)
+    } else {
+        None
+    }
 }
 
 /// What playing this rendition should be assumed to cost.

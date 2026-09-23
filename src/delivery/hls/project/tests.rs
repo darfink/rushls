@@ -571,12 +571,11 @@ fn detected_captions_are_declared_once_and_referenced_by_every_variant()
     let store = StreamStore::default();
     let lease = lease(&store, vec![video(0), audio(1)]);
 
-    // Before detection the presentation says nothing about captions, which is
-    // legal: the attribute is optional, and this origin only knows what it has
-    // observed.
+    // Caption absence is explicit until detection adds a service. A later
+    // snapshot must replace NONE with the same group on every variant.
     let before = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?
         .ok_or_else(|| std::io::Error::other("an attached publication has a topology"))?;
-    assert!(!before.contains("CLOSED-CAPTIONS"));
+    assert!(before.contains("CLOSED-CAPTIONS=NONE"));
 
     assert!(
         lease.declare_closed_captions(Arc::from([ClosedCaptionService {
@@ -591,6 +590,7 @@ fn detected_captions_are_declared_once_and_referenced_by_every_variant()
     let after = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?
         .ok_or_else(|| std::io::Error::other("an attached publication has a topology"))?;
 
+    assert!(!after.contains("CLOSED-CAPTIONS=NONE"));
     assert!(after.contains(concat!(
         "#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID=\"cc\",NAME=\"Service 1\",",
         "DEFAULT=YES,AUTOSELECT=YES,LANGUAGE=\"en\",INSTREAM-ID=\"SERVICE1\"\n"
