@@ -15,6 +15,15 @@ It preserves encoded media without transcoding.
 See [feature coverage](docs/feature-parity.md) and [known limitations](TODO.md)
 for protocol details and remaining work.
 
+## Releases and platform support
+
+Tagged releases provide native Linux and macOS archives for AMD64 and ARM64, with SHA-256 checksums.
+See [release procedures and platform requirements](docs/releases.md).
+Windows is not currently supported because recording and disk retention use Unix APIs.
+
+Chrome's required compatibility check currently uses a local hls.js correction pending upstream submission.
+The official hls.js failure also affects valid media; see [player compatibility](docs/releases.md#player-compatibility).
+
 ## Build and run
 
 Install Rust 1.97 or later and a C compiler for the `ring` dependency.
@@ -112,3 +121,7 @@ The [protocol resources](docs/resources/README.md) include the HLS draft used by
 The manifests currently declare `UNLICENSED`. This repository does not grant an open-source license.
 
 See [CI validation](docs/ci-validation.md) for test coverage, Apple tool setup, and the two-hour HLS authoring audit.
+
+## License
+
+Rushls is available under the [MIT license](LICENSE). Third-party components retain their own licenses.

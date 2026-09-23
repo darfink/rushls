@@ -14,9 +14,9 @@ Rust toolchain installation uses a composite action, with no JavaScript runtime.
 | Validate GStreamer playback | Live control stream; decoded audio/video and end-of-stream | FFmpeg, GStreamer 1.28+ hlsdemux2, PyGObject |
 
 Code, media, Chrome, and GStreamer checks run on pull requests and main-branch pushes.
-Apple validation runs through a reusable workflow on main-branch pushes and manual main-branch runs.
+Apple validation runs through a reusable workflow on main-branch pushes, version tags, and manual main-branch runs.
 Pull requests do not receive the Apple installer and certificate secrets.
-**Publish container image** requires all five validation jobs to succeed for the same commit.
+**Publish container image** requires all five validation jobs and all four native archive smoke tests to succeed for the same commit.
 A failed or skipped Apple validation blocks publication.
 The reusable Apple workflow also supports manual validation without image publication.
 Each ignored Rust test has a job or driver that supplies its external dependencies.
@@ -341,3 +341,5 @@ Its [playlist parser](https://github.com/GStreamer/gstreamer/blob/1.28.6/subproj
 This is a likely cause, not yet confirmed by a corrected GStreamer build.
 The clean control decoded 600 video buffers and reached end-of-stream.
 Chrome's required patched-player check continues to cover GAP playback.
+
+Native binary packaging also runs on pull requests. See [tagged releases](releases.md) for the publication gates and archive checks.

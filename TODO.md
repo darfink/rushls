@@ -29,13 +29,26 @@ Complete these checks before a broad production rollout:
 - [ ] Decide where publisher fairness is enforced: application admission or deployment
   infrastructure. Document and test the chosen protection against one publisher
   exhausting global capacity, including input without pacing.
-- [ ] Automate build, tests, formatting, lint checks, and release delivery in CI/CD.
-  Keep Apple validation on a suitable macOS runner. Report unavailable tools as
-  skipped checks, never as successful validation.
+- [x] Automate formatting, lints, tests, native binary packaging, and tagged release delivery.
+  Apple validation and all native archive smoke tests block publication.
+  See [release procedures](docs/releases.md).
+- [x] Add MIT licensing and scan tracked files and reachable Git history for credentials.
+  See the [review scope and findings](docs/credential-review.md).
+- [ ] Publish the first version tag after the four-platform archive matrix passes.
+- [ ] Submit the hls.js pending-part correction upstream and track its release.
+  The official player's clean control also fails; this is not limited to faulty publishers.
+
 
 ## Known limitations and unresolved reports
 
 These limits remain explicit in the supported scope:
+
+- Windows does not currently build: recording and disk retention depend on Unix filesystem and process APIs.
+  Release binaries cover Linux and macOS on x86-64 and ARM64.
+- Official hls.js 1.7.3 can stall on valid live streams around rendition switches and ENDLIST.
+  Required Chrome validation uses the documented local player patch pending upstream adoption.
+- GStreamer 1.28 passes clean live playback. GAP recovery remains a failing diagnostic;
+  its parser expects a colon after EXT-X-GAP, which is a likely cause.
 
 - Safari video-only playback can end prematurely at a video GAP. Tested A/V cases
   continued, sometimes after a freeze until the next IDR. This does not establish
@@ -57,6 +70,10 @@ These limits remain explicit in the supported scope:
 ## Future features and design decisions
 
 Evaluate these separately from release validation:
+
+- [ ] Port recording and store ownership to Windows without weakening filesystem safety.
+- [ ] Add signed/notarized release binaries and evaluate static Linux builds.
+- [ ] Add multi-architecture container publication.
 
 - [ ] Support coordinated midstream discontinuities and a defined subset of compatible
   codec/configuration changes. Define timestamp-reset semantics before adding recovery.
