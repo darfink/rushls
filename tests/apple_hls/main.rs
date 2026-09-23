@@ -14,6 +14,7 @@
 //! input or the cadence is *unusual*, and the comment on each says which one.
 //! A case with no such comment is not pulling its weight.
 
+mod authoring;
 mod certs;
 mod export;
 mod flv;
@@ -22,6 +23,7 @@ mod observe;
 mod publish;
 mod report;
 mod shape;
+mod trace;
 mod validator;
 
 use std::time::Duration;
@@ -264,13 +266,26 @@ async fn rtmp_video_only() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rtmp_captions_webvtt() -> TestResult {
-    run_with(
+    let Some(origin) = harness::Origin::start_with(
         Setup::default()
             .named("rtmp_captions_webvtt")
             .expect(Expect::captions),
-        publish::rtmp_h264_aac_captions()?,
     )
-    .await
+    .await?
+    else {
+        return Ok(());
+    };
+    origin.publish(publish::rtmp_h264_aac_captions()?).await?;
+    let (_, playlist) = origin
+        .media_playlists()?
+        .into_iter()
+        .find(|(url, _)| url.contains("subtitles.m3u8"))
+        .ok_or("missing caption playlist")?;
+    let text = validator::fetch_webvtt(&playlist, origin.certificate_authority())?;
+    assert!(text.starts_with("WEBVTT"));
+    assert!(text.contains("caption at "));
+    origin.validate_playlist()?;
+    Ok(())
 }
 
 /// Three subtitle renditions in one group.

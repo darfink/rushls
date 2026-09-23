@@ -1,27 +1,16 @@
-//! Server certificates for the Apple HLS suite, without touching system trust.
+//! Optional TLS for Apple's validator without changing system trust.
 //!
-//! `NSURLSession` (what `mediastreamvalidator` uses) will not trust a
-//! self-signed leaf, and the only ways to make it trust one are to mutate the
-//! login keychain or to authenticate an admin trust store change. Both need a
-//! human at the machine, and the first leaves state behind when a test binary
-//! is killed, so neither is done here.
-//!
-//! Instead the suite runs cleartext by default: `mediastreamvalidator` and
-//! `hlsreport` validate an `http://` origin exactly as they validate an
-//! `https://` one, and every rule they check is about playlists and segments
-//! rather than about the transport. TLS is opt-in for the one thing cleartext
-//! genuinely cannot cover — HTTP/2 delivery, which Apple's client reaches only
-//! over TLS — and is enabled by pointing the suite at material the machine
-//! already trusts:
-//!
-//! * `RUSHLS_TEST_TLS_CERT` + `RUSHLS_TEST_TLS_KEY` — a ready leaf chain for
-//!   `127.0.0.1`, already trusted by this machine.
-//! * `RUSHLS_TEST_CA_CERT` + `RUSHLS_TEST_CA_KEY` — an already-trusted CA the
-//!   suite mints a short-lived `127.0.0.1` leaf from. Preferred: a leaf is
-//!   generated per process, so nothing long-lived is checked out or reused.
-//!
-//! Either way the trust decision was made once, by a person, outside the test
-//! suite. Nothing here installs, removes, or reorders a keychain.
+//! The validator has no documented custom-CA option. Supply a certificate
+//! already trusted by macOS; curl's `--cacert` does not configure Apple's client.
+//! `RUSHLS_TEST_TLS_CERT` and `RUSHLS_TEST_TLS_KEY` select a leaf chain and key.
+//! `RUSHLS_TEST_TLS_HOST` selects its hostname (default: `127.0.0.1`), which must
+//! resolve to `127.0.0.1`, optionally also `::1`. A publicly trusted DNS-01 certificate
+//! allows this without Keychain changes, privileged ports, or hosts-file edits.
+//! An already-trusted CA can alternatively be supplied with
+//! `RUSHLS_TEST_CA_CERT` and `RUSHLS_TEST_CA_KEY` to mint a localhost leaf.
+//! `RUSHLS_TEST_TLS_MIN_VERSION` and `RUSHLS_TEST_TLS_MAX_VERSION` select
+//! protocol bounds ("1.2" or "1.3", both default to "1.3").
+//! Without TLS, transport findings remain audit failures.
 
 use std::{
     fs,
@@ -73,9 +62,17 @@ pub fn shared_https() -> Result<Option<Arc<SharedHttps>>, Box<dyn std::error::Er
 /// Distinct from "TLS was never requested": a machine that set the variables
 /// and got cleartext anyway should hear why rather than see a green run.
 pub fn tls_requested() -> bool {
-    ["RUSHLS_TEST_TLS_CERT", "RUSHLS_TEST_CA_CERT"]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some())
+    [
+        "RUSHLS_TEST_TLS_CERT",
+        "RUSHLS_TEST_TLS_KEY",
+        "RUSHLS_TEST_TLS_HOST",
+        "RUSHLS_TEST_TLS_MIN_VERSION",
+        "RUSHLS_TEST_TLS_MAX_VERSION",
+        "RUSHLS_TEST_CA_CERT",
+        "RUSHLS_TEST_CA_KEY",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
 }
 
 fn load() -> Result<Option<Arc<SharedHttps>>, Box<dyn std::error::Error + Send + Sync>> {
@@ -91,6 +88,8 @@ fn load() -> Result<Option<Arc<SharedHttps>>, Box<dyn std::error::Error + Send +
             settings: TlsSettings {
                 certificate: certificate.clone(),
                 key,
+                min_version: tls_version("RUSHLS_TEST_TLS_MIN_VERSION")?,
+                max_version: tls_version("RUSHLS_TEST_TLS_MAX_VERSION")?,
                 ..TlsSettings::default()
             },
             // A supplied chain is trusted by the machine, so `curl` needs the
@@ -109,6 +108,16 @@ fn load() -> Result<Option<Arc<SharedHttps>>, Box<dyn std::error::Error + Send +
         &PathBuf::from(ca_certificate),
         &PathBuf::from(ca_key),
     )?)))
+}
+
+fn tls_version(name: &str) -> Result<cc_tls::TlsVersion, Box<dyn std::error::Error + Send + Sync>> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|error| format!("{name}: {error}").into()),
+        Err(std::env::VarError::NotPresent) => Ok(cc_tls::TlsVersion::Tls13),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn var(name: &str) -> Option<String> {
@@ -159,9 +168,61 @@ fn mint_leaf(
         settings: TlsSettings {
             certificate,
             key,
+            min_version: tls_version("RUSHLS_TEST_TLS_MIN_VERSION")?,
+            max_version: tls_version("RUSHLS_TEST_TLS_MAX_VERSION")?,
             ..TlsSettings::default()
         },
         ca_pem: Some(chain),
         directory: Some(directory),
     })
+}
+
+/// Keep the certificate hostname while ensuring validation reaches our local listener.
+pub async fn origin_host(port: u16) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let host = std::env::var("RUSHLS_TEST_TLS_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-".contains(&byte))
+    {
+        return Err("RUSHLS_TEST_TLS_HOST must be a DNS hostname or 127.0.0.1".into());
+    }
+    let addresses = tokio::net::lookup_host((host.as_str(), port))
+        .await?
+        .collect::<Vec<_>>();
+    if !local_origin_addresses(&addresses) {
+        return Err(
+            "RUSHLS_TEST_TLS_HOST must resolve to 127.0.0.1 and only loopback addresses".into(),
+        );
+    }
+    Ok(host)
+}
+
+// The origin listens on IPv4. Dual-stack clients can fall back from ::1,
+// but DNS must never send validation requests to a non-loopback address.
+fn local_origin_addresses(addresses: &[std::net::SocketAddr]) -> bool {
+    addresses
+        .iter()
+        .any(|address| address.ip() == Ipv4Addr::LOCALHOST)
+        && addresses.iter().all(|address| address.ip().is_loopback())
+}
+
+#[test]
+fn certificate_dns_allows_dual_stack_but_requires_the_local_origin()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (addresses, expected) in [
+        (vec!["127.0.0.1:443"], true),
+        (vec!["127.0.0.1:443", "[::1]:443"], true),
+        (vec!["[::1]:443"], false),
+        (vec!["127.0.0.1:443", "192.0.2.1:443"], false),
+        (vec!["127.0.0.1:443", "[2001:db8::1]:443"], false),
+        (vec![], false),
+    ] {
+        let addresses = addresses
+            .into_iter()
+            .map(str::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(local_origin_addresses(&addresses), expected);
+    }
+    Ok(())
 }

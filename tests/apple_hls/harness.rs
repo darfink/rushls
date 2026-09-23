@@ -48,6 +48,7 @@ pub fn segmentation_with_headroom(
 pub struct Setup {
     pub segmentation: SegmentationPolicy,
     pub readiness: PlaylistReadiness,
+    pub retain: Option<Duration>,
     /// What the publication deliberately contains, so a conformance finding
     /// that is merely inapplicable can be told apart from a defect.
     pub expect: Expect,
@@ -58,6 +59,7 @@ impl Default for Setup {
         Self {
             segmentation: default_segmentation(),
             readiness: PlaylistReadiness::CompletedSegment,
+            retain: None,
             expect: Expect::default(),
         }
     }
@@ -91,6 +93,7 @@ pub struct Origin {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     _https: Option<Arc<certs::SharedHttps>>,
+    _disk: Option<TemporaryDvr>,
 }
 
 impl Origin {
@@ -101,6 +104,13 @@ impl Origin {
     pub async fn start_with(
         mut setup: Setup,
     ) -> Result<Option<Self>, Box<dyn std::error::Error + Send + Sync>> {
+        if std::env::var_os("RUSHLS_TEST_REQUIRE_APPLE_TOOLS").is_some()
+            && (!cfg!(target_os = "macos") || !validator::tools_available())
+        {
+            return Err(
+                "macOS, mediastreamvalidator, and hlsreport are required for this run".into(),
+            );
+        }
         if cfg!(not(target_os = "macos")) {
             eprintln!("skipping Apple HLS tests: macOS and mediastreamvalidator are required");
             return Ok(None);
@@ -117,6 +127,7 @@ impl Origin {
             return Err("TLS was requested but no usable certificate was produced".into());
         }
         let scheme = if https.is_some() { "https" } else { "http" };
+        let host = certs::origin_host(address.port()).await?;
         // Set here rather than per case: whether the transport findings are
         // real is a property of how the suite was launched, not of the media.
         setup.expect.tls = https.is_some();
@@ -124,18 +135,28 @@ impl Origin {
         let mut config = NodeConfig::default();
         // Absolute names so every fetch after the multivariant playlist keeps
         // the scheme under test rather than falling back to a relative one.
-        config.hls.uri_base = UriBase::new(format!("{scheme}://127.0.0.1:{}", address.port()));
+        config.hls.uri_base = UriBase::new(format!("{scheme}://{host}:{}", address.port()));
         config.hls.readiness = setup.readiness;
+        configure_authoring(&mut config, setup.expect.full_authoring);
         config.session.segmentation = setup.segmentation;
+        let disk = configure_retention(&mut config, setup.retain)?;
         let session = config.session;
         let recorder = Recorder::default();
+        let mut policy = StreamPolicy::permissive();
+        if setup.expect.full_authoring {
+            policy.input_mode = rushls::domain::InputMode::Strict;
+        }
         let node = Node::new(
             config,
-            Arc::new(OpenStreamAuthenticator::new(StreamPolicy::permissive())),
+            Arc::new(OpenStreamAuthenticator::new(policy)),
             recorder.events(),
             None,
         )?;
 
+        let application = Arc::new(crate::trace::Traced::new(
+            node.application(),
+            setup.expect.name,
+        )?);
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let stop = async {
             let _ = stopped.await;
@@ -151,7 +172,7 @@ impl Origin {
                 )?;
                 tokio::spawn(serve(
                     tls_listener,
-                    node.application(),
+                    application,
                     HttpConfig {
                         tls: Some(settings),
                         tls_address: Some(address),
@@ -165,7 +186,7 @@ impl Origin {
             }
             None => tokio::spawn(serve(
                 listener,
-                node.application(),
+                application,
                 HttpConfig::default(),
                 None,
                 None,
@@ -178,7 +199,7 @@ impl Origin {
             node,
             session,
             url: format!(
-                "{scheme}://127.0.0.1:{}/live/camera/index.m3u8",
+                "{scheme}://{host}:{}/live/camera/index.m3u8",
                 address.port()
             ),
             ca_pem: https.as_ref().and_then(|https| https.ca_pem.clone()),
@@ -187,6 +208,7 @@ impl Origin {
             shutdown: Some(shutdown),
             server: Some(server),
             _https: https,
+            _disk: disk,
         }))
     }
 
@@ -299,4 +321,71 @@ impl Drop for Origin {
             server.abort();
         }
     }
+}
+
+fn configure_authoring(config: &mut NodeConfig, full_authoring: bool) {
+    config.store.independent_segments = full_authoring;
+    if full_authoring {
+        // Apple fetches some initially advertised parts near the end of
+        // its exhaustive scan. Keep URLs alive across that scan plus
+        // request overhead; the part-tag window and production defaults stay intact.
+        config.store.retention.part_fetch_grace_period =
+            validator::SCAN_TIMEOUT.saturating_mul(2).into();
+    }
+}
+
+fn configure_retention(
+    config: &mut NodeConfig,
+    retain: Option<Duration>,
+) -> std::io::Result<Option<TemporaryDvr>> {
+    if let Some(retain) = retain {
+        let disk = TemporaryDvr::new()?;
+        config.store.retention.retain = retain.into();
+        config.store.retention.maximum_payload_bytes = 512 * 1024 * 1024;
+        // The compact ladder retains roughly 4 GiB. Keep a hard disk cap
+        // that fits a hosted runner while exercising production spill behavior.
+        config.store.disk = Some(rushls::delivery::store::DiskLimits {
+            directory: disk.0.clone(),
+            maximum_payload_bytes: 5 * 1024 * 1024 * 1024,
+        });
+        config.store.retention.maximum_segments = 100_000;
+        config.store.retention.maximum_parts = 200_000;
+        return Ok(Some(disk));
+    }
+    Ok(None)
+}
+
+/// Retained media is disposable; reports are saved separately before teardown.
+/// Keep this last in Origin so the node drops before its directory is removed.
+struct TemporaryDvr(std::path::PathBuf);
+
+impl TemporaryDvr {
+    fn new() -> std::io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("rushls-apple-dvr-{}-{id}", std::process::id()));
+        // Never reuse a directory left by another test process.
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for TemporaryDvr {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn temporary_dvr_removes_payloads_without_sharing_directories() -> std::io::Result<()> {
+    let first = TemporaryDvr::new()?;
+    let second = TemporaryDvr::new()?;
+    assert_ne!(first.0, second.0);
+    let path = first.0.clone();
+    std::fs::write(path.join("segment.m4s"), b"temporary media")?;
+    drop(first);
+    assert!(!path.exists());
+    assert!(second.0.exists());
+    Ok(())
 }

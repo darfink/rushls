@@ -110,3 +110,5 @@ The [protocol resources](docs/resources/README.md) include the HLS draft used by
 ## License
 
 The manifests currently declare `UNLICENSED`. This repository does not grant an open-source license.
+
+See [CI validation](docs/ci-validation.md) for test coverage, Apple tool setup, and the two-hour HLS authoring audit.

@@ -219,7 +219,7 @@ fn interleave_captions(media: Vec<IngressEvent>, captions: &[(u32, Vec<u8>)]) ->
     events
 }
 
-fn encode_cue(name: &[u8], text: &[u8]) -> Bytes {
+pub fn encode_cue(name: &[u8], text: &[u8]) -> Bytes {
     let mut payload = Vec::with_capacity(16 + name.len() + text.len());
     payload.push(0x02);
     payload.extend_from_slice(&u16::try_from(name.len()).expect("name fits").to_be_bytes());

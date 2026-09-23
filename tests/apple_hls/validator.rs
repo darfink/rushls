@@ -34,6 +34,10 @@ pub fn mediastreamvalidator_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+pub fn tools_available() -> bool {
+    mediastreamvalidator_available() && hlsreport_available()
+}
+
 fn hlsreport_available() -> bool {
     Command::new("hlsreport")
         .arg("--version")
@@ -41,8 +45,16 @@ fn hlsreport_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// One live scan can postpone fetching the initial playlist's parts until its end.
+pub const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Validates `url` and fails on any finding this origin is answerable for.
 pub fn validate(url: &str, expect: &Expect) -> Result<(), String> {
+    if expect.full_authoring && (authoring_mode() == AuthoringMode::Off || !tools_available()) {
+        return Err(
+            "the full authoring audit requires both Apple tools and hlsreport enabled".into(),
+        );
+    }
     let mut last = String::new();
     for attempt in 1..=3 {
         match validate_once(url, expect) {
@@ -64,7 +76,9 @@ fn crashed_without_report(error: &str) -> bool {
 fn validate_once(url: &str, expect: &Expect) -> Result<(), String> {
     let report = temporary_path(expect.name, "json");
     let output = Command::new("mediastreamvalidator")
-        .args(["--timeout", "30", "--validation-data-path"])
+        .arg("--timeout")
+        .arg(SCAN_TIMEOUT.as_secs().to_string())
+        .arg("--validation-data-path")
         .arg(&report)
         .arg(url)
         .output()
@@ -88,9 +102,16 @@ fn validate_once(url: &str, expect: &Expect) -> Result<(), String> {
     match authoring_findings(&report) {
         Ok(mut authoring) => findings.append(&mut authoring),
         // A missing or broken hlsreport must not hide what the validator said.
+        Err(reason)
+            if expect.full_authoring
+                || std::env::var_os("RUSHLS_TEST_REQUIRE_APPLE_TOOLS").is_some() =>
+        {
+            keep_artifacts(&report, expect.name)?;
+            return Err(format!("hlsreport failed: {reason}"));
+        }
         Err(reason) => eprintln!("hlsreport unavailable for {}: {reason}", expect.name),
     }
-    keep_artifacts(&report, expect.name);
+    keep_artifacts(&report, expect.name)?;
     let _ = fs::remove_file(&report);
 
     let judgement = Judgement::new(findings, expect);
@@ -124,38 +145,113 @@ fn authoring_findings(json: &Path) -> Result<Vec<Finding>, String> {
     if !hlsreport_available() {
         return Err("not on PATH".into());
     }
+    let original = render_hlsreport(json, None)?;
+    let version = Command::new("hlsreport")
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("cannot identify hlsreport: {error}"))?;
+    let mut value: Value =
+        serde_json::from_slice(&fs::read(json).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let version_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&version.stderr)
+    );
+    if version.status.success() && normalize_tls12_enum(&mut value, version_text.trim()) {
+        // Preserve Apple's original artifacts. This copy changes representation,
+        // not the negotiated protocol or any cipher, finding, or stream metadata.
+        let compatible = json.with_extension("hlsreport-compat.json");
+        fs::write(
+            &compatible,
+            serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let text = render_hlsreport(
+            &compatible,
+            Some(
+                "Compatibility report: hlsreport 1.20.7 expects the legacy TLS 1.2 enum (8). The validator recorded the equivalent wire value 771 (0x0303). Only that representation was converted; original JSON and HTML are retained separately.",
+            ),
+        )?;
+        return Ok(parse_hlsreport(&text));
+    }
+    Ok(parse_hlsreport(&original))
+}
+
+/// Version-specific bridge between Apple's two protocol enums. Do not translate
+/// TLS 1.3 into TLS 1.2, or guess how a different tool/schema version behaves.
+fn normalize_tls12_enum(value: &mut Value, report_version: &str) -> bool {
+    if report_version != "hlsreport: Version 1.20.7 (618.19-230505)"
+        || value.get("validatorVersion").and_then(Value::as_str) != Some("1.20.7 (618.19-230505)")
+        || value.get("dataVersion").and_then(Value::as_f64) != Some(1.1)
+    {
+        return false;
+    }
+    let Some(hosts) = value.get_mut("sslHosts").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for host in hosts.values_mut() {
+        if let Some(version) = host.get_mut("sslNegotiatedProtocolVersion")
+            && version.as_u64() == Some(0x0303)
+        {
+            *version = Value::from(8);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn render_hlsreport(json: &Path, note: Option<&str>) -> Result<String, String> {
     let html = json.with_extension("html");
-    let output = Command::new("hlsreport")
-        .args(["--rule-set=all", "--output"])
-        .arg(&html)
+    let mut command = Command::new("hlsreport");
+    command.args(["--rule-set=all", "--output"]).arg(&html);
+    if let Some(note) = note {
+        command.arg("--note").arg(note);
+    }
+    let output = command
         .arg(json)
         .output()
         .map_err(|error| format!("failed to start: {error}"))?;
-    let text = fs::read_to_string(&html).map_err(|error| {
-        format!(
-            "wrote no HTML ({error}, status {}): {}",
+    if !output.status.success() {
+        return Err(format!(
+            "hlsreport exited {}: {}",
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    })?;
-    Ok(parse_hlsreport(&text))
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = fs::read_to_string(&html).map_err(|error| format!("wrote no HTML: {error}"))?;
+    if !text.contains("HLS Validation Report") {
+        return Err("hlsreport output contains no HLS Validation Report heading".into());
+    }
+    Ok(text)
 }
 
 /// Copies a case's JSON and HTML aside when an operator asked to keep them.
-fn keep_artifacts(json: &Path, name: &str) {
+fn keep_artifacts(json: &Path, name: &str) -> Result<(), String> {
     let Some(directory) = std::env::var_os("RUSHLS_TEST_REPORT_DIR") else {
-        let _ = fs::remove_file(json.with_extension("html"));
-        return;
+        for extension in ["html", "hlsreport-compat.json", "hlsreport-compat.html"] {
+            let _ = fs::remove_file(json.with_extension(extension));
+        }
+        return Ok(());
     };
     let directory = PathBuf::from(directory);
-    if fs::create_dir_all(&directory).is_err() {
-        return;
-    }
-    for extension in ["json", "html"] {
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create report directory: {error}"))?;
+    for extension in [
+        "json",
+        "html",
+        "hlsreport-compat.json",
+        "hlsreport-compat.html",
+    ] {
         let from = json.with_extension(extension);
-        let _ = fs::rename(&from, directory.join(format!("{name}.{extension}")));
+        if from.exists() {
+            fs::copy(&from, directory.join(format!("{name}.{extension}")))
+                .map_err(|error| format!("cannot preserve {extension} report: {error}"))?;
+        }
         let _ = fs::remove_file(&from);
     }
+    Ok(())
 }
 
 /// Collects every `messages` entry, plus the states that imply one.
@@ -323,6 +419,29 @@ pub fn fetch(url: &str, ca_pem: Option<&Path>) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Fetch a retained cue segment together with its optional WebVTT initialization.
+/// `EXT-X-MAP` permits the WEBVTT header to live outside each media segment.
+pub fn fetch_webvtt(playlist: &str, ca_pem: Option<&Path>) -> Result<String, String> {
+    let segment = playlist
+        .lines()
+        .find(|line| !line.starts_with('#') && !line.is_empty())
+        .ok_or("no retained subtitle segment")?;
+    let mut text = String::new();
+    if let Some(map) = playlist
+        .lines()
+        .find(|line| line.starts_with("#EXT-X-MAP:"))
+    {
+        let uri = map
+            .split("URI=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .ok_or("subtitle initialization has no URI")?;
+        text.push_str(&fetch(uri, ca_pem)?);
+    }
+    text.push_str(&fetch(segment, ca_pem)?);
+    Ok(text)
+}
+
 fn temporary_path(name: &str, extension: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -333,4 +452,42 @@ fn temporary_path(name: &str, extension: &str) -> PathBuf {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
     std::env::temp_dir().join(format!("rushls-{safe}-{nonce}.{extension}"))
+}
+
+#[test]
+fn tls_enum_compatibility_preserves_evidence_and_is_version_scoped() {
+    let original = serde_json::json!({
+        "validatorVersion": "1.20.7 (618.19-230505)", "dataVersion": 1.1,
+        "messages": [{"errorComment": "keep this finding"}],
+        "sslHosts": {
+            "tls12": {"sslNegotiatedProtocolVersion": 771, "sslNegotiatedCipher": 49196},
+            "tls13": {"sslNegotiatedProtocolVersion": 772, "sslNegotiatedCipher": 4866},
+            "tls11": {"sslNegotiatedProtocolVersion": 770},
+            "unknown": {"sslNegotiatedProtocolVersion": 999},
+            "missing": {}
+        }
+    });
+    let version = "hlsreport: Version 1.20.7 (618.19-230505)";
+    let mut converted = original.clone();
+    assert!(normalize_tls12_enum(&mut converted, version));
+    let mut expected = original.clone();
+    expected["sslHosts"]["tls12"]["sslNegotiatedProtocolVersion"] = Value::from(8);
+    assert_eq!(converted, expected);
+    assert!(!normalize_tls12_enum(&mut converted, version));
+    let mut unchanged = original.clone();
+    assert!(!normalize_tls12_enum(
+        &mut unchanged,
+        "hlsreport: Version 1.21"
+    ));
+    assert_eq!(unchanged, original);
+    for (field, new_value) in [
+        ("validatorVersion", Value::from("1.21")),
+        ("dataVersion", Value::from(1.2)),
+    ] {
+        let mut unrecognized = original.clone();
+        unrecognized[field] = new_value;
+        let expected = unrecognized.clone();
+        assert!(!normalize_tls12_enum(&mut unrecognized, version));
+        assert_eq!(unrecognized, expected);
+    }
 }

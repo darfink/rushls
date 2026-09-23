@@ -38,6 +38,8 @@ use std::fmt::Write as _;
 pub struct Expect {
     /// Names the case in printed output and in `RUSHLS_TEST_REPORT_DIR` files.
     pub name: &'static str,
+    /// Full authoring audit: no publisher or feature exemptions.
+    pub full_authoring: bool,
     /// A subtitle or closed-caption rendition is published.
     pub captions: bool,
     /// More than one video rendition is published.
@@ -64,6 +66,7 @@ impl Default for Expect {
     fn default() -> Self {
         Self {
             name: "apple-hls",
+            full_authoring: false,
             captions: false,
             ladder: false,
             audio_only: false,
@@ -229,6 +232,29 @@ const PACKAGER_DUTIES: [&str; 18] = [
 pub fn judge(finding: &Finding, expect: &Expect) -> Verdict {
     let title = finding.title.to_ascii_lowercase();
     let scopes = finding.scopes.join("; ").to_ascii_lowercase();
+
+    if expect.full_authoring {
+        if finding.level == Level::NotChecked {
+            return Verdict::CompatibilityException(
+                "Apple performed no validation for this requirement",
+            );
+        }
+        if finding.source == Source::Authoring
+            && title.contains("mime type")
+            && !finding.scopes.is_empty()
+            && finding.scopes.iter().all(|scope| {
+                let scope = scope.to_ascii_lowercase();
+                scope.contains("subtitle")
+                    && scope.contains("received: text/vtt")
+                    && scope.contains("expected text/plain")
+            })
+        {
+            return Verdict::CompatibilityException(
+                "hlsreport expects text/plain for WebVTT; the specification accepts text/vtt and text/plain",
+            );
+        }
+        return Verdict::Defect;
+    }
 
     conditional(&title, &scopes, expect)
         .or_else(|| unimplemented_feature(&title))
@@ -541,8 +567,13 @@ pub fn parse_hlsreport(html: &str) -> Vec<Finding> {
             }
             "h3" => {
                 level = match body.as_str() {
-                    "Must Fix Issues" => Some(Level::MustFix),
-                    "Should Fix Issues" => Some(Level::ShouldFix),
+                    "Must Fix Issues"
+                    | "HLS Spec Must Fix Issues"
+                    | "Authoring Spec Must Fix Issues" => Some(Level::MustFix),
+                    "Should Fix Issues"
+                    | "HLS Spec Should Fix Issues"
+                    | "Authoring Spec Should Fix Issues"
+                    | "Advisories" => Some(Level::ShouldFix),
                     "Requirements with no validation performed" => Some(Level::NotChecked),
                     // "Detailed Output - Variants" and everything after it.
                     _ => None,
@@ -672,6 +703,82 @@ fn decode_entities(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_126_severity_headings_and_advisories() {
+        // 1.26 splits specification and authoring findings into separate headings.
+        // Ignoring the new names would silently report a clean stream.
+        let html = "<h2>General requirements</h2>
+            <h3>HLS Spec Must Fix Issues</h3><h4>1. Missing attribute [#-50096]</h4>
+            <ul><li>All I-Frame Variants</li></ul>
+            <h3>Authoring Spec Must Fix Issues</h3><h4>2. Missing language [#1024]</h4>
+            <h3>Authoring Spec Should Fix Issues</h3><h4>3. Use TLS [#1041]</h4>
+            <h3>Advisories</h3><h4>4. Declare independence [#135042]</h4>
+            <h3>Report Information</h3><h4>Not a finding</h4>";
+        let findings = parse_hlsreport(html);
+        assert_eq!(findings.len(), 4);
+        assert_eq!(findings[0].level, Level::MustFix);
+        assert_eq!(findings[1].level, Level::MustFix);
+        assert_eq!(findings[2].level, Level::ShouldFix);
+        assert_eq!(findings[3].level, Level::ShouldFix);
+        assert_eq!(findings[0].scopes, ["All I-Frame Variants"]);
+        assert_eq!(findings[0].title, "Missing attribute [#-50096]");
+    }
+
+    #[test]
+    fn full_authoring_does_not_inherit_packaging_exemptions() {
+        let expect = Expect {
+            full_authoring: true,
+            ..Expect::default()
+        };
+        for title in [
+            "You MUST provide multiple bit rates of video",
+            "Content not delivered via HTTP/2",
+            "If EXT-X-ENDLIST is specified, then EXT-X-PLAYLIST-TYPE MUST also be specified",
+            "An unknown future authoring requirement",
+        ] {
+            let finding = Finding {
+                source: Source::Authoring,
+                level: Level::ShouldFix,
+                context: "General requirements".into(),
+                title: title.into(),
+                scopes: vec![],
+            };
+            assert_eq!(judge(&finding, &expect), Verdict::Defect, "{title}");
+        }
+    }
+
+    #[test]
+    fn full_authoring_mime_exception_requires_only_subtitle_scopes() {
+        let expect = Expect {
+            full_authoring: true,
+            ..Expect::default()
+        };
+        let mut finding = Finding {
+            source: Source::Authoring,
+            level: Level::MustFix,
+            context: "General requirements".into(),
+            title: "Incorrect MIME type".into(),
+            scopes: vec!["All Subtitle Renditions, Received: text/vtt, Expected text/plain".into()],
+        };
+        assert!(matches!(
+            judge(&finding, &expect),
+            Verdict::CompatibilityException(_)
+        ));
+        let valid = finding.scopes[0].clone();
+        finding.scopes[0] =
+            "All Subtitle Renditions, Received: application/octet-stream, Expected text/plain"
+                .into();
+        assert_eq!(judge(&finding, &expect), Verdict::Defect);
+        finding.scopes[0] = valid;
+        finding.scopes.push("Audio rendition".into());
+        assert_eq!(judge(&finding, &expect), Verdict::Defect);
+        finding.scopes.clear();
+        assert_eq!(judge(&finding, &expect), Verdict::Defect);
+        finding.source = Source::Validator;
+        finding.scopes.push("Subtitle rendition".into());
+        assert_eq!(judge(&finding, &expect), Verdict::Defect);
+    }
 
     #[test]
     fn playlist_independence_exception_does_not_hide_part_independence_defects() {
