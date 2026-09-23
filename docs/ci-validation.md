@@ -9,7 +9,7 @@ Rust toolchain installation uses a composite action, with no JavaScript runtime.
 | --- | --- | --- |
 | Linux CI | Workspace tests, all features, Clippy, formatting, Python unit tests | Rust and Python |
 | macOS media | Ignored decoder tests, recording, RTMP ingest, video GAP fixture export | FFmpeg, including AudioToolbox AAC |
-| Chrome playback | Live control and GAP streams, audio/video rendition switches, completion | Chrome, matching ChromeDriver, hls.js 1.7.3 |
+| Chrome playback | Patched-player unit tests; live control and GAP streams, rendition switches, completion; official-release compatibility | Chrome, matching ChromeDriver, Node.js 24, pinned hls.js source and patch |
 | Apple HLS | Packaging cases, playlist diagnostics, two-hour live authoring audit | macOS, Apple HLS tools, FFmpeg, trusted localhost TLS |
 
 The macOS and browser jobs run on pull requests and main-branch pushes.
@@ -180,7 +180,7 @@ Clippy, formatting, and workflow validation also passed.
 The live Chrome probe also found a failure in the control case with hls.js 1.7.3.
 All scheduled switches completed, but playback stalled before the end.
 The matching GAP case completed successfully.
-The job preserves these results and fails; it does not convert the control failure into a passing expectation.
+The original job preserved these results and failed. The current policy below separates the patched player from official-release compatibility.
 The [earlier append-order investigation](gap-append-order.md) identified player-side ordering defects.
 The browser fixture now also respects each demuxed track clock when pacing packets.
 Regression tests cover cancellation without packet loss and both 48 kHz and 90 kHz timing.
@@ -197,8 +197,17 @@ The comparison changed no production Rushls code or CI player dependency.
 
 The candidate's GAP run reported 574 presented frames. Completion does not establish perceptual concealment quality.
 Local reports and player hashes are in `target/rushls-validation/ci-resume/`; those artifacts are not tracked by Git.
-The [player correction](gap-live-order-fix.md) remains separate from the official bundle used in CI.
-Until that correction is available in the CI player, its failing control also blocks image publication.
+### Current Chrome CI policy
+
+CI builds the [player correction](../tools/patches/hls.js/README.md) from pinned upstream source and a tracked patch.
+The builder uses the upstream npm lockfile and identifies the result as `1.7.3-rushls.1`.
+All upstream unit tests and both patched-player playback cases must pass before image publication.
+The unchanged official 1.7.3 release runs separately as an informational compatibility check.
+Its failure is visible in the job summary and is not treated as successful playback.
+
+The `live-gap-playback` artifact contains both sets of reports, the patch, the unit-test log, and build provenance.
+No Rust playback assertion is relaxed for the patched build.
+Remove the local patch and make the official release blocking again once an upstream release includes the correction.
 
 ## HTTPS audit observation
 

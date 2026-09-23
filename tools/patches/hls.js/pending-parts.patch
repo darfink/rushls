@@ -1,0 +1,523 @@
+diff --git a/src/controller/audio-stream-controller.ts b/src/controller/audio-stream-controller.ts
+index 6b848d40c..f7080ff84 100644
+--- a/src/controller/audio-stream-controller.ts
++++ b/src/controller/audio-stream-controller.ts
+@@ -1066,7 +1066,9 @@ class AudioStreamController
+     if (
+       this.switchingTrack ||
+       fragState === FragmentState.NOT_LOADED ||
+-      fragState === FragmentState.PARTIAL
++      fragState === FragmentState.PARTIAL ||
++      (fragState === FragmentState.OK &&
++        this.hasUnloadedParts(frag, targetBufferTime))
+     ) {
+       if (track.details?.live && !this.initPTS[frag.cc]) {
+         this.log(
+diff --git a/src/controller/base-stream-controller.ts b/src/controller/base-stream-controller.ts
+index a5dfa6aa9..77bb96e1b 100644
+--- a/src/controller/base-stream-controller.ts
++++ b/src/controller/base-stream-controller.ts
+@@ -668,7 +668,11 @@ export default class BaseStreamController
+           lastFragment.end,
+         );
+         if (fragmentAtEnd) {
+-          fragmentTracker.removeFragment(fragmentAtEnd);
++          // Preserve loaded part markers when ENDLIST updates the same parent.
++          // Removing it would replay its earlier parts before the pending tail.
++          if (!mediaFragmentsAreEqual(fragmentAtEnd, lastFragment)) {
++            fragmentTracker.removeFragment(fragmentAtEnd);
++          }
+           fragmentTracker.fragBuffered(lastFragment, true);
+         }
+       }
+@@ -1616,7 +1620,27 @@ export default class BaseStreamController
+     return programFrag;
+   }
+ 
++  protected hasUnloadedParts(frag: Fragment, bufferEnd = -Infinity): boolean {
++    return !!(
++      isMediaFragment(frag) &&
++      this.loadingParts &&
++      this.getLevelDetails()?.partList?.some(
++        (part) =>
++          mediaFragmentsAreEqual(part.fragment, frag) &&
++          !part.loaded &&
++          !part.gap &&
++          // Older parts can lose their loaded marker when tracking is pruned.
++          // Do not reload them behind the microsecond-quantized buffer edge.
++          part.end > bufferEnd + 0.0000015,
++      )
++    );
++  }
++
+   protected isLoopLoading(frag: Fragment, targetBufferTime: number): boolean {
++    // Playlist parts are more precise than the padded parent buffer state.
++    if (this.hasUnloadedParts(frag, targetBufferTime)) {
++      return false;
++    }
+     if (this.nextLoadPosition <= targetBufferTime) {
+       return false;
+     }
+@@ -1883,13 +1907,10 @@ export default class BaseStreamController
+     const { maxFragLookUpTolerance } = config;
+     const partList = levelDetails.partList;
+ 
+-    const loadingParts = !!(
+-      this.loadingParts &&
+-      partList?.length &&
+-      fragmentHint
+-    );
++    const loadingParts = !!(this.loadingParts && partList?.length);
+     if (
+       loadingParts &&
++      fragmentHint &&
+       !this.bitrateTest &&
+       partList[partList.length - 1].fragment.sn === fragmentHint.sn
+     ) {
+@@ -1898,6 +1919,22 @@ export default class BaseStreamController
+       endSN = fragmentHint.sn;
+     }
+ 
++    // Segment lookup can skip fragPrevious and tolerate an entire part's
++    // duration. Preserve a pending part at the buffer edge before advancing
++    // into the next GOP. Allow for microsecond buffer quantization and playlist rounding.
++    const pendingPart = loadingParts
++      ? partList.find(
++          (part) =>
++            !part.loaded &&
++            !part.gap &&
++            part.start <= bufferEnd + 0.0000015 &&
++            part.end > bufferEnd + 0.0000015,
++        )
++      : undefined;
++    if (pendingPart) {
++      return pendingPart.fragment;
++    }
++
+     // Clear fragPrevious if removed from buffer / tracker so that is picked again
+     if (
+       fragPrevious &&
+@@ -1910,6 +1947,7 @@ export default class BaseStreamController
+     if (bufferEnd < end) {
+       const backwardSeek = bufferEnd < this.lastCurrentTime;
+       const lookupTolerance =
++        loadingParts ||
+         backwardSeek ||
+         bufferEnd > end - maxFragLookUpTolerance ||
+         this.media?.paused ||
+@@ -1940,11 +1978,19 @@ export default class BaseStreamController
+       ) {
+         fragPrevious = frag;
+       }
++      // ENDLIST can arrive before the last advertised parts have loaded.
++      // Keep their parent eligible rather than advancing past the final fragment.
+       if (
+         mediaFragmentsAreEqual(frag, fragPrevious) &&
+         (!loadingParts ||
+           partList[0].fragment.sn > frag.sn ||
+-          !levelDetails.live)
++          (!levelDetails.live &&
++            !partList.some(
++              (part) =>
++                mediaFragmentsAreEqual(part.fragment, frag) &&
++                !part.loaded &&
++                !part.gap,
++            )))
+       ) {
+         const nextFrag = fragments[curSNIdx + 1];
+         if (
+diff --git a/src/controller/fragment-tracker.ts b/src/controller/fragment-tracker.ts
+index 94cc34c81..4f35d6a50 100644
+--- a/src/controller/fragment-tracker.ts
++++ b/src/controller/fragment-tracker.ts
+@@ -240,6 +240,9 @@ export class FragmentTracker implements ComponentAPI {
+     if (!fragmentEntity || (fragmentEntity.buffered && frag.gap)) {
+       return;
+     }
++    fragmentEntity.bufferedPartEnd = part
++      ? Math.max(fragmentEntity.bufferedPartEnd ?? -Infinity, part.end)
++      : undefined;
+     const isFragHint = !frag.relurl;
+     Object.keys(timeRanges).forEach((elementaryStream: SourceBufferName) => {
+       const streamInfo = frag.elementaryStreams[elementaryStream];
+@@ -349,6 +352,10 @@ export class FragmentTracker implements ComponentAPI {
+     partial: boolean,
+     timeRange: TimeRanges,
+   ): FragmentBufferedRange {
++    // Buffer padding can cover an entire LL-HLS part. Until the final part
++    // arrives, do not treat that padding as proof the parent is complete.
++    // A late callback for an earlier part must preserve already complete media.
++    const pendingTail = part !== null && part.end < fragment.end;
+     const buffered: FragmentBufferedRange = {
+       time: [],
+       partial,
+@@ -360,7 +367,11 @@ export class FragmentTracker implements ComponentAPI {
+     for (let i = 0; i < timeRange.length; i++) {
+       const startTime = timeRange.start(i) - this.bufferPadding;
+       const endTime = timeRange.end(i) + this.bufferPadding;
+-      if (maxStartPTS >= startTime && minEndPTS <= endTime) {
++      if (
++        maxStartPTS >= startTime &&
++        minEndPTS <= endTime &&
++        (!pendingTail || endPTS <= timeRange.end(i))
++      ) {
+         // Fragment is entirely contained in buffer
+         // No need to check the other timeRange times since it's completely playable
+         buffered.time.push({
+@@ -434,7 +445,11 @@ export class FragmentTracker implements ComponentAPI {
+     if (fragmentEntity) {
+       if (!fragmentEntity.buffered) {
+         return FragmentState.APPENDING;
+-      } else if (isPartial(fragmentEntity)) {
++      } else if (
++        isPartial(fragmentEntity) ||
++        (fragmentEntity.bufferedPartEnd !== undefined &&
++          fragmentEntity.bufferedPartEnd < fragment.end)
++      ) {
+         return FragmentState.PARTIAL;
+       } else {
+         return FragmentState.OK;
+diff --git a/src/controller/stream-controller.ts b/src/controller/stream-controller.ts
+index b023d54af..d87b6eeba 100644
+--- a/src/controller/stream-controller.ts
++++ b/src/controller/stream-controller.ts
+@@ -394,7 +394,9 @@ export default class StreamController
+     const fragState = this.fragmentTracker.getState(frag);
+     if (
+       fragState === FragmentState.NOT_LOADED ||
+-      fragState === FragmentState.PARTIAL
++      fragState === FragmentState.PARTIAL ||
++      (fragState === FragmentState.OK &&
++        this.hasUnloadedParts(frag, targetBufferTime))
+     ) {
+       if (this.bitrateTest) {
+         this.log(
+diff --git a/src/types/fragment-tracker.ts b/src/types/fragment-tracker.ts
+index 3487c429f..88fc87d1f 100644
+--- a/src/types/fragment-tracker.ts
++++ b/src/types/fragment-tracker.ts
+@@ -9,6 +9,8 @@ export interface FragmentEntity {
+   appendedPTS: number | null;
+   loaded: FragLoadedData | null;
+   buffered: boolean;
++  // Last endpoint delivered by parts, independent of later playlist growth.
++  bufferedPartEnd?: number;
+   range: { [key in SourceBufferName | 'subs']: FragmentBufferedRange };
+ }
+ 
+diff --git a/tests/unit/controller/base-stream-controller.ts b/tests/unit/controller/base-stream-controller.ts
+index db6c80fc6..659acd591 100644
+--- a/tests/unit/controller/base-stream-controller.ts
++++ b/tests/unit/controller/base-stream-controller.ts
+@@ -3,6 +3,7 @@ import sinon from 'sinon';
+ import sinonChai from 'sinon-chai';
+ import { hlsDefaultConfig } from '../../../src/config';
+ import { State } from '../../../src/controller/base-stream-controller';
++import { FragmentState } from '../../../src/controller/fragment-tracker';
+ import BaseStreamControllerImpl from '../../../src/controller/stream-controller';
+ import { ErrorDetails, ErrorTypes } from '../../../src/errors';
+ import Hls from '../../../src/hls';
+@@ -100,6 +101,169 @@ describe('BaseStreamController', function () {
+     baseStreamController.media = media;
+   });
+ 
++  describe('pending parts after ENDLIST', function () {
++    [PlaylistLevelType.MAIN, PlaylistLevelType.AUDIO].forEach((type) => {
++      it(`retains the final ${type} parent until its remaining parts load`, function () {
++        const controller = baseStreamController as any;
++        const parent = new Fragment(
++          type,
++          'https://example.com/',
++        ) as MediaFragment;
++        parent.sn = 12;
++        parent.start = 22;
++        parent.duration = 2;
++        const details = new LevelDetails('');
++        details.startSN = details.endSN = 12;
++        details.fragments = [parent];
++        details.live = true;
++        const hint = new Fragment(
++          type,
++          'https://example.com/',
++        ) as MediaFragment;
++        hint.sn = 13;
++        details.fragmentHint = hint;
++        const part = {
++          fragment: parent,
++          index: 9,
++          start: 23.8,
++          duration: 0.2,
++          end: 24,
++          loaded: false,
++          gap: false,
++        };
++        details.partList = [part as unknown as Part];
++        controller.loadingParts = true;
++        controller.fragPrevious = parent;
++        fragmentTracker.state = FragmentState.PARTIAL;
++        expect(controller.getFragmentAtPosition(23.8, 24, details)).to.equal(
++          parent,
++        );
++        details.live = false;
++        details.fragmentHint = undefined;
++        expect(controller.getFragmentAtPosition(23.8, 24, details)).to.equal(
++          parent,
++        );
++        // A cached complete-parent state must not suppress explicit unloaded parts.
++        sinon.stub(controller, 'getLevelDetails').returns(details);
++        fragmentTracker.state = FragmentState.OK;
++        controller.nextLoadPosition = 24;
++        expect(controller.hasUnloadedParts(parent)).to.equal(true);
++        expect(controller.isLoopLoading(parent, 23.8)).to.equal(false);
++        part.loaded = true;
++        expect(controller.getFragmentAtPosition(24, 24, details)).to.equal(
++          null,
++        );
++        part.loaded = false;
++        part.gap = true;
++        expect(controller.hasUnloadedParts(parent)).to.equal(false);
++        expect(controller.getFragmentAtPosition(23.8, 24, details)).to.equal(
++          null,
++        );
++        part.gap = false;
++        controller.loadingParts = false;
++        expect(controller.getFragmentAtPosition(23.8, 24, details)).to.equal(
++          null,
++        );
++      });
++    });
++  });
++
++  it('preserves loaded parts when ENDLIST updates the tracked final parent', function () {
++    const parent = new Fragment(PlaylistLevelType.MAIN, '') as MediaFragment;
++    parent.sn = 12;
++    parent.start = 22;
++    parent.duration = 2;
++    parent.endList = true;
++    const details = new LevelDetails('');
++    details.updated = true;
++    details.live = false;
++    details.fragments = [parent];
++    fragmentTracker.isEndListAppended = () => false;
++    fragmentTracker.getPartialFragment = () => parent;
++    fragmentTracker.removeFragment = sinon.spy();
++    fragmentTracker.fragBuffered = sinon.spy();
++    fragmentTracker.detectPartialFragments = sinon.spy();
++    (baseStreamController as any).checkLiveUpdate(details);
++    expect(fragmentTracker.removeFragment).not.to.have.been.called;
++    expect(fragmentTracker.fragBuffered).to.have.been.calledWith(parent, true);
++  });
++
++  describe('live part boundary selection', function () {
++    [PlaylistLevelType.MAIN, PlaylistLevelType.AUDIO].forEach((type) => {
++      it(`does not skip the last ${type} part using fragment lookup tolerance`, function () {
++        const controller = baseStreamController as any;
++        const previous = new Fragment(type, '') as MediaFragment;
++        previous.sn = 2;
++        previous.start = 2;
++        previous.duration = 2;
++        const next = new Fragment(type, '') as MediaFragment;
++        next.sn = 3;
++        next.start = 4;
++        next.duration = 2;
++        const details = new LevelDetails('');
++        details.live = true;
++        details.startSN = 2;
++        details.endSN = 3;
++        details.fragments = [previous, next];
++        details.fragmentHint = next;
++        const tail = {
++          fragment: previous,
++          index: 9,
++          start: 3.8,
++          end: 4,
++          duration: 0.2,
++          loaded: false,
++          gap: false,
++        };
++        details.partList = [
++          tail,
++          {
++            ...tail,
++            fragment: next,
++            index: 0,
++            start: 4,
++            end: 4.2,
++            independent: true,
++          },
++        ] as unknown as Part[];
++        controller.loadingParts = true;
++        controller.startFragRequested = true;
++        controller.fragPrevious = previous;
++        controller.lastCurrentTime = 2;
++        fragmentTracker.state = FragmentState.OK;
++        sinon.stub(controller, 'getLevelDetails').returns(details);
++        controller.nextLoadPosition = 4;
++        expect(controller.hasUnloadedParts(previous, 3.8)).to.equal(true);
++        expect(controller.isLoopLoading(previous, 3.8)).to.equal(false);
++        expect(controller.hasUnloadedParts(previous, 3.9999995)).to.equal(
++          false,
++        );
++        expect(controller.isLoopLoading(previous, 3.9999995)).to.equal(true);
++        tail.end = 4.000000003;
++        expect(controller.hasUnloadedParts(previous, 3.999999)).to.equal(false);
++        tail.end = 4;
++        fragmentTracker.state = FragmentState.PARTIAL;
++        expect(controller.getFragmentAtPosition(3.8, 4.2, details)).to.equal(
++          previous,
++        );
++        // A stale unloaded flag behind the quantized buffer edge must not
++        // pull selection back into a parent already appended in full.
++        expect(
++          controller.getFragmentAtPosition(3.9999995, 4.2, details),
++        ).to.equal(next);
++        tail.gap = true;
++        expect(controller.getFragmentAtPosition(3.8, 4.2, details)).to.equal(
++          next,
++        );
++        tail.gap = false;
++        tail.loaded = true;
++        expect(controller.getFragmentAtPosition(4, 4.2, details)).to.equal(
++          next,
++        );
++      });
++    });
++  });
++
+   function levelDetailsWithEndSequenceVodOrLive(
+     endSN: number = 1,
+     live: boolean = false,
+diff --git a/tests/unit/controller/fragment-tracker.ts b/tests/unit/controller/fragment-tracker.ts
+index 41cb02754..95ffceeb5 100644
+--- a/tests/unit/controller/fragment-tracker.ts
++++ b/tests/unit/controller/fragment-tracker.ts
+@@ -6,10 +6,12 @@ import {
+ } from '../../../src/controller/fragment-tracker';
+ import { Events } from '../../../src/events';
+ import Hls from '../../../src/hls';
++import { Part } from '../../../src/loader/fragment';
+ import { ElementaryStreamTypes, Fragment } from '../../../src/loader/fragment';
+ import { LoadStats } from '../../../src/loader/load-stats';
+ import { PlaylistLevelType } from '../../../src/types/loader';
+ import { ChunkMetadata } from '../../../src/types/transmuxer';
++import { AttrList } from '../../../src/utils/attr-list';
+ import type {
+   BufferAppendedData,
+   FragBufferedData,
+@@ -19,6 +21,91 @@ import type {
+ use(sinonChai);
+ 
+ describe('FragmentTracker', function () {
++  describe('final parent with pending parts', function () {
++    [PlaylistLevelType.MAIN, PlaylistLevelType.AUDIO].forEach((type) => {
++      it(`keeps ${type} partial until the last part is buffered`, function () {
++        const hls = new Hls({});
++        const tracker = new FragmentTracker(hls);
++        const stream =
++          type === PlaylistLevelType.MAIN
++            ? ElementaryStreamTypes.VIDEO
++            : ElementaryStreamTypes.AUDIO;
++        const frag = createMockFragment(
++          { startPTS: 22, endPTS: 24, sn: 12, level: 0, type },
++          [stream],
++        );
++        const first = new Part(
++          new AttrList('DURATION=1.8,URI="first.m4s"'),
++          frag as any,
++          '',
++          0,
++        );
++        const last = new Part(
++          new AttrList('DURATION=0.2,URI="last.m4s"'),
++          frag as any,
++          '',
++          1,
++          first,
++        );
++        // The playlist can grow a parent that was previously fully buffered.
++        frag.duration = 1.8;
++        triggerFragLoaded(hls, frag);
++        hls.trigger(
++          Events.BUFFER_APPENDED,
++          createBufferAppendedData([{ startPTS: 22, endPTS: 23.8 }]),
++        );
++        hls.trigger(Events.FRAG_BUFFERED, {
++          ...createFragBufferedData(frag),
++          part: first,
++        });
++        expect(tracker.getState(frag)).to.equal(FragmentState.OK);
++        frag.duration = 2;
++        expect(tracker.getState(frag)).to.equal(FragmentState.PARTIAL);
++        // The 200 ms tracker padding must not hide a whole missing final part.
++        triggerFragLoaded(hls, frag);
++        hls.trigger(
++          Events.BUFFER_APPENDED,
++          createBufferAppendedData([{ startPTS: 22, endPTS: 23.8 }]),
++        );
++        hls.trigger(Events.FRAG_BUFFERED, {
++          ...createFragBufferedData(frag),
++          part: first,
++        });
++        expect(tracker.getState(frag)).to.equal(FragmentState.PARTIAL);
++        // A later buffered segment does not fill the missing tail of this one.
++        hls.trigger(
++          Events.BUFFER_APPENDED,
++          createBufferAppendedData([
++            { startPTS: 22, endPTS: 23.8 },
++            { startPTS: 26, endPTS: 28 },
++          ]),
++        );
++        hls.trigger(Events.FRAG_BUFFERED, {
++          ...createFragBufferedData(frag),
++          part: first,
++        });
++        expect(tracker.getState(frag)).to.equal(FragmentState.PARTIAL);
++
++        hls.trigger(
++          Events.BUFFER_APPENDED,
++          createBufferAppendedData([{ startPTS: 22, endPTS: 24 }]),
++        );
++        hls.trigger(Events.FRAG_BUFFERED, {
++          ...createFragBufferedData(frag),
++          part: last,
++        });
++        expect(tracker.getState(frag)).to.equal(FragmentState.OK);
++        hls.trigger(Events.FRAG_BUFFERED, {
++          ...createFragBufferedData(frag),
++          part: first,
++        });
++        expect(tracker.getState(frag)).to.equal(FragmentState.OK);
++        tracker.destroy();
++        hls.destroy();
++      });
++    });
++  });
++
+   describe('getPartialFragment', function () {
+     const hls = new Hls({});
+     const fragmentTracker = new FragmentTracker(hls);
+diff --git a/tests/unit/controller/stream-controller.ts b/tests/unit/controller/stream-controller.ts
+index 0ee0219db..e32d414bb 100644
+--- a/tests/unit/controller/stream-controller.ts
++++ b/tests/unit/controller/stream-controller.ts
+@@ -477,6 +477,20 @@ describe('StreamController', function () {
+       assertNotLoadingState();
+     });
+ 
++    it('loads explicit pending parts despite a complete parent state', function () {
++      fragStateStub(FragmentState.OK);
++      sinon.stub(streamController as any, 'hasUnloadedParts').returns(true);
++      streamController['loadFragment'](frag, level, 0);
++      assertLoadingState(frag);
++    });
++
++    it('does not reload pending parts while the parent is appending', function () {
++      fragStateStub(FragmentState.APPENDING);
++      sinon.stub(streamController as any, 'hasUnloadedParts').returns(true);
++      streamController['loadFragment'](frag, level, 0);
++      assertNotLoadingState();
++    });
++
+     it('should not load a fragment while it is appending', function () {
+       fragStateStub(FragmentState.APPENDING);
+       streamController['loadFragment'](frag, level, 0);

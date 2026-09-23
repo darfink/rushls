@@ -77,12 +77,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
       - name: Install playback dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           python3 tools/install-chrome-driver.py --output "$RUNNER_TEMP/chromedriver"
-          curl --fail --location https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js -o "$RUNNER_TEMP/hls.min.js"
+      - name: Build and unit-test patched hls.js
+        id: player
+        env:
+          CHROME_BIN: /usr/bin/google-chrome
+        run: python3 tools/build-hls-player.py --output target/live-gap-reports/player --unit-tests
       - uses: actions/cache@v6
         with:
           path: |
@@ -90,8 +98,32 @@ jobs:
             ~/.cargo/git
             target/debug
           key: rushls-browser-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
-      - name: Live control and GAP playback
-        run: python3 tools/run-live-gap-ci.py --driver "$RUNNER_TEMP/chromedriver" --hls-js "$RUNNER_TEMP/hls.min.js" --output target/live-gap-reports
+      - name: Patched player — live control and GAP playback (required)
+        id: patched
+        run: python3 tools/run-live-gap-ci.py --driver "$RUNNER_TEMP/chromedriver" --hls-js target/live-gap-reports/player/hls.patched.js --output target/live-gap-reports/patched
+      - name: Official hls.js 1.7.3 compatibility (informational)
+        id: official
+        if: ${{ !cancelled() && steps.player.outcome == 'success' }}
+        continue-on-error: true
+        run: python3 tools/run-live-gap-ci.py --driver "$RUNNER_TEMP/chromedriver" --hls-js target/live-gap-reports/player/hls.official.min.js --output target/live-gap-reports/official
+      - name: Playback summary
+        if: always()
+        env:
+          PLAYER_OUTCOME: ${{ steps.player.outcome }}
+          PATCHED_OUTCOME: ${{ steps.patched.outcome }}
+          OFFICIAL_OUTCOME: ${{ steps.official.outcome }}
+        run: |
+          {
+            echo '## Chrome playback'
+            echo ''
+            echo '| Check | Result | Policy |'
+            echo '| --- | --- | --- |'
+            echo "| Patched player build and upstream unit tests | $PLAYER_OUTCOME | Required |"
+            echo "| Patched player: control, GAPs, rendition switches | $PATCHED_OUTCOME | Required |"
+            echo "| Official hls.js 1.7.3 compatibility | $OFFICIAL_OUTCOME | Informational; pending upstream part-loading correction |"
+            echo ''
+            echo 'The live-gap-playback artifact contains both player reports, the source patch, unit-test log, and build provenance. A patched-player pass does not imply official-release compatibility.'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
