@@ -2150,7 +2150,8 @@ mod end_to_end {
         assert_eq!((initialization.status, segment.status), (200, 200));
         validate_with_ffprobe(&initialization.body, &segment.body);
 
-        validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"));
+        validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"))
+            .await;
 
         let _ = shutdown.send(());
         server
@@ -2496,7 +2497,8 @@ mod end_to_end {
             );
         }
 
-        validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"));
+        validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"))
+            .await;
 
         let _ = shutdown.send(());
         server
@@ -2576,7 +2578,8 @@ mod end_to_end {
             );
         }
 
-        validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"));
+        validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"))
+            .await;
 
         let _ = shutdown.send(());
         server
@@ -2741,7 +2744,16 @@ mod end_to_end {
         )
     }
 
-    fn validate_with_mediastreamvalidator(url: &str) {
+    async fn validate_with_mediastreamvalidator(url: &str) {
+        // These tests serve HTTP on a current-thread runtime. Waiting for an
+        // external client on that thread prevents the server from answering it.
+        let url = url.to_owned();
+        tokio::task::spawn_blocking(move || validate_apple_playlist(&url))
+            .await
+            .expect("Apple validation task completes");
+    }
+
+    fn validate_apple_playlist(url: &str) {
         if !command_exists("mediastreamvalidator") {
             return;
         }

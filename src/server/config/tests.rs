@@ -121,6 +121,7 @@ async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults() -> Resul
             // The one narrowing the compiled default makes: silent
             // replacement of a live publisher needs an explicit opt-in.
             takeovers: TakeoverPolicy::Deny,
+            input_mode: crate::domain::InputMode::Strict,
             ..StreamPolicy::permissive()
         },
         "anyone may publish anything this origin can mux, at any speed"
@@ -162,6 +163,7 @@ async fn open_authentication_is_the_builtin_default() -> Result<(), Box<dyn Erro
         grant.policy,
         StreamPolicy {
             takeovers: TakeoverPolicy::Deny,
+            input_mode: crate::domain::InputMode::Strict,
             ..StreamPolicy::permissive()
         }
     );
@@ -475,6 +477,7 @@ async fn open_authentication_uses_the_builtin_policy_when_http_is_omitted()
         grant.policy,
         StreamPolicy {
             takeovers: TakeoverPolicy::Deny,
+            input_mode: crate::domain::InputMode::Strict,
             ..StreamPolicy::permissive()
         }
     );
@@ -1591,6 +1594,65 @@ max_handshakes = 32
 }
 
 #[test]
+fn tls_version_bounds_resolve_and_reject_invalid_ranges() -> Result<(), Box<dyn Error>> {
+    use cc_tls::TlsVersion::{Tls12, Tls13};
+    let certificate = TempConfig::new("certificate")?;
+    let key = TempConfig::new("key")?;
+    let base = format!(
+        "[http.tls]\ncert = {:?}\nkey = {:?}\n",
+        certificate.path, key.path
+    );
+    for (toml, args, env, expected) in [
+        (base.clone(), vec![], vec![], (Tls13, Tls13)),
+        (
+            format!("{base}version = {{ min = \"1.2\" }}\n"),
+            vec![],
+            vec![],
+            (Tls12, Tls13),
+        ),
+        (
+            format!("{base}version = {{ min = \"1.2\", max = \"1.2\" }}\n"),
+            vec![],
+            vec![],
+            (Tls12, Tls12),
+        ),
+        (
+            base.clone(),
+            vec!["--http-tls-version-min=1.2", "--http-tls-version-max=1.2"],
+            vec![],
+            (Tls12, Tls12),
+        ),
+        (
+            base.clone(),
+            vec![],
+            vec![
+                ("RUSHLS_HTTP_TLS_VERSION_MIN", "1.2"),
+                ("RUSHLS_HTTP_TLS_VERSION_MAX", "1.2"),
+            ],
+            (Tls12, Tls12),
+        ),
+        (
+            format!("{base}version = {{ min = \"1.2\" }}\n"),
+            vec!["--http-tls-version-min=1.3"],
+            vec![],
+            (Tls13, Tls13),
+        ),
+    ] {
+        let resolved = resolve_with(&toml, &args, &env)??;
+        let tls = resolved.node.http.tls.unwrap();
+        assert_eq!((tls.min_version, tls.max_version), expected);
+    }
+    let invalid = resolve_toml(&format!("{base}version = {{ max = \"1.2\" }}\n"))?;
+    assert!(
+        matches!(invalid, Err(ConfigError::Invalid(message)) if message.contains("http.tls.version.min must not exceed http.tls.version.max"))
+    );
+    for version in ["1.0", "1.1", "1.4", "garbage"] {
+        assert!(load_toml(&format!("{base}version = {{ min = {version:?} }}\n"))?.is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn an_rtmp_timeout_below_a_keyframe_interval_is_refused() -> Result<(), Box<dyn Error>> {
     // Hardening that drops legitimate publishers is an outage, not a defence.
     let Err(error) = resolve_toml(
@@ -2225,7 +2287,7 @@ async fn strict_default_and_overrides() -> Result<(), Box<dyn Error>> {
     use crate::domain::InputMode;
     assert_eq!(
         default_policy(&resolve_toml("")??).await?.input_mode,
-        InputMode::Permissive
+        InputMode::Strict
     );
     assert_eq!(
         default_policy(&resolve_toml("[accept]\nstrict = true")??)
@@ -2246,7 +2308,7 @@ async fn strict_default_and_overrides() -> Result<(), Box<dyn Error>> {
         InputMode::Strict
     );
     let named: super::PolicyValue = toml::from_str("")?;
-    assert_eq!(named.resolve("named")?.input_mode, InputMode::Permissive);
+    assert_eq!(named.resolve("named")?.input_mode, InputMode::Strict);
     assert_eq!(
         toml::from_str::<super::PolicyValue>("strict = true")?
             .resolve("named")?
@@ -2431,5 +2493,35 @@ fn malformed_secret_documents_do_not_print_credentials() -> Result<(), Box<dyn E
         assert!(!diagnostic.contains("918273645"), "{diagnostic}");
         assert!(!diagnostic.contains("sensitive-token"), "{diagnostic}");
     }
+    Ok(())
+}
+
+#[test]
+fn strict_policies_configure_the_independence_contract() -> Result<(), Box<dyn Error>> {
+    assert!(resolve_toml("")??.node.store.independent_segments);
+    assert!(
+        !resolve_toml("[accept]\nstrict = false")??
+            .node
+            .store
+            .independent_segments
+    );
+    assert!(
+        !resolve_toml("[accept.policy.legacy]\nstrict = false")??
+            .node
+            .store
+            .independent_segments
+    );
+    assert!(
+        resolve_toml("[accept.policy.normal]")??
+            .node
+            .store
+            .independent_segments
+    );
+    assert!(
+        !resolve_with("", &["--accept-strict=false"], &[])??
+            .node
+            .store
+            .independent_segments
+    );
     Ok(())
 }

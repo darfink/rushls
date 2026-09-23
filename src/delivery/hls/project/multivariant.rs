@@ -94,8 +94,11 @@ pub fn multivariant_playlist(
     let mut out = String::with_capacity(512);
     let mut writer = MultivariantPlaylistWriter::new(&mut out)?;
     write_header(&mut writer, uris)?;
-    // GAP recovery can resume on dependent audio or video. A cached master
-    // must not promise independence before a future gap is known.
+    // The store enforces this across future gaps and publisher takeovers;
+    // observing only the currently retained segments would not be sufficient.
+    if stream.independent_segments {
+        writer.independent_segments()?;
+    }
 
     let playable: Vec<Playable<'_>> = presentation
         .combinations

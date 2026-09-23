@@ -248,6 +248,8 @@ fn write_header(
         skip,
         query_variables,
     ))?;
+    // The multivariant playlist declares independence for the entire presentation.
+    // Repeating the tag here is redundant and discouraged by Apple's validator.
     if query_variables {
         writer.define_queryparam(TOKEN_QUERYPARAM)?;
     }
@@ -273,9 +275,6 @@ fn write_header(
     if rendition.discontinuity_sequence > 0 {
         writer.discontinuity_sequence(rendition.discontinuity_sequence)?;
     }
-
-    // Ordinary segments may resume after a GAP with decoder dependencies.
-    // Individual part flags and I-frame playlists retain their own semantics.
 
     Ok(())
 }

@@ -26,6 +26,12 @@
 # before exiting anyway. Keep it below the grace period your scheduler allows.
 # shutdown = "10s"
 
+# To accept remote clients, replace the loopback addresses below.
+# Use 0.0.0.0 for all IPv4 interfaces, or [::] for all IPv6 interfaces.
+# Whether [::] also accepts IPv4 depends on the host's dual-stack policy.
+# RTMP example: "[::]:1935". HTTP example: "[::]:8080".
+# SRT currently requires IPv4: use "0.0.0.0:9000" until IPv6 is supported.
+
 [rtmp]
 listen = "127.0.0.1:1935"             # local example; default: 0.0.0.0:1935
 # timeout = "10s"                          # idle limit for an established publisher;
@@ -78,6 +84,7 @@ listen = "127.0.0.1:8080"             # local example; default: 0.0.0.0:8080
 # cert        = "/etc/rushls/tls/fullchain.pem"
 # key         = "/etc/rushls/tls/private-key.pem"
 # handshake_timeout = "5s"
+# version = { min = "1.3", max = "1.3" } # set min to "1.2" for older clients; both for TLS 1.2 only
 # max_handshakes = 256                    # concurrent pending TLS handshakes
 
 # Publisher authorization is disabled by default. This service URL is an example.
@@ -117,7 +124,8 @@ listen = "127.0.0.1:8080"             # local example; default: 0.0.0.0:8080
 
 # Media restrictions are examples, not defaults. Omitted predicates allow all supported media.
 # [accept]
-# strict = false                     # strict rejects declared timing violations; permissive permits bounded compensation
+# All-strict policies also enforce and advertise independent segment starts.
+# strict = true                      # reject timing violations; false permits bounded gap recovery
 
 # ceiling  = { pace = "1x", burst = "10s" }     # throttle: at most realtime, with a ten-second head start; omit burst for no head start, omit the table for no cap
 # floor    = { pace = "0.5x", window = "30s" }  # disconnect: below half realtime across any 30s window; omit for no floor

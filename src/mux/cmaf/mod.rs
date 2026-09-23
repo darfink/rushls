@@ -3290,7 +3290,9 @@ mod tests {
             return Ok(());
         };
         let mut asc = String::new();
-        for byte in track.codec_extradata.as_bytes() {
+        // FLAC initialization can contain long metadata blocks. The first
+        // 32 bytes identify these fixed fixtures without exceeding NAME_MAX.
+        for byte in track.codec_extradata.as_bytes().iter().take(32) {
             std::fmt::Write::write_fmt(&mut asc, format_args!("{byte:02x}"))?;
         }
         // Controls use the exact same encoded packets and initialization.

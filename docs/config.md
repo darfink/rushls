@@ -50,7 +50,7 @@ without touching the config? If not, the config is leaking.
 
 ## Design rules
 
-1. **Compiled defaults are permissive.** No file at all yields a working local
+1. **Compiled defaults admit supported media.** No file at all yields a working local
    origin. Hardening is what you *add*, not what you dismantle.
 2. **A short starter and an annotated example.** Optional features remain explicit.
 3. **Operator vocabulary only.** *publisher*, *stream*, *listener*. Never
@@ -85,6 +85,22 @@ is insignificant. Certificates reload in place on rotation, with secure TLS
 defaults and no cipher knobs. HTTPS and MOQ share that rotation machinery, but
 not a `ServerConfig`: HTTP/3 requires TLS 1.3 and `h3` ALPN, so MOQ must not
 reuse the viewer HTTPS config.
+
+HTTPS accepts TLS 1.3 by default. Under `[http.tls]`, `version` groups the protocol bounds:
+
+```toml
+version = { min = "1.3", max = "1.3" }
+```
+
+Both bounds accept `"1.2"` or `"1.3"` and default to `"1.3"`.
+Use `version = { min = "1.2" }` to accept both versions, with TLS 1.3 preferred.
+Use `version = { min = "1.2", max = "1.2" }` for a TLS 1.2-only listener.
+The minimum cannot exceed the maximum.
+
+CLI uses `--http-tls-version-min` and `--http-tls-version-max`.
+Environment variables use `RUSHLS_HTTP_TLS_VERSION_MIN` and `RUSHLS_HTTP_TLS_VERSION_MAX`.
+These bounds do not affect QUIC or outbound clients.
+
 
 Direct exposure has two shared limits under `[http]`: `max_connections`
 and `max_requests`, both defaulting to 4096. HTTP, HTTPS, and a separate
@@ -1240,4 +1256,4 @@ This setting exposes names; it does not create those response headers.
 Keep CDN-specific exposure in the CDN response-header policy when the CDN owns those headers.
 Preserve the origin exposure list when you add CDN header names.
 
-Audio gaps use [bounded GAP handling](audio-recovery.md), enabled by default. Select permissive or strict behavior with `[accept].strict`. See [input modes](input-modes.md).
+Strict input validation is enabled by default. Set `[accept].strict = false` to enable [bounded GAP handling](audio-recovery.md). See [input modes](input-modes.md).

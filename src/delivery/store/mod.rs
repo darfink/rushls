@@ -83,6 +83,9 @@ pub use stream::LiveStream;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoreLimits {
     pub maximum_streams: usize,
+    /// Refuse dependent segment starts, including after gaps and takeovers.
+    /// This is immutable for the lifetime of every retained stream.
+    pub independent_segments: bool,
     /// Cohesive HLS retention and capacity policy applied to each stream.
     pub retention: RetentionPolicy,
     /// Overflow directory and per-stream byte cap, or memory-only.
@@ -93,6 +96,7 @@ impl Default for StoreLimits {
     fn default() -> Self {
         Self {
             maximum_streams: 1_024,
+            independent_segments: false,
             retention: RetentionPolicy::default(),
             disk: None,
         }
@@ -221,6 +225,7 @@ impl StreamStore {
                     self.disk.clone(),
                     self.events.clone(),
                 )
+                .with_independent_segments(self.limits.independent_segments)
                 .with_publication_totals(self.publication_totals.clone())
                 .with_operation_meters(self.operations.clone()),
             );

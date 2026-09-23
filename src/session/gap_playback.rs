@@ -71,6 +71,7 @@ impl PendingPublish for Publish {
                         .ok()
                         .filter(|_| std::env::var_os("RUSHLS_GAP_LIVE_CONTROL").is_none()),
                     pending: VecDeque::new(),
+                    clocks: BTreeMap::new(),
                     state: InputState::Open,
                     anchor: None,
                     gaps: std::env::var_os("RUSHLS_GAP_LIVE_CONTROL").is_none()
@@ -95,6 +96,7 @@ struct Holes {
     video: BTreeMap<TrackId, Option<i64>>,
     video_scenario: Option<String>,
     pending: VecDeque<Packet>,
+    clocks: BTreeMap<TrackId, crate::domain::Timebase>,
     state: InputState,
     anchor: Option<(i64, tokio::time::Instant)>,
     gaps: bool,
@@ -107,6 +109,7 @@ impl PacketSource for Holes {
         Box::pin(async move {
             let report = self.source.discover(limits).await?;
             for track in report.tracks.tracks() {
+                self.clocks.insert(track.id, track.timebase);
                 if track.kind() == MediaKind::Audio {
                     self.audio.insert(track.id, (0, self.audio.len() * 25));
                 } else if track.kind() == MediaKind::Video {
@@ -127,9 +130,13 @@ impl PacketSource for Holes {
                 self.pending.extend(packets);
             }
             if let Some(packet) = self.pending.front() {
-                // MPEG-TS clocks are 90 kHz. Pace source delivery so HTTP clients
-                // observe actual open parents and blocking reloads, not a VOD copy.
-                if let Some(stamp) = packet.dts.or(packet.pts) {
+                // Audio uses its sample clock after demuxing. Normalize pacing
+                // to 90 kHz so clients observe correctly paced open parents
+                // and blocking reloads, not a VOD copy.
+                if let Some(raw) = packet.dts.or(packet.pts) {
+                    let clock = self.clocks[&packet.track_id];
+                    let stamp =
+                        raw * i64::from(clock.num().get()) * 90_000 / i64::from(clock.den().get());
                     let (first, wall) = *self
                         .anchor
                         .get_or_insert((stamp, tokio::time::Instant::now()));
@@ -347,42 +354,56 @@ fn encoded_fixture() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>
 
 #[tokio::test(start_paused = true)]
 async fn cancelling_fixture_pacing_keeps_the_pending_packet() -> Result<(), SourceError> {
-    let meters = crate::observe::SessionMeters::new(crate::observe::ProcessMeters::default());
-    let packet = Packet {
-        track_id: TrackId(1),
-        pts: Some(90_000),
-        dts: Some(90_000),
-        duration: Some(3_600),
-        random_access: false,
-        audio_trim: crate::domain::AudioTrim::default(),
-        webvtt: crate::domain::WebVttCueMetadata::default(),
-        subtitle_position: None,
-        payload: crate::domain::Payload::from_bytes(bytes::Bytes::from_static(b"packet")),
-    };
-    let mut source = Holes {
-        source: MpegTsPacketSource::new(
-            Box::new(ReadInput::closed(Cursor::new(Vec::new()))),
-            MpegTsConfig::default(),
-            InputLimits::permissive(),
-            meters.source_view(),
-        )?,
-        audio: BTreeMap::new(),
-        video: BTreeMap::new(),
-        video_scenario: None,
-        pending: VecDeque::from([packet.clone()]),
-        state: InputState::Closed,
-        anchor: Some((0, tokio::time::Instant::now())),
-        gaps: false,
-    };
-    let mut output = Vec::new();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(10), source.fill(&mut output))
-            .await
-            .is_err()
-    );
-    assert!(output.is_empty());
-    assert_eq!(source.pending.front(), Some(&packet));
-    assert_eq!(source.fill(&mut output).await?, InputState::Closed);
-    assert_eq!(output, vec![packet]);
+    for rate in [48_000_u32, 90_000] {
+        let meters = crate::observe::SessionMeters::new(crate::observe::ProcessMeters::default());
+        let packet = Packet {
+            track_id: TrackId(1),
+            pts: Some(i64::from(rate)),
+            dts: Some(i64::from(rate)),
+            duration: Some(3_600),
+            random_access: false,
+            audio_trim: crate::domain::AudioTrim::default(),
+            webvtt: crate::domain::WebVttCueMetadata::default(),
+            subtitle_position: None,
+            payload: crate::domain::Payload::from_bytes(bytes::Bytes::from_static(b"packet")),
+        };
+        let started = tokio::time::Instant::now();
+        let mut source = Holes {
+            source: MpegTsPacketSource::new(
+                Box::new(ReadInput::closed(Cursor::new(Vec::new()))),
+                MpegTsConfig::default(),
+                InputLimits::permissive(),
+                meters.source_view(),
+            )?,
+            audio: BTreeMap::new(),
+            video: BTreeMap::new(),
+            video_scenario: None,
+            pending: VecDeque::from([packet.clone()]),
+            clocks: BTreeMap::from([(
+                TrackId(1),
+                crate::domain::Timebase::new(
+                    nz::u32!(1),
+                    std::num::NonZeroU32::new(rate).expect("nonzero clock"),
+                ),
+            )]),
+            state: InputState::Closed,
+            anchor: Some((0, started)),
+            gaps: false,
+        };
+        let mut output = Vec::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), source.fill(&mut output))
+                .await
+                .is_err()
+        );
+        assert!(output.is_empty());
+        assert_eq!(source.pending.front(), Some(&packet));
+        assert_eq!(source.fill(&mut output).await?, InputState::Closed);
+        assert_eq!(output, vec![packet]);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the track clock must pace one full second"
+        );
+    }
     Ok(())
 }

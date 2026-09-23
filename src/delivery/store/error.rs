@@ -22,6 +22,8 @@ pub struct StoreFull {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum StoreWriteError {
+    #[error("{rendition_id} started a dependent segment while independent segments are required")]
+    DependentSegment { rendition_id: RenditionId },
     #[error(
         "disk spill failed; retained media remains readable, but publishing cannot continue within the memory budget"
     )]

@@ -18,7 +18,7 @@ use std::{
 
 use crate::source::transport::rtmp::RtmpTimeouts;
 use cc_config::{ByteSize, ConfigSearch, Loader};
-use cc_tls::{ClientIdentity, load_roots};
+use cc_tls::{ClientIdentity, TlsVersion, load_roots};
 use conf::Conf;
 use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
@@ -255,6 +255,12 @@ impl AppConfig {
             LOADER.environment_warnings::<Self>(&env.into_iter().collect::<Vec<_>>());
 
         let (default_policy, policies) = self.accept.resolve()?;
+        // The manifest promise covers retained media across every takeover. A
+        // named permissive policy can be selected on a later publication.
+        let independent_segments = default_policy.input_mode == crate::domain::InputMode::Strict
+            && policies
+                .values()
+                .all(|policy| policy.input_mode == crate::domain::InputMode::Strict);
         let stall = self.accept.stall;
         let open_admission = self.auth.is_open();
         let mut outbound_tls = Vec::new();
@@ -296,6 +302,7 @@ impl AppConfig {
         self.srt.apply(&mut node)?;
         self.moq.apply(&mut node, &mut warnings)?;
         self.hls.apply(&mut node, &mut warnings)?;
+        node.store.independent_segments = independent_segments;
         // After HLS: a stall expressed as a multiple is sized by the segment
         // duration, which only `hls.apply` establishes.
         apply_stall(&mut node, stall, self.hls.segment_duration())?;
@@ -952,8 +959,9 @@ fn startup_warnings(node: &NodeConfig, open_admission: bool) -> Vec<String> {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct AcceptAppConfig {
-    /// Reject timing violations instead of accepting bounded, reported gaps.
-    #[conf(parameter, long, env, default_value = "false")]
+    /// Reject timing violations and dependent segment starts.
+    /// False permits bounded, reported gap recovery.
+    #[conf(parameter, long, env, default_value = "true")]
     strict: bool,
     /// Throttle applied to a publisher offering media faster than `pace`.
     ///
@@ -1483,7 +1491,7 @@ struct PolicyValue {
 
 impl PolicyValue {
     fn input_mode(&self) -> crate::domain::InputMode {
-        if self.strict.unwrap_or(false) {
+        if self.strict.unwrap_or(true) {
             crate::domain::InputMode::Strict
         } else {
             crate::domain::InputMode::Permissive
@@ -1932,6 +1940,7 @@ impl MoqAppConfig {
                 key,
                 handshake_timeout: node.moq.handshake_timeout,
                 maximum_pending_handshakes: 256,
+                ..TlsSettings::default()
             });
         }
 
@@ -2294,6 +2303,9 @@ impl CorsAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct TlsAppConfig {
+    /// Accepted HTTPS protocol range.
+    #[conf(flatten, prefix)]
+    version: TlsVersionAppConfig,
     /// Address serving HTTPS, bound independently of the cleartext listener.
     #[conf(parameter, long, env, default_value = "[::]:8443")]
     listen: SocketAddr,
@@ -2327,8 +2339,24 @@ pub struct TlsAppConfig {
     max_handshakes: usize,
 }
 
+#[derive(Conf)]
+#[conf(serde)]
+pub struct TlsVersionAppConfig {
+    /// Lowest accepted HTTPS version: "1.2" or "1.3".
+    #[conf(parameter, long, env, default_value = "1.3", serde(use_value_parser))]
+    min: TlsVersion,
+    /// Highest accepted HTTPS version: "1.2" or "1.3".
+    #[conf(parameter, long, env, default_value = "1.3", serde(use_value_parser))]
+    max: TlsVersion,
+}
+
 impl TlsAppConfig {
     fn resolve(&self) -> Result<TlsSettings, ConfigError> {
+        if self.version.min > self.version.max {
+            return Err(ConfigError::Invalid(
+                "http.tls.version.min must not exceed http.tls.version.max".to_owned(),
+            ));
+        }
         if self.max_handshakes == 0 {
             return Err(ConfigError::Invalid(
                 "http.tls.max_handshakes must be at least one, or no \
@@ -2342,6 +2370,8 @@ impl TlsAppConfig {
             key: self.key.clone(),
             handshake_timeout: self.handshake_timeout,
             maximum_pending_handshakes: self.max_handshakes,
+            min_version: self.version.min,
+            max_version: self.version.max,
         })
     }
 }

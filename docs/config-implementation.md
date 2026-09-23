@@ -39,8 +39,8 @@ one to one, so every multiple other than 1x is new arithmetic.
 indefinitely. A burst is consumable and refills at `ceiling.pace`. Better
 semantics, but genuinely different behaviour rather than a rename.
 
-**Input modes control compensation.** `accept.strict` defaults to false (permissive).
-Strict mode rejects real audio gaps and declared-cadence violations.
+**Input modes control compensation.** `accept.strict` defaults to true.
+Strict mode rejects real audio gaps, declared-cadence violations, and dependent segment starts.
 Permissive mode uses bounded GAP handling for audio and progressive H.264 without presentation reordering.
 Unsupported video holes fail explicitly. Audio synthesis and video frame-hold recovery are removed.
 Codec declarations establish fixed cadence; nominal rates do not.

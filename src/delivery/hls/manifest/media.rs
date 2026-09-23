@@ -32,11 +32,8 @@ impl<'a> MediaPlaylistWriter<'a> {
     /// Declares that every Media Segment this playlist names is independently
     /// decodable.
     ///
-    /// Projection does not emit this on media playlists today: the
-    /// multivariant playlist already asserts it for the presentation, and HLS
-    /// applies that to the media playlists it names. The writer still knows
-    /// the tag so a later projection that needs it on a media playlist is not
-    /// forced to invent a second spelling.
+    /// Projection emits this only when the store enforces independent starts
+    /// across all publications, including recovery after gaps.
     pub fn independent_segments(&mut self) -> ManifestWriteResult<&mut Self> {
         writeln!(self.out, "#EXT-X-INDEPENDENT-SEGMENTS")?;
         Ok(self)

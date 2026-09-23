@@ -36,6 +36,7 @@ fn stream() -> StreamId {
 fn limits() -> StoreLimits {
     StoreLimits {
         maximum_streams: 8,
+        independent_segments: false,
         retention: RetentionPolicy {
             // Six six-second segments. Pinned rather than taken from the
             // default so these fixtures describe a window of a known size,
@@ -865,6 +866,30 @@ async fn part_tags_and_resources_have_distinct_retention_deadlines() {
 
     tokio::time::advance(Duration::from_secs(18)).await;
     assert!(lease.live().part(RenditionId(0), part_id).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn longer_part_fetch_grace_covers_delayed_readers_without_extending_tags() {
+    let mut limits = limits();
+    limits.retention.part_fetch_grace_period = Duration::from_secs(60).into();
+    let store = StreamStore::new(limits);
+    let lease = lease(&store, &[(0, true)]);
+    configure(&lease, 0, true);
+    for segment in 0..6 {
+        write_segment(&lease, 0, segment, i64::try_from(segment).unwrap() * 6);
+    }
+    let first = PartId(1);
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    assert!(snapshot.segments.parts(&snapshot.segments[0]).is_empty());
+
+    // A validator can fetch an earlier playlist's parts after its 30-second
+    // scan. The production minimum is 18 seconds for this six-second target.
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert!(lease.live().part(RenditionId(0), first).is_some());
+    tokio::time::advance(Duration::from_secs(28)).await;
+    assert!(lease.live().part(RenditionId(0), first).is_some());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(lease.live().part(RenditionId(0), first).is_none());
 }
 
 #[test]
@@ -3033,6 +3058,63 @@ fn segment_ready_follows_commit_and_excludes_unavailable_media()
         assert_eq!(ready[1].media_sequence, 3);
         assert_ne!(ready[0].publication, ready[1].publication);
         assert!(ready[1].discontinuity);
+    }
+    Ok(())
+}
+
+#[test]
+fn required_independence_rejects_dependent_starts_across_takeovers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let store = StreamStore::new(StoreLimits {
+        independent_segments: true,
+        ..limits()
+    });
+    for _ in 0..2 {
+        let lease = lease(&store, &[(0, true), (1, false)]);
+        assert!(lease.live().snapshot().independent_segments);
+        write(&lease, initialization(0, 1));
+        write(&lease, initialization(1, 1));
+        let before = lease.live().retained_payload_bytes();
+        let PackagedMedia::Chunk(mut part) = chunk(0, 0, 0, 0, 1, 3) else {
+            unreachable!()
+        };
+        part.independent = false;
+        assert!(matches!(
+            lease.write(PackagedMedia::Chunk(part)),
+            Err(StoreWriteError::DependentSegment { .. })
+        ));
+        let PackagedMedia::Segment(mut segment) = direct(1, 0, 0, 6, 3) else {
+            unreachable!()
+        };
+        segment.independent = false;
+        assert!(matches!(
+            lease.write(PackagedMedia::Segment(segment)),
+            Err(StoreWriteError::DependentSegment { .. })
+        ));
+        assert_eq!(
+            lease.live().retained_payload_bytes(),
+            before,
+            "rejected media must not become readable"
+        );
+        // Dependent later parts remain valid when the segment starts at a RAP.
+        write_segment(&lease, 0, 0, 0);
+        write(&lease, direct(1, 0, 0, 6, 3));
+        lease.write(PackagedMedia::Gap(crate::mux::PackagedGap {
+            rendition_id: PackagingRenditionId(0),
+            packaging_segment_id: PackagingSegmentId(1),
+            media_start: 6,
+            duration: 6,
+            parts: vec![1; 6],
+        }))?;
+        let PackagedMedia::Chunk(mut resumed) = chunk(0, 2, 0, 12, 1, 3) else {
+            unreachable!()
+        };
+        resumed.independent = false;
+        assert!(matches!(
+            lease.write(PackagedMedia::Chunk(resumed)),
+            Err(StoreWriteError::DependentSegment { .. })
+        ));
+        write_segment(&lease, 0, 2, 12);
     }
     Ok(())
 }

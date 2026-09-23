@@ -88,6 +88,26 @@ const ALPN_PROTOCOLS: [&[u8]; 2] = [b"h2", b"http/1.1"];
 /// reliably load a new certificate against the old key.
 const DEBOUNCE: Duration = Duration::from_secs(1);
 
+/// Supported protocol bounds for TCP TLS. QUIC always uses TLS 1.3.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum TlsVersion {
+    Tls12,
+    #[default]
+    Tls13,
+}
+
+impl std::str::FromStr for TlsVersion {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "1.2" => Ok(Self::Tls12),
+            "1.3" => Ok(Self::Tls13),
+            _ => Err("TLS version must be 1.2 or 1.3"),
+        }
+    }
+}
+
 /// Where the certificate and its key live, and how patient the listener is.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TlsSettings {
@@ -95,6 +115,10 @@ pub struct TlsSettings {
     pub certificate: PathBuf,
     /// PEM, PKCS#8, PKCS#1, or SEC1.
     pub key: PathBuf,
+    /// Lowest accepted TCP TLS version.
+    pub min_version: TlsVersion,
+    /// Highest accepted TCP TLS version. QUIC ignores these TCP bounds.
+    pub max_version: TlsVersion,
     /// Bounds a connection that completes TCP and then stalls mid-handshake.
     pub handshake_timeout: Duration,
     /// Caps handshakes in flight at once, which is what stops a flood from
@@ -107,6 +131,8 @@ impl Default for TlsSettings {
         Self {
             certificate: PathBuf::new(),
             key: PathBuf::new(),
+            min_version: TlsVersion::Tls13,
+            max_version: TlsVersion::Tls13,
             handshake_timeout: Duration::from_secs(10),
             maximum_pending_handshakes: 256,
         }
@@ -115,6 +141,8 @@ impl Default for TlsSettings {
 
 #[derive(Debug, Error)]
 pub enum TlsError {
+    #[error("TLS min_version must not exceed max_version")]
+    InvalidVersionRange,
     #[error("could not read {path}: {source}")]
     Unreadable {
         path: PathBuf,
@@ -306,8 +334,19 @@ impl<O: TlsObserver> TlsListener<O> {
         )?)));
         observer.certificate_loaded(&settings.certificate);
 
+        let versions: &[&rustls::SupportedProtocolVersion] =
+            match (settings.min_version, settings.max_version) {
+                (TlsVersion::Tls12, TlsVersion::Tls12) => &[&rustls::version::TLS12],
+                (TlsVersion::Tls12, TlsVersion::Tls13) => {
+                    &[&rustls::version::TLS13, &rustls::version::TLS12]
+                }
+                (TlsVersion::Tls13, TlsVersion::Tls13) => &[&rustls::version::TLS13],
+                (TlsVersion::Tls13, TlsVersion::Tls12) => {
+                    return Err(TlsError::InvalidVersionRange);
+                }
+            };
         let mut config = ServerConfig::builder_with_provider(Arc::clone(&provider))
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(versions)
             .map_err(TlsError::Configuration)?
             .with_no_client_auth()
             .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
@@ -667,6 +706,99 @@ mod tests {
         };
 
         assert_eq!(watched_directories(&settings), [PathBuf::from("/etc/tls")]);
+    }
+
+    #[tokio::test]
+    async fn tls_version_bounds_control_negotiation() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = scratch("protocol-versions");
+        let (mut settings, der) = write_pair(&directory, "origin.test");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from(der))?;
+        for (min_version, max_version, versions, expected) in [
+            (
+                TlsVersion::Tls13,
+                TlsVersion::Tls13,
+                vec![&rustls::version::TLS12],
+                None,
+            ),
+            (
+                TlsVersion::Tls13,
+                TlsVersion::Tls13,
+                vec![&rustls::version::TLS13],
+                Some(rustls::ProtocolVersion::TLSv1_3),
+            ),
+            (
+                TlsVersion::Tls12,
+                TlsVersion::Tls13,
+                vec![&rustls::version::TLS12],
+                Some(rustls::ProtocolVersion::TLSv1_2),
+            ),
+            (
+                TlsVersion::Tls12,
+                TlsVersion::Tls13,
+                vec![&rustls::version::TLS12, &rustls::version::TLS13],
+                Some(rustls::ProtocolVersion::TLSv1_3),
+            ),
+            (
+                TlsVersion::Tls12,
+                TlsVersion::Tls12,
+                vec![&rustls::version::TLS13],
+                None,
+            ),
+            (
+                TlsVersion::Tls12,
+                TlsVersion::Tls12,
+                vec![&rustls::version::TLS12, &rustls::version::TLS13],
+                Some(rustls::ProtocolVersion::TLSv1_2),
+            ),
+        ] {
+            settings.min_version = min_version;
+            settings.max_version = max_version;
+            let listener = TlsListener::new(
+                TcpListener::bind("127.0.0.1:0").await?,
+                settings.clone(),
+                Arc::new(IgnoreTlsEvents),
+            )?;
+            let client = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
+                .with_protocol_versions(&versions)?
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+            let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+            let (client_result, server_result) =
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(
+                        connector.connect("origin.test".try_into().unwrap(), client_io),
+                        listener.acceptor.accept(server_io),
+                    )
+                })
+                .await?;
+            if let Some(expected) = expected {
+                assert_eq!(
+                    client_result?.get_ref().1.protocol_version(),
+                    Some(expected)
+                );
+                assert_eq!(
+                    server_result?.get_ref().1.protocol_version(),
+                    Some(expected)
+                );
+            } else {
+                assert!(client_result.is_err());
+                assert!(server_result.is_err());
+            }
+        }
+        settings.min_version = TlsVersion::Tls13;
+        settings.max_version = TlsVersion::Tls12;
+        assert!(matches!(
+            TlsListener::new(
+                TcpListener::bind("127.0.0.1:0").await?,
+                settings,
+                Arc::new(IgnoreTlsEvents)
+            ),
+            Err(TlsError::InvalidVersionRange)
+        ));
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[tokio::test]

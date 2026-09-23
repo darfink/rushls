@@ -128,6 +128,15 @@ pub struct PackagedGap {
 }
 
 impl PackagedMedia {
+    /// Whether publishing this event would expose a dependent segment start.
+    pub fn has_dependent_start(&self) -> bool {
+        match self {
+            Self::Chunk(chunk) => chunk.chunk_index == 0 && !chunk.independent,
+            Self::Segment(segment) => !segment.independent,
+            _ => false,
+        }
+    }
+
     pub fn rendition_id(&self) -> PackagingRenditionId {
         match self {
             Self::Initialization(media) => media.rendition_id,

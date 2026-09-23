@@ -131,6 +131,8 @@ pub struct PublicationAnchor {
 
 #[derive(Clone, Debug)]
 pub struct StreamSnapshot {
+    /// The store refuses dependent segment starts for every publication.
+    pub independent_segments: bool,
     /// Changes only for lifecycle, rendition topology, or advertised metadata,
     /// including bandwidth values used by the multivariant projection.
     pub revision: u64,

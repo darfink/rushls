@@ -57,8 +57,8 @@ Their URIs return 404. No empty MP4 files are created.
 Targets, initialization, presentation timestamps, and discontinuity sequence remain unchanged.
 New renditions start at media sequence 1 to avoid an hls.js sequence-zero part-loading bug.
 
-Audio parts after a gap do not claim independence. Video playlists retain their independent-segment guarantee.
-The master playlist omits that guarantee when audio is present.
+Audio parts after a gap do not claim independence.
+When a permissive policy is configured, master and media playlists omit the global independence guarantee.
 Recordings contain the available shortened segments and no files for missing intervals.
 
 Players may conceal, skip, or interrupt playback briefly. GAP signaling does not promise silence or restore decoder dependencies.

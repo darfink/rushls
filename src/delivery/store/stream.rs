@@ -102,6 +102,7 @@ impl SpillWatermarks {
 /// Live media for one logical stream, shared by publishers and readers.
 #[derive(Debug)]
 pub struct LiveStream {
+    independent_segments: bool,
     id: StreamId,
     limits: RetentionPolicy,
     memory: MemoryBudget,
@@ -160,6 +161,21 @@ pub struct StreamState {
 }
 
 impl LiveStream {
+    /// Set only during construction, before any publication can attach.
+    #[must_use]
+    pub fn with_independent_segments(mut self, required: bool) -> Self {
+        assert_eq!(
+            self.state.get_mut().publication,
+            0,
+            "independence must be configured before publication"
+        );
+        self.independent_segments = required;
+        let mut snapshot = (**self.snapshot.load()).clone();
+        snapshot.independent_segments = required;
+        self.snapshot.store(Arc::new(snapshot));
+        self
+    }
+
     pub fn new(id: StreamId, limits: RetentionPolicy, disk: Option<Arc<DiskTier>>) -> Self {
         Self::with_events(id, limits, disk, Events::default())
     }
@@ -181,6 +197,7 @@ impl LiveStream {
         };
         let disk_capacity = disk.as_ref().map_or(0, |tier| tier.maximum_payload_bytes());
         let snapshot = StreamSnapshot {
+            independent_segments: false,
             revision: 0,
             media_catalog_revision: 0,
             ended: false,
@@ -190,6 +207,7 @@ impl LiveStream {
             renditions: Arc::from([]),
         };
         Self {
+            independent_segments: false,
             id,
             limits,
             memory: memory.clone(),
@@ -521,6 +539,7 @@ impl LiveStream {
             .collect::<Vec<_>>()
             .into();
         self.snapshot.store(Arc::new(StreamSnapshot {
+            independent_segments: self.independent_segments,
             revision: state.catalog_revision,
             media_catalog_revision: state.media_catalog_revision,
             ended: state.ended,
@@ -804,6 +823,12 @@ impl LiveStream {
         let mut state = self.state.write();
         if state.publication != publication {
             return Ok(false);
+        }
+
+        // Check before exposing even the first part. A cached playlist's
+        // independence promise must survive gaps, reconnects, and takeovers.
+        if self.independent_segments && media.has_dependent_start() {
+            return Err(StoreWriteError::DependentSegment { rendition_id });
         }
 
         let existing = state

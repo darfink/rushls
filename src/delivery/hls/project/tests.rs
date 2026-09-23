@@ -1410,3 +1410,29 @@ fn scrubbing_advertises_measured_keyframe_bandwidth_instead_of_full_video()
     assert!(tag.contains(&format!("BANDWIDTH={expected},")), "{tag}");
     Ok(())
 }
+
+#[test]
+fn enforced_independence_is_advertised_only_in_master() -> Result<(), Box<dyn std::error::Error>> {
+    let store = StreamStore::new(StoreLimits {
+        independent_segments: true,
+        ..StoreLimits::default()
+    });
+    let lease = lease(&store, vec![video(0)]);
+    write(&lease, initialization(0, 1));
+    write_segment(&lease, 0, 0, 0);
+    let master = multivariant_playlist(&lease.live().snapshot(), &policy(), &uris())?
+        .ok_or("missing master")?;
+    assert!(master.contains("#EXT-X-INDEPENDENT-SEGMENTS\n"));
+    assert!(!render(&lease, 0, &policy())?.contains("#EXT-X-INDEPENDENT-SEGMENTS\n"));
+    let (stream, media) = snapshots(&lease, 0)?;
+    let iframe = super::media::iframe_playlist(
+        &stream,
+        &media,
+        presentation_server_control(&stream, DeliveryTimingPolicy::default()),
+        &policy(),
+        &uris(),
+        PlaylistDelta::Full,
+    )?;
+    assert!(!iframe.contains("#EXT-X-INDEPENDENT-SEGMENTS\n"));
+    Ok(())
+}

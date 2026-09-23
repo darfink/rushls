@@ -1,15 +1,17 @@
 # Input modes
 
-Rushls offers two input modes. Permissive mode is the default.
+Rushls offers two input modes. Strict mode is the default.
 
 ```toml
 [accept]
-strict = false # true rejects timing violations
+strict = true # false enables bounded gap recovery
 ```
 
 Use `--accept-strict=true` or `RUSHLS_ACCEPT_STRICT=true` to override the file.
-Named `[accept.policy.NAME]` tables accept `strict`. Each named policy defaults independently to strict = false.
-Resolution translates the boolean to the internal timing policy.
+Named `[accept.policy.NAME]` tables accept `strict`. Each named policy defaults independently to strict = true.
+Strict mode also rejects dependent segment starts before publication.
+When every configured policy is strict, manifests advertise `EXT-X-INDEPENDENT-SEGMENTS`.
+With a permissive policy configured, they omit that global promise across reconnects.
 
 Recovery limits are internal.
 

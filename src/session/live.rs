@@ -18,6 +18,9 @@ use crate::{
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ExecutionError {
+    #[error("strict publication rejected a dependent segment start")]
+    DependentSegment,
+
     #[error(transparent)]
     Media(#[from] MediaError),
     #[error(transparent)]
@@ -249,6 +252,7 @@ pub struct MediaTail {
     mux_meters: Arc<dyn MuxMeters>,
     delivery_meters: Arc<dyn DeliveryMeters>,
     media: Vec<PackagedMedia>,
+    require_independent_segments: bool,
 }
 
 impl MediaTail {
@@ -264,7 +268,15 @@ impl MediaTail {
             mux_meters,
             delivery_meters,
             media: Vec::with_capacity(INITIAL_BATCH),
+            require_independent_segments: false,
         }
+    }
+
+    /// Strict grants remain strict even when another configured policy permits recovery.
+    #[must_use]
+    pub fn with_input_mode(mut self, mode: crate::domain::InputMode) -> Self {
+        self.require_independent_segments = mode == crate::domain::InputMode::Strict;
+        self
     }
 
     async fn ready(&mut self) -> Result<(), ExecutionError> {
@@ -317,6 +329,10 @@ impl MediaTail {
         let mut result = Ok(());
 
         for media in self.media.drain(..) {
+            if self.require_independent_segments && media.has_dependent_start() {
+                result = Err(ExecutionError::DependentSegment);
+                break;
+            }
             let counts = MediaCounts::of(&media);
             muxed += counts;
             match self.publisher.write(media) {
@@ -735,6 +751,46 @@ mod tests {
 
         fn finish(&mut self, _reason: FinishReason) -> Result<(), HlsError> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn strict_tail_rejects_dependent_starts_before_delivery() {
+        for mode in [
+            crate::domain::InputMode::Strict,
+            crate::domain::InputMode::Permissive,
+        ] {
+            for chunk_index in [0, 1] {
+                let log = Arc::new(parking_lot::Mutex::new(PublishLog::default()));
+                let session = SessionMeters::new(ProcessMeters::default());
+                let mut tail = MediaTail::new(
+                    Box::new(IdleMuxer),
+                    Box::new(OrderedPublisher(log.clone())),
+                    session.mux_view(),
+                    session.delivery_view(),
+                )
+                .with_input_mode(mode);
+                tail.media.push(PackagedMedia::Chunk(PackagedChunk {
+                    rendition_id: PackagingRenditionId(0),
+                    packaging_segment_id: PackagingSegmentId(0),
+                    chunk_index,
+                    media_start: 0,
+                    duration: 1,
+                    independent: false,
+                    payload: Payload::from(vec![1]),
+                }));
+                let rejected = mode == crate::domain::InputMode::Strict && chunk_index == 0;
+                assert_eq!(
+                    tail.publish(),
+                    if rejected {
+                        Err(ExecutionError::DependentSegment)
+                    } else {
+                        Ok(())
+                    }
+                );
+                assert_eq!(log.lock().media_before_captions, usize::from(!rejected));
+                assert!(tail.media.is_empty());
+            }
         }
     }
 

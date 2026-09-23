@@ -355,7 +355,8 @@ async fn pipeline(
         publisher,
         context.meters().mux_view(),
         context.meters().delivery_view(),
-    );
+    )
+    .with_input_mode(grant.policy.input_mode);
 
     context.enter(Phase::Running);
     context.emit(SessionEvent::Running);
