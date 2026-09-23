@@ -25,12 +25,13 @@ A missing or failed `hlsreport` command also fails that job.
 
 Apple directs users to authenticated [Developer downloads](https://developer.apple.com/download/all/?q=HLS).
 The tools support CLI installation after download. They are not part of the Xcode command-line tools.
+Installer 1.26.143.14 requires macOS 26, despite the macOS 15 requirement in its bundled README.
 
 Set these repository variables to enable automatic Apple jobs:
 
 - `APPLE_HLS_TOOLS_URL`: The download URL for an installer or its GPG-encrypted copy.
 - `APPLE_HLS_TOOLS_SHA256`: The SHA-256 of the decrypted installer.
-- `APPLE_HLS_RUNNER`: Optional macOS runner label; defaults to `macos-15`.
+- `APPLE_HLS_RUNNER`: Optional macOS runner label; defaults to `macos-26`.
 
 The compact audit requires 6 GiB of free temporary storage and checks this before encoding and after compilation.
 GitHub [documents only 14 GB](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) for its standard macOS runners.
