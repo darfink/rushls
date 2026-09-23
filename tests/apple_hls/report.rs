@@ -38,8 +38,12 @@ use std::fmt::Write as _;
 pub struct Expect {
     /// Names the case in printed output and in `RUSHLS_TEST_REPORT_DIR` files.
     pub name: &'static str,
-    /// Full authoring audit: no publisher or feature exemptions.
+    /// Full authoring audit: only documented deployment and tool exceptions.
     pub full_authoring: bool,
+    /// Recovery fixtures deliberately allow dependent segments after gaps.
+    pub permissive: bool,
+    /// This case actually injects packet loss; undamaged controls remain strict checks.
+    pub recovery_gaps: bool,
     /// A subtitle or closed-caption rendition is published.
     pub captions: bool,
     /// More than one video rendition is published.
@@ -67,6 +71,8 @@ impl Default for Expect {
         Self {
             name: "apple-hls",
             full_authoring: false,
+            permissive: false,
+            recovery_gaps: false,
             captions: false,
             ladder: false,
             audio_only: false,
@@ -179,8 +185,10 @@ pub enum Verdict {
 /// about which bitrates or profiles *should exist* is addressed to somebody
 /// else. Kept as one table because the distinction that matters is who the rule
 /// is for, not which section of Apple's document it appears in.
-const PUBLISHER_CHOICES: [&str; 14] = [
+const PUBLISHER_CHOICES: [&str; 16] = [
     "multiple bit rates",
+    "one frame per second \"dense\" i-frame renditions",
+    "provide both dolby vision and hdr10",
     "peak bandwidth is less than or equal",
     "default video variant",
     "stream failover",
@@ -197,7 +205,7 @@ const PUBLISHER_CHOICES: [&str; 14] = [
 ];
 
 /// Findings squarely about what this origin wrote into a playlist or segment.
-const PACKAGER_DUTIES: [&str; 18] = [
+const PACKAGER_DUTIES: [&str; 20] = [
     "partial segment",
     "independent",
     "did not refresh",
@@ -205,6 +213,8 @@ const PACKAGER_DUTIES: [&str; 18] = [
     "part-hold-back",
     "hold-back",
     "sync frame",
+    "idr frame",
+    "frame-rate attribute",
     "playlist attribute",
     "target duration",
     "duration of each media segment",
@@ -234,6 +244,20 @@ pub fn judge(finding: &Finding, expect: &Expect) -> Verdict {
     let scopes = finding.scopes.join("; ").to_ascii_lowercase();
 
     if expect.full_authoring {
+        // These are deployment recommendations, not claims made by the origin audit.
+        // Keep the exact findings visible; unrelated recommendations still fail.
+        if finding.source == Source::Authoring
+            && finding.level == Level::ShouldFix
+            && matches!(
+                finding.title.as_str(),
+                "You SHOULD support stream failover [#1040]"
+                    | "For cellular delivery, the default video variant(s) SHOULD be the 730 kb/s variant. [#1083]"
+            )
+        {
+            return Verdict::CompatibilityException(
+                "deployment recommendation: this audit tests one origin with a fixed default variant",
+            );
+        }
         if finding.level == Level::NotChecked {
             return Verdict::CompatibilityException(
                 "Apple performed no validation for this requirement",
@@ -256,6 +280,28 @@ pub fn judge(finding: &Finding, expect: &Expect) -> Verdict {
         return Verdict::Defect;
     }
 
+    if expect.permissive && (
+        title.starts_with("if ext-x-independent-segments is not in the multivariant playlist, then you must use the ext-x-independent-segments tag in all video media playlists")
+        || title.starts_with("multivariant playlist should declare ext-x-independent-segments tag since all media playlists appear to be independent")
+        || title.starts_with("some media playlists appear independent and should declare ext-x-independent-segments tag")
+    ) {
+        return Verdict::NotApplicable("this recovery fixture deliberately allows dependent segments");
+    }
+    if expect.permissive
+        && expect.recovery_gaps
+        && match finding.source {
+            Source::Validator => title == "video segment does not contain an idr frame — trackid:1",
+            Source::Authoring => matches!(
+                title.as_str(),
+                "(segment) video segment does not contain an idr frame [#-50033]"
+                    | "video segments must start with an idr frame [#1021]"
+            ),
+        }
+    {
+        return Verdict::NotApplicable(
+            "this recovery fixture deliberately resumes dependent frames after packet loss",
+        );
+    }
     conditional(&title, &scopes, expect)
         .or_else(|| unimplemented_feature(&title))
         .or_else(|| {
@@ -285,6 +331,7 @@ fn conditional(title: &str, scopes: &str, expect: &Expect) -> Option<Verdict> {
         // Apple cannot report a format present when it did not recognise the
         // format, so this says nothing about the CODECS attribute itself.
         || (title.contains("codecs attribute") && expect.unlisted_codec)
+        || (title.contains("frame-rate attribute") && expect.unlisted_codec)
     {
         return Some(when(
             expect.unlisted_codec,
@@ -326,7 +373,9 @@ fn conditional(title: &str, scopes: &str, expect: &Expect) -> Option<Verdict> {
     }
 
     // Accessibility. Only meaningful when the case published captions.
-    if title.contains("captions should be provided") {
+    if title.contains("captions should be provided")
+        || title.starts_with("stream should declare either subtitle or caption group attributes for all video variants")
+    {
         return Some(when(
             !expect.captions,
             "the case publishes no caption or subtitle track",
@@ -703,6 +752,47 @@ fn decode_entities(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idr_exceptions_apply_only_to_damaged_permissive_cases() {
+        let finding = Finding {
+            source: Source::Authoring,
+            level: Level::MustFix,
+            context: "General requirements".into(),
+            title: "Video segments MUST start with an IDR frame [#1021]".into(),
+            scopes: vec!["All Variants".into()],
+        };
+        for (permissive, recovery_gaps, full_authoring) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            assert_eq!(
+                judge(
+                    &finding,
+                    &Expect {
+                        full_authoring,
+                        permissive,
+                        recovery_gaps,
+                        ..Expect::default()
+                    }
+                ),
+                Verdict::Defect
+            );
+        }
+        assert!(matches!(
+            judge(
+                &finding,
+                &Expect {
+                    permissive: true,
+                    recovery_gaps: true,
+                    ..Expect::default()
+                }
+            ),
+            Verdict::NotApplicable(_)
+        ));
+    }
 
     #[test]
     fn parses_126_severity_headings_and_advisories() {

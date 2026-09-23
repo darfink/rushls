@@ -60,8 +60,8 @@ The credentialed Apple audit runs only on the default branch; fork pull requests
 CI uses TLS 1.3 and uploads reports even when conformance checks fail.
 Version 1.26.143 reports missing TLS delivery even for Apple's public HTTPS example.
 It also reports missing I-frame `HOLD-BACK` when sibling playlists contain partial segments, despite explicit hold-back values.
-These findings remain failures. The workflow does not change Apple's evidence or suppress these findings.
-Without them, tests use HTTP and the strict audit reports transport failures.
+Version-specific exceptions require independent checks. The workflow preserves every original finding and severity.
+Without TLS credentials, tests use HTTP and the strict audit reports transport failures.
 Apple's validator has no documented custom-CA argument; curl's `--cacert` only affects harness requests.
 An existing trusted CA can still be supplied through `RUSHLS_TEST_CA_CERT` and `RUSHLS_TEST_CA_KEY`.
 
@@ -103,15 +103,42 @@ Both original reports remain in `target/apple-authoring/` locally, or the config
 CI uploads original and compatibility JSON/HTML plus request traces as `apple-hls-reports`, including reports from failed runs.
 The artifacts also include the playlists, measured DVR windows, and a retained subtitle segment.
 
-The dedicated audit rejects every must-fix and should-fix finding except the subtitle-only WebVTT MIME finding.
-Apple's tool expects `text/plain` there; the current specification accepts both `text/vtt` and `text/plain`.
-The exception applies only when every scope identifies subtitles and the exact `text/vtt` versus `text/plain` mismatch.
-TLS has no exception: Apple's requirement is TLS 1.2 **or later**.
-Requirements that Apple does not validate remain visible and cannot count as verified.
+## Pass criteria and known tool defects
 
-The shorter packaging tests have broader, explicit exceptions for their deliberately unusual inputs.
-Setting `RUSHLS_TEST_HLSREPORT=strict` rejects unknown findings in that suite, but keeps its documented exceptions.
-The dedicated audit does not inherit those exceptions.
+A passing job means that the tested contract passed with the documented exceptions.
+It does not mean that Apple reported no findings or that every Apple requirement passed.
+Both suites use strict reporting in CI. Unknown findings and genuine defects fail the job.
+
+The two-hour audit permits two deployment recommendations: stream failover (`1040`) and the cellular default variant (`1083`).
+The fixture tests one origin and keeps its 2,000 kb/s default variant.
+All other recommendations remain subject to the audit's checks.
+
+Tool exceptions apply only to validator `1.26.143 (1.26.143-260527)` and JSON schema `1.3`:
+
+| Finding | Evidence required for an exception |
+| --- | --- |
+| TLS delivery (`1041`–`1043`) | Every reported URL uses one HTTPS origin. An independent curl request passes certificate verification and returns HTTP 200. |
+| Missing I-frame HOLD-BACK (`-50096`) | Every affected playlist is I-frame-only. Both the JSON value and a fresh playlist meet `HOLD-BACK >= 3 * TARGETDURATION`. |
+| Missing rendition reports (`-50125`) | Only one regular media playlist exists. There is no other required rendition to report. |
+| HE-AAC identified as AAC-LC (`1051`) | The exact codec mismatch applies to all audio renditions. Independent ffprobe checks identify HE-AAC on every audio rendition. |
+
+The TLS investigation found null security values that the validator exports as false.
+The validator created its TLS checker but never called it during the traced public Apple HTTPS scan.
+The HE-AAC mismatch also occurred when FFmpeg packaged the same fixture without Rushls.
+The [HLS draft, Appendix B.1](https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis-22#appendix-B.1) excludes the current playlist and I-frame playlists from required rendition reports.
+
+A new tool version receives none of these exceptions until its behavior receives review.
+A failed independent check fails CI. The original JSON and HTML remain unchanged.
+Each case also saves `.judgement.json`, with its CI decisions and reasons.
+The GitHub summary shows the two-hour exceptions separately from the original findings.
+
+The legacy subtitle MIME exception remains limited to subtitle-only `text/vtt` versus `text/plain` findings.
+Version 1.26.143 no longer emits that finding.
+Requirements that Apple does not validate remain visible and do not count as verified.
+
+Packaging tests have explicit exceptions for their input: missing captions, unsupported codecs, unusual GOP cadence, and deliberate dependent-frame recovery.
+Ordinary cases use strict input handling and enforce segment independence.
+Only GAP recovery cases use permissive handling. The two-hour audit does not inherit their exceptions.
 
 ## Independent segments
 
@@ -236,8 +263,8 @@ For the Apple audit, supply trusted certificate paths and set:
 RUSHLS_TEST_TLS_MIN_VERSION=1.2 RUSHLS_TEST_TLS_MAX_VERSION=1.2 tools/check-apple-authoring.sh
 ```
 
-The Apple CI job sets these bounds when TLS credentials are configured.
-This audits TLS 1.2; it does not establish that the legacy tool validates TLS 1.3.
+The command above audits TLS 1.2. The current Apple CI job uses TLS 1.3 only.
+The legacy report does not establish TLS 1.3 compliance.
 Rustls retains its cipher defaults. No Keychain changes or privileged operations are needed.
 
 The local TLS 1.2 test negotiated `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` (`0xC02C`).
@@ -265,7 +292,7 @@ The original report retains the enum-related TLS warning; the audit is not fully
 The six-variant audit completed locally in 290 seconds on September 23, 2026.
 All nine media playlists retained at least 7,206 seconds; 33,261 requests completed without delivery errors.
 The report added no findings when the variants above 2,000 kb/s were removed.
-Failover and the cellular default recommendation remain defects; the subtitle MIME finding retains its documented compatibility exception.
+In that earlier run, failover and the cellular default recommendation remained defects. The current pass criteria classify them as deployment recommendations.
 
 Sampling filesystem allocation every ten seconds measured a peak DVR size of 3.60 GiB.
 The local build occupied 3.22 GiB, and encoded templates occupied approximately 18 MiB.

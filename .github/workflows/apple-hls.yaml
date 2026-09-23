@@ -26,6 +26,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       RUSHLS_TEST_REQUIRE_APPLE_TOOLS: '1'
+      RUSHLS_TEST_HLSREPORT: strict
       RUSHLS_TEST_REPORT_DIR: ${{ github.workspace }}/target/apple-reports
     steps:
       - uses: actions/checkout@v7

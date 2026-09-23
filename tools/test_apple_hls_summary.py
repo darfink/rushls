@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -35,6 +36,20 @@ class AppleSummaryTests(unittest.TestCase):
             text = summary.summarize(root, "failure")
         self.assertIn("does not establish conformance", text)
         self.assertIn("**Test outcome:** failure", text)
+
+    def test_ci_exceptions_do_not_hide_original_findings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "two_hour_live_authoring.html").write_text(
+                "<h2>General requirements</h2><h3>HLS Spec Must Fix Issues</h3>"
+                "<h4>1. Missing control</h4>")
+            (root / "two_hour_live_authoring.judgement.json").write_text(json.dumps([
+                {"finding": "Missing control", "verdict": 'CompatibilityException("independent verification passed")'}]))
+            text = summary.summarize(root, "success")
+        self.assertIn("CI exceptions", text)
+        self.assertIn("HLS Spec Must Fix Issues", text)
+        self.assertIn("independent verification passed", text)
+        self.assertIn("It does not mean Apple reported no findings", text)
 
     def test_summary_escapes_html_and_markdown_table_content(self):
         text = summary.escape("<script>x</script>|[link](url)")

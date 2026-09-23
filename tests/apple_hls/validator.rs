@@ -114,7 +114,18 @@ fn validate_once(url: &str, expect: &Expect) -> Result<(), String> {
     keep_artifacts(&report, expect.name)?;
     let _ = fs::remove_file(&report);
 
-    let judgement = Judgement::new(findings, expect);
+    let mut judgement = Judgement::new(findings, expect);
+    crate::exceptions::apply(&value, &mut judgement)?;
+    if let Some(directory) = std::env::var_os("RUSHLS_TEST_REPORT_DIR") {
+        let decisions: Vec<_> = judgement.findings.iter().map(|(finding, verdict)| {
+            serde_json::json!({"finding": finding.title, "verdict": format!("{verdict:?}")})
+        }).collect();
+        fs::write(
+            PathBuf::from(directory).join(format!("{}.judgement.json", expect.name)),
+            serde_json::to_vec_pretty(&decisions).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    }
     eprint!("{}", judgement.render(expect));
     let defects = judgement.defects();
     if defects.is_empty() {

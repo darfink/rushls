@@ -137,13 +137,13 @@ impl Origin {
         // the scheme under test rather than falling back to a relative one.
         config.hls.uri_base = UriBase::new(format!("{scheme}://{host}:{}", address.port()));
         config.hls.readiness = setup.readiness;
-        configure_authoring(&mut config, setup.expect.full_authoring);
+        configure_authoring(&mut config, &setup.expect);
         config.session.segmentation = setup.segmentation;
         let disk = configure_retention(&mut config, setup.retain)?;
         let session = config.session;
         let recorder = Recorder::default();
         let mut policy = StreamPolicy::permissive();
-        if setup.expect.full_authoring {
+        if !setup.expect.permissive {
             policy.input_mode = rushls::domain::InputMode::Strict;
         }
         let node = Node::new(
@@ -323,9 +323,9 @@ impl Drop for Origin {
     }
 }
 
-fn configure_authoring(config: &mut NodeConfig, full_authoring: bool) {
-    config.store.independent_segments = full_authoring;
-    if full_authoring {
+fn configure_authoring(config: &mut NodeConfig, expect: &Expect) {
+    config.store.independent_segments = !expect.permissive;
+    if expect.full_authoring {
         // Apple fetches some initially advertised parts near the end of
         // its exhaustive scan. Keep URLs alive across that scan plus
         // request overhead; the part-tag window and production defaults stay intact.

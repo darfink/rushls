@@ -79,6 +79,15 @@ def summarize(directory, outcome="not recorded", artifact_url=""):
                 requests += 1
                 errors += bool(entry.get("error"))
         lines += [f"HTTP requests: **{requests:,}**. Delivery errors: **{errors:,}**.", ""]
+    decisions = stem.with_suffix(".judgement.json")
+    if decisions.exists():
+        entries = json.loads(decisions.read_text())
+        accepted = [entry for entry in entries if entry["verdict"].startswith("CompatibilityException(")]
+        if accepted:
+            lines += ["### CI exceptions", "", "Passing CI means the tested contract passed with the exceptions below. It does not mean Apple reported no findings.", ""]
+            for entry in accepted:
+                lines.append(f"- {escape(entry['finding'])}: {escape(entry['verdict'])}")
+            lines.append("")
     parsed = Findings()
     parsed.feed(report.read_text())
     lines += ["### Apple's findings", "", "These findings are copied from the original report without exemptions or severity changes.", ""]

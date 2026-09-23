@@ -16,6 +16,7 @@
 
 mod authoring;
 mod certs;
+mod exceptions;
 mod export;
 mod flv;
 mod harness;
@@ -639,10 +640,14 @@ async fn gap_case(
 ) -> TestResult {
     const FIXTURE: &[u8] = include_bytes!("fixtures/h264_fixed_aac.ts");
     for damaged in [false, true] {
-        let setup = Setup::default().named(name).expect(|e| match drop {
-            Some(MediaKind::Video) => e.audio_only(),
-            Some(MediaKind::Audio) => e.video_only(),
-            _ => e,
+        let setup = Setup::default().named(name).expect(|mut e| {
+            e.permissive = true;
+            e.recovery_gaps = damaged;
+            match drop {
+                Some(MediaKind::Video) => e.audio_only(),
+                Some(MediaKind::Audio) => e.video_only(),
+                _ => e,
+            }
         });
         let Some(origin) = harness::Origin::start_with(setup).await? else {
             return Ok(());
