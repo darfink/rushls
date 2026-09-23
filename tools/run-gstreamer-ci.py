@@ -63,6 +63,8 @@ def playback(Gst, url):
     finally:
         pipeline.set_state(Gst.State.NULL)
     result['demuxers'] = sorted(demuxers)
+    if not result['eos'] and not result['errors']:
+        result['errors'].append('Timed out waiting for end-of-stream after 75 seconds')
     # EOS alone can pass an empty or undecoded stream. Require raw output from
     # both tracks over a substantial part of this 24-second live fixture.
     result['ok'] = result['eos'] and not result['errors'] and 'hlsdemux2' in demuxers
@@ -85,6 +87,8 @@ def main():
     gi.require_version('Gst', '1.0')
     from gi.repository import Gst
     Gst.init(None)
+    if Gst.version()[:2] < (1, 28):
+        raise RuntimeError('This playback check requires GStreamer 1.28 or newer')
     for plugin in ('playbin3', 'hlsdemux2', 'avdec_h264', 'avdec_aac'):
         if Gst.ElementFactory.find(plugin) is None:
             raise RuntimeError(f'Missing required GStreamer plugin: {plugin}')

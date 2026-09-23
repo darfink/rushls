@@ -11,7 +11,7 @@ Rust toolchain installation uses a composite action, with no JavaScript runtime.
 | Validate media | Ignored decoder tests, recording, RTMP ingest, video GAP fixture export | FFmpeg, including AudioToolbox AAC |
 | Validate Chrome playback (patched hls.js) | Patched-player unit tests; live control and GAP streams, rendition switches, completion; official-release compatibility | Chrome, matching ChromeDriver, Node.js 24, pinned hls.js source and patch |
 | Validate Apple HLS | Packaging cases, playlist diagnostics, two-hour live authoring audit | macOS, Apple HLS tools, FFmpeg, trusted localhost TLS |
-| Validate GStreamer playback | Live control stream; decoded audio/video and end-of-stream | FFmpeg, GStreamer hlsdemux2, PyGObject |
+| Validate GStreamer playback | Live control stream; decoded audio/video and end-of-stream | FFmpeg, GStreamer 1.28+ hlsdemux2, PyGObject |
 
 Code, media, Chrome, and GStreamer checks run on pull requests and main-branch pushes.
 Apple validation runs through a reusable workflow on main-branch pushes and manual main-branch runs.
@@ -326,6 +326,8 @@ Both audio and video must produce decoded raw buffers spanning at least 12 secon
 The artifact includes buffer counts, timestamps, negotiated formats, warnings, and origin logs.
 This check covers independent client decoding and completion; Chrome covers explicit rendition switching.
 
+CI uses Ubuntu 26.04 for GStreamer 1.28.
+Ubuntu 24.04 supplies 1.24.2, which decoded this control but failed to emit end-of-stream in CI.
 On Linux, install the packages listed in `.github/workflows/ci.yaml`, then run:
 
 ```sh

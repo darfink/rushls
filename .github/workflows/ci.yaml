@@ -133,7 +133,8 @@ jobs:
 
   gstreamer:
     name: Validate GStreamer playback
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 ships GStreamer 1.24, which stalls on this live-to-ENDLIST case.
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
