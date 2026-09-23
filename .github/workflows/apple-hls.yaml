@@ -80,9 +80,11 @@ jobs:
         id: packaging
         run: cargo test --locked --test apple_hls -- --include-ignored --skip authoring::two_hour_live_authoring --test-threads=2
       - name: Two-hour live authoring audit
+        id: audit
         if: ${{ !cancelled() && steps.packaging.outcome != 'skipped' }}
         run: tools/check-apple-authoring.sh
       - name: Upload original and compatibility Apple reports
+        id: reports
         uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -94,6 +96,12 @@ jobs:
             target/apple-reports/*.m3u8
             target/apple-reports/*.vtt
           if-no-files-found: error
+      - name: Show two-hour report on the run summary
+        if: always()
+        env:
+          AUDIT_OUTCOME: ${{ steps.audit.outcome }}
+          ARTIFACT_URL: ${{ steps.reports.outputs.artifact-url }}
+        run: python3 tools/summarize-apple-hls.py "$RUSHLS_TEST_REPORT_DIR"
       - name: Remove temporary TLS files
         if: always()
         run: rm -rf "$RUNNER_TEMP/apple-hls-tls"
