@@ -1,4 +1,11 @@
-# Rushls
+<h1 align="center"><img src="docs/assets/rushls.svg" alt="Rushls" width="480"></h1>
+<p align="center"><strong>One focus: excellent HLS.</strong></p>
+<p align="center">
+  <a href="https://github.com/darfink/rushls/actions/workflows/ci.yaml"><img src="https://github.com/darfink/rushls/actions/workflows/ci.yaml/badge.svg" alt="Build and validation"></a>
+  <a href="https://crates.io/crates/rushls"><img src="https://img.shields.io/crates/v/rushls.svg" alt="crates.io"></a>
+  <a href="https://github.com/darfink/rushls/pkgs/container/rushls"><img src="https://img.shields.io/badge/container-GHCR-986044" alt="Container registry"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+</p>
 
 Rushls focuses on one job: serving HLS and low-latency HLS well.
 It is an origin written in Rust, not an attempt to support every streaming protocol and workflow.
@@ -38,21 +45,34 @@ It runs without system FFmpeg or SRT libraries. Publishing and validation tools 
 
 ## Contents
 
-- [Why Rushls?](#why-rushls)
-- [Supported protocols and codecs](#supported-protocols-and-codecs)
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [Configuration](#configuration)
-- [Publishing streams](#publishing-streams)
-- [Multiple variants, audio tracks, and subtitles](#multiple-variants-audio-tracks-and-subtitles)
-- [Playback and latency](#playback-and-latency)
-- [DVR and resource limits](#dvr-and-resource-limits)
-- [Recording](#recording)
-- [Authentication and encryption](#authentication-and-encryption)
-- [Production operation](#production-operation)
-- [Troubleshooting and compatibility](#troubleshooting-and-compatibility)
-- [Development](#development)
-- [License](#license)
+- **🧭 Start here**
+  - [Why Rushls?](#why-rushls)
+  - [Supported protocols and codecs](#supported-protocols-and-codecs)
+  - [Installation](#installation): [Cargo](#cargo), [binaries](#native-binaries), [Docker](#docker)
+  - [Quick start](#quick-start)
+  - [Configuration](#configuration)
+- **📡 Publish and play**
+  - [Publishing streams](#publishing-streams)
+    - [FFmpeg](#ffmpeg)
+    - [GStreamer](#gstreamer)
+    - [OBS Studio](#obs-studio)
+    - [Media over QUIC](#media-over-quic)
+  - [Multiple variants, audio tracks, and subtitles](#multiple-variants-audio-tracks-and-subtitles)
+  - [Playback and latency](#playback-and-latency)
+- **🔧 Operate**
+  - [DVR and resource limits](#dvr-and-resource-limits)
+  - [Recording](#recording)
+  - [Authentication and encryption](#authentication-and-encryption)
+    - [Publisher admission](#publisher-admission)
+    - [Playback authorization](#playback-authorization)
+    - [TLS and transport encryption](#tls-and-transport-encryption)
+  - [Production operation](#production-operation)
+  - [Troubleshooting and compatibility](#troubleshooting-and-compatibility)
+- **Contribute**
+  - [Development](#development)
+    - [Build from source](#build-from-source)
+    - [Run checks](#run-checks)
+  - [License](#license)
 
 ## Supported protocols and codecs
 
@@ -85,42 +105,42 @@ See [ingest coverage](docs/feature-parity.md) and the [player matrix](docs/gap-p
 
 ## Installation
 
+### Cargo
+
+Install Rust 1.97 or later and a C compiler, then install Rushls from crates.io:
+
+```sh
+cargo install rushls --locked
+```
+
+Cargo compiles the executable and installs it in `~/.cargo/bin`. Make sure this directory is on `PATH`.
+See [Quick start](#quick-start) to create a local configuration and publish your first stream.
+
 ### Native binaries
 
 The release workflow targets Linux and macOS on AMD64/ARM64, plus Windows AMD64.
 A first application release is pending. The `ci-tools` prerelease contains validation tools, not Rushls binaries.
-Until application archives appear on the [release page](https://github.com/darfink/rushls/releases), build from source.
+Check the [release page](https://github.com/darfink/rushls/releases) for application archives.
 
 Archives include configuration examples, documentation, dependency notices, and SHA-256 checksums.
 Linux builds require glibc 2.39 or later. The macOS matrix uses macOS 15.
 Windows recording requires a filesystem with hard links, such as NTFS.
 See [platform requirements and release procedures](docs/releases.md).
 
-### Build from source
-
-Install Rust 1.97 or later and a C compiler for the `ring` dependency.
-
-```sh
-git clone https://github.com/darfink/rushls.git
-cd rushls
-cargo build --release --locked
-./target/release/rushls --config rushls.toml
-```
-
-On Windows, the executable is `target\release\rushls.exe`.
-Shell examples below use POSIX syntax. PowerShell requires its own line-continuation syntax.
-
 ### Docker
 
-Build a local image from the repository root:
+CI publishes the Linux AMD64 image to [GitHub Container Registry](https://github.com/darfink/rushls/pkgs/container/rushls) after validation passes.
+The `edge` tag follows validated main builds. Stable releases also publish `latest` and version tags such as `v0.1.0`.
+For production, pin a released version or image digest.
+Public image access is pending; the commands below require registry access until the package is public.
 
 ```sh
-docker build --build-arg GIT_SHA="$(git rev-parse --short=12 HEAD)" -t rushls .
+docker pull ghcr.io/darfink/rushls:edge
 docker run --rm --name rushls \
   -p 127.0.0.1:1935:1935/tcp \
   -p 127.0.0.1:9000:9000/udp \
   -p 127.0.0.1:8080:8080/tcp \
-  rushls
+  ghcr.io/darfink/rushls:edge
 ```
 
 The image listens on container interfaces and permits unauthenticated publishing.
@@ -135,7 +155,7 @@ docker run --rm --name rushls \
   --mount type=bind,src="$PWD/production.toml",dst=/etc/rushls/rushls.toml,readonly \
   --mount type=bind,src="$PWD/secrets",dst=/run/secrets,readonly \
   --mount type=bind,src="$PWD/data",dst=/var/lib/rushls \
-  rushls
+  ghcr.io/darfink/rushls:edge
 ```
 
 This second command requires your deployment configuration, certificates, secrets, and writable data directory.
@@ -145,11 +165,21 @@ See [deployment](docs/deployment.md) for storage and proxy examples.
 
 ## Quick start
 
-Start Rushls with the bundled loopback configuration:
+Create a configuration that binds each listener to loopback, then start the installed executable:
 
 ```sh
-./target/release/rushls --config rushls.toml
+cat > rushls.toml <<'TOML'
+[rtmp]
+listen = "127.0.0.1:1935"
+[srt]
+listen = "127.0.0.1:9000"
+[http]
+listen = "127.0.0.1:8080"
+TOML
+rushls --config rushls.toml
 ```
+
+Release archives and source checkouts already contain this starter as `rushls.toml`.
 
 In another terminal, publish an H.264/AAC MP4 file:
 
@@ -574,6 +604,22 @@ GStreamer clean-stream playback passes. GAP signaling does not guarantee seamles
 See [player compatibility](docs/releases.md#player-compatibility) and [known limitations](TODO.md).
 
 ## Development
+
+### Build from source
+
+Install Rust 1.97 or later and a C compiler for the `ring` dependency.
+
+```sh
+git clone https://github.com/darfink/rushls.git
+cd rushls
+cargo build --release --locked
+./target/release/rushls --config rushls.toml
+```
+
+On Windows, the executable is `target\release\rushls.exe`.
+Shell examples below use POSIX syntax. PowerShell requires its own line-continuation syntax.
+
+### Run checks
 
 ```sh
 cargo fmt --all -- --check

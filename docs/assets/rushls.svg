@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="170" viewBox="0 0 600 170" role="img" aria-labelledby="title desc">
+  <title id="title">Rushls</title>
+  <desc id="desc">Copper serif wordmark with a segmented play symbol, inspired by a stamped workshop sign.</desc>
+  <g fill="none" stroke="#b66a42" stroke-width="3">
+    <path d="M26 42h92l16 16v64l-16 16H26l-16-16V58z"/>
+    <path d="M30 50h79M30 130h79" stroke-width="1"/>
+  </g>
+  <g fill="#b66a42">
+    <path d="M47 61v58l16-10V71zM69 75v30l16-10V85zM91 88v4l4-2z"/>
+    <text x="157" y="125" font-family="Rockwell, Georgia, 'Times New Roman', serif" font-size="112" font-weight="700" letter-spacing="-4">Rushls</text>
+    <path d="M162 145h410v2H162z"/>
+  </g>
+</svg>
