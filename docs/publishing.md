@@ -35,6 +35,7 @@ An admission service can replace that name with its returned `stream_id`.
 
 Generate 24 seconds of H.264/AAC with a two-second GOP and no B-frames:
 
+<!-- verify: {"id":"fixture"} -->
 ```sh
 ffmpeg -f lavfi -i testsrc2=size=640x360:rate=30 \
   -f lavfi -i sine=frequency=440:sample_rate=48000 \
@@ -161,6 +162,7 @@ For another frame rate, adjust the GOP length to preserve the intended keyframe 
 
 The same encoded ladder can use Enhanced RTMP with FFmpeg 9.0.1:
 
+<!-- verify: {"id":"ladder-rtmp","stream":"ladder","video":2,"audio":1} -->
 ```sh
 ffmpeg -re -i input.mp4 \
   -filter_complex '[0:v]split=2[hi][lo];[lo]scale=320:180[small]' \
@@ -180,6 +182,7 @@ The publisher controls their wire representation; these commands do not use a sy
 
 Publish one video track and two audio tracks with language metadata:
 
+<!-- verify: {"id":"alternate-audio","stream":"languages","video":1,"audio":2,"languages":["en","es"]} -->
 ```sh
 ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -map 0:a:0 \
   -c copy -metadata:s:a:0 language=eng -metadata:s:a:1 language=spa \
@@ -243,6 +246,63 @@ Rushls inspects supported SEI payloads for HLS caption declarations.
 It does not turn those embedded captions into a separate WebVTT track.
 A mixed ladder with an unverifiable codec can prevent a global caption declaration.
 AV1 caption extraction, MPEG-TS subtitle PIDs, and standalone WebVTT/SubRip ingestion remain unsupported.
+
+### Publish captions with gst-captions
+
+[gst-captions](https://github.com/darfink/gst-captions) provides `captionsflvmux`, which inserts `onCaption` or `onTextData` into FLV before RTMP transmission.
+It also provides optional transcription and roll-up elements.
+Rushls receives the caption messages and creates an HLS WebVTT rendition.
+
+Build the model-free muxer from the revision used in Rushls CI:
+
+```sh
+git clone https://github.com/darfink/gst-captions.git
+cd gst-captions
+git checkout 8fbeda5a33ddc8fbd9a90ba1219bee3e288919ca
+cargo build --release --locked --no-default-features --features flvmux
+export GST_PLUGIN_PATH="$PWD/target/release${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+gst-inspect-1.0 captionsflvmux
+```
+
+The build needs GStreamer development headers and `pkg-config`.
+For the official macOS GStreamer framework, first set `PKG_CONFIG_PATH` to its `Versions/Current/lib/pkgconfig` directory.
+The model-free build needs no speech model or transcription backend.
+See the upstream [build instructions](https://github.com/darfink/gst-captions#build) for other installation methods.
+
+With Rushls running, publish 24 seconds of generated video/audio and a two-second caption:
+
+<!-- verify: {"id":"captions", "stream":"captions", "video":1, "audio":1, "subtitles":1, "text":"Hello from gst-captions"} -->
+```sh
+cat > captions.srt <<'CAPTIONS'
+1
+00:00:00,000 --> 00:00:02,000
+Hello from gst-captions
+CAPTIONS
+
+gst-launch-1.0 -e \
+  videotestsrc num-buffers=720 ! video/x-raw,format=I420,width=640,height=360,framerate=30/1 \
+  ! x264enc tune=zerolatency key-int-max=60 option-string=scenecut=0 bitrate=1200 ! h264parse ! queue ! fm. \
+  audiotestsrc num-buffers=1125 samplesperbuffer=1024 ! audio/x-raw,rate=48000,channels=2 \
+  ! avenc_aac ! aacparse ! queue ! fm. \
+  flvmux name=fm streamable=true ! captionsflvmux name=cm input-mode=timed prime=true \
+  ! rtmp2sink location=rtmp://127.0.0.1:1935/live/captions sync=true \
+  filesrc location=captions.srt ! subparse ! text/x-raw,format=utf8 ! queue ! cm.text
+```
+
+Playback: `http://127.0.0.1:8080/live/captions/index.m3u8`.
+Select the subtitle rendition in your player. The master playlist advertises `TYPE=SUBTITLES`.
+This is publisher-side conversion of an SRT subtitle file into RTMP messages, not a standalone subtitle upload endpoint in Rushls.
+
+Use `rtmp2sink` for this pipeline; the legacy `rtmpsink` failed to deliver codec setup correctly in our test.
+Keep `streamable=true` so FLV buffers retain media timestamps.
+Keep `prime=true` so the muxer declares captions during Rushls discovery, even before the first spoken word.
+Without that early declaration, late captions cannot add a subtitle track to an already frozen publication.
+The text branch needs timestamped coverage; missing coverage can backpressure the media branch.
+Rushls resolves a script cue when the next message replaces or clears it.
+Use short cues with prompt updates rather than holding one caption open for the whole broadcast.
+
+For live speech, upstream's `captionstranscriber ! captionsrollup` can feed `cm.text` with `input-mode=replacement`.
+That workflow requires a model and the transcription feature. The CI sample uses deterministic text and does not measure transcription quality.
 
 ## Check the result
 

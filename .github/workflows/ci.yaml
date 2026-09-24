@@ -227,6 +227,52 @@ jobs:
           path: target/gstreamer-reports
           if-no-files-found: error
 
+  documentation:
+    name: Validate documentation examples
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install publisher dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/debug
+            target/caption-plugin
+          key: rushls-docs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'tools/check-doc-examples.py', '.github/workflows/ci.yaml') }}
+          restore-keys: rushls-docs-${{ runner.os }}-${{ runner.arch }}-
+      - name: Build pinned caption muxer without transcription models
+        env:
+          CAPTIONS_REVISION: 8fbeda5a33ddc8fbd9a90ba1219bee3e288919ca
+        run: |
+          git init "$RUNNER_TEMP/gst-captions"
+          git -C "$RUNNER_TEMP/gst-captions" remote add origin https://github.com/darfink/gst-captions.git
+          git -C "$RUNNER_TEMP/gst-captions" fetch --depth=1 origin "$CAPTIONS_REVISION"
+          git -C "$RUNNER_TEMP/gst-captions" checkout --detach FETCH_HEAD
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target/caption-plugin" cargo build --release --locked --manifest-path "$RUNNER_TEMP/gst-captions/Cargo.toml" --no-default-features --features flvmux
+          echo "GST_PLUGIN_PATH=$GITHUB_WORKSPACE/target/caption-plugin/release" >> "$GITHUB_ENV"
+      - name: Build origin and validate documentation configuration
+        run: |
+          cargo build --locked --bin rushls
+          cargo test --locked --test configuration
+      - name: Extract and run documented publishing recipes
+        run: python3 tools/check-doc-examples.py --output target/doc-examples
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: documentation-examples
+          path: target/doc-examples
+          if-no-files-found: warn
+
   apple:
     name: Validate Apple HLS
     if: github.event_name != 'pull_request' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v'))
@@ -235,7 +281,7 @@ jobs:
 
   publish:
     name: Publish container image
-    needs: [release_metadata, binaries, code, media, chrome, gstreamer, apple]
+    needs: [release_metadata, binaries, code, media, chrome, gstreamer, documentation, apple]
     if: github.event_name != 'pull_request' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:

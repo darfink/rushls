@@ -1,8 +1,27 @@
 # Rushls
 
-Rushls is a live HLS and low-latency HLS origin written in Rust.
-It accepts encoded media over RTMP, SRT, or Media over QUIC and serves CMAF media and WebVTT subtitles.
+Rushls focuses on one job: serving HLS and low-latency HLS well.
+It is an origin written in Rust, not an attempt to support every streaming protocol and workflow.
+RTMP, SRT, and Media over QUIC are ingest paths into that HLS pipeline.
 It preserves encoded media without transcoding. The publisher supplies every video variant and audio rendition.
+
+## Why Rushls?
+
+I built Rushls after testing open-source HLS servers for my own production workloads.
+Every server I tested exhibited issues once I moved beyond trivial use cases.
+That experience motivated a dedicated HLS origin, with attention to multitrack streams, DVR, captions, reconnects, and playback behavior.
+This describes my tests and requirements, not a benchmark of every server available today.
+
+Rushls is used in production today. Its development includes:
+
+- More than 1,000 Rust library tests, plus integration, decoder, browser, and load tests.
+- Apple's `mediastreamvalidator` and `hlsreport`, including a two-hour DVR authoring audit with published CI reports.
+- Playback checks for real media, multiple renditions, and live-to-ended transitions.
+- Several corrections to upstream hls.js code discovered during development: pending-part selection, fragment tracking, and ENDLIST state preservation.
+
+The [hls.js corrections](tools/patches/hls.js/README.md) currently ship as a local patch intended for upstream submission; they are not yet merged upstream.
+Validation reports retain [documented exceptions and compatibility limits](docs/ci-validation.md).
+The goal is reliable HLS behavior in demanding workflows, supported by reproducible evidence.
 
 ```text
 FFmpeg / GStreamer / OBS / MoQ publisher
@@ -19,6 +38,7 @@ It runs without system FFmpeg or SRT libraries. Publishing and validation tools 
 
 ## Contents
 
+- [Why Rushls?](#why-rushls)
 - [Supported protocols and codecs](#supported-protocols-and-codecs)
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -133,6 +153,7 @@ Start Rushls with the bundled loopback configuration:
 
 In another terminal, publish an H.264/AAC MP4 file:
 
+<!-- verify: {"id":"quickstart","stream":"demo","video":1,"audio":1} -->
 ```sh
 ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 \
   -c copy -f flv rtmp://127.0.0.1:1935/live/demo
@@ -199,6 +220,7 @@ Tested publisher versions and complete recipes appear in [publishing](docs/publi
 
 RTMP:
 
+<!-- verify: {"id":"ffmpeg-rtmp","stream":"ffmpeg","video":1,"audio":1} -->
 ```sh
 ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 \
   -c copy -f flv rtmp://127.0.0.1:1935/live/ffmpeg
@@ -206,6 +228,7 @@ ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 \
 
 MPEG-TS over SRT:
 
+<!-- verify: {"id":"ffmpeg-srt","stream":"ffmpeg","video":1,"audio":1} -->
 ```sh
 ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts \
   'srt://127.0.0.1:9000?mode=caller&streamid=publish:live/ffmpeg&pkt_size=1316'
@@ -219,6 +242,7 @@ The stream ID selects the resource and supplies an admission credential. It is s
 
 RTMP from live test sources:
 
+<!-- verify: {"id":"gstreamer-rtmp","stream":"synthetic","video":1,"audio":1} -->
 ```sh
 gst-launch-1.0 -e \
   videotestsrc is-live=true ! video/x-raw,width=640,height=360,framerate=30/1 \
@@ -232,6 +256,7 @@ gst-launch-1.0 -e \
 
 MPEG-TS over SRT:
 
+<!-- verify: {"id":"gstreamer-srt","stream":"gstreamer","video":1,"audio":1} -->
 ```sh
 gst-launch-1.0 -e filesrc location=input.mp4 ! qtdemux name=d \
   d.video_0 ! queue ! h264parse ! mux. \
@@ -299,6 +324,7 @@ Separate stream IDs remain separate streams; Rushls does not merge independent p
 
 For example, publish two video sizes and one audio track over SRT:
 
+<!-- verify: {"id":"ladder-srt","stream":"ladder","video":2,"audio":1} -->
 ```sh
 ffmpeg -re -i input.mp4 \
   -filter_complex '[0:v]split=2[hi][lo];[lo]scale=320:180[small]' \
@@ -320,7 +346,8 @@ RTMP `onCaption` and `onTextData` messages create a WebVTT rendition when discov
 Late messages cannot create a new subtitle track.
 Embedded CEA-608/708 captions in H.264/HEVC stay in the video; they are not an automatic WebVTT conversion path.
 Standalone `.srt` or `.vtt` uploads and MPEG-TS subtitle PIDs are not supported ingest paths.
-See [caption details](docs/publishing.md#captions-and-subtitles).
+For a runnable RTMP subtitle example, see [gst-captions publishing](docs/publishing.md#publish-captions-with-gst-captions).
+The [gst-captions](https://github.com/darfink/gst-captions) plugin adds timed text or live transcription as RTMP caption messages.
 
 ## Playback and latency
 
@@ -554,6 +581,10 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 python3 -m unittest discover -s tools -p 'test_*.py'
 ```
+
+CI [extracts and runs the tagged publishing examples](docs/ci-validation.md#executable-documentation) from this README and the publishing guide.
+It checks each audio/video rendition and verifies the caption sample in served WebVTT.
+Configuration examples also pass through the real loader and resolver.
 
 External media, browser, and Apple checks require additional tools.
 See [CI validation](docs/ci-validation.md), [load validation](docs/load-validation.md), and [architecture](docs/architecture.md).

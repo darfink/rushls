@@ -7,6 +7,7 @@ Rust toolchain installation uses a composite action, with no JavaScript runtime.
 
 | Job | Checks | Prerequisites |
 | --- | --- | --- |
+| Validate documentation examples | Commands extracted from README/publishing guide, all advertised A/V renditions decoded, caption text verified in WebVTT | FFmpeg, GStreamer, pinned model-free gst-captions plugin |
 | Validate code | Workspace tests, all features, Clippy, formatting, Python unit tests | Rust and Python |
 | Validate media | Ignored decoder tests, recording, RTMP ingest, video GAP fixture export | FFmpeg, including AudioToolbox AAC |
 | Validate Chrome playback (patched hls.js) | Patched-player unit tests; live control and GAP streams, rendition switches, completion; official-release compatibility | Chrome, matching ChromeDriver, Node.js 24, pinned hls.js source and patch |
@@ -343,3 +344,37 @@ The clean control decoded 600 video buffers and reached end-of-stream.
 Chrome's required patched-player check continues to cover GAP playback.
 
 Native binary packaging also runs on pull requests. See [tagged releases](releases.md) for the publication gates and archive checks.
+
+## Executable documentation
+
+The `Validate documentation examples` job runs on pull requests, main pushes, and version tags.
+It blocks image publication and therefore tagged release publication.
+`tools/check-doc-examples.py` reads shell fences immediately after `<!-- verify: {...} -->` markers in the README and publishing guide.
+The marker names the example, stream, expected rendition counts, and optional language/text assertions.
+The fixture command also comes from the publishing guide.
+
+The runner substitutes free loopback ports and unique stream names, then executes the extracted shell text.
+It does not maintain a second copy of the publishing commands.
+Each advertised audio/video rendition must decode real media; an empty decoder exit does not pass.
+The caption case additionally requires the expected text in a served WebVTT segment.
+Missing expected renditions, wrong languages, publisher errors, missing caption text, and timeouts fail the job.
+
+The caption plugin uses revision `8fbeda5a33ddc8fbd9a90ba1219bee3e288919ca` with only its `flvmux` feature.
+It requires no speech model or transcription service. Update the workflow and publishing guide together when changing that revision.
+The job uploads the extracted commands, tool versions, publisher/decoder logs, playlists, caption output, and JSON results.
+A compact result table also appears in the GitHub job summary.
+
+Run locally after building Rushls and installing the publishing prerequisites:
+
+```sh
+python3 tools/check-doc-examples.py
+python3 tools/check-doc-examples.py --case captions --output target/caption-example
+```
+
+`GST_PLUGIN_PATH` must include the built caption plugin. FFmpeg must support SRT and multitrack FLV.
+CI runs all tagged cases; `--case` is for local diagnosis.
+The existing Rust configuration test extracts and resolves every TOML fence from the README and both operator guides.
+
+This job does not execute administrative installation commands, remote deployment snippets, OBS UI instructions, or speech transcription.
+MoQ's native recipe has separate recorded local validation; it is not part of this documentation job.
+These coverage boundaries do not imply that every code fence in the repository runs in CI.
