@@ -85,7 +85,8 @@ Archives are not yet signed or notarized. SHA-256 checksums detect corruption; t
 
 The required Chrome test uses a pinned hls.js 1.7.3 source build with a local pending-part correction.
 The official release runs as a separate informational check.
-The failure also occurs in the clean control with valid media, during rendition switching and the live-to-ENDLIST transition.
+The confirmed failure occurs in the clean control with valid media, with rendition switching followed by the live-to-ENDLIST transition.
+This combined reproduction does not establish that either operation alone requires the patch.
 It is not limited to invalid publisher input or GAP recovery.
 
 The intent is to upstream this correction. It has not yet been submitted or released upstream.

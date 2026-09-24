@@ -8,7 +8,9 @@ The patch changes upstream source and unit tests. It has not been submitted upst
 ## Problem and proposed correction
 
 During live playback, a parent fragment can appear buffered while some of its parts remain unloaded.
-After an ENDLIST update or a rendition switch, the player can skip these parts and stop before the stream ends.
+The confirmed playback reproduction combines rendition switching with a later ENDLIST update.
+The player skips pending parts and stops before the stream ends.
+That reproduction does not establish that either transition alone causes the same playback failure.
 
 The correction checks pending non-GAP parts before advancing to another parent fragment.
 It preserves loaded-part state across ENDLIST updates and uses actual buffer bounds when marking a parent complete.

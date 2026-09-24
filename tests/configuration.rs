@@ -60,3 +60,78 @@ fn print_config_example_obeys_argument_boundaries() -> Result<(), Box<dyn std::e
     assert!(String::from_utf8(help.stdout)?.contains("--print-config-example"));
     Ok(())
 }
+
+#[tokio::test]
+async fn readme_and_operator_guide_toml_examples_resolve() -> Result<(), Box<dyn std::error::Error>>
+{
+    use rushls::server::config::AppConfig;
+    use std::{ffi::OsString, fs};
+
+    // Replace deployment resources only. Keep field names, durations, capacities,
+    // claims, and protocol choices unchanged so documentation drift fails here.
+    fn resources(value: &mut toml::Value, root: &std::path::Path) {
+        if let toml::Value::Table(table) = value {
+            for (key, value) in table {
+                let file = match key.as_str() {
+                    "cert" => Some("cert.pem"),
+                    "key" => Some("key.pem"),
+                    "signing_secret_file" => Some("signing"),
+                    "token_file" | "passphrase_file" => Some("token"),
+                    "dir" => Some("storage"),
+                    _ => None,
+                };
+                if let Some(file) = file {
+                    *value = toml::Value::String(root.join(file).to_string_lossy().into_owned());
+                } else {
+                    resources(value, root);
+                }
+            }
+        }
+    }
+
+    let directory = std::env::temp_dir().join(format!("rushls-docs-{}", uuid::Uuid::now_v7()));
+    fs::create_dir_all(&directory)?;
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
+    fs::write(directory.join("cert.pem"), certified.cert.pem())?;
+    fs::write(
+        directory.join("key.pem"),
+        certified.signing_key.serialize_pem(),
+    )?;
+    fs::write(directory.join("token"), "documentation-test-token")?;
+    fs::write(
+        directory.join("signing"),
+        format!("whsec_{}", "YWFh".repeat(12)),
+    )?;
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut count = 0;
+        for (name, text) in [
+            ("README.md", include_str!("../README.md")),
+            ("docs/publishing.md", include_str!("../docs/publishing.md")),
+            ("docs/deployment.md", include_str!("../docs/deployment.md")),
+        ] {
+            let text = text.replace("\r\n", "\n");
+            for (index, block) in text.split("```toml\n").skip(1).enumerate() {
+                let source = block.split_once("```").ok_or("unclosed TOML fence")?.0;
+                let mut document: toml::Value = toml::from_str(source)?;
+                resources(&mut document, &directory);
+                let path = directory.join("example.toml");
+                fs::write(&path, toml::to_string(&document)?)?;
+                AppConfig::load_and_resolve_from(
+                    [
+                        OsString::from("rushls"),
+                        OsString::from("--config"),
+                        path.into_os_string(),
+                    ],
+                    [],
+                )
+                .map_err(|error| format!("{name} TOML example {}: {error}", index + 1))?;
+                count += 1;
+            }
+        }
+        assert!(count > 0, "expected the operator configuration examples");
+        Ok(())
+    })();
+    fs::remove_dir_all(directory)?;
+    result
+}

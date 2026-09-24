@@ -87,8 +87,8 @@ See [timestamp failures](timestamp-failures.md) for retention and rejection repo
 
 ## Playback compatibility
 
-GAP handling is active in production; no internal activation switch remains.
-Playlists omit blanket segment-independence claims because resumed audio or video can depend on earlier media.
+Permissive GAP handling is available through `accept.strict = false`.
+If a permissive policy is configured, playlists omit blanket segment-independence claims because resumed media can depend on earlier media.
 Part independence flags still describe individual parts.
 Omitting the playlist tag departs from Apple’s video-playlist authoring requirement. The validator report retains this explicit exception.
 

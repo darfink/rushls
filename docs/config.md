@@ -71,7 +71,7 @@ order the pipeline runs in.
 
 ## Listeners
 
-RTMP and HTTP binds default to dual-stack `[::]`. SRT is IPv4-only
+RTMP and HTTP compiled defaults bind to `0.0.0.0`; explicit `[::]` binds are also supported. SRT is IPv4-only
 (`0.0.0.0`) because ingest uses `rsrt`, which has no IPv6 listener yet.
 MOQ (`[moq] listen`) is **off** until an operator turns it on: WebTransport
 needs a certificate, and the compiled default must boot without one. The usual
