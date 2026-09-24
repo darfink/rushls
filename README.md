@@ -1,4 +1,4 @@
-<h1 align="center"><img src="docs/assets/rushls.svg" alt="Rushls" width="480"></h1>
+<h1 align="center"><img src="docs/assets/rushls.svg" alt="Rushls" width="600"></h1>
 <p align="center"><strong>One focus: excellent HLS.</strong></p>
 <p align="center">
   <a href="https://github.com/darfink/rushls/actions/workflows/ci.yaml"><img src="https://github.com/darfink/rushls/actions/workflows/ci.yaml/badge.svg" alt="Build and validation"></a>
