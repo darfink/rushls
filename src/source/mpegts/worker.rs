@@ -29,7 +29,7 @@ pub enum WorkerEvent {
 
 pub struct QueuedPacket {
     packet: Packet,
-    _permit: Option<PayloadPermit>,
+    _permit: PayloadPermit,
 }
 
 impl QueuedPacket {
@@ -128,7 +128,12 @@ async fn run(
     let _read_charge = match control
         .budget
         .as_ref()
-        .map(|budget| budget.try_reserve(config.read_buffer_size.get(), "demux"))
+        .map(|budget| {
+            budget.try_reserve(
+                config.read_buffer_size.get(),
+                crate::domain::Stage::MpegTsRead,
+            )
+        })
         .transpose()
     {
         Ok(charge) => charge,
@@ -222,12 +227,11 @@ async fn pump(
     terminal: Option<InputState>,
     output: &mpsc::Sender<WorkerEvent>,
 ) {
-    let budget = io
-        .builder
-        .budget
-        .is_none()
-        .then(|| PayloadBudget::new(queued_payload_bytes));
-    if !emit_prefetch(io.builder, budget.as_ref(), output).await {
+    // The queue permit waits; the shared pipeline budget does not. Keeping
+    // both makes a slow session throttle the reader instead of exhausting
+    // the publisher's memory with queued packets.
+    let budget = PayloadBudget::new(queued_payload_bytes);
+    if !emit_prefetch(io.builder, &budget, output).await {
         return;
     }
     if let Some(state) = terminal {
@@ -240,7 +244,7 @@ async fn pump(
             ReadOutcome::Bytes(bytes) => {
                 io.demux.feed(bytes);
                 if let Err(error) =
-                    emit_live(io.builder, io.demux, input_limits, budget.as_ref(), output).await
+                    emit_live(io.builder, io.demux, input_limits, &budget, output).await
                 {
                     let _ = output.send(WorkerEvent::Error(error)).await;
                     return;
@@ -249,7 +253,7 @@ async fn pump(
             ReadOutcome::End(state) => {
                 io.demux.finish();
                 if let Err(error) =
-                    emit_live(io.builder, io.demux, input_limits, budget.as_ref(), output).await
+                    emit_live(io.builder, io.demux, input_limits, &budget, output).await
                 {
                     let _ = output.send(WorkerEvent::Error(error)).await;
                     return;
@@ -603,7 +607,7 @@ impl CatalogBuilder {
 
 async fn emit_prefetch(
     builder: &mut CatalogBuilder,
-    budget: Option<&Arc<PayloadBudget>>,
+    budget: &Arc<PayloadBudget>,
     output: &mpsc::Sender<WorkerEvent>,
 ) -> bool {
     while let Some(packet) = builder.prefetch.pop_front() {
@@ -618,7 +622,7 @@ async fn emit_live(
     builder: &mut CatalogBuilder,
     demux: &mut StreamingTsDemux,
     limits: InputLimits,
-    budget: Option<&Arc<PayloadBudget>>,
+    budget: &Arc<PayloadBudget>,
     output: &mpsc::Sender<WorkerEvent>,
 ) -> Result<(), SourceError> {
     builder.drain(demux, limits, false)?;
@@ -632,13 +636,10 @@ async fn emit_live(
 
 async fn send_packet(
     packet: Packet,
-    budget: Option<&Arc<PayloadBudget>>,
+    budget: &Arc<PayloadBudget>,
     output: &mpsc::Sender<WorkerEvent>,
 ) -> bool {
-    let permit = match budget {
-        Some(budget) => Some(budget.reserve(packet.retained_payload_bytes()).await),
-        None => None,
-    };
+    let permit = budget.reserve(packet.retained_payload_bytes()).await;
     output
         .send(WorkerEvent::Packet(QueuedPacket {
             packet,

@@ -28,6 +28,7 @@ pub(super) fn build_track(
     plan: TrackSegmentationPlan,
     boundary_allowance: Duration,
     events: EventSink,
+    budget: crate::domain::PipelineBudget,
 ) -> Result<(PackagedRendition, Box<dyn TrackPackager>), MuxError> {
     if track.kind() == MediaKind::Subtitle {
         return Err(invalid("subtitle tracks require WebVTT output"));
@@ -38,7 +39,7 @@ pub(super) fn build_track(
             track.id
         )));
     }
-    let output = CmafOutput::open(track).map_err(|error| invalid(error.to_string()))?;
+    let output = CmafOutput::open(track, budget).map_err(|error| invalid(error.to_string()))?;
     let rendition = packaged_rendition(rendition_id, track, &plan, boundary_allowance)?;
     let packager = CmafTrack::new(
         rendition_id,
@@ -137,6 +138,9 @@ struct PendingSample {
     dts: TickTimestamp,
     presented_pts: TickTimestamp,
     duration: TickDuration,
+    /// Output memory reserved when the sample was accepted; `None` for
+    /// timing-only tracks, which serialize nothing.
+    charge: Option<crate::domain::Reservation>,
 }
 
 /// CMAF packaging state for one track.
@@ -150,7 +154,6 @@ struct CmafTrack {
     boundary_allowance: Duration,
     partitioner: crate::segment::cutter::PartPartitioner,
     pending: VecDeque<PendingSample>,
-    pending_bytes: usize,
     partition_clock: crate::segment::cutter::PartClock,
     segment: SegmentCursor,
     fragment: Option<OpenFragment>,
@@ -182,7 +185,6 @@ impl CmafTrack {
             boundary_allowance,
             partitioner: crate::segment::cutter::PartPartitioner::new(plan.part_duration.get()),
             pending: VecDeque::new(),
-            pending_bytes: 0,
             partition_clock: crate::segment::cutter::PartClock::new(
                 track.kind(),
                 plan.segmentation_origin_pts
@@ -204,8 +206,15 @@ impl CmafTrack {
     fn push(
         &mut self,
         sample: &NormalizedMedia,
+        charge: Option<crate::domain::Reservation>,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
+        if self.output.is_some() && charge.is_none() {
+            return Err(mux_error(format!(
+                "{} accepted a sample without reserving its output",
+                self.track_id
+            )));
+        }
         if self.last_dts.is_none() && self.kind == MediaKind::Video && !sample.random_access() {
             return Err(MuxError::Boundary {
                 track: self.track_id,
@@ -258,13 +267,13 @@ impl CmafTrack {
             self.write_pending(count)?;
             self.flush_fragment(out)?;
         }
-        self.pending_bytes = self.pending_bytes.saturating_add(sample.retained_bytes());
         self.pending.push_back(PendingSample {
             sample: sample.clone(),
             pts,
             dts,
             presented_pts,
             duration: presented.duration,
+            charge,
         });
         Ok(())
     }
@@ -342,7 +351,6 @@ impl CmafTrack {
                 .pending
                 .pop_front()
                 .expect("partition counts match the sample queue");
-            self.pending_bytes -= pending.sample.retained_bytes();
             if pending.duration > 0 {
                 self.open_or_extend_fragment(
                     &pending.sample,
@@ -353,7 +361,10 @@ impl CmafTrack {
             // Fully primed units still initialize the decoder, but contribute
             // no presentation duration to the part.
             if let Some(output) = &mut self.output {
-                output.write(&pending.sample, pending.pts, pending.dts);
+                let charge = pending
+                    .charge
+                    .expect("serializing tracks reserve every accepted sample");
+                output.write(&pending.sample, pending.pts, pending.dts, charge);
             }
         }
         Ok(())
@@ -562,8 +573,8 @@ impl CmafTrack {
 }
 
 impl TrackPackager for CmafTrack {
-    fn buffered(&self) -> (usize, usize) {
-        (self.pending_bytes, self.pending.len())
+    fn buffered(&self) -> usize {
+        self.pending.len()
     }
 
     fn cut(
@@ -613,10 +624,40 @@ impl TrackPackager for CmafTrack {
         sample: NormalizedMedia,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError> {
+        let charge = self.reserve(&sample)?;
+        self.push_reserved(sample, charge, out)
+    }
+
+    fn reserve(
+        &self,
+        sample: &NormalizedMedia,
+    ) -> Result<Option<crate::domain::Reservation>, MuxError> {
+        // Gaps publish no bytes, and timing-only tracks serialize nothing.
+        if matches!(sample, NormalizedMedia::Gap(_)) {
+            return Ok(None);
+        }
+        let Some(output) = &self.output else {
+            return Ok(None);
+        };
+        output
+            .reserve(sample.payload_len())
+            .map(Some)
+            .map_err(|source| MuxError::Memory {
+                track: self.track_id,
+                source,
+            })
+    }
+
+    fn push_reserved(
+        &mut self,
+        sample: NormalizedMedia,
+        charge: Option<crate::domain::Reservation>,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
         if let NormalizedMedia::Gap(gap) = sample {
             return self.gap(gap, out);
         }
-        CmafTrack::push(self, &sample, out)
+        CmafTrack::push(self, &sample, charge, out)
     }
 
     fn finish(
@@ -641,7 +682,6 @@ impl TrackPackager for CmafTrack {
             }
         }
         self.pending.clear();
-        self.pending_bytes = 0;
         if let Some(output) = &mut self.output {
             output.finalize();
         }
@@ -992,6 +1032,7 @@ mod tests {
                 segmentation: &segmentation,
                 time_anchor: SystemTime::UNIX_EPOCH,
                 events,
+                budget: &crate::domain::PipelineBudget::unlimited(),
             })
             .expect("the fixture CMAF output starts")
     }
@@ -1000,6 +1041,20 @@ mod tests {
         policy: SegmentBoundaryPolicy,
         timebase: Timebase,
         events: &crate::observe::EventSink,
+    ) -> Result<crate::mux::StartedMuxer, crate::mux::MuxError> {
+        start_with_budget(
+            policy,
+            timebase,
+            events,
+            &crate::domain::PipelineBudget::unlimited(),
+        )
+    }
+
+    fn start_with_budget(
+        policy: SegmentBoundaryPolicy,
+        timebase: Timebase,
+        events: &crate::observe::EventSink,
+        budget: &crate::domain::PipelineBudget,
     ) -> Result<crate::mux::StartedMuxer, crate::mux::MuxError> {
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
             .expect("fixture presentation validates");
@@ -1014,7 +1069,51 @@ mod tests {
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,
             events,
+            budget,
         })
+    }
+
+    /// Draining at finish writes and flushes every accepted sample. Their
+    /// output was reserved on acceptance, so a full budget cannot stop it.
+    #[test]
+    fn accepted_samples_drain_after_the_budget_fills() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::domain::{PipelineBudget, Stage};
+        let budget = PipelineBudget::with_reserve(1024 * 1024, 256 * 1024);
+        let mut started = start_with_budget(
+            SegmentBoundaryPolicy::Strict,
+            Timebase::new(nz::u32!(1), nz::u32!(16_384)),
+            &discarded_events(),
+            &budget,
+        )?;
+        let mut media = Vec::new();
+        started.muxer.push(sample(0, true), &mut media)?;
+        assert!(
+            media.is_empty(),
+            "the sample is still held for partitioning"
+        );
+
+        // The rest of the pipeline takes everything, reserve included.
+        let filler = budget.try_reserve(budget.limit() - budget.used(), Stage::MuxOutput)?;
+        let full = budget.used();
+        let next = i64::try_from(FRAME)?;
+        assert!(matches!(
+            started.muxer.push(sample(next, false), &mut media),
+            Err(crate::mux::MuxError::Memory { .. })
+        ));
+
+        started
+            .muxer
+            .finish(crate::mux::FinishReason::Final, &mut media)?;
+        assert!(
+            media
+                .iter()
+                .any(|item| matches!(item, PackagedMedia::Chunk(_))),
+            "the accepted sample was published"
+        );
+        assert!(budget.used() <= full, "draining never grows usage");
+        drop((media, filler, started));
+        assert_eq!(budget.used(), 0);
+        Ok(())
     }
 
     fn start_audio(
@@ -2147,6 +2246,7 @@ mod tests {
                 segmentation: &segmentation,
                 time_anchor: SystemTime::UNIX_EPOCH,
                 events: &sink,
+                budget: &crate::domain::PipelineBudget::unlimited(),
             })
             .expect("presentation packages");
         let mut media = Vec::new();
@@ -2333,6 +2433,7 @@ mod tests {
                     samples[0].pts(),
                 )]),
                 limits: crate::segment::PrerollLimits::permissive(),
+                budget: &crate::domain::PipelineBudget::unlimited(),
                 policy: crate::segment::SegmentationPolicy::latency_first(
                     Duration::from_secs(2),
                     Duration::from_millis(500),
@@ -2629,9 +2730,12 @@ mod tests {
         assert_eq!((presented.start, presented.duration), (312, 648));
 
         assert_opus_part_cadence(&fixture)?;
-        let mut output = super::output::CmafOutput::open(track).expect("Opus output opens");
+        let mut output =
+            super::output::CmafOutput::open(track, crate::domain::PipelineBudget::unlimited())
+                .expect("Opus output opens");
         for sample in &fixture.samples {
-            output.write(sample, sample.pts() - 312, sample.pts() - 312);
+            let charge = output.reserve(sample.payload_len())?;
+            output.write(sample, sample.pts() - 312, sample.pts() - 312, charge);
         }
         let init = output.flush_fragment().expect("Opus init");
         assert_eq!(edit_list(&init), [(0, 312)]);
@@ -2659,6 +2763,31 @@ mod tests {
         );
         assert_eq!(demuxed.tracks[0].samples.len(), PACKETS);
         assert_eq!(demuxed.tracks[0].samples[0].duration, Some(960));
+        // The roll `sbgp` is framed into `traf` by hand, so the mdat offset
+        // must account for it or every packet would be read shifted.
+        for (demuxed, sample) in demuxed.tracks[0].samples.iter().zip(&fixture.samples) {
+            let NormalizedMedia::Audio(sample) = sample else {
+                panic!("audio sample")
+            };
+            assert_eq!(demuxed.data.as_ref(), sample.payload.as_bytes());
+        }
+        let mut remaining = media.as_bytes();
+        let mut groups = 0;
+        while !remaining.is_empty() {
+            let (atom, size) = transmux::parse_box(remaining)?;
+            if atom.header.box_type.is(b"moof") {
+                for child in transmux::box_iter(atom.body) {
+                    let (child, _) = child?;
+                    if child.header.box_type.is(b"traf") {
+                        for grandchild in transmux::box_iter(child.body) {
+                            groups += usize::from(grandchild?.0.header.box_type.is(b"sbgp"));
+                        }
+                    }
+                }
+            }
+            remaining = &remaining[size..];
+        }
+        assert!(groups > 0, "Opus fragments carry roll groups");
         Ok(())
     }
 
@@ -3034,6 +3163,7 @@ mod tests {
                 segmentation: &segmentation,
                 time_anchor: SystemTime::UNIX_EPOCH,
                 events: &sink,
+                budget: &crate::domain::PipelineBudget::unlimited(),
             })
             .expect("mixed CMAF and WebVTT presentation starts");
         assert_eq!(
@@ -3751,6 +3881,7 @@ mod boundary_accounting_tests {
             plan,
             Duration::ZERO,
             events,
+            crate::domain::PipelineBudget::unlimited(),
         )?;
         let mut out = Vec::new();
         writer.push(
@@ -3867,6 +3998,7 @@ mod gap_tests {
                             plan,
                             Duration::ZERO,
                             events.clone(),
+                            crate::domain::PipelineBudget::unlimited(),
                         )
                         .map(|(_, writer)| writer)
                     })

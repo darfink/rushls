@@ -125,7 +125,7 @@ impl NormalizedMedia {
             Self::Subtitle(sample) => &mut sample.payload,
             Self::Gap(_) => return Ok(()),
         };
-        payload.account(budget, overhead, "normalization")
+        payload.account(budget, overhead, crate::domain::Stage::Normalization)
     }
 
     /// What holding this sample in a buffer actually costs.

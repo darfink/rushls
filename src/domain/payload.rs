@@ -1,4 +1,4 @@
-use super::{BudgetExceeded, PipelineBudget, Reservation};
+use super::{BudgetExceeded, PipelineBudget, Reservation, Stage};
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -11,7 +11,16 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Default)]
 pub struct Payload {
     data: Bytes,
-    charge: Option<Arc<Reservation>>,
+    charge: Option<Arc<Lease>>,
+}
+
+/// A shared allocation charge plus the charging owner's own overhead. The
+/// allocation may be shared with other owners (slices of one slab); the
+/// overhead belongs to this owner and its clones only.
+#[derive(Debug)]
+struct Lease {
+    allocation: Arc<Reservation>,
+    _overhead: Option<Reservation>,
 }
 
 // Resource ownership is not part of media identity.
@@ -24,7 +33,7 @@ impl Eq for Payload {}
 
 struct ChargedBytes {
     data: Bytes,
-    _charge: Arc<Reservation>,
+    _charge: Arc<Lease>,
 }
 impl AsRef<[u8]> for ChargedBytes {
     fn as_ref(&self) -> &[u8] {
@@ -67,21 +76,34 @@ impl Payload {
     }
 
     pub fn budget(&self) -> Option<&PipelineBudget> {
-        self.charge.as_ref().map(|charge| charge.budget())
+        self.charge
+            .as_ref()
+            .map(|charge| charge.allocation.budget())
     }
 
     /// Admit a dependency-produced payload before retaining it. Dependency
     /// allocation itself is separately bounded; this cannot retroactively
     /// meter a backing allocation hidden behind a sliced `Bytes`.
+    ///
+    /// `overhead` is charged even when the backing allocation already has a
+    /// lease, because each owner's metadata is a distinct allocation.
     pub fn account(
         &mut self,
         budget: &PipelineBudget,
         overhead: usize,
-        stage: &'static str,
+        stage: Stage,
     ) -> Result<(), BudgetExceeded> {
-        if self.charge.is_none() {
-            self.charge = Some(budget.charge_bytes(&self.data, overhead, stage)?);
+        if self.charge.is_some() {
+            return Ok(());
         }
+        let overhead = (overhead > 0)
+            .then(|| budget.try_reserve(overhead, stage))
+            .transpose()?;
+        let allocation = budget.charge_bytes(&self.data, stage)?;
+        self.charge = Some(Arc::new(Lease {
+            allocation,
+            _overhead: overhead,
+        }));
         Ok(())
     }
 
@@ -91,10 +113,13 @@ impl Payload {
     }
 
     pub fn reserved_bytes(data: Bytes, reservation: Reservation) -> Self {
-        let charge = reservation.budget().clone().register(&data, reservation);
+        let allocation = reservation.budget().clone().register(&data, reservation);
         Self {
             data,
-            charge: Some(charge),
+            charge: Some(Arc::new(Lease {
+                allocation,
+                _overhead: None,
+            })),
         }
     }
 
@@ -127,7 +152,7 @@ mod tests {
     fn raw_slices_keep_the_reservation_alive() -> Result<(), BudgetExceeded> {
         let budget = PipelineBudget::new(1024);
         let mut payload = Payload::from(vec![0; 1024]);
-        payload.account(&budget, 0, "source")?;
+        payload.account(&budget, 0, Stage::Demux)?;
         let slice = payload.bytes().slice(..1);
         drop(payload);
         assert_eq!(budget.used(), 1024);
@@ -157,7 +182,7 @@ mod tests {
             budget: budget.clone(),
         });
         let mut payload = Payload::from_bytes(data);
-        payload.account(&budget, 0, "demux")?;
+        payload.account(&budget, 0, Stage::Demux)?;
         drop(payload);
         assert_eq!(budget.used(), 0);
         Ok(())
@@ -166,9 +191,9 @@ mod tests {
     #[test]
     fn adapter_slices_reuse_the_transport_allocation_charge() -> Result<(), BudgetExceeded> {
         let budget = PipelineBudget::new(1024);
-        let slab = Payload::reserved(vec![1; 1024], budget.try_reserve(1024, "RTMP receive")?);
+        let slab = Payload::reserved(vec![1; 1024], budget.try_reserve(1024, Stage::RtmpReceive)?);
         let mut packet = Payload::from_bytes(slab.bytes().slice(100..200));
-        packet.account(&budget, 0, "demux")?;
+        packet.account(&budget, 0, Stage::Demux)?;
         assert_eq!(budget.used(), 1024);
         assert_eq!(budget.origins(), [1024, 0, 0, 0, 0]);
         drop(slab);
@@ -179,10 +204,27 @@ mod tests {
     }
 
     #[test]
+    fn reused_allocation_leases_still_charge_owner_overhead() -> Result<(), BudgetExceeded> {
+        let budget = PipelineBudget::new(4096);
+        let slab = Payload::reserved(vec![1; 1024], budget.try_reserve(1024, Stage::RtmpReceive)?);
+        let mut first = Payload::from_bytes(slab.bytes().slice(0..100));
+        let mut second = Payload::from_bytes(slab.bytes().slice(100..200));
+        first.account(&budget, 64, Stage::Demux)?;
+        second.account(&budget, 64, Stage::Demux)?;
+        // One slab charge, plus each packet's own overhead.
+        assert_eq!(budget.used(), 1024 + 128);
+        drop((slab, first));
+        assert_eq!(budget.used(), 1024 + 64);
+        drop(second);
+        assert_eq!(budget.used(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn delivery_does_not_release_other_pipeline_references() -> Result<(), BudgetExceeded> {
         let budget = PipelineBudget::new(128);
         let mut payload = Payload::from(vec![1; 128]);
-        payload.account(&budget, 0, "mux")?;
+        payload.account(&budget, 0, Stage::MuxOutput)?;
         let alias = payload.clone();
         let stored = payload.into_retained();
         assert_eq!(budget.used(), 128);

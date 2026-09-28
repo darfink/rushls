@@ -351,13 +351,15 @@ pub struct MeterSnapshot {
     pub pacing_delay: Duration,
     pub publisher_backpressured: bool,
     /// Configured accounted-allocation limit, excluding uninstrumented native
-    /// buffers and process overhead. This is not an RSS ceiling.
+    /// buffers and process overhead. This is not an RSS ceiling. Zero when the
+    /// publisher budget is unlimited.
     pub pipeline_bytes: u64,
     pub pipeline_used_bytes: u64,
     pub pipeline_peak_bytes: u64,
     pub pipeline_failures: u64,
-    pub pipeline_working_bytes: u64,
-    pub pipeline_origins: [u64; 5],
+    /// Part of `pipeline_bytes` that only output stages may use.
+    pub pipeline_reserve_bytes: u64,
+    pub pipeline_origins: [u64; crate::domain::Origin::ALL.len()],
 }
 
 // Declared apart from the storage above because the storage is not a plain
@@ -410,14 +412,15 @@ series! {
             = |snapshot: &MeterSnapshot| snapshot.publisher_backpressured,
         Gauge("rushls_session_pipeline_capacity_bytes",
             "Bytes one publisher may hold before the store, which \
-             `memory_per_stream` does not cover.")
+             `memory.per_stream` does not cover; 0 when unlimited.")
             = |snapshot: &MeterSnapshot| snapshot.pipeline_bytes,
         Gauge("rushls_session_pipeline_used_bytes", "Current accounted pipeline bytes.")
             = |snapshot: &MeterSnapshot| snapshot.pipeline_used_bytes,
         Gauge("rushls_session_pipeline_peak_bytes", "Peak accounted pipeline bytes.")
             = |snapshot: &MeterSnapshot| snapshot.pipeline_peak_bytes,
-        Gauge("rushls_session_pipeline_working_bytes", "Current temporary serialization reservations within the pipeline total.")
-            = |snapshot: &MeterSnapshot| snapshot.pipeline_working_bytes,
+        Gauge("rushls_session_pipeline_reserve_bytes",
+            "Part of the pipeline capacity kept for finishing in-flight output.")
+            = |snapshot: &MeterSnapshot| snapshot.pipeline_reserve_bytes,
         Counter("rushls_session_pipeline_exhaustions_total", "Failed pipeline memory reservations.")
             = |snapshot: &MeterSnapshot| snapshot.pipeline_failures,
     }
@@ -466,6 +469,11 @@ impl SessionMeters {
         &self.counters.tracks
     }
 
+    /// The publisher's shared pipeline budget.
+    pub fn budget(&self) -> &crate::domain::PipelineBudget {
+        &self.counters.budget
+    }
+
     pub fn source_view(&self) -> Arc<dyn SourceMeters> {
         Arc::clone(&self.counters) as Arc<dyn SourceMeters>
     }
@@ -506,11 +514,16 @@ impl SessionMeters {
             media_lead: Duration::from_nanos(get(&counters.media_lead_nanos)),
             pacing_delay: Duration::from_nanos(get(&counters.pacing_delay_nanos)),
             publisher_backpressured: counters.publisher_backpressured.load(Ordering::Relaxed),
-            pipeline_bytes: counters.budget.limit() as u64,
+            pipeline_bytes: if counters.budget.is_unlimited() {
+                0
+            } else {
+                counters.budget.limit() as u64
+            },
             pipeline_used_bytes: counters.budget.used() as u64,
             pipeline_peak_bytes: counters.budget.peak() as u64,
             pipeline_failures: counters.budget.failures() as u64,
-            pipeline_working_bytes: counters.budget.working() as u64,
+            pipeline_reserve_bytes: (counters.budget.limit() - counters.budget.ordinary_limit())
+                as u64,
             pipeline_origins: counters.budget.origins(),
         }
     }

@@ -98,6 +98,7 @@ pub(super) fn build_track(
     track: &DiscoveredTrack,
     plan: TrackSegmentationPlan,
     events: EventSink,
+    budget: crate::domain::PipelineBudget,
 ) -> Result<(PackagedRendition, Box<dyn TrackPackager>), MuxError> {
     if track.kind() != MediaKind::Subtitle {
         return Err(invalid("WebVTT output requires a subtitle track"));
@@ -122,7 +123,7 @@ pub(super) fn build_track(
     }
 
     let rendition = packaged_rendition(rendition_id, track, &plan);
-    let packager = WebVttTrack::new(rendition_id, track, dialect, plan, events)?;
+    let packager = WebVttTrack::new(rendition_id, track, dialect, plan, events, budget)?;
     Ok((rendition, Box::new(packager)))
 }
 
@@ -162,7 +163,7 @@ fn packaged_rendition(
 }
 
 struct WebVttTrack {
-    budget: Option<crate::domain::PipelineBudget>,
+    budget: crate::domain::PipelineBudget,
     rendition_id: PackagingRenditionId,
     track_id: TrackId,
     dialect: CueDialect,
@@ -200,6 +201,7 @@ impl WebVttTrack {
         dialect: CueDialect,
         plan: TrackSegmentationPlan,
         events: EventSink,
+        budget: crate::domain::PipelineBudget,
     ) -> Result<Self, MuxError> {
         let origin = plan
             .segmentation_origin_pts
@@ -228,7 +230,7 @@ impl WebVttTrack {
         }
 
         Ok(Self {
-            budget: track.codec_extradata.budget().cloned(),
+            budget,
             rendition_id,
             track_id: track.id,
             dialect,
@@ -399,22 +401,20 @@ impl WebVttTrack {
         // Escaping text can expand one input byte into several output bytes.
         // Charge the rendered copy separately from its source payload.
         self.budget
-            .as_ref()
-            .map(|budget| {
-                budget
-                    .try_reserve(
-                        sample
-                            .payload
-                            .len()
-                            .saturating_mul(6)
-                            .saturating_add(sample.webvtt.retained_bytes())
-                            .saturating_add(std::mem::size_of::<Cue>()),
-                        "subtitle cues",
-                    )
-                    .map(Arc::new)
+            .try_reserve(
+                sample
+                    .payload
+                    .len()
+                    .saturating_mul(6)
+                    .saturating_add(sample.webvtt.retained_bytes())
+                    .saturating_add(std::mem::size_of::<Cue>()),
+                crate::domain::Stage::SubtitleCues,
+            )
+            .map(|charge| Some(Arc::new(charge)))
+            .map_err(|source| MuxError::Memory {
+                track: self.track_id,
+                source,
             })
-            .transpose()
-            .map_err(|error| mux_error(error.to_string()))
     }
 
     fn render_cue(&self, sample: &SubtitleSample, start: TickTimestamp) -> Result<Cue, MuxError> {
@@ -738,10 +738,11 @@ impl WebVttTrack {
         }
         let charge = self
             .budget
-            .as_ref()
-            .map(|budget| budget.try_reserve(bound, "subtitle output"))
-            .transpose()
-            .map_err(|error| mux_error(error.to_string()))?;
+            .try_reserve(bound, crate::domain::Stage::SubtitleOutput)
+            .map_err(|source| MuxError::Memory {
+                track: self.track_id,
+                source,
+            })?;
         let milliseconds = TimebaseProjection::new(
             self.plan.timebase,
             Timebase::new(nz::u32!(1), nz::u32!(1_000)),
@@ -786,10 +787,7 @@ impl WebVttTrack {
         if body.len() > bound {
             return Err(mux_error("subtitle output exceeded its reserved bound"));
         }
-        Ok(match charge {
-            Some(charge) => Payload::reserved(body.into_bytes(), charge),
-            None => Payload::from(body.into_bytes()),
-        })
+        Ok(Payload::reserved(body.into_bytes(), charge))
     }
 
     /// Where one part of `window` begins and how long it runs.
@@ -988,9 +986,6 @@ impl TrackPackager for WebVttTrack {
                 self.track_id
             )));
         };
-        if self.budget.is_none() {
-            self.budget = sample.payload.budget().cloned();
-        }
         // Held only when the cue actually lacks an end. A codec that may omit
         // one can still supply it, and a supplied span is the publisher's
         // statement about its own cue: overriding it with a successor's start
@@ -1303,6 +1298,7 @@ mod tests {
             dialect,
             plan(segment_seconds),
             events,
+            crate::domain::PipelineBudget::unlimited(),
         )
         .expect("fixture mux starts")
     }
@@ -1338,6 +1334,7 @@ mod tests {
             dialect,
             plan_with_parts(segment_seconds, part_seconds),
             events,
+            crate::domain::PipelineBudget::unlimited(),
         )
         .expect("fixture mux starts")
     }

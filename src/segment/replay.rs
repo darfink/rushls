@@ -13,6 +13,7 @@ pub fn admit(
     plan: &mut SegmentationPlan,
     samples: &[NormalizedMedia],
     policy: SegmentationPolicy,
+    budget: &crate::domain::PipelineBudget,
     work: &mut usize,
 ) -> Result<(), PrerollError> {
     for track in plan.iter() {
@@ -35,7 +36,7 @@ pub fn admit(
         if *work > 1_000_000 {
             return Err(PrerollError::LimitExceeded);
         }
-        match mux::validate_timing(presentation, plan, samples) {
+        match mux::validate_timing(presentation, plan, samples, budget) {
             Ok(()) => return Ok(()),
             Err(MuxError::Part { track, .. }) => {
                 let index = plan
@@ -85,7 +86,7 @@ pub fn admit(
                     }
                     plan.tracks[index].part_duration =
                         NonZero::new(ceiling).ok_or(CadenceError::InvalidPolicy)?;
-                    match mux::validate_timing(presentation, plan, samples) {
+                    match mux::validate_timing(presentation, plan, samples, budget) {
                         Err(MuxError::Part { track: failed, .. }) if failed == track => {}
                         _ => {
                             found = true;
@@ -96,6 +97,14 @@ pub fn admit(
                 if !found {
                     return Err(CadenceError::InconsistentPartCadence(track).into());
                 }
+            }
+            // Replaying held samples to test a candidate is part of pre-roll's
+            // cost, so report exhaustion there as pre-roll's.
+            Err(MuxError::Memory { source, .. }) => {
+                return Err(PrerollError::Memory {
+                    samples: samples.len(),
+                    source,
+                });
             }
             Err(error) => return Err(PrerollError::Packaging(error)),
         }

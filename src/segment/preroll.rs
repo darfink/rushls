@@ -21,6 +21,8 @@ pub struct PrerollRequest<'a> {
     pub timeline: &'a TimelineCalibration,
     pub limits: PrerollLimits,
     pub policy: SegmentationPolicy,
+    /// The publisher's budget, charged by candidate replays that render text.
+    pub budget: &'a crate::domain::PipelineBudget,
 }
 
 #[derive(Debug)]
@@ -53,12 +55,12 @@ pub async fn run(
         timeline,
         limits,
         policy,
+        budget,
     } = request;
 
     let mut observer = CadenceObserver::new(presentation, timeline, policy)?;
     let horizons = media_horizons(timeline, limits)?;
     let mut buffered = Vec::with_capacity(INITIAL_BUFFER_SAMPLES);
-    let mut buffered_bytes = 0_usize;
     let deadline = Instant::now() + limits.maximum_wall_time;
     let mut work = 0_usize;
 
@@ -69,6 +71,7 @@ pub async fn run(
             &buffered,
             policy,
             limits,
+            budget,
             &mut work,
         )? {
             return Ok(lock(segmentation, buffered, InputState::Open, events));
@@ -87,21 +90,23 @@ pub async fn run(
         let observed_from = buffered.len();
         let state = timeout(remaining, source.next_batch(&mut buffered))
             .await
-            .map_err(|_| PrerollError::LimitExceeded)??;
+            .map_err(|_| PrerollError::LimitExceeded)?
+            .map_err(|error| match error {
+                crate::media::MediaError::Source(crate::source::SourceError::Memory(source)) => {
+                    PrerollError::Memory {
+                        samples: buffered.len(),
+                        source,
+                    }
+                }
+                error => error.into(),
+            })?;
 
         // The buffer was lent out as an `Appender`, so it can only have grown
         // and this range always exists. That is the whole payoff of the narrower
         // type: no length check, and nothing to do if one failed.
         let retained = buffered.len();
         for sample in &buffered[observed_from..] {
-            admit(
-                &mut observer,
-                &horizons,
-                &mut buffered_bytes,
-                retained,
-                limits,
-                sample,
-            )?;
+            admit(&mut observer, &horizons, retained, limits, sample)?;
         }
 
         if !state.is_open() {
@@ -114,6 +119,7 @@ pub async fn run(
                 &buffered,
                 policy,
                 limits,
+                budget,
                 &mut work,
             )?
             else {
@@ -161,7 +167,6 @@ fn media_horizons(
 fn admit(
     observer: &mut CadenceObserver,
     horizons: &[MediaHorizon],
-    buffered_bytes: &mut usize,
     retained: usize,
     limits: PrerollLimits,
     sample: &NormalizedMedia,
@@ -183,18 +188,7 @@ fn admit(
         return Err(PrerollError::LimitExceeded);
     }
 
-    // Charged at full retained cost rather than payload size. An input of empty
-    // access units would otherwise buffer forever: it advances neither the byte
-    // budget nor, if its durations are zero, the media horizon.
-    let total = buffered_bytes
-        .checked_add(sample.retained_bytes())
-        .ok_or(PrerollError::LimitExceeded)?;
-    if total > limits.maximum_buffered_bytes {
-        return Err(PrerollError::LimitExceeded);
-    }
-
     observer.observe(sample)?;
-    *buffered_bytes = total;
     Ok(())
 }
 
@@ -205,6 +199,7 @@ fn select(
     buffered: &[NormalizedMedia],
     policy: SegmentationPolicy,
     limits: PrerollLimits,
+    budget: &crate::domain::PipelineBudget,
     work: &mut usize,
 ) -> Result<Option<SegmentationPlan>, PrerollError> {
     let mut selected = None;
@@ -213,7 +208,15 @@ fn select(
         segmentation.early_boundary = policy.early_boundary;
         segmentation.late_boundary = policy.late_boundary;
         segmentation.limits = limits;
-        match super::replay::admit(presentation, &mut segmentation, buffered, policy, work) {
+        let admitted = super::replay::admit(
+            presentation,
+            &mut segmentation,
+            buffered,
+            policy,
+            budget,
+            work,
+        );
+        match admitted {
             Ok(()) => {
                 selected = Some(segmentation);
                 return Ok(true);
@@ -317,19 +320,9 @@ mod tests {
         SegmentationPolicy::latency_first(Duration::from_secs(10), Duration::from_secs(1))
     }
 
-    /// A byte budget expressed as room for `slots` single-byte samples.
-    ///
-    /// Written this way because the budget is charged at retained cost, so a
-    /// raw byte count would encode `size_of::<NormalizedMedia>()` into every
-    /// expectation and break whenever a field is added.
-    fn budget(slots: usize) -> usize {
-        slots * (size_of::<NormalizedMedia>() + 1)
-    }
-
-    fn limits(slots: usize, maximum_media_duration: Duration) -> PrerollLimits {
+    fn limits(samples: usize, maximum_media_duration: Duration) -> PrerollLimits {
         PrerollLimits {
-            maximum_buffered_bytes: budget(slots),
-            maximum_buffered_samples: usize::MAX,
+            maximum_buffered_samples: samples,
             maximum_wall_time: Duration::from_secs(1),
             maximum_media_duration,
         }
@@ -348,6 +341,7 @@ mod tests {
                 presentation: &presentation,
                 timeline: &timeline,
                 limits,
+                budget: &crate::domain::PipelineBudget::unlimited(),
                 policy: policy(),
             },
             events,
@@ -432,6 +426,7 @@ mod tests {
                 presentation: &presentation(),
                 timeline: &calibrated,
                 limits: limits(64, Duration::from_secs(30)),
+                budget: &crate::domain::PipelineBudget::unlimited(),
                 policy: policy(),
             },
             &sink(),
@@ -459,21 +454,50 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn rejects_when_buffered_bytes_exceed_the_limit() {
-        let mut source = SampleBatches::new(vec![vec![sample(8, true, 3)]]);
+    /// Hands over one batch, then reports that publisher memory ran out.
+    struct ExhaustedAfterFirstBatch(Option<Vec<NormalizedMedia>>);
 
-        let error = preroll(&mut source, limits(1, Duration::from_secs(20)), &sink())
-            .await
-            .expect_err("byte limit rejects pre-roll");
-
-        assert_eq!(error, PrerollError::LimitExceeded);
+    impl SampleSource for ExhaustedAfterFirstBatch {
+        fn next_batch<'a>(
+            &'a mut self,
+            out: &'a mut dyn Appender<NormalizedMedia>,
+        ) -> BoxFuture<'a, Result<InputState, MediaError>> {
+            Box::pin(async move {
+                if let Some(batch) = self.0.take() {
+                    for sample in batch {
+                        out.push(sample);
+                    }
+                    return Ok(InputState::Open);
+                }
+                let exhausted = crate::domain::PipelineBudget::new(0)
+                    .try_reserve(1, crate::domain::Stage::Demux)
+                    .expect_err("an empty budget has no room");
+                Err(crate::source::SourceError::Memory(exhausted).into())
+            })
+        }
     }
 
     #[tokio::test]
-    async fn empty_access_units_are_charged_for_the_room_they_occupy() {
-        // Zero-length payloads that never advance the clock: under a budget
-        // charged on payload size alone, this buffers until the node dies.
+    async fn memory_exhaustion_while_waiting_is_attributed_to_preroll() {
+        // Two keyframes a second apart never satisfy the ten-second cadence,
+        // so pre-roll is still holding both when memory runs out.
+        let mut source =
+            ExhaustedAfterFirstBatch(Some(vec![sample(0, true, 1), sample(1, false, 1)]));
+
+        let error = preroll(&mut source, limits(1_000, Duration::from_secs(20)), &sink())
+            .await
+            .expect_err("exhausted memory ends pre-roll");
+
+        assert!(
+            matches!(error, PrerollError::Memory { samples: 2, .. }),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_access_units_are_bounded_by_the_sample_count() {
+        // Zero-length payloads that never advance the clock: neither bytes nor
+        // media duration would stop this, so the sample count must.
         let mut source = SampleBatches::new(vec![
             (0..64)
                 .map(|_| crate::media::fixtures::video_sample(0, 0, false, 0))
@@ -638,14 +662,9 @@ mod admission_tests {
                 }
             }
             samples.extend((0..193).map(|frame| fixtures::audio_sample(3, frame * 1024, 1024)));
-            samples.sort_by_key(|sample| {
-                sample.pts()
-                    * if sample.track_id() == TrackId(3) {
-                        15
-                    } else {
-                        8
-                    }
-            });
+            // Interleave by wall time: 48 kHz audio ticks are 15/8 of 90 kHz video ticks.
+            let scale = |track| if track == TrackId(3) { 15 } else { 8 };
+            samples.sort_by_key(|sample| sample.pts() * scale(sample.track_id()));
             // Exercise streaming admission rather than only the EOF path.
             let batches = samples.chunks(17).map(<[_]>::to_vec).collect();
             let result = run(
@@ -654,6 +673,7 @@ mod admission_tests {
                     presentation: &presentation,
                     timeline: &timeline,
                     limits: PrerollLimits::permissive(),
+                    budget: &crate::domain::PipelineBudget::unlimited(),
                     policy: SegmentationPolicy::latency_first(
                         Duration::from_secs(2),
                         Duration::from_secs(1),
@@ -706,6 +726,7 @@ mod admission_tests {
                     presentation: &presentation,
                     timeline: &timeline,
                     limits: PrerollLimits::permissive(),
+                    budget: &crate::domain::PipelineBudget::unlimited(),
                     policy,
                 },
                 &events,
@@ -746,6 +767,7 @@ mod admission_tests {
                 presentation: &presentation,
                 timeline: &timeline,
                 limits: PrerollLimits::permissive(),
+                budget: &crate::domain::PipelineBudget::unlimited(),
                 policy,
             },
             &events,
@@ -779,6 +801,7 @@ mod admission_tests {
                 presentation: &presentation,
                 timeline: &timeline,
                 limits: PrerollLimits::permissive(),
+                budget: &crate::domain::PipelineBudget::unlimited(),
                 policy,
             },
             &events,
@@ -817,6 +840,7 @@ mod admission_tests {
                 presentation: &presentation,
                 timeline: &timeline,
                 limits: PrerollLimits::permissive(),
+                budget: &crate::domain::PipelineBudget::unlimited(),
                 policy,
             },
             &crate::mux::fixtures::discarded_events(),
@@ -836,6 +860,7 @@ mod admission_tests {
                 &admitted.buffered,
                 policy,
                 PrerollLimits::permissive(),
+                &crate::domain::PipelineBudget::unlimited(),
                 &mut 999_999
             ),
             Err(PrerollError::LimitExceeded)
@@ -876,6 +901,7 @@ mod admission_tests {
                     presentation: &presentation,
                     timeline: &timeline,
                     limits: PrerollLimits::permissive(),
+                    budget: &crate::domain::PipelineBudget::unlimited(),
                     policy: SegmentationPolicy::latency_first(
                         Duration::from_secs(6),
                         Duration::from_secs(1),
@@ -972,6 +998,7 @@ mod admission_tests {
                     presentation: &presentation,
                     timeline: &timeline,
                     limits: PrerollLimits::permissive(),
+                    budget: &crate::domain::PipelineBudget::unlimited(),
                     policy,
                 },
                 &crate::mux::fixtures::discarded_events(),
@@ -998,6 +1025,7 @@ mod admission_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One end-to-end path: admission, CMAF, and storage.
     async fn repaired_vfr_parts_pass_admission_cmaf_and_hls_storage()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::{
@@ -1044,6 +1072,7 @@ mod admission_tests {
                 presentation: &presentation,
                 timeline: &timeline,
                 limits: PrerollLimits::permissive(),
+                budget: &crate::domain::PipelineBudget::unlimited(),
                 policy,
             },
             &events,
@@ -1063,6 +1092,7 @@ mod admission_tests {
                 presentation: &presentation,
                 timeline: &timeline,
                 limits: PrerollLimits::permissive(),
+                budget: &crate::domain::PipelineBudget::unlimited(),
                 policy,
             },
             &events,
@@ -1079,6 +1109,7 @@ mod admission_tests {
             segmentation: &admitted.segmentation,
             time_anchor: std::time::SystemTime::UNIX_EPOCH,
             events: &events,
+            budget: &crate::domain::PipelineBudget::unlimited(),
         })?;
         let store = StreamStore::default();
         let stream = StreamId::new("repair");

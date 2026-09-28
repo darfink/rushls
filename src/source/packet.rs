@@ -53,7 +53,7 @@ impl Packet {
             self.payload.account(
                 budget,
                 std::mem::size_of::<Self>().saturating_add(self.webvtt.retained_bytes()),
-                "demux",
+                crate::domain::Stage::Demux,
             )?;
         }
         Ok(())

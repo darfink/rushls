@@ -520,7 +520,7 @@ fn render_sessions(output: &mut String, sessions: &[SessionSnapshot]) {
     );
     for session in sessions {
         let labels = session_labels(session);
-        for (origin, bytes) in crate::domain::PipelineBudget::ORIGINS
+        for (origin, bytes) in crate::domain::Origin::ALL
             .iter()
             .zip(session.meters.pipeline_origins)
         {

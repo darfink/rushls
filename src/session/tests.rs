@@ -45,6 +45,8 @@ const SECOND: i64 = 90_000;
 
 type CallLog = Arc<Mutex<Vec<&'static str>>>;
 type FinishLog = Arc<Mutex<Vec<FinishReason>>>;
+/// Captures the session's pipeline budget so tests can check it drains.
+type BudgetProbe = Arc<Mutex<Option<crate::domain::PipelineBudget>>>;
 
 /// Ways a collaborator can misbehave, so the spine's response can be tested
 /// rather than reasoned about.
@@ -186,6 +188,7 @@ struct FakePending {
     batches: Vec<Vec<Packet>>,
     ending: Ending,
     panics_after: Option<u32>,
+    budget_probe: Option<BudgetProbe>,
 }
 
 impl PendingPublish for FakePending {
@@ -212,6 +215,9 @@ impl PendingPublish for FakePending {
         meters: Arc<dyn SourceMeters>,
     ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
         record(&self.log, "accept");
+        if let Some(probe) = &self.budget_probe {
+            *probe.lock() = meters.pipeline_budget().cloned();
+        }
         Box::pin(async move {
             Ok(AcceptedPublish {
                 source: Box::new(FakeSource {
@@ -601,7 +607,7 @@ fn scripted_batches() -> Vec<Vec<Packet>> {
 
 fn config() -> SessionConfig {
     SessionConfig {
-        memory_per_publisher: crate::domain::PipelineBudget::DEFAULT_LIMIT,
+        memory_per_publisher: Some(crate::domain::PipelineBudget::DEFAULT_LIMIT),
         maximum_admission_time: Duration::from_secs(5),
         discovery: DiscoveryLimits {
             maximum_probe_bytes: 1_048_576,
@@ -609,7 +615,6 @@ fn config() -> SessionConfig {
         },
         input: InputLimits::permissive(),
         preroll: PrerollLimits {
-            maximum_buffered_bytes: 8_388_608,
             maximum_buffered_samples: 4_096,
             maximum_wall_time: Duration::from_secs(5),
             maximum_media_duration: Duration::from_secs(30),
@@ -640,6 +645,7 @@ struct Harness {
     meters: ProcessMeters,
     sessions: Registry,
     panics_after: Option<u32>,
+    budget_probe: BudgetProbe,
 }
 
 impl Harness {
@@ -684,6 +690,7 @@ impl Harness {
             meters,
             sessions,
             panics_after: faults.source_panics_after,
+            budget_probe: BudgetProbe::default(),
         }
     }
 
@@ -706,6 +713,7 @@ impl Harness {
             batches: scripted_batches(),
             ending,
             panics_after: self.panics_after,
+            budget_probe: Some(self.budget_probe.clone()),
         })
     }
 
@@ -1773,6 +1781,7 @@ async fn backward_video_timestamps_fail_before_the_offending_sample_is_published
         ],
         ending: Ending::Eof,
         panics_after: None,
+        budget_probe: None,
     });
     let error = run_session(
         pending,
@@ -1837,6 +1846,7 @@ async fn timestamp_failures_report_once_during_preroll_and_live()
             batches,
             ending: Ending::Eof,
             panics_after: None,
+            budget_probe: None,
         });
         let error = run_session(
             pending,
@@ -1974,6 +1984,7 @@ async fn audio_repairs_report_during_preroll_and_live_and_survive_a_failing_batc
             batches,
             ending: Ending::Eof,
             panics_after: None,
+            budget_probe: None,
         });
         let error = run_session(
             Box::new(pending),
@@ -2084,6 +2095,7 @@ async fn input_modes_report_cadence_holes_through_sessions()
                 batches,
                 ending: Ending::Eof,
                 panics_after: None,
+                budget_probe: None,
             });
             let outcome = run_session(
                 pending,
@@ -2187,6 +2199,7 @@ async fn audio_gaps_publish_during_preroll_and_live_then_report_clean_recovery()
             batches,
             ending: Ending::Eof,
             panics_after: None,
+            budget_probe: None,
         });
         run_session(
             Box::new(pending),
@@ -2261,6 +2274,7 @@ async fn video_gap_notices_survive_later_batch_failure_in_preroll_and_live()
             ],
             ending: Ending::Eof,
             panics_after: None,
+            budget_probe: None,
         };
         let error = run_session(
             Box::new(pending),
@@ -2328,7 +2342,7 @@ async fn exhausted_publisher_memory_fails_without_waiting_for_another_keyframe()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = Harness::healthy();
     let mut configuration = config();
-    configuration.memory_per_publisher = 1;
+    configuration.memory_per_publisher = Some(1);
     let outcome = tokio::time::timeout(
         Duration::from_secs(1),
         harness.run_with(Ending::Eof, &configuration),
@@ -2341,5 +2355,22 @@ async fn exhausted_publisher_memory_fails_without_waiting_for_another_keyframe()
     );
     assert_eq!(harness.services.meters.snapshot().sessions_failed, 1);
     assert_eq!(harness.services.meters.snapshot().pipeline_exhaustions, 1);
+    Ok(())
+}
+
+/// Every lease taken while publishing must be released once the session has
+/// ended and its output has been handed to storage.
+#[tokio::test]
+async fn completed_session_returns_its_pipeline_budget() -> Result<(), Box<dyn std::error::Error>> {
+    let harness = Harness::healthy();
+    harness.run(Ending::Eof).await?;
+    let budget = harness
+        .budget_probe
+        .lock()
+        .clone()
+        .ok_or("the source saw the session budget")?;
+    assert!(budget.peak() > 0, "the session charged its media");
+    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.origins(), [0; crate::domain::Origin::ALL.len()]);
     Ok(())
 }

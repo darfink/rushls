@@ -1,5 +1,10 @@
 //! Shared publisher allocation accounting. Reservations never wait: retained
 //! media may need more input before it can release memory.
+//!
+//! A completion reserve sits above the ordinary ceiling. Only stages that turn
+//! held input into output may use it (see [`Stage::may_use_reserve`]), so
+//! ingress and preroll exhaust the ordinary allowance first while in-flight
+//! parts can still be finished and handed to storage.
 use std::sync::{
     Arc, Weak,
     atomic::{AtomicUsize, Ordering},
@@ -8,12 +13,80 @@ use std::sync::{
 #[derive(Clone, Debug)]
 pub struct PipelineBudget(Arc<State>);
 
+/// Where a reservation is requested. Error messages print the stage; metrics
+/// aggregate it into a coarser [`Origin`] so label cardinality stays fixed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
+pub enum Stage {
+    #[display("RTMP receive")]
+    RtmpReceive,
+    #[display("RTMP coalescing")]
+    RtmpCoalescing,
+    #[display("RTMP ingress")]
+    RtmpIngress,
+    #[display("MPEG-TS read")]
+    MpegTsRead,
+    #[display("demux")]
+    Demux,
+    #[display("normalization")]
+    Normalization,
+    #[display("mux output")]
+    MuxOutput,
+    #[display("subtitle cues")]
+    SubtitleCues,
+    #[display("subtitle output")]
+    SubtitleOutput,
+}
+
+impl Stage {
+    pub fn origin(self) -> Origin {
+        match self {
+            Self::RtmpReceive | Self::RtmpCoalescing | Self::RtmpIngress | Self::MpegTsRead => {
+                Origin::Transport
+            }
+            Self::Demux => Origin::Demux,
+            Self::Normalization => Origin::Normalization,
+            Self::MuxOutput => Origin::Mux,
+            Self::SubtitleCues | Self::SubtitleOutput => Origin::Subtitle,
+        }
+    }
+
+    /// Output reservations free their input once published. Letting them use
+    /// the completion reserve means a full pipeline can still drain.
+    pub fn may_use_reserve(self) -> bool {
+        matches!(self, Self::MuxOutput | Self::SubtitleOutput)
+    }
+}
+
+/// Metric attribution for accounted bytes. Discriminants index the counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
+pub enum Origin {
+    #[display("transport")]
+    Transport,
+    #[display("demux")]
+    Demux,
+    #[display("normalization")]
+    Normalization,
+    #[display("mux")]
+    Mux,
+    #[display("subtitle")]
+    Subtitle,
+}
+
+impl Origin {
+    pub const ALL: [Self; 5] = [
+        Self::Transport,
+        Self::Demux,
+        Self::Normalization,
+        Self::Mux,
+        Self::Subtitle,
+    ];
+}
+
 #[derive(Debug)]
 struct State {
     limit: usize,
-    working_allowance: usize,
-    working: AtomicUsize,
-    origins: [AtomicUsize; 5],
+    reserve: usize,
+    origins: [AtomicUsize; Origin::ALL.len()],
     used: AtomicUsize,
     peak: AtomicUsize,
     failures: AtomicUsize,
@@ -25,7 +98,7 @@ struct State {
     "pipeline memory exhausted in {stage}: requested {requested} bytes, using {used} of {limit} (reservation ceiling {ceiling})"
 )]
 pub struct BudgetExceeded {
-    pub stage: &'static str,
+    pub stage: Stage,
     pub requested: usize,
     pub used: usize,
     pub limit: usize,
@@ -42,25 +115,43 @@ pub struct Reservation {
     // Pin the backing bytes until the address index has been removed. Without
     // this, an allocator could reuse an address before the last lease drops.
     backing: Option<bytes::Bytes>,
-    working: bool,
-    origin: usize,
+    origin: Origin,
 }
 
 impl PipelineBudget {
-    pub const ORIGINS: [&'static str; 5] = ["transport", "demux", "mux", "subtitle", "other"];
     pub const MIN_LIMIT: usize = 64 * 1024 * 1024;
     pub const DEFAULT_LIMIT: usize = 128 * 1024 * 1024;
+    /// Largest completion reserve carved out of a publisher budget.
+    pub const MAX_RESERVE: usize = 16 * 1024 * 1024;
 
     pub fn new(limit: usize) -> Self {
-        Self::with_working_allowance(limit, 0)
+        Self::with_reserve(limit, 0)
     }
 
-    pub fn with_working_allowance(limit: usize, working_allowance: usize) -> Self {
-        assert!(working_allowance <= limit);
+    /// A publisher budget: one quarter of the limit, up to [`Self::MAX_RESERVE`],
+    /// is kept for finishing in-flight output. `None` means unlimited.
+    pub fn for_publisher(limit: Option<usize>) -> Self {
+        match limit {
+            Some(limit) => Self::with_reserve(limit, (limit / 4).min(Self::MAX_RESERVE)),
+            None => Self::unlimited(),
+        }
+    }
+
+    /// No ceiling, but still accounted, so usage and peak metrics stay useful
+    /// in trusted deployments that opt out of enforcement.
+    pub fn unlimited() -> Self {
+        Self::with_reserve(usize::MAX, 0)
+    }
+
+    pub fn is_unlimited(&self) -> bool {
+        self.0.limit == usize::MAX
+    }
+
+    pub fn with_reserve(limit: usize, reserve: usize) -> Self {
+        assert!(reserve <= limit);
         Self(Arc::new(State {
             limit,
-            working_allowance,
-            working: AtomicUsize::new(0),
+            reserve,
             origins: std::array::from_fn(|_| AtomicUsize::new(0)),
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -71,11 +162,12 @@ impl PipelineBudget {
 
     /// Recover an existing backing-allocation lease when an adapter emits a
     /// slice. Weak entries never extend the lifetime of media buffers.
+    /// Only the allocation is charged here; per-owner overhead must be
+    /// reserved separately so that it is also counted when a lease is reused.
     pub fn charge_bytes(
         &self,
         data: &bytes::Bytes,
-        overhead: usize,
-        stage: &'static str,
+        stage: Stage,
     ) -> Result<Arc<Reservation>, BudgetExceeded> {
         let address = data.as_ptr() as usize;
         let mut allocations = self.0.allocations.lock();
@@ -85,7 +177,7 @@ impl PipelineBudget {
         {
             return Ok(charge);
         }
-        let mut reservation = self.try_reserve(data.len().saturating_add(overhead), stage)?;
+        let mut reservation = self.try_reserve(data.len(), stage)?;
         // Empty buffers share sentinel addresses, so they must not be indexed.
         if !data.is_empty() {
             reservation.address = Some(address);
@@ -98,15 +190,13 @@ impl PipelineBudget {
         Ok(charge)
     }
 
-    pub fn origins(&self) -> [u64; 5] {
+    pub fn origins(&self) -> [u64; Origin::ALL.len()] {
         std::array::from_fn(|index| self.0.origins[index].load(Ordering::Relaxed) as u64)
     }
 
-    pub fn working(&self) -> usize {
-        self.0.working.load(Ordering::Relaxed)
-    }
-    pub fn retained_limit(&self) -> usize {
-        self.0.limit - self.0.working_allowance
+    /// Ceiling for stages that may not use the completion reserve.
+    pub fn ordinary_limit(&self) -> usize {
+        self.0.limit - self.0.reserve
     }
 
     pub fn register(&self, data: &bytes::Bytes, mut reservation: Reservation) -> Arc<Reservation> {
@@ -139,41 +229,12 @@ impl PipelineBudget {
 
     /// Reserve before allocation. Relaxed ordering suffices: the counter does
     /// not publish data, and ownership synchronizes the allocations themselves.
-    pub fn try_reserve(
-        &self,
-        bytes: usize,
-        stage: &'static str,
-    ) -> Result<Reservation, BudgetExceeded> {
-        self.reserve(bytes, stage, false)
-    }
-
-    /// Temporary copies may use protected headroom, but may never remain as
-    /// retained media without returning to the ordinary allowance.
-    pub fn try_reserve_working(
-        &self,
-        bytes: usize,
-        stage: &'static str,
-    ) -> Result<Reservation, BudgetExceeded> {
-        self.reserve(bytes, stage, true)
-    }
-
-    fn reserve(
-        &self,
-        bytes: usize,
-        stage: &'static str,
-        working: bool,
-    ) -> Result<Reservation, BudgetExceeded> {
-        let origin = match stage {
-            "RTMP receive" | "RTMP coalescing" | "rtmp ingress" => 0,
-            "demux" => 1,
-            "mux output" | "CMAF serialization" => 2,
-            "subtitle cues" | "subtitle output" => 3,
-            _ => 4,
-        };
-        let ceiling = if working {
+    pub fn try_reserve(&self, bytes: usize, stage: Stage) -> Result<Reservation, BudgetExceeded> {
+        let origin = stage.origin();
+        let ceiling = if stage.may_use_reserve() {
             self.limit()
         } else {
-            self.retained_limit()
+            self.ordinary_limit()
         };
         let mut used = self.used();
         loop {
@@ -195,16 +256,12 @@ impl PipelineBudget {
             ) {
                 Ok(_) => {
                     self.0.peak.fetch_max(next, Ordering::Relaxed);
-                    if working {
-                        self.0.working.fetch_add(bytes, Ordering::Relaxed);
-                    }
-                    self.0.origins[origin].fetch_add(bytes, Ordering::Relaxed);
+                    self.0.origins[origin as usize].fetch_add(bytes, Ordering::Relaxed);
                     return Ok(Reservation {
                         budget: self.clone(),
                         bytes,
                         address: None,
                         backing: None,
-                        working,
                         origin,
                     });
                 }
@@ -217,6 +274,25 @@ impl PipelineBudget {
 impl Reservation {
     pub fn budget(&self) -> &PipelineBudget {
         &self.budget
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Merge another unregistered charge into this one, so a charge can grow
+    /// sample by sample and later be split to an exact output size.
+    pub fn absorb(&mut self, mut other: Self) {
+        assert!(
+            Arc::ptr_eq(&self.budget.0, &other.budget.0),
+            "charges from different budgets cannot merge"
+        );
+        assert_eq!(self.origin, other.origin, "charges must share an origin");
+        assert!(
+            self.address.is_none() && other.address.is_none(),
+            "registered allocations cannot merge"
+        );
+        self.bytes += std::mem::take(&mut other.bytes);
     }
 
     /// Split a charge without a release/reacquire window.
@@ -233,7 +309,6 @@ impl Reservation {
             bytes,
             address: None,
             backing: None,
-            working: self.working,
             origin: self.origin,
         }
     }
@@ -253,13 +328,7 @@ impl Drop for Reservation {
         // Deregister before freeing the backing allocation, and release the
         // quota after freeing it. Both ordering constraints matter under reuse.
         drop(self.backing.take());
-        self.budget.0.origins[self.origin].fetch_sub(self.bytes, Ordering::Relaxed);
-        if self.working {
-            self.budget
-                .0
-                .working
-                .fetch_sub(self.bytes, Ordering::Relaxed);
-        }
+        self.budget.0.origins[self.origin as usize].fetch_sub(self.bytes, Ordering::Relaxed);
         self.budget.0.used.fetch_sub(self.bytes, Ordering::Relaxed);
     }
 }
@@ -270,13 +339,13 @@ mod tests {
     #[test]
     fn split_and_exhaustion() -> Result<(), BudgetExceeded> {
         let budget = PipelineBudget::new(100);
-        let mut first = budget.try_reserve(80, "preroll")?;
+        let mut first = budget.try_reserve(80, Stage::Demux)?;
         let second = first.split(30);
-        assert!(budget.try_reserve(21, "mux").is_err());
-        assert!(budget.try_reserve(usize::MAX, "mux").is_err());
+        assert!(budget.try_reserve(21, Stage::MuxOutput).is_err());
+        assert!(budget.try_reserve(usize::MAX, Stage::MuxOutput).is_err());
         drop(first);
         assert_eq!(budget.used(), 30);
-        let third = budget.try_reserve(70, "mux")?;
+        let third = budget.try_reserve(70, Stage::MuxOutput)?;
         assert_eq!(budget.peak(), 100);
         drop((second, third));
         assert_eq!(budget.used(), 0);
@@ -284,22 +353,35 @@ mod tests {
     }
 
     #[test]
-    fn stages_borrow_space_but_cannot_consume_working_headroom() -> Result<(), BudgetExceeded> {
-        let budget = PipelineBudget::with_working_allowance(128, 16);
-        let preroll = budget.try_reserve(96, "demux")?;
-        let output = budget.try_reserve(16, "mux output")?;
-        assert!(budget.try_reserve(1, "demux").is_err());
-        let working = budget.try_reserve_working(16, "CMAF serialization")?;
+    fn only_output_stages_may_use_the_completion_reserve() -> Result<(), BudgetExceeded> {
+        let budget = PipelineBudget::with_reserve(128, 16);
+        let preroll = budget.try_reserve(96, Stage::Demux)?;
+        let mut output = budget.try_reserve(16, Stage::MuxOutput)?;
+        // Input stages stop at the ordinary ceiling ...
+        assert!(budget.try_reserve(1, Stage::Demux).is_err());
+        // ... while output can still finish inside the reserve.
+        output.absorb(budget.try_reserve(16, Stage::MuxOutput)?);
+        assert_eq!(output.bytes(), 32);
         assert_eq!(budget.used(), 128);
-        assert_eq!(budget.working(), 16);
-        assert_eq!(budget.origins(), [0, 96, 32, 0, 0]);
-        assert!(budget.try_reserve_working(1, "CMAF serialization").is_err());
-        drop((working, preroll));
-        let borrowed = budget.try_reserve(96, "mux output")?;
-        assert_eq!(budget.used(), 112);
-        drop((output, borrowed));
+        assert_eq!(budget.origins(), [0, 96, 0, 32, 0]);
+        assert!(budget.try_reserve(1, Stage::MuxOutput).is_err());
+        let retained = output.split(20);
+        drop((output, preroll));
+        assert_eq!(budget.used(), 20);
+        drop(retained);
         assert_eq!(budget.used(), 0);
         assert_eq!(budget.origins(), [0; 5]);
+        Ok(())
+    }
+
+    #[test]
+    fn unlimited_budgets_still_account() -> Result<(), BudgetExceeded> {
+        let budget = PipelineBudget::for_publisher(None);
+        assert!(budget.is_unlimited());
+        let charge = budget.try_reserve(usize::MAX / 2, Stage::Demux)?;
+        assert_eq!(budget.peak(), usize::MAX / 2);
+        drop(charge);
+        assert_eq!(budget.used(), 0);
         Ok(())
     }
 
@@ -309,7 +391,7 @@ mod tests {
         let task_budget = budget.clone();
         let (ready, started) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let _charge = task_budget.try_reserve(100, "demux")?;
+            let _charge = task_budget.try_reserve(100, Stage::Demux)?;
             let _ = ready.send(());
             std::future::pending::<()>().await;
             Ok::<_, BudgetExceeded>(())
@@ -317,7 +399,7 @@ mod tests {
         started.await?;
         assert_eq!(budget.used(), 100);
         let other_publisher = PipelineBudget::new(100);
-        let independent = other_publisher.try_reserve(100, "demux")?;
+        let independent = other_publisher.try_reserve(100, Stage::Demux)?;
         task.abort();
         assert!(task.await.expect_err("task was cancelled").is_cancelled());
         assert_eq!(budget.used(), 0);
@@ -334,7 +416,7 @@ mod tests {
                 let budget = &budget;
                 scope.spawn(move || {
                     for _ in 0..1000 {
-                        if let Ok(permit) = budget.try_reserve(30, "test") {
+                        if let Ok(permit) = budget.try_reserve(30, Stage::Demux) {
                             assert!(budget.used() <= 100);
                             std::thread::yield_now();
                             drop(permit);

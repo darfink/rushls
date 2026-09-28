@@ -1063,7 +1063,7 @@ impl PipelineAppConfig {
                 "pipeline.memory_per_publisher must be at least 64MiB to fit a maximum-sized packet and serialization copies",
             ));
         }
-        node.session.memory_per_publisher = bytes;
+        node.session.memory_per_publisher = Some(bytes);
         Ok(())
     }
 }

@@ -38,9 +38,17 @@ use crate::{
 /// correctly is refused on the same footing as one that fails the handshake;
 /// keeping the bytes as opaque instead only defers the failure to a layer with
 /// less context, turning a protocol error into a packaging error. This is
-/// separate from `[accept]`, which decides *which* codecs are admitted rather
+/// separate from `[publish]`, which decides *which* codecs are admitted rather
 /// than whether the framing is well-formed at all.
 const ENHANCED_VALIDATION: EnhancedValidationMode = EnhancedValidationMode::Strict;
+/// Bytes requested per socket read. Once a publication is admitted each read
+/// gets a fresh, separately charged slab, so no slab outlives its slices.
+const READ_SLAB: usize = 16 * 1024;
+/// Single-segment messages below this size are copied out of their slab. A
+/// retained audio frame or caption would otherwise pin, and be charged for,
+/// a whole slab for as long as preroll or a GOP holds it. Larger messages
+/// are sliced in place; their worst-case amplification is 4x.
+const COMPACT_BELOW: usize = READ_SLAB / 4;
 
 /// Socket deadlines owned by the RTMP transport, independent of protocol state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -335,27 +343,41 @@ struct MediaHandler {
 impl MediaHandler {
     fn coalesce(&self, data: rtmpx::Payload) -> Result<Bytes, Box<str>> {
         use rtmpx::Segments;
-        if data.segment_count() <= 1 {
+        let Some(budget) = &self.budget else {
+            // Before admission there is no budget. `into_bytes` copies only
+            // when the message spans several segments.
+            return Ok(data.into_bytes());
+        };
+        let single = data.segment_count() <= 1;
+        if single && data.len() >= COMPACT_BELOW {
             return self.account(data.into_bytes());
         }
-        let charge = self
-            .budget
-            .as_ref()
-            .map(|budget| budget.try_reserve(data.len(), "RTMP coalescing"))
-            .transpose()
+        // Multi-segment messages need a contiguous copy anyway; small ones are
+        // compacted. Either way, charge before allocating the copy.
+        let charge = budget
+            .try_reserve(
+                data.len()
+                    .saturating_add(std::mem::size_of::<IngressEvent>()),
+                crate::domain::Stage::RtmpCoalescing,
+            )
             .map_err(|error| error.to_string().into_boxed_str())?;
-        let bytes = data.into_bytes();
-        Ok(match charge {
-            Some(charge) => crate::domain::Payload::reserved_bytes(bytes, charge).into_bytes(),
-            None => bytes,
-        })
+        let bytes = if single {
+            Bytes::copy_from_slice(&data.into_bytes())
+        } else {
+            data.into_bytes()
+        };
+        Ok(crate::domain::Payload::reserved_bytes(bytes, charge).into_bytes())
     }
 
     fn account(&self, bytes: Bytes) -> Result<Bytes, Box<str>> {
         let mut payload = crate::domain::Payload::from_bytes(bytes);
         if let Some(budget) = &self.budget {
             payload
-                .account(budget, std::mem::size_of::<IngressEvent>(), "rtmp ingress")
+                .account(
+                    budget,
+                    std::mem::size_of::<IngressEvent>(),
+                    crate::domain::Stage::RtmpIngress,
+                )
                 .map_err(|error| error.to_string().into_boxed_str())?;
         }
         Ok(payload.into_bytes())
@@ -553,11 +575,11 @@ where
         let read_charge = handler
             .budget
             .as_ref()
-            .map(|budget| budget.try_reserve(16 * 1024, "RTMP receive"))
+            .map(|budget| budget.try_reserve(READ_SLAB, crate::domain::Stage::RtmpReceive))
             .transpose()
             .map_err(|error| error.to_string().into_boxed_str())?;
-        buffer.reserve(16 * 1024);
-        let read = async { (&mut io).take(16 * 1024).read_buf(&mut buffer).await };
+        buffer.reserve(READ_SLAB);
+        let read = async { (&mut io).take(READ_SLAB as u64).read_buf(&mut buffer).await };
         let count = match config.timeouts.session_read {
             Some(duration) => tokio::time::timeout(duration, read)
                 .await
@@ -1189,6 +1211,36 @@ mod tests {
             other => panic!("expected script event, got {other:?}"),
         }
         handler.on_unpublish(stream_id).expect("clean unpublish");
+    }
+
+    #[tokio::test]
+    async fn small_messages_are_compacted_out_of_their_read_slab()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::domain::{Payload, PipelineBudget, Stage};
+        let budget = PipelineBudget::new(PipelineBudget::MIN_LIMIT);
+        let (mut handler, _attempt, _reader) = handler(nz::usize!(64 * 1024), 32 * 1024);
+        handler.budget = Some(budget.clone());
+        let slab = Payload::reserved(
+            vec![7; READ_SLAB],
+            budget.try_reserve(READ_SLAB, Stage::RtmpReceive)?,
+        )
+        .into_bytes();
+        let small = handler
+            .coalesce(rtmpx::Payload::from(slab.slice(0..100)))
+            .map_err(String::from)?;
+        let large = handler
+            .coalesce(rtmpx::Payload::from(slab.slice(100..100 + COMPACT_BELOW)))
+            .map_err(String::from)?;
+        drop(slab);
+        let overhead = std::mem::size_of::<IngressEvent>();
+        // The large message still shares the slab; the small one owns a copy.
+        assert_eq!(budget.used(), READ_SLAB + overhead + 100 + overhead);
+        drop(large);
+        assert_eq!(budget.used(), 100 + overhead);
+        assert_eq!(small.as_ref(), &[7; 100]);
+        drop(small);
+        assert_eq!(budget.used(), 0);
+        Ok(())
     }
 
     #[tokio::test]

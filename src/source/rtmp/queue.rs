@@ -70,7 +70,7 @@ struct State {
 }
 
 struct Shared {
-    capacity: std::sync::atomic::AtomicUsize,
+    capacity: usize,
     state: Mutex<State>,
     readable: Notify,
     writable: Notify,
@@ -86,7 +86,7 @@ pub struct IngressWriter {
 
 pub fn channel(capacity: NonZeroUsize) -> (IngressReader, IngressWriter) {
     let shared = Arc::new(Shared {
-        capacity: std::sync::atomic::AtomicUsize::new(capacity.get()),
+        capacity: capacity.get(),
         state: Mutex::new(State {
             events: VecDeque::new(),
             queued_bytes: 0,
@@ -128,10 +128,9 @@ impl Drop for IngressWriter {
 impl IngressWriter {
     pub async fn send(&self, event: IngressEvent) -> Result<(), IngressSendError> {
         let required = event.queued_bytes();
-        let capacity = self
-            .shared
-            .capacity
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // Memory accounting fails fast, so this byte bound is what turns a
+        // publisher outrunning the pipeline into TCP backpressure instead.
+        let capacity = self.shared.capacity;
         if required > capacity {
             return Err(IngressSendError::TooLarge { required, capacity });
         }
@@ -179,12 +178,6 @@ impl IngressWriter {
 }
 
 impl IngressReader {
-    pub fn use_shared_budget(&self, budget: &crate::domain::PipelineBudget) {
-        self.shared
-            .capacity
-            .store(budget.limit(), std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub async fn recv(&mut self) -> IngressEvent {
         loop {
             let notified = self.shared.readable.notified();

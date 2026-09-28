@@ -97,6 +97,34 @@ fn a_segment_erased_by_the_subtitle_suffix_is_refused_at_parse() -> Result {
     Ok(())
 }
 
+/// Recording has its own byte budget. Buffering an open segment must not
+/// also hold the publisher's pipeline charge, or a slow disk would end the
+/// publication instead of just losing the recording.
+#[tokio::test]
+async fn recorded_media_releases_the_pipeline_budget() -> Result {
+    use crate::domain::{PipelineBudget, Stage};
+    let temp = Temp::new();
+    let recorder = Recorder::start(&temp.config(), Events::default(), ProcessMeters::default())?;
+    let mut publisher =
+        factory(recorder.clone()).start(&StreamId::new("org/camera"), presentation())?;
+    let budget = PipelineBudget::new(PipelineBudget::MIN_LIMIT);
+    publisher.write(hls::initialization(0, 1))?;
+    let mut media = hls::chunk(0, 0, 0, 0);
+    let PackagedMedia::Chunk(chunk) = &mut media else {
+        unreachable!("the fixture builds a chunk")
+    };
+    chunk.payload.account(&budget, 0, Stage::MuxOutput)?;
+    assert!(budget.used() > 0);
+    publisher.write(media)?;
+    // The segment is still open, so the recorder is holding the part.
+    assert!(temp.files()?.is_empty());
+    assert_eq!(budget.used(), 0);
+    publisher.finish(FinishReason::Final)?;
+    drop(publisher);
+    recorder.drain(Duration::from_secs(5)).await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn completed_segments_survive_reconnect_with_their_exact_initialization() -> Result {
     let temp = Temp::new();
@@ -311,6 +339,7 @@ async fn real_cmaf_recordings_demux_individually_with_all_samples() -> Result {
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,
             events: &events,
+            budget: &crate::domain::PipelineBudget::unlimited(),
         })?;
         let mut publisher = factory(recorder.clone())
             .start(&StreamId::new("camera"), started.presentation.clone())?;

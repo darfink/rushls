@@ -224,7 +224,17 @@ These families have useful existing meanings and do not require replacement sole
 Detailed failure text stays in events rather than metric labels.
 `rushls_session_info` carries principal identity. Numeric session metrics carry only session and stream identity.
 
-`rushls_session_pipeline_capacity_bytes` reports a ceiling, not current occupancy.
+`rushls_session_pipeline_capacity_bytes` reports the configured accounted-buffer limit.
+`rushls_session_pipeline_used_bytes` and `rushls_session_pipeline_peak_bytes` report
+current and peak reservations. `rushls_session_pipeline_reserve_bytes` reports
+the part of the capacity that only packaging output may use.
+`rushls_session_pipeline_capacity_bytes` is `0` for an unlimited budget.
+`rushls_session_pipeline_exhaustions_total` counts failed reservations.
+`rushls_pipeline_exhaustions_total` retains these counts after sessions finish.
+`rushls_session_pipeline_allocation_bytes{origin="transport|demux|normalization|mux|subtitle"}`
+attributes live reservations to their allocation origin. Shared bytes keep that
+origin as they move between stages. These metrics exclude native MPEG-TS/QUIC
+buffers, uninstrumented metadata, OS buffers, and allocator overhead.
 `rushls_session_pacing_active` reports pacer state, not all reasons for backpressure.
 `store_backpressure` operation metrics cover the separate store-readiness path.
 

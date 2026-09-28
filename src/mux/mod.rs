@@ -182,8 +182,15 @@ pub enum MuxError {
         observed: u64,
         maximum: u64,
     },
-    #[error("coordinator retained {samples} samples / {bytes} bytes beyond its budget")]
-    CoordinatorLimit { samples: usize, bytes: usize },
+    #[error("coordinator retained {samples} samples beyond its limit")]
+    CoordinatorLimit { samples: usize },
+    /// The publisher's memory budget could not hold a sample's output when the
+    /// muxer accepted it. Checked on acceptance so that draining never fails.
+    #[error("{track}: {source}")]
+    Memory {
+        track: crate::domain::TrackId,
+        source: crate::domain::BudgetExceeded,
+    },
     #[error("{track}: {error}")]
     Part {
         track: crate::domain::TrackId,

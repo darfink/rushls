@@ -232,12 +232,12 @@ pub fn offset_cmaf() -> Result<
                 .build(),
         ],
     )?;
-    let events = discarded_events();
     let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
         presentation: &input,
         segmentation: &segmentation,
         time_anchor: crate::delivery::hls::fixtures::anchor(),
-        events: &events,
+        events: &discarded_events(),
+        budget: &crate::domain::PipelineBudget::unlimited(),
     })?;
     let mut media = Vec::new();
     for frame in -1..4 {

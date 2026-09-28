@@ -16,10 +16,11 @@ use crate::{
 
 /// Packages one input track's samples into container objects.
 pub trait TrackPackager: Send {
-    /// Retained unpublished bytes and samples, charged with coordinator queues
-    /// against a single publication budget rather than once per rendition.
-    fn buffered(&self) -> (usize, usize) {
-        (0, 0)
+    /// Retained unpublished samples, counted with coordinator queues against
+    /// a single publication limit rather than once per rendition. Bytes are
+    /// bounded by the shared pipeline budget instead.
+    fn buffered(&self) -> usize {
+        0
     }
 
     /// The input track this packager consumes. Routing is by this alone, so it
@@ -31,6 +32,27 @@ pub trait TrackPackager: Send {
         sample: NormalizedMedia,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError>;
+
+    /// Reserves the output memory `sample` will need, at the moment the muxer
+    /// accepts it. The charge travels with the sample through every queue to
+    /// [`Self::push_reserved`], so releasing held samples later, including
+    /// while draining at finish, never has to allocate.
+    fn reserve(
+        &self,
+        _sample: &NormalizedMedia,
+    ) -> Result<Option<crate::domain::Reservation>, MuxError> {
+        Ok(None)
+    }
+
+    /// Pushes a sample whose output was reserved by [`Self::reserve`].
+    fn push_reserved(
+        &mut self,
+        sample: NormalizedMedia,
+        _charge: Option<crate::domain::Reservation>,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
+        self.push(sample, out)
+    }
 
     /// Commits a selected boundary in the source track's timestamp domain.
     fn cut(

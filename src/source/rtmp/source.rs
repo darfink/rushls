@@ -52,9 +52,6 @@ impl RtmpPacketSource {
         meters: Arc<dyn SourceMeters>,
     ) -> Result<Self, SourceError> {
         limits.validate()?;
-        if let Some(budget) = meters.pipeline_budget() {
-            ingress.use_shared_budget(budget);
-        }
         Ok(Self {
             ingress: Some(ingress),
             limits,
@@ -752,6 +749,28 @@ mod tests {
                 return (packets, state);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_shared_budget_keeps_the_ingress_queue_byte_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // `SessionMeters::new` supplies a pipeline budget to the source view.
+        let meters = SessionMeters::new(ProcessMeters::default());
+        let frame = audio(0, 1, crate::mux::fixtures::AAC_FRAME);
+        let capacity = std::num::NonZeroUsize::new(frame.queued_bytes()).ok_or("empty frame")?;
+        let (reader, writer) = channel(capacity);
+        let _source =
+            RtmpPacketSource::new(reader, InputLimits::permissive(), meters.source_view())?;
+        writer.send(frame).await?;
+        // A publisher outrunning the session must wait for TCP backpressure;
+        // admitting more bytes would only exhaust the budget and fail it.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(50),
+            writer.send(audio(21, 1, crate::mux::fixtures::AAC_FRAME)),
+        )
+        .await;
+        assert!(blocked.is_err(), "the sender waits for queue space");
+        Ok(())
     }
 
     #[tokio::test]

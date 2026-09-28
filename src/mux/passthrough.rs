@@ -42,10 +42,15 @@ impl MuxerFactory for PassThroughMuxerFactory {
                         .late_boundary
                         .saturating_add(request.segmentation.early_boundary),
                     request.events.clone(),
+                    request.budget.clone(),
                 )?,
-                MediaKind::Subtitle => {
-                    webvtt::build_track(rendition_id, track, plan, request.events.clone())?
-                }
+                MediaKind::Subtitle => webvtt::build_track(
+                    rendition_id,
+                    track,
+                    plan,
+                    request.events.clone(),
+                    request.budget.clone(),
+                )?,
             };
             renditions.push(rendition);
             packagers.push(packager);
@@ -79,6 +84,7 @@ pub fn validate_timing(
     presentation: &crate::media::PresentationPlan,
     segmentation: &crate::segment::SegmentationPlan,
     samples: &[crate::media::NormalizedMedia],
+    budget: &crate::domain::PipelineBudget,
 ) -> Result<(), MuxError> {
     use super::Muxer;
     let events = crate::observe::Events::default().scoped(crate::domain::SessionId(nz::u64!(1)));
@@ -90,7 +96,9 @@ pub fn validate_timing(
         let id =
             PackagingRenditionId(u32::try_from(index).map_err(|_| invalid("too many tracks"))?);
         let writer = if track.kind() == MediaKind::Subtitle {
-            webvtt::build_track(id, track, plan, events.clone())?.1
+            // The real WebVTT writer renders and retains cue text while it
+            // replays, so those allocations belong to the publisher's budget.
+            webvtt::build_track(id, track, plan, events.clone(), budget.clone())?.1
         } else {
             cmaf::timing_track(
                 id,
@@ -163,6 +171,7 @@ mod tests {
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,
             events: &events,
+            budget: &crate::domain::PipelineBudget::unlimited(),
         })?;
 
         assert_eq!(started.presentation.renditions.len(), 2);
@@ -224,6 +233,7 @@ mod tests {
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,
             events: &events,
+            budget: &crate::domain::PipelineBudget::unlimited(),
         })?;
         let mut output = Vec::new();
 
@@ -266,9 +276,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn mixed_cmaf_and_webvtt_preserve_the_publication_relative_offset()
-    -> Result<(), Box<dyn std::error::Error>> {
+    type AudioAndSubtitle = (
+        crate::media::PresentationPlan,
+        crate::segment::SegmentationPlan,
+        Vec<NormalizedMedia>,
+    );
+
+    /// An AAC track with priming and one SubRip cue, as the muxer sees them.
+    fn audio_and_subtitle() -> Result<AudioAndSubtitle, Box<dyn std::error::Error>> {
         let audio_timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
         let audio = TrackBuilder::new(0, MediaKind::Audio)
             .codec(Codec::Aac)
@@ -303,16 +318,7 @@ mod tests {
                     .build(),
             ],
         )?;
-        let events = Events::default().scoped(SessionId(nz::u64!(2)));
-        let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
-            presentation: &input,
-            segmentation: &segmentation,
-            time_anchor: SystemTime::UNIX_EPOCH,
-            events: &events,
-        })?;
-        let mut output = Vec::new();
-
-        started.muxer.push(
+        let samples = vec![
             NormalizedMedia::Audio(AudioSample {
                 track_id: TrackId(0),
                 codec: Codec::Aac,
@@ -321,9 +327,6 @@ mod tests {
                 trim: AudioTrim::default(),
                 payload: Payload::from(AAC_FRAME),
             }),
-            &mut output,
-        )?;
-        started.muxer.push(
             NormalizedMedia::Subtitle(SubtitleSample {
                 track_id: TrackId(1),
                 codec: Codec::SubRip,
@@ -333,8 +336,26 @@ mod tests {
                 position: None,
                 payload: Payload::from(b"later subtitle".as_slice()),
             }),
-            &mut output,
-        )?;
+        ];
+        Ok((input, segmentation, samples))
+    }
+
+    #[test]
+    fn mixed_cmaf_and_webvtt_preserve_the_publication_relative_offset()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (input, segmentation, samples) = audio_and_subtitle()?;
+        let events = Events::default().scoped(SessionId(nz::u64!(2)));
+        let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
+            presentation: &input,
+            segmentation: &segmentation,
+            time_anchor: SystemTime::UNIX_EPOCH,
+            events: &events,
+            budget: &crate::domain::PipelineBudget::unlimited(),
+        })?;
+        let mut output = Vec::new();
+        for sample in samples {
+            started.muxer.push(sample, &mut output)?;
+        }
         started.muxer.finish(FinishReason::Final, &mut output)?;
 
         let audio_start = output.iter().find_map(|media| match media {
@@ -354,6 +375,28 @@ mod tests {
 
         assert_eq!(audio_start, Some(0));
         assert_eq!(subtitle_start, Some(1_980));
+        Ok(())
+    }
+
+    /// Timing replay runs the real WebVTT writer, which renders and retains
+    /// cue text. Those allocations must come out of the publisher's budget.
+    #[test]
+    fn subtitle_timing_validation_charges_the_publisher_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (input, segmentation, samples) = audio_and_subtitle()?;
+        let exhausted = crate::domain::PipelineBudget::new(0);
+        assert!(matches!(
+            validate_timing(&input, &segmentation, &samples, &exhausted),
+            Err(MuxError::Memory {
+                track: TrackId(1),
+                ..
+            })
+        ));
+
+        let budget = crate::domain::PipelineBudget::new(1024 * 1024);
+        validate_timing(&input, &segmentation, &samples, &budget)?;
+        assert!(budget.peak() > 0, "cue rendering was charged");
+        assert_eq!(budget.used(), 0, "validation keeps nothing");
         Ok(())
     }
 }

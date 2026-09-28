@@ -380,7 +380,10 @@ impl HlsPublisher for RecordingPublisher {
     fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
         let outcome = self.inner.write(media.clone())?;
         if outcome == PublishOutcome::Published {
-            self.record(media);
+            // The recorder bounds its own queue with separate reservations.
+            // Holding the pipeline lease as well would double-charge the
+            // bytes and let a slow disk exhaust the publisher's budget.
+            self.record(media.into_retained());
         }
         Ok(outcome)
     }

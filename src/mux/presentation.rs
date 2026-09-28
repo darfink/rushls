@@ -515,6 +515,9 @@ pub struct MuxerStartRequest<'a> {
     pub segmentation: &'a crate::segment::SegmentationPlan,
     pub time_anchor: SystemTime,
     pub events: &'a EventSink,
+    /// The publisher's shared memory budget. Output is charged here directly,
+    /// never inferred from whichever input payload happens to carry a lease.
+    pub budget: &'a crate::domain::PipelineBudget,
 }
 
 // Keep this import used in rustdoc/type navigation even though compatibility

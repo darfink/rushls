@@ -12,6 +12,9 @@ struct Track {
     kind: MediaKind,
     writer: Box<dyn TrackPackager>,
     pending: VecDeque<NormalizedMedia>,
+    /// Output charges taken when each `pending` sample was accepted, kept in
+    /// lockstep so a release, including during finish, never allocates.
+    charges: VecDeque<Option<crate::domain::Reservation>>,
     start: TickTimestamp,
 }
 impl Track {
@@ -32,7 +35,6 @@ pub struct Coordinator {
     boundary_budget: Duration,
     limits: PrerollLimits,
     samples: usize,
-    bytes: usize,
     interval: Duration,
     finished: bool,
     events: crate::observe::EventSink,
@@ -60,6 +62,7 @@ impl Coordinator {
                 kind,
                 writer,
                 pending: VecDeque::new(),
+                charges: VecDeque::new(),
                 start: track_plan.segmentation_origin_pts,
             });
         }
@@ -104,7 +107,6 @@ impl Coordinator {
             authority,
             limits: plan.limits,
             samples: 0,
-            bytes: 0,
             interval: plan.shortest_part_duration().saturating_mul(2),
             finished: false,
             events,
@@ -140,14 +142,19 @@ impl Coordinator {
                 .pending
                 .pop_front()
                 .expect("count is within queue");
+            let charge = self.tracks[index]
+                .charges
+                .pop_front()
+                .expect("charges track the pending queue");
             self.samples -= 1;
-            self.bytes -= sample.retained_bytes();
             let now = self.tracks[index].instant(sample.pts());
             let gap_end = match &sample {
                 NormalizedMedia::Gap(gap) => Some(gap.end),
                 _ => None,
             };
-            self.tracks[index].writer.push(sample, out)?;
+            self.tracks[index]
+                .writer
+                .push_reserved(sample, charge, out)?;
             if let Some(end) = gap_end {
                 self.tracks[index].start = end;
             }
@@ -366,9 +373,9 @@ impl Coordinator {
                         .push(NormalizedMedia::Gap(prefix), out)?;
                     self.tracks[index].start = pts;
                     if pts == gap.end {
-                        let removed = self.tracks[index].pending.pop_front().expect("gap exists");
+                        self.tracks[index].pending.pop_front().expect("gap exists");
+                        self.tracks[index].charges.pop_front();
                         self.samples -= 1;
-                        self.bytes -= removed.retained_bytes();
                     } else if let Some(NormalizedMedia::Gap(remaining)) =
                         self.tracks[index].pending.front_mut()
                     {
@@ -474,26 +481,25 @@ impl Muxer for Coordinator {
         if self.tracks[index].kind == MediaKind::Subtitle {
             return self.tracks[index].writer.push(sample, out);
         }
-        let bytes = self.bytes.saturating_add(sample.retained_bytes());
         let samples = self.samples.saturating_add(1);
-        let (writer_bytes, writer_samples) = self
+        let writer_samples = self
             .tracks
             .iter()
             .map(|track| track.writer.buffered())
-            .fold((0_usize, 0_usize), |(bytes, samples), (b, s)| {
-                (bytes.saturating_add(b), samples.saturating_add(s))
-            });
-        if bytes.saturating_add(writer_bytes) > self.limits.maximum_buffered_bytes
-            || samples.saturating_add(writer_samples) > self.limits.maximum_buffered_samples
-        {
+            .fold(0_usize, usize::saturating_add);
+        // Bytes are bounded by the shared pipeline budget; this bounds the
+        // per-sample work and bookkeeping a stalled sibling can accumulate.
+        if samples.saturating_add(writer_samples) > self.limits.maximum_buffered_samples {
             return Err(MuxError::CoordinatorLimit {
-                bytes: bytes.saturating_add(writer_bytes),
                 samples: samples.saturating_add(writer_samples),
             });
         }
-        self.bytes = bytes;
+        // Reserve before queuing: once accepted, the sample must be able to
+        // reach storage even if the rest of the budget fills up meanwhile.
+        let charge = self.tracks[index].writer.reserve(&sample)?;
         self.samples = samples;
         self.tracks[index].pending.push_back(sample);
+        self.tracks[index].charges.push_back(charge);
         self.drive(out)
     }
     fn finish(
@@ -523,9 +529,9 @@ impl Muxer for Coordinator {
                 failure = result.err();
             }
             self.tracks[index].pending.clear();
+            self.tracks[index].charges.clear();
         }
         self.samples = 0;
-        self.bytes = 0;
         failure.map_or(Ok(()), Err)
     }
 }
@@ -760,18 +766,6 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_checks_bytes_even_when_the_sample_count_fits()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (mut mux, _) = coordinator(0, 0)?;
-        mux.limits.maximum_buffered_bytes = 1;
-        assert!(matches!(
-            mux.push(sample(0, 2_000, true), &mut Vec::new()),
-            Err(MuxError::CoordinatorLimit { .. })
-        ));
-        Ok(())
-    }
-
-    #[test]
     fn a_boundary_failure_still_finishes_every_writer() -> Result<(), Box<dyn std::error::Error>> {
         let (mut mux, actions) = coordinator(0, 0)?;
         let mut out = Vec::new();
@@ -780,7 +774,7 @@ mod tests {
         for id in 0..3 {
             assert!(actions.lock().contains(&Action::Finished(TrackId(id))));
         }
-        assert_eq!((mux.samples, mux.bytes), (0, 0));
+        assert_eq!(mux.samples, 0);
         assert!(mux.tracks.iter().all(|track| track.pending.is_empty()));
         Ok(())
     }
@@ -794,14 +788,8 @@ mod tests {
         fn track_id(&self) -> crate::domain::TrackId {
             self.id
         }
-        fn buffered(&self) -> (usize, usize) {
-            (
-                self.samples
-                    .iter()
-                    .map(NormalizedMedia::retained_bytes)
-                    .sum(),
-                self.samples.len(),
-            )
+        fn buffered(&self) -> usize {
+            self.samples.len()
         }
         fn push(
             &mut self,
@@ -823,38 +811,28 @@ mod tests {
 
     #[test]
     fn writer_windows_share_one_publication_budget() -> Result<(), Box<dyn std::error::Error>> {
-        for byte_limit in [false, true] {
-            let (mut mux, _) = coordinator(0, 0)?;
-            for track in &mut mux.tracks {
-                track.writer = Box::new(HoldingWriter {
-                    id: track.plan.track_id,
-                    samples: Vec::new(),
-                });
-            }
-            if byte_limit {
-                mux.limits.maximum_buffered_bytes = 3 * sample(0, 0, true).retained_bytes();
-            } else {
-                mux.limits.maximum_buffered_samples = 3;
-            }
-            let mut output = Vec::new();
-            for id in 0..3 {
-                mux.push(sample(id, 0, true), &mut output)?;
-            }
-            assert_eq!(
-                mux.samples, 0,
-                "all input moved from coordinator queues into writers"
-            );
-            assert!(matches!(
-                mux.push(sample(0, 40, false), &mut output),
-                Err(MuxError::CoordinatorLimit { samples: 4, .. })
-            ));
-            mux.finish(FinishReason::Superseded, &mut output)?;
-            assert!(
-                mux.tracks
-                    .iter()
-                    .all(|track| track.writer.buffered() == (0, 0))
-            );
+        let (mut mux, _) = coordinator(0, 0)?;
+        for track in &mut mux.tracks {
+            track.writer = Box::new(HoldingWriter {
+                id: track.plan.track_id,
+                samples: Vec::new(),
+            });
         }
+        mux.limits.maximum_buffered_samples = 3;
+        let mut output = Vec::new();
+        for id in 0..3 {
+            mux.push(sample(id, 0, true), &mut output)?;
+        }
+        assert_eq!(
+            mux.samples, 0,
+            "all input moved from coordinator queues into writers"
+        );
+        assert!(matches!(
+            mux.push(sample(0, 40, false), &mut output),
+            Err(MuxError::CoordinatorLimit { samples: 4 })
+        ));
+        mux.finish(FinishReason::Superseded, &mut output)?;
+        assert!(mux.tracks.iter().all(|track| track.writer.buffered() == 0));
         Ok(())
     }
 }

@@ -145,10 +145,7 @@ pub async fn run_session(
 ) -> Result<SessionOutcome, SessionError> {
     let meters = SessionMeters::with_budget(
         services.meters.clone(),
-        crate::domain::PipelineBudget::with_working_allowance(
-            config.memory_per_publisher,
-            (config.memory_per_publisher / 4).min(16 * 1024 * 1024),
-        ),
+        crate::domain::PipelineBudget::for_publisher(config.memory_per_publisher),
     );
     // Admission is bounded from out here rather than inside, because the thing
     // being guarded against is a peer that never finishes its handshake, and
@@ -316,14 +313,9 @@ async fn pipeline(
         PrerollRequest {
             presentation: &presentation,
             timeline: &timeline,
-            limits: crate::segment::PrerollLimits {
-                maximum_buffered_bytes: config
-                    .preroll
-                    .maximum_buffered_bytes
-                    .min(config.memory_per_publisher),
-                ..config.preroll
-            },
+            limits: config.preroll,
             policy: config.segmentation,
+            budget: context.meters().budget(),
         },
         context.events(),
     )
@@ -344,6 +336,7 @@ async fn pipeline(
         // tracks; delivery only advances this wall time by packaged timing.
         time_anchor: std::time::SystemTime::now(),
         events: context.events(),
+        budget: context.meters().budget(),
     })?;
     context.emit(SessionEvent::SegmentationContract {
         desired_segment: config.segmentation.desired_segment_duration,

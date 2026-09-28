@@ -2548,7 +2548,7 @@ fn pipeline_memory_has_independent_configuration_and_precedence() -> Result<(), 
     let defaults = resolve_toml("")??;
     assert_eq!(
         defaults.node.session.memory_per_publisher,
-        128 * 1024 * 1024
+        Some(128 * 1024 * 1024)
     );
     let configured = resolve_with(
         "[pipeline]\nmemory_per_publisher = '192MiB'\n",
@@ -2557,7 +2557,7 @@ fn pipeline_memory_has_independent_configuration_and_precedence() -> Result<(), 
     )??;
     assert_eq!(
         configured.node.session.memory_per_publisher,
-        320 * 1024 * 1024
+        Some(320 * 1024 * 1024)
     );
     assert_eq!(
         configured.node.store.retention.maximum_payload_bytes,

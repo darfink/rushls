@@ -38,19 +38,17 @@ pub use preroll::{Preroll, PrerollRequest, run as run_preroll};
 ///
 /// Pre-roll is the one stage that retains everything it inspects — the samples
 /// it examines are the ones the live tail replays, so nothing is discarded
-/// until segmentation locks. All four bounds therefore matter, and none of them
-/// subsumes the others: media duration is defeated by zero-duration access
-/// units, byte budgets by empty payloads, and wall time by an input that floods
+/// until segmentation locks. Bytes are bounded by the publisher's shared
+/// pipeline budget, which charges per-sample overhead too, so a flood of empty
+/// payloads still consumes it. The three bounds here cover what bytes cannot:
+/// media duration is defeated by zero-duration access units, the sample count
+/// bounds per-sample locking work, and wall time bounds an input that floods
 /// faster than it advances its clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrerollLimits {
-    /// Retained size, charged per [`NormalizedMedia::retained_bytes`].
-    ///
-    /// [`NormalizedMedia::retained_bytes`]: crate::media::NormalizedMedia::retained_bytes
-    pub maximum_buffered_bytes: usize,
     /// Retained sample count.
     ///
-    /// Bounds the per-sample work of locking a plan, which the byte budget
+    /// Bounds the per-sample work of locking a plan, which the memory budget
     /// cannot: an input can stay far under budget while producing an enormous
     /// number of tiny access units.
     pub maximum_buffered_samples: usize,
@@ -62,7 +60,6 @@ impl PrerollLimits {
     /// Room for several seconds of high-bitrate multi-track media.
     pub fn permissive() -> Self {
         Self {
-            maximum_buffered_bytes: crate::domain::PipelineBudget::DEFAULT_LIMIT,
             maximum_buffered_samples: 16_384,
             maximum_wall_time: Duration::from_secs(15),
             maximum_media_duration: Duration::from_secs(30),
@@ -344,6 +341,15 @@ pub enum PrerollError {
     Cadence(#[from] CadenceError),
     #[error("segmentation pre-roll exceeded its configured bound")]
     LimitExceeded,
+    /// Publisher memory ran out while pre-roll was holding samples, so
+    /// pre-roll, not the stage that happened to allocate, is the cause.
+    #[error(
+        "segmentation pre-roll holds {samples} samples waiting for a segment cadence and exhausted publisher memory: {source}"
+    )]
+    Memory {
+        samples: usize,
+        source: crate::domain::BudgetExceeded,
+    },
 }
 
 #[cfg(test)]
