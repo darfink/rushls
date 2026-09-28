@@ -142,7 +142,7 @@ pub struct MetricsReader {
     /// Absent unless hooks are configured, which is also when they have
     /// anything to report.
     hooks: Option<Hooks>,
-    /// Absent unless `[auth.playback]` is configured.
+    /// Absent unless `[playback.auth]` is configured.
     playback: Option<PlaybackMeters>,
 }
 
@@ -835,7 +835,7 @@ mod tests {
         );
         assert!(
             !output.contains("rushls_playback_denied_total"),
-            "playback denials are absent until [auth.playback] is configured"
+            "playback denials are absent until [playback.auth] is configured"
         );
     }
 

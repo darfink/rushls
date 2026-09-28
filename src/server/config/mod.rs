@@ -18,7 +18,7 @@ use std::{
 
 use crate::source::transport::rtmp::RtmpTimeouts;
 use conf::Conf;
-use rushls_config::{ByteSize, ConfigSearch, Loader};
+use rushls_config::{ByteSize, ConfigSearch, Loader, TextSource};
 use rushls_tls::{ClientIdentity, TlsVersion, load_roots};
 use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
@@ -67,7 +67,7 @@ pub struct ResolvedAppConfig {
     /// whatever certificate it started with until the process restarted --
     /// which is the failure the watch exists to prevent, and a silent one.
     pub outbound_tls: Vec<OutboundTls>,
-    /// Viewer JWT settings, present when `[auth.playback]` is configured.
+    /// Viewer JWT settings, present when `[playback.auth]` is configured.
     ///
     /// The JWKS fetch, when that is the key source, happens when the gate is
     /// started rather than here: configuration resolve is synchronous and a
@@ -80,7 +80,274 @@ pub struct ResolvedAppConfig {
     /// otherwise the first existing well-known path is used. `None` means
     /// compiled defaults plus environment and CLI flags.
     pub config_file: Option<PathBuf>,
+    /// `--check`: validate, print [`Self::plan`], and exit without serving.
+    pub check: bool,
 }
+
+impl ResolvedAppConfig {
+    /// What `--check` prints: every listener, and the memory the limits can
+    /// commit in the worst case, so an unrealistic plan is visible before
+    /// the node serves anything.
+    pub fn plan(&self) -> String {
+        use std::fmt::Write as _;
+        let node = &self.node;
+        let address = |address: Option<SocketAddr>| {
+            address.map_or_else(|| "off".to_owned(), |address| address.to_string())
+        };
+        let size = |bytes: usize| ByteSize::b(bytes as u64).display().iec().to_string();
+        let mut plan = String::new();
+        let mut line = |text: String| {
+            writeln!(plan, "{text}").expect("writing to a String cannot fail");
+        };
+        line("listeners".to_owned());
+        for (name, value) in [
+            ("ingest.rtmp", address(Some(node.rtmp_address))),
+            ("ingest.srt", address(Some(node.srt_address))),
+            ("ingest.moq", address(node.moq_address)),
+            ("http", address(node.http_address)),
+            ("https", address(node.https_address)),
+            ("metrics", address(node.metrics.listen)),
+        ] {
+            line(format!("  {name:<12} {value}"));
+        }
+
+        let publishers = node.maximum_sessions;
+        let streams = node.store.maximum_streams;
+        let per_stream = node.store.retention.maximum_payload_bytes;
+        let stream_total = per_stream.saturating_mul(streams);
+        line("memory".to_owned());
+        let worst = if let Some(per_publisher) = node.session.memory_per_publisher {
+            let publisher_total = per_publisher.saturating_mul(publishers);
+            line(format!(
+                "  publishers   {publishers} × {} = {}",
+                size(per_publisher),
+                size(publisher_total)
+            ));
+            Some(publisher_total.saturating_add(stream_total))
+        } else {
+            line(format!("  publishers   {publishers} × unlimited"));
+            None
+        };
+        line(format!(
+            "  streams      {streams} × {} = {}",
+            size(per_stream),
+            size(stream_total)
+        ));
+        let worst = worst.map_or_else(|| "unbounded".to_owned(), size);
+        match node.memory_total {
+            Some(total) => line(format!(
+                "  committed    at most {} (memory.total; budgets sum to {worst})",
+                size(total)
+            )),
+            None => line(format!(
+                "  committed    up to {worst} (set memory.total to cap it)"
+            )),
+        }
+        match &node.store.disk {
+            Some(disk) => line(format!(
+                "disk           {streams} × {} = {} in {}",
+                size(disk.maximum_payload_bytes),
+                size(disk.maximum_payload_bytes.saturating_mul(streams)),
+                disk.directory.display()
+            )),
+            None => line("disk           off".to_owned()),
+        }
+        plan
+    }
+}
+
+/// Renders `docs/config-reference.md` from the schema itself, so the reference
+/// TOML path of a schema option, or `None` for command-line-only flags.
+pub fn toml_path(id: &str) -> Option<String> {
+    if matches!(id, "config" | "print_config_example" | "check") {
+        return None;
+    }
+    // Server fields flatten into the document root; their Rust IDs retain `node`.
+    let path = id.strip_prefix("node.").unwrap_or(id);
+    // A credential's file flag is part of that credential's row, not a key.
+    if CREDENTIAL_FILE_FLAGS.contains(&path) {
+        return None;
+    }
+    Some(path.to_owned())
+}
+
+/// Credentials whose command-line flag takes a file path. `conf` refuses a
+/// flag on a secret field, so each has a CLI-only `<name>_file` sibling.
+const CREDENTIAL_FILE_FLAGS: &[&str] = &[
+    "ingest.srt.passphrase_file",
+    "publish.auth.token_file",
+    "playback.auth.secret_file",
+    "metrics.token_file",
+];
+
+/// Renders `docs/config-reference.md` from the schema itself, so the reference
+/// can only describe settings that exist, with the defaults they really have.
+///
+/// One table per top-level section, in schema order. The description is each
+/// field's first doc paragraph; rationale below it stays in the source.
+pub fn reference_markdown() -> String {
+    use conf::introspection::ProgramOptionMeta;
+    use std::fmt::Write as _;
+
+    let cell = |text: String| text.replace('|', "\\|");
+    let mut output = String::from(
+        "# Configuration reference\n\n\
+         Generated from the configuration schema; do not edit by hand. Regenerate with\n\
+         `RUSHLS_UPDATE_CONFIG_REFERENCE=1 cargo test --lib config_reference`.\n\n\
+         Values resolve defaults < TOML < environment < CLI. Credentials take a string,\n\
+         `\"${VAR}\"`, or `{ file = \"/path\" }`. Their CLI flags take only a file path,\n\
+         because arguments are visible in the process list. Structured values\n\
+         (tables and lists) use TOML syntax in environment variables and flags too.\n\
+         See [rushls.example.toml](../rushls.example.toml) for an annotated file.\n",
+    );
+    let mut section = None;
+    for option in AppConfig::program_options() {
+        let Some(path) = toml_path(&option.id().to_string()) else {
+            continue;
+        };
+        let top = match path.split_once('.') {
+            Some((top, _)) => top.to_owned(),
+            // Whole-table settings head their own section.
+            None if matches!(path.as_str(), "record" | "hook") => path.clone(),
+            None => "(top level)".to_owned(),
+        };
+        if section.as_ref() != Some(&top) {
+            write!(
+                output,
+                "\n## {}\n\n| Setting | Default | Environment | CLI | Description |\n|---|---|---|---|---|\n",
+                if top == "(top level)" {
+                    top.clone()
+                } else {
+                    format!("[{top}]")
+                }
+            )
+            .expect("writing to a String cannot fail");
+            section = Some(top);
+        }
+        let description = option
+            .description()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let summary = description
+            .split("\n\n")
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let code = |value: Option<String>| {
+            value.map_or_else(|| "—".to_owned(), |value| format!("`{value}`"))
+        };
+        let flag = option
+            .long_form()
+            .map(|value| format!("--{value}"))
+            .or_else(|| {
+                let sibling = format!("{path}_file");
+                CREDENTIAL_FILE_FLAGS
+                    .contains(&sibling.as_str())
+                    .then(|| format!("--{} <PATH>", path.replace(['.', '_'], "-")))
+            });
+        writeln!(
+            output,
+            "| `{path}` | {} | {} | {} | {} |",
+            cell(code(option.default_help_str().map(ToString::to_string))),
+            cell(code(option.env_form().map(ToString::to_string))),
+            cell(code(flag)),
+            cell(summary),
+        )
+        .expect("writing to a String cannot fail");
+        // Whole-table settings are opaque to `conf`, so list their keys here.
+        let fields: &[(&str, &str, &str)] = match path.as_str() {
+            "record" => RECORD_FIELDS,
+            "hook" => HOOK_FIELDS,
+            _ => &[],
+        };
+        for (key, default, description) in fields {
+            writeln!(
+                output,
+                "| `{path}{key}` | {} | — | — | {} |",
+                cell(if default.is_empty() {
+                    "—".to_owned()
+                } else {
+                    format!("`{default}`")
+                }),
+                cell((*description).to_owned()),
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    output
+}
+
+/// `[record]` keys, as `record::Config` accepts them.
+const RECORD_FIELDS: &[(&str, &str, &str)] = &[
+    (
+        ".dir",
+        "",
+        "Directory recordings are written under. Setting the table enables recording.",
+    ),
+    (
+        ".path",
+        "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4",
+        "Where each completed segment lands under `dir`.",
+    ),
+    (
+        ".queue_size",
+        "128",
+        "Segments queued for writing before new ones are dropped.",
+    ),
+    (
+        ".max_pending",
+        "256MiB",
+        "Open segments, queued jobs, and the active write together.",
+    ),
+];
+
+/// `[hook.<name>]` keys, as `HookEndpointAppConfig` accepts them.
+const HOOK_FIELDS: &[(&str, &str, &str)] = &[
+    (".<name>.url", "", "Where deliveries are posted."),
+    (
+        ".<name>.events",
+        "",
+        "Events this destination receives; required.",
+    ),
+    (
+        ".<name>.token",
+        "",
+        "Bearer credential: inline, `${VAR}`, or `{ file = \"/path\" }`.",
+    ),
+    (
+        ".<name>.signing_secret",
+        "",
+        "`whsec_` key signing each delivery.",
+    ),
+    (
+        ".<name>.queue_size",
+        "1000",
+        "Events held before the oldest is dropped.",
+    ),
+    (
+        ".<name>.max_in_flight",
+        "8",
+        "Distinct streams delivered at once.",
+    ),
+    (
+        ".<name>.max_attempts",
+        "5",
+        "Attempts per event, the first included.",
+    ),
+    (
+        ".<name>.client_cert",
+        "",
+        "PEM certificate chain presented to this endpoint.",
+    ),
+    (".<name>.client_key", "", "PEM private key for that chain."),
+    (
+        ".<name>.ca",
+        "",
+        "PEM authority to trust instead of the platform store.",
+    ),
+];
 
 /// Hooks and the client they deliver with, which carries their own deadline.
 pub struct ResolvedHooks {
@@ -130,27 +397,41 @@ pub struct AppConfig {
     /// Print the annotated configuration example and exit without loading configuration.
     #[conf(flag, long, serde(skip))]
     pub print_config_example: bool,
+    /// Validate the configuration, print the resolved listeners and memory
+    /// plan, and exit without serving.
+    #[conf(flag, long, serde(skip))]
+    pub check: bool,
 
     #[conf(flatten, serde(flatten))]
     pub node: ServerAppConfig,
+    /// How publishers connect: listeners and liveness deadlines.
     #[conf(flatten, prefix)]
-    pub auth: AuthAppConfig,
+    pub ingest: IngestAppConfig,
+    /// Who may publish, and what they may send.
     #[conf(flatten, prefix)]
-    pub rtmp: RtmpAppConfig,
+    pub publish: PublishAppConfig,
+    /// How many publishers and streams this node holds at once.
     #[conf(flatten, prefix)]
-    pub srt: SrtAppConfig,
+    pub limits: LimitsAppConfig,
+    /// Memory budgets for publishers and stored streams.
     #[conf(flatten, prefix)]
-    pub moq: MoqAppConfig,
+    pub memory: MemoryAppConfig,
+    /// Optional disk overflow for older stream media.
     #[conf(flatten, prefix)]
-    pub accept: AcceptAppConfig,
+    pub disk: DiskAppConfig,
     #[conf(flatten, prefix)]
     pub hls: HlsAppConfig,
     #[conf(flatten, prefix)]
-    pub capacity: CapacityAppConfig,
-    #[conf(flatten, prefix)]
-    pub pipeline: PipelineAppConfig,
-    #[conf(flatten, prefix)]
     pub http: HttpAppConfig,
+    /// HTTPS listener. Present enables it, with certificates from `[tls]`.
+    #[conf(flatten, prefix)]
+    pub https: Option<HttpsAppConfig>,
+    /// Certificate and key shared by HTTPS and MoQ ingest.
+    #[conf(flatten, prefix)]
+    pub tls: Option<TlsAppConfig>,
+    /// Who may watch.
+    #[conf(flatten, prefix)]
+    pub playback: PlaybackAppConfig,
     #[conf(flatten, prefix)]
     pub metrics: MetricsAppConfig,
     /// Persistent local segment exports, independent of DVR retention.
@@ -256,19 +537,18 @@ impl AppConfig {
         let mut warnings =
             LOADER.environment_warnings::<Self>(&env.into_iter().collect::<Vec<_>>());
 
-        let (default_policy, policies) = self.accept.resolve()?;
+        let (default_policy, policies) = self.publish.resolve()?;
         // The manifest promise covers retained media across every takeover. A
-        // named permissive policy can be selected on a later publication.
+        // named permissive profile can be selected on a later publication.
         let independent_segments = default_policy.input_mode == crate::domain::InputMode::Strict
             && policies
                 .values()
                 .all(|policy| policy.input_mode == crate::domain::InputMode::Strict);
-        let stall = self.accept.stall;
-        let open_admission = self.auth.is_open();
+        let stall = self.ingest.stall_timeout;
+        let open_admission = self.publish.auth.is_none();
         let mut outbound_tls = Vec::new();
-        let AuthAppConfig { publish, playback } = self.auth;
-        let authenticator = match publish {
-            Some(publish) => publish
+        let authenticator = match self.publish.auth {
+            Some(auth) => auth
                 .resolve(
                     default_policy,
                     policies,
@@ -279,15 +559,16 @@ impl AppConfig {
                 .map(|authenticator| Arc::new(authenticator) as Arc<dyn Authenticator>)?,
             None => Arc::new(OpenStreamAuthenticator::new(default_policy)),
         };
-        let playback = playback
+        let playback = self
+            .playback
+            .auth
             .map(|playback| playback.resolve(&mut client))
             .transpose()?;
 
         let mut node = NodeConfig {
-            maximum_sessions: self.capacity.publishers,
-            shutdown: self.node.shutdown,
-            rtmp_address: self.rtmp.listen,
-            srt_address: self.srt.listen,
+            shutdown: self.node.shutdown_grace,
+            rtmp_address: self.ingest.rtmp.listen,
+            srt_address: self.ingest.srt.listen,
             http_address: self.http.listen.0,
             ..NodeConfig::default()
         };
@@ -300,19 +581,23 @@ impl AppConfig {
         {
             node.name = std::sync::Arc::from(name);
         }
-        self.rtmp.apply(&mut node, &mut warnings)?;
-        self.srt.apply(&mut node)?;
-        self.moq.apply(&mut node, &mut warnings)?;
+        let tls = self.tls.as_ref().map(TlsAppConfig::resolve);
+        self.ingest.apply(&mut node, tls.as_ref(), &mut warnings)?;
         self.hls.apply(&mut node, &mut warnings)?;
         node.store.independent_segments = independent_segments;
         // After HLS: a stall expressed as a multiple is sized by the segment
         // duration, which only `hls.apply` establishes.
         apply_stall(&mut node, stall, self.hls.segment_duration())?;
-        self.capacity.apply(&mut node)?;
-        self.pipeline.apply(&mut node)?;
+        self.limits.apply(&mut node)?;
+        self.memory.apply(&mut node)?;
+        self.disk.apply(&mut node)?;
         node.hls.uri_base = UriBase::new(self.http.public_url.clone());
-        node.http = self.http.resolve()?;
+        node.http = self.http.resolve(self.https.as_ref(), tls.as_ref())?;
         node.https_address = node.http.tls_address;
+        if tls.is_some() && self.https.is_none() && node.moq_address.is_none() {
+            warnings
+                .push("[tls] is configured but neither [https] nor ingest.moq uses it".to_owned());
+        }
         // After `http.resolve`, which replaces the whole struct: the
         // fingerprint route is mounted from the MOQ listener's own
         // certificate, so it exists exactly when MOQ ingest does.
@@ -342,6 +627,7 @@ impl AppConfig {
             warnings,
             outbound_tls,
             config_file: None,
+            check: self.check,
         })
     }
 }
@@ -361,7 +647,7 @@ pub struct ServerAppConfig {
     /// Keep it below the grace period the scheduler allows, or a hard kill
     /// arrives mid-drain and the graceful path buys nothing. Deliberately has
     /// no "off": waiting indefinitely would mean staying alive to serve
-    /// retained media, a wait bounded by `retain` that no scheduler grants.
+    /// retained media, a wait bounded by `hls.window` that no scheduler grants.
     #[conf(
         parameter,
         long,
@@ -370,54 +656,39 @@ pub struct ServerAppConfig {
         value_parser = rushls_config::parse_duration,
         serde(use_value_parser)
     )]
-    pub shutdown: Duration,
+    pub shutdown_grace: Duration,
 }
 
+/// Viewer authorization. A table of its own so `[playback.auth]` reads as the
+/// counterpart of `[publish.auth]`.
 #[derive(Conf)]
 #[conf(serde)]
-pub struct AuthAppConfig {
-    /// Optional external admission service. When omitted, admission is open
-    /// and every publisher gets the default accept set.
-    #[conf(flatten, prefix = "publish", serde(rename = "publish"))]
-    publish: Option<HttpAuthAppConfig>,
+pub struct PlaybackAppConfig {
     /// Optional local JWT verification for viewers. When omitted, anyone with
     /// the URL may watch.
-    #[conf(flatten, prefix = "playback", serde(rename = "playback"))]
-    playback: Option<PlaybackAuthAppConfig>,
-}
-
-impl AuthAppConfig {
-    /// Whether anyone who can reach an ingest listener may publish.
-    fn is_open(&self) -> bool {
-        self.publish.is_none()
-    }
+    #[conf(flatten, prefix)]
+    auth: Option<PlaybackAuthAppConfig>,
 }
 
 #[derive(Conf)]
 #[conf(serde)]
 pub struct PlaybackAuthAppConfig {
-    #[conf(
-        parameter,
-        env,
-        secret,
-        serde(deserialize_with = "rushls_config::deserialize_secret")
-    )]
-    public_key: Option<String>,
+    /// RS256/ES256 verifying key: inline PEM or `{ file = "/path" }`.
     #[conf(parameter, long, env)]
-    public_key_file: Option<PathBuf>,
+    public_key: Option<TextSource>,
+    /// Issuer key set fetched when the gate starts.
     #[conf(parameter, long, env)]
     jwks_url: Option<String>,
-    #[conf(
-        parameter,
-        env,
-        secret,
-        serde(deserialize_with = "rushls_config::deserialize_secret")
-    )]
-    secret: Option<String>,
-    #[conf(parameter, long, env)]
+    /// HS256 shared secret: inline, `${VAR}`, or `{ file = "/path" }`.
+    #[conf(parameter, env, secret)]
+    secret: Option<TextSource>,
+    /// File holding `secret`; the command-line form is always a path.
+    #[conf(parameter, long = "secret", serde(skip))]
     secret_file: Option<PathBuf>,
+    /// Claim carrying the stream the token admits.
     #[conf(parameter, long, env, default_value = "stream")]
     stream_claim: String,
+    /// Clock skew allowed on `exp` and `nbf`.
     #[conf(
         parameter,
         long,
@@ -427,18 +698,15 @@ pub struct PlaybackAuthAppConfig {
         serde(use_value_parser)
     )]
     leeway: Duration,
+    /// Claims that must be present with these values; `iss` and `aud` are required.
     #[conf(parameter, value_parser = TomlTable::<ClaimValue>::from_str)]
     claims: Option<TomlTable<ClaimValue>>,
 }
 
 impl PlaybackAuthAppConfig {
     fn resolve(self, client: &mut LazyHttpClient) -> Result<PlaybackSettings, ConfigError> {
-        let public_key = resolve_optional_text_secret(
-            "the playback public key",
-            self.public_key.as_ref(),
-            self.public_key_file.as_ref(),
-        )?;
-        let secret = resolve_optional_text_secret(
+        let public_key = read_text("the playback public key", self.public_key.as_ref())?;
+        let secret = read_credential(
             "the playback secret",
             self.secret.as_ref(),
             self.secret_file.as_ref(),
@@ -457,8 +725,7 @@ impl PlaybackAuthAppConfig {
             }
             _ => {
                 return Err(invalid(
-                    "[auth.playback] must set exactly one of public_key, public_key_file, \
-                     jwks_url, secret, or secret_file",
+                    "[playback.auth] must set exactly one of public_key, jwks_url, or secret",
                 ));
             }
         };
@@ -492,10 +759,10 @@ fn required_string_claim(
     match claims.get(name) {
         Some(ClaimValue::String(value)) if !value.is_empty() => Ok(value.clone()),
         Some(_) => Err(invalid(format!(
-            "[auth.playback.claims] {name} must be a non-empty string"
+            "[playback.auth.claims] {name} must be a non-empty string"
         ))),
         None => Err(invalid(format!(
-            "[auth.playback.claims] must include {name}"
+            "[playback.auth.claims] must include {name}"
         ))),
     }
 }
@@ -518,17 +785,13 @@ pub struct HttpAuthAppConfig {
     timeout: Duration,
     /// Largest decision this node will read.
     #[conf(parameter, long, env, default_value = "64KiB", serde(use_value_parser))]
-    max_response_bytes: ByteSize,
-    /// Bearer credential presented to the service.
-    #[conf(
-        parameter,
-        env,
-        secret,
-        serde(deserialize_with = "rushls_config::deserialize_secret")
-    )]
-    token: Option<String>,
-    /// File containing the bearer credential presented to the service.
-    #[conf(parameter, long, env)]
+    max_response: ByteSize,
+    /// Bearer credential presented to the service: inline, `${VAR}`, or
+    /// `{ file = "/path" }`.
+    #[conf(parameter, env, secret)]
+    token: Option<TextSource>,
+    /// File holding `token`; the command-line form is always a path.
+    #[conf(parameter, long = "token", serde(skip))]
     token_file: Option<PathBuf>,
     /// Path to a PEM certificate chain this node presents to the service.
     #[conf(parameter, long, env)]
@@ -559,8 +822,8 @@ impl HttpAuthAppConfig {
                 self.timeout
             )));
         }
-        let token = resolve_optional_text_secret(
-            "the auth service token",
+        let token = read_credential(
+            "the publish auth token",
             self.token.as_ref(),
             self.token_file.as_ref(),
         )?;
@@ -568,9 +831,8 @@ impl HttpAuthAppConfig {
         Ok(HttpAuthenticator::new(
             HttpAuthConfig {
                 endpoint: Endpoint::parse(&self.url).map_err(|error| invalid(error.to_string()))?,
-                // `[accept]` itself is the unnamed default, so a response
-                // naming no policy gets it. The reserved `default` policy
-                // name is gone with the table that needed one.
+                // `[publish]` itself is the unnamed default, so a response
+                // naming no profile gets it.
                 default,
                 policies,
                 bearer: token
@@ -579,15 +841,14 @@ impl HttpAuthAppConfig {
                     .map_err(|error| invalid(error.to_string()))?,
             },
             {
-                let limit =
-                    nonzero_bytes("the maximum auth response size", self.max_response_bytes)?;
+                let limit = nonzero_bytes("publish.auth.max_response", self.max_response)?;
                 let tls = OutboundTlsAppConfig {
                     certificate: self.client_cert.clone(),
                     key: self.client_key.clone(),
                     ca: self.ca.clone(),
                 };
                 if tls.is_configured() {
-                    let tls = tls.resolve("[auth.publish]")?;
+                    let tls = tls.resolve("[publish.auth]")?;
                     let built = tls.client(self.timeout, limit)?;
                     // The watch lives as long as the resolved configuration,
                     // because dropping it stops rotations being noticed.
@@ -697,13 +958,11 @@ pub struct HookEndpointAppConfig {
     #[serde(default = "default_max_attempts")]
     max_attempts: u32,
     /// Bearer credential presented to this endpoint.
-    #[serde(default, deserialize_with = "rushls_config::deserialize_secret")]
-    token: Option<String>,
-    /// Reads the bearer credential from a mounted secret instead.
-    token_file: Option<PathBuf>,
-    #[serde(default, deserialize_with = "rushls_config::deserialize_secret")]
-    signing_secret: Option<String>,
-    signing_secret_file: Option<PathBuf>,
+    #[serde(default)]
+    token: Option<TextSource>,
+    /// `whsec_` key signing each delivery.
+    #[serde(default)]
+    signing_secret: Option<TextSource>,
     /// Path to a PEM certificate chain this node presents to this endpoint.
     client_cert: Option<PathBuf>,
     /// Path to the PEM private key for that chain.
@@ -738,16 +997,11 @@ impl HookEndpointAppConfig {
                     .map_err(|error| invalid(format!("hook `{name}`: {error}")))?,
             );
         }
-        let token = resolve_optional_text_secret(
-            &format!("the token for hook `{name}`"),
-            self.token.as_ref(),
-            self.token_file.as_ref(),
-        )?;
+        let token = read_text(&format!("the token for hook `{name}`"), self.token.as_ref())?;
 
-        let signing_secret = resolve_optional_text_secret(
+        let signing_secret = read_text(
             &format!("the signing secret for hook `{name}`"),
             self.signing_secret.as_ref(),
-            self.signing_secret_file.as_ref(),
         )?
         .map(|secret| rushls_hooks::SigningSecret::parse(&secret))
         .transpose()
@@ -903,14 +1157,14 @@ fn apply_stall(
         return Ok(());
     };
     if stall.is_zero() {
-        return Err(invalid("accept.stall must be nonzero"));
+        return Err(invalid("ingest.stall_timeout must be nonzero"));
     }
     // Sampling cannot observe a deadline shorter than its own period, so such
     // a value is not the tighter detection it looks like.
     let interval = node.session.supervision.health_interval;
     if stall < interval {
         return Err(invalid(format!(
-            "accept.stall ({stall:?}) is shorter than the {interval:?} health interval, so it \
+            "ingest.stall_timeout ({stall:?}) is shorter than the {interval:?} health interval, so it \
              cannot be observed"
         )));
     }
@@ -918,7 +1172,7 @@ fn apply_stall(
     // between keyframes.
     if stall < segment_duration {
         return Err(invalid(format!(
-            "accept.stall ({stall:?}) is shorter than the {segment_duration:?} segment duration, \
+            "ingest.stall_timeout ({stall:?}) is shorter than the {segment_duration:?} segment duration, \
              which drops publishers between ordinary keyframes"
         )));
     }
@@ -941,17 +1195,17 @@ fn startup_warnings(node: &NodeConfig, open_admission: bool) -> Vec<String> {
         || node.moq_address.is_some_and(|address| public(&address));
     if open_admission && ingest_is_public {
         warnings.push(
-            "an ingest listener is on a public address with no [auth.publish]: anyone who can \
+            "an ingest listener is on a public address with no [publish.auth]: anyone who can \
              reach it may publish"
                 .to_owned(),
         );
     }
     if node.store.maximum_streams >= usize::MAX / 2 {
-        warnings.push("capacity.streams is effectively uncapped".to_owned());
+        warnings.push("limits.streams is effectively uncapped".to_owned());
     }
     if node.session.supervision.health.stall == Duration::MAX {
         warnings.push(
-            "accept.stall is off: a publisher that goes quiet holds its stream name until it \
+            "ingest.stall_timeout is off: a publisher that goes quiet holds its stream name until it \
              disconnects"
                 .to_owned(),
         );
@@ -959,132 +1213,152 @@ fn startup_warnings(node: &NodeConfig, open_admission: bool) -> Vec<String> {
     warnings
 }
 
+/// Who may publish and what they may send.
+///
+/// The table itself is the default profile. `[publish.profile.<name>]` holds
+/// named alternatives an admission service may select, and `[publish.auth]`
+/// configures that service. A profile uses exactly these keys, so reading one
+/// table answers what it admits.
 #[derive(Conf)]
 #[conf(serde)]
-pub struct AcceptAppConfig {
+pub struct PublishAppConfig {
     /// Reject timing violations and dependent segment starts.
     /// False permits bounded, reported gap recovery.
     #[conf(parameter, long, env, default_value = "true")]
     strict: bool,
-    /// Throttle applied to a publisher offering media faster than `pace`.
-    ///
-    /// Omit the table for no ceiling, which is the compiled default: a
-    /// publisher pushing as fast as its link allows is taken to be asking for
-    /// exactly that.
-    #[conf(flatten, prefix)]
-    ceiling: Option<CeilingAppConfig>,
-    /// Minimum rate a publisher must sustain. Omit the table for no floor.
-    #[conf(flatten, prefix)]
-    floor: Option<FloorAppConfig>,
-    /// How long nothing usable may arrive before the publisher is dropped.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "12s",
-        value_parser = parse_optional_duration,
-        serde(use_value_parser)
-    )]
-    stall: OptionalDuration,
     /// Whether a second publisher may replace the one holding a stream name.
     ///
     /// Refusal by default, because silent replacement turns an encoder
     /// reconnect or a leaked credential into a hijack with no signal. The cost
-    /// is a reconnect blackout after a half-open socket, bounded by `stall`.
+    /// is a reconnect blackout after a half-open socket, bounded by
+    /// `ingest.stall_timeout`.
     #[conf(parameter, long, env, default_value = "false")]
     takeover: bool,
-    #[conf(parameter, value_parser = TomlValue::<VideoAcceptValue>::from_str)]
+    /// Media pace as multiples of wall clock:
+    /// `{ max = "1x", burst = "10s", min = "0.5x", window = "30s" }`.
+    ///
+    /// `max` throttles a publisher running ahead of realtime, allowing `burst`
+    /// of head start. `min` disconnects one averaging slower than it across
+    /// any `window`. Omit either half, or the whole value, for no limit.
+    #[conf(parameter, long, env, value_parser = TomlValue::<PublishRateValue>::from_str)]
+    rate: Option<TomlValue<PublishRateValue>>,
+    /// Video predicates: codecs, resolution, frame_rate, tracks.
+    #[conf(parameter, long, env, value_parser = TomlValue::<VideoAcceptValue>::from_str)]
     video: Option<TomlValue<VideoAcceptValue>>,
-    #[conf(parameter, value_parser = TomlValue::<AudioAcceptValue>::from_str)]
+    /// Audio predicates: codecs, sample_rate, channels, tracks.
+    #[conf(parameter, long, env, value_parser = TomlValue::<AudioAcceptValue>::from_str)]
     audio: Option<TomlValue<AudioAcceptValue>>,
-    #[conf(parameter, value_parser = TomlValue::<SubtitleAcceptValue>::from_str)]
+    /// Subtitle predicates: codecs, tracks.
+    #[conf(parameter, long, env, value_parser = TomlValue::<SubtitleAcceptValue>::from_str)]
     subtitles: Option<TomlValue<SubtitleAcceptValue>>,
-    /// Named alternatives an admission response may select by name.
-    #[conf(parameter, value_parser = TomlTable::<PolicyValue>::from_str)]
-    policy: Option<TomlTable<PolicyValue>>,
+    /// Named alternatives, selected by an auth response `{"profile": "<name>"}`.
+    #[conf(parameter, value_parser = TomlTable::<ProfileValue>::from_str)]
+    profile: Option<TomlTable<ProfileValue>>,
+    /// External admission service. When omitted, anyone who can reach an
+    /// ingest listener may publish under the default profile.
+    #[conf(flatten, prefix)]
+    auth: Option<HttpAuthAppConfig>,
 }
 
-impl AcceptAppConfig {
-    /// The default policy, and every named alternative resolved beside it.
+impl PublishAppConfig {
+    /// The default profile, and every named alternative resolved beside it.
     fn resolve(&self) -> Result<(StreamPolicy, BTreeMap<String, StreamPolicy>), ConfigError> {
-        let default = self.base()?;
-        let mut policies = BTreeMap::new();
+        let default = ProfileValue {
+            strict: Some(self.strict),
+            takeover: Some(self.takeover),
+            rate: self.rate.as_ref().map(|value| value.0.clone()),
+            video: self.video.as_ref().map(|value| value.0.clone()),
+            audio: self.audio.as_ref().map(|value| value.0.clone()),
+            subtitles: self.subtitles.as_ref().map(|value| value.0.clone()),
+        }
+        .resolve("publish")?;
+        let mut profiles = BTreeMap::new();
         for (name, configured) in self
-            .policy
+            .profile
             .as_ref()
             .map(|table| &table.0)
             .into_iter()
             .flatten()
         {
             if name.trim().is_empty() {
-                return Err(invalid("an accept policy name must not be empty"));
+                return Err(invalid("a publish profile name must not be empty"));
             }
-            // A policy replaces `[accept]` wholesale rather than inheriting
+            // A profile replaces `[publish]` wholesale rather than inheriting
             // from it: reading one table must answer what it admits, without
             // replaying a merge against another.
-            policies.insert(name.clone(), configured.resolve(name)?);
+            profiles.insert(
+                name.clone(),
+                configured.resolve(&format!("publish.profile.{name}"))?,
+            );
         }
-        Ok((default, policies))
-    }
-
-    fn base(&self) -> Result<StreamPolicy, ConfigError> {
-        let policy = PolicyValue {
-            strict: Some(self.strict),
-            ceiling: self.ceiling.as_ref().map(CeilingValue::from),
-            floor: self.floor.as_ref().map(FloorValue::from),
-            takeover: Some(self.takeover),
-            video: self.video.as_ref().map(|value| value.0.clone()),
-            audio: self.audio.as_ref().map(|value| value.0.clone()),
-            subtitles: self.subtitles.as_ref().map(|value| value.0.clone()),
-        };
-        policy.resolve("accept")
+        Ok((default, profiles))
     }
 }
 
-/// Shared publisher buffering, independent of retained media storage.
+/// How many publishers and streams this node holds at once.
 #[derive(Conf)]
 #[conf(serde)]
-pub struct PipelineAppConfig {
-    /// Accounted pipeline memory shared by one publisher's stages.
+pub struct LimitsAppConfig {
+    /// Concurrent ingest sessions.
+    #[conf(parameter, long, env, default_value = "256")]
+    publishers: usize,
+    /// Streams held at once: live ones, plus ended ones still inside
+    /// `hls.window`. When full, a new stream name is refused.
+    ///
+    /// Separate from `publishers` because they answer different questions: a
+    /// publisher is an ingest session, a stream is a named presentation in the
+    /// store. Once the window is long the two decouple.
+    #[conf(parameter, long, env, default_value = "1024")]
+    streams: usize,
+}
+
+impl LimitsAppConfig {
+    fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
+        if self.publishers == 0 {
+            return Err(invalid("limits.publishers must be at least one"));
+        }
+        if self.streams == 0 {
+            return Err(invalid("limits.streams must be at least one"));
+        }
+        node.maximum_sessions = self.publishers;
+        node.store.maximum_streams = self.streams;
+        Ok(())
+    }
+}
+
+/// Memory budgets. Worst case is `limits.publishers × per_publisher +
+/// limits.streams × per_stream`, capped by `total` when it is set.
+#[derive(Conf)]
+#[conf(serde)]
+pub struct MemoryAppConfig {
+    /// Memory this node may commit across publishers and streams, or
+    /// "unlimited".
+    ///
+    /// Each active publisher commits `per_publisher` and each stored stream
+    /// `per_stream`. A publication that would take the committed total past
+    /// this is refused, so the budgets below can never add up to more.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "unlimited",
+        value_parser = parse_optional_bytes,
+        serde(use_value_parser)
+    )]
+    total: OptionalBytes,
+    /// Media one publisher holds in flight before storage, or "unlimited".
+    /// Minimum 64MiB, which fits a maximum-sized packet and its output.
     #[conf(
         parameter,
         long,
         env,
         default_value = "128MiB",
+        value_parser = parse_optional_bytes,
         serde(use_value_parser)
     )]
-    memory_per_publisher: ByteSize,
-}
-impl PipelineAppConfig {
-    fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
-        let bytes = nonzero_bytes("pipeline.memory_per_publisher", self.memory_per_publisher)?;
-        if bytes < crate::domain::PipelineBudget::MIN_LIMIT {
-            return Err(invalid(
-                "pipeline.memory_per_publisher must be at least 64MiB to fit a maximum-sized packet and serialization copies",
-            ));
-        }
-        node.session.memory_per_publisher = Some(bytes);
-        Ok(())
-    }
-}
-
-#[derive(Conf)]
-#[conf(serde)]
-pub struct CapacityAppConfig {
-    /// Concurrent ingest sessions.
-    #[conf(parameter, long, env, default_value = "256")]
-    publishers: usize,
-    /// Streams live, plus those still held by `retain`.
-    ///
-    /// Separate from `publishers` because they answer different questions: a
-    /// publisher is an ingest session, a stream is a named presentation in the
-    /// store. Once `retain` can be long the two decouple hard.
-    #[conf(parameter, long, env, default_value = "1024")]
-    streams: usize,
-    /// Retained media and cached manifests for one stream.
-    ///
-    /// Disk-backed streams reserve one eighth for manifests. Active publishers
-    /// also use the separate shared pipeline memory budget.
+    per_publisher: OptionalBytes,
+    /// Stored media and cached playlists for one stream. With `[disk]`, one
+    /// eighth is kept for playlists and older media spills to disk.
     #[conf(
         parameter,
         long,
@@ -1092,44 +1366,80 @@ pub struct CapacityAppConfig {
         default_value = "512MiB",
         serde(use_value_parser)
     )]
-    memory_per_stream: ByteSize,
-    /// Overflow of the same retain window. Omit to stay in memory.
+    per_stream: ByteSize,
+}
+
+impl MemoryAppConfig {
+    fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
+        let per_stream = nonzero_bytes("memory.per_stream", self.per_stream)?;
+        node.store.retention.maximum_payload_bytes = per_stream;
+        let per_publisher = self
+            .per_publisher
+            .0
+            .map(|limit| nonzero_bytes("memory.per_publisher", limit))
+            .transpose()?;
+        if per_publisher.is_some_and(|bytes| bytes < crate::domain::PipelineBudget::MIN_LIMIT) {
+            return Err(invalid(
+                "memory.per_publisher must be at least 64MiB to fit a maximum-sized packet and its output",
+            ));
+        }
+        node.session.memory_per_publisher = per_publisher;
+        node.memory_total = match self.total.0 {
+            None => None,
+            Some(total) => {
+                let total = nonzero_bytes("memory.total", total)?;
+                // Committing an unbounded publisher against a bounded total
+                // would make the total a fiction.
+                let Some(per_publisher) = per_publisher else {
+                    return Err(invalid(
+                        "memory.total needs a finite memory.per_publisher to commit per publisher",
+                    ));
+                };
+                if total < per_publisher.saturating_add(per_stream) {
+                    return Err(invalid(format!(
+                        "memory.total ({}) cannot hold one publisher and its stream \
+                         (per_publisher + per_stream = {})",
+                        ByteSize::b(total as u64),
+                        ByteSize::b(per_publisher.saturating_add(per_stream) as u64),
+                    )));
+                }
+                Some(total)
+            }
+        };
+        Ok(())
+    }
+}
+
+/// Optional disk overflow: older window media moves here once memory is full.
+#[derive(Conf)]
+#[conf(serde)]
+pub struct DiskAppConfig {
+    /// Disk for one stream's older media. Setting it enables spilling; omit
+    /// to stay in memory.
     #[conf(parameter, long, env, serde(use_value_parser))]
-    disk_per_stream: Option<ByteSize>,
-    /// Generation directory for spilled media. Defaults to the platform cache.
+    per_stream: Option<ByteSize>,
+    /// Directory for spilled media. Defaults to the platform cache.
     #[conf(parameter, long, env)]
     dir: Option<PathBuf>,
 }
 
-impl CapacityAppConfig {
+impl DiskAppConfig {
     fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
-        if self.publishers == 0 {
-            return Err(invalid("capacity.publishers must be at least one"));
-        }
-        if self.streams == 0 {
-            return Err(invalid("capacity.streams must be at least one"));
-        }
-        node.maximum_sessions = self.publishers;
-        node.store.maximum_streams = self.streams;
-        node.store.retention.maximum_payload_bytes =
-            nonzero_bytes("capacity.memory_per_stream", self.memory_per_stream)?;
-        node.store.disk = match (&self.disk_per_stream, &self.dir) {
+        node.store.disk = match (&self.per_stream, &self.dir) {
             (None, None) => None,
             (Some(bytes), directory) => Some(DiskLimits {
                 directory: match directory {
                     Some(directory) => directory.clone(),
                     None => paths::default_disk_directory().ok_or_else(|| {
                         invalid(
-                            "could not determine a cache directory for disk overflow; set capacity.dir",
+                            "could not determine a cache directory for disk overflow; set disk.dir",
                         )
                     })?,
                 },
-                maximum_payload_bytes: nonzero_bytes("capacity.disk_per_stream", *bytes)?,
+                maximum_payload_bytes: nonzero_bytes("disk.per_stream", *bytes)?,
             }),
             (None, Some(_)) => {
-                return Err(invalid(
-                    "capacity.disk_per_stream is required when dir is set",
-                ));
+                return Err(invalid("disk.dir needs disk.per_stream to enable spilling"));
             }
         };
         Ok(())
@@ -1191,101 +1501,71 @@ impl TryFrom<String> for PaceValue {
     }
 }
 
-fn parse_pace(value: &str) -> Result<PaceValue, String> {
-    PaceValue::from_str(value)
-}
-
-/// Flattened `[accept.ceiling]`, so `--accept-ceiling-pace` and
-/// `--accept-ceiling-burst` exist as ordinary flags.
+/// `rate = { max = "1x", burst = "10s", min = "0.5x", window = "30s" }`.
 ///
-/// `pace` is required once this table is present. `burst` is not: omitted
-/// means an empty bucket, which is still realtime at `pace`.
-#[derive(Clone, Copy, Conf)]
-#[conf(serde)]
-pub struct CeilingAppConfig {
-    /// Long-run rate the bucket refills at, as a multiple of wall clock.
-    #[conf(
-        parameter,
-        long,
-        env,
-        value_parser = parse_pace,
-        serde(use_value_parser)
-    )]
-    pace: PaceValue,
-    /// Head start, and the most media time the bucket may hold.
-    ///
-    /// Omit or `"0s"` for no head start: a publisher may not run ahead of
-    /// wall clock. Idle time still cannot bank more than this.
-    #[conf(
-        parameter,
-        long,
-        env,
-        value_parser = rushls_config::parse_duration,
-        serde(use_value_parser)
-    )]
-    burst: Option<Duration>,
-}
-
+/// One value rather than separate ceiling and floor tables: both halves are
+/// the same kind of quantity, and they constrain each other.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CeilingValue {
-    pace: PaceValue,
-    #[serde(default)]
+struct PublishRateValue {
+    /// Long-run ceiling a publisher is throttled to.
+    max: Option<PaceValue>,
+    /// Head start `max` allows, and the most media time idle can bank.
     burst: Option<String>,
+    /// Floor below which a publisher is disconnected.
+    min: Option<PaceValue>,
+    /// Averaging window for `min`. The first one is startup grace.
+    window: Option<String>,
 }
 
-impl From<&CeilingAppConfig> for CeilingValue {
-    fn from(value: &CeilingAppConfig) -> Self {
-        Self {
-            pace: value.pace,
-            burst: value
-                .burst
-                .map(|duration| humantime::format_duration(duration).to_string()),
+impl PublishRateValue {
+    fn resolve(&self) -> Result<(Option<Ceiling>, Option<Floor>), String> {
+        let duration = |label: &str, value: &str| {
+            humantime::parse_duration(value).map_err(|error| format!("rate.{label} {error}"))
+        };
+        let ceiling = match (self.max, &self.burst) {
+            (Some(max), burst) => Some(Ceiling {
+                pace: max.0,
+                // No head start: `max` is permission to continue, not to lead.
+                burst: burst
+                    .as_deref()
+                    .map(|burst| duration("burst", burst))
+                    .transpose()?
+                    .unwrap_or(Duration::ZERO),
+            }),
+            (None, Some(_)) => return Err("rate.burst needs rate.max".into()),
+            (None, None) => None,
+        };
+        let floor = match (self.min, &self.window) {
+            (Some(min), Some(window)) => {
+                let window = duration("window", window)?;
+                if window.is_zero() {
+                    return Err("rate.window must be nonzero".into());
+                }
+                Some(Floor {
+                    pace: min.0,
+                    window,
+                })
+            }
+            (Some(_), None) => {
+                return Err("rate.min needs rate.window to average over".into());
+            }
+            (None, Some(_)) => return Err("rate.window needs rate.min".into()),
+            (None, None) => None,
+        };
+        // A ceiling holding a publisher at exactly its floor makes ordinary
+        // jitter fatal, and no value of the pair is usable, so this is a
+        // refusal rather than a warning.
+        if let (Some(ceiling), Some(floor)) = (ceiling, floor)
+            && !floor.pace.is_slower_than(ceiling.pace)
+        {
+            return Err(
+                "rate.min must be slower than rate.max, or the ceiling holds the publisher \
+                 at exactly the floor and ordinary jitter trips it"
+                    .into(),
+            );
         }
-    }
-}
-
-/// Flattened `[accept.floor]`, so `--accept-floor-pace` and
-/// `--accept-floor-window` exist as ordinary flags.
-///
-/// Both fields are required once this table is present: a rate without a
-/// window cannot be judged, and a window without a rate has nothing to judge.
-#[derive(Clone, Copy, Conf)]
-#[conf(serde)]
-pub struct FloorAppConfig {
-    /// Minimum media-time progress against wall-time, averaged over `window`.
-    #[conf(
-        parameter,
-        long,
-        env,
-        value_parser = parse_pace,
-        serde(use_value_parser)
-    )]
-    pace: PaceValue,
-    /// Averaging window. The first one is startup grace.
-    #[conf(
-        parameter,
-        long,
-        env,
-        value_parser = rushls_config::parse_duration,
-        serde(use_value_parser)
-    )]
-    window: Duration,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FloorValue {
-    pace: PaceValue,
-    window: String,
-}
-
-impl From<&FloorAppConfig> for FloorValue {
-    fn from(value: &FloorAppConfig) -> Self {
-        Self {
-            pace: value.pace,
-            window: humantime::format_duration(value.window).to_string(),
-        }
+        Ok((ceiling, floor))
     }
 }
 
@@ -1506,20 +1786,19 @@ struct SubtitleAcceptValue {
     tracks: Option<BoundsValue<usize>>,
 }
 
-/// One complete accept set, whether the default or a named alternative.
+/// One complete publish profile, whether the default or a named alternative.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PolicyValue {
+struct ProfileValue {
     strict: Option<bool>,
-    ceiling: Option<CeilingValue>,
-    floor: Option<FloorValue>,
     takeover: Option<bool>,
+    rate: Option<PublishRateValue>,
     video: Option<VideoAcceptValue>,
     audio: Option<AudioAcceptValue>,
     subtitles: Option<SubtitleAcceptValue>,
 }
 
-impl PolicyValue {
+impl ProfileValue {
     fn input_mode(&self) -> crate::domain::InputMode {
         if self.strict.unwrap_or(true) {
             crate::domain::InputMode::Strict
@@ -1533,40 +1812,8 @@ impl PolicyValue {
         let mut policy = StreamPolicy::permissive();
         policy.input_mode = self.input_mode();
 
-        if let Some(ceiling) = &self.ceiling {
-            let burst = match &ceiling.burst {
-                Some(value) => humantime::parse_duration(value)
-                    .map_err(|error| where_(format!("ceiling.burst {error}")))?,
-                // No head start: `pace` is permission to continue, not to lead.
-                None => Duration::ZERO,
-            };
-            policy.ceiling = Some(Ceiling {
-                pace: ceiling.pace.0,
-                burst,
-            });
-        }
-        if let Some(floor) = &self.floor {
-            let window = humantime::parse_duration(&floor.window)
-                .map_err(|error| where_(format!("floor.window {error}")))?;
-            if window.is_zero() {
-                return Err(where_("floor.window must be nonzero".to_owned()));
-            }
-            // A ceiling holding a publisher at exactly its floor makes
-            // ordinary jitter fatal, and no value of the pair is usable, so
-            // this is a refusal rather than a warning.
-            if let Some(ceiling) = policy.ceiling
-                && !floor.pace.0.is_slower_than(ceiling.pace)
-            {
-                return Err(where_(
-                    "floor.pace must be slower than ceiling.pace, or the ceiling holds the \
-                     publisher at exactly the floor and ordinary jitter trips it"
-                        .to_owned(),
-                ));
-            }
-            policy.floor = Some(Floor {
-                pace: floor.pace.0,
-                window,
-            });
+        if let Some(rate) = &self.rate {
+            (policy.ceiling, policy.floor) = rate.resolve().map_err(where_)?;
         }
         if let Some(takeover) = self.takeover {
             policy.takeovers = if takeover {
@@ -1654,25 +1901,22 @@ fn resolve_bounds<T, U>(
     })
 }
 
+/// How publishers connect: one sub-table per protocol, with the liveness
+/// deadlines every protocol shares.
 #[derive(Conf)]
 #[conf(serde)]
-pub struct RtmpAppConfig {
-    /// Address receiving RTMP publishers.
-    #[conf(parameter, long, env, default_value = "0.0.0.0:1935")]
-    pub listen: SocketAddr,
-    /// How long an established publisher may produce nothing before its
-    /// session is closed.
+pub struct IngestAppConfig {
+    /// How long an established connection may carry nothing before it is
+    /// closed, or "off" on a trusted link.
     ///
-    /// One operator-facing value. The handshake gets its own, tighter limit,
-    /// derived rather than configured: the two phases are not equivalent and
-    /// sizing them together would be wrong in one direction or the other. A
-    /// handshake covers an unauthenticated peer, which is the cheapest way to
-    /// hold a socket open; an established session covers a publisher that has
-    /// proved itself, where a tight limit drops a legitimate stream between
-    /// keyframes.
-    ///
-    /// Exposing both invites exactly the pairing the derivation prevents: a
-    /// generous session timeout accidentally applied to unauthenticated peers.
+    /// One value for every protocol. The handshake gets its own, tighter
+    /// limit, derived rather than configured: a handshake covers an
+    /// unauthenticated peer, which is the cheapest way to hold a socket open,
+    /// while an established session covers a publisher that has proved
+    /// itself, where a tight limit drops a legitimate stream between
+    /// keyframes. Exposing both would invite a generous session limit being
+    /// applied to unauthenticated peers. SRT requires this to exceed its
+    /// receive latency.
     #[conf(
         parameter,
         long,
@@ -1681,58 +1925,195 @@ pub struct RtmpAppConfig {
         value_parser = parse_optional_duration,
         serde(use_value_parser)
     )]
-    timeout: OptionalDuration,
+    idle_timeout: OptionalDuration,
+    /// How long a connected publisher may deliver no usable media before it
+    /// is dropped, or "off".
+    ///
+    /// Unlike `idle_timeout`, bytes may still be arriving: keepalives,
+    /// metadata, or media that cannot be used. Must cover one segment, or a
+    /// publisher between keyframes is dropped.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "12s",
+        value_parser = parse_optional_duration,
+        serde(use_value_parser)
+    )]
+    stall_timeout: OptionalDuration,
+    #[conf(flatten, prefix)]
+    rtmp: RtmpAppConfig,
+    #[conf(flatten, prefix)]
+    srt: SrtAppConfig,
+    #[conf(flatten, prefix)]
+    moq: MoqAppConfig,
 }
 
 /// The unauthenticated phase is never more patient than a few seconds, however
 /// generous an established session is allowed to be.
 const MAXIMUM_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-impl RtmpAppConfig {
-    /// Derives the per-phase timeouts from the one operator-facing value.
-    fn timeouts(&self) -> RtmpTimeouts {
-        let session = self.timeout.0;
-        RtmpTimeouts {
-            // The lesser of the session limit and the constant: a disabled
-            // session timeout still leaves the handshake bounded, because an
-            // unauthenticated peer is the one that should never be trusted to
-            // hold a socket indefinitely.
-            handshake_read: Some(session.map_or(MAXIMUM_HANDSHAKE_TIMEOUT, |session| {
-                session.min(MAXIMUM_HANDSHAKE_TIMEOUT)
-            })),
-            session_read: session,
-            write: session,
-        }
-    }
-
-    fn apply(&self, node: &mut NodeConfig, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
-        let timeouts = self.timeouts();
-
+impl IngestAppConfig {
+    fn apply(
+        &self,
+        node: &mut NodeConfig,
+        tls: Option<&TlsFiles>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), ConfigError> {
+        let idle = self.idle_timeout.0;
         // A session read shorter than a keyframe interval drops publishers
         // mid-GOP. Nothing here knows the publisher's cadence, so this only
         // catches values too small to be deliberate.
-        if let Some(session) = timeouts.session_read
-            && session < Duration::from_secs(1)
+        if let Some(idle) = idle
+            && idle < Duration::from_secs(1)
         {
-            return Err(ConfigError::Invalid(format!(
-                "the RTMP timeout ({session:?}) is below one second, which drops publishers \
+            return Err(invalid(format!(
+                "ingest.idle_timeout ({idle:?}) is below one second, which drops publishers \
                  between ordinary keyframes"
             )));
         }
-
-        node.rtmp.timeouts = timeouts;
-
-        // Disabling a timeout is legitimate on a trusted link and a liability
-        // on a public one, and nothing here can tell which this is. Say so
-        // rather than let an unbounded wait be invisible.
-        if timeouts.session_read.is_none() {
+        // The lesser of the session limit and the constant: a disabled session
+        // timeout still leaves the handshake bounded, because an
+        // unauthenticated peer should never be trusted to hold a socket.
+        let handshake = idle.map_or(MAXIMUM_HANDSHAKE_TIMEOUT, |idle| {
+            idle.min(MAXIMUM_HANDSHAKE_TIMEOUT)
+        });
+        if idle.is_none() {
+            // Legitimate on a trusted link and a liability on a public one;
+            // nothing here can tell which, so say so.
             warnings.push(
-                "the RTMP timeout is disabled: a publisher that stops responding holds its \
+                "ingest.idle_timeout is off: a publisher that stops responding holds its \
                  connection until it is closed from the other end"
                     .to_owned(),
             );
         }
 
+        node.rtmp.timeouts = RtmpTimeouts {
+            handshake_read: Some(handshake),
+            session_read: idle,
+            write: idle,
+        };
+        self.srt.apply(node, idle)?;
+        self.moq.apply(node, idle, handshake, tls)?;
+        Ok(())
+    }
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct RtmpAppConfig {
+    /// Address receiving RTMP publishers.
+    #[conf(parameter, long, env, default_value = "0.0.0.0:1935")]
+    pub listen: SocketAddr,
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct SrtAppConfig {
+    /// Address receiving SRT publishers. SRT currently requires IPv4.
+    #[conf(parameter, long, env, default_value = "0.0.0.0:9000")]
+    pub listen: SocketAddr,
+    /// SRT receive latency; increase for unstable or long-distance networks.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "120ms",
+        value_parser = rushls_config::parse_duration,
+        serde(use_value_parser)
+    )]
+    latency: Duration,
+    /// Optional passphrase: inline, `${VAR}`, or `{ file = "/path" }`.
+    /// Absent accepts unencrypted SRT.
+    #[conf(parameter, env, secret)]
+    passphrase: Option<TextSource>,
+    /// File holding `passphrase`; the command-line form is always a path.
+    #[conf(parameter, long = "passphrase", serde(skip))]
+    passphrase_file: Option<PathBuf>,
+    /// Encryption strength used when a passphrase is configured.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "aes256",
+        serde(use_value_parser)
+    )]
+    encryption: SrtKeyLengthValue,
+}
+
+impl SrtAppConfig {
+    fn apply(&self, node: &mut NodeConfig, idle: Option<Duration>) -> Result<(), ConfigError> {
+        if self.latency.is_zero() {
+            return Err(invalid("ingest.srt.latency must be nonzero"));
+        }
+        // An idle deadline inside the receiver's own latency window would fire
+        // on packets the transport is still legitimately waiting to reorder.
+        if let Some(idle) = idle
+            && idle <= self.latency
+        {
+            return Err(invalid(format!(
+                "ingest.idle_timeout ({idle:?}) must exceed ingest.srt.latency ({:?})",
+                self.latency
+            )));
+        }
+        let passphrase = read_credential(
+            "the SRT passphrase",
+            self.passphrase.as_ref(),
+            self.passphrase_file.as_ref(),
+        )?;
+        node.srt.latency = self.latency;
+        // SRT always keeps a liveness deadline; "off" makes it unreachable.
+        node.srt.peer_idle_timeout = idle.unwrap_or(Duration::MAX);
+        node.srt.encryption = passphrase
+            .map(|passphrase| SrtEncryption::new(passphrase, self.encryption.into()))
+            .transpose()
+            .map_err(ConfigError::SrtEncryption)?;
+        Ok(())
+    }
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct MoqAppConfig {
+    /// Address receiving WebTransport publishers, or "off". Needs `[tls]`:
+    /// WebTransport has no cleartext form, which is why it is off by default.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "off",
+        value_parser = parse_optional_address,
+        serde(use_value_parser)
+    )]
+    pub listen: OptionalAddress,
+}
+
+impl MoqAppConfig {
+    fn apply(
+        &self,
+        node: &mut NodeConfig,
+        idle: Option<Duration>,
+        handshake: Duration,
+        tls: Option<&TlsFiles>,
+    ) -> Result<(), ConfigError> {
+        node.moq_address = self.listen.0;
+        node.moq.idle_timeout = idle;
+        node.moq.handshake_timeout = handshake;
+        if node.moq_address.is_some() {
+            let tls =
+                tls.ok_or_else(|| invalid("ingest.moq needs [tls] with a certificate and key"))?;
+            // handshake_timeout / maximum_pending_handshakes are unused by the
+            // QUIC endpoint: idle and pending-publisher budgets live on
+            // MoqConfig and IngestListener. They exist because TlsSettings is
+            // shared with the HTTPS listener.
+            node.moq.tls = Some(TlsSettings {
+                certificate: tls.cert.clone(),
+                key: tls.key.clone(),
+                handshake_timeout: handshake,
+                maximum_pending_handshakes: 256,
+                ..TlsSettings::default()
+            });
+        }
         Ok(())
     }
 }
@@ -1745,6 +2126,31 @@ impl RtmpAppConfig {
 /// which reads as a mistake and behaves like one if it is ever reached.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OptionalDuration(pub Option<Duration>);
+
+/// A byte limit that may be explicitly lifted.
+///
+/// Like [`OptionalDuration`]'s "off": a trusted deployment may reasonably opt
+/// out of enforcement, and spelling that as an absurd number reads as a
+/// mistake. Usage is still accounted and reported either way.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OptionalBytes(pub Option<ByteSize>);
+
+impl std::fmt::Display for OptionalBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(bytes) => write!(formatter, "{bytes}"),
+            None => formatter.write_str("unlimited"),
+        }
+    }
+}
+
+fn parse_optional_bytes(value: &str) -> Result<OptionalBytes, String> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("unlimited") {
+        return Ok(OptionalBytes(None));
+    }
+    trimmed.parse().map(|bytes| OptionalBytes(Some(bytes)))
+}
 
 impl std::fmt::Display for OptionalDuration {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1794,192 +2200,6 @@ fn parse_optional_duration(value: &str) -> Result<OptionalDuration, String> {
 
 #[derive(Conf)]
 #[conf(serde)]
-pub struct SrtAppConfig {
-    /// Address receiving SRT publishers.
-    #[conf(parameter, long, env, default_value = "0.0.0.0:9000")]
-    pub listen: SocketAddr,
-    /// SRT receive latency; increase for unstable or long-distance networks.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "120ms",
-        value_parser = rushls_config::parse_duration,
-        serde(use_value_parser)
-    )]
-    latency: Duration,
-    /// How long an SRT peer may send nothing before its session is dropped.
-    ///
-    /// Deliberately not folded into the RTMP `timeout`: SRT is connectionless
-    /// and keeps its own keepalive, so this bounds a protocol-level idle
-    /// rather than a stalled socket read. Sharing a knob would imply the two
-    /// move together, and they should not.
-    ///
-    /// Bounded below by `latency`: a deadline inside the receiver's own
-    /// reordering window fires on packets the transport is still legitimately
-    /// waiting for, which is why raising `latency` for a long-haul link
-    /// without raising this is refused rather than tolerated.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "5s",
-        value_parser = rushls_config::parse_duration,
-        serde(use_value_parser)
-    )]
-    timeout: Duration,
-    /// Optional passphrase; absent accepts unencrypted SRT.
-    #[conf(
-        parameter,
-        env,
-        secret,
-        serde(deserialize_with = "rushls_config::deserialize_secret")
-    )]
-    passphrase: Option<String>,
-    /// File containing the optional SRT passphrase.
-    #[conf(parameter, long, env)]
-    passphrase_file: Option<PathBuf>,
-    /// Encryption strength used when a passphrase is configured.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "aes256",
-        serde(use_value_parser)
-    )]
-    encryption: SrtKeyLengthValue,
-}
-
-impl SrtAppConfig {
-    fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
-        if self.latency.is_zero() {
-            return Err(invalid("SRT latency must be nonzero"));
-        }
-        // An idle deadline inside the receiver's own latency window would fire
-        // on packets the transport is still legitimately waiting to reorder.
-        if self.timeout <= self.latency {
-            return Err(invalid(format!(
-                "the SRT timeout ({:?}) must exceed the receive latency ({:?})",
-                self.timeout, self.latency
-            )));
-        }
-        let passphrase = resolve_optional_text_secret(
-            "SRT passphrase",
-            self.passphrase.as_ref(),
-            self.passphrase_file.as_ref(),
-        )?;
-        node.srt.latency = self.latency;
-        node.srt.peer_idle_timeout = self.timeout;
-        node.srt.encryption = passphrase
-            .as_ref()
-            .map(|passphrase| SrtEncryption::new(passphrase.clone(), self.encryption.into()))
-            .transpose()
-            .map_err(ConfigError::SrtEncryption)?;
-        Ok(())
-    }
-}
-
-#[derive(Conf)]
-#[conf(serde)]
-pub struct MoqAppConfig {
-    /// Address receiving WebTransport publishers, or `"off"` to leave MOQ
-    /// unbound. Off is the compiled default: a process can boot without
-    /// certificates, which this listener cannot.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "off",
-        value_parser = parse_optional_address,
-        serde(use_value_parser)
-    )]
-    pub listen: OptionalAddress,
-    /// How long an established publisher may produce nothing before its
-    /// session is closed.
-    ///
-    /// One operator-facing value, the same derivation as `[rtmp] timeout`: the
-    /// handshake is never more patient than a few seconds, even when this is
-    /// `"off"`. QUIC idle is the established-session side; SETUP/CONNECT is
-    /// the unauthenticated one.
-    #[conf(
-        parameter,
-        long,
-        env,
-        default_value = "10s",
-        value_parser = parse_optional_duration,
-        serde(use_value_parser)
-    )]
-    timeout: OptionalDuration,
-    /// Path to a PEM certificate chain, leaf first. Required when `listen` is
-    /// on: WebTransport has no cleartext form.
-    #[conf(parameter, long, env)]
-    cert: Option<PathBuf>,
-    /// Path to a PEM private key. Required with `cert` when `listen` is
-    /// on.
-    #[conf(parameter, long, env)]
-    key: Option<PathBuf>,
-}
-
-impl MoqAppConfig {
-    fn apply(&self, node: &mut NodeConfig, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
-        node.moq_address = self.listen.0;
-        node.moq.idle_timeout = self.timeout.0;
-        // The lesser of the session limit and the constant: a disabled session
-        // timeout still leaves SETUP bounded, because an unauthenticated peer
-        // is the one that should never be trusted to hold a socket indefinitely.
-        node.moq.handshake_timeout = self.timeout.0.map_or(MAXIMUM_HANDSHAKE_TIMEOUT, |session| {
-            session.min(MAXIMUM_HANDSHAKE_TIMEOUT)
-        });
-
-        if let Some(idle) = node.moq.idle_timeout
-            && idle < Duration::from_secs(1)
-        {
-            return Err(ConfigError::Invalid(format!(
-                "the MOQ timeout ({idle:?}) is below one second, which drops publishers \
-                 between ordinary keyframes"
-            )));
-        }
-
-        if node.moq_address.is_some() && node.moq.idle_timeout.is_none() {
-            warnings.push(
-                "the MOQ timeout is disabled: a publisher that stops responding holds its \
-                 connection until it is closed from the other end"
-                    .to_owned(),
-            );
-        }
-
-        if node.moq_address.is_some() {
-            let (certificate, key) = match (&self.cert, &self.key) {
-                (Some(certificate), Some(key)) => (certificate.clone(), key.clone()),
-                (None, None) => {
-                    return Err(invalid("a MOQ listener needs a certificate and key"));
-                }
-                (Some(_), None) => {
-                    return Err(invalid("[moq] sets cert without key"));
-                }
-                (None, Some(_)) => {
-                    return Err(invalid("[moq] sets key without cert"));
-                }
-            };
-            // handshake_timeout / maximum_pending_handshakes are unused by the
-            // QUIC endpoint: idle and pending-publisher budgets live on MoqConfig
-            // and IngestListener. They exist because TlsSettings is shared with
-            // the HTTPS listener.
-            node.moq.tls = Some(TlsSettings {
-                certificate,
-                key,
-                handshake_timeout: node.moq.handshake_timeout,
-                maximum_pending_handshakes: 256,
-                ..TlsSettings::default()
-            });
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Conf)]
-#[conf(serde)]
 pub struct HlsAppConfig {
     /// Publish keyframe playlists for fast seeking and scrubbing through CMAF video.
     #[conf(
@@ -1990,19 +2210,36 @@ pub struct HlsAppConfig {
         default_value = "true"
     )]
     scrubbing: bool,
-    /// Preferred cadence and maximum admitted segment ceiling.
-    #[conf(flatten, prefix)]
-    segment: HlsSegmentConfig,
-    /// Preferred and maximum admitted partial-segment targets.
-    #[conf(flatten, prefix)]
-    part: HlsPartConfig,
-    /// Minimum completed media retained in each live playlist.
+    /// Segment cadence: `"6s"`, or `{ target = "6s", max = "2x", tolerance = "0s" }`.
+    ///
+    /// `max` is the largest segment admission may accept, including rounding
+    /// and both tolerance endpoints. `tolerance` is how far a boundary may
+    /// move either way at runtime. Both take durations or multiples of target.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "6s",
+        value_parser = CadenceValue::from_str,
+    )]
+    segment: CadenceValue,
+    /// Part cadence: `"1s"`, or `{ target = "1s", max = "2x" }`.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "1s",
+        value_parser = CadenceValue::from_str,
+    )]
+    part: CadenceValue,
+    /// How much completed media each live playlist offers: the DVR window.
     ///
     /// A fixed duration (`"18s"`) or a multiple of the segment duration
     /// (`"6x"`), which adapts to `segment_duration`. The media playlist must
     /// never drop below three times the target duration
     /// (draft-pantos-hls-rfc8216bis-22, section 6.2.1), so a fixed window
-    /// shorter than that is refused.
+    /// shorter than that is refused. `memory.per_stream` and `disk` can
+    /// shorten it for high-bitrate streams.
     #[conf(
         parameter,
         long,
@@ -2011,7 +2248,7 @@ pub struct HlsAppConfig {
         value_parser = parse_duration_rule,
         serde(use_value_parser)
     )]
-    retain: DurationRule,
+    window: DurationRule,
     /// How far behind the live edge a player is told to start.
     ///
     /// A multiple of the part duration (`"3x"`) or a fixed duration (`"3s"`).
@@ -2028,30 +2265,101 @@ pub struct HlsAppConfig {
     hold_back: DurationRule,
 }
 
-/// Segment preferences are distinct from the immutable contract admission selects.
-#[derive(Conf)]
-#[conf(serde)]
-pub struct HlsSegmentConfig {
-    /// Preferred segment cadence.
-    #[conf(parameter, long, env, default_value = "6s", value_parser = rushls_config::parse_duration, serde(use_value_parser))]
-    target: Duration,
-    /// Maximum segment ceiling, including rounding and both jitter endpoints.
-    #[conf(parameter, long, env, default_value = "2x", value_parser = parse_duration_rule, serde(use_value_parser))]
-    max: DurationRule,
-    /// Symmetric runtime boundary tolerance, relative to the configured target.
-    #[conf(parameter, long, env, default_value = "0s", value_parser = parse_duration_rule, serde(use_value_parser))]
-    jitter: DurationRule,
+/// A segment or part cadence: `"6s"`, or
+/// `{ target = "6s", max = "2x", tolerance = "0s" }`.
+///
+/// The short form is the common case; the table adds admission ceilings.
+/// Preferences are distinct from the immutable contract admission selects.
+#[derive(Clone, Copy, Debug)]
+pub struct CadenceValue {
+    /// Preferred duration; omitted in the table form keeps the default.
+    target: Option<Duration>,
+    /// Largest admitted value; defaults to twice the target.
+    max: Option<DurationRule>,
+    /// Runtime boundary tolerance either way; segments only.
+    tolerance: Option<DurationRule>,
 }
 
-#[derive(Conf)]
-#[conf(serde)]
-pub struct HlsPartConfig {
-    /// Preferred advertised partial-segment target.
-    #[conf(parameter, long, env, default_value = "1s", value_parser = rushls_config::parse_duration, serde(use_value_parser))]
-    target: Duration,
-    /// Largest part target admission may select; runtime never enlarges it.
-    #[conf(parameter, long, env, default_value = "2x", value_parser = parse_duration_rule, serde(use_value_parser))]
-    max: DurationRule,
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CadenceTable {
+    target: Option<String>,
+    max: Option<String>,
+    tolerance: Option<String>,
+}
+
+impl TryFrom<CadenceTable> for CadenceValue {
+    type Error = String;
+
+    fn try_from(table: CadenceTable) -> Result<Self, Self::Error> {
+        Ok(Self {
+            target: table
+                .target
+                .as_deref()
+                .map(|target| {
+                    humantime::parse_duration(target).map_err(|error| format!("target: {error}"))
+                })
+                .transpose()?,
+            max: table.max.as_deref().map(parse_duration_rule).transpose()?,
+            tolerance: table
+                .tolerance
+                .as_deref()
+                .map(parse_duration_rule)
+                .transpose()?,
+        })
+    }
+}
+
+impl FromStr for CadenceValue {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.trim_start().starts_with('{') {
+            return TomlValue::<CadenceTable>::from_str(value)
+                .map_err(|error| error.message().to_owned())?
+                .0
+                .try_into();
+        }
+        humantime::parse_duration(value.trim())
+            .map(|target| Self {
+                target: Some(target),
+                max: None,
+                tolerance: None,
+            })
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for CadenceValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Shape {
+            Short(String),
+            Full(CadenceTable),
+        }
+        match Shape::deserialize(deserializer)? {
+            Shape::Short(value) => value.parse(),
+            Shape::Full(table) => table.try_into(),
+        }
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl CadenceValue {
+    const SEGMENT: Duration = Duration::from_secs(6);
+    const PART: Duration = Duration::from_secs(1);
+
+    fn target_or(&self, default: Duration) -> Duration {
+        self.target.unwrap_or(default)
+    }
+
+    /// The default ceiling: twice the target.
+    fn max(&self) -> DurationRule {
+        self.max.unwrap_or(DurationRule::MultipleOfTarget(
+            TargetDurationMultiple::integer(2),
+        ))
+    }
 }
 
 /// Unlike retention minima, an admission ceiling must never silently saturate.
@@ -2077,26 +2385,38 @@ fn resolve_hls_rule(rule: DurationRule, target: Duration) -> Result<Duration, Co
 impl HlsAppConfig {
     /// The segment duration other sections size their relative values by.
     fn segment_duration(&self) -> Duration {
-        self.segment.target
+        self.segment.target_or(CadenceValue::SEGMENT)
     }
 
     fn apply(&self, node: &mut NodeConfig, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
-        let maximum_segment = resolve_hls_rule(self.segment.max, self.segment.target)?;
-        let maximum_part = resolve_hls_rule(self.part.max, self.part.target)?;
-        let jitter = resolve_hls_rule(self.segment.jitter, self.segment.target)?;
+        if self.part.tolerance.is_some() {
+            return Err(invalid(
+                "hls.part has no tolerance: parts follow the segment boundaries",
+            ));
+        }
+        let segment = self.segment_duration();
+        let part = self.part.target_or(CadenceValue::PART);
+        let maximum_segment = resolve_hls_rule(self.segment.max(), segment)?;
+        let maximum_part = resolve_hls_rule(self.part.max(), part)?;
+        let tolerance = resolve_hls_rule(
+            self.segment
+                .tolerance
+                .unwrap_or(DurationRule::Fixed(Duration::ZERO)),
+            segment,
+        )?;
         node.session.segmentation = SegmentationPolicy {
-            desired_segment_duration: self.segment.target,
-            desired_part_duration: self.part.target,
+            desired_segment_duration: segment,
+            desired_part_duration: part,
             maximum_segment_duration: maximum_segment,
             maximum_part_duration: maximum_part,
-            early_boundary: jitter,
-            late_boundary: jitter,
+            early_boundary: tolerance,
+            late_boundary: tolerance,
         };
         node.session
             .segmentation
             .validate()
             .map_err(|error| invalid(error.to_string()))?;
-        let window = self.retain;
+        let window = self.window;
         // Validate fixed delivery settings for every contract admission can select.
         let maximum_target = Duration::from_secs(
             u64::try_from(maximum_segment.as_nanos().saturating_add(500_000_000) / 1_000_000_000)
@@ -2105,12 +2425,11 @@ impl HlsAppConfig {
         );
         if window.resolve(maximum_target) < maximum_target.saturating_mul(3) {
             return Err(invalid(
-                "HLS playlist window must be at least three times the maximum target duration",
+                "hls.window must be at least three times the maximum segment duration",
             ));
         }
-        // Interim mapping: the advertised window and the retention window are
-        // one quantity now, so the old playlist knob resolves straight into
-        // it. `[hls] retain` replaces this when the file is rewritten.
+        // The advertised window and the retention window are one quantity:
+        // media a playlist does not name is media no player can request.
         node.store.retention.retain = window;
         // Two thresholds, because the specification has two. Below three parts
         // is a SHOULD, so it is warned: a deployment on a good network may
@@ -2228,20 +2547,29 @@ pub struct HttpAppConfig {
     public_url: String,
     #[conf(flatten, prefix)]
     cors: CorsAppConfig,
-    #[conf(flatten, prefix)]
-    tls: Option<TlsAppConfig>,
 }
 
 impl HttpAppConfig {
-    fn resolve(&self) -> Result<HttpConfig, ConfigError> {
+    fn resolve(
+        &self,
+        https: Option<&HttpsAppConfig>,
+        tls: Option<&TlsFiles>,
+    ) -> Result<HttpConfig, ConfigError> {
+        let https = https
+            .map(|https| {
+                let tls =
+                    tls.ok_or_else(|| invalid("[https] needs [tls] with a certificate and key"))?;
+                https.resolve(tls)
+            })
+            .transpose()?;
         let config = HttpConfig {
             limits: crate::server::http::HttpLimits {
                 maximum_connections: self.max_connections,
                 maximum_requests: self.max_requests,
             },
             cors: self.cors.resolve()?,
-            tls: self.tls.as_ref().map(TlsAppConfig::resolve).transpose()?,
-            tls_address: self.tls.as_ref().map(|tls| tls.listen),
+            tls_address: https.as_ref().map(|(address, _)| *address),
+            tls: https.map(|(_, settings)| settings),
             // Filled in by the caller, which is the only place that knows
             // whether the MOQ listener is on.
             moq_certificate: None,
@@ -2330,21 +2658,17 @@ impl CorsAppConfig {
     }
 }
 
+/// The HTTPS listener. Its certificate and key come from `[tls]`.
 #[derive(Conf)]
 #[conf(serde)]
-pub struct TlsAppConfig {
-    /// Accepted HTTPS protocol range.
+pub struct HttpsAppConfig {
+    /// Accepted protocol range: `{ min = "1.3", max = "1.3" }`. Set min to
+    /// "1.2" for older clients.
     #[conf(flatten, prefix)]
     version: TlsVersionAppConfig,
     /// Address serving HTTPS, bound independently of the cleartext listener.
     #[conf(parameter, long, env, default_value = "[::]:8443")]
     listen: SocketAddr,
-    /// Path to a PEM certificate chain, leaf first.
-    #[conf(parameter, long, env)]
-    cert: PathBuf,
-    /// Path to a PEM private key.
-    #[conf(parameter, long, env)]
-    key: PathBuf,
     /// Bounds a connection that completes TCP and then stalls mid-handshake.
     ///
     /// This is the unauthenticated edge of the node, and a TLS handshake is
@@ -2380,29 +2704,59 @@ pub struct TlsVersionAppConfig {
     max: TlsVersion,
 }
 
-impl TlsAppConfig {
-    fn resolve(&self) -> Result<TlsSettings, ConfigError> {
+impl HttpsAppConfig {
+    fn resolve(&self, tls: &TlsFiles) -> Result<(SocketAddr, TlsSettings), ConfigError> {
         if self.version.min > self.version.max {
             return Err(ConfigError::Invalid(
-                "http.tls.version.min must not exceed http.tls.version.max".to_owned(),
+                "https.version.min must not exceed https.version.max".to_owned(),
             ));
         }
         if self.max_handshakes == 0 {
             return Err(ConfigError::Invalid(
-                "http.tls.max_handshakes must be at least one, or no \
+                "https.max_handshakes must be at least one, or no \
                  TLS connection can be admitted"
                     .to_owned(),
             ));
         }
 
-        Ok(TlsSettings {
-            certificate: self.cert.clone(),
+        Ok((
+            self.listen,
+            TlsSettings {
+                certificate: tls.cert.clone(),
+                key: tls.key.clone(),
+                handshake_timeout: self.handshake_timeout,
+                maximum_pending_handshakes: self.max_handshakes,
+                min_version: self.version.min,
+                max_version: self.version.max,
+            },
+        ))
+    }
+}
+
+/// One certificate for every TLS listener this node runs.
+#[derive(Conf)]
+#[conf(serde)]
+pub struct TlsAppConfig {
+    /// Path to a PEM certificate chain, leaf first. Reloaded on rotation.
+    #[conf(parameter, long, env)]
+    cert: PathBuf,
+    /// Path to the PEM private key for that chain.
+    #[conf(parameter, long, env)]
+    key: PathBuf,
+}
+
+/// Resolved `[tls]` paths, shared by HTTPS and MoQ ingest.
+pub struct TlsFiles {
+    cert: PathBuf,
+    key: PathBuf,
+}
+
+impl TlsAppConfig {
+    fn resolve(&self) -> TlsFiles {
+        TlsFiles {
+            cert: self.cert.clone(),
             key: self.key.clone(),
-            handshake_timeout: self.handshake_timeout,
-            maximum_pending_handshakes: self.max_handshakes,
-            min_version: self.version.min,
-            max_version: self.version.max,
-        })
+        }
     }
 }
 
@@ -2419,23 +2773,19 @@ pub struct MetricsAppConfig {
     /// metrics listener is always cleartext.
     #[conf(parameter, long, env)]
     listen: Option<SocketAddr>,
-    /// Optional bearer token required to scrape `/metrics` and `/metrics/streams`.
-    #[conf(
-        parameter,
-        env,
-        secret,
-        serde(deserialize_with = "rushls_config::deserialize_secret")
-    )]
-    token: Option<String>,
-    /// File containing the optional metrics bearer token.
-    #[conf(parameter, long, env)]
+    /// Bearer token required to scrape `/metrics` and `/metrics/streams`:
+    /// inline, `${VAR}`, or `{ file = "/path" }`.
+    #[conf(parameter, env, secret)]
+    token: Option<TextSource>,
+    /// File holding `token`; the command-line form is always a path.
+    #[conf(parameter, long = "token", serde(skip))]
     token_file: Option<PathBuf>,
 }
 
 impl MetricsAppConfig {
     fn resolve(self) -> Result<MetricsConfig, ConfigError> {
-        let token = resolve_optional_text_secret(
-            "metrics token",
+        let token = read_credential(
+            "the metrics token",
             self.token.as_ref(),
             self.token_file.as_ref(),
         )?;
@@ -2640,18 +2990,29 @@ impl From<CodecValue> for Codec {
     }
 }
 
-// Labels and schema field names belong to this app; secret reading is shared.
-fn resolve_optional_text_secret(
+// Labels belong to this app; reading inline or mounted text is shared.
+fn read_text(label: &str, source: Option<&TextSource>) -> Result<Option<String>, ConfigError> {
+    source
+        .map(|source| source.read(label))
+        .transpose()
+        .map_err(ConfigError::from)
+}
+
+/// Reads a credential that also has a command-line flag.
+///
+/// Arguments are visible to every local user through the process list, so
+/// the flag only ever names a file; it is never the credential itself. It
+/// sits at the CLI's place in the precedence order, above TOML and the
+/// environment.
+fn read_credential(
     label: &str,
-    inline: Option<&String>,
-    file: Option<&PathBuf>,
+    source: Option<&TextSource>,
+    cli_file: Option<&PathBuf>,
 ) -> Result<Option<String>, ConfigError> {
-    rushls_config::resolve_optional_text_secret(
-        label,
-        inline.map(String::as_str),
-        file.map(PathBuf::as_path),
-    )
-    .map_err(ConfigError::from)
+    match cli_file {
+        Some(path) => read_text(label, Some(&TextSource::File(path.clone()))),
+        None => read_text(label, source),
+    }
 }
 
 fn nonzero_bytes(label: &str, value: ByteSize) -> Result<usize, ConfigError> {
@@ -2690,7 +3051,7 @@ fn validate_codecs(
     let configured: Vec<Codec> = configured.into_iter().map(Into::into).collect();
     if let Some(codec) = configured.iter().find(|codec| !permitted.contains(codec)) {
         return Err(invalid(format!(
-            "auth policy `{policy}` {label} contains {codec:?}, which is not valid for that media kind"
+            "{policy}: {label} contains {codec:?}, which is not valid for that media kind"
         )));
     }
     Ok(configured)

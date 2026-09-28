@@ -211,8 +211,10 @@ The tested client is `moq-cli 0.10.0`, whose executable is `moq`.
 For a public deployment, configure a certificate that covers the origin hostname and is trusted by the client:
 
 ```toml
-[moq]
+[ingest.moq]
 listen = "0.0.0.0:4433"
+
+[tls]
 cert = "/run/secrets/fullchain.pem"
 key = "/run/secrets/private-key.pem"
 ```
@@ -226,7 +228,7 @@ ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts - \
 The corresponding HTTP playback path is `/live/moq/index.m3u8` when admission does not remap the stream.
 The `https` URL selects WebTransport. The transport uses UDP, not the ordinary HTTP listener.
 
-For an isolated local test, create a disposable certificate and configure its paths under `[moq]`.
+For an isolated local test, create a disposable certificate and configure its paths under `[tls]`.
 The existing [local MoQ recipe](moq-ingestion.md#local-publish-test) uses `--client-tls-disable-verify` for that test only.
 Production publishers must verify certificates.
 MoQ browser publishing is unverified; the included browser tool is experimental.

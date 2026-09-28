@@ -13,6 +13,112 @@ use std::sync::{
 #[derive(Clone, Debug)]
 pub struct PipelineBudget(Arc<State>);
 
+/// Node-wide committed memory: the sum of the budgets granted to active
+/// publishers and stored streams, against `memory.total`.
+///
+/// Budgets are ceilings, not allocations, so this commits them rather than
+/// measuring use. That is what makes `total` a guarantee: however the budgets
+/// fill, they can never add up to more. Commits never wait; a refused commit
+/// refuses the publication.
+#[derive(Clone, Debug)]
+pub struct MemoryLedger(Arc<LedgerState>);
+
+#[derive(Debug)]
+struct LedgerState {
+    limit: usize,
+    committed: AtomicUsize,
+}
+
+/// Memory committed on a [`MemoryLedger`], returned when dropped.
+#[derive(Debug)]
+pub struct Commitment {
+    ledger: MemoryLedger,
+    bytes: usize,
+}
+
+/// A commitment that would take the ledger past its limit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error(
+    "node memory is fully committed: {requested} more bytes would exceed {committed} of {limit}"
+)]
+pub struct MemoryFull {
+    pub requested: usize,
+    pub committed: usize,
+    pub limit: usize,
+}
+
+impl MemoryLedger {
+    pub fn new(limit: usize) -> Self {
+        Self(Arc::new(LedgerState {
+            limit,
+            committed: AtomicUsize::new(0),
+        }))
+    }
+
+    pub fn limit(&self) -> usize {
+        self.0.limit
+    }
+
+    pub fn committed(&self) -> usize {
+        self.0.committed.load(Ordering::Relaxed)
+    }
+
+    pub fn commit(&self, bytes: usize) -> Result<Commitment, MemoryFull> {
+        let mut committed = self.committed();
+        loop {
+            let next = committed
+                .checked_add(bytes)
+                .filter(|next| *next <= self.0.limit)
+                .ok_or(MemoryFull {
+                    requested: bytes,
+                    committed,
+                    limit: self.0.limit,
+                })?;
+            match self.0.committed.compare_exchange_weak(
+                committed,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Ok(Commitment {
+                        ledger: self.clone(),
+                        bytes,
+                    });
+                }
+                Err(current) => committed = current,
+            }
+        }
+    }
+
+    /// Commits past the limit. Only for a takeover: the incumbent it replaces
+    /// is already stopping and returns its own commitment within its drain.
+    pub fn commit_over(&self, bytes: usize) -> Commitment {
+        self.0.committed.fetch_add(bytes, Ordering::Relaxed);
+        Commitment {
+            ledger: self.clone(),
+            bytes,
+        }
+    }
+}
+
+// Identity, not value: two ledgers are the same only if they share state.
+impl PartialEq for MemoryLedger {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for MemoryLedger {}
+
+impl Drop for Commitment {
+    fn drop(&mut self) {
+        self.ledger
+            .0
+            .committed
+            .fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
 /// Where a reservation is requested. Error messages print the stage; metrics
 /// aggregate it into a coarser [`Origin`] so label cardinality stays fixed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
@@ -371,6 +477,29 @@ mod tests {
         drop(retained);
         assert_eq!(budget.used(), 0);
         assert_eq!(budget.origins(), [0; 5]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_ledger_refuses_commitments_past_its_limit() -> Result<(), MemoryFull> {
+        let ledger = MemoryLedger::new(100);
+        let first = ledger.commit(60)?;
+        assert_eq!(
+            ledger.commit(41).map(|_| ()),
+            Err(MemoryFull {
+                requested: 41,
+                committed: 60,
+                limit: 100
+            })
+        );
+        let second = ledger.commit(40)?;
+        assert_eq!(ledger.committed(), 100);
+        // A takeover may overcommit briefly while its incumbent drains.
+        let takeover = ledger.commit_over(60);
+        drop((first, second));
+        assert_eq!(ledger.committed(), 60);
+        drop(takeover);
+        assert_eq!(ledger.committed(), 0);
         Ok(())
     }
 

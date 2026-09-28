@@ -12,6 +12,8 @@ pub struct Settings {
     http: Http,
     #[conf(env, secret)]
     token: Option<SecretString>,
+    #[conf(env, secret)]
+    credential: Option<TextSource>,
 }
 #[derive(Debug, Conf)]
 #[conf(serde)]
@@ -188,20 +190,32 @@ fn interpolation_is_literal_and_diagnostics_do_not_expose_values() -> Result<(),
 }
 
 #[test]
-fn mounted_secrets_preserve_spaces_and_reject_ambiguous_sources() -> Result<(), Box<dyn Error>> {
+fn text_sources_are_inline_or_files_by_their_shape() -> Result<(), Box<dyn Error>> {
     let file = file(" secret with spaces \r\n")?;
-    assert_eq!(
-        resolve_optional_text_secret("token", None, Some(file.path()))?.as_deref(),
-        Some(" secret with spaces ")
-    );
-    assert_eq!(
-        resolve_optional_text_secret("token", Some("inline\n"), None)?.as_deref(),
-        Some("inline\n")
-    );
-    let error =
-        resolve_optional_text_secret("token", Some("secret"), Some(file.path())).unwrap_err();
-    assert!(matches!(error, ConfigError::SecretConflict(_)));
-    assert!(!error.to_string().contains("secret"));
+    let path = file.path().to_str().ok_or("temp path is not UTF-8")?;
+    // Mounted files lose trailing line endings only; spaces are credential.
+    let from_file = load(&format!("credential = {{ file = '{path}' }}"), &[], &[])?;
+    let credential = from_file.config.credential.ok_or("credential missing")?;
+    assert_eq!(credential.read("credential")?, " secret with spaces ");
+    // Inline values are untouched.
+    let inline = load("credential = \"inline\\n\"", &[], &[])?;
+    let credential = inline
+        .config
+        .credential
+        .as_ref()
+        .ok_or("credential missing")?;
+    assert_eq!(credential.read("credential")?, "inline\n");
+    // The environment accepts both spellings too.
+    let env_file = format!("{{ file = '{path}' }}");
+    let from_env = load("", &[], &[("FIXTURE_CREDENTIAL", env_file.as_str())])?;
+    let credential = from_env.config.credential.ok_or("credential missing")?;
+    assert_eq!(credential.read("credential")?, " secret with spaces ");
+    // A malformed reference is refused without echoing the value.
+    let error = load("credential = { path = 'super-secret' }", &[], &[])
+        .err()
+        .ok_or("unknown reference field accepted")?;
+    assert!(!format!("{error:?} {error}").contains("super-secret"));
+    assert!(!format!("{:?}", inline.config).contains("inline"));
     Ok(())
 }
 

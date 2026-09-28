@@ -5,17 +5,18 @@
 #   srt://127.0.0.1:9000?streamid=publish:<name>
 #   http://127.0.0.1:8080/<app>/<name>/index.m3u8
 #
-# WebTransport ingest is off. Turn it on with [moq] listen, a certificate, and
-# a key; compiled defaults stay cert-free.
+# WebTransport ingest is off. Turn it on with [ingest.moq] listen and a [tls]
+# certificate and key; compiled defaults stay certificate-free.
 # Anyone may publish, at any speed, in any codec this origin can mux. A file
 # pushed as fast as the link allows is packaged that fast, which is what
-# setting no ceiling asks for. See rushls.example.toml for optional settings.
+# setting no rate limit asks for. See rushls.example.toml for optional
+# settings, and run `rushls --check` to see the resolved listeners and memory.
 # Configure authorization and deployment limits before exposing ingest publicly.
 
-[rtmp]
+[ingest.rtmp]
 listen = "127.0.0.1:1935"
 
-[srt]
+[ingest.srt]
 listen = "127.0.0.1:9000"
 
 [http]

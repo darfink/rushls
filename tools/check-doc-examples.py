@@ -229,8 +229,8 @@ def main():
                 finally:
                     stop(generator)
             config = working / 'rushls.toml'
-            config.write_text(f'[rtmp]\nlisten="127.0.0.1:{ports[1935]}"\n'
-                              f'[srt]\nlisten="127.0.0.1:{ports[9000]}"\n'
+            config.write_text(f'[ingest.rtmp]\nlisten="127.0.0.1:{ports[1935]}"\n'
+                              f'[ingest.srt]\nlisten="127.0.0.1:{ports[9000]}"\n'
                               f'[http]\nlisten="127.0.0.1:{ports[8080]}"\n')
             env = {key: value for key, value in os.environ.items() if not key.startswith('RUSHLS_')}
             with (output / 'origin.log').open('w') as log:

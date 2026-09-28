@@ -23,7 +23,7 @@ impl Pattern {
             let at = value.find('{').unwrap_or(value.len());
             let literal = &value[..at];
             if literal.contains('}') {
-                return Err("unmatched closing brace in record.pattern".into());
+                return Err("unmatched closing brace in record.path".into());
             }
             tokens.push(Token::Literal(literal.into()));
             value = &value[at..];
@@ -32,7 +32,7 @@ impl Pattern {
             }
             let end = value
                 .find('}')
-                .ok_or("unclosed placeholder in record.pattern")?;
+                .ok_or("unclosed placeholder in record.path")?;
             let name = &value[1..end];
             tokens.push(match name {
                 "stream" => Token::Stream,
@@ -46,7 +46,7 @@ impl Pattern {
                     if format.is_empty()
                         || StrftimeItems::new(format).any(|item| matches!(item, Item::Error))
                     {
-                        return Err("invalid strftime format in record.pattern".into());
+                        return Err("invalid strftime format in record.path".into());
                     }
                     Token::Time(format.into())
                 }
@@ -98,7 +98,7 @@ impl Pattern {
         };
         if text(0)? == text(1)? {
             return Err(
-                "record.pattern cannot leave {segment} at the end of a component: the .vtt suffix \
+                "record.path cannot leave {segment} at the end of a component: the .vtt suffix \
                  of a subtitle rendition replaces everything after the last dot, so every subtitle \
                  segment would name the same file; move {segment} before the final suffix"
                     .into(),

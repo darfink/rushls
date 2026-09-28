@@ -19,7 +19,7 @@ pub mod interpolate;
 mod secret;
 pub use bytesize::ByteSize;
 pub use humantime::parse_duration;
-pub use secret::{SecretString, deserialize_secret, resolve_optional_text_secret};
+pub use secret::{SecretString, TextSource, deserialize_secret};
 
 /// Tests use explicit paths so developer files cannot change their defaults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,8 +68,6 @@ pub enum ConfigError {
     },
     #[error(transparent)]
     Sources(#[from] conf::Error),
-    #[error("{0} must configure only one of its inline value and `_file`")]
-    SecretConflict(String),
     #[error("could not read {secret} from {path}: {source}")]
     SecretRead {
         secret: String,

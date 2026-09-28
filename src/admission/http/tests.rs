@@ -98,7 +98,7 @@ async fn an_allowing_service_decides_identity_and_selects_a_local_policy() {
         policy
     });
     let sidecar = Sidecar::answering(
-        r#"{"decision":"allow","stream_id":"events/main","principal":"account-42","policy":"protected"}"#,
+        r#"{"decision":"allow","stream_id":"events/main","principal":"account-42","profile":"protected"}"#,
     );
     let address = start(sidecar.clone()).await;
 
@@ -118,7 +118,7 @@ async fn an_allowing_service_decides_identity_and_selects_a_local_policy() {
     assert_eq!(
         grant.policy.takeovers,
         TakeoverPolicy::Deny,
-        "the response selects a policy by name; the limits stay this node's"
+        "the response selects a profile by name; the limits stay this node's"
     );
 }
 
@@ -192,7 +192,7 @@ async fn every_way_of_not_getting_an_answer_denies() {
     let unparsable = Sidecar::answering(r#"{"verdict":"maybe"}"#);
     let erroring = Sidecar::answering("upstream is down").with_status(StatusCode::BAD_GATEWAY);
     let unknown_policy = Sidecar::answering(
-        r#"{"decision":"allow","stream_id":"live/x","principal":"p","policy":"nonexistent"}"#,
+        r#"{"decision":"allow","stream_id":"live/x","principal":"p","profile":"nonexistent"}"#,
     );
     let nameless = Sidecar::answering(r#"{"decision":"allow","stream_id":"  ","principal":"p"}"#);
     let silent = Sidecar::answering("never arrives").slow();

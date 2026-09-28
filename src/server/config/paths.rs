@@ -7,7 +7,7 @@ use directories::ProjectDirs;
 
 /// Platform project directories for this binary.
 ///
-/// `None` when the process has no home directory, which is why `capacity.dir`
+/// `None` when the process has no home directory, which is why `disk.dir`
 /// remains the escape hatch for a disk tier in that environment.
 pub fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("", "", "rushls")

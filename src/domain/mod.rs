@@ -13,7 +13,10 @@ mod ids;
 mod instant;
 mod language;
 mod payload;
-pub use budget::{BudgetExceeded, Origin, PipelineBudget, Reservation, Stage};
+pub use budget::{
+    BudgetExceeded, Commitment, MemoryFull, MemoryLedger, Origin, PipelineBudget, Reservation,
+    Stage,
+};
 mod publisher;
 pub use publisher::{ClientInfo, IngestProtocol, PublishResource, PublisherContext};
 mod rfc6381;

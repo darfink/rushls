@@ -1,6 +1,6 @@
 //! Predicates over the media a publisher may offer.
 //!
-//! Every field an operator writes under `[accept]` is a set of admitted values
+//! Every field an operator writes under `[publish]` is a set of admitted values
 //! rather than a single ceiling. Three constructors cover the whole surface —
 //! exact, one-of, and an inclusive range — so a rule reads the same way
 //! wherever it appears.

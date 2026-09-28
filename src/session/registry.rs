@@ -103,6 +103,8 @@ pub enum RegistryError {
     AlreadyPublished { stream: StreamId },
     #[error("a previous publisher of {stream} is still draining")]
     TakeoverInProgress { stream: StreamId },
+    #[error(transparent)]
+    MemoryFull(#[from] crate::domain::MemoryFull),
 }
 
 /// Every session currently running in this process.
@@ -129,6 +131,8 @@ const DEFAULT_MAXIMUM_SESSIONS: usize = 256;
 struct Inner {
     next_id: AtomicU64,
     maximum: usize,
+    /// `memory.total`, and what each session commits against it.
+    memory: Option<(crate::domain::MemoryLedger, usize)>,
     sessions: RwLock<HashMap<SessionId, Entry>>,
 }
 
@@ -140,10 +144,20 @@ struct Entry {
 
 impl Registry {
     pub fn with_capacity(maximum: usize) -> Self {
+        Self::with_memory(maximum, None)
+    }
+
+    /// As [`Self::with_capacity`], also committing `per_publisher` bytes of a
+    /// node-wide ledger for every registered session.
+    pub fn with_memory(
+        maximum: usize,
+        memory: Option<(crate::domain::MemoryLedger, usize)>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 next_id: AtomicU64::new(0),
                 maximum,
+                memory,
                 sessions: RwLock::new(HashMap::new()),
             }),
         }
@@ -161,7 +175,7 @@ impl Registry {
     /// its handshake accepted and then immediately dropped.
     pub fn preflight(&self, grant: &PublishGrant) -> Result<(), RegistryError> {
         let sessions = self.inner.sessions.read();
-        self.check(&sessions, grant)
+        self.check(&sessions, grant).map(|_| ())
     }
 
     /// Admits a session and displaces any incumbent holding the same stream.
@@ -180,7 +194,21 @@ impl Registry {
         stop: StopToken,
     ) -> Result<Registration, RegistryError> {
         let mut sessions = self.inner.sessions.write();
-        self.check(&sessions, grant)?;
+        let takeover = self.check(&sessions, grant)?;
+        // Under the write lock, so a check and its commit cannot interleave
+        // with another registration's.
+        let memory = self
+            .inner
+            .memory
+            .as_ref()
+            .map(|(ledger, bytes)| {
+                if takeover {
+                    Ok(ledger.commit_over(*bytes))
+                } else {
+                    ledger.commit(*bytes)
+                }
+            })
+            .transpose()?;
         let displaced: Vec<_> = sessions
             .values()
             .filter(|entry| entry.shared.stream == grant.stream_id)
@@ -217,14 +245,16 @@ impl Registry {
             registry: self.clone(),
             shared,
             displaced: displaced_count,
+            _memory: memory,
         })
     }
 
+    /// Returns whether admitting `grant` is a takeover of a running session.
     fn check(
         &self,
         sessions: &HashMap<SessionId, Entry>,
         grant: &PublishGrant,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<bool, RegistryError> {
         let mut incumbent = false;
         let mut draining = false;
         for entry in sessions
@@ -251,7 +281,20 @@ impl Registry {
             }
             .into());
         }
-        Ok(())
+        // A takeover replaces a session that already holds its commitment,
+        // so only a new publication has to fit.
+        if !incumbent
+            && let Some((ledger, bytes)) = &self.inner.memory
+            && ledger.committed().saturating_add(*bytes) > ledger.limit()
+        {
+            return Err(crate::domain::MemoryFull {
+                requested: *bytes,
+                committed: ledger.committed(),
+                limit: ledger.limit(),
+            }
+            .into());
+        }
+        Ok(incumbent)
     }
 
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
@@ -285,6 +328,8 @@ pub struct Registration {
     registry: Registry,
     shared: Arc<SessionShared>,
     displaced: usize,
+    /// This session's share of `memory.total`, returned with the registration.
+    _memory: Option<crate::domain::Commitment>,
 }
 
 impl Registration {
@@ -402,6 +447,35 @@ mod tests {
         assert_eq!(second.displaced(), 0);
         assert_eq!(first_stop.reason(), None);
         assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn sessions_commit_their_budget_against_the_node_total() {
+        let ledger = crate::domain::MemoryLedger::new(250);
+        let registry = Registry::with_memory(8, Some((ledger.clone(), 100)));
+        let first = register(&registry, "live/one", StopToken::new());
+        let _second = register(&registry, "live/two", StopToken::new());
+        assert_eq!(ledger.committed(), 200);
+
+        // A third would take the committed total past 250, although the
+        // session count still has room.
+        let full = crate::domain::MemoryFull {
+            requested: 100,
+            committed: 200,
+            limit: 250,
+        };
+        assert_eq!(registry.preflight(&grant("live/three")), Err(full.into()));
+        assert_eq!(
+            try_register(&registry, "live/three", StopToken::new()).map(|_| ()),
+            Err(full.into())
+        );
+
+        // A takeover replaces a session that already holds its share, so it
+        // is admitted and briefly overcommits while the incumbent drains.
+        let takeover = register(&registry, "live/one", StopToken::new());
+        assert_eq!(ledger.committed(), 300);
+        drop((first, takeover));
+        assert_eq!(ledger.committed(), 100);
     }
 
     #[test]

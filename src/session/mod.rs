@@ -215,9 +215,9 @@ async fn admit(
         services.meters.publisher_rejected();
         let rejection = match error {
             RegistryError::AlreadyPublished { .. } => PublishRejection::AlreadyPublished,
-            RegistryError::TakeoverInProgress { .. } | RegistryError::AtCapacity(_) => {
-                PublishRejection::ServiceUnavailable
-            }
+            RegistryError::TakeoverInProgress { .. }
+            | RegistryError::AtCapacity(_)
+            | RegistryError::MemoryFull(_) => PublishRejection::ServiceUnavailable,
         };
         pending.reject(rejection).await?;
         return Err(match error {

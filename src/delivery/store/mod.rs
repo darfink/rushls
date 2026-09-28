@@ -90,6 +90,8 @@ pub struct StoreLimits {
     pub retention: RetentionPolicy,
     /// Overflow directory and per-stream byte cap, or memory-only.
     pub disk: Option<DiskLimits>,
+    /// `memory.total`: each new stream commits `retention.maximum_payload_bytes`.
+    pub memory: Option<crate::domain::MemoryLedger>,
 }
 
 impl Default for StoreLimits {
@@ -99,6 +101,7 @@ impl Default for StoreLimits {
             independent_segments: false,
             retention: RetentionPolicy::default(),
             disk: None,
+            memory: None,
         }
     }
 }
@@ -214,10 +217,16 @@ impl StreamStore {
             Arc::clone(live)
         } else {
             if current.len() >= self.limits.maximum_streams {
-                return Err(StoreFull {
+                return Err(StoreFull::Streams {
                     maximum: self.limits.maximum_streams,
                 });
             }
+            let commitment = self
+                .limits
+                .memory
+                .as_ref()
+                .map(|ledger| ledger.commit(self.limits.retention.maximum_payload_bytes))
+                .transpose()?;
             let live = Arc::new(
                 LiveStream::with_events(
                     stream.clone(),
@@ -227,7 +236,8 @@ impl StreamStore {
                 )
                 .with_independent_segments(self.limits.independent_segments)
                 .with_publication_totals(self.publication_totals.clone())
-                .with_operation_meters(self.operations.clone()),
+                .with_operation_meters(self.operations.clone())
+                .with_commitment(commitment),
             );
             live.attach_handle(Arc::downgrade(&live));
             let mut next = (*current).clone();

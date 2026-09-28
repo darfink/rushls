@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn a_record_pattern_passes_through_untouched() {
-        // `[record] pattern` uses bare braces and is expanded per segment by a
+        // `record.path` uses bare braces and is expanded per segment by a
         // different layer. The sigils are distinct so that one cannot eat the
         // other.
         let pattern = "{stream}/{time:%Y/%m/%d}/{rendition}_{segment}.m4s";
@@ -211,10 +211,10 @@ mod tests {
         let mut document: toml::Value = toml::from_str(
             r#"
 name = "${NAME}"
-shutdown = "10s"
+shutdown_grace = "10s"
 streams = 256
 
-[accept]
+[publish]
 codecs = ["${CODEC}", "aac"]
 "#,
         )
@@ -225,9 +225,9 @@ codecs = ["${CODEC}", "aac"]
             .expect("every reference resolves");
 
         assert_eq!(document["name"].as_str(), Some("studio"));
-        assert_eq!(document["shutdown"].as_str(), Some("10s"));
+        assert_eq!(document["shutdown_grace"].as_str(), Some("10s"));
         assert_eq!(document["streams"].as_integer(), Some(256));
-        assert_eq!(document["accept"]["codecs"][0].as_str(), Some("opus"));
-        assert_eq!(document["accept"]["codecs"][1].as_str(), Some("aac"));
+        assert_eq!(document["publish"]["codecs"][0].as_str(), Some("opus"));
+        assert_eq!(document["publish"]["codecs"][1].as_str(), Some("aac"));
     }
 }

@@ -43,8 +43,8 @@ def smoke(root, version):
         config = Path(temporary) / 'smoke.toml'
         http = port()
         config.write_text(f'[http]\nlisten = "127.0.0.1:{http}"\n'
-                          f'[rtmp]\nlisten = "127.0.0.1:{port()}"\n'
-                          f'[srt]\nlisten = "127.0.0.1:{port(socket.SOCK_DGRAM)}"\n')
+                          f'[ingest.rtmp]\nlisten = "127.0.0.1:{port()}"\n'
+                          f'[ingest.srt]\nlisten = "127.0.0.1:{port(socket.SOCK_DGRAM)}"\n')
         with (root / 'smoke.log').open('w') as log:
             process = subprocess.Popen([str(binary), '--config', str(config)], cwd=temporary,
                                        env=env, stdout=log, stderr=subprocess.STDOUT,

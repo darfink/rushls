@@ -174,9 +174,9 @@ Create a configuration that binds each listener to loopback, then start the inst
 
 ```sh
 cat > rushls.toml <<'TOML'
-[rtmp]
+[ingest.rtmp]
 listen = "127.0.0.1:1935"
-[srt]
+[ingest.srt]
 listen = "127.0.0.1:9000"
 [http]
 listen = "127.0.0.1:8080"
@@ -234,9 +234,10 @@ rushls --config rushls.toml --http-listen=127.0.0.1:18080
 ```
 
 TOML strings support `${NAME}` and `${NAME:-fallback}` interpolation.
-Secret fields can use their documented `*_file` alternatives.
+Credentials accept a string, `"${VAR}"`, or `{ file = "/path" }`.
 Unknown `RUSHLS_` variables produce warnings. Unknown TOML fields and CLI arguments fail startup.
 Structured policy fields are not all available as environment overrides. `rushls --help` lists supported overrides.
+`rushls --config rushls.toml --check` validates the file, prints listeners and the worst-case memory plan, and exits.
 
 The bundled files bind to loopback. Compiled RTMP, SRT, and HTTP defaults bind to all IPv4 interfaces.
 RTMP and HTTP also accept explicit IPv6 addresses. SRT currently requires IPv4.
@@ -323,11 +324,13 @@ This is the conventional RTMP setup; OBS multitrack output requires separate ver
 ### Media over QUIC
 
 MoQ ingest is optional. It accepts `moq-lite-05` over WebTransport or raw QUIC on one UDP port.
-It requires a certificate and private key:
+It uses the certificate and private key from `[tls]`:
 
 ```toml
-[moq]
+[ingest.moq]
 listen = "0.0.0.0:4433"
+
+[tls]
 cert = "/run/secrets/fullchain.pem"
 key = "/run/secrets/private-key.pem"
 ```
@@ -422,13 +425,17 @@ Configure two hours of requested retention with disk spill:
 
 ```toml
 [hls]
-retain = "2h"
+window = "2h"
 
-[capacity]
+[limits]
 publishers = 16
 streams = 32
-memory_per_stream = "256MiB"
-disk_per_stream = "8GiB"
+
+[memory]
+per_stream = "256MiB"
+
+[disk]
+per_stream = "8GiB"
 dir = "/var/lib/rushls/dvr"
 ```
 
@@ -441,9 +448,9 @@ media bytes ≈ total bitrate in bits/second × retained seconds ÷ 8
 ```
 
 Capacity pressure can shorten the requested window.
-`memory_per_stream` also covers cached manifests, but excludes some in-flight and pipeline memory.
+`memory.per_stream` also covers cached manifests. In-flight media is covered by `memory.per_publisher`.
 Disk-backed streams reserve part of their memory allowance for manifests.
-These values are not a hard process RSS limit.
+These values are not a hard process RSS limit. Set `memory.total` to refuse publications once the committed budgets would exceed a node-wide ceiling.
 
 Multiply per-stream budgets by the maximum retained stream count.
 Finished or disconnected streams can still occupy retention capacity.
@@ -460,16 +467,16 @@ Recording writes completed segments to a filesystem:
 ```toml
 [record]
 dir = "/var/lib/rushls/recordings"
-pattern = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
+path = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
 queue_size = 128
-max_pending_bytes = 268435456
+max_pending = "256MiB"
 ```
 
 Each media file contains its decoder configuration. Source random access and codec preroll still affect independent playback.
 Files appear under their final names after the write completes. Existing files are not overwritten.
 Use `{publication}` to separate repeated sessions.
 
-Recording survives the live stream and is independent of `hls.retain`.
+Recording survives the live stream and is independent of `hls.window`.
 Rushls does not serve these files as an archive or delete them through DVR retention.
 Provide an external retention/upload workflow for the recording directory.
 Queue overflow or disk errors report recording failures while live delivery continues.
@@ -485,14 +492,14 @@ See [recording operations](docs/deployment.md#recording-operations).
 Configure an HTTP service to authorize each publisher:
 
 ```toml
-[auth.publish]
+[publish.auth]
 url = "https://auth.example.com/v1/publish/admit"
-token_file = "/run/secrets/admission-token"
+token = { file = "/run/secrets/admission-token" }
 timeout = "2s"
 ```
 
 The service returns an allow/deny decision, a stream ID, and a principal.
-It can also select a named local media policy.
+It can also select a named local media profile.
 An unavailable or invalid admission response fails closed.
 See the [publisher API](docs/publisher-api.md) for the exact request and response contracts.
 
@@ -501,11 +508,11 @@ See the [publisher API](docs/publisher-api.md) for the exact request and respons
 JWT playback authorization verifies viewer tokens locally:
 
 ```toml
-[auth.playback]
+[playback.auth]
 jwks_url = "https://issuer.example.com/.well-known/jwks.json"
 stream_claim = "stream"
 
-[auth.playback.claims]
+[playback.auth.claims]
 iss = "https://issuer.example.com"
 aud = "rushls-origin"
 ```
@@ -523,14 +530,17 @@ Serve HTTPS directly:
 [http]
 listen = "off"
 
-[http.tls]
+[https]
 listen = "0.0.0.0:8443"
+version = { min = "1.3", max = "1.3" }
+
+[tls]
 cert = "/run/secrets/fullchain.pem"
 key = "/run/secrets/private-key.pem"
-version = { min = "1.3", max = "1.3" }
 ```
 
 Set `min = "1.2"` to allow TLS 1.2 clients alongside TLS 1.3.
+The same `[tls]` certificate serves MoQ ingest.
 Certificate rotation reloads valid replacements without restarting the service.
 Certificate issuance and renewal remain external responsibilities.
 
@@ -538,8 +548,8 @@ RTMP has no native RTMPS listener. Use an external TCP TLS terminator when RTMPS
 SRT uses its own passphrase-based encryption, not TLS:
 
 ```toml
-[srt]
-passphrase_file = "/run/secrets/srt-passphrase"
+[ingest.srt]
+passphrase = { file = "/run/secrets/srt-passphrase" }
 encryption = "aes256"
 ```
 
@@ -553,7 +563,7 @@ Expose Prometheus metrics on a private listener:
 ```toml
 [metrics]
 listen = "127.0.0.1:9090"
-token_file = "/run/secrets/metrics-token"
+token = { file = "/run/secrets/metrics-token" }
 ```
 
 `/metrics` provides totals; `/metrics/streams` provides per-stream and session detail.
@@ -566,7 +576,7 @@ Signed hooks report lifecycle events and completed, fetchable segments:
 [hook.operations]
 url = "https://hooks.example.com/rushls"
 events = ["session.started", "session.ended", "segment.ready"]
-signing_secret_file = "/run/secrets/hook-signing"
+signing_secret = { file = "/run/secrets/hook-signing" }
 ```
 
 Hooks contain JSON metadata and resource paths, not media payloads.
@@ -574,17 +584,17 @@ They do not extend retention. Consumers must fetch segments before expiry and to
 See [hook signing and delivery](docs/publisher-api.md) and [metrics](docs/metrics.md).
 
 Strict input validation is the default. It rejects timing violations and dependent segment starts.
-`accept.strict = false` enables bounded recovery for supported input gaps, not arbitrary damaged media repair.
+`publish.strict = false` enables bounded recovery for supported input gaps, not arbitrary damaged media repair.
 Rushls does not synthesize missing frames or audio.
 See [input modes](docs/input-modes.md) for supported cases and limits.
 
 Reconnects and publisher takeover are distinct operations.
-`accept.takeover = true` allows a new publisher to replace an active one.
+`publish.takeover = true` allows a new publisher to replace an active one.
 An orderly end can close playlists with `ENDLIST`; transport interruptions can preserve a reconnect opportunity.
 Protocol-specific behavior appears in [deployment](docs/deployment.md#reconnects-and-shutdown).
 
 Use SIGTERM on Unix, or Ctrl+C/Ctrl+Break on Windows, for graceful shutdown.
-Set the supervisor's termination grace longer than the configured `shutdown` duration.
+Set the supervisor's termination grace longer than the configured `shutdown_grace` duration.
 Recording, hooks, and outstanding requests need time to drain.
 
 ## Troubleshooting and compatibility

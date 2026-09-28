@@ -192,7 +192,7 @@ pub struct RetentionDepth {
     pub memory_capacity: usize,
     /// Payload bytes in the disk overflow tier.
     pub disk_bytes: usize,
-    /// Configured `disk_per_stream`, or zero when the node is memory-only.
+    /// Configured `disk.per_stream`, or zero when the node is memory-only.
     pub disk_capacity: usize,
 }
 

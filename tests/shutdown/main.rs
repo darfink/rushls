@@ -2,7 +2,7 @@
 //!
 //! Locks in the graceful path: listeners exit on the stop broadcast, the
 //! recorder drain is bounded by `shutdown`, and nothing waits out the full
-//! deadline when there is nothing to drain. Uses a long `RUSHLS_SHUTDOWN`
+//! deadline when there is nothing to drain. Uses a long `RUSHLS_SHUTDOWN_GRACE`
 //! so a regression hangs the test instead of passing slowly.
 
 #![cfg(unix)]
@@ -40,11 +40,11 @@ fn sigterm_with_no_sessions_exits_without_waiting_for_shutdown_deadline() {
             // Hermetic against ambient config: the ready marker is INFO level.
             .env("RUST_LOG", "info")
             .env("RUSHLS_CONFIG", dir.join("empty.toml"))
-            .env("RUSHLS_RTMP_LISTEN", "127.0.0.1:0")
-            .env("RUSHLS_SRT_LISTEN", "127.0.0.1:0")
+            .env("RUSHLS_INGEST_RTMP_LISTEN", "127.0.0.1:0")
+            .env("RUSHLS_INGEST_SRT_LISTEN", "127.0.0.1:0")
             .env("RUSHLS_HTTP_LISTEN", "127.0.0.1:0")
             // Long on purpose: before a fix the process would sit here the hour.
-            .env("RUSHLS_SHUTDOWN", "1h")
+            .env("RUSHLS_SHUTDOWN_GRACE", "1h")
             .current_dir(&dir)
             // rushls logs to stderr.
             .stderr(Stdio::piped())

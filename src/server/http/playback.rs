@@ -135,7 +135,7 @@ impl PlaybackMeters {
     }
 }
 
-/// Resolved `[auth.playback]`, before any JWKS fetch.
+/// Resolved `[playback.auth]`, before any JWKS fetch.
 pub struct PlaybackSettings {
     pub issuer: String,
     pub audience: String,

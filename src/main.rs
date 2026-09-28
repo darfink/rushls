@@ -199,7 +199,7 @@ impl EventObserver for TracingEvents {
                 warn!(
                     stream = %stream,
                     capacity = %reason,
-                    retain = %humantime::format_duration(requested),
+                    window = %humantime::format_duration(requested),
                     retained = %humantime::format_duration(held),
                     "storage capacity reached; oldest media dropped"
                 );
@@ -338,6 +338,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Initialize before configuration so startup failures also carry timestamps.
     init_tracing();
     let resolved = AppConfig::load_and_resolve().unwrap_or_else(|error| error.exit());
+    if resolved.check {
+        // A dry run: everything above has validated, so report and stop
+        // before binding anything.
+        let mut output = std::io::stdout().lock();
+        match &resolved.config_file {
+            Some(path) => writeln!(output, "configuration  {}", path.display())?,
+            None => writeln!(output, "configuration  compiled defaults")?,
+        }
+        output.write_all(resolved.plan().as_bytes())?;
+        for warning in &resolved.warnings {
+            writeln!(output, "warning: {warning}")?;
+        }
+        return Ok(());
+    }
     if let Some(path) = &resolved.config_file {
         info!(path = %path.display(), "loaded configuration");
     } else {

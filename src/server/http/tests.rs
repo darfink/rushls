@@ -3291,7 +3291,7 @@ mod tls {
 
     #[tokio::test]
     async fn metrics_are_served_over_tls() {
-        // Sharing `[http.tls] listen` is how scrapes happen over HTTPS: the
+        // Sharing `[https] listen` is how scrapes happen over HTTPS: the
         // same router, the same certificate, no second metrics listener.
         let directory = scratch("metrics-https");
         let (settings, _) = write_pair(&directory, "origin.test");

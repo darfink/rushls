@@ -19,7 +19,7 @@ fn print_config_example_bypasses_configuration_loading() -> Result<(), Box<dyn s
         command
             .env_clear()
             .env("RUSHLS_CONFIG", &missing)
-            .env("RUSHLS_SHUTDOWN", "invalid-duration")
+            .env("RUSHLS_SHUTDOWN_GRACE", "invalid-duration")
             .env("RUSHLS_METRICS_TOKEN", "sensitive-sentinel")
             .env("RUST_LOG", "invalid[filter")
             .arg("--print-config-example");
@@ -46,7 +46,7 @@ fn print_config_example_obeys_argument_boundaries() -> Result<(), Box<dyn std::e
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_rushls"))
             .env_clear()
-            .env("RUSHLS_SHUTDOWN", "invalid-duration")
+            .env("RUSHLS_SHUTDOWN_GRACE", "invalid-duration")
             .args(args)
             .output()?;
         assert_eq!(output.status.code(), Some(2));
@@ -75,11 +75,24 @@ async fn readme_and_operator_guide_toml_examples_resolve() -> Result<(), Box<dyn
                 let file = match key.as_str() {
                     "cert" => Some("cert.pem"),
                     "key" => Some("key.pem"),
-                    "signing_secret_file" => Some("signing"),
-                    "token_file" | "passphrase_file" => Some("token"),
                     "dir" => Some("storage"),
                     _ => None,
                 };
+                // Credentials written as `{ file = "..." }` point at a mount.
+                let mounted = match key.as_str() {
+                    "signing_secret" => Some("signing"),
+                    "token" | "passphrase" => Some("token"),
+                    _ => None,
+                };
+                if let (Some(mounted), toml::Value::Table(reference)) = (mounted, &mut *value)
+                    && reference.contains_key("file")
+                {
+                    reference.insert(
+                        "file".to_owned(),
+                        toml::Value::String(root.join(mounted).to_string_lossy().into_owned()),
+                    );
+                    continue;
+                }
                 if let Some(file) = file {
                     *value = toml::Value::String(root.join(file).to_string_lossy().into_owned());
                 } else {
@@ -134,4 +147,30 @@ async fn readme_and_operator_guide_toml_examples_resolve() -> Result<(), Box<dyn
     })();
     fs::remove_dir_all(directory)?;
     result
+}
+
+#[test]
+fn check_prints_the_resolved_plan_without_serving() -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    let starter = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("rushls.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_rushls"))
+        .env_clear()
+        .arg("--config")
+        .arg(&starter)
+        .args(["--check", "--memory-total", "64GiB"])
+        .output()?;
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let plan = String::from_utf8(output.stdout)?;
+    assert!(plan.contains("ingest.rtmp  127.0.0.1:1935"), "{plan}");
+    assert!(plan.contains("at most 64.0 GiB"), "{plan}");
+
+    // An invalid configuration fails the check with the ordinary error.
+    let invalid = Command::new(env!("CARGO_BIN_EXE_rushls"))
+        .env_clear()
+        .args(["--check", "--memory-total", "1MiB"])
+        .output()?;
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+    Ok(())
 }

@@ -131,6 +131,8 @@ pub struct LiveStream {
     /// Lives only as long as this retained stream; arbitrary viewer paths
     /// cannot allocate an entry in a process-wide stream-label registry.
     http: crate::observe::http::HttpMeters,
+    /// This stream's share of `memory.total`, returned when it is dropped.
+    commitment: Option<crate::domain::Commitment>,
 }
 
 #[derive(Debug)]
@@ -240,7 +242,15 @@ impl LiveStream {
             telemetry: Mutex::new(PublicationTelemetry::default()),
             operations: crate::observe::OperationMeters::default(),
             http: crate::observe::http::HttpMeters::default(),
+            commitment: None,
         }
+    }
+
+    /// Holds a node-wide memory commitment for this stream's lifetime.
+    #[must_use]
+    pub fn with_commitment(mut self, commitment: Option<crate::domain::Commitment>) -> Self {
+        self.commitment = commitment;
+        self
     }
 
     pub fn http_meters(&self) -> crate::observe::http::HttpMeters {

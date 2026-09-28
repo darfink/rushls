@@ -30,10 +30,11 @@ fn the_example_covers_every_toml_option() -> Result<(), Box<dyn Error>> {
     use conf::{Conf, introspection::ProgramOptionMeta};
 
     let reference = fixtures::Example::read()?;
-    for option in AppConfig::program_options().filter(ProgramOptionMeta::has_serde_source) {
-        let id = option.id().to_string();
-        // Server fields flatten into the document root; their Rust IDs retain `node`.
-        let path = id.strip_prefix("node.").unwrap_or(&id);
+    for option in AppConfig::program_options() {
+        let Some(path) = super::toml_path(&option.id().to_string()) else {
+            continue;
+        };
+        let path = path.as_str();
         assert!(
             fixtures::contains(&reference.document, path),
             "rushls.example.toml does not document {path}"
@@ -58,7 +59,7 @@ fn all_documented_examples_match_the_configuration_schema() -> Result<(), Box<dy
             .doc("rushls.example.toml", document)
             .try_parse()
             .map_err(|error| format!("reference example {path}: {error}"))?;
-        config.accept.resolve()?;
+        config.publish.resolve()?;
         if let Some(record) = config.record {
             record.0.validate()?;
         }
@@ -174,11 +175,11 @@ async fn open_authentication_is_the_builtin_default() -> Result<(), Box<dyn Erro
 fn cli_overrides_environment_which_overrides_toml() -> Result<(), Box<dyn Error>> {
     let config = resolve_with(
         r"
-[capacity]
+[limits]
 publishers = 10
 ",
-        &["--capacity-publishers", "30"],
-        &[("RUSHLS_CAPACITY_PUBLISHERS", "20")],
+        &["--limits-publishers", "30"],
+        &[("RUSHLS_LIMITS_PUBLISHERS", "20")],
     )??;
 
     assert_eq!(config.node.maximum_sessions, 30);
@@ -186,37 +187,62 @@ publishers = 10
 }
 
 #[test]
-fn secret_files_accept_a_cli_path_and_secret_values_do_not() -> Result<(), Box<dyn Error>> {
+fn file_references_reach_secrets_from_the_environment_and_the_cli_takes_paths()
+-> Result<(), Box<dyn Error>> {
     let secret = TempConfig::new("mounted-secret")?;
-    let path = secret.path.to_str().ok_or("temp path is not UTF-8")?;
+    let reference = format!(
+        "{{ file = \"{}\" }}",
+        fixtures::toml_path_contents(&secret.path)
+    );
 
     let config = resolve_with(
         r#"
-[auth.publish]
+[publish.auth]
 url = "http://127.0.0.1/admit"
 "#,
-        &[
-            "--auth-publish-token-file",
-            path,
-            "--metrics-token-file",
-            path,
-            "--srt-passphrase-file",
-            path,
-        ],
         &[],
+        &[
+            ("RUSHLS_PUBLISH_AUTH_TOKEN", reference.as_str()),
+            ("RUSHLS_METRICS_TOKEN", reference.as_str()),
+            ("RUSHLS_INGEST_SRT_PASSPHRASE", reference.as_str()),
+        ],
+    )??;
+    assert!(config.node.metrics.token.is_some());
+    assert!(config.node.srt.encryption.is_some());
+
+    // Flags name a file, never the credential: arguments are visible in the
+    // process list. The flag outranks the environment like any CLI value.
+    let path = secret.path.to_string_lossy().into_owned();
+    let config = resolve_with(
+        "",
+        &["--metrics-token", &path, "--ingest-srt-passphrase", &path],
+        &[("RUSHLS_METRICS_TOKEN", "from-the-environment")],
     )??;
     assert!(config.node.metrics.token.is_some());
     assert!(config.node.srt.encryption.is_some());
 
     for flag in [
-        "--auth-publish-token",
+        "--publish-auth-token",
+        "--playback-auth-secret",
         "--metrics-token",
-        "--srt-passphrase",
+        "--ingest-srt-passphrase",
     ] {
-        let result = load_with("", &[flag, "inline-secret"], &[])?;
+        // An inline value is read as a path, which does not exist.
+        let result = resolve_with(
+            "[publish.auth]\nurl = \"http://127.0.0.1/admit\"\n\
+             [playback.auth]\njwks_url = \"https://issuer.example/jwks\"\n\
+             claims = { iss = \"i\", aud = \"a\" }\n",
+            &[flag, "inline-secret"],
+            &[],
+        )?;
         assert!(
-            result.is_err(),
-            "{flag} is a secret value and must not be a command-line flag"
+            matches!(
+                result,
+                Err(ConfigError::Loading(
+                    rushls_config::ConfigError::SecretRead { .. }
+                ))
+            ),
+            "{flag} must read a file rather than take the credential inline"
         );
     }
     Ok(())
@@ -224,7 +250,7 @@ url = "http://127.0.0.1/admit"
 
 #[test]
 fn an_explicit_config_path_is_recorded() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new("[capacity]\npublishers = 11\n")?;
+    let file = TempConfig::new("[limits]\npublishers = 11\n")?;
     let resolved = AppConfig::load_and_resolve_from(
         os([
             "rushls",
@@ -240,7 +266,7 @@ fn an_explicit_config_path_is_recorded() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn rushls_config_is_used_when_the_cli_omits_the_file() -> Result<(), Box<dyn Error>> {
-    let file = TempConfig::new("[capacity]\npublishers = 12\n")?;
+    let file = TempConfig::new("[limits]\npublishers = 12\n")?;
     let resolved = AppConfig::load_and_resolve_from(
         os(["rushls"]),
         [(
@@ -255,8 +281,8 @@ fn rushls_config_is_used_when_the_cli_omits_the_file() -> Result<(), Box<dyn Err
 
 #[test]
 fn a_cli_config_path_wins_over_rushls_config() -> Result<(), Box<dyn Error>> {
-    let cli = TempConfig::new("[capacity]\npublishers = 13\n")?;
-    let env = TempConfig::new("[capacity]\npublishers = 14\n")?;
+    let cli = TempConfig::new("[limits]\npublishers = 13\n")?;
+    let env = TempConfig::new("[limits]\npublishers = 14\n")?;
     let resolved = AppConfig::load_and_resolve_from(
         os([
             "rushls",
@@ -301,10 +327,10 @@ fn compiled_defaults_do_not_search_well_known_files() -> Result<(), Box<dyn Erro
 fn unknown_rushls_environment_variables_warn_without_blocking_startup() -> Result<(), Box<dyn Error>>
 {
     let env = [
-        ("RUSHLS_CAPACITY_PUBLISHERS", "20"),
+        ("RUSHLS_LIMITS_PUBLISHERS", "20"),
         ("PAGER", "less"),
         ("RUSHLS_TLS_CERTIFICATE", "do-not-print-this"),
-        ("RUSHLS_CAPACITY_MAXIMUM_CONCURRENT_PUBLISHER", "20"),
+        ("RUSHLS_LIMITS_MAXIMUM_CONCURRENT_PUBLISHER", "20"),
     ]
     .map(|(key, value)| (OsString::from(key), OsString::from(value)));
     let resolved = AppConfig::load_and_resolve_from(os(["rushls"]), env)?;
@@ -315,7 +341,7 @@ fn unknown_rushls_environment_variables_warn_without_blocking_startup() -> Resul
         .filter(|warning| warning.starts_with("unrecognized"))
         .collect();
     assert_eq!(warnings.len(), 2);
-    assert!(warnings[0].contains("RUSHLS_CAPACITY_MAXIMUM_CONCURRENT_PUBLISHER"));
+    assert!(warnings[0].contains("RUSHLS_LIMITS_MAXIMUM_CONCURRENT_PUBLISHER"));
     assert!(warnings[1].contains("RUSHLS_TLS_CERTIFICATE"));
     assert!(!format!("{warnings:?}").contains("do-not-print-this"));
     Ok(())
@@ -348,7 +374,7 @@ async fn open_authentication_accepts_any_credential_and_preserves_the_resource()
 -> Result<(), Box<dyn Error>> {
     let config = resolve_toml(
         r"
-[accept]
+[publish]
 takeover = false
 ",
     )??;
@@ -364,103 +390,66 @@ takeover = false
 }
 
 #[tokio::test]
-async fn a_ceiling_pace_alone_is_realtime_with_no_head_start() -> Result<(), Box<dyn Error>> {
-    let from_file = resolve_toml(
-        r#"
-[accept]
-ceiling = { pace = "1x" }
-"#,
-    )??;
-    assert_eq!(
-        default_policy(&from_file).await?.ceiling,
-        Some(Ceiling {
-            pace: Pace::realtime(),
-            burst: Duration::ZERO,
-        })
-    );
+async fn a_rate_max_alone_is_realtime_with_no_head_start() -> Result<(), Box<dyn Error>> {
+    let expected = Some(Ceiling {
+        pace: Pace::realtime(),
+        burst: Duration::ZERO,
+    });
+    let from_file = resolve_toml("[publish]\nrate = { max = \"1x\" }\n")??;
+    assert_eq!(default_policy(&from_file).await?.ceiling, expected);
+    assert_eq!(default_policy(&from_file).await?.floor, None);
 
-    let from_flag = resolve_with("", &["--accept-ceiling-pace", "1x"], &[])??;
-    assert_eq!(
-        default_policy(&from_flag).await?.ceiling,
-        Some(Ceiling {
-            pace: Pace::realtime(),
-            burst: Duration::ZERO,
-        })
-    );
+    // Environment and CLI carry the same inline table.
+    let from_env = resolve_with_env(&[("RUSHLS_PUBLISH_RATE", "{ max = \"1x\" }")])??;
+    assert_eq!(default_policy(&from_env).await?.ceiling, expected);
+    let from_flag = resolve_with("", &["--publish-rate", "{ max = \"1x\" }"], &[])??;
+    assert_eq!(default_policy(&from_flag).await?.ceiling, expected);
     Ok(())
 }
 
 #[tokio::test]
-async fn ceiling_pace_and_burst_flatten_to_cli_flags() -> Result<(), Box<dyn Error>> {
-    let config = resolve_with(
-        "",
-        &[
-            "--accept-ceiling-pace",
-            "1x",
-            "--accept-ceiling-burst",
-            "10s",
-        ],
-        &[],
+async fn one_rate_value_carries_both_the_ceiling_and_the_floor() -> Result<(), Box<dyn Error>> {
+    let config = resolve_toml(
+        "[publish]\nrate = { max = \"1x\", burst = \"10s\", min = \"0.5x\", window = \"30s\" }\n",
     )??;
+    let policy = default_policy(&config).await?;
     assert_eq!(
-        default_policy(&config).await?.ceiling,
+        policy.ceiling,
         Some(Ceiling {
             pace: Pace::realtime(),
             burst: Duration::from_secs(10),
         })
     );
-    Ok(())
-}
-
-#[test]
-fn a_ceiling_burst_without_pace_is_refused() -> Result<(), Box<dyn Error>> {
-    let error = resolve_with("", &["--accept-ceiling-burst", "10s"], &[])?
-        .err()
-        .ok_or("burst without pace must fail")?;
-    assert!(
-        error.to_string().contains("pace"),
-        "unexpected error: {error}"
+    assert_eq!(
+        policy.floor,
+        Some(Floor {
+            pace: Pace::new(nz::u32!(1), nz::u32!(2)),
+            window: Duration::from_secs(30),
+        })
     );
     Ok(())
 }
 
-#[tokio::test]
-async fn floor_pace_and_window_flatten_to_cli_flags() -> Result<(), Box<dyn Error>> {
-    let from_file = resolve_toml(
-        r#"
-[accept]
-floor = { pace = "0.5x", window = "30s" }
-"#,
-    )??;
-    let expected = Floor {
-        pace: Pace::new(nz::u32!(1), nz::u32!(2)),
-        window: Duration::from_secs(30),
-    };
-    assert_eq!(default_policy(&from_file).await?.floor, Some(expected));
-
-    let from_flag = resolve_with(
-        "",
-        &[
-            "--accept-floor-pace",
-            "0.5x",
-            "--accept-floor-window",
-            "30s",
-        ],
-        &[],
-    )??;
-    assert_eq!(default_policy(&from_flag).await?.floor, Some(expected));
-    Ok(())
-}
-
 #[test]
-fn a_floor_pace_without_a_window_is_refused() -> Result<(), Box<dyn Error>> {
-    let error = resolve_with("", &["--accept-floor-pace", "0.5x"], &[])?
-        .err()
-        .ok_or("pace without window must fail")?;
-    assert!(
-        error.to_string().contains("window"),
-        "unexpected error: {error}"
-    );
+fn incomplete_or_contradictory_rates_are_refused() -> Result<(), Box<dyn Error>> {
+    for (rate, expected) in [
+        ("{ burst = \"10s\" }", "rate.burst needs rate.max"),
+        ("{ min = \"0.5x\" }", "rate.min needs rate.window"),
+        ("{ window = \"30s\" }", "rate.window needs rate.min"),
+        (
+            "{ min = \"0.5x\", window = \"0s\" }",
+            "rate.window must be nonzero",
+        ),
+        (
+            "{ max = \"1x\", min = \"1x\", window = \"30s\" }",
+            "rate.min must be slower than rate.max",
+        ),
+    ] {
+        let error = resolve_toml(&format!("[publish]\nrate = {rate}\n"))?
+            .err()
+            .ok_or_else(|| format!("{rate} must fail"))?;
+        assert!(error.to_string().contains(expected), "{rate}: {error}");
+    }
     Ok(())
 }
 
@@ -569,11 +558,11 @@ fn existing_optional_secrets_accept_mounted_files() -> Result<(), Box<dyn Error>
         r#"
 {BASE_CONFIG}
 
-[srt]
-passphrase_file = "{}"
+[ingest.srt]
+passphrase = {{ file = "{}" }}
 
 [metrics]
-token_file = "{}"
+token = {{ file = "{}" }}
 "#,
         fixtures::toml_path_contents(&secret.path),
         fixtures::toml_path_contents(&secret.path),
@@ -585,25 +574,20 @@ token_file = "{}"
 }
 
 #[test]
-fn an_inline_secret_and_its_file_are_mutually_exclusive() -> Result<(), Box<dyn Error>> {
+fn a_credential_is_either_inline_or_a_file_reference() -> Result<(), Box<dyn Error>> {
     let secret = TempConfig::new("mounted-secret")?;
+    // The value's shape decides, so there is no second field to conflict
+    // with; an unknown key inside the reference is refused.
     let result = resolve_toml(&format!(
         r#"
 {BASE_CONFIG}
 
 [metrics]
-token = "inline"
-token_file = "{}"
+token = {{ file = "{}", value = "inline" }}
 "#,
         fixtures::toml_path_contents(&secret.path),
     ))?;
-
-    assert!(matches!(
-        result,
-        Err(ConfigError::Loading(
-            rushls_config::ConfigError::SecretConflict(_)
-        ))
-    ));
+    assert!(matches!(result, Err(ConfigError::Loading(_))));
     Ok(())
 }
 
@@ -621,7 +605,7 @@ fn compiled_defaults_leave_moq_off() -> Result<(), Box<dyn Error>> {
 fn a_moq_listener_without_certificates_is_refused() -> Result<(), Box<dyn Error>> {
     let Err(error) = resolve_toml(
         r#"
-[moq]
+[ingest.moq]
 listen = "127.0.0.1:4433"
 "#,
     )?
@@ -642,17 +626,21 @@ fn a_moq_listener_with_certificates_resolves() -> Result<(), Box<dyn Error>> {
     let (settings, _) = write_pair(&directory, "origin.internal");
     let resolved = resolve_toml(&format!(
         r#"
-[rtmp]
+[ingest.rtmp]
 listen = "127.0.0.1:1935"
 
-[srt]
+[ingest.srt]
 listen = "127.0.0.1:9000"
 
-[moq]
+[ingest]
+idle_timeout = "8s"
+
+[ingest.moq]
 listen = "127.0.0.1:4433"
+
+[tls]
 cert = "{}"
 key = "{}"
-timeout = "8s"
 "#,
         fixtures::toml_path_contents(&settings.certificate),
         fixtures::toml_path_contents(&settings.key)
@@ -681,14 +669,16 @@ fn a_public_moq_listener_with_open_auth_is_warned() -> Result<(), Box<dyn Error>
     let (settings, _) = write_pair(&directory, "origin.internal");
     let resolved = resolve_toml(&format!(
         r#"
-[rtmp]
+[ingest.rtmp]
 listen = "127.0.0.1:1935"
 
-[srt]
+[ingest.srt]
 listen = "127.0.0.1:9000"
 
-[moq]
+[ingest.moq]
 listen = "0.0.0.0:4433"
+
+[tls]
 cert = "{}"
 key = "{}"
 "#,
@@ -701,7 +691,7 @@ key = "{}"
         resolved
             .warnings
             .iter()
-            .any(|warning| warning.contains("public address") && warning.contains("[auth.publish]")),
+            .any(|warning| warning.contains("public address") && warning.contains("[publish.auth]")),
         "open publish on a public MOQ bind should not be invisible: {:?}",
         resolved.warnings
     );
@@ -714,17 +704,21 @@ fn a_disabled_moq_timeout_still_bounds_the_handshake() -> Result<(), Box<dyn Err
     let (settings, _) = write_pair(&directory, "origin.internal");
     let resolved = resolve_toml(&format!(
         r#"
-[rtmp]
+[ingest.rtmp]
 listen = "127.0.0.1:1935"
 
-[srt]
+[ingest.srt]
 listen = "127.0.0.1:9000"
 
-[moq]
+[ingest]
+idle_timeout = "off"
+
+[ingest.moq]
 listen = "127.0.0.1:4433"
+
+[tls]
 cert = "{}"
 key = "{}"
-timeout = "off"
 "#,
         fixtures::toml_path_contents(&settings.certificate),
         fixtures::toml_path_contents(&settings.key)
@@ -737,7 +731,7 @@ timeout = "off"
         resolved
             .warnings
             .iter()
-            .any(|warning| warning.contains("MOQ timeout is disabled")),
+            .any(|warning| warning.contains("ingest.idle_timeout is off")),
         "an unbounded wait on a bound listener should not be invisible: {:?}",
         resolved.warnings
     );
@@ -748,8 +742,8 @@ timeout = "off"
 fn a_moq_timeout_below_a_keyframe_interval_is_refused() -> Result<(), Box<dyn Error>> {
     let Err(error) = resolve_toml(
         r#"
-[moq]
-timeout = "500ms"
+[ingest]
+idle_timeout = "500ms"
 "#,
     )?
     else {
@@ -768,7 +762,7 @@ fn tls_requires_both_the_certificate_and_key() -> Result<(), Box<dyn Error>> {
     let result = load_with(
         BASE_CONFIG,
         &[],
-        &[("RUSHLS_HTTP_TLS_CERT", "/tmp/certificate.pem")],
+        &[("RUSHLS_TLS_CERT", "/tmp/certificate.pem")],
     )?;
 
     assert!(result.is_err());
@@ -780,7 +774,7 @@ fn unknown_toml_keys_are_rejected() -> Result<(), Box<dyn Error>> {
     assert!(
         load_toml(
             r"
-[capacity]
+[limits]
 publishers = 10
 maximum_concurrent_publisherz = 11
 "
@@ -810,7 +804,7 @@ fn file_values_interpolate_from_the_environment() -> Result<(), Box<dyn Error>> 
         r#"
 name = "${NODE_NAME}"
 
-[auth.publish]
+[publish.auth]
 url = "http://${AUTH_HOST}/admit"
 token = "${AUTH_TOKEN}"
 "#,
@@ -864,7 +858,7 @@ async fn mutual_tls_material_resolves_for_the_admission_service() -> Result<(), 
 
     let configuration = format!(
         r#"
-[auth.publish]
+[publish.auth]
 url = "https://auth.internal/admit"
 client_cert = "{}"
 client_key = "{}"
@@ -910,7 +904,7 @@ async fn half_a_client_certificate_pair_is_refused() -> Result<(), Box<dyn Error
         ),
     ] {
         let error = resolve_toml(&format!(
-            "[auth.publish]\nurl = \"https://auth.internal/admit\"\n{line}\n"
+            "[publish.auth]\nurl = \"https://auth.internal/admit\"\n{line}\n"
         ))?
         .err()
         .ok_or("half a pair is refused")?
@@ -925,7 +919,7 @@ async fn an_unreadable_client_certificate_stops_startup() -> Result<(), Box<dyn 
     let directory = scratch("auth-mtls-missing");
     let error = resolve_toml(&format!(
         r#"
-[auth.publish]
+[publish.auth]
 url = "https://auth.internal/admit"
 client_cert = "{}"
 client_key = "{}"
@@ -937,7 +931,7 @@ client_key = "{}"
     .ok_or("an unreadable identity is refused")?
     .to_string();
 
-    assert!(error.contains("[auth.publish]"), "{error}");
+    assert!(error.contains("[publish.auth]"), "{error}");
     Ok(())
 }
 
@@ -1028,7 +1022,7 @@ fn keys_for_unbuilt_features_are_refused_by_name() -> Result<(), Box<dyn Error>>
     // the silent-misconfiguration failure the whole design is against.
     for configuration in [
         // Mutual TLS to the admission service.
-        "[auth.publish]\nurl = \"http://auth\"\nclient_cert = \"/x.pem\"\n",
+        "[publish.auth]\nurl = \"http://auth\"\nclient_cert = \"/x.pem\"\n",
         // Payload-carrying hooks.
         "[hook.archive]\nurl = \"http://archive\"\nevents = [\"session.started\"]\npayload = true\n",
     ] {
@@ -1045,7 +1039,7 @@ fn disk_tier_defaults_the_directory_and_refuses_a_path_without_a_cap() -> Result
 {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/rushls-disk-config-test");
     let both = format!(
-        "[capacity]\ndisk_per_stream = \"8GiB\"\ndir = \"{}\"\n",
+        "[disk]\nper_stream = \"8GiB\"\ndir = \"{}\"\n",
         fixtures::toml_path_contents(&dir)
     );
     let config = resolve_toml(&both)??;
@@ -1058,7 +1052,7 @@ fn disk_tier_defaults_the_directory_and_refuses_a_path_without_a_cap() -> Result
     assert_eq!(disk.maximum_payload_bytes, 8 * 1024 * 1024 * 1024_usize);
     assert_eq!(disk.directory, dir);
 
-    let defaulted = resolve_toml("[capacity]\ndisk_per_stream = \"8GiB\"\n")??;
+    let defaulted = resolve_toml("[disk]\nper_stream = \"8GiB\"\n")??;
     let defaulted = defaulted
         .node
         .store
@@ -1076,8 +1070,8 @@ fn disk_tier_defaults_the_directory_and_refuses_a_path_without_a_cap() -> Result
     );
 
     for configuration in [
-        "[capacity]\ndir = \"/var/lib/rushls\"\n",
-        "[capacity]\ndisk_per_stream = \"0\"\ndir = \"/var/lib/rushls\"\n",
+        "[disk]\ndir = \"/var/lib/rushls\"\n",
+        "[disk]\nper_stream = \"0\"\ndir = \"/var/lib/rushls\"\n",
     ] {
         assert!(
             resolve_toml(configuration)?.is_err(),
@@ -1095,7 +1089,7 @@ fn the_admission_budget_derives_from_the_publisher_budget() -> Result<(), Box<dy
     // unauthenticated sockets.
     let config = resolve_toml(
         r"
-[capacity]
+[limits]
 publishers = 40
 ",
     )??;
@@ -1112,9 +1106,9 @@ publishers = 40
 #[test]
 fn configured_http_auth_resolves_and_guards_its_own_settings() -> Result<(), Box<dyn Error>> {
     let valid = r#"
-[auth.publish]
+[publish.auth]
 url = "http://auth-sidecar:8081/v1/publish/admit"
-max_response_bytes = "64KiB"
+max_response = "64KiB"
 "#;
     assert!(
         resolve_toml(valid)?.is_ok(),
@@ -1125,18 +1119,18 @@ max_response_bytes = "64KiB"
     // takes effect: the session gives up first and blames a stage rather than
     // the service that did not answer.
     let outlives_admission = r#"
-[auth.publish]
+[publish.auth]
 url = "http://auth-sidecar:8081/admit"
 timeout = "30s"
 "#;
     // A response may only name a policy this node actually has.
     let unknown_default = r#"
-[auth.publish]
+[publish.auth]
 url = "http://auth-sidecar:8081/admit"
 default_policy = "nonexistent"
     "#;
     let unusable_url = r#"
-[auth.publish]
+[publish.auth]
 url = "not-a-url"
 "#;
     for configuration in [outlives_admission, unknown_default, unusable_url] {
@@ -1145,16 +1139,17 @@ url = "not-a-url"
             "expected a startup error for:{configuration}"
         );
     }
-    assert!(resolve_toml("[auth]\n")?.is_ok());
+    // `[auth]` is gone: publisher and viewer auth live under what they protect.
+    assert!(resolve_toml("[auth]\n")?.is_err());
     Ok(())
 }
 
 #[test]
 fn playback_auth_requires_one_key_source_and_iss_aud() -> Result<(), Box<dyn Error>> {
     let hmac = r#"
-[auth.playback]
+[playback.auth]
 secret = "playback-hmac-secret"
-[auth.playback.claims]
+[playback.auth.claims]
 iss = "https://issuer.example"
 aud = "rushls-origin"
 tier = "premium"
@@ -1190,9 +1185,9 @@ ok = true
     ));
 
     let jwks = r#"
-[auth.playback]
+[playback.auth]
 jwks_url = "https://issuer.example/.well-known/jwks.json"
-[auth.playback.claims]
+[playback.auth.claims]
 iss = "https://issuer.example"
 aud = "rushls-origin"
 "#;
@@ -1206,35 +1201,35 @@ aud = "rushls-origin"
     );
 
     for configuration in [
-        "[auth.playback]\nsecret = \"shh\"\n",
+        "[playback.auth]\nsecret = \"shh\"\n",
         r#"
-[auth.playback]
+[playback.auth]
 secret = "shh"
 jwks_url = "https://issuer.example/jwks.json"
-[auth.playback.claims]
+[playback.auth.claims]
 iss = "https://issuer.example"
 aud = "rushls-origin"
 "#,
         r#"
-[auth.playback]
+[playback.auth]
 secret = ""
-[auth.playback.claims]
+[playback.auth.claims]
 iss = "https://issuer.example"
 aud = "rushls-origin"
 "#,
         r#"
-[auth.playback]
+[playback.auth]
 secret = "shh"
-[auth.playback.claims]
+[playback.auth.claims]
 iss = 1
 aud = "rushls-origin"
 "#,
         r#"
-[auth.playback]
+[playback.auth]
 secret = "shh"
 jwks_url = "https://issuer.example/jwks.json"
 public_key = "-----BEGIN PUBLIC KEY-----\nMIIB\n-----END PUBLIC KEY-----"
-[auth.playback.claims]
+[playback.auth.claims]
 iss = "https://issuer.example"
 aud = "rushls-origin"
 "#,
@@ -1250,7 +1245,7 @@ aud = "rushls-origin"
 #[test]
 fn http_auth_is_selected_by_the_optional_table() -> Result<(), Box<dyn Error>> {
     let configuration = r#"
-[auth.publish]
+[publish.auth]
 url = "http://auth-sidecar:8081/admit"
 "#;
     assert!(resolve_toml(configuration)?.is_ok());
@@ -1400,8 +1395,8 @@ fn the_rtmp_timeout_derives_a_tighter_handshake_limit() -> Result<(), Box<dyn Er
     // before proving anything is the cheapest attack against an ingest node.
     let resolved = resolve_toml(
         r#"
-[rtmp]
-timeout = "15s"
+[ingest]
+idle_timeout = "15s"
 "#,
     )?
     .unwrap_or_else(|error| panic!("a timeout alone must resolve: {error}"));
@@ -1423,8 +1418,8 @@ fn a_tight_rtmp_timeout_also_tightens_the_handshake() -> Result<(), Box<dyn Erro
     // limit never leaves the unauthenticated phase the more patient one.
     let resolved = resolve_toml(
         r#"
-[rtmp]
-timeout = "2s"
+[ingest]
+idle_timeout = "2s"
 "#,
     )?
     .unwrap_or_else(|error| panic!("a tight timeout must resolve: {error}"));
@@ -1441,8 +1436,8 @@ fn a_disabled_rtmp_timeout_still_bounds_the_handshake() -> Result<(), Box<dyn Er
     // publisher that proved itself, never to a peer that has not.
     let resolved = resolve_toml(
         r#"
-[rtmp]
-timeout = "off"
+[ingest]
+idle_timeout = "off"
 "#,
     )?
     .unwrap_or_else(|error| panic!("a disabled timeout must resolve: {error}"));
@@ -1455,7 +1450,7 @@ timeout = "off"
         resolved
             .warnings
             .iter()
-            .any(|warning| warning.contains("RTMP timeout is disabled")),
+            .any(|warning| warning.contains("ingest.idle_timeout is off")),
         "an unbounded wait on a public bind should not be invisible: {:?}",
         resolved.warnings
     );
@@ -1468,8 +1463,8 @@ fn the_stall_deadline_is_an_absolute_duration() -> Result<(), Box<dyn Error>> {
     // happens to be packaging at.
     let resolved = resolve_toml(
         r#"
-[accept]
-stall = "20s"
+[ingest]
+stall_timeout = "20s"
 "#,
     )?
     .unwrap_or_else(|error| panic!("a stall deadline must resolve: {error}"));
@@ -1490,8 +1485,8 @@ fn a_stall_shorter_than_one_segment_is_refused() -> Result<(), Box<dyn Error>> {
 [hls]
 segment = { target = "10s" }
 
-[accept]
-stall = "5s"
+[ingest]
+stall_timeout = "5s"
 "#,
     )?
     else {
@@ -1509,8 +1504,8 @@ stall = "5s"
 fn a_stall_may_be_disabled_on_a_trusted_link() -> Result<(), Box<dyn Error>> {
     let resolved = resolve_toml(
         r#"
-[accept]
-stall = "off"
+[ingest]
+stall_timeout = "off"
 "#,
     )?
     .unwrap_or_else(|error| panic!("a disabled stall must resolve: {error}"));
@@ -1523,7 +1518,7 @@ stall = "off"
         resolved
             .warnings
             .iter()
-            .any(|warning| warning.contains("accept.stall is off")),
+            .any(|warning| warning.contains("ingest.stall_timeout is off")),
         "an unbounded wait should not be invisible: {:?}",
         resolved.warnings
     );
@@ -1535,8 +1530,8 @@ fn a_stall_deadline_shorter_than_its_sampling_is_refused() -> Result<(), Box<dyn
     // a value is not the tighter detection it appears to be.
     let Err(error) = resolve_toml(
         r#"
-[accept]
-stall = "500ms"
+[ingest]
+stall_timeout = "500ms"
 "#,
     )?
     else {
@@ -1556,9 +1551,11 @@ fn an_srt_idle_deadline_inside_the_latency_window_is_refused() -> Result<(), Box
     // transport is still legitimately waiting for.
     let Err(error) = resolve_toml(
         r#"
-[srt]
+[ingest]
+idle_timeout = "1s"
+
+[ingest.srt]
 latency = "2s"
-timeout = "1s"
 "#,
     )?
     else {
@@ -1566,9 +1563,7 @@ timeout = "1s"
     };
 
     assert!(
-        error
-            .to_string()
-            .contains("must exceed the receive latency"),
+        error.to_string().contains("must exceed ingest.srt.latency"),
         "unexpected error: {error}"
     );
     Ok(())
@@ -1582,11 +1577,13 @@ fn tls_admission_limits_are_configurable() -> Result<(), Box<dyn Error>> {
     let key = TempConfig::new("key")?;
     let resolved = resolve_toml(&format!(
         r#"
-[http.tls]
-cert = "{}"
-key = "{}"
+[https]
 handshake_timeout = "2s"
 max_handshakes = 32
+
+[tls]
+cert = "{}"
+key = "{}"
 "#,
         fixtures::toml_path_contents(&certificate.path),
         fixtures::toml_path_contents(&key.path)
@@ -1605,7 +1602,7 @@ fn tls_version_bounds_resolve_and_reject_invalid_ranges() -> Result<(), Box<dyn 
     let certificate = TempConfig::new("certificate")?;
     let key = TempConfig::new("key")?;
     let base = format!(
-        "[http.tls]\ncert = {:?}\nkey = {:?}\n",
+        "[tls]\ncert = {:?}\nkey = {:?}\n[https]\n",
         certificate.path, key.path
     );
     for (toml, args, env, expected) in [
@@ -1624,7 +1621,7 @@ fn tls_version_bounds_resolve_and_reject_invalid_ranges() -> Result<(), Box<dyn 
         ),
         (
             base.clone(),
-            vec!["--http-tls-version-min=1.2", "--http-tls-version-max=1.2"],
+            vec!["--https-version-min=1.2", "--https-version-max=1.2"],
             vec![],
             (Tls12, Tls12),
         ),
@@ -1632,14 +1629,14 @@ fn tls_version_bounds_resolve_and_reject_invalid_ranges() -> Result<(), Box<dyn 
             base.clone(),
             vec![],
             vec![
-                ("RUSHLS_HTTP_TLS_VERSION_MIN", "1.2"),
-                ("RUSHLS_HTTP_TLS_VERSION_MAX", "1.2"),
+                ("RUSHLS_HTTPS_VERSION_MIN", "1.2"),
+                ("RUSHLS_HTTPS_VERSION_MAX", "1.2"),
             ],
             (Tls12, Tls12),
         ),
         (
             format!("{base}version = {{ min = \"1.2\" }}\n"),
-            vec!["--http-tls-version-min=1.3"],
+            vec!["--https-version-min=1.3"],
             vec![],
             (Tls13, Tls13),
         ),
@@ -1650,7 +1647,7 @@ fn tls_version_bounds_resolve_and_reject_invalid_ranges() -> Result<(), Box<dyn 
     }
     let invalid = resolve_toml(&format!("{base}version = {{ max = \"1.2\" }}\n"))?;
     assert!(
-        matches!(invalid, Err(ConfigError::Invalid(message)) if message.contains("http.tls.version.min must not exceed http.tls.version.max"))
+        matches!(invalid, Err(ConfigError::Invalid(message)) if message.contains("https.version.min must not exceed https.version.max"))
     );
     for version in ["1.0", "1.1", "1.4", "garbage"] {
         assert!(load_toml(&format!("{base}version = {{ min = {version:?} }}\n"))?.is_err());
@@ -1663,8 +1660,8 @@ fn an_rtmp_timeout_below_a_keyframe_interval_is_refused() -> Result<(), Box<dyn 
     // Hardening that drops legitimate publishers is an outage, not a defence.
     let Err(error) = resolve_toml(
         r#"
-[rtmp]
-timeout = "500ms"
+[ingest]
+idle_timeout = "500ms"
 "#,
     )?
     else {
@@ -1855,7 +1852,7 @@ fn the_playlist_window_becomes_the_retention_window() -> Result<(), Box<dyn Erro
         r#"
 [hls]
 segment = { target = "6s", max = "1x" }
-retain = "18s"
+window = "18s"
 "#,
     )??;
 
@@ -1874,7 +1871,7 @@ fn a_fixed_window_below_three_target_durations_is_refused() -> Result<(), Box<dy
             r#"
 [hls]
 segment = { target = "6s" }
-retain = "12s"
+window = "12s"
 "#,
         )?
         .is_err(),
@@ -1891,7 +1888,7 @@ fn a_reconnect_window_below_the_hold_back_is_refused() -> Result<(), Box<dyn Err
 [hls]
 segment = { target = "6s" }
 
-[capacity]
+[limits]
 inactive_stream_retention = "5s"
 "#,
         )?
@@ -1901,7 +1898,7 @@ inactive_stream_retention = "5s"
     assert!(
         resolve_toml(
             r#"
-[capacity]
+[limits]
 inactive_stream_retention = "0s"
 "#,
         )?
@@ -1958,10 +1955,12 @@ impl Drop for TempConfig {
 fn an_unknown_enumerated_value_names_the_alternatives() -> Result<(), Box<dyn Error>> {
     // The point of these messages is that an operator who typos one does not
     // have to go and read the reference file to find out what was allowed.
-    let key_length = load_toml(&format!("{BASE_CONFIG}\n[srt]\nencryption = \"aes999\"\n"))?
-        .err()
-        .ok_or("an unknown key length is refused")?
-        .to_string();
+    let key_length = load_toml(&format!(
+        "{BASE_CONFIG}\n[ingest.srt]\nencryption = \"aes999\"\n"
+    ))?
+    .err()
+    .ok_or("an unknown key length is refused")?
+    .to_string();
     assert!(key_length.contains("aes128"), "{key_length}");
     assert!(key_length.contains("aes256"), "{key_length}");
     Ok(())
@@ -1971,8 +1970,7 @@ fn an_unknown_enumerated_value_names_the_alternatives() -> Result<(), Box<dyn Er
 async fn in_band_text_captions_are_enabled_per_policy() -> Result<(), Box<dyn Error>> {
     let config = resolve_toml(
         r#"
-[auth]
-[accept]
+[publish]
 subtitles = { codecs = ["text", "webvtt"] }
 "#,
     )??;
@@ -1991,7 +1989,7 @@ subtitles = { codecs = ["text", "webvtt"] }
     // misplaced entry silently widen what a publisher may send.
     let wrong_kind = resolve_toml(
         r#"
-[accept]
+[publish]
 video = { codecs = ["text"] }
 "#,
     )?;
@@ -2008,7 +2006,7 @@ fn hls_objects_resolve_targets_maxima_and_symmetric_jitter() -> Result<(), Box<d
     assert_eq!(policy.segment_cap(), Duration::from_secs(4));
     assert_eq!(policy.late_boundary, Duration::ZERO);
     let explicit = resolve_toml(
-        "[hls]\nsegment = { target = '2s', max = '1.5x', jitter = '0.05x' }\npart = { target = '500ms', max = '750ms' }\n",
+        "[hls]\nsegment = { target = '2s', max = '1.5x', tolerance = '0.05x' }\npart = { target = '500ms', max = '750ms' }\n",
     )??;
     let policy = explicit.node.session.segmentation;
     assert_eq!(policy.segment_cap(), Duration::from_secs(3));
@@ -2025,8 +2023,6 @@ fn hls_objects_resolve_targets_maxima_and_symmetric_jitter() -> Result<(), Box<d
         Duration::from_secs(1)
     );
     for invalid in [
-        "segment = '6s'",
-        "part = '1s'",
         "admission = 'hard'",
         "maximum_segment = '2x'",
         "maximum_part = '2x'",
@@ -2035,8 +2031,8 @@ fn hls_objects_resolve_targets_maxima_and_symmetric_jitter() -> Result<(), Box<d
         "segment = { max = '1s' }",
         "segment = { target = '0s' }",
         "part = { target = '0s' }",
-        "segment = { jitter = '1x' }",
-        "part = { jitter = '0s' }",
+        "segment = { tolerance = '1x' }",
+        "part = { tolerance = '0s' }",
         "part = { max = '20s' }",
     ] {
         assert!(
@@ -2057,34 +2053,38 @@ fn hls_objects_resolve_targets_maxima_and_symmetric_jitter() -> Result<(), Box<d
 #[test]
 fn fixed_delivery_budgets_cover_the_entire_admission_range() -> Result<(), Box<dyn Error>> {
     assert!(resolve_toml("[hls]\npart = { target = '1s' }\nhold_back = '3s'\n")?.is_err());
-    assert!(resolve_toml("[hls]\nsegment = { target = '6s' }\nretain = '18s'\n")?.is_err());
-    assert!(resolve_toml("[hls]\nsegment = { max = '1x' }\npart = { max = '1x' }\nhold_back = '3s'\nretain = '18s'\n")?.is_ok());
+    assert!(resolve_toml("[hls]\nsegment = { target = '6s' }\nwindow = '18s'\n")?.is_err());
+    assert!(resolve_toml("[hls]\nsegment = { max = '1x' }\npart = { max = '1x' }\nhold_back = '3s'\nwindow = '18s'\n")?.is_ok());
     Ok(())
 }
 
 #[test]
-fn nested_hls_sources_preserve_precedence() -> Result<(), Box<dyn Error>> {
+fn hls_cadences_take_a_short_form_and_whole_values_override() -> Result<(), Box<dyn Error>> {
+    // The short form is just the target, with the default 2x ceiling.
+    let short = resolve_toml("[hls]\nsegment = '4s'\npart = '500ms'\n")??;
+    let policy = short.node.session.segmentation;
+    assert_eq!(policy.desired_segment_duration, Duration::from_secs(4));
+    assert_eq!(policy.maximum_segment_duration, Duration::from_secs(8));
+    assert_eq!(policy.desired_part_duration, Duration::from_millis(500));
+    assert_eq!(policy.maximum_part_duration, Duration::from_secs(1));
+
+    // An override replaces the whole value, in either spelling.
     let resolved = resolve_with(
         "[hls]\nsegment = { target = '2s', max = '3x' }\npart = { target = '100ms' }\n",
-        &["--hls-segment-target", "4s", "--hls-part-max", "4x"],
-        &[
-            ("RUSHLS_HLS_SEGMENT_TARGET", "3s"),
-            ("RUSHLS_HLS_PART_TARGET", "200ms"),
-        ],
+        &["--hls-segment", "{ target = '4s', max = '3x' }"],
+        &[("RUSHLS_HLS_SEGMENT", "3s"), ("RUSHLS_HLS_PART", "200ms")],
     )??;
     let policy = resolved.node.session.segmentation;
     assert_eq!(policy.desired_segment_duration, Duration::from_secs(4));
     assert_eq!(policy.maximum_segment_duration, Duration::from_secs(12));
     assert_eq!(policy.desired_part_duration, Duration::from_millis(200));
-    assert_eq!(policy.maximum_part_duration, Duration::from_millis(800));
+    assert_eq!(policy.maximum_part_duration, Duration::from_millis(400));
     for flag in [
-        "--hls-segment",
-        "--hls-part",
+        "--hls-segment-target",
+        "--hls-segment-max",
+        "--hls-part-max",
+        "--hls-retain",
         "--hls-admission",
-        "--hls-maximum-segment",
-        "--hls-maximum-part",
-        "--hls-early-boundary",
-        "--hls-late-boundary",
     ] {
         assert!(
             resolve_with("", &[flag, "1s"], &[])?.is_err(),
@@ -2150,7 +2150,7 @@ fn scrubbing_is_enabled_by_default_and_configurable() -> Result<(), Box<dyn Erro
 #[test]
 fn recording_patterns_and_hook_signing_are_validated_at_startup() -> Result<(), Box<dyn Error>> {
     let resolved = resolve_toml(
-        "[record]\ndir = '/archive'\npattern = '{stream}/{publication}/{time:%Y%m%d}/{rendition}_{segment}.mp4'\n",
+        "[record]\ndir = '/archive'\npath = '{stream}/{publication}/{time:%Y%m%d}/{rendition}_{segment}.mp4'\n",
     )??;
     assert_eq!(
         resolved
@@ -2162,16 +2162,16 @@ fn recording_patterns_and_hook_signing_are_validated_at_startup() -> Result<(), 
     );
     for config in [
         "[record]\ndir = 'https://archive'",
-        "[record]\ndir = '/archive'\npattern = '{typo}.mp4'",
-        "[record]\ndir = '/archive'\npattern = '../{stream}.mp4'",
+        "[record]\ndir = '/archive'\npath = '{typo}.mp4'",
+        "[record]\ndir = '/archive'\npath = '../{stream}.mp4'",
         // The `.vtt` suffix of a subtitle rendition replaces everything after
         // the last dot, so this would name one file for every subtitle segment.
-        "[record]\ndir = '/archive'\npattern = '{rendition}.{segment}'",
+        "[record]\ndir = '/archive'\npath = '{rendition}.{segment}'",
         "[record]\ndir = '/archive'\nqueue_size = 0",
-        "[record]\ndir = '/archive'\nmax_pending_bytes = 0",
+        "[record]\ndir = '/archive'\nmax_pending = 0",
         "[record]\ndir = '/archive'\nunknown = 1",
         "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = 'bad-secret'",
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = 'bad-secret'\nsigning_secret_file = '/missing'",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = { file = '/missing' }",
     ] {
         assert!(!matches!(resolve_toml(config), Ok(Ok(_))), "{config}");
     }
@@ -2192,7 +2192,7 @@ fn secret_files_tolerate_a_trailing_newline() -> Result<(), Box<dyn Error>> {
     let signing = TempConfig::new("whsec_BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\n")?;
     let token = TempConfig::new("hunter2\n")?;
     let resolved = resolve_toml(&format!(
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret_file = '{}'\ntoken_file = '{}'\n",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = {{ file = '{}' }}\ntoken = {{ file = '{}' }}\n",
         fixtures::toml_path_contents(&signing.path),
         fixtures::toml_path_contents(&token.path),
     ))??;
@@ -2202,7 +2202,7 @@ fn secret_files_tolerate_a_trailing_newline() -> Result<(), Box<dyn Error>> {
     // names the format rather than the whitespace it once carried.
     let malformed = TempConfig::new("whsec_not+base64!\n")?;
     let Err(error) = resolve_toml(&format!(
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret_file = '{}'\n",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = {{ file = '{}' }}\n",
         fixtures::toml_path_contents(&malformed.path),
     ))?
     else {
@@ -2296,42 +2296,42 @@ async fn strict_default_and_overrides() -> Result<(), Box<dyn Error>> {
         InputMode::Strict
     );
     assert_eq!(
-        default_policy(&resolve_toml("[accept]\nstrict = true")??)
+        default_policy(&resolve_toml("[publish]\nstrict = true")??)
             .await?
             .input_mode,
         InputMode::Strict
     );
     assert_eq!(
-        default_policy(&resolve_with("", &["--accept-strict", "true"], &[])??)
+        default_policy(&resolve_with("", &["--publish-strict", "true"], &[])??)
             .await?
             .input_mode,
         InputMode::Strict
     );
     assert_eq!(
-        default_policy(&resolve_with_env(&[("RUSHLS_ACCEPT_STRICT", "true")])??)
+        default_policy(&resolve_with_env(&[("RUSHLS_PUBLISH_STRICT", "true")])??)
             .await?
             .input_mode,
         InputMode::Strict
     );
-    let named: super::PolicyValue = toml::from_str("")?;
+    let named: super::ProfileValue = toml::from_str("")?;
     assert_eq!(named.resolve("named")?.input_mode, InputMode::Strict);
     assert_eq!(
-        toml::from_str::<super::PolicyValue>("strict = true")?
+        toml::from_str::<super::ProfileValue>("strict = true")?
             .resolve("named")?
             .input_mode,
         InputMode::Strict
     );
     assert_eq!(
         default_policy(&resolve_with(
-            "[accept]\nstrict = true",
-            &["--accept-strict=false"],
+            "[publish]\nstrict = true",
+            &["--publish-strict=false"],
             &[]
         )??)
         .await?
         .input_mode,
         InputMode::Permissive
     );
-    assert!(resolve_toml("[accept]\nstrict = 'invalid'")?.is_err());
+    assert!(resolve_toml("[publish]\nstrict = 'invalid'")?.is_err());
     Ok(())
 }
 
@@ -2341,18 +2341,17 @@ max_connections = 12
 max_requests = 13
 [http.cors]
 credentials = true
-[http.tls]
+[https]
+max_handshakes = 14
+[tls]
 cert = "/tls.pem"
 key = "/tls.key"
-max_handshakes = 14
-[moq]
-cert = "/moq.pem"
-[srt]
+[ingest.srt]
 encryption = "aes128"
-[auth.publish]
+[publish.auth]
 url = "http://auth"
 timeout = "1s"
-max_response_bytes = "32KiB"
+max_response = "32KiB"
 client_cert = "/client.pem"
 [hook.example]
 url = "http://hook"
@@ -2364,7 +2363,7 @@ client_cert = "/hook.pem"
 [record]
 dir = "/archive"
 queue_size = 16
-max_pending_bytes = 1024
+max_pending = "1KiB"
 "#;
 
 #[test]
@@ -2376,26 +2375,22 @@ fn concise_settings_match_file_environment_and_cli_names() -> Result<(), Box<dyn
     assert_eq!(config.http.max_connections, 12);
     assert_eq!(config.http.max_requests, 13);
     assert!(config.http.cors.credentials);
-    assert_eq!(config.http.tls.as_ref().unwrap().max_handshakes, 14);
+    assert_eq!(config.https.as_ref().ok_or("https")?.max_handshakes, 14);
     assert_eq!(
-        config.http.tls.as_ref().unwrap().cert,
+        config.tls.as_ref().ok_or("tls")?.cert,
         PathBuf::from("/tls.pem")
     );
-    assert_eq!(config.moq.cert, Some(PathBuf::from("/moq.pem")));
-    let auth = config.auth.publish.as_ref().unwrap();
+    let auth = config.publish.auth.as_ref().ok_or("publish.auth")?;
     assert_eq!(auth.timeout, Duration::from_secs(1));
     assert_eq!(auth.client_cert, Some(PathBuf::from("/client.pem")));
-    assert_eq!(
-        super::nonzero_bytes("test", auth.max_response_bytes)?,
-        32 * 1024
-    );
-    let hook = &config.hook.as_ref().unwrap().0["example"];
+    assert_eq!(super::nonzero_bytes("test", auth.max_response)?, 32 * 1024);
+    let hook = &config.hook.as_ref().ok_or("hook")?.0["example"];
     assert_eq!(
         (hook.queue_size, hook.max_in_flight, hook.max_attempts),
         (15, 2, 3)
     );
     assert_eq!(hook.client_cert, Some(PathBuf::from("/hook.pem")));
-    let record = &config.record.as_ref().unwrap().0;
+    let record = &config.record.as_ref().ok_or("record")?.0;
     assert_eq!(
         (record.queue_capacity, record.maximum_pending_bytes),
         (16, 1024)
@@ -2405,30 +2400,25 @@ fn concise_settings_match_file_environment_and_cli_names() -> Result<(), Box<dyn
         ("RUSHLS_HTTP_MAX_CONNECTIONS", "21"),
         ("RUSHLS_HTTP_MAX_REQUESTS", "22"),
         ("RUSHLS_HTTP_CORS_CREDENTIALS", "false"),
-        ("RUSHLS_HTTP_TLS_CERT", "/env.pem"),
-        ("RUSHLS_HTTP_TLS_MAX_HANDSHAKES", "23"),
-        ("RUSHLS_MOQ_CERT", "/env-moq.pem"),
-        ("RUSHLS_AUTH_PUBLISH_CLIENT_CERT", "/env-client.pem"),
-        ("RUSHLS_AUTH_PUBLISH_TIMEOUT", "500ms"),
-        ("RUSHLS_AUTH_PUBLISH_MAX_RESPONSE_BYTES", "16KiB"),
-        ("RUSHLS_SRT_ENCRYPTION", "aes256"),
+        ("RUSHLS_TLS_CERT", "/env.pem"),
+        ("RUSHLS_HTTPS_MAX_HANDSHAKES", "23"),
+        ("RUSHLS_PUBLISH_AUTH_CLIENT_CERT", "/env-client.pem"),
+        ("RUSHLS_PUBLISH_AUTH_TIMEOUT", "500ms"),
+        ("RUSHLS_PUBLISH_AUTH_MAX_RESPONSE", "16KiB"),
+        ("RUSHLS_INGEST_SRT_ENCRYPTION", "aes256"),
     ];
     let env = load_with(CONCISE_SETTINGS, &[], &environment)??;
     assert_eq!((env.http.max_connections, env.http.max_requests), (21, 22));
     assert!(!env.http.cors.credentials);
-    assert_eq!(env.http.tls.as_ref().unwrap().max_handshakes, 23);
+    assert_eq!(env.https.as_ref().ok_or("https")?.max_handshakes, 23);
     assert_eq!(
-        env.http.tls.as_ref().unwrap().cert,
+        env.tls.as_ref().ok_or("tls")?.cert,
         PathBuf::from("/env.pem")
     );
-    assert_eq!(env.moq.cert, Some(PathBuf::from("/env-moq.pem")));
-    let auth = env.auth.publish.unwrap();
+    let auth = env.publish.auth.ok_or("publish.auth")?;
     assert_eq!(auth.client_cert, Some(PathBuf::from("/env-client.pem")));
     assert_eq!(auth.timeout, Duration::from_millis(500));
-    assert_eq!(
-        super::nonzero_bytes("test", auth.max_response_bytes)?,
-        16 * 1024
-    );
+    assert_eq!(super::nonzero_bytes("test", auth.max_response)?, 16 * 1024);
 
     let cli = load_with(
         CONCISE_SETTINGS,
@@ -2436,37 +2426,32 @@ fn concise_settings_match_file_environment_and_cli_names() -> Result<(), Box<dyn
             "--http-max-connections=31",
             "--http-max-requests=32",
             "--http-cors-credentials=true",
-            "--http-tls-cert=/cli.pem",
-            "--http-tls-max-handshakes=33",
-            "--moq-cert=/cli-moq.pem",
-            "--auth-publish-client-cert=/cli-client.pem",
-            "--auth-publish-timeout=250ms",
-            "--auth-publish-max-response-bytes=8KiB",
-            "--srt-encryption=aes128",
+            "--tls-cert=/cli.pem",
+            "--https-max-handshakes=33",
+            "--publish-auth-client-cert=/cli-client.pem",
+            "--publish-auth-timeout=250ms",
+            "--publish-auth-max-response=8KiB",
+            "--ingest-srt-encryption=aes128",
         ],
         &environment,
     )??;
     assert_eq!((cli.http.max_connections, cli.http.max_requests), (31, 32));
     assert!(cli.http.cors.credentials);
-    assert_eq!(cli.http.tls.as_ref().unwrap().max_handshakes, 33);
+    assert_eq!(cli.https.as_ref().ok_or("https")?.max_handshakes, 33);
     assert_eq!(
-        cli.http.tls.as_ref().unwrap().cert,
+        cli.tls.as_ref().ok_or("tls")?.cert,
         PathBuf::from("/cli.pem")
     );
-    assert_eq!(cli.moq.cert, Some(PathBuf::from("/cli-moq.pem")));
-    let auth = cli.auth.publish.unwrap();
+    let auth = cli.publish.auth.ok_or("publish.auth")?;
     assert_eq!(auth.client_cert, Some(PathBuf::from("/cli-client.pem")));
     assert_eq!(auth.timeout, Duration::from_millis(250));
-    assert_eq!(
-        super::nonzero_bytes("test", auth.max_response_bytes)?,
-        8 * 1024
-    );
+    assert_eq!(super::nonzero_bytes("test", auth.max_response)?, 8 * 1024);
     Ok(())
 }
 
 #[tokio::test]
 async fn flac_is_an_audio_policy_codec() -> Result<(), Box<dyn Error>> {
-    let config = resolve_toml("[auth]\n[accept.audio]\ncodecs = ['flac']\n")??;
+    let config = resolve_toml("[publish.audio]\ncodecs = ['flac']\n")??;
     let grant = config
         .authenticator
         .authenticate(&request("flac-key"))
@@ -2476,7 +2461,7 @@ async fn flac_is_an_audio_policy_codec() -> Result<(), Box<dyn Error>> {
         crate::admission::Codecs::OneOf(vec![Codec::Flac])
     );
     assert!(matches!(
-        resolve_toml("[accept.video]\ncodecs = ['flac']\n")?,
+        resolve_toml("[publish.video]\ncodecs = ['flac']\n")?,
         Err(ConfigError::Invalid(_))
     ));
     assert_eq!(
@@ -2490,7 +2475,7 @@ async fn flac_is_an_audio_policy_codec() -> Result<(), Box<dyn Error>> {
 fn malformed_secret_documents_do_not_print_credentials() -> Result<(), Box<dyn Error>> {
     for text in [
         "[metrics]\ntoken = 918273645",
-        "[auth.publish]\ntoken = 918273645",
+        "[publish.auth]\ntoken = 918273645",
         "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\ntoken = 918273645",
         "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\ntoken = 'sensitive-token'\nqueue_size = 'bad'",
     ] {
@@ -2506,25 +2491,25 @@ fn malformed_secret_documents_do_not_print_credentials() -> Result<(), Box<dyn E
 fn strict_policies_configure_the_independence_contract() -> Result<(), Box<dyn Error>> {
     assert!(resolve_toml("")??.node.store.independent_segments);
     assert!(
-        !resolve_toml("[accept]\nstrict = false")??
+        !resolve_toml("[publish]\nstrict = false")??
             .node
             .store
             .independent_segments
     );
     assert!(
-        !resolve_toml("[accept.policy.legacy]\nstrict = false")??
+        !resolve_toml("[publish.profile.legacy]\nstrict = false")??
             .node
             .store
             .independent_segments
     );
     assert!(
-        resolve_toml("[accept.policy.normal]")??
+        resolve_toml("[publish.profile.normal]")??
             .node
             .store
             .independent_segments
     );
     assert!(
-        !resolve_with("", &["--accept-strict=false"], &[])??
+        !resolve_with("", &["--publish-strict=false"], &[])??
             .node
             .store
             .independent_segments
@@ -2544,16 +2529,16 @@ fn fixture_paths_escape_windows_separators_and_quotes() -> Result<(), Box<dyn Er
 }
 
 #[test]
-fn pipeline_memory_has_independent_configuration_and_precedence() -> Result<(), Box<dyn Error>> {
+fn publisher_memory_has_independent_configuration_and_precedence() -> Result<(), Box<dyn Error>> {
     let defaults = resolve_toml("")??;
     assert_eq!(
         defaults.node.session.memory_per_publisher,
         Some(128 * 1024 * 1024)
     );
     let configured = resolve_with(
-        "[pipeline]\nmemory_per_publisher = '192MiB'\n",
-        &["--pipeline-memory-per-publisher", "320MiB"],
-        &[("RUSHLS_PIPELINE_MEMORY_PER_PUBLISHER", "256MiB")],
+        "[memory]\nper_publisher = '192MiB'\n",
+        &["--memory-per-publisher", "320MiB"],
+        &[("RUSHLS_MEMORY_PER_PUBLISHER", "256MiB")],
     )??;
     assert_eq!(
         configured.node.session.memory_per_publisher,
@@ -2563,7 +2548,143 @@ fn pipeline_memory_has_independent_configuration_and_precedence() -> Result<(), 
         configured.node.store.retention.maximum_payload_bytes,
         defaults.node.store.retention.maximum_payload_bytes
     );
-    assert!(resolve_toml("[pipeline]\nmemory_per_publisher = '32MiB'\n")?.is_err());
-    assert!(resolve_toml("[pipeline]\nmemory_per_publisher = '0'\n")?.is_err());
+    assert!(resolve_toml("[memory]\nper_publisher = '32MiB'\n")?.is_err());
+    assert!(resolve_toml("[memory]\nper_publisher = '0'\n")?.is_err());
+    // Trusted deployments may lift the ceiling; usage is still accounted.
+    let unlimited = resolve_toml("[memory]\nper_publisher = 'unlimited'\n")??;
+    assert_eq!(unlimited.node.session.memory_per_publisher, None);
+    Ok(())
+}
+
+#[test]
+fn memory_total_caps_the_budgets_and_must_fit_one_publication() -> Result<(), Box<dyn Error>> {
+    let defaults = resolve_toml("")??;
+    assert_eq!(defaults.node.memory_total, None, "uncapped by default");
+
+    let capped = resolve_toml("[memory]\ntotal = '16GiB'\n")??;
+    assert_eq!(capped.node.memory_total, Some(16 << 30));
+    let from_env = resolve_with_env(&[("RUSHLS_MEMORY_TOTAL", "8GiB")])??;
+    assert_eq!(from_env.node.memory_total, Some(8 << 30));
+
+    for (configuration, expected) in [
+        // 128MiB + 512MiB cannot fit in 256MiB.
+        ("[memory]\ntotal = '256MiB'\n", "cannot hold one publisher"),
+        (
+            "[memory]\ntotal = '16GiB'\nper_publisher = 'unlimited'\n",
+            "needs a finite memory.per_publisher",
+        ),
+    ] {
+        let error = resolve_toml(configuration)?
+            .err()
+            .ok_or_else(|| format!("expected an error for {configuration}"))?;
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    Ok(())
+}
+
+#[test]
+fn tls_listeners_share_one_certificate_and_require_it() -> Result<(), Box<dyn Error>> {
+    let certificate = TempConfig::new("certificate")?;
+    let key = TempConfig::new("key")?;
+    let tls = format!(
+        "[tls]\ncert = {:?}\nkey = {:?}\n",
+        certificate.path, key.path
+    );
+
+    let https = resolve_toml(&format!("{tls}[https]\n"))??;
+    let settings = https.node.http.tls.as_ref().ok_or("HTTPS is configured")?;
+    assert_eq!(settings.certificate, certificate.path);
+    assert_eq!(
+        https.node.https_address,
+        Some("[::]:8443".parse().expect("constant is valid"))
+    );
+
+    for (configuration, expected) in [
+        ("[https]\n", "[https] needs [tls]"),
+        (
+            "[ingest.moq]\nlisten = '[::]:4433'\n",
+            "ingest.moq needs [tls]",
+        ),
+    ] {
+        let error = resolve_toml(configuration)?
+            .err()
+            .ok_or_else(|| format!("expected an error for {configuration}"))?;
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+
+    let unused = resolve_toml(&tls)??;
+    assert!(
+        unused
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("[tls] is configured but")),
+        "{:?}",
+        unused.warnings
+    );
+    Ok(())
+}
+
+#[test]
+fn the_check_plan_shows_listeners_and_worst_case_memory() -> Result<(), Box<dyn Error>> {
+    let uncapped = resolve_toml("[limits]\npublishers = 4\nstreams = 8\n")??.plan();
+    assert!(uncapped.contains("ingest.rtmp"), "{uncapped}");
+    assert!(uncapped.contains("ingest.moq   off"), "{uncapped}");
+    // 4 × 128MiB + 8 × 512MiB.
+    assert!(uncapped.contains("4 × 128.0 MiB = 512.0 MiB"), "{uncapped}");
+    assert!(uncapped.contains("8 × 512.0 MiB = 4.0 GiB"), "{uncapped}");
+    assert!(uncapped.contains("up to 4.5 GiB"), "{uncapped}");
+    assert!(uncapped.contains("set memory.total"), "{uncapped}");
+
+    let capped = resolve_toml("[memory]\ntotal = '2GiB'\n")??.plan();
+    assert!(capped.contains("at most 2.0 GiB (memory.total"), "{capped}");
+    Ok(())
+}
+
+#[test]
+fn the_config_reference_is_current() -> Result<(), Box<dyn Error>> {
+    let rendered = super::reference_markdown();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/config-reference.md");
+    if std::env::var_os("RUSHLS_UPDATE_CONFIG_REFERENCE").is_some() {
+        fs::write(&path, &rendered)?;
+    }
+    let committed = fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        committed == rendered,
+        "docs/config-reference.md is stale; regenerate with \
+         RUSHLS_UPDATE_CONFIG_REFERENCE=1 cargo test --lib config_reference"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_reference_lists_only_keys_the_tables_accept() -> Result<(), Box<dyn Error>> {
+    use std::fmt::Write as _;
+
+    // The hand-listed `[record]` and `[hook]` keys must parse, or the
+    // generated reference would describe settings that do not exist.
+    let mut record = String::from("[record]\n");
+    for (key, _, _) in super::RECORD_FIELDS {
+        writeln!(
+            record,
+            "{} = {}",
+            &key[1..],
+            if *key == ".queue_size" { "1" } else { "'1MiB'" }
+        )?;
+    }
+    let record = record
+        .replace("dir = '1MiB'", "dir = '/archive'")
+        .replace("path = '1MiB'", "path = '{stream}_{segment}.mp4'");
+    assert!(load_toml(&record)?.is_ok(), "{record}");
+    let mut hook = String::from("[hook.example]\n");
+    for (key, _, _) in super::HOOK_FIELDS {
+        let key = key.trim_start_matches(".<name>.");
+        let value = match key {
+            "events" => "['session.ended']",
+            "queue_size" | "max_in_flight" | "max_attempts" => "1",
+            _ => "'value'",
+        };
+        writeln!(hook, "{key} = {value}")?;
+    }
+    assert!(load_toml(&hook)?.is_ok(), "{hook}");
     Ok(())
 }

@@ -476,7 +476,7 @@ mod tests {
 
         assert!(matches!(
             factory.start(&StreamId::new("b"), packaged_presentation()),
-            Err(HlsError::Capacity(StoreFull { maximum: 1 }))
+            Err(HlsError::Capacity(StoreFull::Streams { maximum: 1 }))
         ));
     }
 }

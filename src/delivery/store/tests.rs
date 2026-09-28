@@ -37,6 +37,7 @@ fn limits() -> StoreLimits {
     StoreLimits {
         maximum_streams: 8,
         independent_segments: false,
+        memory: None,
         retention: RetentionPolicy {
             // Six six-second segments. Pinned rather than taken from the
             // default so these fixtures describe a window of a known size,
@@ -259,6 +260,42 @@ fn configure(lease: &StreamLease, rendition: u32, chunked: bool) {
         chunked
     );
     write(lease, initialization(rendition, 1));
+}
+
+#[test]
+fn new_streams_commit_their_budget_against_the_node_total() {
+    let ledger = crate::domain::MemoryLedger::new(250);
+    let mut limits = limits();
+    limits.retention.maximum_payload_bytes = 100;
+    limits.memory = Some(ledger.clone());
+    let store = StreamStore::new(limits);
+    let first = store
+        .lease_without_presentation(StreamId::new("live/one"))
+        .expect("room for one");
+    let second = store
+        .lease_without_presentation(StreamId::new("live/two"))
+        .expect("room for two");
+    assert_eq!(ledger.committed(), 200);
+    // Reusing a stored stream commits nothing new.
+    drop(
+        store
+            .lease_without_presentation(StreamId::new("live/one"))
+            .expect("an existing stream needs no new commitment"),
+    );
+    assert_eq!(ledger.committed(), 200);
+    assert_eq!(
+        store
+            .lease_without_presentation(StreamId::new("live/three"))
+            .map(|_| ()),
+        Err(StoreFull::Memory(crate::domain::MemoryFull {
+            requested: 100,
+            committed: 200,
+            limit: 250,
+        }))
+    );
+    // A stream returns its commitment when the store lets go of it.
+    drop((first, second, store));
+    assert_eq!(ledger.committed(), 0);
 }
 
 #[test]

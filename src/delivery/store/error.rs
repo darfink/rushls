@@ -14,10 +14,13 @@ use crate::{
     mux::{PackagingRenditionId, PackagingSegmentId},
 };
 
+/// Why the store could not take another stream.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-#[error("the delivery store is already holding its maximum of {maximum} streams")]
-pub struct StoreFull {
-    pub maximum: usize,
+pub enum StoreFull {
+    #[error("the delivery store is already holding its maximum of {maximum} streams")]
+    Streams { maximum: usize },
+    #[error(transparent)]
+    Memory(#[from] crate::domain::MemoryFull),
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

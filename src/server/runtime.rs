@@ -74,6 +74,9 @@ pub struct NodeConfig {
     pub https_address: Option<SocketAddr>,
     pub maintenance_interval: Duration,
     pub maximum_sessions: usize,
+    /// `memory.total`: node-wide memory committed across publisher and stream
+    /// budgets, or `None` for no ceiling.
+    pub memory_total: Option<usize>,
     pub rtmp: RtmpConfig,
     pub srt: SrtConfig,
     pub moq: MoqConfig,
@@ -133,6 +136,7 @@ impl Default for NodeConfig {
             https_address: None,
             maintenance_interval: Duration::from_secs(1),
             maximum_sessions: 256,
+            memory_total: None,
             rtmp: RtmpConfig::default(),
             srt: SrtConfig::default(),
             moq: MoqConfig::default(),
@@ -342,8 +346,15 @@ impl Node {
         config.rtmp.input_limits = config.session.input;
         config.srt.input_limits = config.session.input;
         config.moq.input_limits = config.session.input;
+        // One ledger shared by the store and the registry, so stream and
+        // publisher budgets commit against the same total.
+        let ledger = config.memory_total.map(crate::domain::MemoryLedger::new);
+        config.store.memory.clone_from(&ledger);
         let store = StreamStore::try_new(config.store.clone())?.with_events(events.clone());
-        let sessions = Registry::with_capacity(config.maximum_sessions);
+        let sessions = Registry::with_memory(
+            config.maximum_sessions,
+            ledger.zip(config.session.memory_per_publisher),
+        );
         let meters = ProcessMeters::default();
         let recorder = config
             .record
@@ -437,7 +448,7 @@ impl Node {
     ///
     /// Apart from the others because it is the one listener that cannot start
     /// without a certificate: QUIC has no cleartext form, so an omitted
-    /// `[moq] tls` is a refusal rather than a fallback to plaintext.
+    /// `ingest.moq` without `[tls]` is a refusal rather than a fallback to plaintext.
     fn bind_moq(&self) -> Result<Option<MoqListener>, RuntimeError> {
         let Some(address) = self.config.moq_address else {
             return Ok(None);

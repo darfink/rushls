@@ -44,13 +44,17 @@ Example for a two-hour DVR window:
 
 ```toml
 [hls]
-retain = "2h"
+window = "2h"
 
-[capacity]
+[limits]
 publishers = 16
 streams = 32
-memory_per_stream = "256MiB"
-disk_per_stream = "8GiB"
+
+[memory]
+per_stream = "256MiB"
+
+[disk]
+per_stream = "8GiB"
 dir = "/var/lib/rushls/dvr"
 ```
 
@@ -84,14 +88,14 @@ Do not assume a network filesystem provides the same lock and durability behavio
 ```toml
 [record]
 dir = "/var/lib/rushls/recordings"
-pattern = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
+path = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
 queue_size = 128
-max_pending_bytes = 268435456
+max_pending = "256MiB"
 ```
 
 The recorder publishes completed segment files without replacing existing names.
 Each file carries decoder configuration, but codec preroll and source random access still affect standalone decoding.
-Keep publication identity in the pattern to separate sessions.
+Keep publication identity in the path to separate sessions.
 
 Rushls does not provide an archive playback API or an automatic recording expiry policy.
 Use a separate process to index, upload, and expire completed files.
@@ -109,14 +113,14 @@ See [release filesystem guarantees](releases.md).
 Publisher admission is an application service, not a list of passwords in Rushls:
 
 ```toml
-[auth.publish]
+[publish.auth]
 url = "https://auth.example.com/v1/publish/admit"
-token_file = "/run/secrets/admission-token"
+token = { file = "/run/secrets/admission-token" }
 timeout = "2s"
-max_response_bytes = "64KiB"
+max_response = "64KiB"
 ```
 
-The admission response chooses `stream_id`, `principal`, and an optional named policy.
+The admission response chooses `stream_id`, `principal`, and an optional named profile.
 Failures deny the connection. A reconnect makes a new admission request.
 The shared token authenticates Rushls to the service; it is not the publisher's stream key.
 Use the exact [publisher API](publisher-api.md#admission) contract.
@@ -125,12 +129,12 @@ For playback, choose one key source: a public key, JWKS URL, or HMAC secret.
 This example uses JWKS:
 
 ```toml
-[auth.playback]
+[playback.auth]
 jwks_url = "https://issuer.example.com/.well-known/jwks.json"
 stream_claim = "stream"
 leeway = "30s"
 
-[auth.playback.claims]
+[playback.auth.claims]
 iss = "https://issuer.example.com"
 aud = "rushls-origin"
 ```
@@ -152,13 +156,15 @@ Native HTTPS configuration:
 [http]
 listen = "off"
 
-[http.tls]
+[https]
 listen = "0.0.0.0:8443"
-cert = "/run/secrets/fullchain.pem"
-key = "/run/secrets/private-key.pem"
 version = { min = "1.3", max = "1.3" }
 handshake_timeout = "5s"
 max_handshakes = 256
+
+[tls]
+cert = "/run/secrets/fullchain.pem"
+key = "/run/secrets/private-key.pem"
 ```
 
 Set `min = "1.2"` when older clients require TLS 1.2. Keep `max = "1.3"` to permit modern negotiation.
@@ -169,17 +175,19 @@ Mount certificate directories so replacement files become visible inside the con
 
 RTMP encryption requires an external TCP TLS terminator forwarding to the private RTMP listener.
 Do not put RTMP through an HTTP `proxy_pass` block.
-MoQ certificates are configured under `[moq]`; QUIC always requires TLS 1.3.
+MoQ ingest reuses the `[tls]` certificate; QUIC always requires TLS 1.3.
 
 SRT uses separate encryption:
 
 ```toml
-[srt]
+[ingest]
+idle_timeout = "5s"
+
+[ingest.srt]
 listen = "0.0.0.0:9000"
-passphrase_file = "/run/secrets/srt-passphrase"
+passphrase = { file = "/run/secrets/srt-passphrase" }
 encryption = "aes256"
 latency = "120ms"
-timeout = "5s"
 ```
 
 SRT passphrases must satisfy the transport's 10–79-byte requirement.
@@ -236,7 +244,7 @@ Strict input validation is the default. It rejects invalid timing and dependent 
 Permissive input mode only handles the bounded cases described in [input modes](input-modes.md).
 It does not generate missing audio or video.
 
-`accept.takeover = true` lets a new publisher replace an active publisher with the same admitted stream ID.
+`publish.takeover = true` lets a new publisher replace an active publisher with the same admitted stream ID.
 It does not combine those publishers into a multitrack presentation or replicate state across origins.
 Reconnect continuity depends on the retained stream and compatible media.
 
@@ -248,7 +256,7 @@ Monitor stream lifecycle events instead of treating every disconnect as an ident
 Set a finite shutdown budget:
 
 ```toml
-shutdown = "10s"
+shutdown_grace = "10s"
 ```
 
 Send SIGTERM on Unix or Ctrl+C/Ctrl+Break on Windows.

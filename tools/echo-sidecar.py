@@ -49,7 +49,7 @@ class Options:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.deny = args.deny
-        self.policy = args.policy
+        self.profile = args.profile
         self.stream = args.stream
         self.token = args.token
         self.quiet = args.quiet
@@ -148,8 +148,8 @@ class Handler(BaseHTTPRequestHandler):
             "stream_id": OPTIONS.stream or requested,
             "principal": "echo-sidecar",
         }
-        if OPTIONS.policy:
-            decision["policy"] = OPTIONS.policy
+        if OPTIONS.profile:
+            decision["profile"] = OPTIONS.profile
         log("ALLOW", GREEN, f"{decision['stream_id']} as {decision['principal']}")
         self._respond(200, decision)
 
@@ -213,7 +213,7 @@ def main() -> int:
     parser.add_argument(
         "--stream", help="admit every publisher to this stream instead of the one asked for"
     )
-    parser.add_argument("--policy", help="name a policy in the allow response")
+    parser.add_argument("--profile", help="name a publish profile in the allow response")
     parser.add_argument(
         "--token", help="require this bearer token, matching `token` in the config"
     )

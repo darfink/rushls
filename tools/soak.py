@@ -270,9 +270,9 @@ class Run:
         with binary.open("rb") as executable:
             binary_hash = hashlib.file_digest(executable, "sha256").hexdigest()
         config = self.out / "rushls.toml"
-        config.write_text(f'''[rtmp]
+        config.write_text(f'''[ingest.rtmp]
 listen = "127.0.0.1:{self.ports['rtmp']}"
-[srt]
+[ingest.srt]
 listen = "127.0.0.1:{self.ports['srt']}"
 [http]
 listen = "127.0.0.1:{self.ports['http']}"
@@ -281,14 +281,16 @@ listen = "127.0.0.1:{self.ports['metrics']}"
 [hls]
 segment = {{ target = "2s", max = "2x" }}
 part = {{ target = "500ms", max = "2x" }}
-retain = "{30 if args.spill_pressure else 12}s"
-[accept]
+window = "{30 if args.spill_pressure else 12}s"
+[publish]
 takeover = true
-[capacity]
+[limits]
 publishers = {args.publishers + 4}
 streams = {args.publishers + 4}
-memory_per_stream = "{1 if args.spill_pressure else 4}MiB"
-disk_per_stream = "16MiB"
+[memory]
+per_stream = "{1 if args.spill_pressure else 4}MiB"
+[disk]
+per_stream = "16MiB"
 dir = {json.dumps(str(self.out / 'dvr'))}
 [record]
 dir = {json.dumps(str(self.archive))}

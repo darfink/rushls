@@ -2,10 +2,16 @@
 
 # RFC: the Rushls configuration surface
 
-Setting names use `max_*` for upper limits, `*_bytes` for byte counts, and
-`*_file` for secret files. Service deadlines use `timeout`. TLS paths use
-`cert`, `key`, and `client_cert`. Queue counts use `queue_size`.
-Enable `[hls].scrubbing` to publish keyframe playlists for fast seeking.
+Setting names use `max_*` for upper limits and `per_*` for budgets that apply
+to each publisher or stream. Sizes are written `"64MiB"`, durations `"10s"`,
+and `"3x"` means three times the related target. Credentials are one field
+each: a string, `"${VAR}"`, or `{ file = "/path" }`. Service deadlines use
+`timeout`. TLS paths use `cert`, `key`, and `client_cert`. Queue counts use
+`queue_size`.
+
+Every setting, with its default, environment variable, and flag, is listed in
+the generated [configuration reference](config-reference.md). `rushls --check`
+validates a configuration and prints its listeners and worst-case memory.
 
 
 > **Status: implemented**, apart from the features named as not built below:
@@ -22,8 +28,9 @@ Enable `[hls].scrubbing` to publish keyframe playlists for fast seeking.
 > document contradicted this design in several places.
 
 The surface is [rushls.example.toml](../rushls.example.toml).
-That file documents every supported TOML field. Its active settings form a local starter;
-commented sections describe optional features and deployment-specific examples.
+That file documents every supported TOML field, grouped by the question it
+answers. Its active settings form a local starter; commented lines show
+defaults, and lines marked "example" are not defaults.
 
 ## What this is reacting to
 
@@ -63,17 +70,22 @@ without touching the config? If not, the config is leaking.
 
 ## The operator questions, in order
 
-Where do I listen → who may publish → what media will I take → how does live
-HLS behave → how hard do I cap this box → who else gets told.
+How do publishers connect (`[ingest]`) → who may publish, and what
+(`[publish]`) → how much does this node hold (`[limits]`, `[memory]`,
+`[disk]`) → what does it serve (`[hls]`, `[http]`, `[https]`, `[tls]`,
+`[playback]`) → what does it report and keep (`[metrics]`, `[record]`,
+`[hook.*]`).
 
 The file follows that order. It is the order the questions occur in, not the
 order the pipeline runs in.
 
 ## Listeners
 
+Ingest listeners live under `[ingest.rtmp]`, `[ingest.srt]`, and
+`[ingest.moq]`; viewers are served by `[http]` and `[https]`.
 RTMP and HTTP compiled defaults bind to `0.0.0.0`; explicit `[::]` binds are also supported. SRT is IPv4-only
 (`0.0.0.0`) because ingest uses `rsrt`, which has no IPv6 listener yet.
-MOQ (`[moq] listen`) is **off** until an operator turns it on: WebTransport
+MOQ (`ingest.moq.listen`) is **off** until an operator turns it on: WebTransport
 needs a certificate, and the compiled default must boot without one. The usual
 proxy posture is cleartext on loopback with TLS ended in front, rather than TLS
 in this process. No trusted-proxy list is configured; header trust is not how
@@ -81,12 +93,25 @@ playlist URLs or auth are derived.
 
 `public_url` only shapes playlist URLs:
 empty means relative, which is right behind a proxy or CDN; a trailing slash
-is insignificant. Certificates reload in place on rotation, with secure TLS
-defaults and no cipher knobs. HTTPS and MOQ share that rotation machinery, but
-not a `ServerConfig`: HTTP/3 requires TLS 1.3 and `h3` ALPN, so MOQ must not
-reuse the viewer HTTPS config.
+is insignificant.
 
-HTTPS accepts TLS 1.3 by default. Under `[http.tls]`, `version` groups the protocol bounds:
+One `[tls]` table holds the certificate and key for every TLS listener. They
+reload in place on rotation, with secure TLS defaults and no cipher knobs.
+HTTPS and MOQ share the files and the rotation machinery, but not a
+`ServerConfig`: HTTP/3 requires TLS 1.3 and `h3` ALPN, so MOQ must not reuse
+the viewer HTTPS config. `[https]` or `ingest.moq.listen` without `[tls]` is a
+startup error; `[tls]` that nothing uses is a warning.
+
+```toml
+[https]
+listen = "[::]:8443"
+
+[tls]
+cert = "/etc/rushls/tls/fullchain.pem"
+key  = "/etc/rushls/tls/private-key.pem"
+```
+
+HTTPS accepts TLS 1.3 by default. Under `[https]`, `version` groups the protocol bounds:
 
 ```toml
 version = { min = "1.3", max = "1.3" }
@@ -97,8 +122,8 @@ Use `version = { min = "1.2" }` to accept both versions, with TLS 1.3 preferred.
 Use `version = { min = "1.2", max = "1.2" }` for a TLS 1.2-only listener.
 The minimum cannot exceed the maximum.
 
-CLI uses `--http-tls-version-min` and `--http-tls-version-max`.
-Environment variables use `RUSHLS_HTTP_TLS_VERSION_MIN` and `RUSHLS_HTTP_TLS_VERSION_MAX`.
+CLI uses `--https-version-min` and `--https-version-max`.
+Environment variables use `RUSHLS_HTTPS_VERSION_MIN` and `RUSHLS_HTTPS_VERSION_MAX`.
 These bounds do not affect QUIC or outbound clients.
 
 
@@ -123,7 +148,7 @@ stream capacity requires earlier removal. Reconnecting again does not extend
 that lifetime. Empty retired renditions leave immediately; active renditions
 keep their existing retention rules. The render cache holds at most 128 regular
 and 128 I-frame playlist entries per stream. Their bytes share the
-`memory_per_stream` budget with media. Eviction preserves responses that
+`memory.per_stream` budget with media. Eviction preserves responses that
 already hold their media or rendered bytes.
 
 MOQ identity matches SRT's last-`/` split: `https://origin/live/camera` is
@@ -138,17 +163,18 @@ The listener accepts `moq-lite-05` over WebTransport (`https://`) and raw QUIC
 Raw QUIC selects the version through TLS ALPN. See [MOQ ingestion](moq-ingestion.md)
 for supported media formats and a local publish test.
 
-## `[accept]`
+## `[publish]`
 
-`[accept]` is admission: everything about whether a publisher is let in and on what
-terms. The top level holds admission controls (`ceiling`, `stall`, `floor`,
-`takeover`, covered under Publish speed below); the nested `[accept.video]`,
-`[accept.audio]`, and `[accept.subtitles]` tables hold predicates. It is the
-per-publisher deal, and the only table whose rules may act on a live session —
-throttle it, drop it, replace it. Sizing the box itself is `[capacity]`, which
-only ever refuses new work.
+`[publish]` is admission: whether a publisher is let in and on what terms. The
+table itself is the default profile. It holds admission controls (`strict`,
+`takeover`, and `rate`, covered under Publish speed below) and the `video`,
+`audio`, and `subtitles` predicates. `[publish.auth]` configures the admission
+service, and `[publish.profile.<name>]` holds named alternatives it may select.
+It is the per-publisher deal, and the only table whose rules may act on a live
+session — throttle it, drop it, replace it. Sizing the box itself is
+`[limits]` and `[memory]`, which only ever refuse new work.
 
-Every field under those nested tables is a **predicate over a candidate** —
+Every field of `video`, `audio`, and `subtitles` is a **predicate over a candidate** —
 the set of values admitted. There are exactly three constructors:
 
 | You write | Means |
@@ -234,49 +260,49 @@ form `{ max = { width = 3840, height = 2160 } }` is always legal.
 
 ### Layering
 
-There are two layers and **one** way to move between them. `[accept]` is the
+There are two layers and **one** way to move between them. `[publish]` is the
 default for every publisher. An admission response may select a different
-named policy, and that is all it may do:
+named profile, and that is all it may do:
 
 ```toml
-[accept.policy.premium]
+[publish.profile.premium]
 video = { resolution = { max = "4k" }, frame_rate = { max = 60 } }
 audio = { channels = { max = 6 } }
 ```
 
-`{"policy": "premium"}` selects it. A policy **replaces `[accept]` wholesale**
-for that publisher: it does not inherit the top-level tables, so anything it
+`{"profile": "premium"}` selects it. A profile **replaces `[publish]` wholesale**
+for that publisher: it does not inherit the default's keys, so anything it
 leaves unsaid takes the compiled default rather than the file's value. Each
-entry supports `strict`, `ceiling`, `floor`, `takeover`, `video`, `audio`, and `subtitles`.
-`accept.stall` remains node-wide, and policies cannot contain other policies.
-Each entry is resolved at startup — so a name no policy defines fails the node, not
+profile uses exactly the default's keys: `strict`, `takeover`, `rate`, `video`,
+`audio`, and `subtitles`. Liveness deadlines are node-wide under `[ingest]`.
+Each entry is resolved at startup — so a name no profile defines fails the node, not
 the publisher, and admission costs a map lookup rather than a parse.
 
-Omitting `policy` applies `[accept]`, which is the common case.
+Omitting `profile` applies `[publish]`, which is the common case.
 
 **A response cannot carry predicates inline.** An earlier draft let it send an
 `accept` object that overrode the file per table. Both exist to answer one
 question — what may this publisher send — and offering two answers means every
 deployment has to decide which it uses, while anyone reading a node's
 configuration has to consult the auth service's source to know what actually
-applies. A named policy keeps the whole admissible set in the file, where it
+applies. A named profile keeps the whole admissible set in the file, where it
 can be reviewed, diffed, and validated at startup; the response chooses among
 sets rather than defining one.
 
-That an inline object could express something a policy cannot is not a real
+That an inline object could express something a profile cannot is not a real
 advantage: a per-account rule still comes from a finite set the operator
 decided on, and enumerating that set is what makes it auditable. A deployment
-that genuinely needs a new shape adds a policy and restarts, which is the same
+that genuinely needs a new shape adds a profile and restarts, which is the same
 cost as every other change to what this node accepts.
 
-A policy may **widen as well as narrow**. One that could only tighten cannot
+A profile may **widen as well as narrow**. One that could only tighten cannot
 say "this account may publish 4K" on a node defaulting to 1080p, which is an
 ordinary tenant rule; requiring it to be expressible would push every
 deployment into a permissive base and make the base meaningless. Widening is
 safe here in a way an inline override was not, because the widened set is
 still one the operator wrote down.
 
-This supersedes an earlier rule that a response could name only a policy and
+This supersedes an earlier rule that a response could name only a profile and
 never carry one — which is, in the end, where this lands again, for a
 different reason. That rule was defensive, assuming a semi-trusted sidecar.
 This one is about legibility: the file stays the whole truth about what the
@@ -289,20 +315,24 @@ belong on the auth service, which already knows the account and the stream.
 
 ## Publish speed
 
-`ceiling`, `stall`, and `floor` are the three pacing bounds, kept side by
-side so their kinship reads at a glance. `ceiling` throttles, `stall` and
-`floor` disconnect — that difference in enforcement is why ceiling and floor
-stay two objects rather than one list. All three are per-publisher contracts,
-so a named policy may set any of them per account.
+`publish.rate` holds both pace bounds in one value: `max` throttles and `min`
+disconnects. They are one value because they are the same kind of quantity —
+media time per wall-clock second — and constrain each other: `min` must be
+slower than `max`. Both are per-publisher contracts, so a named profile may set
+them per account. `ingest.stall_timeout`, the third bound, is node-wide.
 
 ```toml
-ceiling = { pace = "1x", burst = "10s" }     # at most realtime, ten-second head start
-stall   = "12s"                                # nothing usable for 12s: dropped
-# floor  = { pace = "0.5x", window = "30s" }  # below half realtime across 30s: dropped
+[publish]
+rate = { max = "1x", burst = "10s", min = "0.5x", window = "30s" }
+#        at most realtime, with a ten-second head start;
+#        below half realtime across any 30s: dropped
+
+[ingest]
+stall_timeout = "12s"                        # nothing usable for 12s: dropped
 ```
 
-`burst` permits media to run ahead of wall clock. With `--accept-ceiling-pace 1x`,
-omitting `--accept-ceiling-burst` gives no additional head start after pre-roll.
+`burst` permits media to run ahead of wall clock. `rate = { max = "1x" }`
+without `burst` gives no additional head start after pre-roll.
 Pre-roll still collects the media needed for timeline calibration and segmentation.
 A live 1x encoder does not need a burst.
 
@@ -315,48 +345,51 @@ After a stall, the first overdue sample is admitted immediately. Following sampl
 can catch up by at most `burst`. The publisher cannot save the entire idle period
 and use it to send an unlimited backlog.
 
-Exceeding the ceiling **waits**. Transport backpressure is the entire
+Exceeding `max` **waits**. Transport backpressure is the entire
 enforcement: a publisher cannot dump unbounded media into the process, and a
-file pushed at 100x still plays, slowed to live — *when a ceiling is set*.
-Omitting `ceiling` is the compiled default and means exactly what it says: a
+file pushed at 100x still plays, slowed to live — *when `max` is set*.
+Omitting it is the compiled default and means exactly what it says: a
 file pushed as fast as the link allows is packaged as fast as it arrives, and
 plays as fast-forward. That is taken to be what an operator asked for by
 setting no limit, which is why the starter file sets none either. There is no
 disconnect-on-too-fast setting today, because refusing turns an encoder
 catch-up or a large group-of-pictures into an outage. If one ever lands it
-belongs here as a third bound — same `{ pace, window }` shape, disconnect
-above — metered on pace *offered* before the ceiling throttles it, since the
-ceiling masks the signal downstream. Reserved name: `cutoff`.
+belongs in `rate` too — disconnect above a pace averaged over a window —
+metered on pace *offered* before `max` throttles it, since the throttle masks
+the signal downstream. Reserved name: `cutoff`.
 
-`floor` is `{ pace, window }`: the minimum media-time progress against
-wall-time, averaged over the window. Where `stall` asks did anything usable
-arrive, `floor` asks did enough of it arrive — a publisher averaging below
-`pace` across any `window` is disconnected. Both fields are required once a
-floor is set, including on the command line (`--accept-floor-pace` and
-`--accept-floor-window`). Omitted means no floor, which is the compiled
-default. The first window is startup grace, and discontinuities neither credit
-nor reset progress; only discontinuity-corrected media-time counts.
+`min` and `window` are the floor: the minimum media-time progress against
+wall-time, averaged over the window. Where `stall_timeout` asks did anything usable
+arrive, the floor asks did enough of it arrive — a publisher averaging below
+`min` across any `window` is disconnected. Each needs the other; `burst` needs
+`max`. Omitted means no floor, which is the compiled default. The first window
+is startup grace, and discontinuities neither credit nor reset progress; only
+discontinuity-corrected media-time counts.
 
-Omitting `floor` means nothing *ends* a slow session — it does not mean
+Omitting `min` means nothing *ends* a slow session — it does not mean
 nothing notices. A publisher whose media time falls below 90% of wall clock is
 logged as behind realtime, and logged again when it recovers past 95%. This
 reports and never enforces: it is how an operator with no floor learns that a
 nominally live stream is running at a quarter speed, without this node
-inventing a threshold that disconnects. A publisher held at its `ceiling` is
+inventing a threshold that disconnects. A publisher held at its `max` is
 never reported, because it is complying with an instruction this node gave it.
 
-`stall` is **"nothing usable arrived for this long"** — no packets, or packets
+`stall_timeout` is **"nothing usable arrived for this long"** — no packets, or packets
 that do not become media. It is explicitly *not* lag against wall clock, and
 it stays idle-based on purpose: it is the fast dead-versus-alive signal, and
 it resets on every usable arrival with no false-positive mode. A stable 0.98x
-publisher trips no idle timer, and only trips a floor whose `pace` the
+publisher trips no idle timer, and only trips a `min` the
 operator set above it. The two are different failure modes on different
 timescales — seconds of silence versus tens of seconds of slowness — which is
-why they stay two knobs rather than one list. `stall` lives here and not
-under `[hls]` because it measures the publisher, not the playlist: when it
+why they stay two knobs rather than one list. `stall_timeout` lives under `[ingest]`
+and not `[hls]` because it measures the publisher, not the playlist: when it
 fires the origin drops the session and the outputs render the consequence
 (a stale, then ended playlist). A future output table inherits the same
 signal rather than growing its own timer.
+
+`ingest.idle_timeout` is the transport-level counterpart: how long a
+connection may carry no bytes at all. `stall_timeout` fires even while keepalives or
+unusable packets keep arriving.
 
 `takeover` decides what a second publisher for the same stream means. At `false`,
 the default, the newcomer is refused while the current publisher holds the name.
@@ -365,15 +398,15 @@ a discontinuity at the join. The default is refusal because silent replacement
 turns an encoder reconnect or a leaked credential into a hijack with no signal.
 
 The cost of that default is a reconnect blackout. A publisher whose network
-drops without closing its socket still holds the name until `stall` fires, so
-an encoder returning before then is refused — at `stall = "12s"`, up to twelve
+drops without closing its socket still holds the name until `stall_timeout` fires, so
+an encoder returning before then is refused — at `stall_timeout = "12s"`, up to twelve
 seconds of dead air on every partition. Which way to err is a judgement about
 the deployment: `takeover = true` favours reconnect speed and accepts that
 anyone with the credential can seize a live stream, while the default favours
 holding the name and accepts the gap. Operators keeping the default should
-size `stall` with this in mind, since it is what bounds the blackout.
+size `stall_timeout` with this in mind, since it is what bounds the blackout.
 
-`ceiling`, `stall`, `floor`, and `takeover` deliberately do **not** take the
+`rate`, `stall_timeout`, and `takeover` deliberately do **not** take the
 predicate constructors above. Those answer "which values are in the admit
 set"; a refill rate is not a value to test membership against. "Exactly 1x"
 is not something a real encoder can be asked for.
@@ -389,12 +422,15 @@ The `segment` and `part` objects describe preferred targets and admission limits
 
 ```toml
 [hls]
-segment = { target = "6s", max = "2x", jitter = "0s" }
-part    = { target = "1s", max = "2x" }
+segment = "6s"                                       # short form: the target
+part    = "1s"
+# segment = { target = "6s", max = "2x", tolerance = "0s" }   # full form
+# part    = { target = "1s", max = "2x" }
 ```
 
-These are the defaults. Omitted objects and fields use their defaults.
-Equivalent `[hls.segment]` and `[hls.part]` tables are also supported.
+These are the defaults. The short form sets only the target; the table form
+adds admission limits, and its omitted fields use their defaults. Equivalent
+`[hls.segment]` and `[hls.part]` tables are also supported.
 `target` accepts an absolute duration. `max` accepts an absolute duration or
 an exact multiplier of the configured target, including fractional values such as `"1.5x"`.
 Equal target and maximum values forbid growth during admission.
@@ -405,11 +441,12 @@ It checks audio rounding and part feasibility before it selects a boundary.
 Audio-only input uses encoded audio boundaries. Pre-roll capacity limits the
 search resources, independently of these duration limits.
 
-`segment.jitter` permits equal early and late movement around the admitted
+`segment.tolerance` permits equal early and late movement around the admitted
 runtime schedule. It accepts a duration or a multiplier of `segment.target`.
-The default is zero. A 100 ms jitter allowance can increase a segment by
+The default is zero. A 100 ms tolerance can increase a segment by
 200 ms because both endpoints can move. The complete segment ceiling,
 including audio rounding and timestamp quantization, must fit `segment.max`.
+Parts have no tolerance: they follow the segment boundaries.
 
 Admission freezes each selected part target. Ordinary dependent parts span
 85–100% of that target; independent and final parts can be shorter.
@@ -417,13 +454,13 @@ The part writer uses bounded lookahead to repair unpublished cuts.
 It never changes published parts or enlarges targets during runtime.
 A later input change that cannot fit the contract terminates the publication.
 
-This configuration replaces scalar `segment` and `part` values and removes
-`admission`, `maximum_segment`, `maximum_part`, `early_boundary`, and `late_boundary`.
-Old TOML forms and CLI flags are rejected. New environment variables use names
-such as `RUSHLS_HLS_SEGMENT_TARGET`; CLI flags use `--hls-segment-target`.
+`RUSHLS_HLS_SEGMENT` and `--hls-segment` take either form and replace the
+whole value: `RUSHLS_HLS_SEGMENT=4s` or
+`--hls-segment '{ target = "4s", max = "3x" }'`.
 
-`retain` controls how long media stays fetchable, during publication and after
-the publisher disconnects. It also controls the history that the live playlist advertises.
+`window` is the DVR window: how long media stays fetchable, during publication
+and after the publisher disconnects. It is also the history that the live
+playlist advertises.
 
 There is deliberately no separate `playlist` window. Media a playlist does not
 name is media no player can ask for, so retaining beyond the advertised window
@@ -446,18 +483,18 @@ from one response*, not what the playlist advertises: a client without a prior
 copy still receives the full window. So the boundary is a property of the
 delta mechanism, derived from `segment`, and never an operator setting.
 
-`retain` must cover three maximum target durations. A shorter fixed duration
+`window` must cover three maximum target durations. A shorter fixed duration
 is a configuration error. Relative values resolve against the admitted playlist target.
 
-`retain` is **time only**, never bytes. It is a promise to viewers about how
+`window` is **time only**, never bytes. It is a promise to viewers about how
 far back a playlist can point, and viewers seek along time. The storage tiers
 are the cost backing that promise, and are therefore **bytes only**. The
-asymmetry is deliberate: `retain` is what you promise, the tiers are what you
+asymmetry is deliberate: `window` is what you promise, the tiers are what you
 spend, and the two are different questions.
 
 A duration form on the tiers was considered and dropped. "Hold 30 seconds of
 memory" has no fixed byte meaning at a variable bitrate, so it would be a
-second, weaker way of writing `retain` — and the number an operator needs for
+second, weaker way of writing `window` — and the number an operator needs for
 capacity planning is the one that multiplies by `streams`.
 
 ### `scrubbing`
@@ -497,7 +534,7 @@ also works.
 `hold_back` is how far behind the live edge a player is told to start, and it
 is therefore **the floor on live-edge latency**. It takes either a multiple of
 `part` (`"3x"`, the default) or an absolute duration (`"3s"`), the same two
-forms `retain` accepts.
+forms `window` accepts.
 
 It is exposed while the other delivery timing values stay compiled because it
 is the only one that is a genuine tradeoff rather than a correctness
@@ -508,7 +545,7 @@ the origin cannot know. The segment-level `HOLD-BACK` stays derived at three
 target durations, where the specification leaves no such latitude.
 
 The multiple form is the default because the quantity it bounds is the part
-cadence itself: an absolute value chosen against `part = { target = "1s" }` silently
+cadence itself: an absolute value chosen against `part = "1s"` silently
 becomes aggressive when parts are retuned, which is the same reasoning the
 stall rules use.
 
@@ -536,29 +573,33 @@ satisfied.
 
 ## Storage tiers
 
-```
-memory_per_stream   the hot window
-disk_per_stream     overflow, same lifetime
+```toml
+[memory]
+per_stream = "512MiB"     # the hot window
+
+[disk]
+per_stream = "8GiB"       # overflow, same lifetime
+dir        = "/var/lib/rushls/spill"
 ```
 
 One ordered pipeline, not two pools. New media lands in memory; the oldest
 moves to disk when memory is full; the oldest overall is dropped when both are
-full. Anything past `retain` is dropped regardless of tier.
+full. Anything past `hls.window` is dropped regardless of tier.
 
-Effective depth is `retain` clipped by what the tiers hold at the stream's
-bitrate. At 5 Mbps, 256MiB is roughly seven minutes — so `retain = "2h"` on a
+Effective depth is `hls.window` clipped by what the tiers hold at the stream's
+bitrate. At 5 Mbps, 256MiB is roughly seven minutes — so `window = "2h"` on a
 memory-only node does not deliver two hours. This is reported per stream rather
 than left to arithmetic.
 
-`dir` is optional. Omit it and spilled media goes under the platform cache
+`disk.dir` is optional. Omit it and spilled media goes under the platform cache
 directory (`~/.cache/rushls/dvr` on Linux). Set it to pin a volume. `dir`
-without `disk_per_stream` is a startup error: a path with no cap does not
+without `disk.per_stream` is a startup error: a path with no cap does not
 activate the tier. A zero disk cap is refused the same way a zero memory cap is.
 
 The disk window is **process-lifetime**. A restart starts empty; spilled files
 are not rehydrated into the catalog. Writes are still crash-safe (temp, fsync,
 rename) so a new process never serves a torn object. Gzip sidecars count toward
-`disk_per_stream` — omitting them would let a text rendition blow the cap while
+`disk.per_stream` — omitting them would let a text rendition blow the cap while
 the metric looked healthy.
 
 `dir` is locked exclusively at startup. A second node using the same directory
@@ -571,14 +612,20 @@ alive is left alone.
 
 ## Concurrency budgets
 
-Together with the storage tiers above, this is the `[capacity]` table: how big
-a box. Everything here sizes the node and refuses new work when full; nothing
-here touches a live session — that is `[accept]`'s job.
+`[limits]` counts, and `[memory]` and `[disk]` size, how big a box this is.
+Everything here sizes the node and refuses new work when full; nothing here
+touches a live session — that is `[publish]`'s job.
+
+```toml
+[limits]
+publishers = 256          # concurrent ingest sessions
+streams    = 1024         # stored streams, including ended ones in their window
+```
 
 `publishers` and `streams` are separate because they answer different
 questions. A publisher is an ingest session — transport, muxing, CPU. A stream
-is a named presentation held in the store, live *or* still within `retain`.
-Once `retain` can be hours, the two decouple hard: 64 publishers with a
+is a named presentation held in the store, live *or* still within `hls.window`.
+Once the window can be hours, the two decouple hard: 64 publishers with a
 two-hour retain legitimately needs hundreds of store slots.
 
 Each refuses at its own layer, which keeps failures clean: over `publishers` is
@@ -586,18 +633,18 @@ refused at admission, over `streams` at stream creation. Neither becomes a
 write failure mid-session.
 
 **When `streams` is full, a new stream is refused rather than evicting a
-retained one.** `retain` is a promise to viewers holding a playlist; breaking
+retained one.** `hls.window` is a promise to viewers holding a playlist; breaking
 it produces 404s during playback, which is invisible and unactionable. A
 refused publisher is neither.
 
 There is deliberately no viewer cap. Viewers hold no ingest resources; a parked
-playlist reload is a held HTTP request bounded by `shutdown` on the way out,
+playlist reload is a held HTTP request bounded by `shutdown_grace` on the way out,
 and fan-out is the layer in front of this node to own. Capping viewers here
 would turn a CDN sizing answer into an origin config field.
 
 ### What the node actually costs
 
-`memory_per_stream` budgets retained media and cached manifests together.
+`memory.per_stream` budgets retained media and cached manifests together.
 Memory-only streams give media priority and use remaining space for manifests.
 With disk storage, one eighth of the RAM budget is reserved for plain and gzip
 manifest bytes. Media spilling starts above 81.25% of the budget and aims for 75%.
@@ -617,95 +664,187 @@ and bytes held only by responses already in flight. The minimum live media
 window can also exceed an undersized budget. In that case, no manifests are cached.
 This setting is a retention budget, not a hard process-memory ceiling.
 
-A publisher also holds transport framing, demux queues, an in-flight batch,
-pre-roll, and container probing buffers. These have a compiled bound of
-**120MiB per publisher**, held only while ingesting.
+### Publisher memory
 
-```
-retention budget = streams x memory_per_stream   media and manifest caches
-pipeline bound   = publishers x 120MiB            ingest only
+```toml
+[memory]
+per_publisher = "128MiB"
 ```
 
-These terms have different lifetimes. For example, 64 publishers, 256 streams, and 256MiB per stream give
-64GiB of retention budget and 7.5GiB of pipeline capacity, before the overhead above.
+`memory.per_publisher` sets one shared allocation budget per publisher.
+The minimum is `64MiB`. No memory is allocated merely because a budget exists.
+Transport payloads, discovery packets, normalized media, preroll, and packaging
+share the allowance. A stage can use space that another stage does not need.
+Preroll has no byte limit of its own. It is bounded by this budget, together
+with its sample-count, media-duration, and wall-time limits.
 
-The pipeline figure is a compiled constant rather than a setting, because an
-operator has no basis on which to choose one: it is driven by track count and
-group-of-pictures structure, which belong to the publisher rather than to the
-deployment, and a value chosen too low breaks discovery for multi-rendition
-contributors. What is owed instead is the guarantee and a way to check it, so
-it is exported per session as `rushls_session_pipeline_capacity_bytes`.
+Set `per_publisher = "unlimited"` to remove the ceiling. Use this only when
+all publishers are trusted. Usage and peak metrics still report accounted memory.
 
-A `memory_per_publisher` cap is not implemented or accepted as a configuration field. Enforcing one shared budget means deciding what a stage does when
-another holds the bytes it wants — failing the session kills a healthy
-publisher on a transient peak, blocking turns a memory cap into a stall — and
-that is a decision worth making against real numbers from the metric.
+One quarter of the total, limited to `16MiB`, is a completion reserve.
+Only packaging output can use the reserve. Transport, demux, normalization, and
+preroll stop at the ordinary ceiling: `112MiB` inside the default `128MiB` total.
+
+The CMAF muxer reserves the output memory of each sample when it accepts the
+sample. The reservation includes an allowance for container boxes. The sample
+keeps this reservation while it waits for a segment boundary and for its part
+to close. Flushes, including the final drain when a publication ends, therefore
+do not need new memory. A flush writes the part into one buffer of the exact
+size. Each input is released after it is copied, and the unused allowance is
+released at the end of the flush. If memory runs out, the muxer rejects the
+sample that it cannot reserve. Media that the muxer has already accepted can
+still be published.
+
+This guarantee applies only to CMAF audio and video. WebVTT renders cue text
+and segment output when it publishes them. This rendering can use the reserve,
+but it can still fail if the reserve is empty. Preroll replays that test a
+segmentation candidate charge their subtitle rendering to the same budget.
+
+Moves and slices preserve payload reservations. Shared backing bytes are charged
+once when their ownership is visible to Rushls. Packaging output receives
+separate reservations. Storage takes over the delivered output reference.
+Other pipeline references remain charged until their owners release them.
+
+Reservations do not wait for memory. A full preroll buffer can require another
+keyframe before it releases data. Waiting for space at that point can deadlock.
+A failed reservation ends the publication and reports the allocation stage,
+requested bytes, current usage, and configured total through session events.
+If memory runs out while preroll holds samples, the error identifies preroll
+and the number of samples that it holds.
+Queue backpressure, sample-count limits, packet-size limits, and deadlines still apply.
+The RTMP and MPEG-TS ingress queues keep their own 16MiB byte limit. A publisher
+that sends faster than the session consumes waits on TCP instead of exhausting
+the budget.
+
+**This is an accounted-buffer limit, not a process-memory ceiling.**
+MPEG-TS demux internals, the MOQ native cache, OS buffers, allocator overhead,
+and uninstrumented metadata/container capacity remain outside this accounting.
+Dependency-produced payloads are charged before application retention, after
+allocation inside the dependency. Hidden backing capacity cannot be inferred
+from an arbitrary dependency-provided slice.
+RTMP receive slabs are charged before allocation after publication admission.
+RTMP messages smaller than 4KiB are copied out of their 16KiB receive slab.
+A retained audio frame or caption then holds only its own bytes, not the slab.
+Each packet's bookkeeping is charged separately, including packets that share a slab.
+Pre-admission transport buffers retain their existing protocol limits.
+Native cache targets and protocol safety limits remain independent safeguards.
+
+The session metrics report the configured total, current reservations, peak
+reservations, the completion reserve, and failed reservations.
+`rushls_session_pipeline_allocation_bytes` attributes bytes to their allocation
+origin. A payload keeps that attribution as it moves through the pipeline.
+These metrics do not include retained output after the storage handoff.
+
+```text
+worst case = limits.publishers × memory.per_publisher
+           + limits.streams    × memory.per_stream
+```
+
+`rushls --check` prints this sum for the resolved configuration. Node sizing
+must also include the exclusions listed here and the storage exclusions. For
+example, 64 publishers at `128MiB` provide 8GiB of accounted pipeline capacity.
+
+Aggregate encoded bitrate and buffering duration determine a useful starting budget.
+Resolution alone does not determine memory usage. A multitrack publisher retains
+all contributing tracks while admission waits for compatible boundaries.
+For example, 40Mb/s retained for eight seconds requires approximately 38MiB of
+payload, before metadata, transport slabs, burst allowance, and serialization copies.
+Longer GOPs and delayed tracks can increase the retained duration.
+Use peak usage and exhaustion events to evaluate larger publisher budgets.
+
+### Node memory total
+
+```toml
+[memory]
+total = "16GiB"           # default "unlimited"
+```
+
+The defaults allow 256 publishers at 128MiB and 1024 streams at 512MiB: about
+544GiB if every budget filled at once. Budgets are ceilings, not allocations,
+so a node rarely approaches that — but nothing guaranteed it could not.
+`memory.total` is that guarantee. Each active publisher commits its
+`per_publisher` budget and each stored stream its `per_stream` budget against
+the total, and a publication whose commitment would exceed it is refused with
+the protocol's "service unavailable". The budgets can therefore never add up to
+more than `total`, however they fill.
+
+Commitments are released when the session ends and when the stream leaves the
+store. A takeover is admitted even when the total is fully committed: it
+replaces a session that already holds its share, and the displaced session
+returns that share within its drain. `total` must hold at least one publisher
+and its stream, and needs a finite `per_publisher`.
+
+`total` commits budgets rather than measuring use, so it is conservative: a
+node of mostly idle streams refuses new work while real use is far below the
+total. That is the cost of a promise that holds under any mix of bitrates. The
+same exclusions apply as above: `total` is not a process-memory ceiling.
 
 ## Timeouts
 
-`[rtmp] timeout` is the idle limit for an **established** publisher: how long
-it may send nothing before its session is closed. It does not set the
-handshake deadline.
+```toml
+[ingest]
+idle_timeout  = "10s"     # connection silent: closed
+stall_timeout = "12s"     # connected, but no usable media: dropped
+```
+
+`ingest.idle_timeout` is the idle limit for an **established** connection, on
+every ingest protocol: how long it may carry nothing before it is closed. It
+does not set the handshake deadline.
 
 The handshake gets its own, tighter limit, derived rather than configured —
-the lesser of `timeout` and a few seconds. The two phases are not equivalent
-and sizing them together would be wrong in one direction or the other. A
-handshake covers an *unauthenticated* peer, which is the cheapest way to hold a
-socket open, so it should be short. An established session covers a publisher
-that has proved itself, where a tight limit drops a legitimate stream between
-keyframes and turns hardening into an outage.
+the lesser of `idle_timeout` and a few seconds. The two phases are not
+equivalent and sizing them together would be wrong in one direction or the
+other. A handshake covers an *unauthenticated* peer, which is the cheapest way
+to hold a socket open, so it should be short. An established session covers a
+publisher that has proved itself, where a tight limit drops a legitimate
+stream between keyframes and turns hardening into an outage.
 
 One operator-facing value, because the second is only ever "shorter, and
 bounded by a constant". Exposing both invites the pairing that the derived form
 prevents: a generous session timeout accidentally applied to unauthenticated
-peers.
+peers. A value below one second is refused, and `"off"` still leaves the
+handshake bounded.
 
-`[srt] timeout` is the same idea one protocol over, and stays separate rather
-than folding into the RTMP one. SRT is connectionless and keeps its own
-keepalive, so this bounds a protocol-level idle rather than a stalled socket
-read, and the two are sized against different things. This one in particular
-is **bounded below by `latency`**: a deadline inside the receiver's own
-reordering window would fire on packets the transport is still legitimately
-waiting for, so a `timeout` at or under `latency` is refused. Raising
-`latency` for a long-haul link without raising `timeout` is the mistake that
-check exists to catch.
+It is also one value across protocols. RTMP bounds a socket read, SRT a
+protocol-level idle it tracks with its own keepalives, and MoQ the QUIC idle
+timeout; the mechanisms differ, but the operator question — how long may a
+publisher's connection go quiet — does not, and three knobs invited three
+different answers. SRT adds one constraint: the timeout must exceed
+`ingest.srt.latency`, because a deadline inside the receiver's own reordering
+window would fire on packets the transport is still legitimately waiting for.
+Raising `latency` for a long-haul link without raising `idle_timeout` is the
+mistake that check exists to catch.
 
-`[moq] timeout` is the QUIC idle timeout for an established WebTransport
-session, derived the same way as `[rtmp] timeout`: `"off"` still leaves
-SETUP/CONNECT bounded, and a value below one second is refused. It is a
-separate knob because QUIC idle is not an RTMP socket read.
-
-Five idle-adjacent knobs, four different signals. `[rtmp] timeout`, `[srt]
-timeout`, and `[moq] timeout` are transport silence — any bytes reset them —
-and stay per-protocol because what counts as silence differs. `stall` is
-usable-media silence, protocol-agnostic. `floor` is usable-media rate.
-Collapse any of them and one failure mode loses its tuning: a dead socket wants
-seconds, a degraded encoder wants tens of seconds with a pace attached.
+Three idle-adjacent settings, three different signals. `idle_timeout` is
+transport silence — any bytes reset it. `stall_timeout` is usable-media silence.
+`publish.rate.min` is usable-media rate. Collapse any of them and one failure
+mode loses its tuning: a dead socket wants seconds, a degraded encoder wants
+tens of seconds with a pace attached.
 
 ## Shutdown
 
-`shutdown` bounds how long a restart waits before abandoning work in progress.
-It covers both things a restart can cut short: viewers parked on a blocking
-playlist reload, which the delivery path deliberately holds for up to three
-target durations, and hook events still queued for delivery.
+`shutdown_grace` bounds how long a restart waits before abandoning work in
+progress. It covers both things a restart can cut short: viewers parked on a
+blocking playlist reload, which the delivery path deliberately holds for up to
+three target durations, and hook events still queued for delivery.
 
 One knob rather than two, because it answers one operator question and is
 usually sized against an orchestrator's own grace period. Set it below that
 period, or a scheduler sends a hard kill mid-drain and the graceful path buys
 nothing.
 
-It sits at the top level rather than under `[capacity]` because it is not a
-capacity bound. Everything in that table sizes a box — how many of something,
-how much memory. This is process lifecycle, and it belongs beside `name` as a
-property of the node itself.
+It sits at the top level rather than under `[limits]` because it is not a
+capacity bound. That table sizes a box — how many of something. This is
+process lifecycle, and it belongs beside `name` as a property of the node
+itself.
 
-**`"off"` is not legal here**, unlike every other duration. Waiting
-indefinitely would mean staying alive to serve retained media to viewers who
-might arrive, rather than finishing work already in flight — a wait bounded by
-`retain`, which can be hours. No scheduler grants that, so the setting would
-promise what it cannot deliver. A terminating node has usually been removed
-from its load balancer already; keeping retained media available across a
-restart is another node's job, not this one's refusal to exit.
+**`"off"` is not legal here**, unlike most durations. Waiting indefinitely
+would mean staying alive to serve retained media to viewers who might arrive,
+rather than finishing work already in flight — a wait bounded by `hls.window`,
+which can be hours. No scheduler grants that, so the setting would promise
+what it cannot deliver. A terminating node has usually been removed from its
+load balancer already; keeping retained media available across a restart is
+another node's job, not this one's refusal to exit.
 
 ## Node identity
 
@@ -746,16 +885,16 @@ Object-storage FUSE mounts are unsuitable because they can lack the required
 filesystem operations. A separate uploader can scan completed files, upload
 them, then remove them. Rotation and offload remain external.
 
-### Pattern
+### Path
 
 The default configuration is:
 
 ```toml
 [record]
 dir = "/archive"
-pattern = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
+path = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
 queue_size = 128
-max_pending_bytes = 268435456
+max_pending = "256MiB"
 ```
 
 The placeholders have these meanings:
@@ -769,8 +908,8 @@ The placeholders have these meanings:
 | `{segment}` | Publisher-local segment sequence, starting at zero |
 
 The archive publication UUID is separate from the process-local hook `session_id`.
-The default pattern prevents collisions after sequence numbering restarts.
-Custom patterns can omit placeholders, but existing files are never overwritten.
+The default path prevents collisions after sequence numbering restarts.
+Custom paths can omit placeholders, but existing files are never overwritten.
 Subtitle files replace the configured suffix with `.vtt`.
 Because that replacement drops everything after the last dot of the last path
 component, `{segment}` cannot be the last placeholder in one: `{rendition}.{segment}`
@@ -794,7 +933,7 @@ file was written. Scanners must ignore `.rushls-*.tmp` files. A crash can leave
 these temporary files behind.
 
 One background thread performs filesystem writes. `queue_size` bounds
-waiting segments. `max_pending_bytes` bounds retained bytes for open
+waiting segments. `max_pending` bounds retained bytes for open
 segments, queued files, and the active write. Small payloads also incur a
 minimum metadata charge. An open segment has a separate 16,384-handle limit.
 
@@ -804,7 +943,7 @@ collisions also report failures. Live delivery continues. Recording is
 best-effort during overload, not a lossless admission requirement.
 
 An invalid archive root fails startup. After publishers stop, accepted writes drain
-within the remaining `[node] shutdown` budget. An expired drain reports pending
+within the remaining `shutdown_grace` budget. An expired drain reports pending
 outcomes as unknown. Unsynced work does not survive a process crash.
 
 ## Hook delivery
@@ -871,7 +1010,7 @@ segments emits approximately 600 events per hour. Short segments around GAPs
 increase that rate. Subscribe only the destinations that need segment notifications.
 
 A hook destination takes the same `client_cert`, `client_key`, and `ca`
-fields as `[auth.publish]`, with the same meaning and the same in-place
+fields as `[publish.auth]`, with the same meaning and the same in-place
 rotation. Nothing about them is specific to admission: both are operator-run
 services reached over a network the operator may not consider private, and
 proving this origin to one while pinning its issuer in return is the same
@@ -885,9 +1024,9 @@ once and shares one cache.
 
 ## Auth
 
-Two independent questions, two tables. `[auth.publish]` decides who may send
-media; `[auth.playback]` decides who may watch it. Either may be omitted, and
-omission means open.
+Two independent questions, two tables, each under what it protects.
+`[publish.auth]` decides who may send media; `[playback.auth]` decides who may
+watch it. Either may be omitted, and omission means open.
 
 They are shaped differently on purpose, because they are asked at different
 rates. A publisher is admitted once, when it connects, so a network round trip
@@ -903,13 +1042,13 @@ of these decisions:
 ```json
 {"decision": "allow", "stream_id": "live/camera", "principal": "account-42"}
 {"decision": "allow", "stream_id": "live/camera", "principal": "account-42",
- "policy": "premium"}
+ "profile": "premium"}
 {"decision": "deny", "reason": "subscription_inactive"}
 ```
 
-`policy` selects a local `[accept.policy]` entry. An omitted policy uses
-`[accept]`. The response cannot define media predicates or override observed
-transport details. Unknown fields, unknown policies, missing identities, and
+`profile` selects a local `[publish.profile.<name>]` entry. An omitted profile
+uses `[publish]`. The response cannot define media predicates or override observed
+transport details. Unknown fields, unknown profiles, missing identities, and
 blank identities fail closed. The request version defines the response schema.
 
 The request carries `version`, `request_id`, `protocol`, `resource`, `credential`,
@@ -937,17 +1076,17 @@ a shared secret, and checks the token itself — no request leaves the node per
 reload.
 
 Exactly one key source: `public_key` for an asymmetric verifying key,
-`jwks_url` for a rotating key set, or `secret` for a symmetric secret (each
-with a `_file` form). Asymmetric is the better default, because the origin
+`jwks_url` for a rotating key set, or `secret` for a symmetric secret. Key
+material is written inline or as `{ file = "/path" }`. Asymmetric is the better default, because the origin
 never holds anything that could mint a token; a symmetric secret makes every
 origin able to issue viewing rights for every other one.
 
 The verifying key is spelled `public_key` rather than `key` because
-`[http.tls] key` is a *private* key. One word for both, differing only in which
+`[tls] key` is a *private* key. One word for both, differing only in which
 one must never be shared, is how a private key ends up pasted into the wrong
 field.
 
-`[auth.playback.claims]` is what the token must say: each key is a claim name
+`[playback.auth.claims]` is what the token must say: each key is a claim name
 and each value is what that claim must equal. `iss` and `aud` are required.
 Without an audience check, a token the same issuer minted for a different
 service is accepted here.
@@ -1023,7 +1162,7 @@ not hold one uses `payload = true` and receives the bytes directly.
 ## Metrics
 
 **Omit `[metrics]` and nothing is served.** The table is the switch, as it is
-for `[auth.publish]` and `[http.tls]`.
+for `[publish.auth]` and `[https]`.
 
 An earlier draft had both an `enabled` flag and a `listen` that accepted
 `"off"`, which is two disable switches meaning different things: one turning
@@ -1035,7 +1174,7 @@ series carry stream names, which on a public origin is the list of everything
 currently published — not something the viewer-facing port should offer.
 
 To serve them on a viewer port instead, set `listen` to the same address as
-`[http]` or `[http.tls]`. Sharing `[http.tls]` is how scrapes happen over
+`[http]` or `[https]`. Sharing `[https]` is how scrapes happen over
 HTTPS; a dedicated metrics listener is always cleartext. That is a deliberate
 act rather than a magic value, and it makes the sharing visible in the file.
 A token then stops being optional in any public configuration.
@@ -1056,22 +1195,25 @@ a Grafana dashboard, alert rules, and the public-playback probe.
 
 ## Secrets
 
-Every secret has two spellings: a `_file` form reading from a path, and an
-inline form. The `_file` form is preferred and is what the reference shows
-uncommented, because a mounted file with restricted permissions does not appear
-in process listings, crash dumps, or a configuration file that gets committed
-by accident.
-
-The inline form exists because not every deployment has somewhere to mount a
-file, and because it composes with interpolation:
+Every credential is one field, and its value's shape says where it comes from:
 
 ```toml
-secret = "${PLAYBACK_HMAC}"
+token = { file = "/run/secrets/rushls-auth" }   # a mounted file
+token = "${AUTH_TOKEN}"                         # the environment
+token = "literal"                               # inline
 ```
 
-**`${VAR}` is the canonical spelling**, with unambiguous boundaries so a value
-can be composed from more than one variable. Interpolation applies to string
-values only, never to table names or keys.
+The file form is preferred: a mounted file with restricted permissions does not
+appear in process listings, crash dumps, or a configuration file that gets
+committed by accident. An earlier design gave every secret a `_file` twin that
+could not be set together with the inline field — two keys and a rule for one
+value. The shape of the value now makes the choice, so there is nothing to
+conflict. Mounted files lose trailing CR/LF characters only; spaces are part of
+the credential.
+
+**`${VAR}` is the canonical inline spelling**, with unambiguous boundaries so a
+value can be composed from more than one variable. Interpolation applies to
+string values only, never to table names or keys.
 
 `$$` escapes a literal `$`. This matters: passphrases and publishing keys can
 legitimately contain one, and silently interpolating those would corrupt a
@@ -1081,14 +1223,18 @@ working credential.
 into a token would silently disable the check it was protecting. Where an empty
 value is genuinely wanted, `${VAR:-fallback}` says so explicitly.
 
-Setting both forms of one secret is refused rather than resolved by precedence.
+Environment overrides take the same two spellings: a value that parses as
+`{ file = "/path" }` names a file, and anything else is literal, so
+`RUSHLS_METRICS_TOKEN='{ file = "/run/secrets/metrics" }'` mounts one.
 
-The `_file` path is a setting like any other: file, environment, or a
-command-line flag (`--auth-publish-token-file`, `--srt-passphrase-file`,
-`--metrics-token-file`). The secret itself is not a flag. A process listing
-would otherwise show it. Environment and the file remain the two places an
-inline value may appear. Hook tokens stay in `[hook.*]` only: that table is an
-open namespace, and there is no flag for a name chosen at runtime.
+**On the command line, a credential flag always takes a file path**:
+`--metrics-token /run/secrets/metrics`. A process listing shows every argument,
+so the flag never carries the credential itself, and there is no `{ file = }`
+syntax to type there. Like any flag it outranks TOML and the environment. The
+four credentials with flags are `ingest.srt.passphrase`, `publish.auth.token`,
+`playback.auth.secret`, and `metrics.token`. Hook credentials stay in
+`[hook.*]` only: that table is an open namespace, and there is no variable or
+flag for a name chosen at runtime.
 
 ## Configuration mechanics
 
@@ -1099,18 +1245,14 @@ Variables outside that prefix produce no warning. All environment variables rema
 available for interpolation. Custom interpolation inputs can use a separate
 namespace to avoid warnings.
 
-Mounted secret files lose trailing CR/LF characters only. Leading and trailing
-spaces remain part of the credential. Inline credentials remain unchanged.
-
-
 Unknown keys refuse. A misspelled table or field fails startup with its path,
 because silently ignoring it would run an open node the operator thought was
-closed. This is the same fail-closed instinct as an unknown policy name.
+closed. This is the same fail-closed instinct as an unknown profile name.
 
-**Named hooks and policies are open namespaces**: `[hook.*]` and `[accept.policy.*]`.
-The operator chooses their sub-table names. `[auth.playback.claims]` also accepts operator-defined claim names. The names
+**Named hooks and profiles are open namespaces**: `[hook.*]` and `[publish.profile.*]`.
+The operator chooses their sub-table names. `[playback.auth.claims]` also accepts operator-defined claim names. The names
 are keys rather than values — a hook's name identifies it in logs and metrics,
-and a policy's is what an auth response selects — so a table keyed by name
+and a profile's is what an auth response selects — so a table keyed by name
 makes uniqueness structural, since TOML rejects a duplicate key for us. The
 alternative spelling, an array of tables with a `name` field, turns
 uniqueness into a validation rule that has to be written and can be forgotten,
@@ -1134,50 +1276,60 @@ Which **file** is loaded is a separate walk, first match wins:
 
 Platform directories use the application name `rushls`, without an organization prefix.
 If an earlier build stored configuration elsewhere, move the file or select it with `--config`.
-Set `capacity.dir` to keep an existing custom DVR location.
+Set `disk.dir` to keep an existing custom DVR location.
 
 The process logs the path it used, or that it used compiled defaults.
 
 Environment variables use the parser for their corresponding field:
 
 ```sh
-RUSHLS_HLS_SEGMENT_TARGET=6s
-RUSHLS_ACCEPT_STRICT=true
+RUSHLS_HLS_SEGMENT=6s
+RUSHLS_PUBLISH_STRICT=true
+RUSHLS_PUBLISH_RATE='{ max = "1x", burst = "10s" }'
+RUSHLS_MEMORY_TOTAL=16GiB
 ```
 
-`rushls --help` lists the available CLI arguments and environment variables.
-Structured media predicates, named policies, hooks, recording, and playback claims are TOML-only.
-For example, `RUSHLS_ACCEPT_VIDEO_FRAME_RATE` is not a supported override; it produces an unknown-variable warning.
-Use TOML strings with interpolation where a structured field accepts a string value.
+Structured values — `publish.rate`, `publish.video`, `publish.audio`,
+`publish.subtitles`, `hls.segment`, and `hls.part` — take their TOML spelling in
+the environment and on the command line, and replace the whole value. Named
+profiles, hooks, recording, and playback claims are TOML-only. `rushls --help`
+lists the flags and environment variables, and the
+[configuration reference](config-reference.md) lists every setting.
 
 The file is read at startup. New certificates and rotated JWKS keys take effect
 without a restart; anything else requires one. There is deliberately no reload
-signal for `accept`, `capacity`, or `hls`: retuning cadence or capacity under a
-live edge is a restart, sized by `shutdown`. Configuration validation runs at startup.
-There is no `rushls check` subcommand.
+signal for `publish`, `limits`, or `hls`: retuning cadence or capacity under a
+live edge is a restart, sized by `shutdown_grace`. Configuration validation runs
+at startup, and `rushls --check` runs it without serving: it prints the
+listeners, the worst-case memory the limits allow, and any warnings, and exits
+2 on an invalid configuration.
 
 ## What "off" and omission mean
 
 Omission is how a whole feature is turned off; `"off"` is how a single limit
 is lifted.
 
-- `[auth.publish]` omitted — anyone may publish.
-- `[auth.playback]` omitted — anyone with the URL may watch.
+- `[publish.auth]` omitted — anyone may publish.
+- `[playback.auth]` omitted — anyone with the URL may watch.
 - `[metrics]` omitted — nothing is exported.
 - `[record]` omitted — no local copies are written.
-- `[http.tls]` omitted — no HTTPS listener.
-- `[moq]` omitted, or `listen = "off"` — no WebTransport ingest. The compiled
-  default; turning it on requires a certificate and key.
-- `[capacity]` omitted — defaults to 256 publishers, 1,024 streams, and 512 MiB of retained memory per stream.
+- `[https]` omitted — no HTTPS listener.
+- `[tls]` omitted — no certificate, so neither HTTPS nor MoQ ingest.
+- `ingest.moq.listen = "off"` — no WebTransport ingest. The compiled
+  default; turning it on requires `[tls]`.
+- `[limits]` and `[memory]` omitted — 256 publishers, 1,024 streams, 128 MiB per
+  publisher, 512 MiB per stream, and no node total.
+- `[disk]` omitted — streams stay in memory.
 
 - `[http] listen = "off"` — no cleartext listener. Both listeners off refuses to
   boot.
-- `ceiling` omitted — no publish rate ceiling. This is the compiled default.
-- `accept.stall`, `[rtmp] timeout`, and `[moq] timeout` accept `"off"` or `"none"` to disable their deadlines.
-- Numeric `[accept]` predicates and codec lists do not accept `"off"`. Omit a predicate for no restriction.
-- Capacity counts and byte limits must be positive. `memory_per_stream = "off"` is not supported.
+- `publish.rate` omitted — no pace limits. This is the compiled default.
+- `ingest.stall_timeout` and `ingest.idle_timeout` accept `"off"` or `"none"` to disable their deadlines.
+- `memory.total` and `memory.per_publisher` accept `"unlimited"`; usage is still accounted.
+- `[publish]` predicates and codec lists do not accept `"off"`. Omit a predicate for no restriction.
+- Counts and other byte limits must be positive. `memory.per_stream = "off"` is not supported.
 
-`shutdown`, SRT deadlines, TLS handshake deadlines, and other duration fields do not accept `"off"`.
+`shutdown_grace`, SRT latency, TLS handshake deadlines, and other duration fields do not accept `"off"`.
 
 ### Shipped files
 
@@ -1185,8 +1337,10 @@ The two files serve different purposes:
 
 - `rushls.toml` — the local starter. Loopback listeners, everything else
   compiled defaults. Push a file, watch it play.
-- `rushls.example.toml` — every supported TOML field, with optional settings commented.
-  Active settings match the local starter. Examples distinguish defaults from deployment choices.
+- `rushls.example.toml` — every supported TOML field, grouped by question, with
+  optional settings commented. Active settings match the local starter.
+- `docs/config-reference.md` — every setting with its default, environment
+  variable, and flag, generated from the schema; a test fails when it drifts.
 
 Print the example that matches the installed binary:
 
@@ -1205,7 +1359,7 @@ For public deployment, mount a configuration with publisher authorization at `/e
 ## Startup warnings
 
 Warnings cover public ingest without authorization, an effectively uncapped stream count,
-and disabled stall or RTMP/MOQ idle deadlines. Configuration may also warn about HLS timing relationships.
+disabled stall or idle deadlines, and a `[tls]` that nothing uses. Configuration may also warn about HLS timing relationships.
 Unknown `RUSHLS_` environment variables warn without blocking startup.
 
 Hard refusals are kept for the genuinely unbootable. Rules that bounce an
@@ -1216,8 +1370,8 @@ administrator over a relationship they did not know existed should warn.
 - A metrics `per_stream` flag. `/metrics` versus `/metrics/streams` is the
   scraper's choice.
 - Simultaneous HTTP and HTTPS metrics. One `listen`, one transport. Share
-  `[http]` or `[http.tls]`, or bind a dedicated cleartext port.
-- Per-path or per-app accept maps — named policies cover it.
+  `[http]` or `[https]`, or bind a dedicated cleartext port.
+- Per-path or per-app publish maps — named profiles cover it.
 - A disconnect-on-too-fast setting.
 - Classic HLS, or a `low_latency` flag. The origin is low-latency HLS.
 - `log_level` — `RUST_LOG` already does this.
@@ -1230,7 +1384,7 @@ administrator over a relationship they did not know existed should warn.
 ## Known future pressure
 
 Additive, no reorganization needed: a `[dash]` sibling to `[hls]`, stream-key
-auth as `[auth] key_file`, further ingest protocols as new top-level tables,
+auth as `[publish.auth] key`, further ingest protocols as new `[ingest.*]` tables,
 and `EVENT`-type playlists, which would arrive as a new `[hls]` field naming
 the playlist type rather than as a second retention window.
 
@@ -1260,4 +1414,4 @@ This setting exposes names; it does not create those response headers.
 Keep CDN-specific exposure in the CDN response-header policy when the CDN owns those headers.
 Preserve the origin exposure list when you add CDN header names.
 
-Strict input validation is enabled by default. Set `[accept].strict = false` to enable [bounded GAP handling](audio-recovery.md). See [input modes](input-modes.md).
+Strict input validation is enabled by default. Set `publish.strict = false` to enable [bounded GAP handling](audio-recovery.md). See [input modes](input-modes.md).

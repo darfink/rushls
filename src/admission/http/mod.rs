@@ -17,18 +17,18 @@
 //!
 //! # What the response may decide
 //!
-//! Identity, and a policy *by name*. Never the policy itself.
+//! Identity, and a publish profile *by name*. Never the profile itself.
 //!
 //! The reason is legibility rather than defence. The admission service is
-//! trusted — it may select a policy that widens what this node accepts, which
+//! trusted — it may select a profile that widens what this node accepts, which
 //! is how a deployment expresses "this account may publish 4K" on an origin
-//! whose default is smaller. What it may not do is *define* that policy in its
+//! whose default is smaller. What it may not do is *define* that profile in its
 //! response, because then no one could tell what an origin accepts by reading
 //! its configuration: the answer would live partly in a service's source.
 //!
 //! Keeping every admissible set in the file makes it reviewable, diffable, and
 //! validated at startup, and leaves the response choosing among sets rather
-//! than inventing one. A deployment that needs a new shape adds a policy and
+//! than inventing one. A deployment that needs a new shape adds a profile and
 //! restarts, which is the same cost as any other change to what this node
 //! admits. Names are looked up locally, and an unknown one denies.
 
@@ -55,7 +55,7 @@ pub struct HttpAuthConfig {
     pub endpoint: Endpoint,
     /// Applied when an allowing response names no policy.
     ///
-    /// The unnamed `[accept]` set itself, rather than an entry a reserved name
+    /// The unnamed `[publish]` profile itself, rather than an entry a reserved name
     /// points at: naming the default would make it possible to have none.
     pub default: StreamPolicy,
     /// Every policy a response may name, resolved at start-up.
@@ -85,15 +85,15 @@ impl HttpAuthenticator {
             return Err(service("the response named an empty principal"));
         }
         let policy =
-            match allowed.policy.as_deref() {
-                // Naming nothing is the common case and takes `[accept]` itself.
+            match allowed.profile.as_deref() {
+                // Naming nothing is the common case and takes `[publish]` itself.
                 None => &self.config.default,
                 // Fails closed rather than falling back to the default: a service
-                // naming a policy this node does not have is either misconfigured
+                // naming a profile this node does not have is either misconfigured
                 // or looking at a different version of the configuration, and
-                // quietly substituting a policy would apply limits nobody chose.
+                // quietly substituting one would apply limits nobody chose.
                 Some(name) => self.config.policies.get(name).ok_or_else(|| {
-                    service(format!("the response named unknown policy `{name}`"))
+                    service(format!("the response named unknown profile `{name}`"))
                 })?,
             };
 
@@ -215,7 +215,8 @@ enum Decision {
 struct Allowed {
     stream_id: String,
     principal: String,
-    policy: Option<String>,
+    /// A `[publish.profile.<name>]` to apply instead of `[publish]`.
+    profile: Option<String>,
 }
 
 impl Default for HttpAuthConfig {
