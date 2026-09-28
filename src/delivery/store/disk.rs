@@ -787,6 +787,25 @@ mod tests {
             .join(format!("epoch-{epoch}"))
     }
 
+    /// Opens a directory whose previous owner was just dropped.
+    ///
+    /// Drop releases the lock synchronously, but another test in this binary
+    /// may be spawning a child at that moment. The spawn briefly duplicates
+    /// every descriptor, and a `flock` lives until its last duplicate closes,
+    /// so the lock can outlast our drop by the length of that spawn. Only the
+    /// test binary spawns processes; production never shares the window.
+    fn open_after_release(limits: &DiskLimits) -> Result<Arc<DiskTier>, DiskError> {
+        let start = Instant::now();
+        loop {
+            match DiskTier::open(limits) {
+                Err(DiskError::InUse { .. }) if start.elapsed() < Duration::from_secs(2) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// This helper is also an ordinary no-op test unless invoked by the parent
     /// with a private directory. Exiting bypasses Drop to model a crashed writer.
     #[test]
@@ -795,15 +814,19 @@ mod tests {
             return Ok(());
         };
         let root = PathBuf::from(root);
-        let tier = DiskTier::open(&DiskLimits {
+        let limits = DiskLimits {
             directory: root,
             maximum_payload_bytes: 1024,
-        });
+        };
         if std::env::var_os("RUSHLS_TEST_OWNER_BUSY").is_some() {
-            assert!(matches!(tier, Err(DiskError::InUse { .. })));
+            assert!(matches!(
+                DiskTier::open(&limits),
+                Err(DiskError::InUse { .. })
+            ));
             return Ok(());
         }
-        let tier = tier?;
+        // The parent has just dropped its tier.
+        let tier = open_after_release(&limits)?;
         fs::write(tier.shared.generation.join("crash-evidence"), b"orphan")?;
         std::process::exit(0);
     }
@@ -841,7 +864,7 @@ mod tests {
             .map(|entry| entry.path())
             .find(|path| path.join("crash-evidence").exists())
             .ok_or("child left no crash evidence")?;
-        let reopened = DiskTier::open(&limits)?;
+        let reopened = open_after_release(&limits)?;
         assert!(
             !stale.exists(),
             "an exited process must release its generation lock"
@@ -915,13 +938,14 @@ mod tests {
             "two nodes on one dir fail at boot rather than reap each other"
         );
         drop(live);
-        let reopened = DiskTier::open(&DiskLimits {
+        let reopened = open_after_release(&DiskLimits {
             directory: root.clone(),
             maximum_payload_bytes: 1024,
         });
         assert!(
             reopened.is_ok(),
-            "joining the worker on drop releases the directory lock"
+            "joining the worker on drop releases the directory lock: {:?}",
+            reopened.as_ref().err()
         );
         drop(reopened);
         let _ = fs::remove_dir_all(root);
