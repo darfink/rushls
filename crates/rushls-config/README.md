@@ -93,12 +93,13 @@ when another source overrides the field.
 Secret fields use `#[conf(env, secret)]` and `SecretString` for redacted Debug
 output and Serde type errors. Existing string fields can use
 `serde(deserialize_with = "rushls_config::deserialize_secret")` for error redaction. `conf` disallows inline CLI arguments on fields marked secret.
-Applications expose CLI file paths instead and resolve credentials with
-`resolve_optional_text_secret`.
 
-Inline and file forms are mutually exclusive. Mounted secret files lose
-trailing CR/LF characters only. Spaces remain part of the credential.
-Inline values remain unchanged.
+Credentials use one `TextSource` field each: a literal string (including
+`"${VAR}"` interpolation) or `{ file = "/path" }`. The value's shape selects
+the source, so there is no separate `_file` field to conflict with. Environment
+values accept the same two spellings. `TextSource::read` returns the text.
+Mounted secret files lose trailing CR/LF characters only. Spaces remain part of
+the credential. Inline values remain unchanged.
 
 `Loaded::sources` maps field identifiers to defaults, CLI arguments, environment
 names, or document names. It contains no configuration values.

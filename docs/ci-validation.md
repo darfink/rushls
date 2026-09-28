@@ -147,8 +147,8 @@ Only GAP recovery cases use permissive handling. The two-hour audit does not inh
 
 ## Independent segments
 
-`[accept] strict = true` is the default, including for named policies.
-When all configured policies are strict, it also enables an enforced independence contract.
+`[publish] strict = true` is the default, including for named profiles.
+When all configured profiles are strict, it also enables an enforced independence contract.
 The origin advertises `EXT-X-INDEPENDENT-SEGMENTS` in master and media playlists.
 The store refuses dependent first parts and direct segments before they become readable.
 Later parts may depend on earlier parts within the same segment.
@@ -268,7 +268,7 @@ The authoring fixture keeps its 2,000 kb/s default variant; it does not reorder 
 
 ## TLS versions and the legacy report tool
 
-HTTPS defaults to TLS 1.3. Under `[http.tls]`, set `version = { min = "1.2", max = "1.2" }` for TLS 1.2 only.
+HTTPS defaults to TLS 1.3. Under `[https]`, set `version = { min = "1.2", max = "1.2" }` for TLS 1.2 only.
 Set only the minimum to `"1.2"` to accept both versions, with TLS 1.3 preferred.
 
 For the Apple audit, supply trusted certificate paths and set:

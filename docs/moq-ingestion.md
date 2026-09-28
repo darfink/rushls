@@ -45,17 +45,21 @@ This test requires FFmpeg, `moq-cli 0.10.0`, and a certificate for `localhost`.
 Replace the certificate paths in this configuration:
 
 ```toml
-[moq]
+[ingest]
+idle_timeout = "30s"
+
+[ingest.moq]
 listen = "127.0.0.1:4443"
-timeout = "30s"
+
+[ingest.rtmp]
+listen = "127.0.0.1:0"
+
+[ingest.srt]
+listen = "127.0.0.1:0"
+
+[tls]
 cert = "/absolute/path/cert.pem"
 key = "/absolute/path/key.pem"
-
-[rtmp]
-listen = "127.0.0.1:0"
-
-[srt]
-listen = "127.0.0.1:0"
 
 [http]
 listen = "127.0.0.1:18080"
@@ -106,11 +110,11 @@ From `.`, create a development certificate and start the origin:
 ```sh
 ./tools/mint-dev-cert.sh
 cargo run -- \
-  --moq-listen 127.0.0.1:18080 --moq-timeout 30s \
-  --moq-cert ~/.rushls/dev-tls/cert.pem \
-  --moq-key ~/.rushls/dev-tls/key.pem \
+  --ingest-moq-listen 127.0.0.1:18080 --ingest-idle-timeout 30s \
+  --tls-cert ~/.rushls/dev-tls/cert.pem \
+  --tls-key ~/.rushls/dev-tls/key.pem \
   --http-listen 127.0.0.1:18080 \
-  --rtmp-listen 127.0.0.1:0 --srt-listen 127.0.0.1:0
+  --ingest-rtmp-listen 127.0.0.1:0 --ingest-srt-listen 127.0.0.1:0
 ```
 
 In another terminal, serve the test page from `tools`:
@@ -180,7 +184,7 @@ The configuration uses target and maximum objects. These are the defaults:
 
 ```toml
 [hls]
-segment = { target = "6s", max = "2x", jitter = "0s" }
+segment = { target = "6s", max = "2x", tolerance = "0s" }
 part = { target = "1s", max = "2x" }
 ```
 

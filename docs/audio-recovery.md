@@ -15,7 +15,7 @@ Activation does not establish seamless playback or CMAF conformance for damaged 
 ## Input policy
 
 ```toml
-[accept]
+[publish]
 strict = false
 ```
 

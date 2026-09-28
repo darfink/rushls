@@ -3,12 +3,20 @@
 > **Status: largely implemented.** Outstanding, in the order they are least
 > to most self-contained: moderate timestamp jumps becoming discontinuities,
 > payload-carrying hooks,
-> and enforcing `memory_per_publisher`. Playlist Delta Updates,
+> and native dependency memory accounting. Playlist Delta Updates,
 > playback authorization, and
 > effective retention-depth reporting have landed, including the disk tier.
 > Every key belonging to an unbuilt feature is refused
 > at startup by name, so nothing here silently does nothing. Everything else
 > has landed.
+>
+> **Schema rename.** Keys below use the current layout: `[accept]` became
+> `[publish]` (named policies are `[publish.profile.NAME]`), `[rtmp]`, `[srt]`,
+> and `[moq]` moved under `[ingest]` with one shared `idle_timeout`,
+> `[capacity]` split into `[limits]`, `[memory]`, and `[disk]`, `hls.retain`
+> became `hls.window`, `[auth.*]` moved to `[publish.auth]` and
+> `[playback.auth]`, and certificates live in one `[tls]` table. See
+> [the reference](config-reference.md) for every current key.
 >
 > This exists because [config.md](config.md) deliberately designs the
 > configuration **without regard for what the internals currently look like**.
@@ -39,7 +47,7 @@ one to one, so every multiple other than 1x is new arithmetic.
 indefinitely. A burst is consumable and refills at `ceiling.pace`. Better
 semantics, but genuinely different behaviour rather than a rename.
 
-**Input modes control compensation.** `accept.strict` defaults to true.
+**Input modes control compensation.** `publish.strict` defaults to true.
 Strict mode rejects real audio gaps, declared-cadence violations, and dependent segment starts.
 Permissive mode uses bounded GAP handling for audio and progressive H.264 without presentation reordering.
 Unsupported video holes fail explicitly. Audio synthesis and video frame-hold recovery are removed.
@@ -168,7 +176,7 @@ case. The eviction machinery exists; the change is to drop oldest rather than
 only time-expired media in the same retry path.
 
 The same applies to `maximum_parts` and `maximum_segments`, which fail the
-same way and are compiled constants. At `segment = { target = "1s" }` with `retain = "2h"`
+same way and are compiled constants. At `segment = "1s"` with `window = "2h"`
 a stream needs 7200 segments against a 4096 ceiling, so the session dies
 part-way through with no operator setting that explains why. Shedding has to
 cover all three budgets, not only bytes.
@@ -179,65 +187,17 @@ for store capacity would couple output cadence to retention pressure, letting
 one stream's eviction sweep stall another's muxer. Dropping the oldest media
 removes the condition that would have needed waiting on.
 
-**Transient pipeline memory is unaccounted for.** `memory_per_stream` bounds
-retained parts and segments, which is what it should mean to an operator. It
-does not bound what a publisher holds *before* the store, and that is
-substantial: per RTMP session, 16MiB of buffered FLV, 16MiB queued for
-AVFormat, 16MiB of in-flight batch, 64MiB of pre-roll, and 8MiB of discovery
-probe — roughly 120MiB that appears nowhere in `streams x memory_per_stream`.
-SRT adds its own receive buffer.
-
-These stay compiled rather than becoming operator settings: they are
-properties of the pipeline, not policy, and deriving them from
-`memory_per_stream` would wrongly couple retained-window sizing to demux
-buffer sizing. The work is to name the per-publisher total as one constant
-that the individual buffers derive from, and to state the worst case as
-`publishers x` that figure in `config.md`, so capacity planning has the
-number without gaining a knob.
-
-The individual buffers stay internal, but the **total** is an operator-facing
-fact and documenting it alone is not enough. The two terms have different
-lifetimes, which is the same seam `publishers` and `streams` already sit on:
-retained media is charged per stream and outlives its publisher by `retain`,
-while pipeline memory is charged per publisher and is released the moment
-ingest stops. Worst-case memory is therefore
-`streams x memory_per_stream + publishers x <pipeline cost>`, and a
-configuration that presents only the first term as *the* memory setting
-understates the node.
-
-It stays a constant rather than becoming a knob because an operator has no
-basis on which to choose a value: the figure is driven by track count and
-group-of-pictures structure, which are properties of the publisher rather than
-of the deployment. A knob whose correct value is unknowable invites tuning
-that can only break discovery for multi-rendition contributors. What is owed
-instead is the guarantee and a way to check it: the per-publisher ceiling
-named in `config.md`, the reference stating that `memory_per_stream` covers
-retained media only, and a metric for pipeline bytes in use — per publisher
-and in aggregate — so the promise is verifiable on the box rather than only
-asserted here. If a deployment later proves it needs the cap, the additive
-move is a `[capacity] memory_per_publisher` sibling.
-
-**Decided: no `memory_per_publisher` knob for now.** Ship the guarantee, the
-documented figure, and the metric. The knob stays a named future move rather
-than part of this adoption, because a value an operator cannot derive from
-anything they observe is not a setting they can use, and the metric is what
-would tell them they need one.
-
-It appears commented in the reference so the memory model is visible where
-operators read, and it is intended to land — **last**, after everything else
-in this adoption. The ordering is not arbitrary: reporting the total is a sum
-over figures the buffers already maintain, while enforcing one shared budget
-means deciding what a stage does when another holds the bytes it wants. Fail
-the session and a transient peak kills a healthy publisher; block and a memory
-cap becomes a stall. That choice should be made against real numbers from the
-metric rather than ahead of them.
-
-Pre-roll dominates that total and must **not** be shrunk on the strength of
-its size alone. Its horizon is applied per track, so a multi-rendition
-publisher legitimately needs the headroom: pre-roll cannot lock until every
-video track has shown a compatible keyframe cadence, and samples are charged
-at retained cost — `size_of::<NormalizedSample>() + payload` — so many small
-access units consume the budget far faster than their payloads suggest.
+**Revised: shared publisher allocation accounting.**
+`memory.per_publisher` defaults to `128MiB`.
+Reservations follow payload ownership across stages. Packaging output may use
+a completion reserve inside the same total. CMAF reserves each sample's output
+when the muxer accepts it, so accepted audio and video drain without new
+memory; WebVTT output is still rendered on publication. `"unlimited"`
+keeps accounting without a ceiling. Failed reservations end the
+publication instead of waiting for another stage to release memory.
+The current implementation excludes uninstrumented native MPEG-TS/QUIC buffers
+and metadata/container overhead. See [Publisher pipeline memory](config.md#publisher-pipeline-memory)
+for the accounting contract and current metrics.
 
 **A process-wide view of ingest rate.** The density limits are per session, so
 a full node of publishers each sitting just under its own limit is unbounded
@@ -259,9 +219,9 @@ bitrate it has no fixed byte meaning, so it would be a second, weaker way of wri
 **A disk tier.** Spilled payloads live under `{dir}/{generation}/streams/...`.
 When `dir` is omitted, that is the platform cache directory (`.../rushls/dvr`).
 The catalog is not rehydrated after restart: this is process-lifetime overflow
-of `retain`, not DVR that survives reboot. `held` clips when both tiers (or
-the HLS floor) cannot cover `retain`, including when the spill queue is too
-deep to accept more work. Gzip sidecars count toward `disk_per_stream`.
+of `window`, not DVR that survives reboot. `held` clips when both tiers (or
+the HLS floor) cannot cover `window`, including when the spill queue is too
+deep to accept more work. Gzip sidecars count toward `disk.per_stream`.
 
 **Effective-depth reporting, per stream and per tier.** Configured retention is
 a request; what a stream actually holds depends on its bitrate. Without this,
@@ -352,14 +312,14 @@ or extend retention. Binary payload delivery remains unimplemented.
 
 ## Configuration layer
 
-**Named policies only; no inline predicates in a response.** A response may
-carry `policy`, naming an entry under `[accept.policy]` that replaces
-`[accept]` wholesale, and nothing else about media. This is close to what the
+**Named profiles only; no inline predicates in a response.** A response may
+carry `profile`, naming an entry under `[publish.profile]` that replaces
+`[publish]` wholesale, and nothing else about media. This is close to what the
 code already does: `BTreeMap<String, StreamPolicy>` resolved at startup, with
-an unknown name failing closed. Three changes remain — policies move under
-`[accept.policy]` and take the new predicate schema, a policy may widen as
+an unknown name failing closed. Three changes remain — profiles move under
+`[publish.profile]` and take the new predicate schema, a profile may widen as
 well as narrow the compiled default, and the reserved `default` name goes away
-in favour of `[accept]` itself being the unnamed default.
+in favour of `[publish]` itself being the unnamed default.
 
 The module note in `admission/http` arguing that a response must never carry
 policy is therefore *upheld* rather than reversed, but its reasoning is
@@ -368,7 +328,7 @@ is legibility — the file stays the whole truth about what the node accepts,
 reviewable and startup-validated, and the response only chooses among sets it
 defines.
 
-**Client certificates on outbound calls.** Built for `[auth.publish]`.
+**Client certificates on outbound calls.** Built for `[publish.auth]`.
 
 The listener's rotation machinery is reused rather than duplicated: the
 resolver behind its `ArcSwap` now answers both `ResolvesServerCert` and
@@ -427,12 +387,13 @@ mount `/metrics` on the other.
 
 **A derived handshake timeout.** One operator-facing RTMP timeout fans out to
 an established-session limit and a shorter unauthenticated-handshake limit.
-The per-phase overrides that exist today are removed. `[moq] timeout` uses the
-same derivation for QUIC idle versus SETUP/CONNECT.
+The per-phase overrides that exist today are removed. `ingest.idle_timeout`
+is that one setting for every protocol; MoQ uses the same derivation for QUIC
+idle versus SETUP/CONNECT.
 
-**`[moq]` is a third ingest listener, off by default.** WebTransport or raw QUIC with
+**`[ingest.moq]` is a third ingest listener, off by default.** WebTransport or raw QUIC with
 moq-lite-05, one broadcast per publication. LOC and legacy Hang frames are accepted. Listen stays `"off"` so a node
-boots without certificates. Turning it on requires a certificate and key; the
+boots without certificates. Turning it on requires `[tls]`; the
 QUIC `ServerConfig` is TLS 1.3 with `h3` ALPN and the same rotating resolver
 as HTTPS, never the HTTPS config itself. Handshake runs on the connection
 task. The hang catalog freezes at discovery; later add, remove, or codec-config
@@ -447,16 +408,16 @@ instead defers the failure to a layer with less context and turns a protocol
 error into a packaging error. If real publishers turn out to violate the
 specification in practice, the answer is to decide deliberately which
 deviation to tolerate, not to leave a switch that disables the whole check.
-This is separate from `[accept]`, which decides *which* codecs are admitted;
+This is separate from `[publish]`, which decides *which* codecs are admitted;
 this decides whether the framing is well-formed at all.
 
-**`[srt] timeout` becomes operator-facing and keeps its `latency` floor.**
+**`ingest.idle_timeout` keeps SRT's `latency` floor.**
 `SrtConfig::peer_idle_timeout` exists and is already validated as strictly
-greater than `latency`; the reference now exposes both, so the invariant moves
+greater than `ingest.srt.latency`; the reference now exposes both, so the invariant moves
 from an internal default pairing to a relationship between two configured
 values and must be refused rather than silently adjusted.
 
-**`floor.pace` must be refused at or above `ceiling.pace`.** A ceiling holding
+**`rate.min` must be refused at or above `rate.max`.** A ceiling holding
 a publisher at exactly the floor makes ordinary jitter fatal, and no value of
 the pair is usable, so this is a refusal rather than a warning.
 
@@ -472,12 +433,13 @@ happens there and still composes with environment and command-line overrides.
 
 Built. The braces are what let a value be composed from several variables and
 sit against surrounding text, and they keep the sigil distinct from
-`[record] pattern`, whose `{stream}` and `{time:...}` placeholders carry no
+`record.path`, whose `{stream}` and `{time:...}` placeholders carry no
 `$` and are expanded per segment by a different layer. One resolves once at
 startup from the environment; the other resolves per file from media.
 
-**An inline form for every secret**, alongside the existing `_file` forms.
-Setting both is refused rather than ordered by precedence.
+**One field per secret.** Each credential is a `TextSource`: a string,
+`"${VAR}"`, or `{ file = "/path" }`. The earlier `_file` twins are gone, so
+there is no pair to conflict.
 
 **A node name.** Nothing identifies the process today. It defaults to the
 hostname and feeds metric labels, log fields, and the producer identity on hook

@@ -90,7 +90,7 @@ a crash could not tear down players that the reconnect budget still covers.
 `SrtSocket::recv` returns `Ok(None)` for SHUTDOWN/Local and `Err(Closed(reason))`
 for a break. Dropping an `rsrt` handle sends SHUTDOWN, which is the orderly
 encoder stop (FFmpeg/`srt-live-transmit` `srt_close`, Ctrl-C). `kill -9` or a
-network cut produces `PeerIdle` after `[srt] timeout` (default 5 s). An encoder
+network cut produces `PeerIdle` after `ingest.idle_timeout` (default 10 s). An encoder
 that stays connected and only stops sending media will keep the socket alive
 with keepalives; that is transport silence vs media silence, and the live stall
 policy already covers the latter.
@@ -171,7 +171,7 @@ A deadline cannot freeze a catalog without timestamps on all discovered A/V trac
 Pre-roll then consumes the same source under its own limits to establish segment cadence.
 The live pacer starts after pre-roll. Queue backpressure does not require a larger pre-roll queue.
 
-The compiled 120 MiB total describes application payload budgets, not maximum process memory.
+The configurable shared publisher budget describes accounted application buffers, not maximum process memory.
 The native TS demuxer has additional per-PID PES and probe buffers.
 Parsed RTMP objects, queue entries, and allocator overhead also consume memory.
 

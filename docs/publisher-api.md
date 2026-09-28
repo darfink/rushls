@@ -37,12 +37,13 @@ schema follows the request's `version`. An allowing response is:
   "decision": "allow",
   "stream_id": "events/main",
   "principal": "account-42",
-  "policy": "premium"
+  "profile": "premium"
 }
 ```
 
-`stream_id` and `principal` are required, nonblank strings. `policy` is optional
-and selects a locally configured policy. Omission or `null` selects the default.
+`stream_id` and `principal` are required, nonblank strings. `profile` is optional
+and selects a `[publish.profile.NAME]` table. Omission or `null` selects the
+default `[publish]` profile.
 A denying response is:
 
 ```json
@@ -121,7 +122,7 @@ CloudEvents IDs identify occurrences across restarts.
 
 ## HMAC signing
 
-Each hook can configure `signing_secret` or `signing_secret_file`, but not both.
+Each hook can configure `signing_secret` as a string, `"${VAR}"`, or `{ file = "/path" }`.
 The value is `whsec_` followed by base64 encoding of at least 32 random bytes.
 Mounted secret files use the existing text-secret rules. Keys load at startup
 and remain redacted in debug output and configuration errors.
@@ -130,7 +131,7 @@ and remain redacted in debug output and configuration errors.
 [hook.automation]
 url = "https://automation.example.internal/rushls"
 events = ["session.started", "session.ended"]
-signing_secret_file = "/run/secrets/rushls-webhook-signing"
+signing_secret = { file = "/run/secrets/rushls-webhook-signing" }
 ```
 
 Signing follows the symmetric

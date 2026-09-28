@@ -3,15 +3,15 @@
 Rushls offers two input modes. Strict mode is the default.
 
 ```toml
-[accept]
+[publish]
 strict = true # false enables bounded gap recovery
 ```
 
-Use `--accept-strict=true` or `RUSHLS_ACCEPT_STRICT=true` to override the file.
-Named `[accept.policy.NAME]` tables accept `strict`. Each named policy defaults independently to strict = true.
+Use `--publish-strict=true` or `RUSHLS_PUBLISH_STRICT=true` to override the file.
+Named `[publish.profile.NAME]` tables accept `strict`. Each named profile defaults independently to strict = true.
 Strict mode also rejects dependent segment starts before publication.
-When every configured policy is strict, manifests advertise `EXT-X-INDEPENDENT-SEGMENTS`.
-With a permissive policy configured, they omit that global promise across reconnects.
+When every configured profile is strict, manifests advertise `EXT-X-INDEPENDENT-SEGMENTS`.
+With a permissive profile configured, they omit that global promise across reconnects.
 
 Recovery limits are internal.
 
@@ -87,8 +87,8 @@ See [timestamp failures](timestamp-failures.md) for retention and rejection repo
 
 ## Playback compatibility
 
-Permissive GAP handling is available through `accept.strict = false`.
-If a permissive policy is configured, playlists omit blanket segment-independence claims because resumed media can depend on earlier media.
+Permissive GAP handling is available through `publish.strict = false`.
+If a permissive profile is configured, playlists omit blanket segment-independence claims because resumed media can depend on earlier media.
 Part independence flags still describe individual parts.
 Omitting the playlist tag departs from Apple’s video-playlist authoring requirement. The validator report retains this explicit exception.
 
