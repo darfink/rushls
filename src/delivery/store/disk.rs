@@ -300,7 +300,7 @@ impl DiskTier {
     }
 
     pub fn spill_pending(&self) -> usize {
-        self.shared.pending.load(Ordering::Relaxed)
+        self.shared.pending.load(Ordering::Acquire)
     }
 
     pub fn spills_failed(&self) -> u64 {
@@ -316,8 +316,8 @@ impl DiskTier {
         match jobs.try_send(job) {
             Ok(()) => true,
             Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
-                self.shared.pending.fetch_sub(1, Ordering::Relaxed);
                 self.shared.note_finished(&job.stream, job.epoch);
+                self.shared.pending.fetch_sub(1, Ordering::Relaxed);
                 drop(job);
                 false
             }
@@ -432,8 +432,10 @@ fn spill_loop(shared: &DiskShared, rx: &Receiver<SpillJob>) {
                 }
             }
         }
-        shared.pending.fetch_sub(1, Ordering::Relaxed);
         shared.note_finished(&job.stream, job.epoch);
+        // Only after any deferred epoch reap: a zero count must mean every
+        // effect of the job, including removing a retired epoch, is done.
+        shared.pending.fetch_sub(1, Ordering::Release);
         // Release payload references before admitting more publisher bytes.
         drop(job);
         if let Some(live) = live {
