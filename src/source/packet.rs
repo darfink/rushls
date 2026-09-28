@@ -44,6 +44,21 @@ pub struct Packet {
 }
 
 impl Packet {
+    /// Charge once before this packet enters discovery or a live queue.
+    pub fn account(
+        &mut self,
+        budget: Option<&crate::domain::PipelineBudget>,
+    ) -> Result<(), SourceError> {
+        if let Some(budget) = budget {
+            self.payload.account(
+                budget,
+                std::mem::size_of::<Self>().saturating_add(self.webvtt.retained_bytes()),
+                "demux",
+            )?;
+        }
+        Ok(())
+    }
+
     /// Encoded bytes retained by this packet, including packet side data that
     /// was promoted into the domain model.
     pub fn retained_payload_bytes(&self) -> usize {
@@ -115,6 +130,8 @@ pub enum DiscoveryProblem {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum SourceError {
+    #[error(transparent)]
+    Memory(#[from] crate::domain::BudgetExceeded),
     #[error("failed to open input: {0}")]
     Open(Box<str>),
     #[error("stream discovery failed: {0}")]

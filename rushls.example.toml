@@ -193,11 +193,18 @@ listen = "127.0.0.1:8080"             # local example; default: 0.0.0.0:8080
 # streams           = 1024                  # live, plus those still held by retain; when full, a new stream is refused
 # memory_per_stream = "512MiB"             # retained media and cached manifests
                                          # excludes in-flight overhead and the minimum live-window exception
-                                         # plus a fixed per-publisher pipeline cost while ingesting
+                                         # plus the shared publisher pipeline budget while ingesting
 # Pipeline capacity is reported as rushls_session_pipeline_capacity_bytes.
 # disk_per_stream = "8GiB"               # older media spills here; omit to stay in memory
                                          # disk-backed: 1/8 RAM for manifests; media spills at 81.25% down to 75%
 # dir             = "/var/lib/rushls"    # optional; default is the platform cache (.../rushls/dvr)
+
+# [pipeline]
+# memory_per_publisher = "128MiB"          # shared accounted memory; minimum 64MiB
+# Stages borrow from one budget. The limit includes temporary mux copies.
+# Up to 16MiB inside the total is protected for temporary serialization work.
+# Native MPEG-TS/QUIC buffers and allocation overhead remain outside this limit.
+# Current and peak usage: rushls_session_pipeline_{used,peak}_bytes.
 
 # Recording is disabled by default; /archive is an example destination.
 # Write a copy of every segment to a filesystem. Outlives the stream and is

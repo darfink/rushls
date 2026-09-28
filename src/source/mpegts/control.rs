@@ -8,14 +8,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const NOT_PROBING: usize = usize::MAX;
 
 pub struct Control {
+    pub budget: Option<crate::domain::PipelineBudget>,
     cancelled: AtomicBool,
     probe_remaining: AtomicUsize,
     probe_exceeded: AtomicBool,
 }
 
 impl Control {
-    pub fn new() -> Self {
+    pub fn with_budget(budget: Option<crate::domain::PipelineBudget>) -> Self {
         Self {
+            budget,
             cancelled: AtomicBool::new(false),
             probe_remaining: AtomicUsize::new(NOT_PROBING),
             probe_exceeded: AtomicBool::new(false),

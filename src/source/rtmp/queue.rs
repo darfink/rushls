@@ -70,7 +70,7 @@ struct State {
 }
 
 struct Shared {
-    capacity: usize,
+    capacity: std::sync::atomic::AtomicUsize,
     state: Mutex<State>,
     readable: Notify,
     writable: Notify,
@@ -86,7 +86,7 @@ pub struct IngressWriter {
 
 pub fn channel(capacity: NonZeroUsize) -> (IngressReader, IngressWriter) {
     let shared = Arc::new(Shared {
-        capacity: capacity.get(),
+        capacity: std::sync::atomic::AtomicUsize::new(capacity.get()),
         state: Mutex::new(State {
             events: VecDeque::new(),
             queued_bytes: 0,
@@ -128,11 +128,12 @@ impl Drop for IngressWriter {
 impl IngressWriter {
     pub async fn send(&self, event: IngressEvent) -> Result<(), IngressSendError> {
         let required = event.queued_bytes();
-        if required > self.shared.capacity {
-            return Err(IngressSendError::TooLarge {
-                required,
-                capacity: self.shared.capacity,
-            });
+        let capacity = self
+            .shared
+            .capacity
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if required > capacity {
+            return Err(IngressSendError::TooLarge { required, capacity });
         }
         loop {
             let notified = self.shared.writable.notified();
@@ -147,9 +148,7 @@ impl IngressWriter {
                     return Err(IngressSendError::Terminal);
                 }
                 // A byte limit alone permits unbounded empty/tiny script tags.
-                if state.events.len() < 4_096
-                    && state.queued_bytes <= self.shared.capacity - required
-                {
+                if state.events.len() < 4_096 && state.queued_bytes <= capacity - required {
                     state.queued_bytes += required;
                     state.events.push_back(event);
                     self.shared.readable.notify_one();
@@ -180,6 +179,12 @@ impl IngressWriter {
 }
 
 impl IngressReader {
+    pub fn use_shared_budget(&self, budget: &crate::domain::PipelineBudget) {
+        self.shared
+            .capacity
+            .store(budget.limit(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub async fn recv(&mut self) -> IngressEvent {
         loop {
             let notified = self.shared.readable.notified();

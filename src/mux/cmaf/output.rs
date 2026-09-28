@@ -26,6 +26,8 @@ use crate::{
 const TRACK_ID: u32 = 1;
 
 pub(super) struct CmafOutput {
+    budget: Option<crate::domain::PipelineBudget>,
+    init_bound: usize,
     spec: TrackSpec,
     codec: Codec,
     nal_length_bytes: usize,
@@ -52,6 +54,12 @@ impl CmafOutput {
         let timescale = media_timescale(track.timebase)?;
         let config = codec_config(track)?;
         Ok(Self {
+            budget: track.codec_extradata.budget().cloned(),
+            init_bound: track
+                .codec_extradata
+                .len()
+                .saturating_mul(8)
+                .saturating_add(64 * 1024),
             nal_length_bytes: match &config {
                 CodecConfig::Avc { config, .. } => {
                     usize::from(config.config.length_size_minus_one + 1)
@@ -83,6 +91,9 @@ impl CmafOutput {
         pts: TickTimestamp,
         dts: TickTimestamp,
     ) {
+        if self.budget.is_none() {
+            self.budget = sample_payload(sample).budget().cloned();
+        }
         if self.first_decode.is_none() {
             self.first_decode = Some(dts);
             self.first_pts = Some(pts);
@@ -139,6 +150,20 @@ impl CmafOutput {
     }
 
     fn build_init(&self) -> Result<Payload, Box<str>> {
+        let mut charge = self
+            .budget
+            .as_ref()
+            .map(|budget| budget.try_reserve(self.init_bound, "mux output"))
+            .transpose()
+            .map_err(mux)?;
+        let _scratch = self
+            .budget
+            .as_ref()
+            .map(|budget| {
+                budget.try_reserve_working(self.init_bound.saturating_mul(2), "CMAF serialization")
+            })
+            .transpose()
+            .map_err(mux)?;
         let init = build_init_segment(std::slice::from_ref(&self.spec), self.spec.timescale)
             .map_err(mux)?;
         let elst = edit_list(
@@ -146,18 +171,54 @@ impl CmafOutput {
             self.first_decode.unwrap_or(0),
             self.first_pts.unwrap_or(0),
         );
-        Ok(Payload::from_bytes(with_cmaf_init(
-            &init,
-            elst,
-            self.roll.is_some(),
-            &self.video,
-        )?))
+        let bytes = with_cmaf_init(&init, elst, self.roll.is_some(), &self.video)?;
+        if bytes.capacity() > self.init_bound {
+            return Err("CMAF initialization exceeded its reserved bound".into());
+        }
+        Ok(match charge.as_mut() {
+            Some(charge) => {
+                let retained = charge.split(bytes.capacity());
+                Payload::reserved(bytes, retained)
+            }
+            None => Payload::from_bytes(bytes),
+        })
     }
 
     fn build_media(&mut self) -> Result<Payload, Box<str>> {
         if self.pending.is_empty() {
             return Ok(Payload::default());
         }
+        // One-run-per-sample is the worst case for box headers. The allowance
+        // also covers Opus sample groups. Reserve temporary mdat/run copies
+        // separately so they can use working headroom without escaping into
+        // long-lived output buffers.
+        let payload_bytes = self
+            .pending
+            .iter()
+            .try_fold(0_usize, |total, sample| {
+                total.checked_add(sample.data.len())
+            })
+            .ok_or_else(|| Box::<str>::from("CMAF allocation size overflow"))?;
+        let output_bound = payload_bytes
+            .checked_add(self.pending.len().saturating_mul(256))
+            .and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(|| Box::<str>::from("CMAF allocation size overflow"))?;
+        let mut output_charge = self
+            .budget
+            .as_ref()
+            .map(|budget| budget.try_reserve(output_bound, "mux output"))
+            .transpose()
+            .map_err(mux)?;
+        let scratch_bound = payload_bytes
+            .saturating_mul(3)
+            .saturating_add(self.pending.len().saturating_mul(512))
+            .saturating_add(4096);
+        let _scratch = self
+            .budget
+            .as_ref()
+            .map(|budget| budget.try_reserve_working(scratch_bound, "CMAF serialization"))
+            .transpose()
+            .map_err(mux)?;
         let origin = self.first_decode.unwrap_or(0);
         let mut samples = Vec::with_capacity(self.pending.len());
         for pending in self.pending.drain(..) {
@@ -180,7 +241,7 @@ impl CmafOutput {
             ));
         }
         let video = matches!(self.codec, Codec::H264 | Codec::Hevc | Codec::Av1);
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(output_bound);
         let mut start = 0;
         for end in 1..=samples.len() {
             if end < samples.len() && !(video && samples[end].flags.is_sync) {
@@ -188,10 +249,24 @@ impl CmafOutput {
             }
             // Each keyframe gets its own moof, so trick play can fetch it
             // without preceding dependent frames. Parts retain their cadence.
-            bytes.extend_from_slice(&self.build_run(&samples[start..end])?);
+            let run = self.build_run(&samples[start..end])?;
+            if run.len() > output_bound.saturating_sub(bytes.len()) {
+                return Err("CMAF serialization exceeded its reserved bound".into());
+            }
+            bytes.extend_from_slice(&run);
             start = end;
         }
-        Ok(Payload::from_bytes(bytes))
+        // The conservative construction bound must not become permanent
+        // padding in every stored part. Scratch is still reserved during the
+        // possible reallocating shrink.
+        bytes.shrink_to_fit();
+        Ok(match output_charge.as_mut() {
+            Some(charge) => {
+                let retained = charge.split(bytes.capacity());
+                Payload::reserved(bytes, retained)
+            }
+            None => Payload::from_bytes(bytes),
+        })
     }
 
     fn build_run(&mut self, samples: &[Sample]) -> Result<Vec<u8>, Box<str>> {
@@ -570,6 +645,8 @@ mod tests {
             .build();
         let mut output =
             CmafOutput::open(&track).map_err(|error| std::io::Error::other(error.to_string()))?;
+        let budget = crate::domain::PipelineBudget::with_working_allowance(1024 * 1024, 256 * 1024);
+        output.budget = Some(budget.clone());
         output.first_decode = Some(100);
         for index in 0..6 {
             output.pending.push(PendingSample {
@@ -610,6 +687,45 @@ mod tests {
         }
         assert_eq!(times, [0, 2, 4]);
         assert_eq!(output.sequence, 4);
+        assert_eq!(budget.working(), 0, "serialization scratch does not escape");
+        assert!(budget.used() >= payload.len());
+        let stored = payload.into_retained();
+        assert_eq!(budget.used(), 0);
+        assert!(!stored.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn output_exhaustion_preserves_input_until_cleanup() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            domain::{MediaKind, PipelineBudget, fixtures::TrackBuilder},
+            mux::fixtures::{H264_EXTRADATA, H264_IDR},
+        };
+        let budget = PipelineBudget::new(4096);
+        let track = TrackBuilder::new(0, MediaKind::Video)
+            .codec_extradata(H264_EXTRADATA.to_vec())
+            .build();
+        let mut output =
+            CmafOutput::open(&track).map_err(|error| std::io::Error::other(error.to_string()))?;
+        output.budget = Some(budget.clone());
+        let mut sample = Payload::from(H264_IDR.to_vec());
+        sample.account(&budget, 0, "demux")?;
+        output.pending.push(PendingSample {
+            dts: 0,
+            pts: 0,
+            duration: 3000,
+            random_access: true,
+            data: sample.into_bytes(),
+        });
+        let error = output
+            .build_media()
+            .expect_err("output reservation must fail before serialization");
+        assert!(error.contains("pipeline memory exhausted"));
+        assert_eq!(output.pending.len(), 1);
+        assert_eq!(budget.used(), H264_IDR.len());
+        assert_eq!(budget.working(), 0);
+        drop(output);
+        assert_eq!(budget.used(), 0);
         Ok(())
     }
 

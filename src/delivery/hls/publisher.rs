@@ -225,7 +225,7 @@ impl StorePublisher {
             PackagedMedia::Segment(segment) => &segment.payload,
             PackagedMedia::SegmentCompleted(_) | PackagedMedia::Gap(_) => return None,
         };
-        Some(Payload::from_bytes(gzip(payload.bytes())))
+        Some(Payload::from_bytes(gzip(&payload.bytes())))
     }
 }
 
@@ -244,7 +244,7 @@ impl HlsPublisher for StorePublisher {
 
     fn write(&mut self, media: PackagedMedia) -> Result<PublishOutcome, HlsError> {
         let gzip = self.encoding(&media);
-        if self.lease.write_encoded(media, gzip)? {
+        if self.lease.write_encoded(media.into_retained(), gzip)? {
             // The store commit has released its mutation lock by here.
             // Emitting inline gives this transition causal order with the
             // later `session.ended` emitted by the same session task.

@@ -2542,3 +2542,28 @@ fn fixture_paths_escape_windows_separators_and_quotes() -> Result<(), Box<dyn Er
     assert_eq!(document["path"].as_str(), path.to_str());
     Ok(())
 }
+
+#[test]
+fn pipeline_memory_has_independent_configuration_and_precedence() -> Result<(), Box<dyn Error>> {
+    let defaults = resolve_toml("")??;
+    assert_eq!(
+        defaults.node.session.memory_per_publisher,
+        128 * 1024 * 1024
+    );
+    let configured = resolve_with(
+        "[pipeline]\nmemory_per_publisher = '192MiB'\n",
+        &["--pipeline-memory-per-publisher", "320MiB"],
+        &[("RUSHLS_PIPELINE_MEMORY_PER_PUBLISHER", "256MiB")],
+    )??;
+    assert_eq!(
+        configured.node.session.memory_per_publisher,
+        320 * 1024 * 1024
+    );
+    assert_eq!(
+        configured.node.store.retention.maximum_payload_bytes,
+        defaults.node.store.retention.maximum_payload_bytes
+    );
+    assert!(resolve_toml("[pipeline]\nmemory_per_publisher = '32MiB'\n")?.is_err());
+    assert!(resolve_toml("[pipeline]\nmemory_per_publisher = '0'\n")?.is_err());
+    Ok(())
+}

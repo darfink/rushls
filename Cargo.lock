@@ -377,79 +377,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rushls-config"
-version = "0.1.0"
-dependencies = [
- "bytesize",
- "conf",
- "directories",
- "humantime",
- "serde",
- "tempfile",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "rushls-hooks"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "bytes",
- "rushls-outbound",
- "derive_more",
- "http",
- "parking_lot",
- "ring",
- "serde",
- "serde_json",
- "thiserror",
- "time",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "rushls-metrics"
-version = "0.1.0"
-dependencies = [
- "subtle",
-]
-
-[[package]]
-name = "rushls-outbound"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bytes",
- "derive_more",
- "http",
- "http-body-util",
- "hyper-rustls",
- "hyper-util",
- "rustls",
- "rustls-native-certs",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "rushls-tls"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "axum",
- "notify",
- "notify-debouncer-full",
- "rcgen",
- "rustls",
- "thiserror",
- "tokio",
- "tokio-rustls",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2364,11 +2291,6 @@ dependencies = [
  "bytesize",
  "cap-fs-ext",
  "cap-std",
- "rushls-config",
- "rushls-hooks",
- "rushls-metrics",
- "rushls-outbound",
- "rushls-tls",
  "chrono",
  "conf",
  "derive_more",
@@ -2396,6 +2318,11 @@ dependencies = [
  "ring",
  "rsrt",
  "rtmpx",
+ "rushls-config",
+ "rushls-hooks",
+ "rushls-metrics",
+ "rushls-outbound",
+ "rushls-tls",
  "rustls",
  "scuffle-av1",
  "scuffle-h265",
@@ -2415,6 +2342,79 @@ dependencies = [
  "urlencoding",
  "uuid",
  "web-transport-quinn",
+]
+
+[[package]]
+name = "rushls-config"
+version = "0.1.0"
+dependencies = [
+ "bytesize",
+ "conf",
+ "directories",
+ "humantime",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "rushls-hooks"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "derive_more",
+ "http",
+ "parking_lot",
+ "ring",
+ "rushls-outbound",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "rushls-metrics"
+version = "0.1.0"
+dependencies = [
+ "subtle",
+]
+
+[[package]]
+name = "rushls-outbound"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "derive_more",
+ "http",
+ "http-body-util",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "rustls-native-certs",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "rushls-tls"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "axum",
+ "notify",
+ "notify-debouncer-full",
+ "rcgen",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

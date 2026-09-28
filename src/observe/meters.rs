@@ -16,6 +16,10 @@ use super::counters::{counters, series};
 /// while it drains a socket read and calls this once, so the atomic traffic is
 /// per batch rather than per packet.
 pub trait SourceMeters: Send + Sync {
+    fn pipeline_budget(&self) -> Option<&crate::domain::PipelineBudget> {
+        None
+    }
+
     fn source_progress(&self, bytes: u64, packets: u64);
 
     /// Reported when the input changes codec parameters mid-stream.
@@ -29,6 +33,10 @@ pub trait SourceMeters: Send + Sync {
 
 /// Volume produced by normalization.
 pub trait MediaMeters: Send + Sync {
+    fn pipeline_budget(&self) -> Option<&crate::domain::PipelineBudget> {
+        None
+    }
+
     fn video_interval(&self, _observation: crate::domain::VideoTimestampObservation) {}
     fn compensation(&self, _notice: &crate::domain::NormalizationNotice) {}
     fn track_input(&self, _id: crate::domain::TrackId, _bytes: usize) {}
@@ -85,6 +93,10 @@ counters! {
         part_contract_failures: u64 = Counter("rushls_part_contract_failures_total", "Publications rejected by the part contract."),
         boundary_contract_failures: u64 = Counter("rushls_boundary_contract_failures_total", "Publications rejected by segment boundary constraints."),
         coordinator_limit_failures: u64 = Counter("rushls_coordinator_limit_failures_total", "Publications exceeding coordinator resource limits."),
+        pipeline_exhaustions: u64 = Counter(
+            "rushls_pipeline_exhaustions_total",
+            "Failed memory reservations reported by completed or failed publishing sessions."
+        ),
         sessions_failed: u64 = Counter(
             "rushls_sessions_failed_total",
             "Publishing sessions that failed."
@@ -227,6 +239,10 @@ impl ProcessMeters {
         }
     }
 
+    pub fn pipeline_exhaustions(&self, count: u64) {
+        add(&self.counters.pipeline_exhaustions, count);
+    }
+
     pub fn session_failed(&self) {
         add(&self.counters.sessions_failed, 1);
     }
@@ -292,6 +308,7 @@ pub struct SessionMeters {
 
 #[derive(Debug)]
 struct SessionCounters {
+    budget: crate::domain::PipelineBudget,
     /// Uses the runtime clock so liveness can be exercised deterministically
     /// rather than by sleeping in tests.
     started_at: Instant,
@@ -333,9 +350,14 @@ pub struct MeterSnapshot {
     pub media_lead: Duration,
     pub pacing_delay: Duration,
     pub publisher_backpressured: bool,
-    /// The per-publisher pipeline ceiling, so worst-case node memory is
-    /// computable from what is scraped rather than from the documentation.
+    /// Configured accounted-allocation limit, excluding uninstrumented native
+    /// buffers and process overhead. This is not an RSS ceiling.
     pub pipeline_bytes: u64,
+    pub pipeline_used_bytes: u64,
+    pub pipeline_peak_bytes: u64,
+    pub pipeline_failures: u64,
+    pub pipeline_working_bytes: u64,
+    pub pipeline_origins: [u64; 5],
 }
 
 // Declared apart from the storage above because the storage is not a plain
@@ -390,13 +412,29 @@ series! {
             "Bytes one publisher may hold before the store, which \
              `memory_per_stream` does not cover.")
             = |snapshot: &MeterSnapshot| snapshot.pipeline_bytes,
+        Gauge("rushls_session_pipeline_used_bytes", "Current accounted pipeline bytes.")
+            = |snapshot: &MeterSnapshot| snapshot.pipeline_used_bytes,
+        Gauge("rushls_session_pipeline_peak_bytes", "Peak accounted pipeline bytes.")
+            = |snapshot: &MeterSnapshot| snapshot.pipeline_peak_bytes,
+        Gauge("rushls_session_pipeline_working_bytes", "Current temporary serialization reservations within the pipeline total.")
+            = |snapshot: &MeterSnapshot| snapshot.pipeline_working_bytes,
+        Counter("rushls_session_pipeline_exhaustions_total", "Failed pipeline memory reservations.")
+            = |snapshot: &MeterSnapshot| snapshot.pipeline_failures,
     }
 }
 
 impl SessionMeters {
     pub fn new(process: ProcessMeters) -> Self {
+        Self::with_budget(
+            process,
+            crate::domain::PipelineBudget::new(crate::domain::PipelineBudget::DEFAULT_LIMIT),
+        )
+    }
+
+    pub fn with_budget(process: ProcessMeters, budget: crate::domain::PipelineBudget) -> Self {
         Self {
             counters: Arc::new(SessionCounters {
+                budget,
                 started_at: Instant::now(),
                 process,
                 bytes_received: AtomicU64::new(0),
@@ -468,7 +506,12 @@ impl SessionMeters {
             media_lead: Duration::from_nanos(get(&counters.media_lead_nanos)),
             pacing_delay: Duration::from_nanos(get(&counters.pacing_delay_nanos)),
             publisher_backpressured: counters.publisher_backpressured.load(Ordering::Relaxed),
-            pipeline_bytes: crate::source::PipelineMemory::TOTAL as u64,
+            pipeline_bytes: counters.budget.limit() as u64,
+            pipeline_used_bytes: counters.budget.used() as u64,
+            pipeline_peak_bytes: counters.budget.peak() as u64,
+            pipeline_failures: counters.budget.failures() as u64,
+            pipeline_working_bytes: counters.budget.working() as u64,
+            pipeline_origins: counters.budget.origins(),
         }
     }
 
@@ -562,6 +605,10 @@ impl SessionCounters {
 }
 
 impl SourceMeters for SessionCounters {
+    fn pipeline_budget(&self) -> Option<&crate::domain::PipelineBudget> {
+        Some(&self.budget)
+    }
+
     fn source_progress(&self, bytes: u64, packets: u64) {
         add(&self.bytes_received, bytes);
         add(&self.packets_received, packets);
@@ -578,6 +625,10 @@ impl SourceMeters for SessionCounters {
 }
 
 impl MediaMeters for SessionCounters {
+    fn pipeline_budget(&self) -> Option<&crate::domain::PipelineBudget> {
+        Some(&self.budget)
+    }
+
     fn video_interval(&self, observation: crate::domain::VideoTimestampObservation) {
         self.process
             .video_intervals

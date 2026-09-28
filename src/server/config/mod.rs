@@ -148,6 +148,8 @@ pub struct AppConfig {
     #[conf(flatten, prefix)]
     pub capacity: CapacityAppConfig,
     #[conf(flatten, prefix)]
+    pub pipeline: PipelineAppConfig,
+    #[conf(flatten, prefix)]
     pub http: HttpAppConfig,
     #[conf(flatten, prefix)]
     pub metrics: MetricsAppConfig,
@@ -307,6 +309,7 @@ impl AppConfig {
         // duration, which only `hls.apply` establishes.
         apply_stall(&mut node, stall, self.hls.segment_duration())?;
         self.capacity.apply(&mut node)?;
+        self.pipeline.apply(&mut node)?;
         node.hls.uri_base = UriBase::new(self.http.public_url.clone());
         node.http = self.http.resolve()?;
         node.https_address = node.http.tls_address;
@@ -1038,6 +1041,33 @@ impl AcceptAppConfig {
     }
 }
 
+/// Shared publisher buffering, independent of retained media storage.
+#[derive(Conf)]
+#[conf(serde)]
+pub struct PipelineAppConfig {
+    /// Accounted pipeline memory shared by one publisher's stages.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "128MiB",
+        serde(use_value_parser)
+    )]
+    memory_per_publisher: ByteSize,
+}
+impl PipelineAppConfig {
+    fn apply(&self, node: &mut NodeConfig) -> Result<(), ConfigError> {
+        let bytes = nonzero_bytes("pipeline.memory_per_publisher", self.memory_per_publisher)?;
+        if bytes < crate::domain::PipelineBudget::MIN_LIMIT {
+            return Err(invalid(
+                "pipeline.memory_per_publisher must be at least 64MiB to fit a maximum-sized packet and serialization copies",
+            ));
+        }
+        node.session.memory_per_publisher = bytes;
+        Ok(())
+    }
+}
+
 #[derive(Conf)]
 #[conf(serde)]
 pub struct CapacityAppConfig {
@@ -1053,8 +1083,8 @@ pub struct CapacityAppConfig {
     streams: usize,
     /// Retained media and cached manifests for one stream.
     ///
-    /// Disk-backed streams reserve one eighth for manifests. A publisher holds a fixed pipeline
-    /// cost while ingesting, reported as `rushls_session_pipeline_capacity_bytes`.
+    /// Disk-backed streams reserve one eighth for manifests. Active publishers
+    /// also use the separate shared pipeline memory budget.
     #[conf(
         parameter,
         long,

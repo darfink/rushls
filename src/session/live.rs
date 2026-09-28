@@ -190,7 +190,8 @@ impl SampleSource for MediaHead {
                 BatchUnit::Samples,
                 self.limits.maximum_samples_per_batch,
             );
-            for packet in self.packets.drain(..) {
+            for mut packet in self.packets.drain(..) {
+                packet.account(self.meters.pipeline_budget())?;
                 self.meters
                     .track_input(packet.track_id, packet.retained_payload_bytes());
                 // Inspected before normalization, while the access unit is
@@ -225,7 +226,10 @@ impl SampleSource for MediaHead {
                 .count();
             self.density
                 .admit(consumed.packets as u64, &self.normalized)?;
-            for sample in self.normalized.drain(..) {
+            for mut sample in self.normalized.drain(..) {
+                sample
+                    .account(self.meters.pipeline_budget())
+                    .map_err(crate::source::SourceError::from)?;
                 if !matches!(sample, NormalizedMedia::Gap(_)) {
                     self.meters.track_normalized(
                         sample.track_id(),

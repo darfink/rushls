@@ -8,10 +8,12 @@ use std::{future::Future, pin::Pin};
 
 pub mod aac;
 mod appender;
+mod budget;
 mod ids;
 mod instant;
 mod language;
 mod payload;
+pub use budget::{BudgetExceeded, PipelineBudget, Reservation};
 mod publisher;
 pub use publisher::{ClientInfo, IngestProtocol, PublishResource, PublisherContext};
 mod rfc6381;

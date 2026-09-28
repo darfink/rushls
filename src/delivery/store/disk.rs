@@ -105,7 +105,7 @@ impl HeldBytes {
         }
     }
 
-    pub fn bytes(&self) -> Option<&bytes::Bytes> {
+    pub fn bytes(&self) -> Option<bytes::Bytes> {
         match self {
             Self::Memory(payload) => Some(payload.bytes()),
             Self::Disk(_) => None,

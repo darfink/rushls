@@ -52,6 +52,9 @@ impl RtmpPacketSource {
         meters: Arc<dyn SourceMeters>,
     ) -> Result<Self, SourceError> {
         limits.validate()?;
+        if let Some(budget) = meters.pipeline_budget() {
+            ingress.use_shared_budget(budget);
+        }
         Ok(Self {
             ingress: Some(ingress),
             limits,
@@ -90,6 +93,7 @@ impl PacketSource for RtmpPacketSource {
 
             let deadline = Instant::now() + limits.maximum_wall_time;
             let mut builder = CatalogBuilder::new();
+            builder.budget = self.meters.pipeline_budget().cloned();
             let mut probed = 0_usize;
 
             loop {
@@ -209,6 +213,9 @@ impl PacketSource for RtmpPacketSource {
                         }
                         Some(event) => {
                             let mut mapped = live_packets(event, &self.tracks, self.limits)?;
+                            for packet in &mut mapped {
+                                packet.account(self.meters.pipeline_budget())?;
+                            }
                             let Some(packet) = mapped.pop_front() else {
                                 continue;
                             };
@@ -285,6 +292,7 @@ enum Observe {
 }
 
 struct CatalogBuilder {
+    budget: Option<crate::domain::PipelineBudget>,
     /// Discovery order is HLS rendition order; the first of each kind is DEFAULT.
     tracks: Vec<DiscoveredTrack>,
     text: Option<DiscoveredTrack>,
@@ -301,6 +309,7 @@ struct CatalogBuilder {
 impl CatalogBuilder {
     fn new() -> Self {
         Self {
+            budget: None,
             tracks: Vec::new(),
             text: None,
             next_id: 0,
@@ -367,12 +376,14 @@ impl CatalogBuilder {
         if track.first_pts.is_none() {
             track.first_pts = Some(i64::from(timestamp));
         }
-        self.prefetch.push_back(map::text_packet(
+        let mut packet = map::text_packet(
             track.id,
             timestamp,
             text,
             limits.maximum_payload_bytes_per_packet,
-        )?);
+        )?;
+        packet.account(self.budget.as_ref())?;
+        self.prefetch.push_back(packet);
         Ok(Observe::Continue)
     }
 
@@ -423,7 +434,8 @@ impl CatalogBuilder {
                         )
                     })?;
                 let packets = map::packets(track, timestamp, sample, limits)?;
-                for packet in packets {
+                for mut packet in packets {
+                    packet.account(self.budget.as_ref())?;
                     crate::source::record_first_pts(track, &packet)?;
                     self.prefetch.push_back(packet);
                 }

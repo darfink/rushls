@@ -143,7 +143,13 @@ pub async fn run_session(
     config: &SessionConfig,
     slot: PendingPermit,
 ) -> Result<SessionOutcome, SessionError> {
-    let meters = SessionMeters::new(services.meters.clone());
+    let meters = SessionMeters::with_budget(
+        services.meters.clone(),
+        crate::domain::PipelineBudget::with_working_allowance(
+            config.memory_per_publisher,
+            (config.memory_per_publisher / 4).min(16 * 1024 * 1024),
+        ),
+    );
     // Admission is bounded from out here rather than inside, because the thing
     // being guarded against is a peer that never finishes its handshake, and
     // nothing on the far side of that handshake is running yet to notice.
@@ -310,7 +316,13 @@ async fn pipeline(
         PrerollRequest {
             presentation: &presentation,
             timeline: &timeline,
-            limits: config.preroll,
+            limits: crate::segment::PrerollLimits {
+                maximum_buffered_bytes: config
+                    .preroll
+                    .maximum_buffered_bytes
+                    .min(config.memory_per_publisher),
+                ..config.preroll
+            },
             policy: config.segmentation,
         },
         context.events(),
@@ -453,6 +465,9 @@ fn report(
     services: &Services,
     result: &Result<SessionOutcome, SessionError>,
 ) {
+    services
+        .meters
+        .pipeline_exhaustions(context.meters().snapshot().pipeline_failures);
     match result {
         Ok(outcome) => {
             services.meters.session_completed();

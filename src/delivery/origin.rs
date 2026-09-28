@@ -116,7 +116,7 @@ impl Origin {
                     .ok_or(DeliveryError::UnknownResource)?;
                 MediaObject {
                     body: MediaBody::single(held.payload.clone()),
-                    gzip: held.gzip.as_ref().map(Payload::bytes).cloned(),
+                    gzip: held.gzip.as_ref().map(Payload::bytes),
                     contract,
                 }
             }

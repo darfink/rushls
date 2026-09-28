@@ -601,6 +601,7 @@ fn scripted_batches() -> Vec<Vec<Packet>> {
 
 fn config() -> SessionConfig {
     SessionConfig {
+        memory_per_publisher: crate::domain::PipelineBudget::DEFAULT_LIMIT,
         maximum_admission_time: Duration::from_secs(5),
         discovery: DiscoveryLimits {
             maximum_probe_bytes: 1_048_576,
@@ -2319,5 +2320,26 @@ async fn video_gap_notices_survive_later_batch_failure_in_preroll_and_live()
             if live { 2 } else { 0 }
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn exhausted_publisher_memory_fails_without_waiting_for_another_keyframe()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = Harness::healthy();
+    let mut configuration = config();
+    configuration.memory_per_publisher = 1;
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        harness.run_with(Ending::Eof, &configuration),
+    )
+    .await?;
+    let error = outcome.expect_err("sample cannot fit the shared budget");
+    assert!(
+        error.to_string().contains("pipeline memory exhausted"),
+        "{error}"
+    );
+    assert_eq!(harness.services.meters.snapshot().sessions_failed, 1);
+    assert_eq!(harness.services.meters.snapshot().pipeline_exhaustions, 1);
     Ok(())
 }

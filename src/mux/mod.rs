@@ -128,6 +128,20 @@ pub struct PackagedGap {
 }
 
 impl PackagedMedia {
+    /// Move this output reference from pipeline accounting to storage. Other
+    /// aliases still held by the pipeline retain their reservations.
+    #[must_use]
+    pub fn into_retained(mut self) -> Self {
+        let payload = match &mut self {
+            Self::Initialization(media) => &mut media.payload,
+            Self::Chunk(media) => &mut media.payload,
+            Self::Segment(media) => &mut media.payload,
+            Self::SegmentCompleted(_) | Self::Gap(_) => return self,
+        };
+        *payload = std::mem::take(payload).into_retained();
+        self
+    }
+
     /// Whether publishing this event would expose a dependent segment start.
     pub fn has_dependent_start(&self) -> bool {
         match self {

@@ -169,12 +169,14 @@ impl MoqPacketSource {
                 self.limits.maximum_payload_bytes_per_packet,
             )?;
         }
-        map::packet(
+        let mut packet = map::packet(
             track.id,
             track.codec,
             &frame,
             self.limits.maximum_payload_bytes_per_packet,
-        )
+        )?;
+        packet.account(self.meters.pipeline_budget())?;
+        Ok(packet)
     }
 
     fn check_announcement(&self, path: &str, present: bool) -> Result<(), SourceError> {
@@ -290,12 +292,13 @@ impl PacketSource for MoqPacketSource {
                             )?;
                             inline.configure(track)?;
                         }
-                        let packet = map::packet(
+                        let mut packet = map::packet(
                             track.id,
                             track.codec,
                             &frame,
                             self.limits.maximum_payload_bytes_per_packet,
                         )?;
+                        packet.account(self.meters.pipeline_budget())?;
                         record_first_pts(track, &packet)?;
                         self.prefetch.push_back(packet);
                         if can_freeze(mapped) {

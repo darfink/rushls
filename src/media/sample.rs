@@ -109,6 +109,25 @@ impl NormalizedMedia {
         }
     }
 
+    /// Account for a normalizer-created allocation before downstream retention.
+    /// Payloads forwarded unchanged keep their existing allocation lease.
+    pub fn account(
+        &mut self,
+        budget: Option<&crate::domain::PipelineBudget>,
+    ) -> Result<(), crate::domain::BudgetExceeded> {
+        let Some(budget) = budget else {
+            return Ok(());
+        };
+        let overhead = size_of::<Self>();
+        let payload = match self {
+            Self::Video(sample) => &mut sample.payload,
+            Self::Audio(sample) => &mut sample.payload,
+            Self::Subtitle(sample) => &mut sample.payload,
+            Self::Gap(_) => return Ok(()),
+        };
+        payload.account(budget, overhead, "normalization")
+    }
+
     /// What holding this sample in a buffer actually costs.
     ///
     /// Charging only [`Self::payload_len`] would let an input with empty or

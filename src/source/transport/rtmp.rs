@@ -86,12 +86,8 @@ impl Default for RtmpConfig {
                 session_read: Some(Duration::from_secs(10)),
                 write: Some(Duration::from_secs(10)),
             },
-            maximum_reassembly_bytes: NonZeroUsize::new(crate::source::PipelineMemory::TRANSPORT)
-                .expect("the transport budget is nonzero"),
-            maximum_queued_payload_bytes: NonZeroUsize::new(
-                crate::source::PipelineMemory::DEMUX_QUEUE,
-            )
-            .expect("the demux queue budget is nonzero"),
+            maximum_reassembly_bytes: nz::usize!(16 * 1024 * 1024),
+            maximum_queued_payload_bytes: nz::usize!(16 * 1024 * 1024),
             maximum_message_bytes: nz::usize!(8 * 1024 * 1024),
             input_limits: InputLimits::permissive(),
         }
@@ -153,6 +149,7 @@ impl RtmpPendingPublish {
             publish: Some(publish_tx),
             writer,
             active_stream_id: None,
+            budget: None,
             maximum_message_bytes: config.maximum_message_bytes.get(),
         };
         let mut session = tokio::spawn(async move {
@@ -221,11 +218,12 @@ impl PendingPublish for RtmpPendingPublish {
                 session,
                 ..
             } = *self;
+            let budget = meters.pipeline_budget().cloned();
             let source = RtmpPacketSource::new(ingress, config.input_limits, meters)
                 .map_err(|error| TransportError::Accept(error.to_string().into()))?;
             let (completion_tx, completion_rx) = oneshot::channel();
             decision
-                .send(PublishDecision::Accept(completion_tx))
+                .send(PublishDecision::Accept(completion_tx, budget))
                 .map_err(|_| {
                     TransportError::Accept(
                         "RTMP connection ended before acceptance completed".into(),
@@ -310,7 +308,10 @@ struct PublishAttempt {
 
 #[derive(Debug)]
 enum PublishDecision {
-    Accept(oneshot::Sender<Result<(), Box<str>>>),
+    Accept(
+        oneshot::Sender<Result<(), Box<str>>>,
+        Option<crate::domain::PipelineBudget>,
+    ),
     Reject(PublishRejection, oneshot::Sender<()>),
 }
 
@@ -327,10 +328,39 @@ struct MediaHandler {
     publish: Option<oneshot::Sender<PublishAttempt>>,
     writer: IngressWriter,
     active_stream_id: Option<u32>,
+    budget: Option<crate::domain::PipelineBudget>,
     maximum_message_bytes: usize,
 }
 
 impl MediaHandler {
+    fn coalesce(&self, data: rtmpx::Payload) -> Result<Bytes, Box<str>> {
+        use rtmpx::Segments;
+        if data.segment_count() <= 1 {
+            return self.account(data.into_bytes());
+        }
+        let charge = self
+            .budget
+            .as_ref()
+            .map(|budget| budget.try_reserve(data.len(), "RTMP coalescing"))
+            .transpose()
+            .map_err(|error| error.to_string().into_boxed_str())?;
+        let bytes = data.into_bytes();
+        Ok(match charge {
+            Some(charge) => crate::domain::Payload::reserved_bytes(bytes, charge).into_bytes(),
+            None => bytes,
+        })
+    }
+
+    fn account(&self, bytes: Bytes) -> Result<Bytes, Box<str>> {
+        let mut payload = crate::domain::Payload::from_bytes(bytes);
+        if let Some(budget) = &self.budget {
+            payload
+                .account(budget, std::mem::size_of::<IngressEvent>(), "rtmp ingress")
+                .map_err(|error| error.to_string().into_boxed_str())?;
+        }
+        Ok(payload.into_bytes())
+    }
+
     async fn send(&mut self, event: IngressEvent) -> Result<(), Box<str>> {
         let required = event.queued_bytes();
         if required > self.maximum_message_bytes {
@@ -392,7 +422,8 @@ impl MediaHandler {
             .await
             .map_err(|_| Box::<str>::from("publication admission decision was dropped"))?
         {
-            PublishDecision::Accept(completion) => {
+            PublishDecision::Accept(completion, budget) => {
+                self.budget = budget;
                 self.active_stream_id = Some(stream_id);
                 let _ = completion.send(Ok(()));
                 Ok(PublishOutcome::Accepted)
@@ -512,12 +543,19 @@ where
     let mut session = ServerSession::new(session_config)
         .map_err(|error| format!("could not create RTMP session: {error}").into_boxed_str())?;
     let mut input = Bytes::from(carry);
-    let mut buffer = BytesMut::with_capacity(16 * 1024);
+    let mut buffer = BytesMut::new();
     loop {
         if !process_session_input(&mut io, &mut session, &mut handler, config, &mut input).await? {
             return Ok(false);
         }
-        // Retain the read allocation while the decoder holds incomplete messages.
+        // A leased slab remains charged through decoder and elementary-unit
+        // slices. The parser never needs its own independently sized pool.
+        let read_charge = handler
+            .budget
+            .as_ref()
+            .map(|budget| budget.try_reserve(16 * 1024, "RTMP receive"))
+            .transpose()
+            .map_err(|error| error.to_string().into_boxed_str())?;
         buffer.reserve(16 * 1024);
         let read = async { (&mut io).take(16 * 1024).read_buf(&mut buffer).await };
         let count = match config.timeouts.session_read {
@@ -531,6 +569,11 @@ where
             return Ok(true);
         }
         input = buffer.split().freeze();
+        if let Some(charge) = read_charge {
+            input = crate::domain::Payload::reserved_bytes(input, charge).into_bytes();
+            // Avoid recycling capacity while another slab still owns a view.
+            buffer = BytesMut::with_capacity(0);
+        }
     }
 }
 
@@ -599,8 +642,9 @@ where
                 } => {
                     // The codec pipeline needs contiguous samples. Reuse a single segment,
                     // otherwise coalesce once here; the RTMP decoder itself keeps slices.
-                    let media = ValidatedMedia::parse_audio(data.into_bytes(), ENHANCED_VALIDATION)
-                        .map_err(|error| error.to_string().into_boxed_str())?;
+                    let media =
+                        ValidatedMedia::parse_audio(handler.coalesce(data)?, ENHANCED_VALIDATION)
+                            .map_err(|error| error.to_string().into_boxed_str())?;
                     handler
                         .on_audio(stream_id.get(), timestamp.value, media)
                         .await?;
@@ -611,8 +655,9 @@ where
                     stream_id,
                     ..
                 } => {
-                    let media = ValidatedMedia::parse_video(data.into_bytes(), ENHANCED_VALIDATION)
-                        .map_err(|error| error.to_string().into_boxed_str())?;
+                    let media =
+                        ValidatedMedia::parse_video(handler.coalesce(data)?, ENHANCED_VALIDATION)
+                            .map_err(|error| error.to_string().into_boxed_str())?;
                     handler
                         .on_video(stream_id.get(), timestamp.value, media)
                         .await?;
@@ -634,7 +679,7 @@ where
                             .on_script(
                                 stream_id.get(),
                                 timestamp,
-                                message.into_payload().into_bytes(),
+                                handler.coalesce(message.into_payload())?,
                             )
                             .await?;
                     }
@@ -904,6 +949,7 @@ mod tests {
                 publish: Some(publish),
                 writer,
                 active_stream_id: None,
+                budget: None,
                 maximum_message_bytes,
             },
             attempt,
@@ -928,7 +974,7 @@ mod tests {
         let (completion_tx, completion_rx) = oneshot::channel();
         attempt
             .decision
-            .send(PublishDecision::Accept(completion_tx))
+            .send(PublishDecision::Accept(completion_tx, None))
             .expect("handler still awaits decision");
         completion_rx
             .await
@@ -962,7 +1008,7 @@ mod tests {
         let (completion_tx, _completion_rx) = oneshot::channel();
         attempt
             .decision
-            .send(PublishDecision::Accept(completion_tx))
+            .send(PublishDecision::Accept(completion_tx, None))
             .expect("handler still awaits decision");
         let (_handler, result) = publish.await.expect("handler task did not panic");
         assert!(result.is_ok());

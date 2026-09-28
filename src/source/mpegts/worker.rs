@@ -29,7 +29,7 @@ pub enum WorkerEvent {
 
 pub struct QueuedPacket {
     packet: Packet,
-    _permit: PayloadPermit,
+    _permit: Option<PayloadPermit>,
 }
 
 impl QueuedPacket {
@@ -124,6 +124,19 @@ async fn run(
 ) {
     let mut demux = StreamingTsDemux::new();
     let mut builder = CatalogBuilder::new();
+    builder.budget = control.budget.clone();
+    let _read_charge = match control
+        .budget
+        .as_ref()
+        .map(|budget| budget.try_reserve(config.read_buffer_size.get(), "demux"))
+        .transpose()
+    {
+        Ok(charge) => charge,
+        Err(error) => {
+            let _ = discovery.send(Err(error.into()));
+            return;
+        }
+    };
     let mut buffer = vec![0_u8; config.read_buffer_size.get()];
     let mut seen_prefix = Vec::new();
     let mut io = WorkerIo {
@@ -209,8 +222,12 @@ async fn pump(
     terminal: Option<InputState>,
     output: &mpsc::Sender<WorkerEvent>,
 ) {
-    let budget = PayloadBudget::new(queued_payload_bytes);
-    if !emit_prefetch(io.builder, &budget, output).await {
+    let budget = io
+        .builder
+        .budget
+        .is_none()
+        .then(|| PayloadBudget::new(queued_payload_bytes));
+    if !emit_prefetch(io.builder, budget.as_ref(), output).await {
         return;
     }
     if let Some(state) = terminal {
@@ -223,7 +240,7 @@ async fn pump(
             ReadOutcome::Bytes(bytes) => {
                 io.demux.feed(bytes);
                 if let Err(error) =
-                    emit_live(io.builder, io.demux, input_limits, &budget, output).await
+                    emit_live(io.builder, io.demux, input_limits, budget.as_ref(), output).await
                 {
                     let _ = output.send(WorkerEvent::Error(error)).await;
                     return;
@@ -232,7 +249,7 @@ async fn pump(
             ReadOutcome::End(state) => {
                 io.demux.finish();
                 if let Err(error) =
-                    emit_live(io.builder, io.demux, input_limits, &budget, output).await
+                    emit_live(io.builder, io.demux, input_limits, budget.as_ref(), output).await
                 {
                     let _ = output.send(WorkerEvent::Error(error)).await;
                     return;
@@ -318,6 +335,7 @@ fn discovery_end_error(control: &Control, saw_mpeg_ts: bool) -> SourceError {
 }
 
 struct CatalogBuilder {
+    budget: Option<crate::domain::PipelineBudget>,
     pending: BTreeMap<u32, DiscoveredTrack>,
     av1: BTreeMap<u32, (TrackSpec, Option<bool>)>,
     skipped: BTreeSet<u32>,
@@ -332,6 +350,7 @@ struct CatalogBuilder {
 impl CatalogBuilder {
     fn new() -> Self {
         Self {
+            budget: None,
             pending: BTreeMap::new(),
             av1: BTreeMap::new(),
             skipped: BTreeSet::new(),
@@ -520,18 +539,20 @@ impl CatalogBuilder {
             return Ok(());
         };
         if track.codec == crate::domain::Codec::Opus {
-            self.prefetch.extend(super::opus::packets(
-                track,
-                &sample,
-                limits.maximum_payload_bytes_per_packet,
-            )?);
+            let packets =
+                super::opus::packets(track, &sample, limits.maximum_payload_bytes_per_packet)?;
+            for mut packet in packets {
+                packet.account(self.budget.as_ref())?;
+                self.prefetch.push_back(packet);
+            }
             return self.try_freeze(false);
         }
-        let packet = map::packet(
+        let mut packet = map::packet(
             TrackId(track_id),
             sample,
             limits.maximum_payload_bytes_per_packet,
         )?;
+        packet.account(self.budget.as_ref())?;
         crate::source::record_first_pts(track, &packet)?;
         self.prefetch.push_back(packet);
         self.try_freeze(false)
@@ -582,7 +603,7 @@ impl CatalogBuilder {
 
 async fn emit_prefetch(
     builder: &mut CatalogBuilder,
-    budget: &Arc<PayloadBudget>,
+    budget: Option<&Arc<PayloadBudget>>,
     output: &mpsc::Sender<WorkerEvent>,
 ) -> bool {
     while let Some(packet) = builder.prefetch.pop_front() {
@@ -597,7 +618,7 @@ async fn emit_live(
     builder: &mut CatalogBuilder,
     demux: &mut StreamingTsDemux,
     limits: InputLimits,
-    budget: &Arc<PayloadBudget>,
+    budget: Option<&Arc<PayloadBudget>>,
     output: &mpsc::Sender<WorkerEvent>,
 ) -> Result<(), SourceError> {
     builder.drain(demux, limits, false)?;
@@ -611,10 +632,13 @@ async fn emit_live(
 
 async fn send_packet(
     packet: Packet,
-    budget: &Arc<PayloadBudget>,
+    budget: Option<&Arc<PayloadBudget>>,
     output: &mpsc::Sender<WorkerEvent>,
 ) -> bool {
-    let permit = budget.reserve(packet.retained_payload_bytes()).await;
+    let permit = match budget {
+        Some(budget) => Some(budget.reserve(packet.retained_payload_bytes()).await),
+        None => None,
+    };
     output
         .send(WorkerEvent::Packet(QueuedPacket {
             packet,

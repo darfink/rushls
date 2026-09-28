@@ -32,10 +32,7 @@ impl Default for MpegTsConfig {
         Self {
             read_buffer_size: nz::usize!(32 * 1024),
             packet_channel_capacity: nz::usize!(64),
-            maximum_queued_payload_bytes: NonZeroUsize::new(
-                crate::source::PipelineMemory::DEMUX_QUEUE,
-            )
-            .expect("the demux queue budget is nonzero"),
+            maximum_queued_payload_bytes: nz::usize!(16 * 1024 * 1024),
         }
     }
 }
@@ -66,12 +63,13 @@ impl MpegTsPacketSource {
                 "queued payload budget must fit one maximum-sized packet".into(),
             ));
         }
+        let control = Arc::new(Control::with_budget(meters.pipeline_budget().cloned()));
         Ok(Self {
             input: Some(input),
             config,
             limits,
             meters,
-            control: Arc::new(Control::new()),
+            control,
             receiver: None,
             pending: None,
             discovery: None,

@@ -512,8 +512,24 @@ fn render_sessions(output: &mut String, sessions: &[SessionSnapshot]) {
         MetricKind::Gauge,
     );
 
+    metadata(
+        output,
+        "rushls_session_pipeline_allocation_bytes",
+        "Accounted pipeline bytes by allocation origin; shared bytes stay attributed to their first owner.",
+        MetricKind::Gauge,
+    );
     for session in sessions {
         let labels = session_labels(session);
+        for (origin, bytes) in crate::domain::PipelineBudget::ORIGINS
+            .iter()
+            .zip(session.meters.pipeline_origins)
+        {
+            writeln!(
+                output,
+                "rushls_session_pipeline_allocation_bytes{{{labels},origin=\"{origin}\"}} {bytes}"
+            )
+            .expect("writing to a String cannot fail");
+        }
         writeln!(
             output,
             "{SESSION_INFO}{{{labels},principal=\"{}\",phase=\"{}\"}} 1",

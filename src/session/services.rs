@@ -31,6 +31,8 @@ pub struct Services {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionConfig {
+    /// Shared accounted bytes retained by one active publisher.
+    pub memory_per_publisher: usize,
     /// How long the handshake and authentication may take.
     ///
     /// Every later stage bounds its own wait, so without this one a connection
@@ -47,6 +49,7 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            memory_per_publisher: crate::domain::PipelineBudget::DEFAULT_LIMIT,
             maximum_admission_time: Duration::from_secs(10),
             discovery: DiscoveryLimits {
                 // A multi-rendition contribution can carry several megabits
@@ -56,7 +59,12 @@ impl Default for SessionConfig {
                 maximum_wall_time: Duration::from_secs(10),
             },
             input: InputLimits::permissive(),
-            preroll: PrerollLimits::permissive(),
+            preroll: PrerollLimits {
+                // Session memory is shared; standalone pre-roll still has its
+                // own fallback byte bound when no session drives it.
+                maximum_buffered_bytes: usize::MAX,
+                ..PrerollLimits::permissive()
+            },
             segmentation: SegmentationPolicy::default(),
             supervision: SupervisionPolicy::default(),
         }

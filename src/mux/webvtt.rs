@@ -51,6 +51,7 @@ const INITIALIZATION: &[u8] = b"WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGT
 
 #[derive(Clone, Debug)]
 struct Cue {
+    _charge: Option<Arc<crate::domain::Reservation>>,
     /// Presentation-relative span, kept alongside the rendered milliseconds so
     /// a part can select the cues overlapping its own interval without
     /// reparsing what was already formatted.
@@ -63,6 +64,7 @@ struct Cue {
 
 #[derive(Clone, Debug)]
 struct ActiveCue {
+    _charge: Option<Arc<crate::domain::Reservation>>,
     sample: SubtitleSample,
     start: TickTimestamp,
     content: CueContent,
@@ -160,6 +162,7 @@ fn packaged_rendition(
 }
 
 struct WebVttTrack {
+    budget: Option<crate::domain::PipelineBudget>,
     rendition_id: PackagingRenditionId,
     track_id: TrackId,
     dialect: CueDialect,
@@ -225,6 +228,7 @@ impl WebVttTrack {
         }
 
         Ok(Self {
+            budget: track.codec_extradata.budget().cloned(),
             rendition_id,
             track_id: track.id,
             dialect,
@@ -388,7 +392,33 @@ impl WebVttTrack {
         Ok((first_index, last_index))
     }
 
+    fn reserve_cue(
+        &self,
+        sample: &SubtitleSample,
+    ) -> Result<Option<Arc<crate::domain::Reservation>>, MuxError> {
+        // Escaping text can expand one input byte into several output bytes.
+        // Charge the rendered copy separately from its source payload.
+        self.budget
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .try_reserve(
+                        sample
+                            .payload
+                            .len()
+                            .saturating_mul(6)
+                            .saturating_add(sample.webvtt.retained_bytes())
+                            .saturating_add(std::mem::size_of::<Cue>()),
+                        "subtitle cues",
+                    )
+                    .map(Arc::new)
+            })
+            .transpose()
+            .map_err(|error| mux_error(error.to_string()))
+    }
+
     fn render_cue(&self, sample: &SubtitleSample, start: TickTimestamp) -> Result<Cue, MuxError> {
+        let charge = self.reserve_cue(sample)?;
         let CueAction::Show(content) = self.dialect.read(sample)? else {
             // A clear never reaches rendering: `push` consumes it to end the
             // held cue and holds nothing in its place, so there is no cue to
@@ -410,6 +440,7 @@ impl WebVttTrack {
             )));
         }
         Ok(Cue {
+            _charge: charge,
             start,
             end: start
                 .checked_add_unsigned(sample.duration)
@@ -476,10 +507,14 @@ impl WebVttTrack {
     /// Only pops from the front, so callers must have materialized a window
     /// that outlives `now` first — otherwise this drains the queue and strands
     /// the invariant that an unfinished muxer always has a current window.
-    fn seal_before(&mut self, now: MediaInstant, out: &mut dyn Appender<PackagedMedia>) {
+    fn seal_before(
+        &mut self,
+        now: MediaInstant,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
         if self.part_ticks.is_some() {
-            self.seal_parts_before(now, out);
-            return;
+            self.seal_parts_before(now, out)?;
+            return Ok(());
         }
         while self.windows.front().is_some_and(|window| {
             self.window_end(window)
@@ -491,8 +526,9 @@ impl WebVttTrack {
             let duration = self
                 .window_duration(window.id)
                 .expect("queued WebVTT windows have valid timing");
-            self.emit(&window, duration, out);
+            self.emit(&window, duration, out)?;
         }
+        Ok(())
     }
 
     /// As [`Self::seal_before`], one part at a time.
@@ -502,11 +538,15 @@ impl WebVttTrack {
     /// queue cannot drain here for the same reason it cannot in whole-segment
     /// mode: `ensure_current_at` has already materialized a window whose
     /// content outlives `now`, and its final part therefore never seals.
-    fn seal_parts_before(&mut self, now: MediaInstant, out: &mut dyn Appender<PackagedMedia>) {
+    fn seal_parts_before(
+        &mut self,
+        now: MediaInstant,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
         while let Some(mut window) = self.windows.pop_front() {
             let Ok(total) = self.window_duration(window.id) else {
                 self.windows.push_front(window);
-                return;
+                return Ok(());
             };
             let count = self.part_count(total);
             while window.sealed_parts < count {
@@ -522,15 +562,16 @@ impl WebVttTrack {
                 {
                     break;
                 }
-                self.emit_part(&window, window.sealed_parts, start, duration, out);
+                self.emit_part(&window, window.sealed_parts, start, duration, out)?;
                 window.sealed_parts += 1;
             }
             if window.sealed_parts < count {
                 self.windows.push_front(window);
-                return;
+                return Ok(());
             }
             self.complete(&window, total, out);
         }
+        Ok(())
     }
 
     /// Publishes everything left of `window` up to `total`, then closes it.
@@ -543,16 +584,17 @@ impl WebVttTrack {
         window: &mut Window,
         total: TickDuration,
         out: &mut dyn Appender<PackagedMedia>,
-    ) {
+    ) -> Result<(), MuxError> {
         let count = self.part_count(total);
         while window.sealed_parts < count {
             let Some((start, duration)) = self.part_span(window, total, window.sealed_parts) else {
                 break;
             };
-            self.emit_part(window, window.sealed_parts, start, duration, out);
+            self.emit_part(window, window.sealed_parts, start, duration, out)?;
             window.sealed_parts += 1;
         }
         self.complete(window, total, out);
+        Ok(())
     }
 
     /// Materializes windows until one of them still has content ahead of `now`.
@@ -595,7 +637,12 @@ impl WebVttTrack {
         Ok(())
     }
 
-    fn emit(&self, window: &Window, duration: TickDuration, out: &mut dyn Appender<PackagedMedia>) {
+    fn emit(
+        &self,
+        window: &Window,
+        duration: TickDuration,
+        out: &mut dyn Appender<PackagedMedia>,
+    ) -> Result<(), MuxError> {
         let end = window.start.saturating_add_unsigned(duration);
         out.push(PackagedMedia::Segment(PackagedSegment {
             rendition_id: self.rendition_id,
@@ -603,13 +650,14 @@ impl WebVttTrack {
             media_start: window.start,
             duration,
             independent: true,
-            payload: Payload::from(self.render_range(
+            payload: self.render_range(
                 window,
                 window.start,
                 end,
                 self.dialect == CueDialect::Text,
-            )),
+            )?,
         }));
+        Ok(())
     }
 
     /// Publishes one part, carrying every cue on screen during its interval.
@@ -627,7 +675,7 @@ impl WebVttTrack {
         start: TickTimestamp,
         duration: TickDuration,
         out: &mut dyn Appender<PackagedMedia>,
-    ) {
+    ) -> Result<(), MuxError> {
         let end = start.saturating_add_unsigned(duration);
         out.push(PackagedMedia::Chunk(PackagedChunk {
             rendition_id: self.rendition_id,
@@ -636,8 +684,9 @@ impl WebVttTrack {
             media_start: start,
             duration,
             independent: true,
-            payload: Payload::from(self.render_range(window, start, end, true)),
+            payload: self.render_range(window, start, end, true)?,
         }));
+        Ok(())
     }
 
     fn complete(
@@ -666,12 +715,38 @@ impl WebVttTrack {
         start: TickTimestamp,
         end: TickTimestamp,
         clip_resolved: bool,
-    ) -> Vec<u8> {
+    ) -> Result<Payload, MuxError> {
+        let cue_bytes = |cue: &Cue| {
+            cue.text
+                .len()
+                .saturating_add(cue.identifier.as_ref().map_or(0, |value| value.len()))
+                .saturating_add(cue.settings.as_ref().map_or(0, |value| value.len()))
+                .saturating_add(128)
+        };
+        let mut bound = window
+            .cues
+            .iter()
+            .filter(|cue| cue.start < end && cue.end > start)
+            .fold(0_usize, |sum, cue| sum.saturating_add(cue_bytes(cue)));
+        if let Some(active) = &self.active
+            && active.start < end
+        {
+            bound = bound
+                .saturating_add(active.content.text.len())
+                .saturating_add(active.content.metadata.retained_bytes())
+                .saturating_add(128);
+        }
+        let charge = self
+            .budget
+            .as_ref()
+            .map(|budget| budget.try_reserve(bound, "subtitle output"))
+            .transpose()
+            .map_err(|error| mux_error(error.to_string()))?;
         let milliseconds = TimebaseProjection::new(
             self.plan.timebase,
             Timebase::new(nz::u32!(1), nz::u32!(1_000)),
         );
-        let mut body = String::new();
+        let mut body = String::with_capacity(bound);
         for cue in window
             .cues
             .iter()
@@ -708,7 +783,13 @@ impl WebVttTrack {
                 &active.content.text,
             );
         }
-        body.into_bytes()
+        if body.len() > bound {
+            return Err(mux_error("subtitle output exceeded its reserved bound"));
+        }
+        Ok(match charge {
+            Some(charge) => Payload::reserved(body.into_bytes(), charge),
+            None => Payload::from(body.into_bytes()),
+        })
     }
 
     /// Where one part of `window` begins and how long it runs.
@@ -764,7 +845,7 @@ impl WebVttTrack {
 
         self.initialize(out);
         self.ensure_through(prepared.last_index)?;
-        self.seal_before(self.instant(prepared.start), out);
+        self.seal_before(self.instant(prepared.start), out)?;
         let mut placed = false;
         for window in &mut self.windows {
             if window.id < prepared.first_index || window.id > prepared.last_index {
@@ -907,6 +988,9 @@ impl TrackPackager for WebVttTrack {
                 self.track_id
             )));
         };
+        if self.budget.is_none() {
+            self.budget = sample.payload.budget().cloned();
+        }
         // Held only when the cue actually lacks an end. A codec that may omit
         // one can still supply it, and a supplied span is the publisher's
         // statement about its own cue: overriding it with a successor's start
@@ -935,6 +1019,7 @@ impl TrackPackager for WebVttTrack {
             // Validated before it is held, so a malformed cue fails on the push
             // that delivered it rather than at whatever unrelated moment later
             // resolves it.
+            let cue_charge = self.reserve_cue(&sample)?;
             let action = self.dialect.read(&sample)?;
             // Timing is checked here for the same reason. `prepare_cue` runs
             // only when the cue is placed, so without this a cue starting
@@ -988,6 +1073,7 @@ impl TrackPackager for WebVttTrack {
             self.close_active_at(start, out)?;
             self.last_cue_start = Some(sample.pts);
             self.active = Some(ActiveCue {
+                _charge: cue_charge,
                 sample,
                 start,
                 content,
@@ -1020,7 +1106,7 @@ impl TrackPackager for WebVttTrack {
         // start of the presentation rather than from its first cue.
         self.initialize(out);
         self.report_long_lived_state(now);
-        self.seal_before(now, out);
+        self.seal_before(now, out)?;
         Ok(())
     }
 
@@ -1085,9 +1171,9 @@ impl TrackPackager for WebVttTrack {
                 break;
             }
             if self.part_ticks.is_some() {
-                self.seal_remaining_parts(&mut window, duration, out);
+                self.seal_remaining_parts(&mut window, duration, out)?;
             } else {
-                self.emit(&window, duration, out);
+                self.emit(&window, duration, out)?;
             }
         }
         self.windows.clear();
