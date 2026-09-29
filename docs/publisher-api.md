@@ -114,8 +114,12 @@ type or meaning, moves the type to `.v2`. Subscriptions name the kind
 The existing `was_available` field means this session reached its running
 pipeline state. Stream playability belongs to `stream.available` instead.
 
-Stream events contain only `stream_id` in `data`. They do not name a session,
-because a stream can remain playable across publisher reconnects. Credentials
+Stream events carry `stream_id` in `data`, and `stream.available` adds
+`playlist_path`, the multivariant playlist's server path such as
+`/live/camera/index.m3u8`. Like `segment.ready` paths, it is rooted rather than
+absolute: join it to the origin or CDN the consumer uses. Stream events do not
+name a session, because a stream can remain playable across publisher
+reconnects. Credentials
 never appear in lifecycle events. Session IDs are decimal strings to preserve
 64-bit precision. They are process-local and can repeat after a restart.
 CloudEvents IDs identify occurrences across restarts.

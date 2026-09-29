@@ -94,6 +94,8 @@ impl Occurrence for Event {
             // stream, which outlives whichever publisher made it playable.
             Event::StreamAvailable(available) => serde_json::json!({
                 "stream_id": available.stream.0.as_str(),
+                // Rooted like `segment.ready` paths: join it to the origin.
+                "playlist_path": crate::delivery::hls::uri::multivariant_path(&available.stream),
             }),
             Event::StreamUnavailable(unavailable) => serde_json::json!({
                 "stream_id": unavailable.stream.0.as_str(),

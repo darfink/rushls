@@ -107,6 +107,18 @@ impl UriBase {
         Self((!trimmed.is_empty()).then(|| Arc::from(trimmed)))
     }
 
+    /// `path` under `http.public_url` when one is configured, else unchanged.
+    ///
+    /// Only the configured base can make a location absolute: a listen
+    /// address such as `0.0.0.0:8080` is not reachable, and any host guessed
+    /// from it would be wrong behind a proxy or CDN.
+    pub fn locate(&self, path: &str) -> String {
+        match &self.0 {
+            Some(base) => format!("{base}{path}"),
+            None => path.to_owned(),
+        }
+    }
+
     pub fn uris(&self, stream: &StreamId) -> PlaylistUris {
         PlaylistUris {
             root: self
@@ -116,6 +128,14 @@ impl UriBase {
             query_variables: false,
         }
     }
+}
+
+/// Server path of a stream's multivariant playlist, e.g. `/live/demo/index.m3u8`.
+///
+/// Rooted like the media paths lifecycle events carry, so a consumer joins
+/// either to the same origin.
+pub fn multivariant_path(stream: &StreamId) -> String {
+    format!("/{}/{MULTIVARIANT_NAME}", PercentEncoded(stream.as_str()))
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -238,6 +258,22 @@ mod tests {
     use crate::delivery::uri::{MediaResourcePath, parse_media_path};
 
     use super::*;
+
+    #[test]
+    fn a_playlist_location_is_absolute_only_under_a_configured_base() {
+        let path = multivariant_path(&StreamId::new("live/my camera"));
+        assert_eq!(path, "/live/my%20camera/index.m3u8");
+        assert_eq!(
+            parse_path(&path).map(|parsed| parsed.resource),
+            Ok(Resource::Multivariant),
+            "the logged path is one the origin serves"
+        );
+        assert_eq!(UriBase::default().locate(&path), path);
+        assert_eq!(
+            UriBase::new("https://cdn.example/hls/").locate(&path),
+            "https://cdn.example/hls/live/my%20camera/index.m3u8"
+        );
+    }
 
     #[test]
     fn relative_and_rooted_names_preserve_the_shared_media_namespace() {

@@ -3,6 +3,7 @@ use std::{error::Error, io::Write, sync::Arc};
 use conf::Conf;
 
 use rushls::{
+    delivery::hls::uri::{UriBase, multivariant_path},
     domain::{SessionId, StreamId},
     hooks::{self, HookObserver},
     observe::{EventObserver, Events, NodeEvent, SessionEnd, SessionEvent, StreamEvent},
@@ -21,7 +22,10 @@ use tracing_subscriber::{
 #[global_allocator]
 static ALLOCATOR: rushls::allocation::CountingAllocator = rushls::allocation::CountingAllocator;
 
-struct TracingEvents;
+struct TracingEvents {
+    /// `http.public_url`, which alone can make a logged playlist location absolute.
+    playlists: UriBase,
+}
 
 impl EventObserver for TracingEvents {
     // Keeping this exhaustive mapping together makes every operator-facing
@@ -192,7 +196,11 @@ impl EventObserver for TracingEvents {
             StreamEvent::SegmentReady(segment) => {
                 debug!(stream = %stream, rendition = segment.rendition_id, segment = segment.segment_id, "segment ready");
             }
-            StreamEvent::Available => info!(stream = %stream, "playable"),
+            StreamEvent::Available => info!(
+                stream = %stream,
+                playlist = %self.playlists.locate(&multivariant_path(&stream)),
+                "playable"
+            ),
             StreamEvent::Retired => info!(stream = %stream, "no longer reachable"),
             StreamEvent::RetentionClipped {
                 reason,
@@ -428,7 +436,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // The base observer is what hooks themselves report through, so a failing
     // hook cannot produce events that re-enter it.
-    let base: Arc<dyn EventObserver> = Arc::new(TracingEvents);
+    let base: Arc<dyn EventObserver> = Arc::new(TracingEvents {
+        playlists: resolved.node.hls.uri_base.clone(),
+    });
     let (observer, dispatchers, exported) = match resolved.hooks {
         Some(ResolvedHooks { config, client }) => {
             let (hooks, dispatchers) =

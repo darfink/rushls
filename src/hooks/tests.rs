@@ -257,6 +257,10 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
         assert!(body["data"].get("credential").is_none());
     }
     assert_eq!(
+        bodies[1]["data"]["playlist_path"],
+        "/live/camera/index.m3u8"
+    );
+    assert_eq!(
         seen.sessions.lock().len(),
         3,
         "the observer decorates rather than replaces: a node keeps the +         reporting it already had"
