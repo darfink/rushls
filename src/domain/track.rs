@@ -240,6 +240,23 @@ pub struct DiscoveredTrack {
     pub codec_extradata: Payload,
 }
 
+/// A publisher-supplied track name, cleaned for use as an HLS `NAME`, or
+/// `None` when nothing usable is left.
+///
+/// Every protocol hands titles over verbatim, and they end up in a quoted
+/// playlist attribute where a double quote or a control character would make
+/// the playlist unwritable. Such a name is dropped rather than repaired, so
+/// the track falls back to a generated name instead of a mangled one. Very
+/// long names are dropped for the same reason: no player picker shows them.
+pub fn track_title(value: &str) -> Option<String> {
+    const MAXIMUM_BYTES: usize = 256;
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= MAXIMUM_BYTES
+        && !value.chars().any(|c| c == '"' || c.is_control()))
+    .then(|| value.to_owned())
+}
+
 impl DiscoveredTrack {
     pub fn kind(&self) -> MediaKind {
         self.parameters.kind()
@@ -400,5 +417,16 @@ mod tests {
 
         assert!(!ntsc.exceeds(thirty));
         assert!(thirty.exceeds(ntsc));
+    }
+
+    #[test]
+    fn titles_that_cannot_be_a_playlist_name_are_dropped() {
+        use super::track_title;
+
+        assert_eq!(track_title("  Español  ").as_deref(), Some("Español"));
+        assert_eq!(track_title("Director's \"cut\""), None);
+        assert_eq!(track_title("two\nlines"), None);
+        assert_eq!(track_title("   "), None);
+        assert_eq!(track_title(&"x".repeat(257)), None);
     }
 }

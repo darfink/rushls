@@ -91,6 +91,12 @@ impl MappedCatalog {
                 .iter()
                 .position(|track| track.id == old.id)
                 .expect("fingerprint and tracks have the same IDs");
+            // Labels are descriptive, not decoder state, so they stay out of
+            // the fingerprint: a newer snapshot may rename a track during
+            // discovery, and renaming one after freeze changes nothing.
+            self.tracks[index]
+                .title
+                .clone_from(&next.tracks[index].title);
             // Repeated snapshots preserve timestamps and in-band video metadata.
             if old == new {
                 continue;
@@ -167,7 +173,7 @@ pub fn tracks_from_catalog(
             parameters,
             timebase: TIMEBASE,
             first_pts: None,
-            title: None,
+            title: config.label.as_deref().and_then(crate::domain::track_title),
             language: None,
             codec_extradata: Payload::from_bytes(extradata),
         });
@@ -202,7 +208,7 @@ pub fn tracks_from_catalog(
             parameters,
             timebase: TIMEBASE,
             first_pts: None,
-            title: None,
+            title: config.label.as_deref().and_then(crate::domain::track_title),
             language: None,
             codec_extradata: Payload::from_bytes(extradata),
         });
@@ -775,6 +781,39 @@ mod tests {
         assert_eq!(mapped.tracks[0], discovered_video);
         Ok(())
     }
+    #[test]
+    fn catalog_labels_become_track_titles_and_may_change() -> Result<(), SourceError> {
+        let labelled = |label: &str| {
+            let mut config = opus_loc();
+            config.label = Some(label.to_owned());
+            config
+        };
+        let video = BTreeMap::new();
+        let audio = BTreeMap::from([
+            ("en".into(), labelled(" English ")),
+            // A quote could not be written into a playlist NAME.
+            ("sv".into(), labelled("Svenska \"SDH\"")),
+        ]);
+        let mut mapped = tracks_from_catalog(&video, &audio)?;
+        assert_eq!(mapped.tracks[0].title.as_deref(), Some("English"));
+        assert_eq!(mapped.tracks[1].title, None);
+
+        // A later snapshot may rename a track without changing its decoder state.
+        let renamed = BTreeMap::from([
+            ("en".into(), labelled("English (commentary)")),
+            ("sv".into(), labelled("Svenska")),
+        ]);
+        let next = tracks_from_catalog(&video, &renamed)?;
+        mapped.fingerprint.diff(&next.fingerprint)?;
+        mapped.refine(next)?;
+        assert_eq!(
+            mapped.tracks[0].title.as_deref(),
+            Some("English (commentary)")
+        );
+        assert_eq!(mapped.tracks[1].title.as_deref(), Some("Svenska"));
+        Ok(())
+    }
+
     #[test]
     fn catalog_video_preserves_codec_cadence_for_all_supported_codecs()
     -> Result<(), Box<dyn std::error::Error>> {

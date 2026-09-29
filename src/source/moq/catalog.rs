@@ -60,6 +60,9 @@ pub struct VideoConfig {
     /// Set when the rendition lives on another broadcast, which ingest refuses.
     #[serde(default)]
     pub broadcast: Option<String>,
+    /// Human-readable rendition name for track pickers (hang 0.21+).
+    #[serde(default)]
+    pub label: Option<String>,
     /// A WebCodecs registry string, such as `avc1.640028`.
     pub codec: String,
     #[serde(default, deserialize_with = "hex_bytes")]
@@ -79,6 +82,9 @@ pub struct VideoConfig {
 pub struct AudioConfig {
     #[serde(default)]
     pub broadcast: Option<String>,
+    /// Human-readable rendition name for track pickers (hang 0.21+).
+    #[serde(default)]
+    pub label: Option<String>,
     pub codec: String,
     #[serde(default)]
     pub sample_rate: u32,

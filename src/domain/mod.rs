@@ -39,7 +39,7 @@ pub use time::{
 };
 pub use track::{
     AudioTiming, AudioTrim, Codec, DiscoveredTrack, FrameRate, MediaKind, MediaParameters,
-    SubtitlePosition, TrackCatalog, TrackCatalogError, TrackCounts, WebVttCueMetadata,
+    SubtitlePosition, TrackCatalog, TrackCatalogError, TrackCounts, WebVttCueMetadata, track_title,
 };
 
 /// A boxed future returned by object-safe trait methods.

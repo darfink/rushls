@@ -27,10 +27,15 @@ pub fn apply(track: &mut DiscoveredTrack, metadata: &ParsedMetadata) {
         .and_then(|entry| text(&entry.properties, "language"))
         .or_else(|| text(&metadata.properties, language))
         .or_else(|| text(&metadata.properties, "language"));
+    // A title that cannot be a playlist NAME falls through to the next level,
+    // then to a generated name.
+    let usable = |properties: &Amf0Object, key: &str| {
+        text(properties, key).and_then(|value| crate::domain::track_title(&value))
+    };
     track.title = numbered
-        .and_then(|entry| text(&entry.properties, "title"))
-        .or_else(|| text(&metadata.properties, title))
-        .or_else(|| text(&metadata.properties, "title"));
+        .and_then(|entry| usable(&entry.properties, "title"))
+        .or_else(|| usable(&metadata.properties, title))
+        .or_else(|| usable(&metadata.properties, "title"));
 }
 
 fn text(properties: &Amf0Object, key: &str) -> Option<String> {

@@ -274,9 +274,9 @@ Names and languages come from the source:
 | --- | --- | --- |
 | RTMP | `onMetaData` `title`, per track with Enhanced RTMP, or `audiotitle` / `videotitle` | `onMetaData` `language`, per track or `audiolanguage` / `videolanguage` |
 | SRT | Not carried | ISO 639 descriptor, for example FFmpeg `-metadata:s:a:0 language=eng` |
-| MoQ | Not carried | Not carried |
+| MoQ | Catalog rendition `label` (hang 0.21 and later) | Not carried |
 
-A track without a name gets a generic one such as `Audio 2`.
+A track without a name gets a generic one such as `Audio 2`. A name containing a double quote or a control character is ignored, since it cannot be written into the playlist.
 
 ## Supported codecs
 

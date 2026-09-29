@@ -28,6 +28,10 @@ After discovery, decoder configuration changes fail ingestion.
 | CMAF and unknown containers | Rejected |
 | Renditions on another broadcast | Rejected |
 
+A rendition's catalog `label` (hang 0.21 and later) becomes its HLS `NAME`.
+Labels are descriptive, so a catalog update that changes only a label never ends the publication; after discovery the new label is ignored.
+The catalog has no language field, so MoQ renditions carry no `LANGUAGE`.
+
 MOQ supplies presentation timestamps, without decode timestamps.
 The shared normalizer reconstructs decode timestamps. Reordered H.264 requires frame timing from the SPS.
 
