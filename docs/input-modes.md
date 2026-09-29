@@ -32,7 +32,19 @@ Contradictory explicit declarations fail in both modes.
 ## Permissive compensation
 
 Permissive mode represents missing audio with explicit GAPs.
-It also emits video GAPs for declared fixed, progressive H.264 cadence without presentation reordering.
+It also emits video GAPs for a declared fixed cadence without presentation reordering, in the scope each codec's declaration covers:
+
+| Codec | Declaration | Scope |
+| --- | --- | --- |
+| H.264 | SPS VUI fixed frame rate | Progressive frames |
+| HEVC | VPS/SPS HRD fixed picture rate | Progressive pictures, one temporal layer |
+| AV1 | Sequence header timing info with `num_ticks_per_picture` | Single-layer temporal units with one shown frame |
+
+Encoders must be asked for the declaration: libx264 `force-cfr=1`, libx265 `hrd=1` with VBV settings,
+and for SVT-AV1 the `av1_metadata=tick_rate=R:num_ticks_per_picture=1` bitstream filter.
+B-frames, or any other presentation reordering, rule out video GAPs.
+HEVC and AV1 GAPs were validated by decoding the served output with FFmpeg; player behaviour at a GAP is recorded in the [player matrix](gap-player-matrix.md), which covers H.264.
+
 Other video mappings reject cadence holes with `unsupported_configuration`.
 Early pictures beyond rounding tolerance remain fatal. Neither mode falls back to extending frames or synthesizing audio.
 An accepted late picture retains its timestamp and starts the next cadence expectation.

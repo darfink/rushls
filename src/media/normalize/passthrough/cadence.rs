@@ -31,15 +31,39 @@ pub(super) struct CadenceValidator {
     pub notices: Vec<NormalizationNotice>,
 }
 impl CadenceValidator {
+    /// Whether a hole can be served as a GAP instead of ending the publication.
+    ///
+    /// Each codec qualifies only under the scope its declaration was verified
+    /// for, because that scope is what makes "one packet, one displayed
+    /// picture, one interval" true: H.264 progressive frames, HEVC progressive
+    /// pictures on the base temporal layer, and AV1 single-layer temporal
+    /// units. Presentation reordering is excluded for all three: with a
+    /// reorder depth, a late picture cannot be told from a missing one until
+    /// pictures after it have already been released in decode order.
     fn supports_gaps(&self) -> bool {
+        use crate::domain::CadenceScope as S;
         self.depth == 0
-            && self.status.codec == Codec::H264
             && matches!(
-                self.declaration,
-                VideoCadence::Fixed {
-                    scope: crate::domain::CadenceScope::ProgressiveFrames,
-                    ..
-                }
+                (self.status.codec, self.declaration),
+                (
+                    Codec::H264,
+                    VideoCadence::Fixed {
+                        scope: S::ProgressiveFrames,
+                        ..
+                    }
+                ) | (
+                    Codec::Hevc,
+                    VideoCadence::Fixed {
+                        scope: S::ProgressiveBaseLayer,
+                        ..
+                    }
+                ) | (
+                    Codec::Av1,
+                    VideoCadence::Fixed {
+                        scope: S::SingleLayerTemporalUnits,
+                        ..
+                    }
+                )
             )
     }
 
@@ -61,6 +85,14 @@ impl CadenceValidator {
             .picture_mapping
             .as_ref()
             .is_some_and(|mapping| mapping.check(packet.payload.as_bytes()).is_err())
+        {
+            return Ok(None);
+        }
+        // An AV1 temporal unit that does not show exactly one frame has no
+        // presentation interval of its own to measure a hole against; `push`
+        // decides what it means.
+        if self.status.codec == Codec::Av1
+            && crate::media::av1::displayed_pictures(packet.payload.as_bytes()) != Some(1)
         {
             return Ok(None);
         }

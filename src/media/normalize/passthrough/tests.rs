@@ -1894,6 +1894,102 @@ fn video_gaps_preserve_samples_and_resume_original_clock() -> Result<(), Normali
     Ok(())
 }
 
+/// A fixed-cadence HEVC or AV1 track as real encoder headers declare it, with
+/// one displayed picture per packet.
+fn fixed_video_of(codec: Codec, delay: u32) -> (DiscoveredTrack, &'static [u8]) {
+    use crate::domain::{CadenceScope, CadenceSource, VideoCadence};
+    let rate = FrameRate::new(nz::u32!(25), nz::u32!(1));
+    let mut track = fixed_video(rate, delay);
+    track.codec = codec;
+    let (source, scope, extradata, payload): (_, _, &[u8], &'static [u8]) = match codec {
+        // TRAIL_R, base layer, first slice in PPS 0.
+        Codec::Hevc => (
+            CadenceSource::HevcSpsHrd,
+            CadenceScope::ProgressiveBaseLayer,
+            crate::media::fixtures::HEVC_FIXED_CADENCE,
+            &[0, 0, 0, 3, 2, 1, 0xc0],
+        ),
+        // OBU_FRAME holding one shown inter frame.
+        Codec::Av1 => (
+            CadenceSource::Av1Sequence,
+            CadenceScope::SingleLayerTemporalUnits,
+            crate::media::fixtures::AV1_FIXED_CADENCE,
+            &[0x32, 1, 0x30],
+        ),
+        _ => unreachable!("only HEVC and AV1 are exercised here"),
+    };
+    track.codec_extradata = extradata.to_vec().into();
+    track.video_cadence = VideoCadence::Fixed {
+        rate,
+        source,
+        scope,
+    };
+    (track, payload)
+}
+
+#[test]
+fn hevc_and_av1_holes_become_gaps_like_h264() -> Result<(), NormalizeError> {
+    use crate::domain::{InputMode, RecoveryMethod, RecoveryTransition};
+    for codec in [Codec::Hevc, Codec::Av1] {
+        let (track, payload) = fixed_video_of(codec, 0);
+        let mut started = mode_start(track, InputMode::Permissive)?;
+        let mut out = Vec::new();
+        // The 40, 80 ms pictures are missing.
+        for pts in [0, 120, 160] {
+            let mut p = packet(0, Some(pts), Some(pts), None);
+            p.payload = payload.into();
+            started.normalizer.push(p, &mut out)?;
+        }
+        started.normalizer.finish(&mut out)?;
+        assert_eq!(out.len(), 4, "{codec:?}");
+        assert!(
+            matches!(&out[1], NormalizedMedia::Gap(g) if g.start == 3_600 && g.end == 10_800),
+            "{codec:?}: {:?}",
+            out[1]
+        );
+        let notices = started.normalizer.take_notices();
+        assert_eq!(notices.len(), 1, "{codec:?}");
+        assert_eq!(notices[0].transition, RecoveryTransition::Degraded);
+        assert_eq!(notices[0].status.method, RecoveryMethod::Gap);
+    }
+    Ok(())
+}
+
+#[test]
+fn hevc_and_av1_holes_stay_fatal_in_strict_mode_and_with_reordering() -> Result<(), NormalizeError>
+{
+    use crate::domain::{InputMode, RecoveryRejection};
+    for codec in [Codec::Hevc, Codec::Av1] {
+        for (mode, delay) in [(InputMode::Strict, 0), (InputMode::Permissive, 2)] {
+            let (track, payload) = fixed_video_of(codec, delay);
+            let mut started = mode_start(track, mode)?;
+            let mut out = Vec::new();
+            let mut result = Ok(());
+            for pts in [0, 40, 80, 200, 240, 280, 320] {
+                let mut p = packet(0, Some(pts), Some(pts - 80), Some(40));
+                p.payload = payload.into();
+                result = started.normalizer.push(p, &mut out);
+                if result.is_err() {
+                    break;
+                }
+            }
+            let result = result.and_then(|()| started.normalizer.finish(&mut out));
+            let issue = timing_issue(result.expect_err("the 120, 160 ms pictures are missing"));
+            assert_eq!(
+                issue.recovery_rejection,
+                (mode == InputMode::Permissive)
+                    .then_some(RecoveryRejection::UnsupportedConfiguration),
+                "{codec:?} {mode:?} depth {delay}"
+            );
+            assert!(
+                out.iter()
+                    .all(|sample| !matches!(sample, NormalizedMedia::Gap(_)))
+            );
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn video_gap_rejection_is_atomic_and_has_no_compensation_notice() -> Result<(), NormalizeError> {
     use crate::domain::InputMode;

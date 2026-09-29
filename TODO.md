@@ -57,8 +57,10 @@ These limits remain explicit in the supported scope:
   continued, sometimes after a freeze until the next IDR. This does not establish
   support for every codec, player, or seek position.
   See [video GAP validation](docs/video-gap-validation.md).
-- Permissive video GAP recovery supports progressive H.264 without presentation
-  reordering. Unsupported video recovery mappings remain fatal.
+- Permissive video GAP recovery supports declared fixed-cadence H.264, single-layer
+  HEVC, and single-layer AV1 without presentation reordering. Unsupported video
+  recovery mappings remain fatal. HEVC and AV1 GAPs are validated by FFmpeg decoding,
+  not yet in the browser/Safari player matrix.
 - Midstream codec/configuration changes and unexplained clock resets remain fatal.
   Reconnect discontinuities do not provide recovery within an active publication.
 - Different initial track epochs remain an unresolved input case. Independent
@@ -80,7 +82,7 @@ Evaluate these separately from release validation:
 
 - [ ] Support coordinated midstream discontinuities and a defined subset of compatible
   codec/configuration changes. Define timestamp-reset semantics before adding recovery.
-- [ ] Extend video GAP recovery to additional codecs and presentation mappings with
+- [ ] Extend video GAP recovery to presentation reordering and other mappings with
   decoder and player validation.
 - [ ] Support AV1 SVC.
 - [ ] Evaluate trusted original-publisher attribution for relayed MoQ sources.
