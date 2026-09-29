@@ -231,7 +231,7 @@ The `https` URL selects WebTransport. The transport uses UDP, not the ordinary H
 For an isolated local test, create a disposable certificate and configure its paths under `[tls]`.
 The existing [local MoQ recipe](moq-ingestion.md#local-publish-test) uses `--client-tls-disable-verify` for that test only.
 Production publishers must verify certificates.
-MoQ browser publishing is unverified; the included browser tool is experimental.
+MoQ browser publishing has a manual Chrome procedure in [MoQ ingestion](moq-ingestion.md#browser-publish-test); it does not run in CI.
 
 ## Captions and subtitles
 
