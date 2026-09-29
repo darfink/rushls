@@ -119,7 +119,8 @@ def main():
         shutil.copy2(Path('target') / args.target / 'release' / binary, stage / binary)
         for filename in ('README.md', 'LICENSE', 'rushls.example.toml'):
             shutil.copyfile(filename, stage / filename)
-        shutil.copytree('docs', stage / 'docs')
+        # Contributor documentation stays in the repository; users get the guides.
+        shutil.copytree('docs', stage / 'docs', ignore=shutil.ignore_patterns('development'))
         shutil.copytree('tools/patches/hls.js', stage / 'tools/patches/hls.js')
         shutil.copyfile('tools/build-hls-player.py', stage / 'tools/build-hls-player.py')
         notices(stage / 'THIRD-PARTY-NOTICES.md')
