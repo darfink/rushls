@@ -12,181 +12,82 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
-Rushls focuses on one job: serving HLS and low-latency HLS well.
-It is an origin written in Rust, not an attempt to support every streaming protocol and workflow.
-RTMP, SRT, and Media over QUIC are ingest paths into that HLS pipeline.
-It preserves encoded media without transcoding. The publisher supplies every video variant and audio rendition.
+Rushls is a live streaming origin that does one thing: **HLS and Low-Latency HLS, the way Apple specifies them.**
 
-## Why Rushls?
+There are plenty of open-source media servers. Most treat HLS as one output among many,
+and few produce HLS that passes Apple's validation once a stream carries more than one video and one audio track.
+Rushls is built for exactly that case. Publish **one** RTMP or SRT stream that carries an encoding ladder,
+alternate audio languages, and captions, and Rushls serves it as **one adaptive HLS presentation**:
+viewers switch bitrate, pick a language, and turn on subtitles.
 
-I built Rushls after testing open-source HLS servers for my own production workloads.
-Every server I tested exhibited issues once I moved beyond trivial use cases.
-That experience motivated a dedicated HLS origin, with attention to multitrack streams, DVR, captions, reconnects, and playback behavior.
-This describes my tests and requirements, not a benchmark of every server available today.
+- **Adaptive bitrate from a single publication.** Multiple video renditions, alternate audio tracks, WebVTT subtitles, and CEA-608/708 caption declarations.
+- **Low-Latency HLS.** Partial segments, blocking playlist reload, delta updates, preload hints, and rendition reports.
+- **Checked by Apple's own tools.** Every main-branch build runs Apple's `mediastreamvalidator` and `hlsreport`, including a two-hour live DVR audit. A failure blocks the release.
+- **DVR, scrubbing, and recording.** A rolling window in memory with disk spill, I-frame playlists for fast seeking, and recording of every segment to disk.
+- **CDN-ready.** `Cache-Control` follows the HLS specification's caching recommendations.
+- **Built for operation.** Publisher admission webhook, JWT playback authorization, signed lifecycle hooks, and Prometheus metrics.
+- **One self-contained binary.** No FFmpeg, no libsrt, nothing else to install.
 
-Rushls is used in production today. Its development includes:
-
-- More than 1,000 Rust library tests, plus integration, decoder, browser, and load tests.
-- Apple's `mediastreamvalidator` and `hlsreport`, including a two-hour DVR authoring audit with published CI reports.
-- Playback checks for real media, multiple renditions, and live-to-ended transitions.
-- Several corrections to upstream hls.js code discovered during development: pending-part selection, fragment tracking, and ENDLIST state preservation.
-
-The [hls.js corrections](tools/patches/hls.js/README.md) currently ship as a local patch intended for upstream submission; they are not yet merged upstream.
-Validation reports retain [documented exceptions and compatibility limits](docs/ci-validation.md).
-The goal is reliable HLS behavior in demanding workflows, supported by reproducible evidence.
+Rushls packages media; it does not transcode. Your encoder produces the renditions, and Rushls turns them into HLS.
 
 ```text
-FFmpeg / GStreamer / OBS / MoQ publisher
-              │ RTMP, MPEG-TS over SRT, or MoQ
+OBS / FFmpeg / GStreamer / MoQ publisher
+              │ RTMP, SRT, or Media over QUIC
               ▼
-           Rushls ──── recording files
+           Rushls ──── recordings on disk
               │ HLS / LL-HLS over HTTP(S)
               ▼
-         Player or CDN
+      CDN, then players
 ```
-
-Rushls supports multitrack publishing, rolling DVR, disk retention, recording, publisher authorization, JWT playback authorization, signed hooks, and Prometheus metrics.
-It runs without system FFmpeg or SRT libraries. Publishing and validation tools are separate dependencies.
 
 ## Contents
 
-- **🧭 Start here**
-  - [Why Rushls?](#why-rushls)
-  - [Supported protocols and codecs](#supported-protocols-and-codecs)
-  - [Installation](#installation): [Cargo](#cargo), [binaries](#native-binaries), [Docker](#docker)
-  - [Quick start](#quick-start)
-  - [Configuration](#configuration)
-- **📡 Publish and play**
-  - [Publishing streams](#publishing-streams)
-    - [FFmpeg](#ffmpeg)
-    - [GStreamer](#gstreamer)
-    - [OBS Studio](#obs-studio)
-    - [Media over QUIC](#media-over-quic)
-  - [Multiple variants, audio tracks, and subtitles](#multiple-variants-audio-tracks-and-subtitles)
-  - [Playback and latency](#playback-and-latency)
-- **🔧 Operate**
-  - [DVR and resource limits](#dvr-and-resource-limits)
-  - [Recording](#recording)
-  - [Authentication and encryption](#authentication-and-encryption)
-    - [Publisher admission](#publisher-admission)
-    - [Playback authorization](#playback-authorization)
-    - [TLS and transport encryption](#tls-and-transport-encryption)
-  - [Production operation](#production-operation)
-  - [Troubleshooting and compatibility](#troubleshooting-and-compatibility)
-- **Contribute**
-  - [Development](#development)
-    - [Build from source](#build-from-source)
-    - [Run checks](#run-checks)
-  - [License](#license)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Publishing](#publishing): [FFmpeg](#ffmpeg), [GStreamer](#gstreamer), [OBS Studio](#obs-studio), [Media over QUIC](#media-over-quic)
+- [Renditions, audio tracks, and subtitles](#renditions-audio-tracks-and-subtitles)
+- [Supported codecs](#supported-codecs)
+- [HLS features](#hls-features)
+- [Apple HLS Authoring Specification](#apple-hls-authoring-specification)
+- [CDN and caching](#cdn-and-caching)
+- [DVR and recording](#dvr-and-recording)
+- [Security](#security)
+- [Operations](#operations)
+- [Advanced](#advanced)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
 
-## Supported protocols and codecs
+## Install
 
-This table describes server ingestion and output, not decoder support in every player.
-**Yes** means an implemented path. Footnotes identify restrictions and differences in validation coverage.
+**Binary.** Download an archive for Linux, macOS, or Windows from the [releases page](https://github.com/darfink/rushls/releases), extract it, and run `rushls`.
+The first application release is still pending; until then, use Cargo.
 
-| Codec / media | RTMP / Enhanced RTMP | MPEG-TS over SRT | MoQ | HLS output |
-| --- | --- | --- | --- | --- |
-| H.264 / AVC | Yes | Yes | Yes [3] | CMAF |
-| H.265 / HEVC | Enhanced RTMP | Yes | Yes [3] | CMAF |
-| AV1 | Enhanced RTMP | AV1G mapping only [1] | Yes [3] | CMAF |
-| AAC-LC | Yes | ADTS | Yes [3] | CMAF |
-| HE-AAC / HE-AAC v2 | Explicit SBR/PS signaling [2] | ADTS limitations [2] | Configuration-dependent [2][3] | CMAF |
-| Opus | Enhanced RTMP [4] | Mono/stereo [4] | Yes [3] | CMAF |
-| FLAC | Enhanced RTMP, mono/stereo [4] | No | No | CMAF |
-| Text captions | `onCaption` / `onTextData` [5] | No standalone subtitle ingest | No standalone subtitle ingest | WebVTT |
-| Embedded CEA-608/708 | H.264 / HEVC [5] | H.264 / HEVC [5] | Not separately validated | In-band declarations [5] |
-| MP3, AC-3, E-AC-3, VP9, VVC | No | No | No | No |
-
-1. AV1 over MPEG-TS requires the GStreamer AV1G private-PES mapping, its descriptor, and an in-band sequence header.
-2. HE-AAC requires explicit decoder signaling. Implicit SBR detection and AAC-LATM ingestion are unsupported. Do not assume every ADTS HE-AAC source works.
-3. MoQ uses `moq-lite-05`, LOC or legacy Hang, and catalog decoder configuration. The native H.264/AAC publisher is tested. Browser publishing remains unverified.
-4. Decoder tests cover FLAC and MPEG-TS Opus. Browser FLAC playback and live RTMP Opus have narrower validation coverage.
-5. Script captions become WebVTT. Embedded captions remain in the video and receive HLS declarations. They are not converted into WebVTT.
-
-SRT accepts MPEG-TS only, not Matroska, WebM, FLV, or MP4.
-Rushls does not provide RTSP, WebRTC/WHIP, or RTMP/SRT playback endpoints.
-H.264/AAC is the starting point for broad player compatibility.
-See [ingest coverage](docs/feature-parity.md) and the [player matrix](docs/gap-player-matrix.md) for detailed evidence.
-
-## Installation
-
-### Cargo
-
-Install Rust 1.97 or later and a C compiler, then install Rushls from crates.io:
+**Cargo.** Install Rust 1.97 or later and a C compiler, then:
 
 ```sh
 cargo install rushls --locked
 ```
 
-Cargo compiles the executable and installs it in `~/.cargo/bin`. Make sure this directory is on `PATH`.
-See [Quick start](#quick-start) to create a local configuration and publish your first stream.
-
-### Native binaries
-
-The release workflow targets Linux and macOS on AMD64/ARM64, plus Windows AMD64.
-A first application release is pending. The `ci-tools` prerelease contains validation tools, not Rushls binaries.
-Check the [release page](https://github.com/darfink/rushls/releases) for application archives.
-
-Archives include configuration examples, documentation, dependency notices, and SHA-256 checksums.
-Linux builds require glibc 2.39 or later. The macOS matrix uses macOS 15.
-Windows recording requires a filesystem with hard links, such as NTFS.
-See [platform requirements and release procedures](docs/releases.md).
-
-### Docker
-
-CI publishes the Linux AMD64 image to [GitHub Container Registry](https://github.com/darfink/rushls/pkgs/container/rushls) after validation passes.
-The `edge` tag follows validated main builds. Stable releases also publish `latest` and version tags such as `v0.1.0`.
-For production, pin a released version or image digest.
-Public image access is pending; the commands below require registry access until the package is public.
+**Docker.**
 
 ```sh
-docker pull ghcr.io/darfink/rushls:edge
-docker run --rm --name rushls \
-  -p 127.0.0.1:1935:1935/tcp \
-  -p 127.0.0.1:9000:9000/udp \
-  -p 127.0.0.1:8080:8080/tcp \
-  ghcr.io/darfink/rushls:edge
+docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 ghcr.io/darfink/rushls:edge
 ```
 
-The image listens on container interfaces and permits unauthenticated publishing.
-These port mappings expose it only on the host loopback interface.
-For remote access, configure authorization and encryption before changing the mappings.
+The image is not public yet; until it is, pulling it requires registry access.
 
-Mount a deployment configuration at `/etc/rushls/rushls.toml`:
-
-```sh
-docker run --rm --name rushls \
-  -p 1935:1935/tcp -p 9000:9000/udp -p 8443:8443/tcp \
-  --mount type=bind,src="$PWD/production.toml",dst=/etc/rushls/rushls.toml,readonly \
-  --mount type=bind,src="$PWD/secrets",dst=/run/secrets,readonly \
-  --mount type=bind,src="$PWD/data",dst=/var/lib/rushls \
-  ghcr.io/darfink/rushls:edge
-```
-
-This second command requires your deployment configuration, certificates, secrets, and writable data directory.
-The container runs as UID/GID `65532:65532`. Grant that identity access to its volumes.
-MoQ also needs its configured UDP port, for example `-p 4433:4433/udp`.
-See [deployment](docs/deployment.md) for storage and proxy examples.
+Linux binaries need glibc 2.39 or later. See [releases](docs/releases.md) for platforms and image tags.
 
 ## Quick start
 
-Create a configuration that binds each listener to loopback, then start the installed executable:
+Start the server. It runs without a configuration file:
 
 ```sh
-cat > rushls.toml <<'TOML'
-[ingest.rtmp]
-listen = "127.0.0.1:1935"
-[ingest.srt]
-listen = "127.0.0.1:9000"
-[http]
-listen = "127.0.0.1:8080"
-TOML
-rushls --config rushls.toml
+rushls
 ```
 
-Release archives and source checkouts already contain this starter as `rushls.toml`.
-
-In another terminal, publish an H.264/AAC MP4 file:
+Publish an H.264/AAC file from another terminal:
 
 <!-- verify: {"id":"quickstart","stream":"demo","video":1,"audio":1} -->
 ```sh
@@ -194,63 +95,54 @@ ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 \
   -c copy -f flv rtmp://127.0.0.1:1935/live/demo
 ```
 
-Open this URL in an HLS-capable player:
+Play it in Safari, VLC, or any HLS player:
 
 ```text
 http://127.0.0.1:8080/live/demo/index.m3u8
 ```
 
-Without publisher authorization, `/live/demo` identifies the stream.
-With authorization, the admission service selects the final stream ID and can change its playback path.
-A plain browser navigation is not a JavaScript player. Safari can use native HLS; other browsers typically need an HLS library.
+The playlist appears once Rushls has seen enough media to plan segments, usually a few seconds.
+Browsers other than Safari need a JavaScript player such as hls.js.
+If the file has irregular keyframes, use the [encoding recipe](docs/publishing.md#prepare-a-test-file).
 
-Stream copy preserves the input codecs, timestamps, and keyframes.
-If the file lacks compatible media or regular keyframes, use the [encoding recipe](docs/publishing.md#prepare-a-test-file).
-The first playable playlist appears after discovery and sufficient media arrive.
+> [!WARNING]
+> Without a configuration file, Rushls listens on all interfaces (RTMP 1935, SRT 9000, HTTP 8080) and **anyone who can reach it may publish**.
+> That is fine on a laptop. Before exposing it, set up [publisher admission](#publisher-admission).
 
 ## Configuration
 
-[rushls.toml](rushls.toml) is the short local starter.
-[rushls.example.toml](rushls.example.toml) lists every supported TOML field, with optional features commented out.
-Do not uncomment the entire example: some fields require external services, and some alternatives are mutually exclusive.
-
-Print the annotated example from the installed binary:
+Write the annotated example, which lists every setting with its default, and edit what you need:
 
 ```sh
-rushls --print-config-example > my-rushls.toml
-rushls --config my-rushls.toml
+rushls --print-config-example > rushls.toml
+rushls --check     # validate, show listeners and the memory plan, then exit
+rushls
 ```
 
-The print command exits without loading configuration or reading secret files.
-Its output matches the installed version.
-Use the full executable path if `rushls` is not on `PATH`.
-
-Values resolve in this order: compiled defaults, TOML, environment, then CLI arguments.
-For example:
+Rushls finds its configuration from `--config`, then `RUSHLS_CONFIG`, then `./rushls.toml`, then the platform's configuration directory.
+With Docker, mount it over the bundled one:
 
 ```sh
-RUSHLS_HTTP_LISTEN=127.0.0.1:18080 rushls --config rushls.toml
-rushls --config rushls.toml --http-listen=127.0.0.1:18080
+docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 \
+  -v "$PWD/rushls.toml:/etc/rushls/rushls.toml:ro" ghcr.io/darfink/rushls:edge
 ```
 
-TOML strings support `${NAME}` and `${NAME:-fallback}` interpolation.
-Credentials accept a string, `"${VAR}"`, or `{ file = "/path" }`.
-Unknown `RUSHLS_` variables produce warnings. Unknown TOML fields and CLI arguments fail startup.
-Structured policy fields are not all available as environment overrides. `rushls --help` lists supported overrides.
-`rushls --config rushls.toml --check` validates the file, prints listeners and the worst-case memory plan, and exits.
+Most settings can also come from the environment or the command line, which win over the file (`rushls --help` lists them):
 
-The bundled files bind to loopback. Compiled RTMP, SRT, and HTTP defaults bind to all IPv4 interfaces.
-RTMP and HTTP also accept explicit IPv6 addresses. SRT currently requires IPv4.
+```sh
+RUSHLS_HTTP_LISTEN=127.0.0.1:18080 rushls
+rushls --http-listen 127.0.0.1:18080
+```
 
-Configuration changes require a restart, except supported certificate and key rotation.
-See the [configuration guide](docs/config.md) for discovery paths and detailed field behavior.
+Profiles, hooks, recording, and playback claims are file-only.
+Secrets accept a string, `"${VAR}"`, or `{ file = "/run/secrets/name" }`.
+Unknown settings stop startup instead of being ignored. Configuration changes need a restart, except rotated certificates and JWKS keys.
+See the [configuration guide](docs/config.md), the [full reference](docs/config-reference.md), and [deployment](docs/deployment.md) for containers, storage, and proxies.
 
-## Publishing streams
+## Publishing
 
-The examples use the local configuration and one stream name per command.
-File publishers use an H.264/AAC `input.mp4`; the GStreamer RTMP example generates live test media.
-Run each publisher separately. All resulting playlists follow `/live/NAME/index.m3u8`.
-Tested publisher versions and complete recipes appear in [publishing](docs/publishing.md).
+Every publisher below produces a playlist at `/live/NAME/index.m3u8`.
+File examples use an H.264/AAC `input.mp4`. Tested versions and more recipes are in the [publishing guide](docs/publishing.md).
 
 ### FFmpeg
 
@@ -262,17 +154,13 @@ ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 \
   -c copy -f flv rtmp://127.0.0.1:1935/live/ffmpeg
 ```
 
-MPEG-TS over SRT:
+SRT (MPEG-TS). Quote the URL so the shell leaves `&` alone:
 
 <!-- verify: {"id":"ffmpeg-srt","stream":"ffmpeg","video":1,"audio":1} -->
 ```sh
 ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts \
   'srt://127.0.0.1:9000?mode=caller&streamid=publish:live/ffmpeg&pkt_size=1316'
 ```
-
-Quote SRT URLs so the shell does not interpret `&`.
-Rushls is the SRT listener; the publisher is the caller.
-The stream ID selects the resource and supplies an admission credential. It is separate from SRT encryption.
 
 ### GStreamer
 
@@ -290,7 +178,7 @@ gst-launch-1.0 -e \
   rtmpsink location=rtmp://127.0.0.1:1935/live/synthetic sync=true
 ```
 
-MPEG-TS over SRT:
+SRT from a file:
 
 <!-- verify: {"id":"gstreamer-srt","stream":"gstreamer","video":1,"audio":1} -->
 ```sh
@@ -301,15 +189,13 @@ gst-launch-1.0 -e filesrc location=input.mp4 ! qtdemux name=d \
   srtsink uri='srt://127.0.0.1:9000?mode=caller&streamid=publish:live/gstreamer' sync=true
 ```
 
-These commands require the relevant transport, parser, and encoder plugins.
-Direct MP4-to-FLV remuxing in GStreamer produced overlapping startup timestamps in our test; use FFmpeg for RTMP file publishing.
-The [publishing guide](docs/publishing.md#gstreamer) includes plugin checks and the observed file-conversion limitation.
+For RTMP from a file, use FFmpeg: GStreamer's MP4-to-FLV remux produced overlapping startup timestamps in our tests.
 
 ### OBS Studio
 
-Select **Settings → Stream → Custom**:
+In **Settings → Stream**, choose **Custom**:
 
-| Field | Local value |
+| Field | Value |
 | --- | --- |
 | Server | `rtmp://127.0.0.1:1935/live` |
 | Stream key | `obs` |
@@ -317,14 +203,11 @@ Select **Settings → Stream → Custom**:
 | Audio encoder | AAC |
 | Keyframe interval | 2 seconds |
 
-The playback URL is `http://127.0.0.1:8080/live/obs/index.m3u8`.
-With admission enabled, use the stream key issued by your application.
-This is the conventional RTMP setup; OBS multitrack output requires separate version-specific verification.
+Play `http://127.0.0.1:8080/live/obs/index.m3u8`. With admission enabled, use the stream key your application issues.
 
 ### Media over QUIC
 
-MoQ ingest is optional. It accepts `moq-lite-05` over WebTransport or raw QUIC on one UDP port.
-It uses the certificate and private key from `[tls]`:
+MoQ ingest is off by default. It needs a UDP port and a TLS certificate:
 
 ```toml
 [ingest.moq]
@@ -335,7 +218,7 @@ cert = "/run/secrets/fullchain.pem"
 key = "/run/secrets/private-key.pem"
 ```
 
-A native `moq-cli 0.10.0` publisher can import MPEG-TS from FFmpeg:
+Publish with `moq-cli` 0.10.0:
 
 ```sh
 ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts - \
@@ -343,24 +226,21 @@ ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts - \
       --broadcast live/moq --client-version moq-lite-05 import ts
 ```
 
-Use a hostname covered by the certificate and trusted by the publisher.
-Do not assume another MoQ draft or media container is compatible.
-Browser publishing remains unverified. See [MoQ ingestion](docs/moq-ingestion.md) for catalog requirements and local certificate testing.
+Rushls speaks `moq-lite-05` only. See [MoQ ingestion](docs/moq-ingestion.md) for catalog requirements and local certificates.
 
-## Multiple variants, audio tracks, and subtitles
+## Renditions, audio tracks, and subtitles
 
-A publication can carry multiple video and audio tracks.
-Rushls exposes them through one HLS multivariant playlist.
-Separate stream IDs remain separate streams; Rushls does not merge independent publishers into one ladder.
+This is what Rushls is for. One publication can carry several video tracks, several audio tracks, and captions.
+Rushls serves them together from one multivariant playlist, so players can switch between them.
 
-| Goal | Publisher input |
+| You want | The publisher sends |
 | --- | --- |
-| Adaptive video | Multiple encoded video tracks with aligned keyframes |
-| Alternate audio | Multiple audio tracks, with language metadata where available |
-| Separate channels | Different publication names / admitted stream IDs |
-| Subtitles | Supported caption messages present during discovery |
+| Adaptive bitrate | Several video tracks with aligned keyframes |
+| Alternate languages | Several audio tracks, with language metadata |
+| Subtitles | RTMP `onCaption` / `onTextData` messages, served as WebVTT |
+| Closed captions | CEA-608/708 inside H.264/HEVC, declared in the playlist |
 
-For example, publish two video sizes and one audio track over SRT:
+Two video sizes and one audio track over SRT:
 
 <!-- verify: {"id":"ladder-srt","stream":"ladder","video":2,"audio":1} -->
 ```sh
@@ -373,123 +253,161 @@ ffmpeg -re -i input.mp4 \
   -f mpegts 'srt://127.0.0.1:9000?mode=caller&streamid=publish:live/ladder&pkt_size=1316'
 ```
 
-This example assumes a 30 fps, 16:9 source. Its GOP is two seconds.
-Use matching timestamps and keyframe boundaries across video tracks.
-Rushls discovers the track set at startup. Adding tracks or changing decoder configuration mid-publication fails ingestion.
+This assumes a 30 fps source, so `-g 60` gives a keyframe every 2 seconds in both renditions.
+Enhanced RTMP carries multiple tracks too; see [multitrack publishing](docs/publishing.md#multitrack-publishing) for RTMP and alternate audio recipes.
 
-Enhanced RTMP also supports multitrack messages.
-See [multitrack publishing](docs/publishing.md#multitrack-publishing) for the tested FFmpeg version, RTMP recipe, and alternate audio example.
+Subtitles: caption messages become a WebVTT rendition when they are present at startup.
+The [gst-captions](https://github.com/darfink/gst-captions) plugin sends timed text or live transcription as RTMP captions;
+see [publishing captions](docs/publishing.md#publish-captions-with-gst-captions).
 
-RTMP `onCaption` and `onTextData` messages create a WebVTT rendition when discovered before the track set freezes.
-Late messages cannot create a new subtitle track.
-Embedded CEA-608/708 captions in H.264/HEVC stay in the video; they are not an automatic WebVTT conversion path.
-Standalone `.srt` or `.vtt` uploads and MPEG-TS subtitle PIDs are not supported ingest paths.
-For a runnable RTMP subtitle example, see [gst-captions publishing](docs/publishing.md#publish-captions-with-gst-captions).
-The [gst-captions](https://github.com/darfink/gst-captions) plugin adds timed text or live transcription as RTMP caption messages.
+Rushls fixes the set of tracks when a publication starts. Adding a track, or changing a codec configuration mid-stream, ends the publication.
+Separate stream names stay separate streams; Rushls does not merge publishers into one ladder.
 
-## Playback and latency
+## Supported codecs
 
-Always start with the multivariant playlist:
+Input protocols and codecs. Output is always HLS with CMAF (fragmented MP4) segments, and WebVTT for subtitles.
 
-```text
-https://origin.example.com/live/demo/index.m3u8
-```
+| | RTMP | SRT | MoQ |
+| --- | :---: | :---: | :---: |
+| H.264 / AVC | ✅ | ✅ | ✅ |
+| H.265 / HEVC | ✅ <sup>1</sup> | ✅ | ✅ |
+| AV1 | ✅ <sup>1</sup> | ✅ <sup>2</sup> | ✅ |
+| AAC-LC | ✅ | ✅ | ✅ |
+| HE-AAC v1 / v2 | ✅ <sup>3</sup> | ✅ <sup>3</sup> | ✅ <sup>3</sup> |
+| Opus | ✅ <sup>1</sup> | ✅ <sup>4</sup> | ✅ |
+| FLAC | ✅ <sup>1 4</sup> | ❌ | ❌ |
+| Captions → WebVTT | ✅ | ❌ | ❌ |
+| CEA-608/708 in video | ✅ | ✅ | ❔ <sup>5</sup> |
+| MP3, AC-3, E-AC-3, VP9, VVC | ❌ | ❌ | ❌ |
 
-Native Safari HLS and JavaScript HLS players use the same URL.
-A CDN can sit between viewers and Rushls. It must preserve LL-HLS query parameters and support blocking playlist requests.
-For cross-origin playback, configure CORS for the player origin.
+1. Requires Enhanced RTMP.
+2. Only with the GStreamer AV1 mapping (AV1G private PES) and an in-band sequence header.
+3. Only with explicit SBR/PS signalling. Implicit HE-AAC and AAC-LATM are not detected.
+4. Mono and stereo.
+5. Not validated.
 
-A starting configuration for segment and part duration is:
+SRT carries MPEG-TS only. MoQ uses `moq-lite-05`. Rushls has no RTSP, WebRTC, or WHIP ingest, and no RTMP or SRT playback.
+For the widest player support, publish H.264 and AAC-LC. Player support for HEVC, AV1, Opus, and FLAC in HLS varies; see the [player matrix](docs/gap-player-matrix.md).
 
-```toml
-[hls]
-segment = { target = "6s", max = "2x" }
-part = { target = "1s", max = "2x" }
-hold_back = "3x"
-scrubbing = true
-```
+## HLS features
 
-`hold_back` is a live-edge floor, not an end-to-end latency guarantee.
-Encoder buffering, keyframes, SRT latency, networks, and player behavior also contribute.
-Rushls cannot insert keyframes. Admission can select larger targets within the configured bounds to fit the source.
-Scrubbing adds I-frame playlists for compatible CMAF video.
+| Feature | Tags and parameters | |
+| --- | --- | :---: |
+| fMP4 / CMAF segments | `EXT-X-MAP`, `EXT-X-INDEPENDENT-SEGMENTS` | ✅ |
+| Adaptive bitrate | `EXT-X-STREAM-INF` with `CODECS`, `RESOLUTION`, `FRAME-RATE`, `AVERAGE-BANDWIDTH`, `VIDEO-RANGE` | ✅ |
+| Alternate audio | `EXT-X-MEDIA` `TYPE=AUDIO` with `LANGUAGE`, `CHANNELS`, `DEFAULT`, `AUTOSELECT` | ✅ |
+| WebVTT subtitles | `EXT-X-MEDIA` `TYPE=SUBTITLES` | ✅ |
+| Closed captions | `EXT-X-MEDIA` `TYPE=CLOSED-CAPTIONS` with `INSTREAM-ID` | ✅ |
+| Partial segments | `EXT-X-PART`, `EXT-X-PART-INF`, `EXT-X-PRELOAD-HINT` | ✅ |
+| Blocking playlist reload | `EXT-X-SERVER-CONTROL` `CAN-BLOCK-RELOAD`, `_HLS_msn`, `_HLS_part` | ✅ |
+| Delta playlist updates | `CAN-SKIP-UNTIL`, `_HLS_skip`, `EXT-X-SKIP` | ✅ |
+| Rendition reports | `EXT-X-RENDITION-REPORT` | ✅ |
+| Live-edge hold back | `HOLD-BACK`, `PART-HOLD-BACK` | ✅ |
+| Scrubbing / trick play | `EXT-X-I-FRAME-STREAM-INF`, `EXT-X-I-FRAMES-ONLY`, `EXT-X-BYTERANGE` | ✅ |
+| Wall-clock time | `EXT-X-PROGRAM-DATE-TIME` | ✅ |
+| Gaps and reconnects | `EXT-X-GAP`, `EXT-X-DISCONTINUITY`, `EXT-X-DISCONTINUITY-SEQUENCE` | ✅ |
+| DVR window and end of stream | `EXT-X-MEDIA-SEQUENCE`, `EXT-X-ENDLIST` | ✅ |
+| Token in query string | `EXT-X-DEFINE:QUERYPARAM` | ✅ |
+| HTTP/2 | Over HTTPS, negotiated with ALPN | ✅ |
+| Content steering | `EXT-X-CONTENT-STEERING` | ❌ |
+| Date ranges, ad markers, interstitials | `EXT-X-DATERANGE` | ❌ |
+| Encryption and DRM | `EXT-X-KEY`, `EXT-X-SESSION-KEY` | ❌ |
+| Session data | `EXT-X-SESSION-DATA` | ❌ |
+| MPEG-TS segments | | ❌ |
 
-The [deployment guide](docs/deployment.md#reverse-proxies-and-cdns) explains HTTP timeouts and caching.
-The [player matrix](docs/gap-player-matrix.md) separates measured playback results from codec packaging support.
+## Apple HLS Authoring Specification
 
-## DVR and resource limits
+The [HLS Authoring Specification for Apple Devices](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices)
+splits the work between the packager and the encoder.
 
-DVR lets viewers seek within the retained live window.
-Time retention and byte capacity both limit that window.
-Configure two hours of requested retention with disk spill:
+Rushls handles the packaging side: CMAF segments with a 6-second target, 1-second parts, I-frame playlists,
+complete `EXT-X-STREAM-INF` attributes, independent segments, and program date-time.
+It does not implement content steering, encryption, or interstitials.
+
+The encoder side is yours. A publication that follows these settings gives a presentation that meets the specification:
+
+| Setting | Recommendation |
+| --- | --- |
+| Keyframes | Every 2 seconds, at the same timestamps in every rendition |
+| Scene cuts | Disable scene-cut keyframes (`-sc_threshold 0`), or force the 2-second grid with `-force_key_frames 'expr:gte(t,n_forced*2)'` |
+| Video codec | H.264 for compatibility; HEVC for HDR and 4K |
+| Ladder | Several rungs, for example 1920×1080 at 6 Mbps, 1280×720 at 3 Mbps, 960×540 at 2 Mbps, 640×360 at 365 kbps |
+| Frame rate | The source frame rate, the same in every rung |
+| Audio | AAC-LC stereo at 48 kHz, around 128 kbps |
+
+The [renditions example](#renditions-audio-tracks-and-subtitles) shows the FFmpeg options for aligned keyframes.
+
+## CDN and caching
+
+Put a CDN between Rushls and your viewers. Rushls sets `Cache-Control` on every response,
+following the recommendations in [RFC 8216bis Appendix B](https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis#appendix-B),
+so a CDN that honours origin headers needs no per-path TTLs:
+
+| Response | Cached for |
+| --- | --- |
+| Playlist, blocking reload (`_HLS_msn` in the URL) | 6 × target duration |
+| Playlist, live edge | ½ × target duration |
+| Init section, segment, part (`.mp4`, `.m4s`, `.vtt`) | 6 × target duration, `immutable` |
+| Not found, request with an `_HLS_` directive | 4 × target duration |
+| Not found, otherwise | 1 × target duration |
+
+Lifetimes under one second become `no-cache`. With playback authorization on, `public` is left out,
+so shared caches do not store a response fetched with an `Authorization` header.
+
+**Cloudflare.** Cloudflare decides what to cache by file extension unless a Cache Rule says otherwise. For the stream paths:
+
+1. Add a Cache Rule that makes them eligible for cache, with **Edge TTL** set to use the origin's `Cache-Control` header.
+2. Keep the query string in the cache key (the default). `_HLS_msn`, `_HLS_part`, and `_HLS_skip` name different playlist states.
+3. Optionally set `http.public_url` to the Cloudflare hostname, so the startup log prints the viewer-facing playlist URL.
+4. Check Cloudflare's terms for your plan: they restrict serving video through the standard CDN on some plans.
+
+Any CDN must also hold blocking playlist requests open, support Range requests, and never share a playlist that carries one viewer's token.
+See [reverse proxies and CDNs](docs/deployment.md#reverse-proxies-and-cdns) for Nginx and CORS.
+
+## DVR and recording
+
+**DVR** lets viewers seek back within the live stream. Keep two hours, spilling to disk when memory fills:
 
 ```toml
 [hls]
 window = "2h"
 
-[limits]
-publishers = 16
-streams = 32
-
 [memory]
 per_stream = "256MiB"
 
 [disk]
-per_stream = "8GiB"
 dir = "/var/lib/rushls/dvr"
+per_stream = "8GiB"
 ```
 
-At 6 Mbps total across all tracks, two hours needs about 5.4 GB of media before overhead.
-An 8 GiB allowance provides headroom for that example, not for every ladder.
-Sum every retained video and audio track, not just the variant a viewer selects.
+Size the disk for every track, not only the one a viewer watches: bytes ≈ total bitrate × seconds ÷ 8.
+Two hours at 6 Mbps across all renditions is about 5.4 GB. If a limit is reached, the window gets shorter.
+DVR lasts as long as the process; a restart starts fresh. [Storage and capacity](docs/deployment.md#storage-and-capacity) covers sizing.
 
-```text
-media bytes ≈ total bitrate in bits/second × retained seconds ÷ 8
-```
-
-Capacity pressure can shorten the requested window.
-`memory.per_stream` also covers cached manifests. In-flight media is covered by `memory.per_publisher`.
-Disk-backed streams reserve part of their memory allowance for manifests.
-These values are not a hard process RSS limit. Set `memory.total` to refuse publications once the committed budgets would exceed a node-wide ceiling.
-
-Multiply per-stream budgets by the maximum retained stream count.
-Finished or disconnected streams can still occupy retention capacity.
-Monitor actual retention depth, storage availability, and process memory.
-
-DVR is process-lifetime storage. A restart does not restore the old live catalog from disk.
-For persistent copies, configure recording separately.
-See [storage sizing](docs/deployment.md#storage-and-capacity).
-
-## Recording
-
-Recording writes completed segments to a filesystem:
+**Recording** writes every completed segment to disk, independent of the DVR window:
 
 ```toml
 [record]
 dir = "/var/lib/rushls/recordings"
 path = "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4"
-queue_size = 128
-max_pending = "256MiB"
 ```
 
-Each media file contains its decoder configuration. Source random access and codec preroll still affect independent playback.
-Files appear under their final names after the write completes. Existing files are not overwritten.
-Use `{publication}` to separate repeated sessions.
+Each file is complete when its final name appears; in-progress files are named `.rushls-*.tmp`.
+Rushls does not upload recordings itself. To move them to S3 or any other object store, run [rclone](https://rclone.org) on a timer:
 
-Recording survives the live stream and is independent of `hls.window`.
-Rushls does not serve these files as an archive or delete them through DVR retention.
-Provide an external retention/upload workflow for the recording directory.
-Queue overflow or disk errors report recording failures while live delivery continues.
+```sh
+rclone move /var/lib/rushls/recordings s3:my-bucket/recordings \
+  --exclude '.rushls-*' --min-age 1m
+```
 
-The directory must be writable by the service identity.
-Windows requires hard-link support; its directory metadata does not have the same power-loss durability guarantee as Unix.
+If disk or queue limits are hit, recording drops segments and reports it, and live delivery continues.
 See [recording operations](docs/deployment.md#recording-operations).
 
-## Authentication and encryption
+## Security
 
 ### Publisher admission
 
-Configure an HTTP service to authorize each publisher:
+Let your own service decide who may publish, and under which stream ID:
 
 ```toml
 [publish.auth]
@@ -498,14 +416,12 @@ token = { file = "/run/secrets/admission-token" }
 timeout = "2s"
 ```
 
-The service returns an allow/deny decision, a stream ID, and a principal.
-It can also select a named local media profile.
-An unavailable or invalid admission response fails closed.
-See the [publisher API](docs/publisher-api.md) for the exact request and response contracts.
+Rushls sends the stream key and client details; the service answers allow or deny, with a stream ID and optionally a media profile.
+If the service is unreachable, publishing is refused. See the [publisher API](docs/publisher-api.md).
 
 ### Playback authorization
 
-JWT playback authorization verifies viewer tokens locally:
+Verify viewer JWTs locally against a JWKS:
 
 ```toml
 [playback.auth]
@@ -517,14 +433,12 @@ iss = "https://issuer.example.com"
 aud = "rushls-origin"
 ```
 
-Tokens must identify the authorized stream and satisfy the configured claims.
-Viewers can supply a bearer token or the supported `token` query parameter.
-Choose CDN cache rules that preserve authorization. The query-token form requires HLS v11 variable substitution (`EXT-X-DEFINE:QUERYPARAM`), which not every player supports.
-See [playback authorization](docs/deployment.md#authorization).
+Viewers send the token as a bearer header or a `token` query parameter. The query form relies on
+`EXT-X-DEFINE:QUERYPARAM`, which not every player supports. See [authorization](docs/deployment.md#authorization).
 
-### TLS and transport encryption
+### TLS
 
-Serve HTTPS directly:
+Serve HTTPS, and HTTP/2, directly:
 
 ```toml
 [http]
@@ -532,97 +446,118 @@ listen = "off"
 
 [https]
 listen = "0.0.0.0:8443"
-version = { min = "1.3", max = "1.3" }
 
 [tls]
 cert = "/run/secrets/fullchain.pem"
 key = "/run/secrets/private-key.pem"
 ```
 
-Set `min = "1.2"` to allow TLS 1.2 clients alongside TLS 1.3.
-The same `[tls]` certificate serves MoQ ingest.
-Certificate rotation reloads valid replacements without restarting the service.
-Certificate issuance and renewal remain external responsibilities.
-
-RTMP has no native RTMPS listener. Use an external TCP TLS terminator when RTMPS is required, and enable `ingest.rtmp.proxy_protocol` so Rushls still sees each client address.
-SRT uses its own passphrase-based encryption, not TLS:
-
-```toml
-[ingest.srt]
-passphrase = { file = "/run/secrets/srt-passphrase" }
-encryption = "aes256"
-```
-
-MoQ always uses QUIC TLS 1.3. HTTP TLS version bounds do not change QUIC.
+Rushls reloads rotated certificates without a restart. The same certificate serves MoQ.
+SRT uses its own encryption: set `ingest.srt.passphrase`.
+For RTMPS, put a TCP TLS terminator in front of the RTMP port, and see [client addresses](#client-addresses-behind-a-proxy).
 See [encryption and certificates](docs/deployment.md#encryption-and-certificates).
 
-## Production operation
+## Operations
 
-Expose Prometheus metrics on a private listener:
+Expose Prometheus metrics on a private listener, and send lifecycle events to your service:
 
 ```toml
 [metrics]
 listen = "127.0.0.1:9090"
 token = { file = "/run/secrets/metrics-token" }
-```
 
-`/metrics` provides totals; `/metrics/streams` provides per-stream and session detail.
-HTTP `/health/live` and `/health/ready` support process and readiness probes.
-Keep metrics private and use the supplied [monitoring examples](examples/monitoring).
-
-Signed hooks report lifecycle events and completed, fetchable segments:
-
-```toml
 [hook.operations]
 url = "https://hooks.example.com/rushls"
-events = ["session.started", "session.ended", "segment.ready"]
+events = ["session.started", "session.ended", "stream.available", "segment.ready"]
 signing_secret = { file = "/run/secrets/hook-signing" }
+
+[log]
+format = "json"
 ```
 
-Hooks contain JSON metadata and resource paths, not media payloads.
-They do not extend retention. Consumers must fetch segments before expiry and tolerate retries.
-See [hook signing and delivery](docs/publisher-api.md) and [metrics](docs/metrics.md).
+- `/metrics` has totals, `/metrics/streams` has per-stream detail. `/health/live` and `/health/ready` serve probes. See [metrics](docs/metrics.md) and the [monitoring examples](examples/monitoring).
+- Hooks are signed CloudEvents with metadata and paths, not media. See [hooks](docs/publisher-api.md#lifecycle-hooks).
+- `[log] level` sets how much Rushls logs; `RUST_LOG` overrides it for dependencies too.
+- Stop with SIGTERM (Ctrl+C on Windows). Give the supervisor more time than `shutdown_grace`, so hooks and recordings can drain.
 
-Strict input validation is the default. It rejects timing violations and dependent segment starts.
-`publish.strict = false` enables bounded recovery for supported input gaps, not arbitrary damaged media repair.
-Rushls does not synthesize missing frames or audio.
-See [input modes](docs/input-modes.md) for supported cases and limits.
+## Advanced
 
-Reconnects and publisher takeover are distinct operations.
-`publish.takeover = true` allows a new publisher to replace an active one.
-An orderly end can close playlists with `ENDLIST`; transport interruptions can preserve a reconnect opportunity.
-Protocol-specific behavior appears in [deployment](docs/deployment.md#reconnects-and-shutdown).
+### Irregular keyframe intervals
 
-Use SIGTERM on Unix, or Ctrl+C/Ctrl+Break on Windows, for graceful shutdown.
-Set the supervisor's termination grace longer than the configured `shutdown_grace` duration.
-Recording, hooks, and outstanding requests need time to drain.
+Rushls fixes a segment schedule from the first keyframes it sees. Every later segment boundary needs a keyframe near its planned time.
+An encoder whose keyframe interval varies, such as a variable frame rate source or scene-change keyframes, eventually misses one, and the publication ends with:
 
-## Troubleshooting and compatibility
+```text
+no keyframe for segment boundary at 16s (>= 4.12s late, tolerance 0s); set segment.tolerance >= 5s or fix the encoder keyframe interval
+```
 
-| Symptom | First check |
+Fix the encoder if you can. Otherwise, allow the boundary to move:
+
+```toml
+[hls]
+segment = { target = "6s", max = "2x", tolerance = "2s" }
+```
+
+The cost applies to the whole publication: `EXT-X-TARGETDURATION` grows by twice the tolerance (6 s becomes 10 s here),
+and players without Low-Latency HLS sit further behind the live edge. See [irregular keyframe intervals](docs/config.md#hls).
+
+### Scrubbing
+
+Scrubbing is the thumbnail preview you see while dragging the seek bar. Rushls serves an I-frame playlist for each video rendition,
+pointing at the keyframes inside existing segments, so players can show it without downloading whole segments. It is on by default; turn it off with `hls.scrubbing = false`.
+With a 2-second GOP there is one frame every 2 seconds; a 1-second GOP gives denser previews.
+
+### Latency
+
+```toml
+[hls]
+segment = "6s"
+part = "1s"
+hold_back = "3x"
+```
+
+Low-Latency HLS players follow parts, so `part` and `hold_back` (in parts) set how close to live they play.
+Encoder buffering, the keyframe interval, SRT latency, and the player add to that. Rushls cannot insert keyframes.
+
+### Input validation and takeover
+
+Rushls rejects timing errors in the input by default. `publish.strict = false` allows bounded recovery from gaps; it does not repair damaged media or invent frames.
+See [input modes](docs/input-modes.md).
+`publish.takeover = true` lets a new publisher replace the current one under the same stream ID. See [reconnects and shutdown](docs/deployment.md#reconnects-and-shutdown).
+
+### Client addresses behind a proxy
+
+Behind a TLS terminator or load balancer, every RTMP publisher appears to come from the proxy.
+Enable the PROXY protocol (v1 or v2) so Rushls sees the real client, and optionally limit publishers per client:
+
+```toml
+[ingest.rtmp]
+listen = "0.0.0.0:1935"
+proxy_protocol = true
+
+[limits]
+publishers_per_address = 16
+```
+
+The per-address limit covers RTMP, SRT, and MoQ together, and counts IPv6 clients per /64.
+
+## Troubleshooting
+
+| Symptom | Check |
 | --- | --- |
-| Publisher rejected | Admission response, stream identity, codec support, strict timing validation, and source keyframes |
-| Missing variant or audio track | Publisher mappings, discovery-time track presence, and actual transport multitrack support |
-| High latency | Encoder buffers/GOP, SRT latency, selected segment/part targets, and player live-edge policy |
-| DVR shorter than requested | Aggregate bitrate, byte limits, retained stream count, and disk availability |
-| Recording fails | Directory ownership, free space, queue pressure, and filesystem hard-link support |
-| HTTP works but browser playback fails | CORS, HTTPS mixed content, player library, and browser codec support |
+| Publisher rejected | Admission response, codec support, timing validation, and source keyframes |
+| "no keyframe for segment boundary" | The encoder's keyframe interval; see [irregular keyframe intervals](#irregular-keyframe-intervals) |
+| A rendition or audio track is missing | Publisher track mapping, and that every track is present at startup |
+| High latency | Encoder buffering and GOP, SRT latency, segment and part targets, and the player |
+| DVR shorter than requested | Total bitrate, memory and disk limits, and free disk space |
+| Recording fails | Directory ownership, free space, and hard-link support on the filesystem |
+| HTTP works but the browser does not play | CORS, mixed HTTP/HTTPS content, the player library, and browser codec support |
 | MoQ connection rejected | `moq-lite-05`, certificate trust, UDP reachability, and catalog format |
 
-The confirmed upstream hls.js 1.7.3 failure used rendition switching followed by `ENDLIST`, with no injected GAPs.
-That combined case does not establish that switching or `ENDLIST` alone requires the patch.
-Required Chrome validation uses a [local hls.js correction](tools/patches/hls.js/README.md) pending upstream submission.
-This is a specific tested transition, not a claim that ordinary Chrome playback generally fails.
-
-Safari and GStreamer have separate documented GAP-recovery limitations.
-GStreamer clean-stream playback passes. GAP signaling does not guarantee seamless decoder recovery.
-See [player compatibility](docs/releases.md#player-compatibility) and [known limitations](TODO.md).
+Player notes: hls.js 1.7.3 fails one tested case, a rendition switch followed by `ENDLIST`; CI uses a [local hls.js correction](tools/patches/hls.js/README.md) pending upstream submission.
+Safari and GStreamer have their own GAP-recovery limits. See the [player matrix](docs/gap-player-matrix.md), [player compatibility](docs/releases.md#player-compatibility), and [validation exceptions](docs/ci-validation.md).
 
 ## Development
-
-### Build from source
-
-Install Rust 1.97 or later and a C compiler for the `ring` dependency.
 
 ```sh
 git clone https://github.com/darfink/rushls.git
@@ -631,10 +566,7 @@ cargo build --release --locked
 ./target/release/rushls --config rushls.toml
 ```
 
-On Windows, the executable is `target\release\rushls.exe`.
-Shell examples below use POSIX syntax. PowerShell requires its own line-continuation syntax.
-
-### Run checks
+The checkout's `rushls.toml` binds every listener to loopback. Run the checks before sending a change:
 
 ```sh
 cargo fmt --all -- --check
@@ -643,14 +575,9 @@ cargo test --workspace --all-features --locked
 python3 -m unittest discover -s tools -p 'test_*.py'
 ```
 
-CI [extracts and runs the tagged publishing examples](docs/ci-validation.md#executable-documentation) from this README and the publishing guide.
-It checks each audio/video rendition and verifies the caption sample in served WebVTT.
-Configuration examples also pass through the real loader and resolver.
-
-External media, browser, and Apple checks require additional tools.
-See [CI validation](docs/ci-validation.md), [load validation](docs/load-validation.md), and [architecture](docs/architecture.md).
-All local dependencies reside in `crates/`; a fresh clone needs no sibling repositories.
+CI also runs the tagged publishing commands in this README and checks every rendition they produce, and loads every TOML block here through the real configuration loader.
+Media, browser, and Apple checks need extra tools; see [CI validation](docs/ci-validation.md) and [architecture](docs/architecture.md).
 
 ## License
 
-Rushls uses the [MIT license](LICENSE). Third-party components retain their own licenses.
+Rushls uses the [MIT license](LICENSE). Third-party components keep their own licenses.
