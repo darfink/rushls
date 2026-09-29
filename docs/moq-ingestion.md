@@ -147,6 +147,9 @@ python3 -m http.server 18099 --bind 127.0.0.1
 
 Open `http://localhost:18099/browser-moq-publish.html` in Chrome.
 Click **Camera + Mic**.
+Leave **Captions (utf8)** selected to also publish a caption rendition.
+Type a caption and press Enter, or select **Auto** to send one every two seconds; **Clear** removes the caption on screen.
+The subtitle rendition appears in the multivariant playlist as `English`.
 The page fetches the certificate fingerprint from the HTTP listener and pins the WebTransport certificate.
 The origin also accepts the IPv6 loopback address that Chrome can select for `localhost`.
 

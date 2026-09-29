@@ -16,6 +16,10 @@
   #log { white-space: pre-wrap; background: rgba(127,127,127,.12); border-radius: 8px; padding: 10px;
          max-height: 260px; overflow: auto; font: 12px/1.4 ui-monospace, monospace; }
   .hint { color: #777; font-size: 12px; }
+  #stage { position: relative; display: inline-block; width: 100%; max-width: 480px; }
+  #onscreen { position: absolute; left: 8px; right: 8px; bottom: 12px; text-align: center; pointer-events: none;
+              font: 600 16px/1.3 system-ui, sans-serif; color: #fff; text-shadow: 0 0 4px #000, 0 0 2px #000; }
+  #caption { width: 360px; }
 </style>
 </head>
 <body>
@@ -25,7 +29,13 @@
   Captures with the browser's own APIs (<b>Camera+Mic</b> = <code>getUserMedia</code>,
   <b>Screen</b> = <code>getDisplayMedia</code>), encodes with WebCodecs, and publishes to the
   origin over WebTransport (<code>moq-lite-05</code>) as a hang <code>legacy</code> broadcast with an
-  H.264 <code>avc3</code> video track and an Opus audio track.
+  H.264 <code>avc3</code> video track, an Opus audio track, and optionally a <code>utf8</code>
+  caption track that the origin packages as WebVTT subtitles.
+</p>
+<p class="hint">
+  A caption is stamped with <code>performance.now()</code> in microseconds when you send it, the same
+  clock the library stamps captured video and audio with, so it lands on the frame that was on screen
+  at that moment. It stays up until the next caption replaces it or <b>Clear</b> removes it.
 </p>
 <p class="hint">
   The origin is <code>http://</code> on purpose. Chromium will not complete a WebTransport
@@ -46,12 +56,23 @@
   <button id="screen">🖥️ Screen</button>
   <button id="stop" disabled>⏹ Stop</button>
   <label><input type="checkbox" id="audio" checked> Audio (Opus)</label>
+  <label><input type="checkbox" id="captions" checked> Captions (utf8)</label>
   <label><input type="checkbox" id="preview" checked> Local preview</label>
 </div>
 
-<moq-publish id="pub" announce="never" preview="source">
-  <video autoplay muted playsinline></video>
-</moq-publish>
+<div id="stage">
+  <moq-publish id="pub" announce="never" preview="source">
+    <video autoplay muted playsinline></video>
+  </moq-publish>
+  <div id="onscreen"></div>
+</div>
+
+<div class="row">
+  <input type="text" id="caption" placeholder="Caption text, Enter to send" disabled>
+  <button id="send" disabled>💬 Send</button>
+  <button id="clear" disabled>🧹 Clear</button>
+  <label><input type="checkbox" id="auto" disabled> Auto (every 2 s)</label>
+</div>
 
 <div class="row">
   <label>HLS manifest <input type="text" id="hls" value="http://127.0.0.1:18080/web/index.m3u8" size="40"></label>
@@ -62,7 +83,8 @@
 <pre id="log"></pre>
 
 <script type="module">
-import "https://esm.sh/@moq/publish@0.4.6/element";
+import "https://esm.sh/@moq/publish@0.5.1/element";
+import { Hang } from "https://esm.sh/@moq/publish@0.5.1";
 
 const $ = (id) => document.getElementById(id);
 const pub = $("pub");
@@ -134,6 +156,72 @@ $("open-hls").addEventListener("click", () => window.open($("hls").value, "_blan
 let running = false;
 let waitTimer = 0;
 
+// 3. Captions. One utf8 rendition: every frame is one cue, shown from its timestamp until
+//    the next cue, and an empty cue clears it. Each cue opens its own group, so a
+//    subscriber that joins later starts at the caption currently on screen.
+const captions = { rendition: undefined, writer: undefined, dispose: undefined, current: "", auto: 0, count: 0 };
+
+function openCaptions() {
+  const rendition = pub.broadcast.text("captions");
+  rendition.config.set({
+    format: "utf8", role: "caption", lang: "en", label: "English", container: { kind: "legacy" },
+  });
+  const attach = (track) => {
+    // The track exists only while someone is subscribed (the demand gate).
+    captions.writer = track
+      ? new Hang.Container.Legacy.Producer(track, new Hang.Container.Legacy.Format("data"))
+      : undefined;
+    if (track) {
+      log("caption track subscribed");
+      if (captions.current) writeCue(captions.current);
+    }
+  };
+  captions.dispose = rendition.track.subscribe(attach);
+  attach(rendition.track.peek());
+  captions.rendition = rendition;
+}
+
+function closeCaptions() {
+  clearInterval(captions.auto);
+  captions.dispose?.();
+  captions.rendition?.close();
+  Object.assign(captions, { rendition: undefined, writer: undefined, dispose: undefined, current: "", auto: 0 });
+  $("onscreen").textContent = "";
+}
+
+function writeCue(text) {
+  // Microseconds on performance.now(): the clock capture stamps video and audio with.
+  const timestamp = Math.round(performance.now() * 1000);
+  captions.writer?.encode(new TextEncoder().encode(text), timestamp, true);
+}
+
+function sendCue(text) {
+  // A blank line would end a WebVTT cue early, so keep one line per caption row.
+  text = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).join("\n");
+  captions.current = text;
+  $("onscreen").textContent = text;
+  writeCue(text);
+  log(text ? "cue: " + JSON.stringify(text) : "cue: clear", captions.writer ? "" : "(no subscriber yet)");
+}
+
+function setCaptionControls(enabled) {
+  for (const id of ["caption", "send", "clear", "auto"]) $(id).disabled = !enabled;
+  if (!enabled) $("auto").checked = false;
+}
+
+$("send").addEventListener("click", () => { sendCue($("caption").value); $("caption").value = ""; });
+$("caption").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") { sendCue($("caption").value); $("caption").value = ""; }
+});
+$("clear").addEventListener("click", () => sendCue(""));
+$("auto").addEventListener("change", () => {
+  clearInterval(captions.auto);
+  if ($("auto").checked) {
+    captions.auto = setInterval(() =>
+      sendCue("Caption " + ++captions.count + " · " + new Date().toLocaleTimeString()), 2000);
+  }
+});
+
 function start(kind) {
   if (running) return;
   running = true;
@@ -148,6 +236,11 @@ function start(kind) {
 
   // Adding or removing audio changes the origin's frozen track set.
   $("audio").disabled = true;
+  $("captions").disabled = true;
+  if ($("captions").checked) {
+    openCaptions();
+    setCaptionControls(true);
+  }
   $("stop").disabled = false;
   $("camera").disabled = true;
   $("screen").disabled = true;
@@ -177,7 +270,10 @@ function stop() {
   pub.announce = "never";
   pub.source = undefined;
   pub.url = undefined;
+  closeCaptions();
+  setCaptionControls(false);
   $("audio").disabled = false;
+  $("captions").disabled = false;
   $("stop").disabled = true;
   $("camera").disabled = false;
   $("screen").disabled = false;
