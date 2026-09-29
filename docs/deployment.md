@@ -18,7 +18,8 @@ Use `--config` to select that file explicitly.
 
 | Listener | Transport | Example port | Encryption |
 | --- | --- | --- | --- |
-| RTMP | TCP | 1935 | External TLS termination for RTMPS |
+| RTMP | TCP | 1935 | None; use RTMPS |
+| RTMPS | TCP | 1936 | Native TLS 1.2 or 1.3 |
 | SRT | UDP, IPv4 only | 9000 | SRT passphrase / AES |
 | MoQ | UDP | 4433 | QUIC TLS 1.3 |
 | HTTP | TCP | 8080 | Cleartext or a private proxy backend |
@@ -173,7 +174,21 @@ An external certificate manager must issue and renew it.
 Rushls reloads valid certificate replacements; an invalid replacement leaves the previous certificate active.
 Mount certificate directories so replacement files become visible inside the container.
 
-RTMP encryption requires an external TCP TLS terminator forwarding to the private RTMP listener.
+RTMPS is served natively with the same `[tls]` certificate:
+
+```toml
+[ingest.rtmps]
+listen = "0.0.0.0:1936"
+
+[tls]
+cert = "/run/secrets/fullchain.pem"
+key = "/run/secrets/private-key.pem"
+```
+
+Encoders publish to `rtmps://origin.example.com:1936/live/NAME`. The listener accepts TLS 1.2 and 1.3.
+To stop accepting unencrypted RTMP, keep `ingest.rtmp.listen` on loopback or block its port.
+
+An external TCP TLS terminator in front of the plain RTMP listener also works.
 Do not put RTMP through an HTTP `proxy_pass` block.
 Behind a terminator, every RTMP publisher appears to come from the terminator's address.
 Configure it to send a PROXY protocol header (v1 or v2) and enable `proxy_protocol`, so admission, logs, hooks, and per-address limits see the real client:

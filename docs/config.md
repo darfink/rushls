@@ -81,8 +81,8 @@ order the pipeline runs in.
 
 ## Listeners
 
-Ingest listeners live under `[ingest.rtmp]`, `[ingest.srt]`, and
-`[ingest.moq]`; viewers are served by `[http]` and `[https]`.
+Ingest listeners live under `[ingest.rtmp]`, `[ingest.rtmps]`, `[ingest.srt]`,
+and `[ingest.moq]`; viewers are served by `[http]` and `[https]`.
 RTMP and HTTP compiled defaults bind to `0.0.0.0`; explicit `[::]` binds are also supported. SRT is IPv4-only
 (`0.0.0.0`) because ingest uses `rsrt`, which has no IPv6 listener yet.
 MOQ (`ingest.moq.listen`) is **off** until an operator turns it on: WebTransport
@@ -98,16 +98,42 @@ any client that reaches the port directly claim any address. SRT and MoQ run
 over UDP, where proxies that terminate the protocol are rare and a UDP load
 balancer preserves the source address.
 
+`[ingest.rtmps]` terminates TLS in this process, so an encoder can publish
+`rtmps://` without a separate terminator in front. It is **off** until
+`listen` is set, and needs `[tls]`:
+
+```toml
+[ingest.rtmps]
+listen = "[::]:1936"
+
+[tls]
+cert = "/etc/rushls/tls/fullchain.pem"
+key  = "/etc/rushls/tls/private-key.pem"
+```
+
+It is a listener of its own rather than TLS detection on the RTMP port:
+encoders choose the transport from the URL scheme, and a separate port lets a
+firewall expose only the encrypted one. It accepts TLS 1.2 and 1.3 whatever
+`[https]` requires, because encoders embed TLS stacks that update slowly. The
+TLS handshake counts against the same pre-publish deadline as the RTMP
+handshake, and runs only after `limits.publishers_per_address` has admitted
+the client. Admission requests and hooks name the protocol `rtmps`; RTMP
+behind an external terminator still reports `rtmp`, because nothing here can
+see that the hop before it was encrypted. `ingest.rtmps.proxy_protocol` works
+like the RTMP setting, with the header read before the TLS handshake, as a
+TCP load balancer passing TLS through sends it.
+
 `public_url` only shapes playlist URLs:
 empty means relative, which is right behind a proxy or CDN; a trailing slash
 is insignificant.
 
 One `[tls]` table holds the certificate and key for every TLS listener. They
 reload in place on rotation, with secure TLS defaults and no cipher knobs.
-HTTPS and MOQ share the files and the rotation machinery, but not a
+HTTPS, RTMPS, and MOQ share the files and the rotation machinery, but not a
 `ServerConfig`: HTTP/3 requires TLS 1.3 and `h3` ALPN, so MOQ must not reuse
-the viewer HTTPS config. `[https]` or `ingest.moq.listen` without `[tls]` is a
-startup error; `[tls]` that nothing uses is a warning.
+the viewer HTTPS config, and RTMPS negotiates no ALPN at all. `[https]`,
+`ingest.rtmps.listen`, or `ingest.moq.listen` without `[tls]` is a startup
+error; `[tls]` that nothing uses is a warning.
 
 ```toml
 [https]

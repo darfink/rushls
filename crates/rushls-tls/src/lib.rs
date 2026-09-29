@@ -326,38 +326,12 @@ impl<O: TlsObserver> TlsListener<O> {
         settings: TlsSettings,
         observer: Arc<O>,
     ) -> Result<Self, TlsError> {
-        // Carried explicitly rather than through `CryptoProvider::install_default`
-        // so nothing here depends on a process-global having been set first.
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let resolver = Arc::new(CertificateResolver(ArcSwap::from_pointee(load(
-            &settings, &provider,
-        )?)));
-        observer.certificate_loaded(&settings.certificate);
-
-        let versions: &[&rustls::SupportedProtocolVersion] =
-            match (settings.min_version, settings.max_version) {
-                (TlsVersion::Tls12, TlsVersion::Tls12) => &[&rustls::version::TLS12],
-                (TlsVersion::Tls12, TlsVersion::Tls13) => {
-                    &[&rustls::version::TLS13, &rustls::version::TLS12]
-                }
-                (TlsVersion::Tls13, TlsVersion::Tls13) => &[&rustls::version::TLS13],
-                (TlsVersion::Tls13, TlsVersion::Tls12) => {
-                    return Err(TlsError::InvalidVersionRange);
-                }
-            };
-        let mut config = ServerConfig::builder_with_provider(Arc::clone(&provider))
-            .with_protocol_versions(versions)
-            .map_err(TlsError::Configuration)?
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
-        config.alpn_protocols = ALPN_PROTOCOLS.iter().map(|name| name.to_vec()).collect();
-
-        let watcher =
-            CertificateWatch::start(settings.clone(), resolver, provider, Arc::clone(&observer))?;
+        let (config, watcher) =
+            rotating_tcp_server_config(settings.clone(), &ALPN_PROTOCOLS, Arc::clone(&observer))?;
 
         Ok(Self {
             tcp,
-            acceptor: TlsAcceptor::from(Arc::new(config)),
+            acceptor: TlsAcceptor::from(config),
             handshakes: JoinSet::new(),
             settings,
             observer,
@@ -495,6 +469,51 @@ impl CertificateWatch {
             pump,
         })
     }
+}
+
+/// A rustls server configuration for TCP, with a rotating certificate.
+///
+/// For callers that run their own accept loop and handshake inside it, such
+/// as an ingest listener that must reserve capacity and establish the client
+/// address before spending a TLS handshake on it. [`TlsListener`] is built on
+/// the same configuration. An empty `alpn` negotiates no application protocol,
+/// which is what protocols predating ALPN expect.
+///
+/// The returned [`CertificateWatch`] must be held for as long as the config is
+/// used; dropping it silently stops reloads.
+pub fn rotating_tcp_server_config<O: TlsObserver>(
+    settings: TlsSettings,
+    alpn: &[&[u8]],
+    observer: Arc<O>,
+) -> Result<(Arc<ServerConfig>, CertificateWatch), TlsError> {
+    let versions: &[&rustls::SupportedProtocolVersion] =
+        match (settings.min_version, settings.max_version) {
+            (TlsVersion::Tls12, TlsVersion::Tls12) => &[&rustls::version::TLS12],
+            (TlsVersion::Tls12, TlsVersion::Tls13) => {
+                &[&rustls::version::TLS13, &rustls::version::TLS12]
+            }
+            (TlsVersion::Tls13, TlsVersion::Tls13) => &[&rustls::version::TLS13],
+            (TlsVersion::Tls13, TlsVersion::Tls12) => {
+                return Err(TlsError::InvalidVersionRange);
+            }
+        };
+    // Carried explicitly rather than through `CryptoProvider::install_default`
+    // so nothing here depends on a process-global having been set first.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let resolver = Arc::new(CertificateResolver(ArcSwap::from_pointee(load(
+        &settings, &provider,
+    )?)));
+    observer.certificate_loaded(&settings.certificate);
+
+    let mut config = ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(versions)
+        .map_err(TlsError::Configuration)?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>);
+    config.alpn_protocols = alpn.iter().map(|name| name.to_vec()).collect();
+
+    let watcher = CertificateWatch::start(settings, resolver, provider, observer)?;
+    Ok((Arc::new(config), watcher))
 }
 
 /// A rustls server configuration for QUIC, with the same rotating certificate

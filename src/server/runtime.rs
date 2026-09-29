@@ -41,7 +41,7 @@ use crate::{
 use super::{
     http::{
         self, Application, HttpConfig, PlaybackGate, PlaybackSettings, PlaybackStartError,
-        Readiness, TlsError,
+        Readiness, TlsError, TlsSettings,
     },
     metrics::{MetricsConfig, MetricsEndpoint, MetricsReader},
 };
@@ -68,6 +68,14 @@ pub struct NodeConfig {
     /// Expect a PROXY protocol header on every RTMP connection, naming the
     /// client behind a load balancer or TLS terminator.
     pub rtmp_proxy_protocol: bool,
+    /// RTMP over TLS terminated by this node. `None` leaves it off, which is
+    /// the compiled default so a process can boot without certificates.
+    pub rtmps_address: Option<SocketAddr>,
+    /// Expect a PROXY protocol header before the TLS handshake on every RTMPS
+    /// connection, for a TCP load balancer passing TLS through untouched.
+    pub rtmps_proxy_protocol: bool,
+    /// Certificate and TLS versions for RTMPS, from `[tls]`.
+    pub rtmps_tls: Option<TlsSettings>,
     pub srt_address: SocketAddr,
     /// WebTransport ingest. `None` leaves MOQ off, which is the compiled default
     /// so a process can boot without certificates.
@@ -141,6 +149,9 @@ impl Default for NodeConfig {
             record: None,
             rtmp_address: "0.0.0.0:1935".parse().expect("constant address is valid"),
             rtmp_proxy_protocol: false,
+            rtmps_address: None,
+            rtmps_proxy_protocol: false,
+            rtmps_tls: None,
             srt_address: "0.0.0.0:9000".parse().expect("constant address is valid"),
             moq_address: None,
             http_address: Some("0.0.0.0:8080".parse().expect("constant address is valid")),
@@ -172,6 +183,11 @@ pub enum RuntimeError {
         address: SocketAddr,
         source: std::io::Error,
     },
+    #[error("could not bind RTMPS at {address}: {source}")]
+    BindRtmps {
+        address: SocketAddr,
+        source: std::io::Error,
+    },
     #[error("could not bind SRT at {address}: {source}")]
     BindSrt {
         address: SocketAddr,
@@ -196,6 +212,8 @@ pub enum RuntimeError {
     Disk(#[from] DiskError),
     #[error("RTMP listener failed: {0}")]
     Rtmp(std::io::Error),
+    #[error("RTMPS listener failed: {0}")]
+    Rtmps(std::io::Error),
     #[error("SRT listener stopped unexpectedly")]
     SrtStopped,
     #[error("MOQ listener stopped unexpectedly")]
@@ -484,19 +502,15 @@ impl Node {
         Ok(Some(listener))
     }
 
-    /// Runs both listeners and maintenance until `shutdown` resolves.
-    pub async fn serve(
-        mut self,
-        shutdown: impl Future<Output = ()> + Send,
-    ) -> Result<(), RuntimeError> {
-        let rtmp_listener =
-            TcpListener::bind(self.config.rtmp_address)
-                .await
-                .map_err(|source| RuntimeError::BindRtmp {
-                    address: self.config.rtmp_address,
-                    source,
-                })?;
-        let srt_listener = SrtListener::bind(
+    /// Binds every configured ingest listener and reports where each listens.
+    async fn bind_ingest(&self) -> Result<IngestListeners, RuntimeError> {
+        let rtmp = TcpListener::bind(self.config.rtmp_address)
+            .await
+            .map_err(|source| RuntimeError::BindRtmp {
+                address: self.config.rtmp_address,
+                source,
+            })?;
+        let srt = SrtListener::bind(
             self.config.srt_address,
             self.config.srt.clone(),
             self.config.maximum_sessions,
@@ -506,7 +520,77 @@ impl Node {
             address: self.config.srt_address,
             source,
         })?;
-        let moq_listener = self.bind_moq()?;
+        let moq = self.bind_moq()?;
+        let rtmps = self.bind_rtmps().await?;
+
+        let events = &self.services.events;
+        // Reported from the bound listeners rather than from configuration,
+        // because with an ephemeral port the configured value is a zero and
+        // the real one exists nowhere else.
+        report_bound(events, Protocol::Rtmp, rtmp.local_addr());
+        if let Some(listener) = &rtmps {
+            report_bound(events, Protocol::Rtmps, listener.tcp.local_addr());
+        }
+        report_bound(events, Protocol::Srt, Ok(srt.local_address()));
+        if let Some(listener) = &moq {
+            report_bound(
+                events,
+                Protocol::Moq,
+                listener
+                    .local_address()
+                    .map_err(|error| std::io::Error::other(error.to_string())),
+            );
+        }
+        Ok(IngestListeners {
+            rtmp,
+            rtmps,
+            srt,
+            moq,
+        })
+    }
+
+    /// Binds the RTMPS listener, when an address asks for one.
+    ///
+    /// Like MOQ, it cannot start without a certificate, so a missing one is a
+    /// refusal rather than a fallback to cleartext on the RTMPS port.
+    async fn bind_rtmps(&self) -> Result<Option<RtmpsListener>, RuntimeError> {
+        let Some(address) = self.config.rtmps_address else {
+            return Ok(None);
+        };
+        let settings = self
+            .config
+            .rtmps_tls
+            .clone()
+            .ok_or(RuntimeError::InvalidConfiguration(
+                "an RTMPS listener needs a certificate and key",
+            ))?;
+        let (tls, watch) = http::rotating_ingest_server_config(
+            settings,
+            self.services.meters.clone(),
+            self.services.events.clone(),
+            Protocol::Rtmps,
+        )?;
+        let tcp = TcpListener::bind(address)
+            .await
+            .map_err(|source| RuntimeError::BindRtmps { address, source })?;
+        Ok(Some(RtmpsListener {
+            tcp,
+            acceptor: tokio_rustls::TlsAcceptor::from(tls),
+            config: RtmpConfig {
+                protocol: crate::domain::IngestProtocol::Rtmps,
+                ..self.config.rtmp
+            },
+            proxy_protocol: self.config.rtmps_proxy_protocol,
+            _watch: watch,
+        }))
+    }
+
+    /// Runs both listeners and maintenance until `shutdown` resolves.
+    pub async fn serve(
+        mut self,
+        shutdown: impl Future<Output = ()> + Send,
+    ) -> Result<(), RuntimeError> {
+        let ingest = self.bind_ingest().await?;
         // Each viewer listener binds on its own, so enabling TLS adds HTTPS
         // beside cleartext rather than moving it.
         let http_listener = match self.config.http_address {
@@ -530,21 +614,6 @@ impl Node {
         };
 
         let events = self.services.events.clone();
-        // Reported from the bound listeners rather than from configuration,
-        // because with an ephemeral port the configured value is a zero and
-        // the real one exists nowhere else.
-        report_bound(&events, Protocol::Rtmp, rtmp_listener.local_addr());
-        report_bound(&events, Protocol::Srt, Ok(srt_listener.local_address()));
-        if let Some(listener) = &moq_listener {
-            report_bound(
-                &events,
-                Protocol::Moq,
-                listener
-                    .local_address()
-                    .map_err(|error| std::io::Error::other(error.to_string())),
-            );
-        }
-
         let (stop_tx, stop_rx) = watch::channel(false);
         let readiness = Readiness::default();
         let playback = match self.playback.take() {
@@ -558,9 +627,7 @@ impl Node {
         let mut tasks = JoinSet::new();
         self.spawn_listeners(
             &mut tasks,
-            rtmp_listener,
-            srt_listener,
-            moq_listener,
+            ingest,
             http_listener,
             https_listener,
             metrics_listener,
@@ -610,9 +677,7 @@ impl Node {
     fn spawn_listeners(
         &self,
         tasks: &mut JoinSet<Result<(), RuntimeError>>,
-        rtmp_listener: TcpListener,
-        srt_listener: SrtListener,
-        moq_listener: Option<MoqListener>,
+        ingest: IngestListeners,
         http_listener: Option<TcpListener>,
         https_listener: Option<TcpListener>,
         metrics_listener: Option<TcpListener>,
@@ -621,7 +686,7 @@ impl Node {
         readiness: &Readiness,
         stop_rx: watch::Receiver<bool>,
     ) -> Result<(), RuntimeError> {
-        self.spawn_ingest(tasks, rtmp_listener, srt_listener, moq_listener, &stop_rx);
+        self.spawn_ingest(tasks, ingest, &stop_rx);
 
         // Metrics are served on a viewer listener only when the operator gave
         // them that same address. Matching HTTP or HTTPS is one transport, not
@@ -712,9 +777,7 @@ impl Node {
     fn spawn_ingest(
         &self,
         tasks: &mut JoinSet<Result<(), RuntimeError>>,
-        rtmp_listener: TcpListener,
-        srt_listener: SrtListener,
-        moq_listener: Option<MoqListener>,
+        ingest: IngestListeners,
         stop_rx: &watch::Receiver<bool>,
     ) {
         let maximum_pending = self.config.maximum_pending_publishers_per_listener();
@@ -726,7 +789,7 @@ impl Node {
             .map(PublishersPerAddress::new);
         tasks.spawn(run_ingest(
             RtmpListener {
-                tcp: rtmp_listener,
+                tcp: ingest.rtmp,
                 config: self.config.rtmp,
                 proxy_protocol: self.config.rtmp_proxy_protocol,
             },
@@ -736,16 +799,26 @@ impl Node {
             per_address.clone(),
             stop_rx.clone(),
         ));
-        let moq_session_config = moq_listener.is_some().then(|| Arc::clone(&session_config));
+        if let Some(rtmps) = ingest.rtmps {
+            tasks.spawn(run_ingest(
+                rtmps,
+                self.services.clone(),
+                Arc::clone(&session_config),
+                PendingPublishers::new(maximum_pending),
+                per_address.clone(),
+                stop_rx.clone(),
+            ));
+        }
+        let moq_session_config = ingest.moq.is_some().then(|| Arc::clone(&session_config));
         tasks.spawn(run_ingest(
-            srt_listener,
+            ingest.srt,
             self.services.clone(),
             session_config,
             PendingPublishers::new(maximum_pending),
             per_address.clone(),
             stop_rx.clone(),
         ));
-        if let (Some(moq_listener), Some(session_config)) = (moq_listener, moq_session_config) {
+        if let (Some(moq_listener), Some(session_config)) = (ingest.moq, moq_session_config) {
             tasks.spawn(run_ingest(
                 moq_listener,
                 self.services.clone(),
@@ -775,6 +848,14 @@ fn node_name() -> Arc<str> {
         .ok()
         .filter(|name| !name.trim().is_empty())
         .map_or_else(|| Arc::from("rushls"), |name| Arc::from(name.trim()))
+}
+
+/// Every bound ingest listener, handed to the accept loops as one.
+struct IngestListeners {
+    rtmp: TcpListener,
+    rtmps: Option<RtmpsListener>,
+    srt: SrtListener,
+    moq: Option<MoqListener>,
 }
 
 /// Binds one viewer-facing or metrics listener.
@@ -927,23 +1008,7 @@ impl IngestListener for RtmpListener {
     async fn identify(
         (mut stream, peer, config, proxy_protocol): Self::Connection,
     ) -> Result<(SocketAddr, Self::Identified), TransportError> {
-        if !proxy_protocol {
-            return Ok((peer, (stream, config)));
-        }
-        // Under the handshake's own deadline: a proxy that connects and sends
-        // nothing is as unauthenticated as any other silent peer.
-        let deadline = config
-            .timeouts
-            .handshake_read
-            .map_or(config.maximum_publish_wait, |read| {
-                read.min(config.maximum_publish_wait)
-            });
-        let client = tokio::time::timeout(deadline, proxy::read_header(&mut stream, peer))
-            .await
-            .map_err(|_| {
-                TransportError::Handshake("no PROXY protocol header before the deadline".into())
-            })?
-            .map_err(|reason| TransportError::Handshake(reason.into()))?;
+        let client = tcp_client(&mut stream, peer, &config, proxy_protocol).await?;
         Ok((client, (stream, config)))
     }
 
@@ -951,6 +1016,119 @@ impl IngestListener for RtmpListener {
         (stream, config): Self::Identified,
         client: SocketAddr,
     ) -> Result<Box<dyn PendingPublish>, TransportError> {
+        RtmpPendingPublish::handshake(stream, client, config)
+            .await
+            .map(|pending| Box::new(pending) as Box<dyn PendingPublish>)
+    }
+}
+
+/// The deadline for everything a TCP ingest peer does before its first
+/// publish command can arrive: a PROXY header, a TLS handshake.
+///
+/// Each is as unauthenticated as the RTMP handshake itself, so none gets more
+/// patience than it.
+fn tcp_handshake_deadline(config: &RtmpConfig) -> Duration {
+    config
+        .timeouts
+        .handshake_read
+        .map_or(config.maximum_publish_wait, |read| {
+            read.min(config.maximum_publish_wait)
+        })
+}
+
+/// The client behind a TCP ingest connection: the socket's peer, or the
+/// address a required PROXY header names.
+async fn tcp_client(
+    stream: &mut tokio::net::TcpStream,
+    peer: SocketAddr,
+    config: &RtmpConfig,
+    proxy_protocol: bool,
+) -> Result<SocketAddr, TransportError> {
+    if !proxy_protocol {
+        return Ok(peer);
+    }
+    // Under the handshake's own deadline: a proxy that connects and sends
+    // nothing is as unauthenticated as any other silent peer.
+    tokio::time::timeout(
+        tcp_handshake_deadline(config),
+        proxy::read_header(stream, peer),
+    )
+    .await
+    .map_err(|_| TransportError::Handshake("no PROXY protocol header before the deadline".into()))?
+    .map_err(|reason| TransportError::Handshake(reason.into()))
+}
+
+/// RTMP inside TLS that this node terminates itself.
+///
+/// Not built on [`http::TlsListener`], which completes handshakes before
+/// yielding a connection. Ingest must reserve a pending-publisher slot and
+/// count the client address first, so the TLS handshake runs on the
+/// connection's own task like the RTMP handshake after it. A PROXY header, when
+/// required, precedes TLS: a TCP load balancer passing TLS through prepends it
+/// in cleartext.
+struct RtmpsListener {
+    tcp: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    config: RtmpConfig,
+    proxy_protocol: bool,
+    /// Dropping it would silently stop certificate reloads.
+    _watch: rushls_tls::CertificateWatch,
+}
+
+impl IngestListener for RtmpsListener {
+    type Connection = (
+        tokio::net::TcpStream,
+        SocketAddr,
+        RtmpConfig,
+        bool,
+        tokio_rustls::TlsAcceptor,
+    );
+    type Identified = (tokio::net::TcpStream, RtmpConfig, tokio_rustls::TlsAcceptor);
+
+    const PROTOCOL: Protocol = Protocol::Rtmps;
+
+    async fn accept(&mut self) -> Accepted<Self::Connection> {
+        match self.tcp.accept().await {
+            Ok((stream, peer)) => Accepted::Connection((
+                stream,
+                peer,
+                self.config,
+                self.proxy_protocol,
+                self.acceptor.clone(),
+            )),
+            Err(error) => Accepted::Stopped(RuntimeError::Rtmps(error)),
+        }
+    }
+
+    async fn identify(
+        (mut stream, peer, config, proxy_protocol, acceptor): Self::Connection,
+    ) -> Result<(SocketAddr, Self::Identified), TransportError> {
+        let client = tcp_client(&mut stream, peer, &config, proxy_protocol).await?;
+        Ok((client, (stream, config, acceptor)))
+    }
+
+    /// TLS first, after the per-address count, so a client over its limit
+    /// never costs a handshake.
+    async fn handshake(
+        (stream, config, acceptor): Self::Identified,
+        client: SocketAddr,
+    ) -> Result<Box<dyn PendingPublish>, TransportError> {
+        let started = tokio::time::Instant::now();
+        let stream = tokio::time::timeout(tcp_handshake_deadline(&config), acceptor.accept(stream))
+            .await
+            .map_err(|_| TransportError::Handshake("TLS handshake did not finish in time".into()))?
+            .map_err(|error| {
+                TransportError::Handshake(format!("TLS handshake failed: {error}").into())
+            })?;
+        // The RTMP handshake gets what is left of the pre-publish allowance,
+        // so TLS cannot stretch the unauthenticated phase past it.
+        let config = RtmpConfig {
+            maximum_publish_wait: config
+                .maximum_publish_wait
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_millis(1)),
+            ..config
+        };
         RtmpPendingPublish::handshake(stream, client, config)
             .await
             .map(|pending| Box::new(pending) as Box<dyn PendingPublish>)
@@ -1208,6 +1386,184 @@ mod tests {
     };
 
     use super::*;
+
+    mod rtmps {
+        use std::io::IoSlice;
+
+        use bytes::Bytes;
+        use rtmpx::{
+            Packet, Segments,
+            handshake::{Handshake, HandshakeProgress, HandshakeRole},
+            sessions::{
+                ClientEvent, ClientOutput, ClientSession, ClientSessionConfig, PublishMode,
+            },
+        };
+        use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
+        use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+        use super::*;
+        use crate::{domain::IngestProtocol, server::http::fixtures};
+
+        type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+        /// A bound RTMPS listener serving a fresh self-signed certificate.
+        async fn listener()
+        -> Result<(RtmpsListener, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+            let directory = fixtures::scratch("rtmps");
+            let (settings, certificate) = fixtures::write_pair(&directory, "origin.test");
+            let (tls, watch) = http::rotating_ingest_server_config(
+                TlsSettings {
+                    min_version: rushls_tls::TlsVersion::Tls12,
+                    ..settings
+                },
+                ProcessMeters::default(),
+                Events::default(),
+                Protocol::Rtmps,
+            )?;
+            Ok((
+                RtmpsListener {
+                    tcp: TcpListener::bind("127.0.0.1:0").await?,
+                    acceptor: tokio_rustls::TlsAcceptor::from(tls),
+                    config: RtmpConfig {
+                        protocol: IngestProtocol::Rtmps,
+                        ..RtmpConfig::default()
+                    },
+                    proxy_protocol: false,
+                    _watch: watch,
+                },
+                certificate,
+            ))
+        }
+
+        /// Runs one connection through every step the accept loop would.
+        async fn negotiate(
+            listener: &mut RtmpsListener,
+        ) -> Result<Box<dyn PendingPublish>, TransportError> {
+            let Accepted::Connection(connection) = listener.accept().await else {
+                panic!("the listener accepts");
+            };
+            let (client, identified) = RtmpsListener::identify(connection).await?;
+            RtmpsListener::handshake(identified, client).await
+        }
+
+        async fn write<S: AsyncWrite + Unpin, P: Segments>(
+            io: &mut S,
+            mut packet: Packet<P>,
+        ) -> std::io::Result<()> {
+            while !packet.is_complete() {
+                let mut slices = [IoSlice::new(&[]); 32];
+                let count = packet.io_slices(&mut slices);
+                let written = io.write_vectored(&slices[..count]).await?;
+                if written == 0 {
+                    return Err(std::io::ErrorKind::WriteZero.into());
+                }
+                packet.advance(written);
+            }
+            io.flush().await
+        }
+
+        /// An encoder: RTMP handshake, `connect("live")`, `publish("camera")`,
+        /// then it waits for the server to decide.
+        async fn publish<S: AsyncRead + AsyncWrite + Unpin>(mut io: S) -> TestResult {
+            let mut handshake = Handshake::new(HandshakeRole::Client);
+            io.write_all(&handshake.generate_outbound_p0_and_p1()?)
+                .await?;
+            let mut buffer = vec![0; 16 * 1024];
+            let mut input = loop {
+                let read = io.read(&mut buffer).await?;
+                if read == 0 {
+                    return Err("closed during the RTMP handshake".into());
+                }
+                match handshake.process_bytes(&buffer[..read])? {
+                    HandshakeProgress::InProgress { response_bytes } => {
+                        io.write_all(&response_bytes).await?;
+                    }
+                    HandshakeProgress::Completed {
+                        response_bytes,
+                        remaining_bytes,
+                    } => {
+                        io.write_all(&response_bytes).await?;
+                        break Bytes::from(remaining_bytes);
+                    }
+                }
+            };
+            let mut session = ClientSession::new(ClientSessionConfig::default())?;
+            // Both queue their commands; `receive` hands them out as packets.
+            session.connect("live")?;
+            loop {
+                while let Some(output) = session.receive(&mut input)? {
+                    match output {
+                        ClientOutput::Packet(packet) => write(&mut io, packet).await?,
+                        ClientOutput::Event(ClientEvent::ConnectionRequestAccepted { .. }) => {
+                            session.publish("camera", PublishMode::Live)?;
+                        }
+                        _ => {}
+                    }
+                }
+                let read = io.read(&mut buffer).await?;
+                if read == 0 {
+                    return Ok(());
+                }
+                input = Bytes::copy_from_slice(&buffer[..read]);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_tls_publisher_reaches_admission_as_rtmps() -> TestResult {
+            let (mut listener, certificate) = listener().await?;
+            let address = listener.tcp.local_addr()?;
+
+            let mut roots = RootCertStore::empty();
+            roots.add(certificate.into())?;
+            let config = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            let encoder = tokio::spawn(async move {
+                let tcp = tokio::net::TcpStream::connect(address).await?;
+                let local = tcp.local_addr()?;
+                let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+                    .connect(ServerName::try_from("origin.test")?, tcp)
+                    .await?;
+                // The publish outcome is decided by the test, not the encoder.
+                let _ = publish(tls).await;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(local)
+            });
+
+            let pending = negotiate(&mut listener).await?;
+            let request = pending.publish_request()?;
+            assert_eq!(request.protocol, IngestProtocol::Rtmps);
+            assert_eq!(request.resource.namespace.as_deref(), Some("live"));
+            assert_eq!(request.resource.name, "camera");
+            drop(pending);
+            let local = encoder.await??;
+            assert_eq!(
+                request.client.remote_address, local,
+                "admission sees the encoder's own address"
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn a_cleartext_rtmp_publisher_is_refused() -> TestResult {
+            let (mut listener, _) = listener().await?;
+            let address = listener.tcp.local_addr()?;
+            let encoder = tokio::spawn(async move {
+                let tcp = tokio::net::TcpStream::connect(address).await?;
+                let _ = publish(tcp).await;
+                Ok::<_, std::io::Error>(())
+            });
+
+            let Err(error) = negotiate(&mut listener).await else {
+                panic!("RTMP without TLS must not reach admission");
+            };
+            assert!(error.to_string().contains("TLS handshake"), "{error}");
+            encoder.await??;
+            Ok(())
+        }
+    }
 
     fn node(config: NodeConfig) -> Result<Node, RuntimeError> {
         node_with_events(config, Events::default())

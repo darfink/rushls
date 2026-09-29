@@ -85,3 +85,20 @@ pub(crate) fn rotating_quic_server_config(
         Arc::new(NodeTlsObserver::new(meters, events).for_protocol(protocol)),
     )
 }
+
+/// TCP ingest TLS: the configured versions, no ALPN, rotating certificates.
+///
+/// No ALPN because RTMP predates it: encoders send none, and a server that
+/// insisted on one would refuse every publisher.
+pub(crate) fn rotating_ingest_server_config(
+    settings: TlsSettings,
+    meters: ProcessMeters,
+    events: Events,
+    protocol: Protocol,
+) -> Result<(Arc<rustls::ServerConfig>, rushls_tls::CertificateWatch), TlsError> {
+    rushls_tls::rotating_tcp_server_config(
+        settings,
+        &[],
+        Arc::new(NodeTlsObserver::new(meters, events).for_protocol(protocol)),
+    )
+}

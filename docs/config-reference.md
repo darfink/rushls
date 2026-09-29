@@ -24,6 +24,8 @@ See [rushls.example.toml](../rushls.example.toml) for an annotated file.
 | `ingest.stall_timeout` | `12s` | `RUSHLS_INGEST_STALL_TIMEOUT` | `--ingest-stall-timeout` | How long a connected publisher may deliver no usable media before it is dropped, or "off". |
 | `ingest.rtmp.listen` | `0.0.0.0:1935` | `RUSHLS_INGEST_RTMP_LISTEN` | `--ingest-rtmp-listen` | Address receiving RTMP publishers. |
 | `ingest.rtmp.proxy_protocol` | `false` | `RUSHLS_INGEST_RTMP_PROXY_PROTOCOL` | `--ingest-rtmp-proxy-protocol` | Require a PROXY protocol header (v1 or v2) naming the client on every connection. Only for a listener that nothing but the proxy can reach. |
+| `ingest.rtmps.listen` | `off` | `RUSHLS_INGEST_RTMPS_LISTEN` | `--ingest-rtmps-listen` | Address receiving RTMPS publishers, or "off". Needs `[tls]`, which is why it is off by default. |
+| `ingest.rtmps.proxy_protocol` | `false` | `RUSHLS_INGEST_RTMPS_PROXY_PROTOCOL` | `--ingest-rtmps-proxy-protocol` | Require a PROXY protocol header (v1 or v2) before the TLS handshake on every connection, for a TCP load balancer that passes TLS through. Only for a listener that nothing but the proxy can reach. |
 | `ingest.srt.listen` | `0.0.0.0:9000` | `RUSHLS_INGEST_SRT_LISTEN` | `--ingest-srt-listen` | Address receiving SRT publishers. SRT currently requires IPv4. |
 | `ingest.srt.latency` | `120ms` | `RUSHLS_INGEST_SRT_LATENCY` | `--ingest-srt-latency` | SRT receive latency; increase for unstable or long-distance networks. |
 | `ingest.srt.passphrase` | — | `RUSHLS_INGEST_SRT_PASSPHRASE` | `--ingest-srt-passphrase <PATH>` | Optional passphrase: inline, `${VAR}`, or `{ file = "/path" }`. Absent accepts unencrypted SRT. |

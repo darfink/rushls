@@ -129,6 +129,7 @@ impl ResolvedAppConfig {
         line("listeners".to_owned());
         for (name, value) in [
             ("ingest.rtmp", address(Some(node.rtmp_address))),
+            ("ingest.rtmps", address(node.rtmps_address)),
             ("ingest.srt", address(Some(node.srt_address))),
             ("ingest.moq", address(node.moq_address)),
             ("http", address(node.http_address)),
@@ -453,7 +454,7 @@ pub struct AppConfig {
     /// HTTPS listener. Present enables it, with certificates from `[tls]`.
     #[conf(flatten, prefix)]
     pub https: Option<HttpsAppConfig>,
-    /// Certificate and key shared by HTTPS and MoQ ingest.
+    /// Certificate and key shared by HTTPS, RTMPS, and MoQ ingest.
     #[conf(flatten, prefix)]
     pub tls: Option<TlsAppConfig>,
     /// Who may watch.
@@ -637,9 +638,15 @@ impl AppConfig {
         node.hls.uri_base = UriBase::new(self.http.public_url.clone());
         node.http = self.http.resolve(self.https.as_ref(), tls.as_ref())?;
         node.https_address = node.http.tls_address;
-        if tls.is_some() && self.https.is_none() && node.moq_address.is_none() {
-            warnings
-                .push("[tls] is configured but neither [https] nor ingest.moq uses it".to_owned());
+        if tls.is_some()
+            && self.https.is_none()
+            && node.moq_address.is_none()
+            && node.rtmps_address.is_none()
+        {
+            warnings.push(
+                "[tls] is configured but none of [https], ingest.rtmps, or ingest.moq uses it"
+                    .to_owned(),
+            );
         }
         // After `http.resolve`, which replaces the whole struct: the
         // fingerprint route is mounted from the MOQ listener's own
@@ -1235,6 +1242,7 @@ fn startup_warnings(node: &NodeConfig, open_admission: bool) -> Vec<String> {
     let public = |address: &SocketAddr| !address.ip().is_loopback();
 
     let ingest_is_public = public(&node.rtmp_address)
+        || node.rtmps_address.is_some_and(|address| public(&address))
         || public(&node.srt_address)
         || node.moq_address.is_some_and(|address| public(&address));
     if open_admission && ingest_is_public {
@@ -2017,6 +2025,8 @@ pub struct IngestAppConfig {
     #[conf(flatten, prefix)]
     rtmp: RtmpAppConfig,
     #[conf(flatten, prefix)]
+    rtmps: RtmpsAppConfig,
+    #[conf(flatten, prefix)]
     srt: SrtAppConfig,
     #[conf(flatten, prefix)]
     moq: MoqAppConfig,
@@ -2067,6 +2077,7 @@ impl IngestAppConfig {
             write: idle,
         };
         self.srt.apply(node, idle)?;
+        self.rtmps.apply(node, handshake, tls)?;
         self.moq.apply(node, idle, handshake, tls)?;
         Ok(())
     }
@@ -2088,6 +2099,59 @@ pub struct RtmpAppConfig {
     /// reaches the port directly claim to be anyone.
     #[conf(parameter, long, env, default_value = "false")]
     pub proxy_protocol: bool,
+}
+
+/// RTMP inside TLS, terminated by this node with the `[tls]` certificate.
+#[derive(Conf)]
+#[conf(serde)]
+pub struct RtmpsAppConfig {
+    /// Address receiving RTMPS publishers, or "off". Needs `[tls]`, which is
+    /// why it is off by default.
+    ///
+    /// A listener of its own rather than TLS detection on the RTMP port:
+    /// encoders pick the transport from the URL scheme, and a separate port
+    /// lets a firewall expose only the encrypted one.
+    #[conf(
+        parameter,
+        long,
+        env,
+        default_value = "off",
+        value_parser = parse_optional_address,
+        serde(use_value_parser)
+    )]
+    pub listen: OptionalAddress,
+    /// Require a PROXY protocol header (v1 or v2) before the TLS handshake on
+    /// every connection, for a TCP load balancer that passes TLS through.
+    /// Only for a listener that nothing but the proxy can reach.
+    #[conf(parameter, long, env, default_value = "false")]
+    pub proxy_protocol: bool,
+}
+
+impl RtmpsAppConfig {
+    fn apply(
+        &self,
+        node: &mut NodeConfig,
+        handshake: Duration,
+        tls: Option<&TlsFiles>,
+    ) -> Result<(), ConfigError> {
+        node.rtmps_address = self.listen.0;
+        node.rtmps_proxy_protocol = self.proxy_protocol;
+        if node.rtmps_address.is_some() {
+            let tls =
+                tls.ok_or_else(|| invalid("ingest.rtmps needs [tls] with a certificate and key"))?;
+            node.rtmps_tls = Some(TlsSettings {
+                certificate: tls.cert.clone(),
+                key: tls.key.clone(),
+                // Encoders embed their own TLS stacks and update them slowly,
+                // so TLS 1.2 stays accepted here whatever HTTPS requires.
+                min_version: TlsVersion::Tls12,
+                max_version: TlsVersion::Tls13,
+                handshake_timeout: handshake,
+                maximum_pending_handshakes: 256,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Conf)]
@@ -2828,7 +2892,7 @@ pub struct TlsAppConfig {
     key: PathBuf,
 }
 
-/// Resolved `[tls]` paths, shared by HTTPS and MoQ ingest.
+/// Resolved `[tls]` paths, shared by HTTPS, RTMPS, and MoQ ingest.
 pub struct TlsFiles {
     cert: PathBuf,
     key: PathBuf,

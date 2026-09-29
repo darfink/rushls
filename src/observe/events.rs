@@ -297,6 +297,7 @@ pub enum NodeEvent {
 #[display(rename_all = "lowercase")]
 pub enum Protocol {
     Rtmp,
+    Rtmps,
     Srt,
     Http,
     Https,

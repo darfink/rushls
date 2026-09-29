@@ -2605,6 +2605,10 @@ fn tls_listeners_share_one_certificate_and_require_it() -> Result<(), Box<dyn Er
             "[ingest.moq]\nlisten = '[::]:4433'\n",
             "ingest.moq needs [tls]",
         ),
+        (
+            "[ingest.rtmps]\nlisten = '[::]:1936'\n",
+            "ingest.rtmps needs [tls]",
+        ),
     ] {
         let error = resolve_toml(configuration)?
             .err()
@@ -2707,6 +2711,39 @@ fn rtmp_proxy_protocol_and_the_per_address_limit_reach_the_node() -> Result<(), 
     // Zero would refuse everyone, and a value above `publishers` never applies.
     assert!(resolve_toml("[limits]\npublishers_per_address = 0\n")?.is_err());
     assert!(resolve_toml("[limits]\npublishers = 8\npublishers_per_address = 9\n")?.is_err());
+    Ok(())
+}
+
+#[test]
+fn an_rtmps_listener_uses_the_shared_certificate() -> Result<(), Box<dyn Error>> {
+    let defaults = resolve_toml("")??;
+    assert_eq!(
+        defaults.node.rtmps_address, None,
+        "off without a certificate"
+    );
+    assert!(defaults.node.rtmps_tls.is_none());
+
+    let directory = scratch("rtmps-listen");
+    let (settings, _) = write_pair(&directory, "origin.internal");
+    let resolved = resolve_toml(&format!(
+        "[ingest.rtmps]\nlisten = '127.0.0.1:1936'\nproxy_protocol = true\n\
+         [https]\nversion = {{ min = '1.3', max = '1.3' }}\n\
+         [tls]\ncert = \"{}\"\nkey = \"{}\"\n",
+        fixtures::toml_path_contents(&settings.certificate),
+        fixtures::toml_path_contents(&settings.key)
+    ))??;
+    assert_eq!(
+        resolved.node.rtmps_address,
+        Some("127.0.0.1:1936".parse().expect("constant is valid"))
+    );
+    assert!(resolved.node.rtmps_proxy_protocol);
+    let tls = resolved.node.rtmps_tls.ok_or("RTMPS TLS is configured")?;
+    assert_eq!(tls.certificate, settings.certificate);
+    assert_eq!(
+        (tls.min_version, tls.max_version),
+        (rushls_tls::TlsVersion::Tls12, rushls_tls::TlsVersion::Tls13),
+        "encoders keep TLS 1.2 even where HTTPS requires 1.3"
+    );
     Ok(())
 }
 

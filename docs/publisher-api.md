@@ -23,7 +23,8 @@ Rushls sends one POST with `Content-Type: application/json`:
 }
 ```
 
-`protocol` is `rtmp`, `srt`, or `moq`. `remote_address` is the transport peer's
+`protocol` is `rtmp`, `rtmps`, `srt`, or `moq`. `rtmps` means this node
+terminated TLS; RTMP behind an external terminator reports `rtmp`. `remote_address` is the transport peer's
 socket address, including its port. It does not claim to identify a publisher
 behind a relay. Optional transport metadata uses `null` when unavailable.
 `resource.namespace` can also be `null`.

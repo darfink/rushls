@@ -78,6 +78,9 @@ pub struct RtmpConfig {
     /// Largest RTMP audio or video message accepted from one publisher.
     pub maximum_message_bytes: NonZeroUsize,
     pub input_limits: InputLimits,
+    /// How admission requests and hooks name this transport: `rtmp`, or
+    /// `rtmps` when this node terminated TLS in front of the handshake.
+    pub protocol: IngestProtocol,
 }
 
 impl Default for RtmpConfig {
@@ -98,6 +101,7 @@ impl Default for RtmpConfig {
             maximum_queued_payload_bytes: nz::usize!(16 * 1024 * 1024),
             maximum_message_bytes: nz::usize!(8 * 1024 * 1024),
             input_limits: InputLimits::permissive(),
+            protocol: IngestProtocol::Rtmp,
         }
     }
 }
@@ -154,6 +158,7 @@ impl RtmpPendingPublish {
         let (publish_tx, publish_rx) = oneshot::channel();
         let handler = MediaHandler {
             remote_address,
+            protocol: config.protocol,
             publish: Some(publish_tx),
             writer,
             active_stream_id: None,
@@ -333,6 +338,7 @@ enum PublishOutcome {
 
 struct MediaHandler {
     remote_address: SocketAddr,
+    protocol: IngestProtocol,
     publish: Option<oneshot::Sender<PublishAttempt>>,
     writer: IngressWriter,
     active_stream_id: Option<u32>,
@@ -421,7 +427,7 @@ impl MediaHandler {
             .ok_or_else(|| Box::<str>::from("RTMP connection attempted a second publication"))?;
         let (decision_tx, decision_rx) = oneshot::channel();
         let request = PublishRequest {
-            protocol: IngestProtocol::Rtmp,
+            protocol: self.protocol,
             resource: PublishResource {
                 namespace: Some(app_name.to_owned()),
                 name: stream_name.to_owned(),
@@ -968,6 +974,7 @@ mod tests {
         (
             MediaHandler {
                 remote_address: "127.0.0.1:1935".parse().expect("constant is valid"),
+                protocol: IngestProtocol::Rtmp,
                 publish: Some(publish),
                 writer,
                 active_stream_id: None,

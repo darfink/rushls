@@ -34,6 +34,10 @@
 listen = "127.0.0.1:1935"                  # example (loopback); default "0.0.0.0:1935"
 # proxy_protocol = false                   # true behind a TLS terminator or load balancer that sends PROXY v1/v2
 
+# [ingest.rtmps]                           # RTMP over TLS; needs [tls]. Accepts TLS 1.2 and 1.3
+# listen         = "off"                   # e.g. "[::]:1936"
+# proxy_protocol = false                   # true behind a TCP load balancer that sends PROXY v1/v2
+
 [ingest.srt]
 listen = "127.0.0.1:9000"                  # example (loopback); default "0.0.0.0:9000"; IPv4 only
 # latency    = "120ms"                     # raise on lossy or long-haul links; below idle_timeout
@@ -119,7 +123,7 @@ listen = "127.0.0.1:8080"                  # example (loopback); default "0.0.0.
 # handshake_timeout = "5s"
 # max_handshakes    = 256
 
-# One certificate for HTTPS and MoQ ingest. Reloaded on rotation.
+# One certificate for HTTPS, RTMPS, and MoQ ingest. Reloaded on rotation.
 # [tls]
 # cert = "/etc/rushls/tls/fullchain.pem"   # example
 # key  = "/etc/rushls/tls/private-key.pem" # example

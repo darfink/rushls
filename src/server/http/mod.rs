@@ -67,8 +67,8 @@ pub use playback::{PlaybackGate, PlaybackSettings, PlaybackStartError};
 
 use body::{RangeOutcome, StoredMediaBody, parse_range};
 
-pub(crate) use tls::rotating_quic_server_config;
 pub use tls::{TlsError, TlsListener, TlsSettings};
+pub(crate) use tls::{rotating_ingest_server_config, rotating_quic_server_config};
 
 /// What a response with no reusable lifetime says.
 ///

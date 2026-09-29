@@ -13,6 +13,12 @@ use std::net::SocketAddr;
 #[serde(rename_all = "lowercase")]
 pub enum IngestProtocol {
     Rtmp,
+    /// RTMP inside TLS, terminated by this node.
+    ///
+    /// Named apart from `rtmp` so an admission service can require
+    /// encryption; RTMP behind an external terminator still reports `rtmp`,
+    /// because nothing here can tell that the hop before it was encrypted.
+    Rtmps,
     Srt,
     Moq,
 }
@@ -67,6 +73,7 @@ mod tests {
         // protocol is spelled.
         for (protocol, wire) in [
             (IngestProtocol::Rtmp, "rtmp"),
+            (IngestProtocol::Rtmps, "rtmps"),
             (IngestProtocol::Srt, "srt"),
             (IngestProtocol::Moq, "moq"),
         ] {
