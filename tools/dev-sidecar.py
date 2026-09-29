@@ -5,25 +5,24 @@ Stdlib only, one file, no install step. Serves both surfaces at once because in
 practice you want to watch a publication end to end: admission at ``/admit``,
 lifecycle deliveries at ``/events``.
 
-    ./tools/echo-sidecar.py                 # allow everyone, print everything
-    ./tools/echo-sidecar.py --deny          # refuse every publisher
-    ./tools/echo-sidecar.py --port 9000
+    ./tools/dev-sidecar.py                  # allow everyone, print everything
+    ./tools/dev-sidecar.py --deny           # refuse every publisher
+    ./tools/dev-sidecar.py --port 9000
 
 Point Rushls at it with the tables below. They are deliberately separate: you
 can run either half on its own.
 
-    [auth]
-    provider = "http"
-
-    [auth.http]
+    [publish.auth]
     url = "http://127.0.0.1:8081/admit"
 
-    [hooks.endpoints.echo]
+    [hook.dev]
     url = "http://127.0.0.1:8081/events"
     events = ["session.started", "stream.available", "session.ended"]
 
 This is a development tool. It has no authentication of its own, answers every
 caller, and should not be reachable from anywhere you do not control.
+It admits everyone, so it is not an authorization example; for that, see
+``examples/admission/``.
 """
 
 from __future__ import annotations
@@ -137,7 +136,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if OPTIONS.deny:
             log("DENY", RED, f"refusing {requested}")
-            self._respond(200, {"decision": "deny", "reason": "echo_sidecar_denies"})
+            self._respond(200, {"decision": "deny", "reason": "dev_sidecar_denies"})
             return
 
         # Echoing the requested resource is what makes this a useful default:
@@ -146,7 +145,7 @@ class Handler(BaseHTTPRequestHandler):
         decision = {
             "decision": "allow",
             "stream_id": OPTIONS.stream or requested,
-            "principal": "echo-sidecar",
+            "principal": "dev-sidecar",
         }
         if OPTIONS.profile:
             decision["profile"] = OPTIONS.profile
@@ -201,7 +200,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Echo sidecar for Rushls admission and lifecycle hooks.",
+        description="Development sidecar for Rushls admission and lifecycle hooks.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

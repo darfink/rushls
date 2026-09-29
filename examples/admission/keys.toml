@@ -1,0 +1,16 @@
+# Stream keys for examples/admission/admission.py. Each key is a secret the
+# publisher presents; `stream` is the public stream ID it publishes to, so the
+# playlist is /<stream>/index.m3u8 whatever the key is.
+
+[keys."k3y-studio-a-7f2c9d"]
+stream = "studio/a"
+principal = "studio-a"
+
+[keys."k3y-events-4b81e0"]
+stream = "events/main"
+principal = "events-team"
+profile = "premium"                  # a [publish.profile.premium] in rushls.toml
+
+[keys."k3y-retired-000000"]
+stream = "old/channel"
+disabled = true                      # refused without deleting the entry
