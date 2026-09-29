@@ -110,6 +110,14 @@ Evaluate these separately from release validation:
   is access control rather than DRM, and player support for clear-key `SAMPLE-AES` is
   unverified. The main value is groundwork for FairPlay/Widevine through a DRM vendor;
   licensing stays out of scope.
+- [ ] Read hang `vtt` text renditions: each frame is a self-contained WebVTT segment
+  with its own cue timing, so it needs a small cue parser and a rule for which clock
+  those timings are on. `utf8` cues are already ingested. Start once a real publisher
+  sends `vtt`; the IETF streaming format may yet change how cues are carried.
+- [ ] Map a hang text rendition's `role = "caption"` to `CHARACTERISTICS` with the
+  `public.accessibility.transcribes-spoken-dialog` and `describes-music-and-sound`
+  values, so players can tell SDH captions from subtitles. The playlist writer has no
+  `CHARACTERISTICS` support yet.
 
 ## Completed baseline
 
