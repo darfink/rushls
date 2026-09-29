@@ -4,12 +4,11 @@
     <img src="docs/assets/rushls.svg" alt="Rushls" width="420">
   </picture>
 </h1>
-<p align="center"><strong>One focus: excellent HLS.</strong></p>
 <p align="center">
-  <a href="https://github.com/darfink/rushls/actions/workflows/ci.yaml"><img src="https://github.com/darfink/rushls/actions/workflows/ci.yaml/badge.svg" alt="Build and validation"></a>
-  <a href="https://crates.io/crates/rushls"><img src="https://img.shields.io/crates/v/rushls.svg" alt="crates.io"></a>
-  <a href="https://github.com/darfink/rushls/pkgs/container/rushls"><img src="https://img.shields.io/badge/container-GHCR-986044" alt="Container registry"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <a href="https://github.com/darfink/rushls/actions/workflows/ci.yaml"><img src="https://img.shields.io/github/actions/workflow/status/darfink/rushls/ci.yaml?branch=main&style=flat-square&label=build" alt="Build and validation"></a>
+  <a href="https://crates.io/crates/rushls"><img src="https://img.shields.io/crates/v/rushls?style=flat-square" alt="crates.io"></a>
+  <a href="https://github.com/darfink/rushls/pkgs/container/rushls"><img src="https://img.shields.io/badge/container-GHCR-986044?style=flat-square" alt="Container registry"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT license"></a>
 </p>
 
 Rushls is a live streaming origin that does one thing: **HLS and Low-Latency HLS, the way Apple specifies them.**
@@ -26,7 +25,7 @@ viewers switch bitrate, pick a language, and turn on subtitles.
 - **DVR, scrubbing, and recording.** A rolling window in memory with disk spill, I-frame playlists for fast seeking, and recording of every segment to disk.
 - **CDN-ready.** `Cache-Control` follows the HLS specification's caching recommendations.
 - **Built for operation.** Publisher admission webhook, JWT playback authorization, signed lifecycle hooks, and Prometheus metrics.
-- **One self-contained binary.** No FFmpeg, no libsrt, nothing else to install.
+- **One self-contained binary.** No FFmpeg, no libsrt — completely standalone.
 
 Rushls packages media; it does not transcode. Your encoder produces the renditions, and Rushls turns them into HLS.
 
@@ -60,24 +59,28 @@ OBS / FFmpeg / GStreamer / MoQ publisher
 
 ## Install
 
-**Binary.** Download an archive for Linux, macOS, or Windows from the [releases page](https://github.com/darfink/rushls/releases), extract it, and run `rushls`.
-The first application release is still pending; until then, use Cargo.
+### Binary
 
-**Cargo.** Install Rust 1.97 or later and a C compiler, then:
+Download an archive for Linux, macOS, or Windows from the [releases page](https://github.com/darfink/rushls/releases), extract it, and run `rushls`.
+The first application release is still pending; until then, use Cargo.
+Linux binaries need glibc 2.39 or later.
+
+### Cargo
+
+Install Rust 1.97 or later and a C compiler, then:
 
 ```sh
 cargo install rushls --locked
 ```
 
-**Docker.**
+### Docker
 
 ```sh
 docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 ghcr.io/darfink/rushls:edge
 ```
 
 The image is not public yet; until it is, pulling it requires registry access.
-
-Linux binaries need glibc 2.39 or later. See [releases](docs/releases.md) for platforms and image tags.
+See [releases](docs/releases.md) for platforms and image tags.
 
 ## Quick start
 
@@ -230,7 +233,7 @@ Rushls speaks `moq-lite-05` only. See [MoQ ingestion](docs/moq-ingestion.md) for
 
 ## Renditions, audio tracks, and subtitles
 
-This is what Rushls is for. One publication can carry several video tracks, several audio tracks, and captions.
+One publication can carry several video tracks, several audio tracks, and captions.
 Rushls serves them together from one multivariant playlist, so players can switch between them.
 
 | You want | The publisher sends |
@@ -263,28 +266,34 @@ see [publishing captions](docs/publishing.md#publish-captions-with-gst-captions)
 Rushls fixes the set of tracks when a publication starts. Adding a track, or changing a codec configuration mid-stream, ends the publication.
 Separate stream names stay separate streams; Rushls does not merge publishers into one ladder.
 
+**How the playlist is laid out.** All video tracks form one ladder, all audio tracks one group of alternatives, and all subtitle tracks another.
+The first track of each kind is the default. Neither the grouping nor the default is configurable today.
+Names and languages come from the source:
+
+| Protocol | Name (`NAME`) | Language (`LANGUAGE`) |
+| --- | --- | --- |
+| RTMP | `onMetaData` `title`, per track with Enhanced RTMP, or `audiotitle` / `videotitle` | `onMetaData` `language`, per track or `audiolanguage` / `videolanguage` |
+| SRT | Not carried | ISO 639 descriptor, for example FFmpeg `-metadata:s:a:0 language=eng` |
+| MoQ | Not carried | Not carried |
+
+A track without a name gets a generic one such as `Audio 2`.
+
 ## Supported codecs
 
 Input protocols and codecs. Output is always HLS with CMAF (fragmented MP4) segments, and WebVTT for subtitles.
 
-| | RTMP | SRT | MoQ |
-| --- | :---: | :---: | :---: |
-| H.264 / AVC | ✅ | ✅ | ✅ |
-| H.265 / HEVC | ✅ <sup>1</sup> | ✅ | ✅ |
-| AV1 | ✅ <sup>1</sup> | ✅ <sup>2</sup> | ✅ |
-| AAC-LC | ✅ | ✅ | ✅ |
-| HE-AAC v1 / v2 | ✅ <sup>3</sup> | ✅ <sup>3</sup> | ✅ <sup>3</sup> |
-| Opus | ✅ <sup>1</sup> | ✅ <sup>4</sup> | ✅ |
-| FLAC | ✅ <sup>1 4</sup> | ❌ | ❌ |
-| Captions → WebVTT | ✅ | ❌ | ❌ |
-| CEA-608/708 in video | ✅ | ✅ | ❔ <sup>5</sup> |
-| MP3, AC-3, E-AC-3, VP9, VVC | ❌ | ❌ | ❌ |
-
-1. Requires Enhanced RTMP.
-2. Only with the GStreamer AV1 mapping (AV1G private PES) and an in-band sequence header.
-3. Only with explicit SBR/PS signalling. Implicit HE-AAC and AAC-LATM are not detected.
-4. Mono and stereo.
-5. Not validated.
+| | RTMP(S) | SRT | MoQ | Notes |
+| --- | :---: | :---: | :---: | --- |
+| H.264 / AVC | ✅ | ✅ | ✅ | |
+| H.265 / HEVC | ✅ | ✅ | ✅ | RTMP needs Enhanced RTMP |
+| AV1 | ✅ | ✅ | ✅ | RTMP needs Enhanced RTMP; SRT needs the GStreamer AV1G mapping and an in-band sequence header |
+| AAC-LC | ✅ | ✅ | ✅ | |
+| HE-AAC v1 / v2 | ✅ | ✅ | ✅ | Explicit SBR/PS signalling only; implicit HE-AAC and AAC-LATM are not detected |
+| Opus | ✅ | ✅ | ✅ | RTMP needs Enhanced RTMP; SRT is mono or stereo |
+| FLAC | ✅ | ❌ | ❌ | Enhanced RTMP, mono or stereo |
+| Captions → WebVTT | ✅ | ❌ | ❌ | RTMP `onCaption` / `onTextData` |
+| CEA-608/708 in video | ✅ | ✅ | ✅ | H.264 and HEVC; declared in the playlist, not converted to WebVTT |
+| MP3, AC-3, E-AC-3, VP9, VVC | ❌ | ❌ | ❌ | |
 
 SRT carries MPEG-TS only. MoQ uses `moq-lite-05`. Rushls has no RTSP, WebRTC, or WHIP ingest, and no RTMP or SRT playback.
 For the widest player support, publish H.264 and AAC-LC. Player support for HEVC, AV1, Opus, and FLAC in HLS varies; see the [player matrix](docs/gap-player-matrix.md).
@@ -358,15 +367,20 @@ so shared caches do not store a response fetched with an `Authorization` header.
 
 1. Add a Cache Rule that makes them eligible for cache, with **Edge TTL** set to use the origin's `Cache-Control` header.
 2. Keep the query string in the cache key (the default). `_HLS_msn`, `_HLS_part`, and `_HLS_skip` name different playlist states.
-3. Optionally set `http.public_url` to the Cloudflare hostname, so the startup log prints the viewer-facing playlist URL.
-4. Check Cloudflare's terms for your plan: they restrict serving video through the standard CDN on some plans.
+3. Check Cloudflare's terms for your plan: they restrict serving video through the standard CDN on some plans.
 
 Any CDN must also hold blocking playlist requests open, support Range requests, and never share a playlist that carries one viewer's token.
 See [reverse proxies and CDNs](docs/deployment.md#reverse-proxies-and-cdns) for Nginx and CORS.
 
+**With playback authorization.** Media bytes are the same for every viewer, so they should be cached without the token in the cache key,
+but then a cached segment would be served to anyone. [`examples/cloudflare/playback-worker.js`](examples/cloudflare/playback-worker.js)
+is a sample Worker, built on the small [`jose`](https://github.com/panva/jose) library, that verifies the JWT at the edge as Rushls does, and only then serves media from a token-free cache entry.
+
 ## DVR and recording
 
-**DVR** lets viewers seek back within the live stream. Keep two hours, spilling to disk when memory fills:
+**DVR** lets viewers seek back within the live stream. Media is kept in memory first.
+When a stream reaches `memory.per_stream`, its oldest media moves to disk, up to `disk.per_stream`.
+Without `[disk]`, the memory budget alone limits the window. Two hours, spilling to disk:
 
 ```toml
 [hls]
@@ -381,7 +395,7 @@ per_stream = "8GiB"
 ```
 
 Size the disk for every track, not only the one a viewer watches: bytes ≈ total bitrate × seconds ÷ 8.
-Two hours at 6 Mbps across all renditions is about 5.4 GB. If a limit is reached, the window gets shorter.
+Two hours at 6 Mbps across all renditions is about 5.4 GB. If both budgets fill, the oldest media is dropped and the window gets shorter.
 DVR lasts as long as the process; a restart starts fresh. [Storage and capacity](docs/deployment.md#storage-and-capacity) covers sizing.
 
 **Recording** writes every completed segment to disk, independent of the DVR window:
@@ -418,6 +432,8 @@ timeout = "2s"
 
 Rushls sends the stream key and client details; the service answers allow or deny, with a stream ID and optionally a media profile.
 If the service is unreachable, publishing is refused. See the [publisher API](docs/publisher-api.md).
+[`examples/admission`](examples/admission/admission.py) is a small example service: a stream-key allowlist that maps each secret key to a public stream ID.
+For development, [`tools/dev-sidecar.py`](tools/dev-sidecar.py) admits everyone and prints every admission request and hook event.
 
 ### Playback authorization
 
@@ -436,9 +452,14 @@ aud = "rushls-origin"
 Viewers send the token as a bearer header or a `token` query parameter. The query form relies on
 `EXT-X-DEFINE:QUERYPARAM`, which not every player supports. See [authorization](docs/deployment.md#authorization).
 
+Rushls fetches the JWKS at startup, and refuses to start if it cannot. It refreshes the key set in the background,
+following the JWKS response's `Cache-Control: max-age` (clamped to 30 seconds to 1 hour, 5 minutes by default).
+If a refresh fails, the current keys stay in use and Rushls retries after 5 minutes.
+A token signed with a key ID that is not in the current set is refused, so publish new keys before you sign with them.
+
 ### TLS
 
-Serve HTTPS, and HTTP/2, directly:
+Serve HTTPS (with HTTP/2) and RTMPS directly:
 
 ```toml
 [http]
@@ -447,14 +468,17 @@ listen = "off"
 [https]
 listen = "0.0.0.0:8443"
 
+[ingest.rtmps]
+listen = "0.0.0.0:1936"
+
 [tls]
 cert = "/run/secrets/fullchain.pem"
 key = "/run/secrets/private-key.pem"
 ```
 
+Encoders publish to `rtmps://origin.example.com:1936/live/NAME`. RTMPS accepts TLS 1.2 and 1.3, and admission sees the protocol as `rtmps`.
 Rushls reloads rotated certificates without a restart. The same certificate serves MoQ.
 SRT uses its own encryption: set `ingest.srt.passphrase`.
-For RTMPS, put a TCP TLS terminator in front of the RTMP port, and see [client addresses](#client-addresses-behind-a-proxy).
 See [encryption and certificates](docs/deployment.md#encryption-and-certificates).
 
 ## Operations
@@ -521,14 +545,18 @@ Encoder buffering, the keyframe interval, SRT latency, and the player add to tha
 
 ### Input validation and takeover
 
-Rushls rejects timing errors in the input by default. `publish.strict = false` allows bounded recovery from gaps; it does not repair damaged media or invent frames.
-See [input modes](docs/input-modes.md).
+Rushls rejects timing errors in the input by default. With `publish.strict = false`, a hole in the input is served as `EXT-X-GAP`
+instead of ending the publication: missing audio, and missing video when the encoder declares a fixed frame rate and sends no B-frames (H.264, HEVC, or AV1).
+Recovery has limits (500 ms per hole, 1 second per minute), and Rushls never invents frames or audio. See [input modes](docs/input-modes.md).
 `publish.takeover = true` lets a new publisher replace the current one under the same stream ID. See [reconnects and shutdown](docs/deployment.md#reconnects-and-shutdown).
 
 ### Client addresses behind a proxy
 
-Behind a TLS terminator or load balancer, every RTMP publisher appears to come from the proxy.
-Enable the PROXY protocol (v1 or v2) so Rushls sees the real client, and optionally limit publishers per client:
+Behind a TLS terminator or load balancer, every RTMP or RTMPS publisher appears to come from the proxy's address.
+If your proxy sends the PROXY protocol (v1 or v2), Rushls can read the real client address from it.
+Enable it only when the proxy sends it: with `proxy_protocol = true`, Rushls refuses connections without the header.
+`ingest.rtmps.proxy_protocol` does the same for a TCP load balancer that passes TLS through.
+You can also limit publishers per client:
 
 ```toml
 [ingest.rtmp]
@@ -563,10 +591,10 @@ Safari and GStreamer have their own GAP-recovery limits. See the [player matrix]
 git clone https://github.com/darfink/rushls.git
 cd rushls
 cargo build --release --locked
-./target/release/rushls --config rushls.toml
+./target/release/rushls --config rushls.example.toml
 ```
 
-The checkout's `rushls.toml` binds every listener to loopback. Run the checks before sending a change:
+The example configuration's only active settings bind every listener to loopback. Run the checks before sending a change:
 
 ```sh
 cargo fmt --all -- --check
