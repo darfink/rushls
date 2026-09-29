@@ -539,7 +539,21 @@ fn recognize_a53(
             // CEA-608 Line 21 fields. Field 1 carries CC1/CC2 and field 2
             // carries CC3/CC4; which of the two channels is in use cannot be
             // told apart without decoding the control codes.
-            field @ (0 | 1) => found.cea608_fields |= 1 << field,
+            //
+            // Valid null pairs (both bytes 0x00 once parity is stripped) mean
+            // different things on the two fields. On field 1 they are how an
+            // encoder keeps an idle caption service running, which is the
+            // announcement a player needs before the first line of text: the
+            // multivariant playlist is usually fetched once, so declaring CC1
+            // only at the first cue would hide it from anyone already
+            // watching. On field 2 they are filler that converters such as
+            // GStreamer's `ccconverter` emit whenever field 1 is in use, and
+            // counting them declared an empty CC3 beside every real CC1.
+            0 => found.cea608_fields |= 1,
+            1 if triplet[1] & 0x7F != 0 || triplet[2] & 0x7F != 0 => {
+                found.cea608_fields |= 1 << 1;
+            }
+            1 => {}
             // DTVCC data. cc_type 3 announces a packet and carries its header
             // plus the first payload byte; cc_type 2 continues one. Both bytes
             // of the triplet belong to the packet.
@@ -799,6 +813,33 @@ mod tests {
         assert!(observed.a53_present);
         assert_eq!(observed.cea608_fields, 0b01);
         assert!(!observed.dtvcc_present);
+    }
+
+    #[test]
+    fn valid_null_pairs_on_an_unused_field_do_not_declare_it() {
+        // GStreamer's ccconverter keeps field 2 running with cc_valid set and
+        // null bytes. Counting them declared an empty CC3 next to the real CC1.
+        let mut detector =
+            H264CaptionDetector::new(&track(Codec::H264, avcc_extradata())).expect("h264 track");
+        let captions = sei_nal(4, &cc_data(&[(0, 0x48, 0x49), (1, 0x00, 0x00)]));
+        let access_unit = avcc_access_unit(&[captions, slice_nal(&[0x88; 32])]);
+
+        assert!(detector.inspect(&access_unit));
+        assert_eq!(detector.observed().cea608_fields, 0b01);
+    }
+
+    #[test]
+    fn an_idle_field_one_service_is_declared_before_its_first_cue() {
+        // Valid nulls on field 1 are an encoder announcing a caption service
+        // that has not spoken yet. Waiting for text would declare CC1 after
+        // players had already read the multivariant playlist.
+        let mut detector =
+            H264CaptionDetector::new(&track(Codec::H264, avcc_extradata())).expect("h264 track");
+        let captions = sei_nal(4, &cc_data(&[(0, 0x00, 0x00), (1, 0x00, 0x00)]));
+        let access_unit = avcc_access_unit(&[captions, slice_nal(&[0x88; 32])]);
+
+        assert!(detector.inspect(&access_unit));
+        assert_eq!(detector.observed().cea608_fields, 0b01);
     }
 
     #[test]
