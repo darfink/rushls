@@ -455,6 +455,33 @@ The default is zero. A 100 ms tolerance can increase a segment by
 including audio rounding and timestamp quantization, must fit `segment.max`.
 Parts have no tolerance: they follow the segment boundaries.
 
+**Irregular keyframe intervals.** Admission fixes one segment schedule from
+the first keyframes it sees, and every later cut must find a keyframe inside
+the tolerance window around its planned instant. The schedule never moves: a
+late cut does not shift the next one. An encoder whose keyframe interval
+varies — variable frame rate sources, scene-change keyframes that restart the
+interval, some OBS setups — misses a window and ends the publication, with an
+error naming how late the keyframe was and the tolerance that would cover it.
+
+Fix the encoder first where possible: a fixed interval (`-g`, `-keyint_min`,
+and `-sc_threshold 0` in FFmpeg; a keyframe interval in seconds in OBS) keeps
+the tolerance at zero. Otherwise, raise `segment.tolerance` to the lateness
+the encoder shows, and `segment.max` if the ceiling no longer fits:
+
+```toml
+[hls]
+segment = { target = "6s", max = "2x", tolerance = "2s" }
+```
+
+The cost is paid for the whole publication, on time or not. The tolerance
+raises `EXT-X-TARGETDURATION` by twice its value — 6 s becomes 10 s here — and
+players without Low-Latency HLS hold back three target durations from the live
+edge, so their latency grows by six times the tolerance. Low-Latency players
+follow the part target and are unaffected. Tolerance absorbs keyframes that
+wobble around a steady interval; an encoder that settles into a different
+interval mid-stream still fails, because each window is measured from the
+original schedule.
+
 Admission freezes each selected part target. Ordinary dependent parts span
 85–100% of that target; independent and final parts can be shorter.
 The part writer uses bounded lookahead to repair unpublished cuts.

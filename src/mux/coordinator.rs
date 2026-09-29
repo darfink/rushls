@@ -33,6 +33,8 @@ pub struct Coordinator {
     early: u64,
     late: u64,
     boundary_budget: Duration,
+    /// Configured `segment.tolerance`, reported when a boundary is missed.
+    late_tolerance: Duration,
     limits: PrerollLimits,
     samples: usize,
     interval: Duration,
@@ -103,6 +105,7 @@ impl Coordinator {
                 .duration_to_ticks_floor(plan.late_boundary)
                 .saturating_add(source.boundary_tolerance),
             boundary_budget: plan.late_boundary.saturating_add(plan.early_boundary),
+            late_tolerance: plan.late_boundary,
             tracks,
             authority,
             limits: plan.limits,
@@ -242,7 +245,7 @@ impl Coordinator {
         Ok(None)
     }
 
-    fn window_failure(&self, track: &Track, reason: &'static str) -> MuxError {
+    fn window_failure(&self, track: &Track, reason: crate::mux::BoundaryMissReason) -> MuxError {
         let authority = &self.tracks[self.authority];
         let progress = authority
             .pending
@@ -253,13 +256,18 @@ impl Coordinator {
             })
             .max()
             .unwrap_or(self.nominal);
+        let timebase = authority.plan.timebase;
+        let since = |from: TickTimestamp, to: TickTimestamp| {
+            timebase.ticks_to_duration(u64::try_from(to.saturating_sub(from)).unwrap_or(0))
+        };
         MuxError::BoundaryWindow {
             track: track.plan.track_id,
-            reason,
-            progress,
-            earliest: self.nominal.saturating_sub_unsigned(self.early),
-            latest: self.nominal.saturating_add_unsigned(self.late),
-            timebase: authority.plan.timebase,
+            miss: crate::mux::BoundaryMiss {
+                reason,
+                planned: since(authority.plan.presentation_origin_pts, self.nominal),
+                overrun: since(self.nominal, progress),
+                tolerance: self.late_tolerance,
+            },
         }
     }
 
@@ -292,7 +300,10 @@ impl Coordinator {
                 })
             })
         {
-            return Err(self.window_failure(videos[0], "misaligned random-access boundaries"));
+            return Err(self.window_failure(
+                videos[0],
+                crate::mux::BoundaryMissReason::MisalignedKeyframes,
+            ));
         }
 
         for track in &self.tracks {
@@ -311,7 +322,9 @@ impl Coordinator {
                     && Self::compare(track.instant(sample.pts()), late)
                         .is_ok_and(|order| order != Ordering::Greater)
             }) {
-                return Err(self.window_failure(track, "missing common random-access boundary"));
+                return Err(
+                    self.window_failure(track, crate::mux::BoundaryMissReason::MissingKeyframe)
+                );
             }
         }
         Ok(())
@@ -741,10 +754,27 @@ mod tests {
         let (mut mux, _) = coordinator(0, 100)?;
         let mut output = Vec::new();
         mux.push(sample(0, 2_000, false), &mut output)?;
-        assert!(matches!(
-            mux.push(sample(0, 2_101, false), &mut output),
-            Err(MuxError::BoundaryWindow { .. })
-        ));
+        let Err(error @ MuxError::BoundaryWindow { miss, .. }) =
+            mux.push(sample(0, 2_101, false), &mut output)
+        else {
+            panic!("a keyframe missing past the window must fail the boundary");
+        };
+        // Reported in the operator's units, with the fix spelled out.
+        assert_eq!(
+            miss,
+            crate::mux::BoundaryMiss {
+                reason: crate::mux::BoundaryMissReason::MissingKeyframe,
+                planned: Duration::from_secs(2),
+                overrun: Duration::from_millis(101),
+                tolerance: Duration::from_millis(100),
+            }
+        );
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "track/0: no keyframe for segment boundary at 2s (>= 0.101s late, tolerance 0.1s); \
+             set segment.tolerance >= 1s or fix the encoder keyframe interval"
+        );
         Ok(())
     }
     #[test]

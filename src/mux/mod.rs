@@ -162,18 +162,82 @@ impl PackagedMedia {
     }
 }
 
+/// Why a planned segment boundary could not be cut.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundaryMissReason {
+    /// Media ran past the boundary's window without a keyframe.
+    MissingKeyframe,
+    /// Every video rendition has keyframes, but none at a common instant.
+    MisalignedKeyframes,
+}
+
+/// A missed segment boundary, in the terms an operator configures.
+///
+/// Durations rather than ticks: the fix is a `segment.tolerance` value, so
+/// the message should read in the same unit. The keyframe has not arrived
+/// when this is raised, so `overrun` is how late it is *at least*.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoundaryMiss {
+    pub reason: BoundaryMissReason,
+    /// The planned boundary, as media time since the publication began.
+    pub planned: Duration,
+    /// How far media progressed past the planned boundary without a cut.
+    pub overrun: Duration,
+    /// The configured `segment.tolerance`, the late side of the window.
+    pub tolerance: Duration,
+}
+
+impl BoundaryMiss {
+    /// The smallest whole-second `segment.tolerance` that would have covered
+    /// the lateness seen so far. A lower bound: the keyframe may be later still.
+    pub fn suggested_tolerance(&self) -> Duration {
+        Duration::from_secs(self.overrun.as_secs().saturating_add(1))
+    }
+}
+
+impl std::fmt::Display for BoundaryMiss {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Decimal seconds, the unit `segment.tolerance` is written in:
+        // "4.12s" rather than "4s 120ms". Millisecond precision, trailing
+        // zeros trimmed.
+        let time = |duration: Duration| {
+            let millis = duration.as_millis();
+            let fraction = format!("{:03}", millis % 1000);
+            let fraction = fraction.trim_end_matches('0');
+            if fraction.is_empty() {
+                format!("{}s", millis / 1000)
+            } else {
+                format!("{}.{fraction}s", millis / 1000)
+            }
+        };
+        match self.reason {
+            BoundaryMissReason::MissingKeyframe => write!(
+                f,
+                "no keyframe for segment boundary at {} (>= {} late, tolerance {}); \
+                 set segment.tolerance >= {} or fix the encoder keyframe interval",
+                time(self.planned),
+                time(self.overrun),
+                time(self.tolerance),
+                time(self.suggested_tolerance()),
+            ),
+            BoundaryMissReason::MisalignedKeyframes => write!(
+                f,
+                "no keyframe shared by all video renditions near segment boundary at {} \
+                 (checked {} past it); align encoder keyframes",
+                time(self.planned),
+                time(self.overrun),
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum MuxError {
-    #[error(
-        "{track}: {reason}; progress={progress}, permitted window=[{earliest}, {latest}] in {timebase:?}"
-    )]
+    /// No usable keyframe reached a planned segment boundary in time.
+    #[error("{track}: {miss}")]
     BoundaryWindow {
         track: crate::domain::TrackId,
-        reason: &'static str,
-        progress: TickTimestamp,
-        earliest: TickTimestamp,
-        latest: TickTimestamp,
-        timebase: Timebase,
+        miss: BoundaryMiss,
     },
     #[error("{track}: {reason}; observed={observed}, maximum={maximum} ticks")]
     Boundary {
