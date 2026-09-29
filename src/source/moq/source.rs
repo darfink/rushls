@@ -4,11 +4,15 @@
 //! waits until each track has a presentation timestamp. After discovery, an
 //! added or removed track or a codec-config change is fatal. Media is read in
 //! group order and never silently skipped: a sequence gap fails the publication.
+//!
+//! Text tracks are the exception to waiting: captions may stay silent for
+//! minutes, so discovery freezes on audio and video alone and cues join
+//! whenever the publisher sends one.
 
 use std::{collections::VecDeque, sync::Arc, task::Poll, time::Instant};
 
 use crate::{
-    domain::{Appender, BoxFuture, DiscoveredTrack, TrackCatalog, TrackId},
+    domain::{Appender, BoxFuture, Codec, DiscoveredTrack, MediaKind, TrackCatalog, TrackId},
     observe::SourceMeters,
     source::{
         DiscoveryLimits, DiscoveryProblem, DiscoveryReport, InputLimits, InputState, Packet,
@@ -38,6 +42,8 @@ pub struct MoqPacketSource {
     next_track: usize,
     /// The receive cache's bytes, mirrored into the publisher budget.
     cache: Option<CacheCharge>,
+    /// Where the audio/video timeline starts, once discovery has frozen it.
+    cue_floor: Option<i64>,
 }
 
 /// Charges `moq_net`'s receive cache to the publisher budget.
@@ -139,6 +145,7 @@ impl MoqPacketSource {
             terminal: None,
             next_track: 0,
             cache: None,
+            cue_floor: None,
         }
     }
 
@@ -203,10 +210,15 @@ impl MoqPacketSource {
                 ))
                 .await
                 .map_err(classify_net)?;
+            let reader = loc::Reader::new(subscriber, mapped.legacy[index]);
             self.tracks.push(LiveTrack {
                 id: track.id,
                 codec: track.codec,
-                reader: loc::Reader::new(subscriber, mapped.legacy[index]),
+                reader: if track.codec == Codec::Text {
+                    reader.cues()
+                } else {
+                    reader
+                },
                 ended: false,
                 inline: mapped.inline_h264[index].then(super::h264::Inline::default),
             });
@@ -233,6 +245,9 @@ impl MoqPacketSource {
             &frame,
             self.limits.maximum_payload_bytes_per_packet,
         )?;
+        if track.codec == Codec::Text {
+            clamp_cue(&mut packet, self.cue_floor);
+        }
         packet.account(self.meters.pipeline_budget())?;
         Ok(packet)
     }
@@ -263,7 +278,34 @@ impl MoqPacketSource {
         Ok(())
     }
 
-    fn store_discovery(&mut self, mapped: MappedCatalog) -> DiscoveryReport {
+    fn store_discovery(&mut self, mut mapped: MappedCatalog) -> DiscoveryReport {
+        // Audio and video all have a first timestamp by now, and the earliest
+        // of them is where the presentation starts.
+        self.cue_floor = mapped
+            .tracks
+            .iter()
+            .filter(|track| track.kind() != MediaKind::Subtitle)
+            .filter_map(|track| track.first_pts)
+            .min();
+        let floor = self.cue_floor;
+        for track in mapped
+            .tracks
+            .iter_mut()
+            .filter(|track| track.codec == Codec::Text)
+        {
+            track.first_pts = track
+                .first_pts
+                .map(|pts| floor.map_or(pts, |floor| pts.max(floor)));
+        }
+        for packet in &mut self.prefetch {
+            let cue = mapped
+                .tracks
+                .iter()
+                .any(|track| track.id == packet.track_id && track.codec == Codec::Text);
+            if cue {
+                clamp_cue(packet, self.cue_floor);
+            }
+        }
         self.fingerprint = Some(mapped.fingerprint);
         let catalog = DiscoveryReport {
             tracks: TrackCatalog::new(mapped.tracks)
@@ -310,6 +352,7 @@ impl PacketSource for MoqPacketSource {
                         let next = map::tracks_from_catalog(
                             &catalog.video.renditions,
                             &catalog.audio.renditions,
+                            &catalog.text.renditions,
                         )?;
                         if let Some(existing) = &mut mapped {
                             existing.refine(next)?;
@@ -414,6 +457,7 @@ impl PacketSource for MoqPacketSource {
                             let next = map::tracks_from_catalog(
                                 &catalog.video.renditions,
                                 &catalog.audio.renditions,
+                                &catalog.text.renditions,
                             )?;
                             if let Some(frozen) = &self.fingerprint {
                                 frozen.diff(&next.fingerprint)?;
@@ -550,7 +594,24 @@ fn can_freeze(mapped: &MappedCatalog) -> bool {
     mapped
         .tracks
         .iter()
+        .filter(|track| track.kind() != MediaKind::Subtitle)
         .all(|track| track.first_pts.is_some() && !track.codec_extradata.is_empty())
+}
+
+/// Moves a cue that starts before the presentation up to its first instant.
+///
+/// A subscription begins at each track's latest group. For audio and video
+/// that is a recent keyframe, but for captions it is the last cue sent, which
+/// can be minutes old and still on screen. That cue is still what a viewer
+/// joining now should see, so it starts where the presentation starts rather
+/// than failing the WebVTT writer for predating it. A clear is moved the same
+/// way and simply ends nothing.
+fn clamp_cue(packet: &mut Packet, floor: Option<i64>) {
+    if let (Some(pts), Some(floor)) = (packet.pts, floor)
+        && pts < floor
+    {
+        packet.pts = Some(floor);
+    }
 }
 
 fn rendition_name(track: &DiscoveredTrack) -> Result<&str, SourceError> {
@@ -604,7 +665,7 @@ mod tests {
 
     use crate::source::DiscoveryLimits;
 
-    use super::super::fixtures::{Fixture, discovery_limits, loc_catalog};
+    use super::super::fixtures::{Fixture, captioned_catalog, discovery_limits, loc_catalog};
 
     #[tokio::test]
     async fn discovers_loc_tracks_and_prefills_the_first_frames() -> Result<(), SourceError> {
@@ -702,6 +763,86 @@ mod tests {
             .expect("the captions are declared");
         assert_eq!(declared.len(), 1);
         assert_eq!(declared[0].channel, CaptionChannel::Cea608Field(0));
+        Ok(())
+    }
+
+    /// The caption track's packets, in the order the source handed them on.
+    fn cues(discovery: &DiscoveryReport, packets: &[Packet]) -> Vec<(Option<i64>, Vec<u8>)> {
+        let text = discovery
+            .tracks
+            .tracks()
+            .iter()
+            .find(|track| track.codec == Codec::Text)
+            .expect("the caption rendition is a track")
+            .id;
+        packets
+            .iter()
+            .filter(|packet| packet.track_id == text)
+            .map(|packet| (packet.pts, packet.payload.as_bytes().to_vec()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_silent_caption_track_does_not_hold_discovery() -> Result<(), SourceError> {
+        let (mut fixture, mut source) = Fixture::new();
+        fixture.publish_catalog(&captioned_catalog());
+        // Created but never written to, as a publisher serves any catalog track.
+        fixture.track("captions");
+        fixture.publish_frame("1080p", 0, crate::mux::fixtures::H264_IDR);
+        fixture.publish_frame("opus", 0, &[0xFC]);
+
+        // No cue has been sent, yet the catalog freezes with the text track in it.
+        let discovery = source.discover(discovery_limits()).await?;
+        let text = discovery
+            .tracks
+            .tracks()
+            .iter()
+            .find(|track| track.kind() == MediaKind::Subtitle)
+            .expect("the caption rendition is a track");
+        assert_eq!((text.codec, text.first_pts), (Codec::Text, None));
+        assert_eq!(text.title.as_deref(), Some("English"));
+
+        // Cues arrive later on the shared microsecond clock, and an empty cue
+        // survives as the instruction to clear the display.
+        fixture.publish_legacy_frame("captions", 1_000_000, b"hello");
+        fixture.publish_legacy_frame("captions", 2_500_000, b"");
+        fixture.finish_media();
+        fixture.producer.finish();
+        let mut packets = Vec::new();
+        while source.fill(&mut packets).await? == InputState::Open {}
+        assert_eq!(
+            cues(&discovery, &packets),
+            vec![
+                (Some(1_000_000), b"hello".to_vec()),
+                (Some(2_500_000), Vec::new())
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cue_older_than_the_presentation_starts_with_it() -> Result<(), SourceError> {
+        let (mut fixture, mut source) = Fixture::new();
+        fixture.publish_catalog(&captioned_catalog());
+        // The last caption sent before this origin subscribed is still on
+        // screen, but predates every frame of audio and video it will receive.
+        fixture.publish_legacy_frame("captions", 100_000, b"still showing");
+        fixture.publish_frame("1080p", 4_000_000, crate::mux::fixtures::H264_IDR);
+        fixture.publish_frame("opus", 4_020_000, &[0xFC]);
+        let discovery = source.discover(discovery_limits()).await?;
+        fixture.publish_legacy_frame("captions", 4_500_000, b"next");
+        fixture.finish_media();
+        fixture.producer.finish();
+
+        let mut packets = Vec::new();
+        while source.fill(&mut packets).await? == InputState::Open {}
+        assert_eq!(
+            cues(&discovery, &packets),
+            vec![
+                (Some(4_000_000), b"still showing".to_vec()),
+                (Some(4_500_000), b"next".to_vec())
+            ]
+        );
         Ok(())
     }
 
@@ -845,8 +986,11 @@ mod tests {
         let Incoming::Catalog(Some(catalog)) = source.next_incoming().await? else {
             panic!("catalog");
         };
-        let mapped =
-            map::tracks_from_catalog(&catalog.video.renditions, &catalog.audio.renditions)?;
+        let mapped = map::tracks_from_catalog(
+            &catalog.video.renditions,
+            &catalog.audio.renditions,
+            &catalog.text.renditions,
+        )?;
         source.subscribe_tracks(&mapped).await?;
         for sequence in 1..5 {
             fixture.publish_frame("1080p", sequence * 33_333, crate::mux::fixtures::H264_IDR);

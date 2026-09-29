@@ -68,6 +68,24 @@ impl Fixture {
         group.finish().expect("media group finishes");
     }
 
+    /// One legacy-container frame (a microsecond varint, then the payload) in
+    /// a group of its own, which is how hang publishes a caption cue.
+    pub fn publish_legacy_frame(&mut self, name: &str, micros: u64, payload: &[u8]) {
+        let mut data = bytes::BytesMut::new();
+        moq_net::VarInt::from_u64(micros)
+            .expect("a test timestamp fits a varint")
+            .encode_quic(&mut data)
+            .expect("a varint encodes");
+        data.extend_from_slice(payload);
+        let timestamp = Timestamp::from_micros(micros).expect("a test timestamp fits");
+        let track = self.track(name);
+        let mut group = track.append_group().expect("media group");
+        group
+            .write_frame(timestamp, data.freeze())
+            .expect("legacy frame writes");
+        group.finish().expect("media group finishes");
+    }
+
     pub fn finish_media(&mut self) {
         for (_, mut producer) in self.tracks.drain() {
             producer.finish().expect("LOC tracks finish");
@@ -91,6 +109,19 @@ pub fn loc_catalog() -> serde_json::Value {
             "numberOfChannels": 2,
         } } },
     })
+}
+
+/// [`loc_catalog`] plus one legacy `utf8` caption rendition named `captions`.
+pub fn captioned_catalog() -> serde_json::Value {
+    let mut catalog = loc_catalog();
+    catalog["text"] = serde_json::json!({ "renditions": { "captions": {
+        "format": "utf8",
+        "role": "caption",
+        "lang": "en",
+        "label": "English",
+        "container": { "kind": "legacy" },
+    } } });
+    catalog
 }
 
 pub fn discovery_limits() -> DiscoveryLimits {

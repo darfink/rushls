@@ -33,6 +33,8 @@ const PRIORITY: u8 = 100;
 pub struct Catalog {
     pub video: Renditions<VideoConfig>,
     pub audio: Renditions<AudioConfig>,
+    /// Caption and subtitle renditions (hang 0.21+).
+    pub text: Renditions<TextConfig>,
     #[serde(skip)]
     pub wire_bytes: usize,
 }
@@ -96,6 +98,34 @@ pub struct AudioConfig {
     #[serde(default)]
     pub container: Container,
 }
+
+/// A caption or subtitle rendition.
+///
+/// Each frame is one cue stamped with its start on the broadcast's media
+/// clock, the same clock audio and video use, which is what lines cues up
+/// with the picture without any separate synchronisation. `role` is not read:
+/// HLS has no field to carry the caption/subtitle distinction this origin
+/// could fill from it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextConfig {
+    #[serde(default)]
+    pub broadcast: Option<String>,
+    /// Human-readable rendition name for track pickers.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The cue payload format: `utf8`, `vtt`, `ttml`, or a newer name.
+    pub format: String,
+    /// BCP-47 language tag.
+    #[serde(default)]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub container: Container,
+}
+
+/// hang's bare-text cue format: each cue shows until the next one replaces
+/// it, and an empty cue clears the display.
+pub const UTF8_TEXT: &str = "utf8";
 
 /// The frame format a rendition is published in.
 ///

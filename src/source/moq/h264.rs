@@ -127,6 +127,7 @@ mod tests {
         let mut mapped = map::tracks_from_catalog(
             &BTreeMap::from([("video".into(), config)]),
             &BTreeMap::new(),
+            &BTreeMap::new(),
         )?;
         let record = transmux::AVCDecoderConfigurationRecord::parse(
             crate::media::fixtures::H264_FIXED_CADENCE,

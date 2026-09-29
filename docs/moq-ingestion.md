@@ -10,7 +10,7 @@ A WebTransport `token` query parameter supplies the credential. Without that par
 
 ## Media formats
 
-The origin reads `catalog.json` and subscribes to each audio and video rendition.
+The origin reads `catalog.json` and subscribes to each audio, video, and text rendition.
 The first catalog fixes the track set. Track and container changes fail ingestion.
 During discovery, the origin accepts an OpusHead that replaces an omitted Opus description.
 It recalculates the first audible timestamp from the encoder delay before discovery ends.
@@ -25,12 +25,29 @@ After discovery, decoder configuration changes fail ingestion.
 | HEVC / AV1 | Catalog `description` contains decoder configuration |
 | AAC | Catalog `description` contains AudioSpecificConfig |
 | Opus | Catalog description, or mono/stereo configuration from channel count |
+| Text `utf8` | One cue per frame, shown until the next cue; an empty cue clears it. Served as WebVTT. |
+| Text `vtt` / `ttml` | Rejected |
 | CMAF and unknown containers | Rejected |
 | Renditions on another broadcast | Rejected |
 
 A rendition's catalog `label` (hang 0.21 and later) becomes its HLS `NAME`.
 Labels are descriptive, so a catalog update that changes only a label never ends the publication; after discovery the new label is ignored.
-The catalog has no language field, so MoQ renditions carry no `LANGUAGE`.
+Audio and video renditions have no language field in the catalog, so they carry no `LANGUAGE`; a text rendition's `lang` becomes its `LANGUAGE`.
+
+### Captions and subtitles
+
+A hang catalog `text` section declares caption renditions; each frame is one cue.
+A cue's timestamp is the moment it appears, on the same clock as the audio and video frames.
+That shared clock is the only synchronisation: a cue stamped when a frame is captured appears with that frame.
+The cue stays on screen until the next cue replaces it, and an empty cue clears it.
+
+Discovery does not wait for a cue, since captions can be silent for minutes.
+The origin subscribes from each track's latest group. For a text track, that is the caption currently on screen, which can be older than the first video frame the origin receives.
+Such a cue starts where the presentation starts, rather than failing the publication.
+
+A cue must reach the origin before the part that covers its timestamp is published. A cue sent as soon as it is stamped travels with the video of the same moment, so it is in time.
+A later cue is reported as `subtitle cue too late` and appears only from the next part that is not yet published.
+Stamp each cue when it is sent, not with the time of the speech it transcribes: a transcript is always behind the audio, and its cues would all arrive late.
 
 MOQ supplies presentation timestamps, without decode timestamps.
 The shared normalizer reconstructs decode timestamps. Reordered H.264 requires frame timing from the SPS.

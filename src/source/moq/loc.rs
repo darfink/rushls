@@ -40,6 +40,8 @@ pub struct Reader {
     /// Position within the open group, which is what names the keyframe.
     index: usize,
     legacy: bool,
+    /// Whether an empty payload is media rather than a marker.
+    cues: bool,
     next_sequence: Option<u64>,
     pending: BTreeMap<u64, moq_net::group::Consumer>,
     gap_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -52,10 +54,19 @@ impl Reader {
             group: None,
             index: 0,
             legacy,
+            cues: false,
             next_sequence: None,
             pending: BTreeMap::new(),
             gap_deadline: None,
         }
+    }
+
+    /// Reads a text track, where an empty cue is how a publisher clears the
+    /// display. Legacy's end marker only exists on audio and video, so here the
+    /// same bytes are a cue and must reach the WebVTT writer.
+    pub fn cues(mut self) -> Self {
+        self.cues = true;
+        self
     }
 
     /// The next frame, `None` once the publisher finishes the track.
@@ -85,7 +96,7 @@ impl Reader {
             } else {
                 decode(&frame.payload, keyframe)?
             };
-            if decoded.payload.is_empty() {
+            if decoded.payload.is_empty() && !self.cues {
                 continue;
             }
             return Poll::Ready(Ok(Some(decoded)));

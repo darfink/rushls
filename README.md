@@ -240,7 +240,7 @@ Rushls serves them together from one multivariant playlist, so players can switc
 | --- | --- |
 | Adaptive bitrate | Several video tracks with aligned keyframes |
 | Alternate languages | Several audio tracks, with language metadata |
-| Subtitles | RTMP `onCaption` / `onTextData` messages, served as WebVTT |
+| Subtitles | RTMP `onCaption` / `onTextData` messages, or a MoQ `utf8` text rendition, served as WebVTT |
 | Closed captions | CEA-608/708 inside H.264/HEVC, declared in the playlist |
 
 Two video sizes and one audio track over SRT:
@@ -260,6 +260,7 @@ This assumes a 30 fps source, so `-g 60` gives a keyframe every 2 seconds in bot
 Enhanced RTMP carries multiple tracks too; see [multitrack publishing](docs/publishing.md#multitrack-publishing) for RTMP and alternate audio recipes.
 
 Subtitles: caption messages become a WebVTT rendition when they are present at startup.
+A MoQ publisher declares its text renditions in the catalog instead, so they exist from the start even before the first cue.
 The [gst-captions](https://github.com/darfink/gst-captions) plugin sends timed text or live transcription as RTMP captions;
 see [publishing captions](docs/publishing.md#publish-captions-with-gst-captions).
 
@@ -274,7 +275,7 @@ Names and languages come from the source:
 | --- | --- | --- |
 | RTMP | `onMetaData` `title`, per track with Enhanced RTMP, or `audiotitle` / `videotitle` | `onMetaData` `language`, per track or `audiolanguage` / `videolanguage` |
 | SRT | Not carried | ISO 639 descriptor, for example FFmpeg `-metadata:s:a:0 language=eng` |
-| MoQ | Catalog rendition `label` (hang 0.21 and later) | Not carried |
+| MoQ | Catalog rendition `label` (hang 0.21 and later) | Text renditions only, from `lang` |
 
 A track without a name gets a generic one such as `Audio 2`. A name containing a double quote or a control character is ignored, since it cannot be written into the playlist.
 
@@ -291,7 +292,7 @@ Input protocols and codecs. Output is always HLS with CMAF (fragmented MP4) segm
 | HE-AAC v1 / v2 | ✅ | ✅ | ✅ | Explicit SBR/PS signalling only; implicit HE-AAC and AAC-LATM are not detected |
 | Opus | ✅ | ✅ | ✅ | RTMP needs Enhanced RTMP; SRT is mono or stereo |
 | FLAC | ✅ | ❌ | ❌ | Enhanced RTMP, mono or stereo |
-| Captions → WebVTT | ✅ | ❌ | ❌ | RTMP `onCaption` / `onTextData` |
+| Captions → WebVTT | ✅ | ❌ | ✅ | RTMP `onCaption` / `onTextData`; MoQ `utf8` text renditions |
 | CEA-608/708 in video | ✅ | ✅ | ✅ | H.264 and HEVC; declared in the playlist, not converted to WebVTT |
 | MP3, AC-3, E-AC-3, VP9, VVC | ❌ | ❌ | ❌ | |
 

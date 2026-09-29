@@ -4,6 +4,10 @@
 //! explicitly so ingest cannot silently discard a rendition. avc3 H.264 gets
 //! its decoder configuration from the first access unit; other codecs require
 //! catalog configuration (with a mono/stereo fallback for Opus).
+//!
+//! Text renditions become subtitle tracks. Only hang's `utf8` cues are read:
+//! they are the open-ended captions RTMP script data already produces, so the
+//! WebVTT path needs nothing new to package them.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
@@ -12,7 +16,7 @@ use broadcast_common::Parse;
 use bytes::Bytes;
 
 use super::{
-    catalog::{self, AudioCodec, AudioConfig, VideoCodec, VideoConfig},
+    catalog::{self, AudioCodec, AudioConfig, TextConfig, VideoCodec, VideoConfig},
     loc,
 };
 
@@ -97,6 +101,9 @@ impl MappedCatalog {
             self.tracks[index]
                 .title
                 .clone_from(&next.tracks[index].title);
+            self.tracks[index]
+                .language
+                .clone_from(&next.tracks[index].language);
             // Repeated snapshots preserve timestamps and in-band video metadata.
             if old == new {
                 continue;
@@ -134,10 +141,17 @@ impl MappedCatalog {
 pub fn tracks_from_catalog(
     video: &BTreeMap<String, VideoConfig>,
     audio: &BTreeMap<String, AudioConfig>,
+    text: &BTreeMap<String, TextConfig>,
 ) -> Result<MappedCatalog, SourceError> {
-    if video.keys().any(|name| audio.contains_key(name)) {
+    // One wire track cannot be two kinds of media: the frames on it would be
+    // read twice, as two different things.
+    if video.keys().any(|name| audio.contains_key(name))
+        || text
+            .keys()
+            .any(|name| video.contains_key(name) || audio.contains_key(name))
+    {
         return Err(SourceError::Demux(
-            "audio and video cannot share a MOQ track name".into(),
+            "audio, video, and text renditions cannot share a MOQ track name".into(),
         ));
     }
     let mut tracks = Vec::new();
@@ -153,22 +167,11 @@ pub fn tracks_from_catalog(
         let (codec, parameters, extradata) = video_track(name, config)?;
         let id = TrackId(next_id);
         next_id += 1;
-        fingerprint.insert(
-            key.clone(),
-            FrozenTrack {
-                id,
-                codec,
-                extradata: extradata.to_vec(),
-                container: config.container.kind().to_owned(),
-                parameters,
-                description_pending: false,
-            },
-        );
-        tracks.push(DiscoveredTrack {
+        let track = DiscoveredTrack {
             decoder_config_origin: configuration_origin(config.description.as_ref()),
             video_cadence: crate::domain::VideoCadence::Unknown,
             id,
-            source_key: Some(key),
+            source_key: Some(key.clone()),
             codec,
             parameters,
             timebase: TIMEBASE,
@@ -176,7 +179,9 @@ pub fn tracks_from_catalog(
             title: config.label.as_deref().and_then(crate::domain::track_title),
             language: None,
             codec_extradata: Payload::from_bytes(extradata),
-        });
+        };
+        fingerprint.insert(key, freeze(&track, &config.container, false));
+        tracks.push(track);
     }
 
     for (name, config) in audio {
@@ -187,23 +192,13 @@ pub fn tracks_from_catalog(
         let (codec, parameters, extradata) = audio_track(name, config)?;
         let id = TrackId(next_id);
         next_id += 1;
-        fingerprint.insert(
-            key.clone(),
-            FrozenTrack {
-                id,
-                codec,
-                extradata: extradata.to_vec(),
-                container: config.container.kind().to_owned(),
-                parameters,
-                description_pending: codec == Codec::Opus
-                    && config.description.as_ref().is_none_or(Bytes::is_empty),
-            },
-        );
-        tracks.push(DiscoveredTrack {
+        let description_pending =
+            codec == Codec::Opus && config.description.as_ref().is_none_or(Bytes::is_empty);
+        let track = DiscoveredTrack {
             decoder_config_origin: configuration_origin(config.description.as_ref()),
             video_cadence: crate::domain::VideoCadence::Unknown,
             id,
-            source_key: Some(key),
+            source_key: Some(key.clone()),
             codec,
             parameters,
             timebase: TIMEBASE,
@@ -211,7 +206,9 @@ pub fn tracks_from_catalog(
             title: config.label.as_deref().and_then(crate::domain::track_title),
             language: None,
             codec_extradata: Payload::from_bytes(extradata),
-        });
+        };
+        fingerprint.insert(key, freeze(&track, &config.container, description_pending));
+        tracks.push(track);
     }
 
     if tracks.is_empty() {
@@ -220,18 +217,45 @@ pub fn tracks_from_catalog(
         ));
     }
 
+    // After audio and video, so the empty check above still requires a
+    // timeline: cues are placed against picture and sound, never alone.
+    for (name, config) in text {
+        legacy.push(!config.container.is_loc());
+        let key = source_key("text", name);
+        let track = text_track(name, config, key.clone(), TrackId(next_id))?;
+        next_id += 1;
+        fingerprint.insert(key, freeze(&track, &config.container, false));
+        tracks.push(track);
+    }
+
     Ok(MappedCatalog {
         tracks,
         legacy,
         inline_h264: video
             .values()
             .map(|config| catalog::video_codec(&config.codec) == Some(VideoCodec::H264Inline))
-            .chain(audio.values().map(|_| false))
+            .chain(std::iter::repeat_n(false, audio.len() + text.len()))
             .collect(),
         fingerprint: CatalogFingerprint {
             tracks: fingerprint,
         },
     })
+}
+
+/// What a later catalog must repeat for this track to be the same publication.
+fn freeze(
+    track: &DiscoveredTrack,
+    container: &catalog::Container,
+    description_pending: bool,
+) -> FrozenTrack {
+    FrozenTrack {
+        id: track.id,
+        codec: track.codec,
+        extradata: track.codec_extradata.as_bytes().to_vec(),
+        container: container.kind().to_owned(),
+        parameters: track.parameters,
+        description_pending,
+    }
 }
 
 pub fn source_key(kind: &str, rendition: &str) -> SourceTrackKey {
@@ -271,7 +295,8 @@ pub fn packet(
         } else {
             None
         },
-        random_access: frame.keyframe,
+        // Every cue stands alone, wherever it sits in its group.
+        random_access: frame.keyframe || codec == Codec::Text,
         audio_trim: crate::domain::AudioTrim::default(),
         webvtt: crate::domain::WebVttCueMetadata::default(),
         subtitle_position: None,
@@ -311,6 +336,47 @@ fn refuse_foreign_broadcast(rendition: &str, foreign: bool) -> Result<(), Source
         ));
     }
     Ok(())
+}
+
+/// A `utf8` caption rendition: open-ended cues on the shared microsecond clock.
+fn text_track(
+    name: &str,
+    config: &TextConfig,
+    key: SourceTrackKey,
+    id: TrackId,
+) -> Result<DiscoveredTrack, SourceError> {
+    refuse_foreign_broadcast(name, config.broadcast.is_some())?;
+    require_container(name, &config.container)?;
+    require_utf8_text(name, config)?;
+    Ok(DiscoveredTrack {
+        decoder_config_origin: crate::domain::DecoderConfigOrigin::Publisher,
+        video_cadence: crate::domain::VideoCadence::Unknown,
+        id,
+        source_key: Some(key),
+        codec: Codec::Text,
+        parameters: MediaParameters::Subtitle,
+        timebase: TIMEBASE,
+        first_pts: None,
+        title: config.label.as_deref().and_then(crate::domain::track_title),
+        language: config.lang.clone(),
+        codec_extradata: Payload::from(Vec::new()),
+    })
+}
+
+/// `vtt` and `ttml` cues carry their own timing and markup, which would need a
+/// parser per format; refusing them by name keeps a publisher from losing its
+/// subtitles without being told.
+fn require_utf8_text(rendition: &str, config: &TextConfig) -> Result<(), SourceError> {
+    if config.format == catalog::UTF8_TEXT {
+        return Ok(());
+    }
+    Err(SourceError::Demux(
+        format!(
+            "text rendition `{rendition}` uses the {} format; only utf8 cues are ingested",
+            config.format
+        )
+        .into(),
+    ))
 }
 
 fn video_track(
@@ -555,7 +621,7 @@ mod tests {
         let mut audio = BTreeMap::new();
         audio.insert("opus".to_owned(), opus_loc());
 
-        let mapped = tracks_from_catalog(&video, &audio)?;
+        let mapped = tracks_from_catalog(&video, &audio, &BTreeMap::new())?;
         assert_eq!(mapped.tracks.len(), 2);
         assert_eq!(mapped.tracks[0].codec, Codec::H264);
         assert_eq!(
@@ -574,7 +640,7 @@ mod tests {
     fn h264_without_avcc_is_refused() {
         let mut video = BTreeMap::new();
         video.insert("1080p".to_owned(), h264_loc(None));
-        assert!(tracks_from_catalog(&video, &BTreeMap::new()).is_err());
+        assert!(tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -588,7 +654,8 @@ mod tests {
         }));
         let mut video = BTreeMap::new();
         video.insert("vp8".to_owned(), vp8);
-        let error = tracks_from_catalog(&video, &BTreeMap::new()).expect_err("vp8 is refused");
+        let error = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())
+            .expect_err("vp8 is refused");
         assert!(error.to_string().contains("vp8"), "{error}");
 
         let cmaf: VideoConfig = rendition(serde_json::json!({
@@ -599,7 +666,8 @@ mod tests {
         }));
         let mut video = BTreeMap::new();
         video.insert("cmaf".to_owned(), cmaf);
-        let error = tracks_from_catalog(&video, &BTreeMap::new()).expect_err("cmaf is refused");
+        let error = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())
+            .expect_err("cmaf is refused");
         assert!(error.to_string().contains("cmaf"), "{error}");
     }
 
@@ -613,7 +681,7 @@ mod tests {
         }));
         let mut video = BTreeMap::new();
         video.insert("legacy".to_owned(), legacy);
-        let mapped = tracks_from_catalog(&video, &BTreeMap::new())?;
+        let mapped = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
         assert_eq!(mapped.legacy, vec![true]);
         Ok(())
     }
@@ -629,7 +697,7 @@ mod tests {
         }));
         let mut video = BTreeMap::new();
         video.insert("avc3".to_owned(), avc3);
-        let mapped = tracks_from_catalog(&video, &BTreeMap::new())?;
+        let mapped = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
         assert_eq!(mapped.inline_h264, vec![true]);
         assert!(mapped.tracks[0].codec_extradata.is_empty());
         Ok(())
@@ -644,14 +712,14 @@ mod tests {
                 crate::mux::fixtures::H264_EXTRADATA,
             ))),
         );
-        let first = tracks_from_catalog(&video, &BTreeMap::new())?;
+        let first = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
         video.insert(
             "720p".to_owned(),
             h264_loc(Some(Bytes::from_static(
                 crate::mux::fixtures::H264_EXTRADATA,
             ))),
         );
-        let later = tracks_from_catalog(&video, &BTreeMap::new())?;
+        let later = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
         assert!(matches!(
             first.fingerprint.diff(&later.fingerprint),
             Err(SourceError::TrackSetChanged)
@@ -686,7 +754,7 @@ mod tests {
             ))),
         )]);
         let audio = BTreeMap::from([("same".into(), opus_loc())]);
-        assert!(tracks_from_catalog(&video, &audio).is_err());
+        assert!(tracks_from_catalog(&video, &audio, &BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -697,9 +765,9 @@ mod tests {
                 crate::mux::fixtures::H264_EXTRADATA,
             ))),
         )]);
-        let first = tracks_from_catalog(&video, &BTreeMap::new())?;
+        let first = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
         video.get_mut("video").expect("track").container = catalog::Container::default();
-        let next = tracks_from_catalog(&video, &BTreeMap::new())?;
+        let next = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
         assert!(matches!(
             first.fingerprint.diff(&next.fingerprint),
             Err(SourceError::CodecParametersChanged { .. })
@@ -712,6 +780,7 @@ mod tests {
         let mapped = tracks_from_catalog(
             &BTreeMap::new(),
             &BTreeMap::from([("audio".into(), opus_loc())]),
+            &BTreeMap::new(),
         )?;
         let MediaParameters::Audio { timing, .. } = mapped.tracks[0].parameters else {
             panic!("audio");
@@ -724,11 +793,11 @@ mod tests {
     fn provisional_opus_can_be_refined_only_once() -> Result<(), SourceError> {
         let video = BTreeMap::new();
         let mut audio = BTreeMap::from([("opus".into(), opus_loc())]);
-        let mut mapped = tracks_from_catalog(&video, &audio)?;
+        let mut mapped = tracks_from_catalog(&video, &audio, &BTreeMap::new())?;
         let provisional = mapped.fingerprint.clone();
         audio.get_mut("opus").expect("audio").description =
             Some(super::super::fixtures::opus_head(312).into());
-        let next = tracks_from_catalog(&video, &audio)?;
+        let next = tracks_from_catalog(&video, &audio, &BTreeMap::new())?;
         assert!(provisional.diff(&next.fingerprint).is_err());
         mapped.refine(next)?;
         assert_eq!(
@@ -737,11 +806,11 @@ mod tests {
                 .pre_skip,
             312
         );
-        mapped.refine(tracks_from_catalog(&video, &audio)?)?;
+        mapped.refine(tracks_from_catalog(&video, &audio, &BTreeMap::new())?)?;
         audio.get_mut("opus").expect("audio").description =
             Some(super::super::fixtures::opus_head(120).into());
         assert!(matches!(
-            mapped.refine(tracks_from_catalog(&video, &audio)?),
+            mapped.refine(tracks_from_catalog(&video, &audio, &BTreeMap::new())?),
             Err(SourceError::CodecParametersChanged { .. })
         ));
         Ok(())
@@ -769,18 +838,19 @@ mod tests {
             })),
         )]);
         let mut audio = BTreeMap::from([("opus".into(), opus_loc())]);
-        let mut mapped = tracks_from_catalog(&video, &audio)?;
+        let mut mapped = tracks_from_catalog(&video, &audio, &BTreeMap::new())?;
         mapped.tracks[0].codec_extradata = crate::mux::fixtures::H264_EXTRADATA.into();
         mapped.tracks[0].first_pts = Some(123);
         let discovered_video = mapped.tracks[0].clone();
         audio.get_mut("opus").expect("audio").description =
             Some(super::super::fixtures::opus_head(312).into());
-        mapped.refine(tracks_from_catalog(&video, &audio)?)?;
+        mapped.refine(tracks_from_catalog(&video, &audio, &BTreeMap::new())?)?;
         assert_eq!(mapped.tracks[0], discovered_video);
-        mapped.refine(tracks_from_catalog(&video, &audio)?)?;
+        mapped.refine(tracks_from_catalog(&video, &audio, &BTreeMap::new())?)?;
         assert_eq!(mapped.tracks[0], discovered_video);
         Ok(())
     }
+
     #[test]
     fn catalog_labels_become_track_titles_and_may_change() -> Result<(), SourceError> {
         let labelled = |label: &str| {
@@ -794,7 +864,7 @@ mod tests {
             // A quote could not be written into a playlist NAME.
             ("sv".into(), labelled("Svenska \"SDH\"")),
         ]);
-        let mut mapped = tracks_from_catalog(&video, &audio)?;
+        let mut mapped = tracks_from_catalog(&video, &audio, &BTreeMap::new())?;
         assert_eq!(mapped.tracks[0].title.as_deref(), Some("English"));
         assert_eq!(mapped.tracks[1].title, None);
 
@@ -803,7 +873,7 @@ mod tests {
             ("en".into(), labelled("English (commentary)")),
             ("sv".into(), labelled("Svenska")),
         ]);
-        let next = tracks_from_catalog(&video, &renamed)?;
+        let next = tracks_from_catalog(&video, &renamed, &BTreeMap::new())?;
         mapped.fingerprint.diff(&next.fingerprint)?;
         mapped.refine(next)?;
         assert_eq!(
@@ -812,6 +882,77 @@ mod tests {
         );
         assert_eq!(mapped.tracks[1].title.as_deref(), Some("Svenska"));
         Ok(())
+    }
+
+    fn utf8_text(fields: serde_json::Value) -> TextConfig {
+        let mut base = serde_json::json!({ "format": "utf8", "container": { "kind": "legacy" } });
+        if let (Some(base), serde_json::Value::Object(extra)) = (base.as_object_mut(), fields) {
+            base.extend(extra);
+        }
+        rendition(base)
+    }
+
+    #[test]
+    fn utf8_text_renditions_become_open_ended_subtitle_tracks() -> Result<(), SourceError> {
+        let video = BTreeMap::from([(
+            "1080p".into(),
+            h264_loc(Some(Bytes::from_static(
+                crate::mux::fixtures::H264_EXTRADATA,
+            ))),
+        )]);
+        let text = BTreeMap::from([(
+            "captions".into(),
+            utf8_text(serde_json::json!({
+                "role": "caption", "lang": "en", "label": "English (CC)", "jitter": 50,
+            })),
+        )]);
+        let mapped = tracks_from_catalog(&video, &BTreeMap::new(), &text)?;
+
+        // Text follows audio and video, keyed and clocked like every other track.
+        let cues = &mapped.tracks[1];
+        assert_eq!(cues.id, TrackId(1));
+        assert_eq!(cues.kind(), crate::domain::MediaKind::Subtitle);
+        assert_eq!(cues.codec, Codec::Text);
+        assert_eq!(cues.timebase, TIMEBASE);
+        assert_eq!(cues.source_key, Some(source_key("text", "captions")));
+        assert_eq!(cues.title.as_deref(), Some("English (CC)"));
+        assert_eq!(cues.language.as_deref(), Some("en"));
+        assert_eq!(mapped.legacy, vec![false, true]);
+        assert_eq!(mapped.inline_h264, vec![false, false]);
+
+        // A cue is a random access point wherever it sits in its group.
+        let frame = loc_frame(5_000, Bytes::from_static(b"hello"), false);
+        let cue = packet(cues.id, Codec::Text, &frame, 64)?;
+        assert!(cue.random_access);
+        assert_eq!((cue.pts, cue.duration), (Some(5_000), None));
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_or_misplaced_text_renditions_are_refused_by_name() {
+        let video = BTreeMap::from([(
+            "main".into(),
+            h264_loc(Some(Bytes::from_static(
+                crate::mux::fixtures::H264_EXTRADATA,
+            ))),
+        )]);
+        for format in ["vtt", "ttml", "srt"] {
+            let text = BTreeMap::from([(
+                "subs".into(),
+                utf8_text(serde_json::json!({ "format": format })),
+            )]);
+            let error = tracks_from_catalog(&video, &BTreeMap::new(), &text)
+                .expect_err("only utf8 is ingested");
+            assert!(error.to_string().contains(format), "{error}");
+            assert!(error.to_string().contains("subs"), "{error}");
+        }
+
+        let clash = BTreeMap::from([("main".into(), utf8_text(serde_json::json!({})))]);
+        assert!(tracks_from_catalog(&video, &BTreeMap::new(), &clash).is_err());
+
+        // Cues are placed against picture and sound, so they cannot be alone.
+        let alone = BTreeMap::from([("subs".into(), utf8_text(serde_json::json!({})))]);
+        assert!(tracks_from_catalog(&BTreeMap::new(), &BTreeMap::new(), &alone).is_err());
     }
 
     #[test]
@@ -829,6 +970,7 @@ mod tests {
             config.description = Some(Bytes::from_static(bytes));
             let mapped = tracks_from_catalog(
                 &BTreeMap::from([("video".into(), config)]),
+                &BTreeMap::new(),
                 &BTreeMap::new(),
             )?;
             let cadence = crate::media::cadence::inspect(&mapped.tracks[0]);
