@@ -37,7 +37,8 @@ The reorder buffer holds at most 256 groups. A missing group beyond either limit
 
 Discovery limits cover subscriptions, catalog bytes, and media probing.
 Packet limits apply to returned samples. The MOQ cache has a 16 MiB eviction target.
-That target is not a hard allocation limit. The dependency buffers incoming frames before the adapter checks their payload size.
+That target is not a hard allocation limit: the dependency buffers incoming frames before the adapter checks their payload size.
+The cache's usage is therefore charged to `memory.per_publisher` as it grows, one frame behind the allocation.
 
 ## Local publish test
 

@@ -173,6 +173,8 @@ impl MoqListener {
 pub struct MoqPendingPublish {
     request: PublishRequest,
     origin: moq_net::origin::Producer,
+    /// The receive cache's pool, so the source can charge what it holds.
+    pool: moq_net::cache::Pool,
     session: moq_net::Session,
     driver: JoinHandle<Result<(), moq_net::Error>>,
     config: MoqConfig,
@@ -253,11 +255,11 @@ async fn setup(
 
     let setup_path = moq_request.path().to_owned();
     // Bound the model's cache target as well as the batches we retain. The
-    // dependency treats this as an eviction target, not a hard allocation cap.
+    // dependency treats this as an eviction target, not a hard allocation cap,
+    // so the source also charges the pool's usage to the publisher budget.
+    let pool = moq_net::cache::Pool::new(crate::source::PipelineMemory::TRANSPORT as u64);
     let origin = moq_net::origin::Info::new(moq_net::Origin::random())
-        .with_pool(moq_net::cache::Pool::new(
-            crate::source::PipelineMemory::TRANSPORT as u64,
-        ))
+        .with_pool(pool.clone())
         .with_cache_duration(Duration::from_secs(30))
         .produce();
     let (session, driver) = moq_request
@@ -305,6 +307,7 @@ async fn setup(
             },
         },
         origin,
+        pool,
         session,
         driver,
         config,
@@ -378,6 +381,7 @@ impl PendingPublish for MoqPendingPublish {
             let source = MoqPacketSource::from_origin(
                 &self.origin.consume(),
                 Some(self.session),
+                self.pool,
                 self.config.input_limits,
                 meters,
             )

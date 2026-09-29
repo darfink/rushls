@@ -795,8 +795,15 @@ The RTMP and MPEG-TS ingress queues keep their own 16MiB byte limit. A publisher
 that sends faster than the session consumes waits on TCP instead of exhausting
 the budget.
 
+MoQ's receive cache is charged as it grows. The `moq_net` dependency allocates
+each frame before Rushls sees it and keeps recent groups for late readers, so
+the charge follows the cache's own byte count each time a frame is read. It
+lags by one frame, and a frame that is both cached and in the pipeline counts
+twice. The cache's 16MiB eviction target keeps that overlap small, and the
+error names `MoQ receive cache` when it is what runs out.
+
 **This is an accounted-buffer limit, not a process-memory ceiling.**
-MPEG-TS demux internals, the MOQ native cache, OS buffers, allocator overhead,
+MPEG-TS demux internals, OS buffers, allocator overhead,
 and uninstrumented metadata/container capacity remain outside this accounting.
 Dependency-produced payloads are charged before application retention, after
 allocation inside the dependency. Hidden backing capacity cannot be inferred

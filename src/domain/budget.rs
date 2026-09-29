@@ -131,6 +131,10 @@ pub enum Stage {
     RtmpIngress,
     #[display("MPEG-TS read")]
     MpegTsRead,
+    /// Frames `moq_net` holds in its receive cache, measured rather than
+    /// reserved before allocation: the dependency allocates them itself.
+    #[display("MoQ receive cache")]
+    MoqCache,
     #[display("demux")]
     Demux,
     #[display("normalization")]
@@ -146,9 +150,11 @@ pub enum Stage {
 impl Stage {
     pub fn origin(self) -> Origin {
         match self {
-            Self::RtmpReceive | Self::RtmpCoalescing | Self::RtmpIngress | Self::MpegTsRead => {
-                Origin::Transport
-            }
+            Self::RtmpReceive
+            | Self::RtmpCoalescing
+            | Self::RtmpIngress
+            | Self::MpegTsRead
+            | Self::MoqCache => Origin::Transport,
             Self::Demux => Origin::Demux,
             Self::Normalization => Origin::Normalization,
             Self::MuxOutput => Origin::Mux,

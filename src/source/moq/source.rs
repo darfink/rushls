@@ -36,6 +36,52 @@ pub struct MoqPacketSource {
     prefetch: VecDeque<Packet>,
     terminal: Option<InputState>,
     next_track: usize,
+    /// The receive cache's bytes, mirrored into the publisher budget.
+    cache: Option<CacheCharge>,
+}
+
+/// Charges `moq_net`'s receive cache to the publisher budget.
+///
+/// The dependency allocates each frame itself, before this source sees it, and
+/// keeps recent groups for late readers. Its pool target is an eviction goal,
+/// not a limit, so without this those bytes would sit outside
+/// `memory.per_publisher` entirely. The charge follows the pool's own count,
+/// taken each time a frame is read: it lags one frame, which is as early as
+/// anything outside the dependency can see an allocation, and a budget that
+/// cannot cover it ends the publication like any other exhausted stage.
+///
+/// A frame both cached and in the pipeline is charged twice, once as cache and
+/// once as a packet. The pool's target bounds that overlap, and it errs toward
+/// refusing a publisher rather than under-counting one.
+struct CacheCharge {
+    pool: moq_net::cache::Pool,
+    held: Option<crate::domain::Reservation>,
+}
+
+impl CacheCharge {
+    fn reconcile(
+        &mut self,
+        budget: Option<&crate::domain::PipelineBudget>,
+    ) -> Result<(), crate::domain::BudgetExceeded> {
+        let Some(budget) = budget else {
+            return Ok(());
+        };
+        let used = usize::try_from(self.pool.used()).unwrap_or(usize::MAX);
+        let held = self
+            .held
+            .as_ref()
+            .map_or(0, crate::domain::Reservation::bytes);
+        if used > held {
+            let more = budget.try_reserve(used - held, crate::domain::Stage::MoqCache)?;
+            match &mut self.held {
+                Some(held) => held.absorb(more),
+                None => self.held = Some(more),
+            }
+        } else if let Some(reservation) = self.held.as_mut().filter(|_| used < held) {
+            drop(reservation.split(held - used));
+        }
+        Ok(())
+    }
 }
 
 struct LiveTrack {
@@ -64,6 +110,7 @@ impl MoqPacketSource {
     pub fn from_origin(
         origin: &moq_net::origin::Consumer,
         session: Option<moq_net::Session>,
+        pool: moq_net::cache::Pool,
         limits: InputLimits,
         meters: Arc<dyn SourceMeters>,
     ) -> Result<Self, SourceError> {
@@ -71,6 +118,7 @@ impl MoqPacketSource {
         Ok(Self {
             announced: Some(origin.announced()),
             _session: session,
+            cache: Some(CacheCharge { pool, held: None }),
             ..Self::empty(limits, meters)
         })
     }
@@ -90,7 +138,16 @@ impl MoqPacketSource {
             prefetch: VecDeque::new(),
             terminal: None,
             next_track: 0,
+            cache: None,
         }
+    }
+
+    /// Brings the cache charge up to date; called for every frame read.
+    fn charge_cache(&mut self) -> Result<(), SourceError> {
+        if let Some(cache) = &mut self.cache {
+            cache.reconcile(self.meters.pipeline_budget())?;
+        }
+        Ok(())
     }
 
     async fn ensure_catalog_subscription(&mut self) -> Result<(), SourceError> {
@@ -158,6 +215,7 @@ impl MoqPacketSource {
     }
 
     fn media_packet(&mut self, index: usize, mut frame: loc::Frame) -> Result<Packet, SourceError> {
+        self.charge_cache()?;
         let track = self
             .tracks
             .get_mut(index)
@@ -272,6 +330,7 @@ impl PacketSource for MoqPacketSource {
                         }
                     }
                     Incoming::Frame { index, mut frame } => {
+                        self.charge_cache()?;
                         probed = probed.saturating_add(frame.payload.len());
                         if probed > limits.maximum_probe_bytes {
                             return Err(DiscoveryProblem::ProbeLimitExceeded.into());
@@ -617,6 +676,7 @@ mod tests {
         let mut source = MoqPacketSource::from_origin(
             &origin.consume(),
             None,
+            moq_net::cache::Pool::unbounded(),
             InputLimits::permissive(),
             meters.source_view(),
         )?;
@@ -632,6 +692,49 @@ mod tests {
                 DiscoveryProblem::DeadlineExceeded
             )))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn the_receive_cache_is_charged_to_the_publisher_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::domain::{PipelineBudget, Stage};
+
+        let pool = moq_net::cache::Pool::new(64 * 1024 * 1024);
+        let mut info = moq_net::broadcast::Info::new();
+        info.origin = moq_net::origin::Info::new(moq_net::Origin::random()).with_pool(pool.clone());
+        let mut broadcast = info.produce();
+        let mut track = broadcast.create_track("video", None)?;
+        let mut group = track.append_group()?;
+        group.write_frame(moq_net::Timestamp::ZERO, vec![0_u8; 1024 * 1024])?;
+        let cached = usize::try_from(pool.used())?;
+        assert!(
+            cached >= 1024 * 1024,
+            "the dependency counts the frame it holds"
+        );
+
+        let budget = PipelineBudget::new(8 * 1024 * 1024);
+        let mut charge = CacheCharge {
+            pool: pool.clone(),
+            held: None,
+        };
+        charge.reconcile(Some(&budget))?;
+        assert_eq!(budget.used(), cached);
+        charge.reconcile(Some(&budget))?;
+        assert_eq!(
+            budget.used(),
+            cached,
+            "an unchanged cache is not charged twice"
+        );
+
+        let small = PipelineBudget::new(512 * 1024);
+        let error = CacheCharge { pool, held: None }
+            .reconcile(Some(&small))
+            .expect_err("a cache larger than the budget refuses the publisher");
+        assert_eq!(error.stage, Stage::MoqCache);
+
+        drop(charge);
+        assert_eq!(budget.used(), 0, "the charge is released with the source");
         Ok(())
     }
 
