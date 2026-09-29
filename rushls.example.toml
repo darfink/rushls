@@ -4,7 +4,7 @@
 #   2. Who may publish, and what .... [publish]
 #   3. How much this node holds ..... [limits] [memory] [disk]
 #   4. What it serves ............... [hls] [http] [https] [tls] [playback]
-#   5. What it reports and keeps .... [metrics] [record] [hook.*]
+#   5. What it reports and keeps .... [metrics] [log] [record] [hook.*]
 #
 # Active lines run a local origin on loopback, like rushls.toml. Commented
 # lines show compiled defaults; lines marked "example" are not defaults.
@@ -140,6 +140,12 @@ listen = "127.0.0.1:8080"                  # example (loopback); default "0.0.0.
 # [metrics]
 # listen = "127.0.0.1:9090"                # example
 # token  = "${METRICS_TOKEN}"              # example
+
+# level is Rushls's own; dependencies log at warn. RUST_LOG, when set, replaces
+# the whole filter (e.g. "info,quinn=trace"); --log-level overrides RUST_LOG.
+# [log]
+# level  = "info"                          # error, warn, info, debug, or trace
+# format = "text"                          # "json": one object per line, for log collectors
 
 # A copy of every completed segment, independent of the HLS window.
 # [record]

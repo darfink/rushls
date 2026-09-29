@@ -82,6 +82,33 @@ pub struct ResolvedAppConfig {
     pub config_file: Option<PathBuf>,
     /// `--check`: validate, print [`Self::plan`], and exit without serving.
     pub check: bool,
+    /// How the process logs, applied once configuration has loaded.
+    pub log: LogSettings,
+}
+
+/// Resolved `[log]`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogSettings {
+    /// An `EnvFilter` directive, already validated.
+    pub filter: String,
+    pub format: LogFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
+#[display(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable lines.
+    Text,
+    /// One JSON object per line, for log collectors.
+    Json,
+}
+
+impl FromStr for LogFormat {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        one_of(&[Self::Text, Self::Json], value, "log format")
+    }
 }
 
 impl ResolvedAppConfig {
@@ -434,6 +461,9 @@ pub struct AppConfig {
     pub playback: PlaybackAppConfig,
     #[conf(flatten, prefix)]
     pub metrics: MetricsAppConfig,
+    /// What the process logs, and in which format.
+    #[conf(flatten, prefix)]
+    pub log: LogAppConfig,
     /// Persistent local segment exports, independent of DVR retention.
     #[conf(parameter, value_parser = TomlValue::<crate::delivery::record::Config>::from_str)]
     pub record: Option<TomlValue<crate::delivery::record::Config>>,
@@ -493,8 +523,19 @@ impl AppConfig {
         search: ConfigSearch,
     ) -> Result<ResolvedAppConfig, ConfigError> {
         let env: Vec<(OsString, OsString)> = env.into_iter().collect();
-        let (config, config_file) = Self::load_from_with(args, env.iter().cloned(), search)?;
-        let mut resolved = config.resolve_from(env)?;
+        let loaded = Loader { search, ..LOADER }.load_from::<Self>(args, env.iter().cloned())?;
+        // `RUST_LOG` ranks as an environment value, so a `--log-level` flag
+        // still beats it; withholding it from resolution is how.
+        let from_cli = matches!(
+            loaded.sources.get("log.level"),
+            Some(rushls_config::Source::Cli)
+        );
+        let env = env
+            .into_iter()
+            .filter(|(name, _)| !(from_cli && name == "RUST_LOG"))
+            .collect::<Vec<_>>();
+        let config_file = loaded.path;
+        let mut resolved = loaded.config.resolve_from(env)?;
         resolved.config_file = config_file;
         Ok(resolved)
     }
@@ -534,8 +575,9 @@ impl AppConfig {
     ) -> Result<ResolvedAppConfig, ConfigError> {
         let defaults = NodeConfig::default();
         let mut client = LazyHttpClient::default();
-        let mut warnings =
-            LOADER.environment_warnings::<Self>(&env.into_iter().collect::<Vec<_>>());
+        let env = env.into_iter().collect::<Vec<_>>();
+        let mut warnings = LOADER.environment_warnings::<Self>(&env);
+        let log = self.log.resolve(&env)?;
 
         let (default_policy, policies) = self.publish.resolve()?;
         // The manifest promise covers retained media across every takeover. A
@@ -629,6 +671,7 @@ impl AppConfig {
             outbound_tls,
             config_file: None,
             check: self.check,
+            log,
         })
     }
 }
@@ -2835,6 +2878,87 @@ impl MetricsAppConfig {
         Ok(MetricsConfig {
             listen: self.listen,
             token: token.map(MetricsToken::new),
+        })
+    }
+}
+
+#[derive(Conf)]
+#[conf(serde)]
+pub struct LogAppConfig {
+    /// How much Rushls itself logs: error, warn, info, debug, or trace.
+    /// Dependencies stay at warn.
+    ///
+    /// A level rather than a filter directive, because this is the operator's
+    /// question — what is Rushls doing — and a bare "debug" applied to every
+    /// crate would bury the answer under QUIC and TLS internals. `RUST_LOG`,
+    /// when set, replaces the whole filter with its own directives, which is
+    /// the escape hatch for debugging a dependency; `--log-level` still
+    /// beats it.
+    #[conf(parameter, long, env, default_value = "info", serde(use_value_parser))]
+    level: LogLevel,
+    /// "text" for people, "json" (one object per line) for log collectors.
+    #[conf(parameter, long, env, default_value = "text", serde(use_value_parser))]
+    format: LogFormat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, derive_more::Display)]
+#[display(rename_all = "lowercase")]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl FromStr for LogLevel {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        one_of(
+            &[
+                Self::Error,
+                Self::Warn,
+                Self::Info,
+                Self::Debug,
+                Self::Trace,
+            ],
+            value,
+            "log level (directives belong in RUST_LOG)",
+        )
+    }
+}
+
+impl LogAppConfig {
+    /// Dependencies' warnings are real problems — a certificate that will not
+    /// load, a peer breaking protocol — so they stay visible at every level.
+    const DEPENDENCIES: &str = "warn";
+
+    fn resolve(&self, env: &[(OsString, OsString)]) -> Result<LogSettings, ConfigError> {
+        let rust_log = env
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "RUST_LOG")
+            .map(|(_, value)| value.to_string_lossy().trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let Some(filter) = rust_log else {
+            // `rushls` matches by prefix, so it covers the workspace crates
+            // (`rushls_config`, `rushls_tls`, ...) as well as the binary.
+            return Ok(LogSettings {
+                filter: format!("{},rushls={}", Self::DEPENDENCIES, self.level),
+                format: self.format,
+            });
+        };
+        // Refused at startup: a typo would otherwise silently log at some
+        // other level, which is exactly when an operator needs logs.
+        tracing_subscriber::EnvFilter::builder()
+            .parse(&filter)
+            .map_err(|error| {
+                invalid(format!("RUST_LOG {filter:?} is not a log filter: {error}"))
+            })?;
+        Ok(LogSettings {
+            filter,
+            format: self.format,
         })
     }
 }

@@ -2709,3 +2709,77 @@ fn rtmp_proxy_protocol_and_the_per_address_limit_reach_the_node() -> Result<(), 
     assert!(resolve_toml("[limits]\npublishers = 8\npublishers_per_address = 9\n")?.is_err());
     Ok(())
 }
+
+#[test]
+fn log_settings_rank_rust_log_as_an_environment_override() -> Result<(), Box<dyn Error>> {
+    use super::{LogFormat, LogSettings};
+
+    let resolve = |args: &[&str], env: &[(&str, &str)]| {
+        AppConfig::load_and_resolve_from(
+            std::iter::once("rushls")
+                .chain(args.iter().copied())
+                .map(OsString::from),
+            env.iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        )
+        .map(|resolved| resolved.log)
+    };
+    let settings = |filter: &str, format| LogSettings {
+        filter: filter.to_owned(),
+        format,
+    };
+
+    // The level is Rushls's own; dependencies stay at warn.
+    assert_eq!(
+        resolve(&[], &[])?,
+        settings("warn,rushls=info", LogFormat::Text)
+    );
+    assert_eq!(
+        resolve(
+            &[],
+            &[("RUSHLS_LOG_FORMAT", "json"), ("RUSHLS_LOG_LEVEL", "debug")]
+        )?,
+        settings("warn,rushls=debug", LogFormat::Json)
+    );
+    // `RUST_LOG` replaces the whole filter, and a flag beats it.
+    assert_eq!(
+        resolve(
+            &[],
+            &[
+                ("RUST_LOG", "info,quinn=trace"),
+                ("RUSHLS_LOG_LEVEL", "debug")
+            ]
+        )?
+        .filter,
+        "info,quinn=trace"
+    );
+    assert_eq!(
+        resolve(&["--log-level", "trace"], &[("RUST_LOG", "warn")])?.filter,
+        "warn,rushls=trace"
+    );
+    // Directives belong in RUST_LOG; an unparsable one names its source.
+    assert!(resolve(&["--log-level", "info,quinn=warn"], &[]).is_err());
+    let Err(error) = resolve(&[], &[("RUST_LOG", "info,[bad")]) else {
+        panic!("an unparsable RUST_LOG must be refused");
+    };
+    assert!(error.to_string().contains("RUST_LOG"), "{error}");
+    assert!(resolve(&["--log-format", "yaml"], &[]).is_err());
+    Ok(())
+}
+
+#[test]
+fn the_rushls_level_covers_workspace_crates_and_not_dependencies() -> Result<(), Box<dyn Error>> {
+    use tracing::Level;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let filter = tracing_subscriber::EnvFilter::builder().parse("warn,rushls=debug")?;
+    let subscriber = tracing_subscriber::registry().with(filter);
+    tracing::subscriber::with_default(subscriber, || {
+        assert!(tracing::enabled!(target: "rushls", Level::DEBUG));
+        assert!(tracing::enabled!(target: "rushls::source::rtmp", Level::DEBUG));
+        assert!(tracing::enabled!(target: "rushls_config", Level::DEBUG));
+        assert!(!tracing::enabled!(target: "quinn", Level::INFO));
+        assert!(tracing::enabled!(target: "quinn", Level::WARN));
+    });
+    Ok(())
+}

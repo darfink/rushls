@@ -6,12 +6,15 @@ use rushls::{
     domain::{SessionId, StreamId},
     hooks::{self, HookObserver},
     observe::{EventObserver, Events, NodeEvent, SessionEnd, SessionEvent, StreamEvent},
-    server::{AppConfig, Node, ResolvedHooks},
+    server::{AppConfig, LogFormat, LogSettings, Node, ResolvedHooks},
     version,
 };
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{
+    EnvFilter, Layer, Registry, fmt, layer::SubscriberExt, registry::LookupSpan, reload,
+    util::SubscriberInitExt,
+};
 
 // Instrumentation is absent from ordinary production builds.
 #[cfg(feature = "allocation-counting")]
@@ -307,18 +310,66 @@ impl EventObserver for TracingEvents {
     }
 }
 
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+/// The subscriber beneath the output layer: the registry and its filter.
+type Filtered = tracing_subscriber::layer::Layered<reload::Layer<EnvFilter, Registry>, Registry>;
+type Output = Box<dyn Layer<Filtered> + Send + Sync>;
+
+/// Handles for applying `[log]` once configuration has loaded.
+struct Logging {
+    filter: reload::Handle<EnvFilter, Registry>,
+    output: reload::Handle<Output, Filtered>,
+}
+
+impl Logging {
+    /// Starts with text at `RUST_LOG` or info, so a configuration error,
+    /// which is reported before `[log]` can be read, is still timestamped.
+    fn init() -> Self {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let (filter, filter_handle) = reload::Layer::new(filter);
+        let (output, output_handle) = reload::Layer::new(output_layer(LogFormat::Text));
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(output)
+            .init();
+        Self {
+            filter: filter_handle,
+            output: output_handle,
+        }
+    }
+
+    /// Applies the resolved `[log]` settings. The filter was validated during
+    /// resolution, so failing here is a defect rather than bad input.
+    fn apply(&self, settings: &LogSettings) -> Result<(), Box<dyn Error>> {
+        self.filter
+            .reload(EnvFilter::builder().parse(&settings.filter)?)?;
+        self.output.reload(output_layer(settings.format))?;
+        Ok(())
+    }
+}
+
+fn output_layer<S>(format: LogFormat) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
     let timestamp_format = time::format_description::parse_owned::<2>(
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z",
     )
     .expect("the log timestamp format is valid");
-    fmt()
-        .with_env_filter(filter)
+    let layer = fmt::layer()
         .with_writer(std::io::stderr)
         .with_target(false)
-        .with_timer(fmt::time::UtcTime::new(timestamp_format))
-        .init();
+        .with_timer(fmt::time::UtcTime::new(timestamp_format));
+    match format {
+        LogFormat::Text => layer.boxed(),
+        // Flattened so fields sit beside `level` and `message`, which is the
+        // shape log collectors index without a per-source parsing rule.
+        LogFormat::Json => layer
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .boxed(),
+    }
 }
 
 #[tokio::main]
@@ -348,8 +399,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Initialize before configuration so startup failures also carry timestamps.
-    init_tracing();
+    let logging = Logging::init();
     let resolved = AppConfig::load_and_resolve().unwrap_or_else(|error| error.exit());
+    logging.apply(&resolved.log)?;
     if resolved.check {
         // A dry run: everything above has validated, so report and stop
         // before binding anything.

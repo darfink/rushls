@@ -8,7 +8,9 @@ pub mod http;
 pub mod metrics;
 mod runtime;
 
-pub use config::{AppConfig, ConfigError, ResolvedAppConfig, ResolvedHooks};
+pub use config::{
+    AppConfig, ConfigError, LogFormat, LogSettings, ResolvedAppConfig, ResolvedHooks,
+};
 pub use http::{
     AllowedOrigins, CorsConfig, OriginPattern, OriginPatternError, Readiness, TlsError,
     TlsSettings, WildcardDepth,

@@ -92,7 +92,7 @@ h264-reader = "0.8.0"
 scuffle-h265 = "0.2.2"
 scuffle-av1 = "0.1.4"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "std", "time"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "std", "time"] }
 cap-std = "4"
 cap-fs-ext = "4"
 

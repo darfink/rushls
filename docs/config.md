@@ -1195,6 +1195,33 @@ An earlier draft had both an `enabled` flag and a `listen` that accepted
 metrics off entirely, one moving them to a shared port. Table-as-switch removes
 the ambiguity and matches how every other optional feature here reads.
 
+## Logging
+
+```toml
+[log]
+level  = "info"   # Rushls only: error, warn, info, debug, trace
+format = "text"   # "json" for log collectors
+```
+
+**`level` is how much Rushls says, not a filter.** It applies to Rushls's own
+targets, workspace crates included; dependencies stay at `warn`, so their real
+problems — a certificate that will not load, a peer breaking protocol — still
+show. A bare level applied to every crate would make `debug` useless: the
+answer to "what is Rushls doing" would be buried under QUIC and TLS internals.
+Directive syntax is refused here, because it belongs to the next knob.
+
+**`RUST_LOG` is the escape hatch.** When set, it replaces the whole filter
+with its own directives — `RUST_LOG=info,quinn=trace` to debug a dependency —
+the way every Rust tool reads it. It ranks as an environment value: it beats
+the file and `RUSHLS_LOG_LEVEL`, and `--log-level` beats it. An unparsable
+`RUST_LOG` is refused at startup rather than silently logging at some other
+level exactly when logs are needed.
+
+`format` is the part `RUST_LOG` could never express. JSON writes one object
+per line with event fields beside `timestamp`, `level`, and `message`. A
+configuration error that stops startup is reported as text, since `[log]`
+cannot be read until the configuration has loaded.
+
 Present, metrics get their **own listener**, defaulting to loopback. Prometheus
 series carry stream names, which on a public origin is the list of everything
 currently published — not something the viewer-facing port should offer.
@@ -1400,7 +1427,6 @@ administrator over a relationship they did not know existed should warn.
 - Per-path or per-app publish maps — named profiles cover it.
 - A disconnect-on-too-fast setting.
 - Classic HLS, or a `low_latency` flag. The origin is low-latency HLS.
-- `log_level` — `RUST_LOG` already does this.
 - Configurable health probe paths.
 - Per-hook queue depth, retry counts, and response ceilings.
 - Per-hook rendition filtering — `ce-rendition` lets a consumer filter on

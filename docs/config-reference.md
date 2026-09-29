@@ -130,6 +130,13 @@ See [rushls.example.toml](../rushls.example.toml) for an annotated file.
 | `metrics.listen` | — | `RUSHLS_METRICS_LISTEN` | `--metrics-listen` | Where metrics are served. Absent exports nothing. |
 | `metrics.token` | — | `RUSHLS_METRICS_TOKEN` | `--metrics-token <PATH>` | Bearer token required to scrape `/metrics` and `/metrics/streams`: inline, `${VAR}`, or `{ file = "/path" }`. |
 
+## [log]
+
+| Setting | Default | Environment | CLI | Description |
+|---|---|---|---|---|
+| `log.level` | `info` | `RUSHLS_LOG_LEVEL` | `--log-level` | How much Rushls itself logs: error, warn, info, debug, or trace. Dependencies stay at warn. |
+| `log.format` | `text` | `RUSHLS_LOG_FORMAT` | `--log-format` | "text" for people, "json" (one object per line) for log collectors. |
+
 ## [record]
 
 | Setting | Default | Environment | CLI | Description |
