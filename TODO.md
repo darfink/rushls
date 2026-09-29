@@ -97,6 +97,19 @@ Evaluate these separately from release validation:
   decisions. Separate HLS requirements, Apple authoring requirements, and CMAF constraints.
 - [ ] Profile performance and allocations before selecting optimizations.
 - [ ] Review error types for consistent classification and actionable diagnostics.
+- [ ] Support HLS interstitials: `EXT-X-DATERANGE` with `CLASS="com.apple.hls.interstitials"`
+  and `X-ASSET-URI` / `X-ASSET-LIST`. The player fetches each asset as its own HLS
+  presentation, so the main stream's codecs are not a hard requirement; matching encodes
+  only make transitions smoother. Needs a cue source (an HTTP "insert now / at time" API
+  first; SCTE-35 over MPEG-TS for broadcast sources; no mainstream encoder is confirmed to
+  send RTMP `onCuePoint`), DATERANGE output in media playlists, and real
+  `CAN-SKIP-DATERANGES` / `RECENTLY-REMOVED-DATERANGES` handling in delta updates.
+- [ ] Evaluate `SAMPLE-AES` (CMAF `cbcs`) encryption with keys from an external key
+  service. Moderate effort: encryption boxes in init segments and every fragment,
+  including each LL-HLS part, and pattern encryption of video slice data. A plain key URL
+  is access control rather than DRM, and player support for clear-key `SAMPLE-AES` is
+  unverified. The main value is groundwork for FairPlay/Widevine through a DRM vendor;
+  licensing stays out of scope.
 
 ## Completed baseline
 
