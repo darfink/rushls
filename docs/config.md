@@ -1439,14 +1439,16 @@ is lifted.
 
 ### Shipped files
 
-The two files serve different purposes:
+Two files describe the configuration:
 
-- `rushls.toml` — the local starter. Loopback listeners, everything else
-  compiled defaults. Push a file, watch it play.
 - `rushls.example.toml` — every supported TOML field, grouped by question, with
-  optional settings commented. Active settings match the local starter.
+  optional settings commented. Its only active settings bind the listeners to
+  loopback, so it runs as-is as a local origin.
 - `docs/config-reference.md` — every setting with its default, environment
   variable, and flag, generated from the schema; a test fails when it drifts.
+
+There is no separate starter file. A second, shorter file had to be kept in
+step with the example, and two files named alike invited editing the wrong one.
 
 Print the example that matches the installed binary:
 

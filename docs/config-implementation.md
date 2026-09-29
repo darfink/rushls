@@ -469,7 +469,7 @@ replace it, or the independence silently reintroduces drift.
 The container image ships `examples/container/rushls.toml` for local container development.
 It binds container interfaces and permits publishing without authentication.
 Public deployments must mount a configuration with publisher authorization.
-`rushls.toml` remains the local loopback starter; `rushls.example.toml` lists the supported configuration fields.
+`rushls.example.toml` lists the supported configuration fields, and its active lines are a loopback starter.
 
 ## Deferred
 

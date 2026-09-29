@@ -19,7 +19,7 @@ Linux archives target Ubuntu 24.04 or compatible systems with glibc 2.39 or late
 They are not static musl binaries. Older Linux distributions are not validated release targets.
 macOS archives are tested on macOS 15; older macOS versions are not covered by this matrix.
 
-Each archive contains the executable, starter and annotated configurations, README, documentation, MIT license, and dependency notices.
+Each archive contains the executable, the annotated configuration example, README, documentation, MIT license, and dependency notices.
 CI extracts the archive and runs the extracted executable on its native platform.
 It checks version output, exact example-config output, HTTP readiness, and graceful shutdown.
 The full media and player tests run separately in the same workflow.

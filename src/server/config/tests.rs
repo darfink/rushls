@@ -84,14 +84,14 @@ fn load_shipped(name: &str) -> Result<ResolvedAppConfig, Box<dyn Error>> {
 }
 
 #[tokio::test]
-async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults() -> Result<(), Box<dyn Error>>
+async fn the_example_file_is_a_loopback_origin_with_compiled_defaults() -> Result<(), Box<dyn Error>>
 {
-    // The local starter narrows the listeners and nothing else, so anything
-    // that drifts away from a compiled default here is an accident.
-    let config = load_shipped("rushls.toml")?;
+    // The example's active lines narrow the listeners and nothing else, so
+    // anything that drifts away from a compiled default here is an accident.
+    let config = load_shipped("rushls.example.toml")?;
     assert_eq!(
         config.config_file,
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rushls.toml"))
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rushls.example.toml"))
     );
 
     assert_eq!(
@@ -111,11 +111,15 @@ async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults() -> Resul
         config.node.metrics.listen, None,
         "metrics are off by default"
     );
+    assert_eq!(config.node.rtmps_address, None);
+    assert!(config.hooks.is_none());
+    assert!(config.playback.is_none());
 
     let grant = config
         .authenticator
         .authenticate(&request("ignored"))
         .await?;
+    assert_eq!(grant.principal, Principal("anonymous".into()));
     assert_eq!(
         grant.policy,
         StreamPolicy {
@@ -127,25 +131,6 @@ async fn the_starter_file_is_a_loopback_origin_with_compiled_defaults() -> Resul
         },
         "anyone may publish anything this origin can mux, at any speed"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn the_example_file_is_the_starter_with_optional_documentation() -> Result<(), Box<dyn Error>>
-{
-    let starter: toml::Value = toml::from_str(include_str!("../../../rushls.toml"))?;
-    let example: toml::Value = toml::from_str(include_str!("../../../rushls.example.toml"))?;
-    assert_eq!(example, starter, "only the loopback listeners are active");
-    let config = load_shipped("rushls.example.toml")?;
-    assert!(config.hooks.is_none());
-    assert!(config.playback.is_none());
-    assert!(config.node.metrics.listen.is_none());
-    assert!(config.node.moq_address.is_none());
-    let grant = config
-        .authenticator
-        .authenticate(&request("ignored"))
-        .await?;
-    assert_eq!(grant.principal, Principal("anonymous".into()));
     Ok(())
 }
 
@@ -316,8 +301,8 @@ fn a_missing_config_file_is_an_error() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn compiled_defaults_do_not_search_well_known_files() -> Result<(), Box<dyn Error>> {
-    // The crate tree has a rushls.toml. A fixture that asked for compiled
-    // defaults must not pick it up.
+    // A checkout may hold a generated rushls.toml. A fixture that asked for
+    // compiled defaults must not pick it up.
     let resolved = AppConfig::load_and_resolve_from(os(["rushls"]), std::iter::empty())?;
     assert_eq!(resolved.config_file, None);
     Ok(())

@@ -1,4 +1,6 @@
 /target
+# Generated locally with `rushls --print-config-example > rushls.toml`.
+/rushls.toml
 .DS_Store
 __pycache__/
 *.py[cod]

@@ -25,7 +25,7 @@ Select the SRT-enabled executable in your `PATH` before using the recipes.
 Start Rushls from the repository root:
 
 ```sh
-./target/release/rushls --config rushls.toml
+./target/release/rushls --config rushls.example.toml
 ```
 
 A stream named `live/demo` has the master playlist `http://127.0.0.1:8080/live/demo/index.m3u8`.

@@ -6,8 +6,8 @@
 #   4. What it serves ............... [hls] [http] [https] [tls] [playback]
 #   5. What it reports and keeps .... [metrics] [log] [record] [hook.*]
 #
-# Active lines run a local origin on loopback, like rushls.toml. Commented
-# lines show compiled defaults; lines marked "example" are not defaults.
+# Active lines run a local origin on loopback. Commented lines show compiled
+# defaults; lines marked "example" are not defaults.
 # Publishing and playback need no authorization in this file. Configure
 # authorization (publish.auth, playback.auth) and limits before exposing it.
 #

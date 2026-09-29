@@ -117,7 +117,7 @@ def main():
         stage.mkdir()
         binary = 'rushls.exe' if os.name == 'nt' else 'rushls'
         shutil.copy2(Path('target') / args.target / 'release' / binary, stage / binary)
-        for filename in ('README.md', 'LICENSE', 'rushls.toml', 'rushls.example.toml'):
+        for filename in ('README.md', 'LICENSE', 'rushls.example.toml'):
             shutil.copyfile(filename, stage / filename)
         shutil.copytree('docs', stage / 'docs')
         shutil.copytree('tools/patches/hls.js', stage / 'tools/patches/hls.js')

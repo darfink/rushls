@@ -153,7 +153,7 @@ async fn readme_and_operator_guide_toml_examples_resolve() -> Result<(), Box<dyn
 fn check_prints_the_resolved_plan_without_serving() -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
 
-    let starter = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("rushls.toml");
+    let starter = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("rushls.example.toml");
     let output = Command::new(env!("CARGO_BIN_EXE_rushls"))
         .env_clear()
         .arg("--config")
