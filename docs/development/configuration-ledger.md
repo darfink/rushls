@@ -16,9 +16,9 @@
 > `[capacity]` split into `[limits]`, `[memory]`, and `[disk]`, `hls.retain`
 > became `hls.window`, `[auth.*]` moved to `[publish.auth]` and
 > `[playback.auth]`, and certificates live in one `[tls]` table. See
-> [the reference](config-reference.md) for every current key.
+> [the reference](../configuration-reference.md) for every current key.
 >
-> This exists because [config.md](config.md) deliberately designs the
+> This exists because [the configuration design](configuration-design.md) deliberately designs the
 > configuration **without regard for what the internals currently look like**.
 > That is the point of the exercise: the operator surface is chosen first, and
 > the application changes to serve it. This file was the honest accounting of
@@ -53,7 +53,7 @@ Permissive mode uses bounded GAP handling for audio and progressive H.264 withou
 Unsupported video holes fail explicitly. Audio synthesis and video frame-hold recovery are removed.
 Codec declarations establish fixed cadence; nominal rates do not.
 Checks run during pre-roll and live processing, independently of pacing.
-See [input-modes.md](input-modes.md) for internal limits and host reporting.
+See [input handling](../input-handling.md) for internal limits and host reporting.
 
 ## Health
 
@@ -196,7 +196,7 @@ memory; WebVTT output is still rendered on publication. `"unlimited"`
 keeps accounting without a ceiling. Failed reservations end the
 publication instead of waiting for another stage to release memory.
 The current implementation excludes uninstrumented native MPEG-TS/QUIC buffers
-and metadata/container overhead. See [Publisher pipeline memory](config.md#publisher-pipeline-memory)
+and metadata/container overhead. See [Publisher pipeline memory](configuration-design.md#publisher-memory)
 for the accounting contract and current metrics.
 
 **A process-wide view of ingest rate.** The density limits are per session, so
@@ -480,4 +480,4 @@ Everything else in this ledger is specified in `config.md` and pending
 implementation. Environment interpolation is designed, not deferred to a later
 design.
 
-Audio compensation policy and episode hooks are described in [Audio gap recovery](audio-recovery.md).
+Audio compensation policy and episode hooks are described in [Audio gap recovery](../input-handling.md).

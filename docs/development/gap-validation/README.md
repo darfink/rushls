@@ -1,13 +1,13 @@
 # GAP player validation matrix
 
-Evidence review: 2026-09-20. The historical tables precede the [live regression follow-up](gap-live-follow-up.md) and [Chrome isolation](gap-chrome-isolation.md).
+Evidence review: 2026-09-20. The historical tables precede the [live regression follow-up](investigations/live-follow-up.md) and [Chrome isolation](investigations/chrome-isolation.md).
 The tables summarize recorded experiments, not a completed support certification.
 Historical reports use Safari 26.6.2, Chrome 153, and official hls.js 1.7.3 unless stated otherwise.
 New runs must record their actual versions.
 
-The latest [local hls.js candidate results](gap-live-order-fix.md) include two completed uninterrupted controls and completed audio/video GAP runs.
+The latest [local hls.js candidate results](investigations/live-order-fix.md) include two completed uninterrupted controls and completed audio/video GAP runs.
 Those results apply to the patched player, not official hls.js. Bounded repeated audio appends remain unresolved.
-Raw evidence follows the [local artifact policy](validation-artifacts.md).
+Raw evidence follows the [local artifact policy](artifacts.md).
 
 ## Current implementation and scope
 
@@ -39,8 +39,8 @@ Completed playlists with parts do not establish live LL-HLS behavior.
 | Opus, mono/stereo | GAP decode recorded | Safari starts recorded within the audio matrix. No complete Chrome matrix established | Pending |
 | FLAC, mono 44.1 kHz/16-bit and stereo 48 kHz/24-bit | Exact PCM and fresh decoding after GAPs recorded | Pending, including uninterrupted browser controls | Pending |
 
-Sources: [audio experiment log](audio-gap-validation.md#initial-completed-playlist-results),
-[controlled follow-up](audio-gap-validation.md#controlled-follow-up), and [FLAC validation](flac.md#validation).
+Sources: [audio experiment log](audio.md#initial-completed-playlist-results),
+[controlled follow-up](audio.md#controlled-follow-up), and [FLAC validation](flac.md#validation).
 The initial audio matrix passed all 24 native Safari checks and 21 of 24 Safari/hls.js checks.
 Focused full-segment follow-ups passed 20 comparisons across the three initially failing AAC configurations.
 Those results do not establish the full Chrome, seeking, or live matrix.
@@ -56,11 +56,11 @@ Those results do not establish the full Chrome, seeking, or live matrix.
 | H.264/AAC, early loss during pre-roll | Player attempt inconclusive | Near-end progress without normal completion | Repeat startup and completion checks |
 | HEVC/AV1 or reordered H.264 with audio loss | Pending | Pending | Uninterrupted codec control, then audio GAP cases |
 
-Sources: [video experiments](video-gap-validation.md#playback-observations),
-[corrected live fixture](video-gap-validation.md#live-av-follow-up),
-[integrated detection](video-gap-validation.md#detection-to-publication-integration),
-[production Safari failure](video-gap-validation.md#foreground-retry-failure-reproduced-on-production-output),
-and [regression checks](gap-regressions.md#recorded-checks).
+Sources: [video experiments](video.md#playback-observations),
+[corrected live fixture](video.md#live-av-follow-up),
+[integrated detection](video.md#detection-to-publication-integration),
+[production Safari failure](video.md#foreground-retry-failure-reproduced-on-production-output),
+and [regression checks](regressions.md#recorded-checks).
 
 Safari sometimes resumed video only at the next IDR, with approximately one second between picture callbacks.
 Chrome decoded altered dependent pictures until the next IDR in the video fixture.
@@ -98,7 +98,7 @@ Continuation does not establish intact pictures, silence, or perceptual A/V sync
 7. Record support decisions and select a small repeatable regression set from the completed cases.
    Keep known failures separate from passing cases.
 
-The existing [regression commands](gap-regressions.md) provide the starting fixtures and browser probes.
+The existing [regression commands](regressions.md) provide the starting fixtures and browser probes.
 The Apple harness already has four loss/control pairs. It checks packaging, not decoder continuation.
 
 ## Result record and completion rule

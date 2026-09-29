@@ -1,10 +1,10 @@
 # Chrome GAP isolation
 
 Local evidence paths below are relative to the repository root and are not included in a clone.
-See [validation artifacts](validation-artifacts.md) for storage and reproduction guidance.
+See [validation artifacts](../artifacts.md) for storage and reproduction guidance.
 
 Date: 2026-09-20. This follow-up separates audio loss from video loss in the live H.264/AAC fixture.
-It follows the [six-case live check](gap-live-follow-up.md).
+It follows the [six-case live check](live-follow-up.md).
 
 ## Method
 
@@ -62,7 +62,7 @@ The shared symptom is incomplete final-part loading after a live stream ends.
 This is distinct from failure to resume at the earlier GAP itself.
 
 These results do not prove whether the remaining defect is in the origin, player, or their timing interaction.
-The [ENDLIST trace](gap-endlist-trace.md) captures that transition and the player's part-selection decision.
+The [ENDLIST trace](endlist-trace.md) captures that transition and the player's part-selection decision.
 Use a fixed video variant for that diagnostic, and retain the ordinary-player controls.
 Compare final-part resource availability and timestamps with requested, loaded, and appended ranges before changing production packaging.
 
@@ -73,7 +73,7 @@ Its directory retains compressed browser reports, session events, origin logs, a
 The production source patch is unchanged from the preceding six-case archive.
 The first audio report has no per-track buffer snapshot. Its repeat supplies that evidence.
 
-Use the [live reproduction commands](gap-live-follow-up.md#retained-evidence-and-reproduction) with the scenario environment described here.
+Use the [live reproduction commands](live-follow-up.md#retained-evidence-and-reproduction) with the scenario environment described here.
 Use a fresh ready-file path for every run. No Safari tests ran in this isolation set.
 
 All twelve playback-tool tests, Python compilation, documentation links, and whitespace checks passed after the diagnostic addition.

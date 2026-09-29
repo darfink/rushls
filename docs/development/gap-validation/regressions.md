@@ -1,7 +1,7 @@
 # GAP regression checks
 
-The [GAP player matrix](gap-player-matrix.md) lists current evidence, support limits, and the remaining execution order.
-Store generated captures under `target/rushls-validation/`; see [validation artifacts](validation-artifacts.md).
+The [GAP player matrix](README.md) lists current evidence, support limits, and the remaining execution order.
+Store generated captures under `target/rushls-validation/`; see [validation artifacts](artifacts.md).
 
 These checks distinguish packaging correctness from player continuation.
 The browser results do not prove seamless concealment or perceptual A/V synchronization.
@@ -91,3 +91,32 @@ Official hls.js passed eight startup checks and two seek checks for video loss w
 Native Safari passed a full-segment A/V fresh start at 2.46 seconds.
 Its first displayed frame was at 4.04 seconds, after the next IDR.
 These checks do not complete the wider codec, live seek, and player matrix.
+
+## Audio decoder checks
+
+See [audio GAP validation](audio.md) for measured results.
+
+Decoder checks generate real audio, remove packets, and package the remaining audio through Rushls with 200 ms parts.
+They check decoded continuation rather than treating successful muxing as successful recovery.
+
+```sh
+RUSHLS_GAP_FIXTURES=/tmp/rushls-gap-fixtures cargo test -p rushls --lib gapped_audio_decodes -- --ignored
+RUSHLS_GAP_FIXTURES=/tmp/rushls-gap-fixtures cargo test -p rushls --lib he_aac_gaps_decode -- --ignored
+```
+
+The HE-AAC check requires FFmpeg's macOS AudioToolbox encoder.
+Exported playlists and media come from the production muxer, store, and playlist projection.
+`index.m3u8` includes parts; `full.m3u8` omits LL-HLS tags for full-segment checks.
+
+The browser probe requires Safari remote automation and a local hls.js bundle from its official distribution.
+Start `safaridriver -p 4445`, then run:
+
+```sh
+python3 tools/check-gap-playback.py \
+  --fixtures /tmp/rushls-gap-fixtures --hls-js /path/to/hls.min.js \
+  --output /tmp/gap-playback.json
+```
+
+Use `--playlist full.m3u8` for full-segment checks.
+The probe checks playback progress, continuation, and seeking after the gap.
+These completed-playlist checks do not replace live LL-HLS, A/V synchronization, or alternate-rendition tests.

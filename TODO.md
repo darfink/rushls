@@ -12,7 +12,7 @@ Complete these checks before a broad production rollout:
   process allocation counters, latency limits, resource bounds, and cleanup assertions.
 - [x] Exercise concurrent reconnects, malformed RTMP connections, abrupt publisher
   loss, recorder write failure/recovery, and DVR pressure alongside healthy streams.
-  Record the executed workloads and results in [load validation](docs/load-validation.md).
+  Record the executed workloads and results in [load validation](docs/development/load-testing.md).
 - [ ] Establish deployment-specific capacity through longer runs on representative
   hardware and media. Include real disk-full/stalled-device and packet-loss scenarios
   where the deployment requires them. Local validation is not a production capacity claim.
@@ -21,8 +21,8 @@ Complete these checks before a broad production rollout:
   and blocking reloads across successor publication and rendition retirement.
 - [ ] Complete the supported codec/player matrix for startup, seeking, live playback,
   and rendition switching around GAPs. Record transient freezes and skips separately
-  from persistent stalls. Track results in the [player matrix](docs/gap-player-matrix.md)
-  and use the [GAP regression checks](docs/gap-regressions.md).
+  from persistent stalls. Track results in the [player matrix](docs/development/gap-validation/README.md)
+  and use the [GAP regression checks](docs/development/gap-validation/regressions.md).
 - [ ] Aggregate hook failure logs into unhealthy/recovered transitions and periodic
   totals. Preserve per-event counters. Include a rejecting endpoint under
   `segment.ready` traffic in the load tests.
@@ -31,9 +31,9 @@ Complete these checks before a broad production rollout:
   exhausting global capacity, including input without pacing.
 - [x] Automate formatting, lints, tests, native binary packaging, and tagged release delivery.
   Apple validation and all native archive smoke tests block publication.
-  See [release procedures](docs/releases.md).
+  See [release procedures](docs/development/releasing.md).
 - [x] Add MIT licensing and scan tracked files and reachable Git history for credentials.
-  See the [review scope and findings](docs/credential-review.md).
+  See the [review scope and findings](docs/development/reviews/credentials-2026-09-23.md).
 - [ ] Verify the final Windows storage cleanup fix and extracted ZIP smoke test on CI.
   The previous native run passed 1,009 Rushls tests; one cleanup race required a fix.
   GitHub blocked the verification run because of account billing or spending limits.
@@ -56,7 +56,7 @@ These limits remain explicit in the supported scope:
 - Safari video-only playback can end prematurely at a video GAP. Tested A/V cases
   continued, sometimes after a freeze until the next IDR. This does not establish
   support for every codec, player, or seek position.
-  See [video GAP validation](docs/video-gap-validation.md).
+  See [video GAP validation](docs/development/gap-validation/video.md).
 - Permissive video GAP recovery supports declared fixed-cadence H.264, single-layer
   HEVC, and single-layer AV1 without presentation reordering. Unsupported video
   recovery mappings remain fatal. HEVC and AV1 GAPs are validated by FFmpeg decoding,
@@ -135,5 +135,5 @@ These items no longer belong in the implementation backlog:
 - Metadata-only `segment.ready` hooks after completed media commits. GAP entries do
   not emit ready events. Binary payload hooks remain outside the implemented scope.
 
-See [input modes](docs/input-modes.md), [audio GAP validation](docs/audio-gap-validation.md),
-and [hook configuration](docs/config.md#hook-delivery) for the current behavior.
+See [input handling](docs/input-handling.md), [audio GAP validation](docs/development/gap-validation/audio.md),
+and [hook configuration](docs/configuration.md#hooks) for the current behavior.

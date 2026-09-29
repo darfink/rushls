@@ -1,6 +1,7 @@
-> Current timestamp policy and failure hooks: [Timestamp failures](timestamp-failures.md).
+# Configuration design
 
-# RFC: the Rushls configuration surface
+> This is the design record behind the configuration: the reasoning, the alternatives that were rejected, and why.
+> To configure Rushls, read the [configuration guide](../configuration.md) instead.
 
 Setting names use `max_*` for upper limits and `per_*` for budgets that apply
 to each publisher or stream. Sizes are written `"64MiB"`, durations `"10s"`,
@@ -10,7 +11,7 @@ each: a string, `"${VAR}"`, or `{ file = "/path" }`. Service deadlines use
 `queue_size`.
 
 Every setting, with its default, environment variable, and flag, is listed in
-the generated [configuration reference](config-reference.md). `rushls --check`
+the generated [configuration reference](../configuration-reference.md). `rushls --check`
 validates a configuration and prints its listeners and worst-case memory.
 
 
@@ -27,7 +28,7 @@ validates a configuration and prints its listeners and worst-case memory.
 > Replaces the earlier open discussion in `CONFIG.md`, now removed. That
 > document contradicted this design in several places.
 
-The surface is [rushls.example.toml](../rushls.example.toml).
+The surface is [rushls.example.toml](../../rushls.example.toml).
 That file documents every supported TOML field, grouped by the question it
 answers. Its active settings form a local starter; commented lines show
 defaults, and lines marked "example" are not defaults.
@@ -193,7 +194,7 @@ The origin rejects a second broadcast on the same connection.
 
 The listener accepts `moq-lite-05` over WebTransport (`https://`) and raw QUIC
 (`moqt://`). WebTransport selects the version in the CONNECT response.
-Raw QUIC selects the version through TLS ALPN. See [MOQ ingestion](moq-ingestion.md)
+Raw QUIC selects the version through TLS ALPN. See [MOQ ingestion](../moq.md)
 for supported media formats and a local publish test.
 
 ## `[publish]`
@@ -1152,7 +1153,7 @@ the authorized `stream_id` and `principal`. Credentials never enter lifecycle
 events. The auth service controls the grant, while the node controls observed
 transport facts.
 
-See [Publisher API](publisher-api.md) for complete examples and hook signature
+See [Publisher API](../admission-and-hooks.md) for complete examples and hook signature
 verification.
 
 ### Playback
@@ -1302,7 +1303,7 @@ output deadlines and wall-time lag, rendition comparisons, and retention.
 `/metrics` contains node totals, HTTP body and response measurements, operation
 durations, capacity, and hook delivery measurements.
 
-See [Metrics](metrics.md) for exact semantics, replacement names, queries,
+See [Metrics](../metrics.md) for exact semantics, replacement names, queries,
 a Grafana dashboard, alert rules, and the public-playback probe.
 
 
@@ -1407,7 +1408,7 @@ Structured values — `publish.rate`, `publish.video`, `publish.audio`,
 the environment and on the command line, and replace the whole value. Named
 profiles, hooks, recording, and playback claims are TOML-only. `rushls --help`
 lists the flags and environment variables, and the
-[configuration reference](config-reference.md) lists every setting.
+[configuration reference](../configuration-reference.md) lists every setting.
 
 The file is read at startup. New certificates and rotated JWKS keys take effect
 without a restart; anything else requires one. There is deliberately no reload
@@ -1467,7 +1468,7 @@ The binary embeds the same file that lives in the repository. Printing bypasses 
 including invalid files and environment overrides. It does not resolve credentials or start the server.
 The flag is CLI-only; it is not a TOML field or environment setting.
 
-The container image ships [examples/container/rushls.toml](../examples/container/rushls.toml).
+The container image ships [examples/container/rushls.toml](../../examples/container/rushls.toml).
 It listens on container interfaces and permits publishing without authentication.
 For public deployment, mount a configuration with publisher authorization at `/etc/rushls/rushls.toml`.
 
@@ -1528,4 +1529,4 @@ This setting exposes names; it does not create those response headers.
 Keep CDN-specific exposure in the CDN response-header policy when the CDN owns those headers.
 Preserve the origin exposure list when you add CDN header names.
 
-Strict input validation is enabled by default. Set `publish.strict = false` to enable [bounded GAP handling](audio-recovery.md). See [input modes](input-modes.md).
+Strict input validation is enabled by default. Set `publish.strict = false` to enable [bounded GAP handling](../input-handling.md). See [input modes](../input-handling.md).

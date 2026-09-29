@@ -184,7 +184,7 @@ impl ResolvedAppConfig {
     }
 }
 
-/// Renders `docs/config-reference.md` from the schema itself, so the reference
+/// Renders `docs/configuration-reference.md` from the schema itself, so the reference
 /// TOML path of a schema option, or `None` for command-line-only flags.
 pub fn toml_path(id: &str) -> Option<String> {
     if matches!(id, "config" | "print_config_example" | "check") {
@@ -208,7 +208,7 @@ const CREDENTIAL_FILE_FLAGS: &[&str] = &[
     "metrics.token_file",
 ];
 
-/// Renders `docs/config-reference.md` from the schema itself, so the reference
+/// Renders `docs/configuration-reference.md` from the schema itself, so the reference
 /// can only describe settings that exist, with the defaults they really have.
 ///
 /// One table per top-level section, in schema order. The description is each

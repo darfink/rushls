@@ -2632,14 +2632,14 @@ fn the_check_plan_shows_listeners_and_worst_case_memory() -> Result<(), Box<dyn 
 #[test]
 fn the_config_reference_is_current() -> Result<(), Box<dyn Error>> {
     let rendered = super::reference_markdown();
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/config-reference.md");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/configuration-reference.md");
     if std::env::var_os("RUSHLS_UPDATE_CONFIG_REFERENCE").is_some() {
         fs::write(&path, &rendered)?;
     }
     let committed = fs::read_to_string(&path).unwrap_or_default();
     assert!(
         committed == rendered,
-        "docs/config-reference.md is stale; regenerate with \
+        "docs/configuration-reference.md is stale; regenerate with \
          RUSHLS_UPDATE_CONFIG_REFERENCE=1 cargo test --lib config_reference"
     );
     Ok(())

@@ -14,7 +14,7 @@
 #   rushls --print-config-example > rushls.toml   # this file
 #   rushls --check                                 # listeners and memory plan
 #
-# docs/config-reference.md lists every setting with its environment variable
+# docs/configuration-reference.md lists every setting with its environment variable
 # and CLI flag. Values resolve defaults < TOML < environment < CLI.
 #
 # Durations read "10s", "1m30s". Sizes read "64MiB". "3x" means three times

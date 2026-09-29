@@ -1,9 +1,9 @@
 # Player regression and remaining loading failures
 
 Local evidence paths below are relative to the repository root and are not included in a clone.
-See [validation artifacts](validation-artifacts.md) for storage and reproduction guidance.
+See [validation artifacts](../artifacts.md) for storage and reproduction guidance.
 
-Date: 2026-09-20. This follows the [ENDLIST trace](gap-endlist-trace.md).
+Date: 2026-09-20. This follows the [ENDLIST trace](endlist-trace.md).
 
 ## Candidate and regression
 
@@ -55,6 +55,6 @@ The case index (`target/rushls-validation/endlist-fix-2026-09-20/results.json`) 
 The archive also retains unit-test logs, build output, the candidate patch, and probe snapshots.
 The Rust origins completed successfully. Rushls packaging did not change.
 
-The [tracker correction](gap-tracker-fix.md) adds coverage for buffer padding and parent growth, with new live validation.
+The [tracker correction](tracker-fix.md) adds coverage for buffer padding and parent growth, with new live validation.
 The fully buffered, ended-MediaSource stall remains a separate playback problem.
 Do not describe the candidate as a complete fix or close the codec/player matrix on the basis of its unit tests.

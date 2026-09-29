@@ -1,9 +1,9 @@
 # Pending-part tracking and loading correction
 
 Local evidence paths below are relative to the repository root and are not included in a clone.
-See [validation artifacts](validation-artifacts.md) for storage and reproduction guidance.
+See [validation artifacts](../artifacts.md) for storage and reproduction guidance.
 
-Date: 2026-09-20. This extends the [selector candidate](gap-player-fix.md).
+Date: 2026-09-20. This extends the [selector candidate](player-fix.md).
 The changes remain in the isolated hls.js worktree. Rushls packaging is unchanged.
 
 ## Changes and regression coverage
@@ -50,7 +50,7 @@ The final TypeScript narrowing guard excludes initialization fragments from the 
 
 The final control reproduces the separate playback stall after buffering and MediaSource completion.
 Do not interpret the pending-part correction as a fix for that stall, or as completed codec/player validation.
-The [MSE comparison](gap-mse-comparison.md) investigates media-element progress with complete final buffers and ended MediaSource.
+The [MSE comparison](mse-comparison.md) investigates media-element progress with complete final buffers and ended MediaSource.
 
 ## Review artifacts
 

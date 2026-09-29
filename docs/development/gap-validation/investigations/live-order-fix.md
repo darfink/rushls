@@ -1,9 +1,9 @@
 # Live part ordering correction
 
 Local evidence paths below are relative to the repository root and are not included in a clone.
-See [validation artifacts](validation-artifacts.md) for storage and reproduction guidance.
+See [validation artifacts](../artifacts.md) for storage and reproduction guidance.
 
-Date: 2026-09-20. Follow-up to the [append-order investigation](gap-append-order.md).
+Date: 2026-09-20. Follow-up to the [append-order investigation](append-order.md).
 
 The local hls.js candidate now preserves pending parts across live segment boundaries and ENDLIST.
 The uninterrupted control completes with continuous buffers, all 600 video frames, and no duplicate or backward appends on either track.

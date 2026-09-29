@@ -122,6 +122,14 @@ async fn readme_and_operator_guide_toml_examples_resolve() -> Result<(), Box<dyn
             ("README.md", include_str!("../README.md")),
             ("docs/publishing.md", include_str!("../docs/publishing.md")),
             ("docs/deployment.md", include_str!("../docs/deployment.md")),
+            (
+                "docs/configuration.md",
+                include_str!("../docs/configuration.md"),
+            ),
+            (
+                "docs/input-handling.md",
+                include_str!("../docs/input-handling.md"),
+            ),
         ] {
             let text = text.replace("\r\n", "\n");
             for (index, block) in text.split("```toml\n").skip(1).enumerate() {

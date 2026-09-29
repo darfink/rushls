@@ -22,7 +22,7 @@ not build them until a publisher needs them.
 | SRT FLV, MP4/fMP4, anything else avformat probed | **gap** | MPEG-TS only. Not an incomplete demuxer; other containers were never the live ingest contract. |
 | Enhanced RTMP extra A/V tracks | **done** | OneTrack and packed `ManyTracks` become distinct catalog entries keyed by `audio/{id}` / `video/{id}`. Legacy default track stays `audio` / `video`. Identical sequence headers are ignored. Changed codec configurations fail the publish; a new id after freeze is `TrackSetChanged`. HTTP e2e: two OneTrack AAC → two `STREAM-INF` audio variants. |
 | MPEG-TS extra audio/video PIDs | **done** | Mapper keeps every mapped PID. Admission default is `tracks = Any`. Apple HLS: H.264 + two AAC-LC PIDs, and two H.264 PIDs + AAC. HTTP e2e covers the two-video ladder through pre-roll cadence. |
-| Media over QUIC | **done** (native client tested) | WebTransport and raw QUIC, pinned to moq-lite-05. LOC and legacy Hang. H.264 (including Annex-B avc3), HEVC/AV1 with catalog configuration, AAC/Opus. Catalog changes and media-group gaps fail ingestion. moq-cli 0.10.0 H.264/AAC → HLS decoded with FFmpeg. Embedded CEA-608 in H.264 is declared (moq-cli `avc3` import over QUIC, and an in-process test). Browser publishing has a manual Chrome procedure (`tools/browser-moq-publish.html`, `tools/browser-ladder-bench.html`) but no CI job. See [MOQ ingestion](moq-ingestion.md). |
+| Media over QUIC | **done** (native client tested) | WebTransport and raw QUIC, pinned to moq-lite-05. LOC and legacy Hang. H.264 (including Annex-B avc3), HEVC/AV1 with catalog configuration, AAC/Opus. Catalog changes and media-group gaps fail ingestion. moq-cli 0.10.0 H.264/AAC → HLS decoded with FFmpeg. Embedded CEA-608 in H.264 is declared (moq-cli `avc3` import over QUIC, and an in-process test). Browser publishing has a manual Chrome procedure (`tools/browser-moq-publish.html`, `tools/browser-ladder-bench.html`) but no CI job. See [MOQ ingestion](../../moq.md). |
 
 ## Codecs
 
@@ -32,7 +32,7 @@ not build them until a publisher needs them.
 | H.264 + AAC, MPEG-TS | **done** | Discovery + CMAF round-trip in-process. The MPEG-TS Apple matrix passes. |
 | HEVC | **done** (Apple matrix) | Apple matrix passes for RTMP HEVC + AAC and MPEG-TS HEVC + AAC. |
 | AV1 | **done** (decode + live start-of-stream) | RTMP mapping and CMAF writer exist. TS accepts GStreamer AV1G private PES with its av1C descriptor and an in-band sequence header. Native round-trip and independent FFmpeg decode pass. A live AV1+Opus publish plays in Chrome and hls.js. Other AV1 TS mappings remain unsupported. |
-| FLAC over Enhanced RTMP | **done** (mono/stereo, decoder tested) | Exact frame durations, packed-message splitting, strict/GAP policy, and fMP4 output. FFmpeg PCM comparisons pass. Browser playback remains unverified. See [FLAC](flac.md). |
+| FLAC over Enhanced RTMP | **done** (mono/stereo, decoder tested) | Exact frame durations, packed-message splitting, strict/GAP policy, and fMP4 output. FFmpeg PCM comparisons pass. Browser playback remains unverified. See [FLAC](../gap-validation/flac.md). |
 | Opus over RTMP | **done** (in-process) | A stereo silence packet passes RTMP parsing, normalization, CMAF writing, and demuxing. The test checks 312-sample pre-skip, 48 kHz playback, and separate 44.1 kHz input metadata. Live RTMP Opus is untested; live MPEG-TS Opus is proven in Chrome/hls.js with AV1. |
 | Opus over MPEG-TS | **done** (mono/stereo, decode + live start-of-stream) | Resolves the Opus PMT descriptors and parses PES control headers before shared normalization. Preserves startup and final trim at 48 kHz. Extended channel mappings remain unsupported. |
 | AAC-HE / HEv2 frame size | **done** (signaled SBR/PS) | Shared ASC parser handles hierarchical and sync-extension signaling, core/output sample rates, and 960/1024 core frames. Real HE and HEv2 FLV fixtures yield 2048 output samples at 48 kHz and decode through FFmpeg. Implicit SBR without ASC signaling still needs bitstream detection. |
@@ -183,7 +183,7 @@ The latter distinguishes startup trimming from random-access pre-roll.
 
 The new synthetic fixtures under `tests/apple_hls/fixtures` cover HE/HEv2,
 Opus TS, AV1G TS, H.264 aspect/color, and HEVC static HDR.
-See [fixture generation notes](../tests/apple_hls/fixtures/native-codecs.md).
+See [fixture generation notes](../../../tests/apple_hls/fixtures/native-codecs.md).
 The ordinary library suite requires no external decoder for these fixtures.
 `independent_decoder_accepts_native_ts_opus_and_av1g` is an ignored test that requires FFmpeg.
 Run it explicitly to check decoding and Opus startup alignment against the TS decoder.

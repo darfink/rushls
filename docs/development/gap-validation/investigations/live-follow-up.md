@@ -1,7 +1,7 @@
 # Live GAP regression follow-up
 
 Local evidence paths below are relative to the repository root and are not included in a clone.
-See [validation artifacts](validation-artifacts.md) for storage and reproduction guidance.
+See [validation artifacts](../artifacts.md) for storage and reproduction guidance.
 
 Date: 2026-09-20. These runs used production normalization, publication, storage, and HTTP delivery.
 They cover H.264/AAC live playback only. They do not complete startup, seeking, or the wider codec matrix.
@@ -75,7 +75,7 @@ Thus, the earlier final-part explanation does not cover every failure in this se
 Buffered ranges also contain holes in the uninterrupted Chrome control.
 The next investigation must distinguish declared media timing, loaded parts, and appended MSE ranges before assigning a cause.
 
-The [Chrome isolation follow-up](gap-chrome-isolation.md) repeats no-switch cases with audio-only loss and video-only loss with continuous audio.
+The [Chrome isolation follow-up](chrome-isolation.md) repeats no-switch cases with audio-only loss and video-only loss with continuous audio.
 Retain official-player results separately from diagnostic player changes.
 Startup positions, interactive seeks, other audio codecs, and HEVC/AV1 with audio loss remain pending.
 

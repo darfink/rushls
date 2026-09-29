@@ -186,7 +186,7 @@ The live Chrome probe also found a failure in the control case with hls.js 1.7.3
 All scheduled switches completed, but playback stalled before the end.
 The matching GAP case completed successfully.
 The original job preserved these results and failed. The current policy below separates the patched player from official-release compatibility.
-The [earlier append-order investigation](gap-append-order.md) identified player-side ordering defects.
+The [earlier append-order investigation](gap-validation/investigations/append-order.md) identified player-side ordering defects.
 The browser fixture now also respects each demuxed track clock when pacing packets.
 Regression tests cover cancellation without packet loss and both 48 kHz and 90 kHz timing.
 
@@ -204,7 +204,7 @@ The candidate's GAP run reported 574 presented frames. Completion does not estab
 Local reports and player hashes are in `target/rushls-validation/ci-resume/`; those artifacts are not tracked by Git.
 ### Current Chrome CI policy
 
-CI builds the [player correction](../tools/patches/hls.js/README.md) from pinned upstream source and a tracked patch.
+CI builds the [player correction](../../tools/patches/hls.js/README.md) from pinned upstream source and a tracked patch.
 The builder uses the upstream npm lockfile and identifies the result as `1.7.3-rushls.1`.
 All upstream unit tests and both patched-player playback cases must pass before image publication.
 The unchanged official 1.7.3 release runs separately as an informational compatibility check.
@@ -343,7 +343,7 @@ This is a likely cause, not yet confirmed by a corrected GStreamer build.
 The clean control decoded 600 video buffers and reached end-of-stream.
 Chrome's required patched-player check continues to cover GAP playback.
 
-Native binary packaging also runs on pull requests. See [tagged releases](releases.md) for the publication gates and archive checks.
+Native binary packaging also runs on pull requests. See [tagged releases](releasing.md) for the publication gates and archive checks.
 
 ## Executable documentation
 

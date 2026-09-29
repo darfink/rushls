@@ -107,7 +107,7 @@ For remote archival, `segment.ready` hooks supply fetchable resource paths inste
 Fetch them before live retention expires. A hook does not reserve the segment indefinitely.
 
 Unix flushes file contents and directory metadata. Windows flushes contents without the same directory-entry power-loss guarantee.
-See [release filesystem guarantees](releases.md).
+See [Windows notes](installation.md#windows).
 
 ## Authorization
 
@@ -124,7 +124,7 @@ max_response = "64KiB"
 The admission response chooses `stream_id`, `principal`, and an optional named profile.
 Failures deny the connection. A reconnect makes a new admission request.
 The shared token authenticates Rushls to the service; it is not the publisher's stream key.
-Use the exact [publisher API](publisher-api.md#admission) contract.
+Use the exact [admission](admission-and-hooks.md#admission) contract.
 
 For playback, choose one key source: a public key, JWKS URL, or HMAC secret.
 This example uses JWKS:
@@ -146,7 +146,7 @@ Query tokens can appear in access logs. Restrict log access and redact credentia
 
 Bearer authentication needs headers on subsequent media requests, not only the first playlist request.
 Query-token playlists require HLS v11 `EXT-X-DEFINE:QUERYPARAM` substitution, including on child requests.
-Players without this support, including hls.js-light, cannot use that form. See [configuration](config.md) before integrating a player or CDN.
+Players without this support, including hls.js-light, cannot use that form. See [playback authorization](configuration.md#playback) before integrating a player or CDN.
 For JWKS deployments, allow outbound access to the issuer and monitor key refresh failures.
 
 ## Encryption and certificates
@@ -267,7 +267,7 @@ Relative URLs remain the default when it is empty.
 ## Reconnects and shutdown
 
 Strict input validation is the default. It rejects invalid timing and dependent segment starts.
-Permissive input mode only handles the bounded cases described in [input modes](input-modes.md).
+Permissive input mode only handles the bounded cases described in [input handling](input-handling.md).
 It does not generate missing audio or video.
 
 `publish.takeover = true` lets a new publisher replace an active publisher with the same admitted stream ID.
@@ -323,4 +323,4 @@ Start with [metrics documentation](metrics.md) and the [Prometheus/Grafana examp
 Track admission failures, timestamp failures, stream availability, retention depth, recording failures, hook delivery, CPU, memory, and filesystem capacity.
 Test a representative publisher and player through the actual proxy/CDN before rollout.
 Include reconnects, disk pressure, and viewer load in operational validation.
-See [load validation](load-validation.md) for the measured harness and its limits.
+See [load validation](development/load-testing.md) for the measured harness and its limits.

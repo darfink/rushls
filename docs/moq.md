@@ -1,4 +1,6 @@
-# MOQ ingestion
+# MoQ
+
+Rushls ingests Media over QUIC (MoQ) publications in the hang format and serves them as HLS.
 
 The origin accepts `moq-lite-05` over WebTransport and raw QUIC on the same UDP port.
 WebTransport uses `h3` ALPN and selects `moq-lite-05` in the CONNECT response.

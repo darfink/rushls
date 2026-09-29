@@ -1,9 +1,9 @@
 # Final-part selection at ENDLIST
 
 Local evidence paths below are relative to the repository root and are not included in a clone.
-See [validation artifacts](validation-artifacts.md) for storage and reproduction guidance.
+See [validation artifacts](../artifacts.md) for storage and reproduction guidance.
 
-Date: 2026-09-20. This investigation follows the [Chrome isolation cases](gap-chrome-isolation.md).
+Date: 2026-09-20. This investigation follows the [Chrome isolation cases](chrome-isolation.md).
 It identifies one player selection failure. It does not resolve every recorded playback stall.
 
 ## Captured failure
@@ -81,7 +81,7 @@ The reusable probe now accepts `--fixed-level 0 --switches none --trace-endlist`
 The diagnostic override exists only in the archived experiment, not in the reusable probe.
 Thirteen playback-tool tests, Python compilation, JavaScript syntax, documentation links, and whitespace checks passed.
 
-The [candidate and live follow-up](gap-player-fix.md) add this regression and identify a second tracker-state blocker.
+The [candidate and live follow-up](player-fix.md) add this regression and identify a second tracker-state blocker.
 
 The next player regression should replay the final live playlist followed by ENDLIST while the last parent still has unloaded parts.
 It must require the selector to retain that parent for audio and video, then stop after all parts load.

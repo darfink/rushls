@@ -1,9 +1,9 @@
 # Live video append ordering
 
 Local evidence paths below are relative to the repository root and are not included in a clone.
-See [validation artifacts](validation-artifacts.md) for storage and reproduction guidance.
+See [validation artifacts](../artifacts.md) for storage and reproduction guidance.
 
-Date: 2026-09-20. Follow-up to the [completed-media comparison](gap-mse-comparison.md).
+Date: 2026-09-20. Follow-up to the [completed-media comparison](mse-comparison.md).
 
 The captured player appends video parts out of decode-time order and repeats nine parts.
 Direct MSE replay reproduces the buffer holes without hls.js.
@@ -11,7 +11,7 @@ Sorting the video appends and removing byte-identical duplicates restores all 60
 This identifies an append-sequence defect in the tested local player candidate.
 It does not establish which candidate change or upstream path causes the selection error.
 
-The subsequent [live ordering correction](gap-live-order-fix.md) fixes pending-part selection and ENDLIST marker loss in the local candidate.
+The subsequent [live ordering correction](live-order-fix.md) fixes pending-part selection and ENDLIST marker loss in the local candidate.
 
 ## First hole
 

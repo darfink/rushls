@@ -6,7 +6,7 @@ The existing `target/` ignore rule excludes this directory from commits.
 
 Local captures include browser reports, logs, generated media, packet traces, experimental patches, and snapshots of tools used during a run.
 They are not available in a fresh clone. Paths in investigation notes identify local evidence, not downloadable GitHub resources.
-Use the [GAP regression checks](gap-regressions.md) to generate fresh evidence.
+Use the [GAP regression checks](regressions.md) to generate fresh evidence.
 
 ## Run directories
 

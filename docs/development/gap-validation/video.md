@@ -6,7 +6,7 @@ Production GAP handling is now active for audio and declared fixed, progressive 
 The test-only activation paths and blanket playlist independence claims have been removed.
 Unsupported video mappings still reject cadence holes. Strict mode still rejects holes.
 This activation does not resolve the player failures recorded below or establish CMAF conformance.
-The [GAP player matrix](gap-player-matrix.md) records current evidence and pending checks.
+The [GAP player matrix](README.md) records current evidence and pending checks.
 The experiment log below preserves historical results. Its gate decisions and test counts are not current release status.
 
 

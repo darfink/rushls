@@ -1,8 +1,7 @@
-# Rushls metrics
+# Metrics
 
 Rushls exposes node metrics at `/metrics` and stream diagnostics at `/metrics/streams`.
 The `[metrics]` configuration controls the listener and bearer authentication. Both endpoints use the same authorization rules.
-The new metric contract replaces ambiguous names directly. There are no compatibility aliases.
 
 ## Diagnose a reported stall
 
@@ -305,7 +304,7 @@ Program-date-time freshness is an origin timeline observation, not a trusted cap
 `rushls_timestamp_rejections_total{code,media_kind}` counts failed sessions with a typed timestamp issue.
 Each session increments one series once. Labels use fixed issue codes and media kinds.
 The series appears after its first rejection. Track IDs and timestamps are available in failure events, not metric labels.
-See [Timestamp failures](timestamp-failures.md) for configuration and hook fields.
+See [input handling](input-handling.md#when-a-publication-is-rejected) for configuration and hook fields.
 
 ### Audio compensation
 
@@ -313,7 +312,7 @@ See [Timestamp failures](timestamp-failures.md) for configuration and hook field
 `rushls_audio_compensation_seconds_total{codec,method}` counts exact missing audio duration for `method="gap"`.
 Labels use bounded codec and method values. They do not include track IDs or timestamps.
 These counters describe normalization, including media that a later pipeline failure prevents from reaching playback.
-See [Audio gap recovery](audio-recovery.md) for policy and host notifications.
+See [input handling](input-handling.md#hooks-logs-and-metrics) for policy and host notifications.
 
 ## Video cadence
 
@@ -322,7 +321,7 @@ These observations do not prove packet loss.
 `rushls_video_cadence_violations_total{codec}` counts violations of explicitly declared cadence, including rejected input.
 `rushls_video_compensation_seconds_total{codec,method}` counts accepted excess duration; its method is `gap`.
 Unavailable validation does not increment compensation counters.
-See [input modes](input-modes.md) for policy and hooks.
+See [input handling](input-handling.md) for policy and hooks.
 
 ## Optional allocator measurements
 
@@ -336,4 +335,4 @@ Binaries built with `--features allocation-counting` expose three additional cou
 
 The difference between allocated and freed bytes approximates current requested Rust heap bytes.
 The counters exclude native-library allocations and allocator overhead. Their snapshots are not atomic as a group.
-Ordinary binaries omit this instrumentation. See [load validation](load-validation.md) for the measured workload and limits.
+Ordinary binaries omit this instrumentation. See [load validation](development/load-testing.md) for the measured workload and limits.

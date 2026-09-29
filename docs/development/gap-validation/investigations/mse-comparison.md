@@ -1,15 +1,15 @@
 # Chrome completed-media replay and live comparison
 
 Local evidence paths below are relative to the repository root and are not included in a clone.
-See [validation artifacts](validation-artifacts.md) for storage and reproduction guidance.
+See [validation artifacts](../artifacts.md) for storage and reproduction guidance.
 
-Date: 2026-09-20. Follow-up to the [pending-part candidate](gap-tracker-fix.md).
+Date: 2026-09-20. Follow-up to the [pending-part candidate](tracker-fix.md).
 
 Completed-media replay succeeds, but the live uninterrupted control still stalls.
 Chrome reports video demuxer underflow without a decoder error.
 The evidence narrows the investigation to live delivery and appending. It does not establish the root cause.
 
-The subsequent [append-order investigation](gap-append-order.md) reproduces buffer holes from out-of-order and duplicate video appends.
+The subsequent [append-order investigation](append-order.md) reproduces buffer holes from out-of-order and duplicate video appends.
 
 ## Completed-stream results
 

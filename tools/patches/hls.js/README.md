@@ -50,7 +50,7 @@ The official GAP result varies with timing; it passed locally but stalled in Lin
 
 Playback completion does not prove perfect GAP concealment or eliminate every redundant audio append.
 Keep those questions separate from the missing-part correction.
-See [the loading analysis](../../../docs/gap-live-order-fix.md) for the detailed investigation.
+See [the loading analysis](../../../docs/development/gap-validation/investigations/live-order-fix.md) for the detailed investigation.
 
 CI blocks on patched-player unit tests and both playback cases.
 It also runs the official release as a separate informational compatibility check.

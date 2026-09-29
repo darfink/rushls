@@ -80,7 +80,7 @@ docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 ghcr.io/darfink/rushl
 ```
 
 The image is not public yet; until it is, pulling it requires registry access.
-See [releases](docs/releases.md) for platforms and image tags.
+See [installation](docs/installation.md) for platforms and image tags.
 
 ## Quick start
 
@@ -140,7 +140,8 @@ rushls --http-listen 127.0.0.1:18080
 Profiles, hooks, recording, and playback claims are file-only.
 Secrets accept a string, `"${VAR}"`, or `{ file = "/run/secrets/name" }`.
 Unknown settings stop startup instead of being ignored. Configuration changes need a restart, except rotated certificates and JWKS keys.
-See the [configuration guide](docs/config.md), the [full reference](docs/config-reference.md), and [deployment](docs/deployment.md) for containers, storage, and proxies.
+See the [configuration guide](docs/configuration.md), the [full reference](docs/configuration-reference.md), and [deployment](docs/deployment.md) for containers, storage, and proxies.
+All documentation is indexed in [docs](docs/README.md).
 
 ## Publishing
 
@@ -229,7 +230,7 @@ ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts - \
       --broadcast live/moq --client-version moq-lite-05 import ts
 ```
 
-Rushls speaks `moq-lite-05` only. See [MoQ ingestion](docs/moq-ingestion.md) for catalog requirements and local certificates.
+Rushls speaks `moq-lite-05` only. See [MoQ](docs/moq.md) for catalog requirements and local certificates.
 
 ## Renditions, audio tracks, and subtitles
 
@@ -297,7 +298,7 @@ Input protocols and codecs. Output is always HLS with CMAF (fragmented MP4) segm
 | MP3, AC-3, E-AC-3, VP9, VVC | ❌ | ❌ | ❌ | |
 
 SRT carries MPEG-TS only. MoQ uses `moq-lite-05`. Rushls has no RTSP, WebRTC, or WHIP ingest, and no RTMP or SRT playback.
-For the widest player support, publish H.264 and AAC-LC. Player support for HEVC, AV1, Opus, and FLAC in HLS varies; see the [player matrix](docs/gap-player-matrix.md).
+For the widest player support, publish H.264 and AAC-LC. Player support for HEVC, AV1, Opus, and FLAC in HLS varies; see [players](docs/players.md).
 
 ## HLS features
 
@@ -432,7 +433,7 @@ timeout = "2s"
 ```
 
 Rushls sends the stream key and client details; the service answers allow or deny, with a stream ID and optionally a media profile.
-If the service is unreachable, publishing is refused. See the [publisher API](docs/publisher-api.md).
+If the service is unreachable, publishing is refused. See [admission and hooks](docs/admission-and-hooks.md).
 [`examples/admission`](examples/admission/admission.py) is a small example service: a stream-key allowlist that maps each secret key to a public stream ID.
 For development, [`tools/dev-sidecar.py`](tools/dev-sidecar.py) admits everyone and prints every admission request and hook event.
 
@@ -501,7 +502,7 @@ format = "json"
 ```
 
 - `/metrics` has totals, `/metrics/streams` has per-stream detail. `/health/live` and `/health/ready` serve probes. See [metrics](docs/metrics.md) and the [monitoring examples](examples/monitoring).
-- Hooks are signed CloudEvents with metadata and paths, not media. See [hooks](docs/publisher-api.md#lifecycle-hooks).
+- Hooks are signed CloudEvents with metadata and paths, not media. See [hooks](docs/admission-and-hooks.md#lifecycle-hooks).
 - `[log] level` sets how much Rushls logs; `RUST_LOG` overrides it for dependencies too.
 - Stop with SIGTERM (Ctrl+C on Windows). Give the supervisor more time than `shutdown_grace`, so hooks and recordings can drain.
 
@@ -524,7 +525,7 @@ segment = { target = "6s", max = "2x", tolerance = "2s" }
 ```
 
 The cost applies to the whole publication: `EXT-X-TARGETDURATION` grows by twice the tolerance (6 s becomes 10 s here),
-and players without Low-Latency HLS sit further behind the live edge. See [irregular keyframe intervals](docs/config.md#hls).
+and players without Low-Latency HLS sit further behind the live edge. See [irregular keyframe intervals](docs/configuration.md#irregular-keyframe-intervals).
 
 ### Scrubbing
 
@@ -548,7 +549,7 @@ Encoder buffering, the keyframe interval, SRT latency, and the player add to tha
 
 Rushls rejects timing errors in the input by default. With `publish.strict = false`, a hole in the input is served as `EXT-X-GAP`
 instead of ending the publication: missing audio, and missing video when the encoder declares a fixed frame rate and sends no B-frames (H.264, HEVC, or AV1).
-Recovery has limits (500 ms per hole, 1 second per minute), and Rushls never invents frames or audio. See [input modes](docs/input-modes.md).
+Recovery has limits (500 ms per hole, 1 second per minute), and Rushls never invents frames or audio. See [input handling](docs/input-handling.md).
 `publish.takeover = true` lets a new publisher replace the current one under the same stream ID. See [reconnects and shutdown](docs/deployment.md#reconnects-and-shutdown).
 
 ### Client addresses behind a proxy
@@ -584,7 +585,7 @@ The per-address limit covers RTMP, SRT, and MoQ together, and counts IPv6 client
 | MoQ connection rejected | `moq-lite-05`, certificate trust, UDP reachability, and catalog format |
 
 Player notes: hls.js 1.7.3 fails one tested case, a rendition switch followed by `ENDLIST`; CI uses a [local hls.js correction](tools/patches/hls.js/README.md) pending upstream submission.
-Safari and GStreamer have their own GAP-recovery limits. See the [player matrix](docs/gap-player-matrix.md), [player compatibility](docs/releases.md#player-compatibility), and [validation exceptions](docs/ci-validation.md).
+Safari and GStreamer have their own GAP-recovery limits. See [players](docs/players.md).
 
 ## Development
 
@@ -605,7 +606,7 @@ python3 -m unittest discover -s tools -p 'test_*.py'
 ```
 
 CI also runs the tagged publishing commands in this README and checks every rendition they produce, and loads every TOML block here through the real configuration loader.
-Media, browser, and Apple checks need extra tools; see [CI validation](docs/ci-validation.md) and [architecture](docs/architecture.md).
+Media, browser, and Apple checks need extra tools; see [CI validation](docs/development/ci.md) and [architecture](docs/development/architecture.md).
 
 ## License
 

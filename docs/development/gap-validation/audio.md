@@ -6,7 +6,7 @@ Production GAP handling is now active for audio and declared fixed, progressive 
 The test-only activation paths and blanket playlist independence claims have been removed.
 Unsupported video mappings still reject cadence holes. Strict mode still rejects holes.
 This activation does not resolve the player failures recorded below or establish CMAF conformance.
-The [GAP player matrix](gap-player-matrix.md) records current evidence and pending checks.
+The [GAP player matrix](README.md) records current evidence and pending checks.
 The experiment log below preserves historical results. Its gate decisions and test counts are not current release status.
 
 
@@ -15,7 +15,7 @@ The experiment log below preserves historical results. Its gate decisions and te
 ### Initial release decision (superseded)
 
 At this stage, the production gate remained closed. Decoder checks and completed-playlist checks do not establish safe live LL-HLS or A/V rendition behavior.
-See [Audio gaps](audio-recovery.md) for the policy and reproduction commands.
+See [Audio gaps](../../input-handling.md) for the policy and reproduction commands.
 
 ## Automated checks
 
@@ -225,4 +225,4 @@ It removed a packet before awaiting delivery; a supervision wake-up could cancel
 The corrected adapter retains the packet, with a regression test for cancellation.
 Earlier live comparisons in this document therefore had uncontrolled additional packet loss.
 Static decoder and completed-playlist tests are unaffected.
-See [the corrected live A/V results](video-gap-validation.md#live-av-follow-up).
+See [the corrected live A/V results](video.md#live-av-follow-up).

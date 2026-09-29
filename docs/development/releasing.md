@@ -1,9 +1,11 @@
-# Tagged releases
+# Releasing
+
+User-facing platform, download, and container details are in [Installation](../installation.md).
 
 Rushls uses the MIT license. Third-party dependencies retain their own licenses.
 The hls.js source patch retains its upstream Apache 2.0 license.
 
-## Release assets
+## What CI builds
 
 The CI workflow builds and tests native archives on every pull request and main-branch push:
 
@@ -23,8 +25,6 @@ Each archive contains the executable, the annotated configuration example, READM
 CI extracts the archive and runs the extracted executable on its native platform.
 It checks version output, exact example-config output, HTTP readiness, and graceful shutdown.
 The full media and player tests run separately in the same workflow.
-
-In TOML, write Windows paths with forward slashes or literal single-quoted strings, such as `dir = 'C:\Rushls\recordings'`.
 
 Windows archives include `rushls.exe`. Windows library tests and archive smoke tests run on a native runner.
 Use a local filesystem with hard-link support, such as NTFS, for recording.
@@ -70,27 +70,3 @@ Container tags follow this policy:
 - `latest`: a stable tagged release; prereleases and main-branch builds do not update it.
 
 The container currently targets Linux AMD64. Native ARM64 binaries are separate release assets.
-
-Verify downloaded files before extraction:
-
-```sh
-sha256sum --check checksums.sha256
-```
-
-On macOS, use `shasum -a 256 --check checksums.sha256`.
-The checksum file lists all archives; download all listed files or select the entry for your platform.
-Archives are not yet signed or notarized. SHA-256 checksums detect corruption; they are not a signature.
-
-## Player compatibility
-
-The required Chrome test uses a pinned hls.js 1.7.3 source build with a local pending-part correction.
-The official release runs as a separate informational check.
-The confirmed failure occurs in the clean control with valid media, with rendition switching followed by the live-to-ENDLIST transition.
-This combined reproduction does not establish that either operation alone requires the patch.
-It is not limited to invalid publisher input or GAP recovery.
-
-The intent is to upstream this correction. It has not yet been submitted or released upstream.
-See [the patch and reproduction instructions](../tools/patches/hls.js/README.md).
-Rushls binary archives do not contain a browser player or claim that official hls.js passes these cases.
-GStreamer clean playback passes; its GAP recovery diagnostic remains unresolved.
-See [CI validation](ci-validation.md) for exact coverage and exceptions.

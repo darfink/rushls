@@ -1,10 +1,10 @@
-# Publishing to Rushls
+# Publishing
 
 These recipes target the bundled loopback configuration and unauthenticated local publishing.
 Use one publisher at a time for each stream name.
 The examples use POSIX shell syntax.
 
-## Tools and validation
+## Tested tools
 
 The recipe validation uses FFmpeg 9.0.1, GStreamer 1.28.6, and `moq-cli 0.10.0` on macOS.
 FFmpeg must include `libx264`, the AAC encoder, and SRT support for the SRT commands.
@@ -22,10 +22,11 @@ The SRT protocol must appear in FFmpeg's protocol list.
 On the validation host, Homebrew's `ffmpeg-full` provides SRT; the default `ffmpeg` binary does not.
 Select the SRT-enabled executable in your `PATH` before using the recipes.
 
-Start Rushls from the repository root:
+Start Rushls with the example configuration, which binds every listener to loopback:
 
 ```sh
-./target/release/rushls --config rushls.example.toml
+rushls --print-config-example > rushls.toml
+rushls --config rushls.toml
 ```
 
 A stream named `live/demo` has the master playlist `http://127.0.0.1:8080/live/demo/index.m3u8`.
@@ -205,7 +206,7 @@ This documents conventional RTMP field mapping. This overhaul does not certify a
 
 ## Media over QUIC
 
-Use the [MoQ guide](moq-ingestion.md) for the exact `moq-lite-05` contract.
+Use the [MoQ guide](moq.md) for the exact `moq-lite-05` contract.
 The tested client is `moq-cli 0.10.0`, whose executable is `moq`.
 
 For a public deployment, configure a certificate that covers the origin hostname and is trusted by the client:
@@ -229,9 +230,9 @@ The corresponding HTTP playback path is `/live/moq/index.m3u8` when admission do
 The `https` URL selects WebTransport. The transport uses UDP, not the ordinary HTTP listener.
 
 For an isolated local test, create a disposable certificate and configure its paths under `[tls]`.
-The existing [local MoQ recipe](moq-ingestion.md#local-publish-test) uses `--client-tls-disable-verify` for that test only.
+The existing [local MoQ recipe](moq.md#local-publish-test) uses `--client-tls-disable-verify` for that test only.
 Production publishers must verify certificates.
-MoQ browser publishing has a manual Chrome procedure in [MoQ ingestion](moq-ingestion.md#browser-publish-test); it does not run in CI.
+MoQ browser publishing has a manual Chrome procedure in the [MoQ guide](moq.md#browser-publish-test); it does not run in CI.
 
 ## Captions and subtitles
 
