@@ -175,6 +175,17 @@ Mount certificate directories so replacement files become visible inside the con
 
 RTMP encryption requires an external TCP TLS terminator forwarding to the private RTMP listener.
 Do not put RTMP through an HTTP `proxy_pass` block.
+Behind a terminator, every RTMP publisher appears to come from the terminator's address.
+Configure it to send a PROXY protocol header (v1 or v2) and enable `proxy_protocol`, so admission, logs, hooks, and per-address limits see the real client:
+
+```toml
+[ingest.rtmp]
+listen = "127.0.0.1:1935"
+proxy_protocol = true
+```
+
+With HAProxy, add `send-proxy-v2` to the `server` line. With nginx `stream`, set `proxy_protocol on;`. AWS NLB target groups have a proxy protocol v2 attribute.
+Once enabled, a connection without a header is refused, so the listener must be reachable only through the proxy.
 MoQ ingest reuses the `[tls]` certificate; QUIC always requires TLS 1.3.
 
 SRT uses separate encryption:

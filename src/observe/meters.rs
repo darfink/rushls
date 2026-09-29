@@ -109,6 +109,10 @@ counters! {
             "rushls_publishers_rejected_total",
             "Publishers rejected before a session started."
         ),
+        publishers_address_limited: u64 = Counter(
+            "rushls_publishers_address_limited_total",
+            "Connections refused by limits.publishers_per_address."
+        ),
         codec_parameter_changes: u64 = Counter(
             "rushls_codec_parameter_changes_total",
             "Mid-stream codec parameter changes detected."
@@ -253,6 +257,10 @@ impl ProcessMeters {
 
     pub fn publisher_rejected(&self) {
         add(&self.counters.publishers_rejected, 1);
+    }
+
+    pub fn publisher_address_limited(&self) {
+        add(&self.counters.publishers_address_limited, 1);
     }
 
     /// Recorded where the change is detected, not reconstructed afterwards by

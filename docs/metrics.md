@@ -220,6 +220,7 @@ A separate operator budget remains a deployment/runtime change outside this metr
 ## Capacity and lifecycle
 
 Session lifecycle, segmentation failures, recording losses, TLS handshakes, playback denials, and hook delivery metrics remain available.
+`rushls_publishers_address_limited_total` counts connections refused by `limits.publishers_per_address`; the matching event names the address.
 These families have useful existing meanings and do not require replacement solely for naming consistency.
 Detailed failure text stays in events rather than metric labels.
 `rushls_session_info` carries principal identity. Numeric session metrics carry only session and stream identity.

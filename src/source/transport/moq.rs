@@ -183,23 +183,61 @@ impl MoqPendingPublish {
         request: web_transport_quinn::quinn::Incoming,
         config: MoqConfig,
     ) -> Result<Self, TransportError> {
-        tokio::time::timeout(config.handshake_timeout, handshake_inner(request, config))
+        Self::connect(request, config).await?.handshake().await
+    }
+
+    /// Completes the QUIC handshake only, which proves the client address.
+    ///
+    /// Split from SETUP so a per-address limit can count the client before
+    /// the rest of the handshake runs, without trusting a source address that
+    /// a spoofed packet could claim. One deadline covers both steps.
+    pub async fn connect(
+        request: web_transport_quinn::quinn::Incoming,
+        config: MoqConfig,
+    ) -> Result<MoqConnection, TransportError> {
+        let deadline = tokio::time::Instant::now() + config.handshake_timeout;
+        let connection = tokio::time::timeout_at(deadline, request)
             .await
-            .map_err(|_| {
-                TransportError::Handshake(
-                    "MOQ publisher did not finish SETUP before the deadline".into(),
-                )
-            })?
+            .map_err(|_| missed_deadline())?
+            .map_err(|error| {
+                TransportError::Handshake(format!("QUIC handshake failed: {error}").into())
+            })?;
+        Ok(MoqConnection {
+            connection,
+            config,
+            deadline,
+        })
     }
 }
 
-async fn handshake_inner(
-    wt_request: web_transport_quinn::quinn::Incoming,
+fn missed_deadline() -> TransportError {
+    TransportError::Handshake("MOQ publisher did not finish SETUP before the deadline".into())
+}
+
+/// A MoQ client whose QUIC handshake has completed, awaiting SETUP.
+pub struct MoqConnection {
+    connection: web_transport_quinn::quinn::Connection,
+    config: MoqConfig,
+    deadline: tokio::time::Instant,
+}
+
+impl MoqConnection {
+    /// Validated by the completed QUIC handshake.
+    pub fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
+    }
+
+    pub async fn handshake(self) -> Result<MoqPendingPublish, TransportError> {
+        tokio::time::timeout_at(self.deadline, setup(self.connection, self.config))
+            .await
+            .map_err(|_| missed_deadline())?
+    }
+}
+
+async fn setup(
+    connection: web_transport_quinn::quinn::Connection,
     config: MoqConfig,
 ) -> Result<MoqPendingPublish, TransportError> {
-    let connection = wt_request.await.map_err(|error| {
-        TransportError::Handshake(format!("QUIC handshake failed: {error}").into())
-    })?;
     let remote_address = connection.remote_address();
     let (session, partial) = accept_transport(connection).await?;
 

@@ -91,6 +91,13 @@ proxy posture is cleartext on loopback with TLS ended in front, rather than TLS
 in this process. No trusted-proxy list is configured; header trust is not how
 playlist URLs or auth are derived.
 
+`ingest.rtmp.proxy_protocol` is the one place a proxy's word is taken for the
+client address, and it is mandatory once enabled: every connection must open
+with a PROXY v1 or v2 header, or it is refused. An optional header would let
+any client that reaches the port directly claim any address. SRT and MoQ run
+over UDP, where proxies that terminate the protocol are rare and a UDP load
+balancer preserves the source address.
+
 `public_url` only shapes playlist URLs:
 empty means relative, which is right behind a proxy or CDN; a trailing slash
 is insignificant.
@@ -620,6 +627,7 @@ touches a live session — that is `[publish]`'s job.
 [limits]
 publishers = 256          # concurrent ingest sessions
 streams    = 1024         # stored streams, including ended ones in their window
+publishers_per_address = 16   # optional; default: no per-client limit
 ```
 
 `publishers` and `streams` are separate because they answer different
@@ -631,6 +639,24 @@ two-hour retain legitimately needs hundreds of store slots.
 Each refuses at its own layer, which keeps failures clean: over `publishers` is
 refused at admission, over `streams` at stream creation. Neither becomes a
 write failure mid-session.
+
+**`publishers_per_address` stops one client filling `publishers`.** A
+connection holds a pending slot through its handshake and admission, before
+anything has proved it is a publisher, so one host that keeps connecting and
+stalling can occupy every slot even with `[publish.auth]` configured. The
+limit counts connections, pending and admitted, across RTMP, SRT, and MoQ
+together; it is about the client, not the protocol. Streams are the wrong
+unit: the stream ID does not exist until admission finishes, which is after
+the window this protects. IPv6 counts per `/64`, since one host routinely
+holds a whole prefix. A refusal is immediate, reported as a
+`PublisherAddressLimited` event and `rushls_publishers_address_limited_total`.
+
+It is off by default because a contribution gateway or transcoder can
+legitimately publish dozens of streams from one address. It counts only
+addresses a peer cannot forge: TCP and SRT addresses are proven by their
+handshakes, MoQ is counted once QUIC completes, and behind an RTMP proxy the
+address comes from `ingest.rtmp.proxy_protocol` — without it, every proxied
+publisher shares the proxy's address and one limit.
 
 **When `streams` is full, a new stream is refused rather than evicting a
 retained one.** `hls.window` is a promise to viewers holding a playlist; breaking

@@ -257,6 +257,17 @@ pub enum NodeEvent {
     /// belongs in [`ProcessMeters`](super::ProcessMeters); this carries the
     /// reason, which a counter cannot.
     PublisherHandshakeFailed { protocol: Protocol, reason: String },
+    /// A connection was refused because its client already holds
+    /// `limits.publishers_per_address` publishers.
+    ///
+    /// Separate from a failed handshake: the peer did nothing wrong on the
+    /// wire, and an operator tuning the limit needs to see which clients hit
+    /// it. `address` is the counted unit, a `/64` for IPv6.
+    PublisherAddressLimited {
+        protocol: Protocol,
+        address: String,
+        maximum: usize,
+    },
     /// An admitted publication ended in an error.
     ///
     /// Overlaps [`SessionEvent::Failed`] for a session that got as far as

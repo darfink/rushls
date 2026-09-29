@@ -544,7 +544,7 @@ The same `[tls]` certificate serves MoQ ingest.
 Certificate rotation reloads valid replacements without restarting the service.
 Certificate issuance and renewal remain external responsibilities.
 
-RTMP has no native RTMPS listener. Use an external TCP TLS terminator when RTMPS is required.
+RTMP has no native RTMPS listener. Use an external TCP TLS terminator when RTMPS is required, and enable `ingest.rtmp.proxy_protocol` so Rushls still sees each client address.
 SRT uses its own passphrase-based encryption, not TLS:
 
 ```toml

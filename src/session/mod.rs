@@ -21,6 +21,7 @@ use crate::{
     },
 };
 
+mod addresses;
 mod context;
 mod control;
 mod health;
@@ -31,6 +32,7 @@ mod registry;
 mod services;
 mod supervise;
 
+pub use addresses::{AddressFull, AddressKey, AddressPermit, PublishersPerAddress};
 pub use context::SessionContext;
 pub use control::{StopReason, StopToken};
 pub use health::{HealthEvaluation, HealthPolicy, evaluate as evaluate_health};

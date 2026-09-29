@@ -568,6 +568,7 @@ impl AppConfig {
         let mut node = NodeConfig {
             shutdown: self.node.shutdown_grace,
             rtmp_address: self.ingest.rtmp.listen,
+            rtmp_proxy_protocol: self.ingest.rtmp.proxy_protocol,
             srt_address: self.ingest.srt.listen,
             http_address: self.http.listen.0,
             ..NodeConfig::default()
@@ -1310,6 +1311,16 @@ pub struct LimitsAppConfig {
     /// store. Once the window is long the two decouple.
     #[conf(parameter, long, env, default_value = "1024")]
     streams: usize,
+    /// Publishers one client address may hold at once, across every ingest
+    /// protocol and including those still being admitted. Omit for no limit.
+    ///
+    /// `publishers` is node-wide, and a connection takes a slot before
+    /// admission finishes, so one host that keeps connecting and stalling
+    /// can fill them all even with `[publish.auth]` configured. IPv6 counts
+    /// per `/64`. Behind an RTMP proxy, enable `ingest.rtmp.proxy_protocol`
+    /// or every RTMP publisher shares the proxy's address.
+    #[conf(parameter, long, env)]
+    publishers_per_address: Option<usize>,
 }
 
 impl LimitsAppConfig {
@@ -1322,6 +1333,25 @@ impl LimitsAppConfig {
         }
         node.maximum_sessions = self.publishers;
         node.store.maximum_streams = self.streams;
+        node.maximum_publishers_per_address = self
+            .publishers_per_address
+            .map(|maximum| {
+                std::num::NonZeroUsize::new(maximum).ok_or_else(|| {
+                    invalid(
+                        "limits.publishers_per_address must be at least one; omit it for no limit",
+                    )
+                })
+            })
+            .transpose()?;
+        if let Some(maximum) = node.maximum_publishers_per_address
+            && maximum.get() > self.publishers
+        {
+            return Err(invalid(format!(
+                "limits.publishers_per_address ({maximum}) exceeds limits.publishers ({}), \
+                 so it could never apply",
+                self.publishers
+            )));
+        }
         Ok(())
     }
 }
@@ -2005,6 +2035,16 @@ pub struct RtmpAppConfig {
     /// Address receiving RTMP publishers.
     #[conf(parameter, long, env, default_value = "0.0.0.0:1935")]
     pub listen: SocketAddr,
+    /// Require a PROXY protocol header (v1 or v2) naming the client on every
+    /// connection. Only for a listener that nothing but the proxy can reach.
+    ///
+    /// Behind a TLS terminator or load balancer, the socket's peer is the
+    /// proxy, so admission, logs, hooks, and `limits.publishers_per_address`
+    /// would all see one address for every publisher. The header is
+    /// mandatory once enabled: an optional one would let any client that
+    /// reaches the port directly claim to be anyone.
+    #[conf(parameter, long, env, default_value = "false")]
+    pub proxy_protocol: bool,
 }
 
 #[derive(Conf)]

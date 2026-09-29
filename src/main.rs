@@ -275,6 +275,18 @@ impl EventObserver for TracingEvents {
             NodeEvent::PublisherHandshakeFailed { protocol, reason } => {
                 warn!(protocol = %protocol, reason = %reason, "handshake rejected");
             }
+            NodeEvent::PublisherAddressLimited {
+                protocol,
+                address,
+                maximum,
+            } => {
+                warn!(
+                    protocol = %protocol,
+                    address = %address,
+                    maximum,
+                    "publisher refused: too many from this address"
+                );
+            }
             NodeEvent::PublisherSessionFailed { protocol, reason } => {
                 warn!(protocol = %protocol, reason = %reason, "publishing session failed");
             }

@@ -2688,3 +2688,24 @@ fn the_reference_lists_only_keys_the_tables_accept() -> Result<(), Box<dyn Error
     assert!(load_toml(&hook)?.is_ok(), "{hook}");
     Ok(())
 }
+
+#[test]
+fn rtmp_proxy_protocol_and_the_per_address_limit_reach_the_node() -> Result<(), Box<dyn Error>> {
+    let defaults = resolve_toml("")??;
+    assert!(!defaults.node.rtmp_proxy_protocol);
+    assert_eq!(defaults.node.maximum_publishers_per_address, None);
+
+    let configured = resolve_toml(
+        "[ingest.rtmp]\nproxy_protocol = true\n[limits]\npublishers_per_address = 4\n",
+    )??;
+    assert!(configured.node.rtmp_proxy_protocol);
+    assert_eq!(
+        configured.node.maximum_publishers_per_address,
+        Some(nz::usize!(4))
+    );
+
+    // Zero would refuse everyone, and a value above `publishers` never applies.
+    assert!(resolve_toml("[limits]\npublishers_per_address = 0\n")?.is_err());
+    assert!(resolve_toml("[limits]\npublishers = 8\npublishers_per_address = 9\n")?.is_err());
+    Ok(())
+}

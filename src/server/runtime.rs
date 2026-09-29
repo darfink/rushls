@@ -23,11 +23,15 @@ use crate::{
     media::PassThroughNormalizerFactory,
     mux::PassThroughMuxerFactory,
     observe::{Events, NodeEvent, ProcessMeters, Protocol, StreamEvent},
-    session::{PendingPublishers, Registry, Services, SessionConfig, StopReason, run_session},
+    session::{
+        PendingPublishers, PublishersPerAddress, Registry, Services, SessionConfig, StopReason,
+        run_session,
+    },
     source::{
         PendingPublish, TransportError,
         transport::{
-            moq::{MoqConfig, MoqListener, MoqPendingPublish},
+            moq::{MoqConfig, MoqConnection, MoqListener, MoqPendingPublish},
+            proxy,
             rtmp::{RtmpConfig, RtmpPendingPublish},
             srt::{SrtConfig, SrtListener, SrtPendingPublish},
         },
@@ -61,6 +65,9 @@ pub struct NodeConfig {
     pub shutdown: Duration,
     pub record: Option<crate::delivery::record::Config>,
     pub rtmp_address: SocketAddr,
+    /// Expect a PROXY protocol header on every RTMP connection, naming the
+    /// client behind a load balancer or TLS terminator.
+    pub rtmp_proxy_protocol: bool,
     pub srt_address: SocketAddr,
     /// WebTransport ingest. `None` leaves MOQ off, which is the compiled default
     /// so a process can boot without certificates.
@@ -74,6 +81,9 @@ pub struct NodeConfig {
     pub https_address: Option<SocketAddr>,
     pub maintenance_interval: Duration,
     pub maximum_sessions: usize,
+    /// Publishers one client address may hold, pending and admitted, across
+    /// every ingest listener. `None` counts nothing.
+    pub maximum_publishers_per_address: Option<std::num::NonZeroUsize>,
     /// `memory.total`: node-wide memory committed across publisher and stream
     /// budgets, or `None` for no ceiling.
     pub memory_total: Option<usize>,
@@ -130,12 +140,14 @@ impl Default for NodeConfig {
             shutdown: Duration::from_secs(10),
             record: None,
             rtmp_address: "0.0.0.0:1935".parse().expect("constant address is valid"),
+            rtmp_proxy_protocol: false,
             srt_address: "0.0.0.0:9000".parse().expect("constant address is valid"),
             moq_address: None,
             http_address: Some("0.0.0.0:8080".parse().expect("constant address is valid")),
             https_address: None,
             maintenance_interval: Duration::from_secs(1),
             maximum_sessions: 256,
+            maximum_publishers_per_address: None,
             memory_total: None,
             rtmp: RtmpConfig::default(),
             srt: SrtConfig::default(),
@@ -609,35 +621,7 @@ impl Node {
         readiness: &Readiness,
         stop_rx: watch::Receiver<bool>,
     ) -> Result<(), RuntimeError> {
-        let maximum_pending = self.config.maximum_pending_publishers_per_listener();
-        let session_config = Arc::new(self.config.session);
-        tasks.spawn(run_ingest(
-            RtmpListener {
-                tcp: rtmp_listener,
-                config: self.config.rtmp,
-            },
-            self.services.clone(),
-            Arc::clone(&session_config),
-            PendingPublishers::new(maximum_pending),
-            stop_rx.clone(),
-        ));
-        let moq_session_config = moq_listener.is_some().then(|| Arc::clone(&session_config));
-        tasks.spawn(run_ingest(
-            srt_listener,
-            self.services.clone(),
-            session_config,
-            PendingPublishers::new(maximum_pending),
-            stop_rx.clone(),
-        ));
-        if let (Some(moq_listener), Some(session_config)) = (moq_listener, moq_session_config) {
-            tasks.spawn(run_ingest(
-                moq_listener,
-                self.services.clone(),
-                session_config,
-                PendingPublishers::new(maximum_pending),
-                stop_rx.clone(),
-            ));
-        }
+        self.spawn_ingest(tasks, rtmp_listener, srt_listener, moq_listener, &stop_rx);
 
         // Metrics are served on a viewer listener only when the operator gave
         // them that same address. Matching HTTP or HTTPS is one transport, not
@@ -723,6 +707,56 @@ impl Node {
         Ok(())
     }
 
+    /// One accept loop per ingest listener, each with its own pending budget
+    /// and all sharing one per-address count.
+    fn spawn_ingest(
+        &self,
+        tasks: &mut JoinSet<Result<(), RuntimeError>>,
+        rtmp_listener: TcpListener,
+        srt_listener: SrtListener,
+        moq_listener: Option<MoqListener>,
+        stop_rx: &watch::Receiver<bool>,
+    ) {
+        let maximum_pending = self.config.maximum_pending_publishers_per_listener();
+        let session_config = Arc::new(self.config.session);
+        // One count shared by every listener: the limit is per client.
+        let per_address = self
+            .config
+            .maximum_publishers_per_address
+            .map(PublishersPerAddress::new);
+        tasks.spawn(run_ingest(
+            RtmpListener {
+                tcp: rtmp_listener,
+                config: self.config.rtmp,
+                proxy_protocol: self.config.rtmp_proxy_protocol,
+            },
+            self.services.clone(),
+            Arc::clone(&session_config),
+            PendingPublishers::new(maximum_pending),
+            per_address.clone(),
+            stop_rx.clone(),
+        ));
+        let moq_session_config = moq_listener.is_some().then(|| Arc::clone(&session_config));
+        tasks.spawn(run_ingest(
+            srt_listener,
+            self.services.clone(),
+            session_config,
+            PendingPublishers::new(maximum_pending),
+            per_address.clone(),
+            stop_rx.clone(),
+        ));
+        if let (Some(moq_listener), Some(session_config)) = (moq_listener, moq_session_config) {
+            tasks.spawn(run_ingest(
+                moq_listener,
+                self.services.clone(),
+                session_config,
+                PendingPublishers::new(maximum_pending),
+                per_address,
+                stop_rx.clone(),
+            ));
+        }
+    }
+
     fn metrics_endpoint(&self) -> Option<MetricsEndpoint> {
         self.config
             .metrics
@@ -777,19 +811,35 @@ trait IngestListener: Send + 'static {
     /// What `accept` yields: everything the connection's own task will need,
     /// since it cannot borrow the listener.
     type Connection: Send + 'static;
+    /// A connection whose client address is established.
+    type Identified: Send + 'static;
 
     const PROTOCOL: Protocol;
 
     fn accept(&mut self) -> impl Future<Output = Accepted<Self::Connection>> + Send;
 
+    /// Establishes the client address, on the connection's own task.
+    ///
+    /// The address must be one the peer cannot simply claim, because
+    /// `limits.publishers_per_address` counts it: a spoofed address could
+    /// otherwise use up a real client's allowance. TCP and SRT have proved
+    /// theirs by the time they are accepted; QUIC proves it by completing
+    /// its handshake; a PROXY header is trusted because only the proxy can
+    /// reach a listener that requires one.
+    fn identify(
+        connection: Self::Connection,
+    ) -> impl Future<Output = Result<(SocketAddr, Self::Identified), TransportError>> + Send;
+
     /// Negotiates on the connection's own task.
     fn handshake(
-        connection: Self::Connection,
+        connection: Self::Identified,
+        client: SocketAddr,
     ) -> impl Future<Output = Result<Box<dyn PendingPublish>, TransportError>> + Send;
 }
 
 impl IngestListener for MoqListener {
     type Connection = (web_transport_quinn::quinn::Incoming, MoqConfig);
+    type Identified = MoqConnection;
 
     const PROTOCOL: Protocol = Protocol::Moq;
 
@@ -800,10 +850,19 @@ impl IngestListener for MoqListener {
         }
     }
 
-    async fn handshake(
+    async fn identify(
         (request, config): Self::Connection,
+    ) -> Result<(SocketAddr, Self::Identified), TransportError> {
+        let connection = MoqPendingPublish::connect(request, config).await?;
+        Ok((connection.remote_address(), connection))
+    }
+
+    async fn handshake(
+        connection: Self::Identified,
+        _client: SocketAddr,
     ) -> Result<Box<dyn PendingPublish>, TransportError> {
-        MoqPendingPublish::handshake(request, config)
+        connection
+            .handshake()
             .await
             .map(|pending| Box::new(pending) as Box<dyn PendingPublish>)
     }
@@ -811,6 +870,7 @@ impl IngestListener for MoqListener {
 
 impl IngestListener for SrtListener {
     type Connection = SrtPendingPublish;
+    type Identified = SrtPendingPublish;
 
     const PROTOCOL: Protocol = Protocol::Srt;
 
@@ -822,9 +882,21 @@ impl IngestListener for SrtListener {
         }
     }
 
+    /// rsrt's handshake includes a cookie exchange, so the address is proven.
+    fn identify(
+        connection: Self::Connection,
+    ) -> impl Future<Output = Result<(SocketAddr, Self::Identified), TransportError>> {
+        std::future::ready(
+            connection
+                .publish_request()
+                .map(|request| (request.client.remote_address, connection)),
+        )
+    }
+
     /// Already negotiated: rsrt completes its handshake inside `accept`.
     fn handshake(
-        connection: Self::Connection,
+        connection: Self::Identified,
+        _client: SocketAddr,
     ) -> impl Future<Output = Result<Box<dyn PendingPublish>, TransportError>> {
         std::future::ready(Ok(Box::new(connection) as Box<dyn PendingPublish>))
     }
@@ -834,26 +906,101 @@ impl IngestListener for SrtListener {
 struct RtmpListener {
     tcp: TcpListener,
     config: RtmpConfig,
+    proxy_protocol: bool,
 }
 
 impl IngestListener for RtmpListener {
-    type Connection = (tokio::net::TcpStream, RtmpConfig);
+    type Connection = (tokio::net::TcpStream, SocketAddr, RtmpConfig, bool);
+    type Identified = (tokio::net::TcpStream, RtmpConfig);
 
     const PROTOCOL: Protocol = Protocol::Rtmp;
 
     async fn accept(&mut self) -> Accepted<Self::Connection> {
         match self.tcp.accept().await {
-            Ok((stream, _)) => Accepted::Connection((stream, self.config)),
+            Ok((stream, peer)) => {
+                Accepted::Connection((stream, peer, self.config, self.proxy_protocol))
+            }
             Err(error) => Accepted::Stopped(RuntimeError::Rtmp(error)),
         }
     }
 
+    async fn identify(
+        (mut stream, peer, config, proxy_protocol): Self::Connection,
+    ) -> Result<(SocketAddr, Self::Identified), TransportError> {
+        if !proxy_protocol {
+            return Ok((peer, (stream, config)));
+        }
+        // Under the handshake's own deadline: a proxy that connects and sends
+        // nothing is as unauthenticated as any other silent peer.
+        let deadline = config
+            .timeouts
+            .handshake_read
+            .map_or(config.maximum_publish_wait, |read| {
+                read.min(config.maximum_publish_wait)
+            });
+        let client = tokio::time::timeout(deadline, proxy::read_header(&mut stream, peer))
+            .await
+            .map_err(|_| {
+                TransportError::Handshake("no PROXY protocol header before the deadline".into())
+            })?
+            .map_err(|reason| TransportError::Handshake(reason.into()))?;
+        Ok((client, (stream, config)))
+    }
+
     async fn handshake(
-        (stream, config): Self::Connection,
+        (stream, config): Self::Identified,
+        client: SocketAddr,
     ) -> Result<Box<dyn PendingPublish>, TransportError> {
-        RtmpPendingPublish::handshake_tcp(stream, config)
+        RtmpPendingPublish::handshake(stream, client, config)
             .await
             .map(|pending| Box::new(pending) as Box<dyn PendingPublish>)
+    }
+}
+
+/// Handshakes a connection whose address is established, holding its
+/// per-address permit for the rest of the session.
+async fn run_connection<L: IngestListener>(
+    connection: L::Connection,
+    services: Services,
+    session_config: Arc<SessionConfig>,
+    per_address: Option<PublishersPerAddress>,
+    slot: crate::session::PendingPermit,
+) {
+    let refused = |reason: String| {
+        services.events.emit(NodeEvent::PublisherHandshakeFailed {
+            protocol: L::PROTOCOL,
+            reason,
+        });
+    };
+    let (client, identified) = match L::identify(connection).await {
+        Ok(identified) => identified,
+        Err(error) => return refused(error.to_string()),
+    };
+    // Dropped when this task ends, so it spans admission and the session.
+    let _permit = match per_address
+        .map(|limit| limit.try_acquire(client.ip()))
+        .transpose()
+    {
+        Ok(permit) => permit,
+        Err(full) => {
+            services.meters.publisher_address_limited();
+            services.events.emit(NodeEvent::PublisherAddressLimited {
+                protocol: L::PROTOCOL,
+                address: full.address.to_string(),
+                maximum: full.maximum,
+            });
+            return;
+        }
+    };
+    let pending = match L::handshake(identified, client).await {
+        Ok(pending) => pending,
+        Err(error) => return refused(error.to_string()),
+    };
+    if let Err(error) = run_session(pending, &services, session_config.as_ref(), slot).await {
+        services.events.emit(NodeEvent::PublisherSessionFailed {
+            protocol: L::PROTOCOL,
+            reason: error.to_string(),
+        });
     }
 }
 
@@ -863,6 +1010,7 @@ async fn run_ingest<L: IngestListener>(
     services: Services,
     session_config: Arc<SessionConfig>,
     pending_publishers: PendingPublishers,
+    per_address: Option<PublishersPerAddress>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
     let mut connections = JoinSet::new();
@@ -911,28 +1059,13 @@ async fn run_ingest<L: IngestListener>(
                     }
                     Accepted::Stopped(error) => return Err(error),
                 };
-                let services = services.clone();
-                let session_config = Arc::clone(&session_config);
-                connections.spawn(async move {
-                    let pending = match L::handshake(connection).await {
-                        Ok(pending) => pending,
-                        Err(error) => {
-                            services.events.emit(NodeEvent::PublisherHandshakeFailed {
-                                protocol: L::PROTOCOL,
-                                reason: error.to_string(),
-                            });
-                            return;
-                        }
-                    };
-                    if let Err(error) =
-                        run_session(pending, &services, session_config.as_ref(), slot).await
-                    {
-                        services.events.emit(NodeEvent::PublisherSessionFailed {
-                            protocol: L::PROTOCOL,
-                            reason: error.to_string(),
-                        });
-                    }
-                });
+                connections.spawn(run_connection::<L>(
+                    connection,
+                    services.clone(),
+                    Arc::clone(&session_config),
+                    per_address.clone(),
+                    slot,
+                ));
             }
         }
     }
@@ -1207,6 +1340,116 @@ mod tests {
             "MOQ must bind when listen is on: {events:?}"
         );
         assert!(matches!(events.last(), Some(NodeEvent::ShuttingDown)));
+        Ok(())
+    }
+
+    /// PROXY headers name the client that `limits.publishers_per_address`
+    /// counts, and a connection without one is refused rather than trusted.
+    #[tokio::test]
+    async fn proxied_clients_are_counted_per_address() -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::AsyncWriteExt;
+
+        #[derive(Default)]
+        struct Recorder(parking_lot::Mutex<Vec<NodeEvent>>);
+
+        impl EventObserver for Recorder {
+            fn observe(&self, _session: crate::domain::SessionId, _event: SessionEvent) {}
+
+            fn observe_node(&self, event: NodeEvent) {
+                self.0.lock().push(event);
+            }
+        }
+
+        impl Recorder {
+            /// Waits for an event, since connections are handled on their own tasks.
+            async fn find<T>(&self, pick: impl Fn(&NodeEvent) -> Option<T>) -> Option<T> {
+                for _ in 0..200 {
+                    if let Some(found) = self.0.lock().iter().find_map(&pick) {
+                        return Some(found);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                None
+            }
+        }
+
+        let recorder = Arc::new(Recorder::default());
+        let config = NodeConfig {
+            rtmp_address: "127.0.0.1:0".parse()?,
+            rtmp_proxy_protocol: true,
+            srt_address: "127.0.0.1:0".parse()?,
+            http_address: None,
+            https_address: None,
+            maximum_publishers_per_address: Some(nz::usize!(1)),
+            ..NodeConfig::default()
+        };
+        let node = node_with_events(
+            config,
+            Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>),
+        )?;
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(node.serve(async {
+            let _ = stopped.await;
+        }));
+        let rtmp = recorder
+            .find(|event| match event {
+                NodeEvent::ListenerBound {
+                    protocol: Protocol::Rtmp,
+                    address,
+                } => Some(*address),
+                _ => None,
+            })
+            .await
+            .ok_or("RTMP never bound")?;
+
+        let proxied = |client: &'static str| async move {
+            let mut stream = tokio::net::TcpStream::connect(rtmp).await?;
+            stream
+                .write_all(format!("PROXY TCP4 {client} 10.0.0.1 40000 1935\r\n").as_bytes())
+                .await?;
+            // Holds the connection mid-handshake, and so its permit.
+            Ok::<_, std::io::Error>(stream)
+        };
+        let first = proxied("203.0.113.7").await?;
+        let second = proxied("203.0.113.7").await?;
+        let limited = recorder
+            .find(|event| match event {
+                NodeEvent::PublisherAddressLimited {
+                    address, maximum, ..
+                } => Some((address.clone(), *maximum)),
+                _ => None,
+            })
+            .await;
+        assert_eq!(limited, Some(("203.0.113.7".to_owned(), 1)));
+
+        // A different client behind the same proxy is counted separately.
+        let other = proxied("203.0.113.8").await?;
+        // A peer that reaches the listener directly cannot skip the header.
+        let mut direct = tokio::net::TcpStream::connect(rtmp).await?;
+        direct.write_all(&[3; 16]).await?;
+        let refused = recorder
+            .find(|event| match event {
+                NodeEvent::PublisherHandshakeFailed { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .await
+            .ok_or("the headerless connection was not refused")?;
+        assert!(refused.contains("PROXY protocol"), "{refused}");
+        let limits = recorder
+            .0
+            .lock()
+            .iter()
+            .filter(|event| matches!(event, NodeEvent::PublisherAddressLimited { .. }))
+            .count();
+        assert_eq!(
+            limits, 1,
+            "only the second connection from one client is refused"
+        );
+
+        // Closed first, so the drain does not wait out their handshake deadline.
+        drop((first, second, other, direct));
+        let _ = stop.send(());
+        serving.await??;
         Ok(())
     }
 

@@ -23,6 +23,7 @@ See [rushls.example.toml](../rushls.example.toml) for an annotated file.
 | `ingest.idle_timeout` | `10s` | `RUSHLS_INGEST_IDLE_TIMEOUT` | `--ingest-idle-timeout` | How long an established connection may carry nothing before it is closed, or "off" on a trusted link. |
 | `ingest.stall_timeout` | `12s` | `RUSHLS_INGEST_STALL_TIMEOUT` | `--ingest-stall-timeout` | How long a connected publisher may deliver no usable media before it is dropped, or "off". |
 | `ingest.rtmp.listen` | `0.0.0.0:1935` | `RUSHLS_INGEST_RTMP_LISTEN` | `--ingest-rtmp-listen` | Address receiving RTMP publishers. |
+| `ingest.rtmp.proxy_protocol` | `false` | `RUSHLS_INGEST_RTMP_PROXY_PROTOCOL` | `--ingest-rtmp-proxy-protocol` | Require a PROXY protocol header (v1 or v2) naming the client on every connection. Only for a listener that nothing but the proxy can reach. |
 | `ingest.srt.listen` | `0.0.0.0:9000` | `RUSHLS_INGEST_SRT_LISTEN` | `--ingest-srt-listen` | Address receiving SRT publishers. SRT currently requires IPv4. |
 | `ingest.srt.latency` | `120ms` | `RUSHLS_INGEST_SRT_LATENCY` | `--ingest-srt-latency` | SRT receive latency; increase for unstable or long-distance networks. |
 | `ingest.srt.passphrase` | — | `RUSHLS_INGEST_SRT_PASSPHRASE` | `--ingest-srt-passphrase <PATH>` | Optional passphrase: inline, `${VAR}`, or `{ file = "/path" }`. Absent accepts unencrypted SRT. |
@@ -54,6 +55,7 @@ See [rushls.example.toml](../rushls.example.toml) for an annotated file.
 |---|---|---|---|---|
 | `limits.publishers` | `256` | `RUSHLS_LIMITS_PUBLISHERS` | `--limits-publishers` | Concurrent ingest sessions. |
 | `limits.streams` | `1024` | `RUSHLS_LIMITS_STREAMS` | `--limits-streams` | Streams held at once: live ones, plus ended ones still inside `hls.window`. When full, a new stream name is refused. |
+| `limits.publishers_per_address` | — | `RUSHLS_LIMITS_PUBLISHERS_PER_ADDRESS` | `--limits-publishers-per-address` | Publishers one client address may hold at once, across every ingest protocol and including those still being admitted. Omit for no limit. |
 
 ## [memory]
 
