@@ -651,6 +651,60 @@ mod tests {
         Ok(())
     }
 
+    /// Real IDR slice preceded by an ATSC A/53 SEI carrying CEA-608 "HI" on
+    /// field 1, as an encoder embeds captions in each access unit.
+    fn captioned_idr() -> Vec<u8> {
+        let payload: &[u8] = &[
+            0xB5, 0x00, 0x31, b'G', b'A', b'9', b'4', 0x03, 0xC1, 0xFF, 0xFC, 0xC8, 0x49, 0xFF,
+        ];
+        let mut sei = vec![0x06, 0x04, u8::try_from(payload.len()).expect("fits")];
+        sei.extend_from_slice(payload);
+        sei.push(0x80);
+        let mut unit = u32::try_from(sei.len())
+            .expect("fits")
+            .to_be_bytes()
+            .to_vec();
+        unit.extend_from_slice(&sei);
+        unit.extend_from_slice(crate::mux::fixtures::H264_IDR);
+        unit
+    }
+
+    #[tokio::test]
+    async fn embedded_cea608_survives_moq_ingest_and_is_declared() -> Result<(), SourceError> {
+        use crate::{domain::MediaKind, mux::CaptionChannel};
+
+        let (mut fixture, mut source) = Fixture::new();
+        fixture.publish_catalog(&loc_catalog());
+        for index in 0..3 {
+            fixture.publish_frame("1080p", index * 500_000, &captioned_idr());
+        }
+        fixture.publish_frame("opus", 0, &[0xFC]);
+        let discovery = source.discover(discovery_limits()).await?;
+        fixture.finish_media();
+        fixture.producer.finish();
+
+        let mut packets = Vec::new();
+        while source.fill(&mut packets).await? == InputState::Open {}
+
+        // The same verifier a session runs, over what the MoQ source handed on.
+        let tracks = discovery.tracks.tracks();
+        let video = tracks
+            .iter()
+            .find(|track| track.kind() == MediaKind::Video)
+            .expect("a video track")
+            .id;
+        let mut verifier = crate::media::CaptionVerifier::new(tracks, None);
+        let declared = packets
+            .iter()
+            .filter(|packet| packet.track_id == video)
+            .filter_map(|packet| verifier.inspect(video, packet.payload.as_bytes()))
+            .last()
+            .expect("the captions are declared");
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].channel, CaptionChannel::Cea608Field(0));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn finishing_every_track_is_a_closed_input() -> Result<(), SourceError> {
         let (mut fixture, mut source) = Fixture::new();
