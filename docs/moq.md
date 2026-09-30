@@ -153,6 +153,9 @@ Leave **Captions (utf8)** selected to also publish a caption rendition.
 Type a caption and press Enter, or select **Auto** to send one every two seconds; **Clear** removes the caption on screen.
 The subtitle rendition appears in the multivariant playlist as `English`.
 The page fetches the certificate fingerprint from the HTTP listener and pins the WebTransport certificate.
+Chrome does not consult locally installed roots for WebTransport, so the page passes the fingerprint as `serverCertificateHashes`.
+Chrome accepts a pinned certificate only if it is ECDSA P-256 and valid for at most 14 days. `mint-dev-cert.sh` creates a 13-day certificate; run it daily, and Rushls reloads it without a restart.
+Rushls serves `/certificate.sha256` only while MoQ ingest is on. A production origin with a publicly trusted certificate needs no pinning.
 The origin also accepts the IPv6 loopback address that Chrome can select for `localhost`.
 
 After the origin reports `playable`, decode 30 seconds of video and audio:

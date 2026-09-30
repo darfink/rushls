@@ -62,7 +62,6 @@ OBS / FFmpeg / GStreamer / MoQ publisher
 ### Binary
 
 Download an archive for Linux, macOS, or Windows from the [releases page](https://github.com/darfink/rushls/releases), extract it, and run `rushls`.
-The first application release is still pending; until then, use Cargo.
 Linux binaries need glibc 2.39 or later.
 
 ### Cargo
@@ -76,11 +75,10 @@ cargo install rushls --locked
 ### Docker
 
 ```sh
-docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 ghcr.io/darfink/rushls:edge
+docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 ghcr.io/darfink/rushls:latest
 ```
 
-The image is not public yet; until it is, pulling it requires registry access.
-See [installation](docs/installation.md) for platforms and image tags.
+`latest` is the newest stable release; `edge` follows `main`. See [installation](docs/installation.md) for platforms and image tags.
 
 ## Quick start
 
@@ -105,47 +103,83 @@ http://127.0.0.1:8080/live/demo/index.m3u8
 ```
 
 The playlist appears once Rushls has seen enough media to plan segments, usually a few seconds.
-Browsers other than Safari need a JavaScript player such as hls.js.
+Safari and recent Chrome play the URL directly. Other browsers, such as Firefox, need a JavaScript player:
+open [`examples/player/index.html`](examples/player/index.html), a single page that loads [hls.js](https://github.com/video-dev/hls.js) from a CDN.
 If the file has irregular keyframes, use the [encoding recipe](docs/publishing.md#prepare-a-test-file).
 
 > [!WARNING]
 > Without a configuration file, Rushls listens on all interfaces (RTMP 1935, SRT 9000, HTTP 8080) and **anyone who can reach it may publish**.
-> That is fine on a laptop. Before exposing it, set up [publisher admission](#publisher-admission).
+> Before exposing it, set up [publisher admission](#publisher-admission).
 
 ## Configuration
 
-Write the annotated example, which lists every setting with its default, and edit what you need:
+Rushls runs without a file. To change anything, generate the annotated example, which lists every setting with its default:
 
 ```sh
 rushls --print-config-example > rushls.toml
-rushls --check     # validate, show listeners and the memory plan, then exit
-rushls
 ```
 
-Rushls finds its configuration from `--config`, then `RUSHLS_CONFIG`, then `./rushls.toml`, then the platform's configuration directory.
-With Docker, mount it over the bundled one:
+Edit what you need, then validate it. `--check` shows the listeners and the memory plan, and exits:
+
+```sh
+rushls --check
+```
+
+Rushls reads the first configuration file it finds:
+
+1. `--config PATH`
+2. `RUSHLS_CONFIG`
+3. `./rushls.toml` in the working directory
+4. `~/.config/rushls/rushls.toml` (on macOS, `~/Library/Application Support/rushls/`; on Windows, `%APPDATA%\rushls\config\`)
+
+With Docker, mount yours over the bundled one:
 
 ```sh
 docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 \
-  -v "$PWD/rushls.toml:/etc/rushls/rushls.toml:ro" ghcr.io/darfink/rushls:edge
+  -v "$PWD/rushls.toml:/etc/rushls/rushls.toml:ro" ghcr.io/darfink/rushls:latest
 ```
 
-Most settings can also come from the environment or the command line, which win over the file (`rushls --help` lists them):
+### Overrides
+
+An environment variable or a command-line flag overrides a single setting in the file. The command line wins over the environment.
+The variable is `RUSHLS_` followed by the setting path in capitals, and the flag is the path with dashes:
+
+| File | Environment | Command line |
+| --- | --- | --- |
+| `http.listen` | `RUSHLS_HTTP_LISTEN` | `--http-listen` |
+| `hls.segment` | `RUSHLS_HLS_SEGMENT` | `--hls-segment` |
 
 ```sh
 RUSHLS_HTTP_LISTEN=127.0.0.1:18080 rushls
 rushls --http-listen 127.0.0.1:18080
 ```
 
-Profiles, hooks, recording, and playback claims are file-only.
-Secrets accept a string, `"${VAR}"`, or `{ file = "/run/secrets/name" }`.
-Unknown settings stop startup instead of being ignored. Configuration changes need a restart, except rotated certificates and JWKS keys.
+Profiles, hooks, recording, and playback claims can only be set in the file. `rushls --help` lists every flag.
+
+### Values
+
+Any string in the file can refer to the environment: `"${VAR}"`, `"${VAR:-fallback}"` for a default, and `$$` for a literal `$`.
+An undefined variable without a fallback is an error, not an empty string.
+A credential can also come from a file, which keeps it out of the configuration and out of process listings:
+
+```toml
+[metrics]
+listen = "127.0.0.1:9090"
+token = { file = "/run/secrets/metrics-token" }   # or "${METRICS_TOKEN}", or an inline string
+```
+
+Durations are written `"500ms"`, `"10s"`, `"2h"`, and sizes `"128MiB"`, `"8GiB"`.
+
+Rushls refuses to start on an unknown setting and names it, so a misspelled table such as `[publish.auht]` cannot silently turn a feature off.
+An unknown `RUSHLS_` environment variable only logs a warning.
+Configuration changes need a restart, except rotated certificates and JWKS keys.
+
 See the [configuration guide](docs/configuration.md), the [full reference](docs/configuration-reference.md), and [deployment](docs/deployment.md) for containers, storage, and proxies.
 All documentation is indexed in [docs](docs/README.md).
 
 ## Publishing
 
-Every publisher below produces a playlist at `/live/NAME/index.m3u8`.
+The samples below all produce a playlist at `/live/NAME/index.m3u8`.
 File examples use an H.264/AAC `input.mp4`. Tested versions and more recipes are in the [publishing guide](docs/publishing.md).
 
 ### FFmpeg
@@ -230,7 +264,12 @@ ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts - \
       --broadcast live/moq --client-version moq-lite-05 import ts
 ```
 
-Rushls speaks `moq-lite-05` only. See [MoQ](docs/moq.md) for catalog requirements and local certificates.
+Rushls speaks `moq-lite-05` only. See [MoQ](docs/moq.md) for catalog requirements.
+
+To try it from a browser, [`tools/browser-moq-publish.html`](tools/browser-moq-publish.html) publishes your camera, microphone, and typed captions over WebTransport.
+A local origin has no publicly trusted certificate, so the page pins it with WebTransport's `serverCertificateHashes`,
+reading the fingerprint from Rushls at `/certificate.sha256`. Chrome accepts a pinned certificate only if it is ECDSA P-256 and valid for at most 14 days,
+and [`tools/mint-dev-cert.sh`](tools/mint-dev-cert.sh) creates one. The steps are in the [browser publish test](docs/moq.md#browser-publish-test).
 
 ## Renditions, audio tracks, and subtitles
 
@@ -260,10 +299,15 @@ ffmpeg -re -i input.mp4 \
 This assumes a 30 fps source, so `-g 60` gives a keyframe every 2 seconds in both renditions.
 Enhanced RTMP carries multiple tracks too; see [multitrack publishing](docs/publishing.md#multitrack-publishing) for RTMP and alternate audio recipes.
 
-Subtitles: caption messages become a WebVTT rendition when they are present at startup.
-A MoQ publisher declares its text renditions in the catalog instead, so they exist from the start even before the first cue.
-The [gst-captions](https://github.com/darfink/gst-captions) plugin sends timed text or live transcription as RTMP captions;
-see [publishing captions](docs/publishing.md#publish-captions-with-gst-captions).
+Subtitles and captions:
+
+- Over RTMP, `onCaption` / `onTextData` messages become a WebVTT subtitle rendition, if they arrive while the publication starts.
+- Over MoQ, the catalog declares each text rendition, so it exists from the start, even before its first cue.
+- CEA-608/708 captions inside the video need nothing extra; Rushls declares them in the playlist.
+
+> [!NOTE]
+> GStreamer has no built-in element for RTMP captions. The third-party [gst-captions](https://github.com/darfink/gst-captions) plugin adds one,
+> and can send timed text or live transcription. See [publishing captions](docs/publishing.md#publish-captions-with-gst-captions).
 
 Rushls fixes the set of tracks when a publication starts. Adding a track, or changing a codec configuration mid-stream, ends the publication.
 Separate stream names stay separate streams; Rushls does not merge publishers into one ladder.
@@ -275,7 +319,7 @@ Names and languages come from the source:
 | Protocol | Name (`NAME`) | Language (`LANGUAGE`) |
 | --- | --- | --- |
 | RTMP | `onMetaData` `title`, per track with Enhanced RTMP, or `audiotitle` / `videotitle` | `onMetaData` `language`, per track or `audiolanguage` / `videolanguage` |
-| SRT | Not carried | ISO 639 descriptor, for example FFmpeg `-metadata:s:a:0 language=eng` |
+| SRT | Not carried | ISO 639 descriptor, for example FFmpeg `-metadata:s:a:0 language=eng` or GStreamer [`taginject`](docs/publishing.md#alternate-audio-over-srt) |
 | MoQ | Catalog rendition `label` (hang 0.21 and later) | Text renditions only, from `lang` |
 
 A track without a name gets a generic one such as `Audio 2`. A name containing a double quote or a control character is ignored, since it cannot be written into the playlist.
@@ -350,8 +394,8 @@ The [renditions example](#renditions-audio-tracks-and-subtitles) shows the FFmpe
 
 ## CDN and caching
 
-Put a CDN between Rushls and your viewers. Rushls sets `Cache-Control` on every response,
-following the recommendations in [RFC 8216bis Appendix B](https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis#appendix-B),
+Rushls can serve viewers directly. For a large audience, put a CDN in front of it.
+Rushls sets `Cache-Control` on every response, following the caching recommendations in the [current HLS specification](https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis),
 so a CDN that honours origin headers needs no per-path TTLs:
 
 | Response | Cached for |
@@ -365,16 +409,20 @@ so a CDN that honours origin headers needs no per-path TTLs:
 Lifetimes under one second become `no-cache`. With playback authorization on, `public` is left out,
 so shared caches do not store a response fetched with an `Authorization` header.
 
-**Cloudflare.** Cloudflare decides what to cache by file extension unless a Cache Rule says otherwise. For the stream paths:
+Whichever CDN you use, it must hold blocking playlist requests open, support Range requests, and never share a playlist that carries one viewer's token.
+See [reverse proxies and CDNs](docs/deployment.md#reverse-proxies-and-cdns) for Nginx and CORS.
+
+### Cloudflare
+
+Cloudflare decides what to cache by file extension unless a Cache Rule says otherwise. For the stream paths:
 
 1. Add a Cache Rule that makes them eligible for cache, with **Edge TTL** set to use the origin's `Cache-Control` header.
 2. Keep the query string in the cache key (the default). `_HLS_msn`, `_HLS_part`, and `_HLS_skip` name different playlist states.
 3. Check Cloudflare's terms for your plan: they restrict serving video through the standard CDN on some plans.
 
-Any CDN must also hold blocking playlist requests open, support Range requests, and never share a playlist that carries one viewer's token.
-See [reverse proxies and CDNs](docs/deployment.md#reverse-proxies-and-cdns) for Nginx and CORS.
+### Cloudflare with playback authorization
 
-**With playback authorization.** Media bytes are the same for every viewer, so they should be cached without the token in the cache key,
+Media bytes are the same for every viewer, so they should be cached without the token in the cache key,
 but then a cached segment would be served to anyone. [`examples/cloudflare/playback-worker.js`](examples/cloudflare/playback-worker.js)
 is a sample Worker, built on the small [`jose`](https://github.com/panva/jose) library, that verifies the JWT at the edge as Rushls does, and only then serves media from a token-free cache entry.
 
@@ -495,7 +543,7 @@ token = { file = "/run/secrets/metrics-token" }
 [hook.operations]
 url = "https://hooks.example.com/rushls"
 events = ["session.started", "session.ended", "stream.available", "segment.ready"]
-signing_secret = { file = "/run/secrets/hook-signing" }
+signing_secret = { file = "/run/secrets/hook-signing" }   # optional: signs each event
 
 [log]
 format = "json"
@@ -511,7 +559,7 @@ format = "json"
 ### Irregular keyframe intervals
 
 Rushls fixes a segment schedule from the first keyframes it sees. Every later segment boundary needs a keyframe near its planned time.
-An encoder whose keyframe interval varies, such as a variable frame rate source or scene-change keyframes, eventually misses one, and the publication ends with:
+An encoder whose keyframe interval varies, such as a variable frame rate source or scene-change keyframes, may miss one. The publication then ends with:
 
 ```text
 no keyframe for segment boundary at 16s (>= 4.12s late, tolerance 0s); set segment.tolerance >= 5s or fix the encoder keyframe interval
@@ -584,8 +632,7 @@ The per-address limit covers RTMP, SRT, and MoQ together, and counts IPv6 client
 | HTTP works but the browser does not play | CORS, mixed HTTP/HTTPS content, the player library, and browser codec support |
 | MoQ connection rejected | `moq-lite-05`, certificate trust, UDP reachability, and catalog format |
 
-Player notes: hls.js 1.7.3 fails one tested case, a rendition switch followed by `ENDLIST`; CI uses a [local hls.js correction](tools/patches/hls.js/README.md) pending upstream submission.
-Safari and GStreamer have their own GAP-recovery limits. See [players](docs/players.md).
+Player-specific behaviour is covered in [players](docs/players.md).
 
 ## Development
 
