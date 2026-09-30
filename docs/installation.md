@@ -30,7 +30,7 @@ Archives are not signed or notarized yet. A checksum detects a corrupted downloa
 ## Container image
 
 ```sh
-docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 ghcr.io/darfink/rushls:edge
+docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 ghcr.io/darfink/rushls:latest
 ```
 
 | Tag | Contents |
@@ -43,6 +43,8 @@ docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 ghcr.io/darfink/rushl
 The image is Linux AMD64 only, and runs as UID/GID `65532:65532`.
 It ships [a configuration](../examples/container/rushls.toml) that listens on all container interfaces and lets anyone publish;
 mount your own at `/etc/rushls/rushls.toml` for anything public. See [Deployment](deployment.md) for volumes and secrets.
+`/var/lib/rushls` is writable by that user and is the working directory; point `disk.dir` and `record.dir` below it and mount a volume there.
+Without `disk.dir`, spilled DVR media goes under `/var/lib/rushls/cache`.
 
 ## Windows
 

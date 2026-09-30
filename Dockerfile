@@ -4,19 +4,19 @@ FROM rust:1.97-slim-trixie AS builder
 
 WORKDIR /workspace
 
-# gcc is for ring's vendored C/asm kernel at build time. The crate does not
-# link a system crypto library, and SRT is now pure Rust (`rsrt`).
+# gcc and the C library headers are for ring's vendored C/asm kernel, the only
+# native code in the build. The binary links no system crypto library, and SRT
+# is pure Rust (`rsrt`).
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    build-essential \
-    ca-certificates \
+    gcc \
+    libc6-dev \
   && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
 # `.dockerignore` omits `.git`, so bake the commit in from the host:
-#   docker build -f Dockerfile \
-#     --build-arg GIT_SHA="$(git rev-parse --short=12 HEAD)" .
+#   docker build --build-arg GIT_SHA="$(git rev-parse --short=12 HEAD)" .
 ARG GIT_SHA=
 ENV GIT_SHA=$GIT_SHA
 
@@ -29,8 +29,14 @@ RUN --mount=type=cache,id=rushls-cargo-registry,target=/usr/local/cargo/registry
 FROM debian:trixie-slim AS runtime
 
 ARG GIT_SHA=
-LABEL org.opencontainers.image.revision=$GIT_SHA
+LABEL org.opencontainers.image.title="Rushls" \
+      org.opencontainers.image.description="Live HLS and Low-Latency HLS origin for RTMP, SRT, and Media over QUIC" \
+      org.opencontainers.image.source="https://github.com/darfink/rushls" \
+      org.opencontainers.image.documentation="https://github.com/darfink/rushls#readme" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.revision=$GIT_SHA
 
+# CA roots verify outbound HTTPS: the admission service, JWKS, and hooks.
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -40,15 +46,25 @@ RUN apt-get update \
 COPY --from=builder /usr/local/bin/rushls /usr/local/bin/rushls
 COPY examples/container/rushls.toml /etc/rushls/rushls.toml
 
-# The development configuration listens on container interfaces and permits publishing.
+# The bundled configuration listens on container interfaces and permits publishing.
 # Replace it with a bind mount or select another path with RUSHLS_CONFIG.
 ENV RUSHLS_CONFIG=/etc/rushls/rushls.toml
 
-# RTMP/TCP, SRT/UDP, and HLS/HTTP respectively.
+# A writable home for DVR spill and recordings, owned by the runtime user. A
+# named volume mounted here inherits that ownership; a bind mount must be
+# writable by 65532. XDG_CACHE_HOME puts the default `disk.dir` here too.
+RUN install -d -o 65532 -g 65532 /var/lib/rushls
+ENV XDG_CACHE_HOME=/var/lib/rushls/cache
+WORKDIR /var/lib/rushls
+
+# RTMP/TCP, SRT/UDP, and HLS/HTTP, as the bundled configuration listens.
+# RTMPS (1936/tcp), HTTPS, and MoQ (UDP) are off until configured with a certificate.
 EXPOSE 1935/tcp 9000/udp 8080/tcp
 
-# No writable application directory or privileged port is required. A numeric
-# identity also works in minimal Kubernetes environments without /etc/passwd.
+# No privileged port is required. A numeric identity also works in minimal
+# Kubernetes environments without /etc/passwd.
 USER 65532:65532
 
+# Rushls handles SIGTERM itself, draining hooks and recordings for
+# `shutdown_grace`; give `docker stop -t` longer than that.
 ENTRYPOINT ["/usr/local/bin/rushls"]
