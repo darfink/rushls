@@ -1,0 +1,78 @@
+<!doctype html>
+<!--
+  A minimal HLS test player. Open this file directly in a browser, or add
+  ?src=<playlist URL> to start playing at once. hls.js handles playback in
+  browsers with Media Source Extensions; others fall back to native HLS.
+  Rushls allows any CORS origin by default, so a file:// page can load it.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rushls player</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+<style>
+  :root { color-scheme: light dark; font: 14px/1.4 system-ui, sans-serif; }
+  body { margin: 0; padding: 16px; max-width: 1100px; margin-inline: auto; }
+  form { display: flex; gap: 8px; margin-bottom: 12px; }
+  input { flex: 1; min-width: 0; padding: 6px 8px; font: inherit; border-radius: 6px; border: 1px solid #8888; }
+  button { padding: 6px 14px; font: inherit; border-radius: 6px; border: 1px solid #8888; cursor: pointer; }
+  video { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; }
+  #status { margin-top: 8px; min-height: 1.4em; font-family: ui-monospace, monospace; font-size: 12px; opacity: 0.8; }
+</style>
+</head>
+<body>
+<form id="form">
+  <input id="src" type="url" required value="http://127.0.0.1:8080/live/demo/index.m3u8" aria-label="Playlist URL">
+  <button type="submit">Play</button>
+</form>
+<video id="video" controls muted playsinline></video>
+<div id="status"></div>
+<script>
+  const video = document.getElementById('video');
+  const input = document.getElementById('src');
+  const status = document.getElementById('status');
+  let hls;
+
+  function play(url) {
+    hls?.destroy();
+    hls = undefined;
+    status.textContent = '';
+    if (window.Hls?.isSupported()) {
+      hls = new Hls({ lowLatencyMode: true });
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data.fatal) status.textContent = `hls.js: ${data.type} / ${data.details}`;
+      });
+      hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+        status.textContent = `hls.js ${Hls.version}: ${data.levels.length} video rendition(s)`;
+      });
+      hls.loadSource(url);
+      hls.attachMedia(video);
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;
+      status.textContent = 'native HLS';
+    } else {
+      status.textContent = 'This browser cannot play HLS.';
+      return;
+    }
+    video.play().catch(() => {});
+  }
+
+  document.getElementById('form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const url = input.value.trim();
+    history.replaceState(null, '', `?src=${encodeURIComponent(url)}`);
+    play(url);
+  });
+  video.addEventListener('error', () => {
+    status.textContent = `media error: ${video.error?.message || video.error?.code}`;
+  });
+
+  const initial = new URLSearchParams(location.search).get('src');
+  if (initial) {
+    input.value = initial;
+    play(initial);
+  }
+</script>
+</body>
+</html>
