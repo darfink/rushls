@@ -195,6 +195,23 @@ Both audio tracks contain the same test audio. Replace the second mapping with a
 Rushls maps MPEG-TS ISO 639 language descriptors into HLS language metadata.
 Track titles have different transport coverage; language tags do not imply arbitrary title metadata support.
 
+With GStreamer, `taginject` sets each track's language, and `mpegtsmux` writes it as the ISO 639 descriptor.
+Both two-letter and three-letter codes work. This publishes the prepared file's audio twice, as English and Spanish:
+
+<!-- verify: {"id":"gstreamer-languages","stream":"gst-languages","video":1,"audio":2,"languages":["en","es"]} -->
+```sh
+gst-launch-1.0 -e filesrc location=input.mp4 ! qtdemux name=d \
+  d.video_0 ! queue ! h264parse ! mux. \
+  d.audio_0 ! queue ! aacparse ! tee name=audio \
+  audio. ! queue ! taginject tags="language-code=en" ! mux. \
+  audio. ! queue ! taginject tags="language-code=es" ! mux. \
+  mpegtsmux name=mux alignment=7 ! \
+  srtsink uri='srt://127.0.0.1:9000?mode=caller&streamid=publish:live/gst-languages' sync=true
+```
+
+Place `taginject` after the parser and before `mpegtsmux`, one per track.
+MPEG-TS has no per-track name, so a `title` tag is dropped and the rendition gets a generic name such as `Audio 2`.
+
 ## OBS Studio
 
 Use the Custom service with server `rtmp://127.0.0.1:1935/live` and stream key `obs`.
