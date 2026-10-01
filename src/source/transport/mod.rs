@@ -6,6 +6,5 @@
 //! carries.
 
 pub mod moq;
-pub mod proxy;
 pub mod rtmp;
 pub mod srt;

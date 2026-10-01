@@ -1,5 +1,7 @@
 use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
+use rushls_common::proxy_protocol::{self, HeaderError};
+
 use thiserror::Error;
 use tokio::{
     net::TcpListener,
@@ -31,7 +33,6 @@ use crate::{
         PendingPublish, TransportError,
         transport::{
             moq::{MoqConfig, MoqConnection, MoqListener, MoqPendingPublish},
-            proxy,
             rtmp::{RtmpConfig, RtmpPendingPublish},
             srt::{SrtConfig, SrtListener, SrtPendingPublish},
         },
@@ -1051,11 +1052,31 @@ async fn tcp_client(
     // nothing is as unauthenticated as any other silent peer.
     tokio::time::timeout(
         tcp_handshake_deadline(config),
-        proxy::read_header(stream, peer),
+        proxy_protocol::read_header(stream, peer),
     )
     .await
     .map_err(|_| TransportError::Handshake("no PROXY protocol header before the deadline".into()))?
-    .map_err(|reason| TransportError::Handshake(reason.into()))
+    .map_err(|error| match error {
+        // Named, because the fix is either the balancer's PROXY setting or
+        // this one, and each listener has its own.
+        HeaderError::Missing => TransportError::Handshake(
+            format!(
+                "{error}; {} requires one",
+                proxy_protocol_setting(config.protocol)
+            )
+            .into(),
+        ),
+        error => TransportError::Handshake(error.to_string().into()),
+    })
+}
+
+/// The setting that made a listener require PROXY headers. Only the two TCP
+/// ingest listeners take one.
+fn proxy_protocol_setting(protocol: crate::domain::IngestProtocol) -> &'static str {
+    match protocol {
+        crate::domain::IngestProtocol::Rtmps => "ingest.rtmps.proxy_protocol",
+        _ => "ingest.rtmp.proxy_protocol",
+    }
 }
 
 /// RTMP inside TLS that this node terminates itself.
@@ -1872,7 +1893,10 @@ mod tests {
             })
             .await
             .ok_or("the headerless connection was not refused")?;
-        assert!(refused.contains("PROXY protocol"), "{refused}");
+        assert!(
+            refused.contains("ingest.rtmp.proxy_protocol requires one"),
+            "{refused}"
+        );
         let limits = recorder
             .0
             .lock()
@@ -1889,6 +1913,21 @@ mod tests {
         let _ = stop.send(());
         serving.await??;
         Ok(())
+    }
+
+    /// Each TCP ingest listener has its own PROXY setting, and a refusal names
+    /// the one that applies.
+    #[test]
+    fn a_missing_proxy_header_names_its_own_listener_setting() {
+        use crate::domain::IngestProtocol;
+        assert_eq!(
+            proxy_protocol_setting(IngestProtocol::Rtmp),
+            "ingest.rtmp.proxy_protocol"
+        );
+        assert_eq!(
+            proxy_protocol_setting(IngestProtocol::Rtmps),
+            "ingest.rtmps.proxy_protocol"
+        );
     }
 
     #[tokio::test]
