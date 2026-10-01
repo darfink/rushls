@@ -35,7 +35,9 @@ jobs:
         run: brew install gnupg
       - name: Install Apple HLS tools
         env:
-          GH_TOKEN: ${{ github.token }}
+          # A public repository cannot hold the installer, so it lives in a
+          # private repository; this read-only token downloads from there.
+          GH_TOKEN: ${{ secrets.APPLE_HLS_TOOLS_TOKEN || github.token }}
           APPLE_HLS_TOOLS_URL: ${{ vars.APPLE_HLS_TOOLS_URL }}
           APPLE_HLS_TOOLS_SHA256: ${{ vars.APPLE_HLS_TOOLS_SHA256 }}
           APPLE_HLS_TOOLS_PASSPHRASE: ${{ secrets.APPLE_HLS_TOOLS_PASSPHRASE }}

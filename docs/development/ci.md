@@ -45,7 +45,10 @@ The compact fixture targets standard hosted runners; the space check accounts fo
 A storage prerequisite failure does not count as a completed audit.
 
 `tools/install-apple-hls-tools.sh` downloads, verifies, and installs the package.
-Rushls stores the encrypted installer as an asset in the `ci-tools` GitHub release.
+Rushls stores the encrypted installer as an asset in the `ci-tools` release of a private repository,
+because Apple does not allow redistribution and this repository is public.
+`APPLE_HLS_TOOLS_URL` points at that asset. The `APPLE_HLS_TOOLS_TOKEN` Actions secret is a fine-grained
+token with read-only `contents` access to that repository only; the job downloads with it.
 The `APPLE_HLS_TOOLS_PASSPHRASE` Actions secret contains its decryption key.
 The workflow decrypts the installer in a private temporary directory and checks the original SHA-256 before installation.
 The installer and key are excluded from caches and report artifacts. Temporary installer files are removed when the script exits.

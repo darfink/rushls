@@ -11,8 +11,9 @@ fi
 umask 077
 installer_dir="$(mktemp -d)"
 trap 'hdiutil detach "$installer_dir/mount" >/dev/null 2>&1 || true; rm -rf "$installer_dir"' EXIT
-# The repository is private before launch. Use the job's read-only token for
-# GitHub assets; never send that token to an arbitrary installer host.
+# Apple's installer must not be public, so it is a release asset of a private
+# repository. Use the job's read-only token for GitHub assets; never send that
+# token to an arbitrary installer host.
 if [[ "$APPLE_HLS_TOOLS_URL" =~ ^https://github.com/([^/]+/[^/]+)/releases/download/([^/]+)/([^/]+)$ ]] && test -n "${GH_TOKEN:-}"; then
   gh release download "${BASH_REMATCH[2]}" --repo "${BASH_REMATCH[1]}" \
     --pattern "${BASH_REMATCH[3]}" --output "$installer_dir/download"
