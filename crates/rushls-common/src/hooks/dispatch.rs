@@ -11,9 +11,9 @@ use tokio::{
     task::JoinSet,
 };
 
-use rushls_outbound::{HttpClient, OutboundError, Response};
+use crate::outbound::{HttpClient, OutboundError, Response};
 
-use crate::{
+use crate::hooks::{
     CONTENT_TYPE, Dispatcher, Dispatchers, Envelope, HookObserver, Loss, Occurrence, Queue, Shared,
 };
 

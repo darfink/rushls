@@ -1,12 +1,12 @@
 //! TLS termination with certificates that rotate underneath a running origin.
 //!
-//! `rushls-tls` owns certificate loading, rotation, and TLS listeners. This module
+//! `rushls_common::tls` owns certificate loading, rotation, and TLS listeners. This module
 //! adapts its [`TlsObserver`] to node reporting, keeping application metrics
 //! and events independent of the certificate machinery.
 
 use std::{path::Path, sync::Arc};
 
-pub use rushls_tls::{TlsError, TlsListener as SharedTlsListener, TlsSettings};
+pub use rushls_common::tls::{TlsError, TlsListener as SharedTlsListener, TlsSettings};
 
 use crate::observe::{Events, NodeEvent, ProcessMeters, Protocol};
 
@@ -36,7 +36,7 @@ impl NodeTlsObserver {
     }
 }
 
-impl rushls_tls::TlsObserver for NodeTlsObserver {
+impl rushls_common::tls::TlsObserver for NodeTlsObserver {
     fn certificate_loaded(&self, certificate: &Path) {
         self.events.emit(NodeEvent::CertificateLoaded {
             certificate: certificate.to_path_buf(),
@@ -78,8 +78,14 @@ pub(crate) fn rotating_quic_server_config(
     meters: ProcessMeters,
     events: Events,
     protocol: Protocol,
-) -> Result<(Arc<rustls::ServerConfig>, rushls_tls::CertificateWatch), TlsError> {
-    rushls_tls::rotating_quic_server_config(
+) -> Result<
+    (
+        Arc<rustls::ServerConfig>,
+        rushls_common::tls::CertificateWatch,
+    ),
+    TlsError,
+> {
+    rushls_common::tls::rotating_quic_server_config(
         settings,
         &[web_transport_quinn::ALPN.as_bytes()],
         Arc::new(NodeTlsObserver::new(meters, events).for_protocol(protocol)),
@@ -95,8 +101,14 @@ pub(crate) fn rotating_ingest_server_config(
     meters: ProcessMeters,
     events: Events,
     protocol: Protocol,
-) -> Result<(Arc<rustls::ServerConfig>, rushls_tls::CertificateWatch), TlsError> {
-    rushls_tls::rotating_tcp_server_config(
+) -> Result<
+    (
+        Arc<rustls::ServerConfig>,
+        rushls_common::tls::CertificateWatch,
+    ),
+    TlsError,
+> {
+    rushls_common::tls::rotating_tcp_server_config(
         settings,
         &[],
         Arc::new(NodeTlsObserver::new(meters, events).for_protocol(protocol)),

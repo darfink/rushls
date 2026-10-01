@@ -51,7 +51,7 @@ pub struct Config {
     #[serde(
         default = "default_bytes",
         rename = "max_pending",
-        deserialize_with = "rushls_config::deserialize_bytes"
+        deserialize_with = "rushls_common::config::deserialize_bytes"
     )]
     pub maximum_pending_bytes: usize,
 }

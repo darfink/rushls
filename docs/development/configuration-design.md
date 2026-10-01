@@ -1352,7 +1352,7 @@ flag for a name chosen at runtime.
 
 ## Configuration mechanics
 
-Rushls uses `rushls-config` for source loading, interpolation, and
+Rushls uses `rushls_common::config` for source loading, interpolation, and
 file discovery. Unknown `RUSHLS_` environment variables produce startup warnings
 and are ignored as configuration overrides. Warnings include names, never values.
 Variables outside that prefix produce no warning. All environment variables remain

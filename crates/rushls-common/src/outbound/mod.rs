@@ -18,6 +18,9 @@
 //! — so [`Endpoint::is_encrypted`] reports the scheme and leaves the judgement
 //! to the operator who chose the address.
 
+mod client_tls;
+pub use client_tls::{ClientTls, ClientTlsError, ClientTlsFiles};
+
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;

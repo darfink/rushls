@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::{Envelope, Kind, Subject};
+use crate::hooks::{Envelope, Kind, Subject};
 
 /// Pending work for one hook, ordered per subject.
 #[derive(Debug)]

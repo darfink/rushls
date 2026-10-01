@@ -29,7 +29,7 @@ mod fixtures;
 fn the_example_covers_every_toml_option() -> Result<(), Box<dyn Error>> {
     use conf::{Conf, introspection::ProgramOptionMeta};
 
-    let reference = fixtures::Example::read()?;
+    let reference = fixtures::example()?;
     for option in AppConfig::program_options() {
         let Some(path) = super::toml_path(&option.id().to_string()) else {
             continue;
@@ -47,7 +47,7 @@ fn the_example_covers_every_toml_option() -> Result<(), Box<dyn Error>> {
 fn all_documented_examples_match_the_configuration_schema() -> Result<(), Box<dyn Error>> {
     use conf::Conf;
 
-    let reference = fixtures::Example::read()?;
+    let reference = fixtures::example()?;
     for (path, value) in &reference.examples {
         let mut document = reference.document.clone();
         fixtures::set(&mut document, path, value.clone())?;
@@ -224,7 +224,7 @@ url = "http://127.0.0.1/admit"
             matches!(
                 result,
                 Err(ConfigError::Loading(
-                    rushls_config::ConfigError::SecretRead { .. }
+                    rushls_common::config::ConfigError::SecretRead { .. }
                 ))
             ),
             "{flag} must read a file rather than take the credential inline"
@@ -293,7 +293,7 @@ fn a_missing_config_file_is_an_error() -> Result<(), Box<dyn Error>> {
         .err()
         .ok_or("a missing --config path must fail")?;
     assert!(
-        matches!(error, ConfigError::Loading(rushls_config::ConfigError::Read { ref path, .. }) if *path == missing),
+        matches!(error, ConfigError::Loading(rushls_common::config::ConfigError::Read { ref path, .. }) if *path == missing),
         "unexpected error: {error}"
     );
     Ok(())
@@ -1583,7 +1583,7 @@ key = "{}"
 
 #[test]
 fn tls_version_bounds_resolve_and_reject_invalid_ranges() -> Result<(), Box<dyn Error>> {
-    use rushls_tls::TlsVersion::{Tls12, Tls13};
+    use rushls_common::tls::TlsVersion::{Tls12, Tls13};
     let certificate = TempConfig::new("certificate")?;
     let key = TempConfig::new("key")?;
     let base = format!(
@@ -2652,7 +2652,7 @@ fn the_reference_lists_only_keys_the_tables_accept() -> Result<(), Box<dyn Error
     // The hand-listed `[record]` and `[hook]` keys must parse, or the
     // generated reference would describe settings that do not exist.
     let mut record = String::from("[record]\n");
-    for (key, _, _) in super::RECORD_FIELDS {
+    for super::TableKey { suffix: key, .. } in super::RECORD_FIELDS {
         writeln!(
             record,
             "{} = {}",
@@ -2665,7 +2665,7 @@ fn the_reference_lists_only_keys_the_tables_accept() -> Result<(), Box<dyn Error
         .replace("path = '1MiB'", "path = '{stream}_{segment}.mp4'");
     assert!(load_toml(&record)?.is_ok(), "{record}");
     let mut hook = String::from("[hook.example]\n");
-    for (key, _, _) in super::HOOK_FIELDS {
+    for super::TableKey { suffix: key, .. } in super::HOOK_FIELDS {
         let key = key.trim_start_matches(".<name>.");
         let value = match key {
             "events" => "['session.ended']",
@@ -2726,7 +2726,10 @@ fn an_rtmps_listener_uses_the_shared_certificate() -> Result<(), Box<dyn Error>>
     assert_eq!(tls.certificate, settings.certificate);
     assert_eq!(
         (tls.min_version, tls.max_version),
-        (rushls_tls::TlsVersion::Tls12, rushls_tls::TlsVersion::Tls13),
+        (
+            rushls_common::tls::TlsVersion::Tls12,
+            rushls_common::tls::TlsVersion::Tls13
+        ),
         "encoders keep TLS 1.2 even where HTTPS requires 1.3"
     );
     Ok(())
@@ -2799,7 +2802,7 @@ fn the_rushls_level_covers_workspace_crates_and_not_dependencies() -> Result<(),
     tracing::subscriber::with_default(subscriber, || {
         assert!(tracing::enabled!(target: "rushls", Level::DEBUG));
         assert!(tracing::enabled!(target: "rushls::source::rtmp", Level::DEBUG));
-        assert!(tracing::enabled!(target: "rushls_config", Level::DEBUG));
+        assert!(tracing::enabled!(target: "rushls_common::config", Level::DEBUG));
         assert!(!tracing::enabled!(target: "quinn", Level::INFO));
         assert!(tracing::enabled!(target: "quinn", Level::WARN));
     });

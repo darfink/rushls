@@ -21,9 +21,9 @@ use axum::{Router, body::Bytes, extract::State, http::StatusCode, routing::post}
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
-use rushls_outbound::{ClientConfig, Endpoint, HttpClient};
+use crate::outbound::{ClientConfig, Endpoint, HttpClient};
 
-use crate::{
+use crate::hooks::{
     HookConfig, HookObserver, HooksConfig, Loss, Occurrence, Queue, Renderer, Subject, build,
 };
 
@@ -85,7 +85,7 @@ fn began(thing: &str, detail: u64) -> Happened {
     }
 }
 
-fn envelope(thing: &str) -> crate::Envelope<Thing, Happening> {
+fn envelope(thing: &str) -> crate::hooks::Envelope<Thing, Happening> {
     Renderer::new("urn:example:node:test", 1)
         .render(&began(thing, 1))
         .expect("an event renders")
@@ -317,7 +317,7 @@ fn producer_ingress_is_bounded_and_never_waits_for_the_dispatcher() -> Result<()
     let (hooks, _dispatchers) = build(
         config(vec![hook]),
         client,
-        Arc::new(crate::IgnoreHookEvents),
+        Arc::new(crate::hooks::IgnoreHookEvents),
     )?;
 
     hooks.deliver(&began("workshop/first", 1));
@@ -505,11 +505,11 @@ async fn signed_retries_cover_the_exact_wire_body_and_stable_event_id() -> Resul
     recorder.failing_status.store(503, Ordering::Relaxed);
     let address = start(recorder.clone()).await;
     let mut destination = hook(address, &[Happening::Began]);
-    destination.signing_secret = Some(crate::SigningSecret::parse(&format!(
+    destination.signing_secret = Some(crate::hooks::SigningSecret::parse(&format!(
         "whsec_{}",
         STANDARD.encode([7; 32])
     ))?);
-    destination.bearer = Some(rushls_outbound::BearerToken::new("shared-token")?);
+    destination.bearer = Some(crate::outbound::BearerToken::new("shared-token")?);
     deliver(destination, &[began("camera", 1)], 2, &recorder).await;
     let wire = recorder.wire.lock();
     assert_eq!(wire.len(), 2);
@@ -522,7 +522,7 @@ async fn signed_retries_cover_the_exact_wire_body_and_stable_event_id() -> Resul
             parsed["id"].as_str().unwrap()
         );
         assert_eq!(headers["authorization"], "Bearer shared-token");
-        assert_eq!(headers["content-type"], crate::CONTENT_TYPE);
+        assert_eq!(headers["content-type"], crate::hooks::CONTENT_TYPE);
         let timestamp: i64 = headers["webhook-timestamp"].to_str()?.parse()?;
         assert!((time::OffsetDateTime::now_utc().unix_timestamp() - timestamp).abs() < 10);
         let mut signed = format!("{}.{}.", headers["webhook-id"].to_str()?, timestamp).into_bytes();
@@ -570,7 +570,7 @@ fn invalid_destinations_fail_before_channels_are_created() -> Result<(), Box<dyn
         let result = build::<Happened>(
             config(vec![valid.clone(), invalid]),
             client.clone(),
-            Arc::new(crate::IgnoreHookEvents),
+            Arc::new(crate::hooks::IgnoreHookEvents),
         );
         assert!(
             result.is_err(),
@@ -580,7 +580,7 @@ fn invalid_destinations_fail_before_channels_are_created() -> Result<(), Box<dyn
     let result = build::<Happened>(
         config(vec![valid.clone(), valid]),
         client,
-        Arc::new(crate::IgnoreHookEvents),
+        Arc::new(crate::hooks::IgnoreHookEvents),
     );
     assert_eq!(
         result.err().map(|error| error.reason),

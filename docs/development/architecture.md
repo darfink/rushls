@@ -1,18 +1,22 @@
 # Architecture
 
-Rushls keeps media behavior in the application and infrastructure in five local crates.
-All five crates are direct application dependencies. Cargo resolves their versions from the root manifest.
+Rushls keeps media behavior in the application and infrastructure in one local crate,
+`rushls-common`, which Routmp shares. Each module sits behind a feature of the same name,
+so a dependent compiles only what it uses.
 
-| Crate | Responsibility |
+| Feature and module | Responsibility |
 | --- | --- |
-| `rushls-config` | TOML discovery, interpolation, environment and CLI overrides, secret files, and source diagnostics |
-| `rushls-outbound` | HTTP connection pools, credentials, deadlines, and response limits |
-| `rushls-hooks` | Lifecycle envelopes, signing, ordering, retries, and bounded delivery queues |
-| `rushls-tls` | PEM loading, certificate rotation, client identities, and TLS listeners |
-| `rushls-metrics` | Metrics credentials and Prometheus label escaping |
+| `config` | TOML discovery, interpolation, environment and CLI overrides, secret files, and source diagnostics |
+| `outbound` | HTTP connection pools, credentials, client TLS, deadlines, and response limits |
+| `hooks` | Lifecycle envelopes, signing, ordering, retries, and bounded delivery queues |
+| `tls` | PEM loading, certificate rotation, client identities, and TLS listeners |
+| `metrics` | Metrics credentials and Prometheus label escaping |
+| `proxy-protocol` | PROXY protocol v1 and v2 headers |
+| `accept` | Which `accept` errors are fatal, and the backoff for the rest |
 
-`rushls-hooks` depends on `rushls-outbound`. Admission and JWKS requests use HTTP transport
-without hook delivery. Separate crates keep those dependencies explicit.
+`hooks` enables `outbound`, which enables `tls`. Admission and JWKS requests use HTTP
+transport without hook delivery. The modules report through return values and observer
+traits rather than logging, so each application keeps control of its own events.
 
 The application owns its configuration schema and semantic validation.
 It also owns stream identities, authorization responses, lifecycle event contents,
@@ -26,5 +30,5 @@ The RTMP protocol implementation comes from the `rtmpx` registry dependency.
 The application uses `rsrt` for SRT and Rust media libraries for demuxing and packaging.
 
 Shared configuration startup assertions live in
-[`crates/rushls-config/tests/support/fixtures.rs`](../../crates/rushls-config/tests/support/fixtures.rs).
+[`crates/rushls-common/tests/support/fixtures.rs`](../../crates/rushls-common/tests/support/fixtures.rs).
 Application integration tests call those assertions against the built executable.

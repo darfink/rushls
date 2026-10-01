@@ -47,7 +47,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use rushls_metrics::bearer_token;
+use rushls_common::metrics::bearer_token;
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio::net::TcpListener;
 

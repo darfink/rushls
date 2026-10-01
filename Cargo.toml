@@ -18,17 +18,22 @@ include = ["/src/**/*.rs", "/build.rs", "/rushls.example.toml", "/README.md", "/
 allocation-counting = []
 
 [dependencies]
-rushls-config.workspace = true
 # `chrono` only for operator-facing strftime patterns in `record.pattern`:
 # validation via `StrftimeItems` and formatting with `%Y/%m/%d` vocabulary.
 # `time` (workspace) stays the runtime clock; its formatting syntax is
 # different, so it cannot validate strftime strings.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-rushls-hooks.workspace = true
-rushls-metrics.workspace = true
-rushls-outbound.workspace = true
 rtmpx.workspace = true
-rushls-tls = { workspace = true, features = ["axum"] }
+rushls-common = { workspace = true, features = [
+  "accept",
+  "axum",
+  "config",
+  "hooks",
+  "metrics",
+  "outbound",
+  "proxy-protocol",
+  "tls",
+] }
 arc-swap = "1"
 derive_more = { version = "2", features = ["debug", "deref", "display"] }
 bytes = "1.12.1"
@@ -138,12 +143,8 @@ homepage = "https://github.com/darfink/rushls"
 # Common dependency versions for the application and its infrastructure crates.
 [workspace.dependencies]
 # Internal
-rushls-config = { path = "crates/rushls-config", version = "0.1.0" }
-rushls-outbound = { path = "crates/rushls-outbound", version = "0.1.0" }
-rushls-hooks = { path = "crates/rushls-hooks", version = "0.1.0" }
+rushls-common = { path = "crates/rushls-common", version = "0.1.0" }
 rtmpx = "3.1"
-rushls-tls = { path = "crates/rushls-tls", version = "0.1.0" }
-rushls-metrics = { path = "crates/rushls-metrics", version = "0.1.0" }
 
 # External
 conf = "0.4"

@@ -15,11 +15,18 @@ use std::{
 };
 use thiserror::Error;
 
+pub mod example;
 pub mod interpolate;
+pub mod reference;
 mod secret;
+mod values;
 pub use bytesize::ByteSize;
 pub use humantime::parse_duration;
 pub use secret::{SecretString, TextSource, deserialize_secret};
+pub use values::{
+    OptionalAddress, OptionalBytes, OptionalDuration, TomlTable, TomlValue, parse_optional_address,
+    parse_optional_bytes, parse_optional_duration, read_credential,
+};
 
 /// Tests use explicit paths so developer files cannot change their defaults.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

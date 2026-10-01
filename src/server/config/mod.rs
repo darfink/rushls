@@ -18,8 +18,12 @@ use std::{
 
 use crate::source::transport::rtmp::RtmpTimeouts;
 use conf::Conf;
-use rushls_config::{ByteSize, ConfigSearch, Loader, TextSource};
-use rushls_tls::{ClientIdentity, TlsVersion, load_roots};
+use rushls_common::config::{
+    ByteSize, ConfigSearch, Loader, OptionalAddress, OptionalBytes, OptionalDuration, TextSource,
+    TomlTable, TomlValue, parse_optional_address, parse_optional_bytes, parse_optional_duration,
+    reference::{Reference, TableKey},
+};
+use rushls_common::tls::{ClientIdentity, TlsVersion, load_roots};
 use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use thiserror::Error;
@@ -184,7 +188,6 @@ impl ResolvedAppConfig {
     }
 }
 
-/// Renders `docs/configuration-reference.md` from the schema itself, so the reference
 /// TOML path of a schema option, or `None` for command-line-only flags.
 pub fn toml_path(id: &str) -> Option<String> {
     if matches!(id, "config" | "print_config_example" | "check") {
@@ -210,16 +213,9 @@ const CREDENTIAL_FILE_FLAGS: &[&str] = &[
 
 /// Renders `docs/configuration-reference.md` from the schema itself, so the reference
 /// can only describe settings that exist, with the defaults they really have.
-///
-/// One table per top-level section, in schema order. The description is each
-/// field's first doc paragraph; rationale below it stays in the source.
 pub fn reference_markdown() -> String {
-    use conf::introspection::ProgramOptionMeta;
-    use std::fmt::Write as _;
-
-    let cell = |text: String| text.replace('|', "\\|");
-    let mut output = String::from(
-        "# Configuration reference\n\n\
+    rushls_common::config::reference::reference_markdown::<AppConfig>(&Reference {
+        preamble: "# Configuration reference\n\n\
          Generated from the configuration schema; do not edit by hand. Regenerate with\n\
          `RUSHLS_UPDATE_CONFIG_REFERENCE=1 cargo test --lib config_reference`.\n\n\
          Values resolve defaults < TOML < environment < CLI. Credentials take a string,\n\
@@ -227,154 +223,88 @@ pub fn reference_markdown() -> String {
          because arguments are visible in the process list. Structured values\n\
          (tables and lists) use TOML syntax in environment variables and flags too.\n\
          See [rushls.example.toml](../rushls.example.toml) for an annotated file.\n",
-    );
-    let mut section = None;
-    for option in AppConfig::program_options() {
-        let Some(path) = toml_path(&option.id().to_string()) else {
-            continue;
-        };
-        let top = match path.split_once('.') {
-            Some((top, _)) => top.to_owned(),
-            // Whole-table settings head their own section.
-            None if matches!(path.as_str(), "record" | "hook") => path.clone(),
-            None => "(top level)".to_owned(),
-        };
-        if section.as_ref() != Some(&top) {
-            write!(
-                output,
-                "\n## {}\n\n| Setting | Default | Environment | CLI | Description |\n|---|---|---|---|---|\n",
-                if top == "(top level)" {
-                    top.clone()
-                } else {
-                    format!("[{top}]")
-                }
-            )
-            .expect("writing to a String cannot fail");
-            section = Some(top);
-        }
-        let description = option
-            .description()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        let summary = description
-            .split("\n\n")
-            .next()
-            .unwrap_or_default()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let code = |value: Option<String>| {
-            value.map_or_else(|| "—".to_owned(), |value| format!("`{value}`"))
-        };
-        let flag = option
-            .long_form()
-            .map(|value| format!("--{value}"))
-            .or_else(|| {
-                let sibling = format!("{path}_file");
-                CREDENTIAL_FILE_FLAGS
-                    .contains(&sibling.as_str())
-                    .then(|| format!("--{} <PATH>", path.replace(['.', '_'], "-")))
-            });
-        writeln!(
-            output,
-            "| `{path}` | {} | {} | {} | {} |",
-            cell(code(option.default_help_str().map(ToString::to_string))),
-            cell(code(option.env_form().map(ToString::to_string))),
-            cell(code(flag)),
-            cell(summary),
-        )
-        .expect("writing to a String cannot fail");
-        // Whole-table settings are opaque to `conf`, so list their keys here.
-        let fields: &[(&str, &str, &str)] = match path.as_str() {
-            "record" => RECORD_FIELDS,
-            "hook" => HOOK_FIELDS,
-            _ => &[],
-        };
-        for (key, default, description) in fields {
-            writeln!(
-                output,
-                "| `{path}{key}` | {} | — | — | {} |",
-                cell(if default.is_empty() {
-                    "—".to_owned()
-                } else {
-                    format!("`{default}`")
-                }),
-                cell((*description).to_owned()),
-            )
-            .expect("writing to a String cannot fail");
-        }
-    }
-    output
+        toml_path: &toml_path,
+        credential_file_flags: CREDENTIAL_FILE_FLAGS,
+        tables: &[("record", RECORD_FIELDS), ("hook", HOOK_FIELDS)],
+    })
 }
 
 /// `[record]` keys, as `record::Config` accepts them.
-const RECORD_FIELDS: &[(&str, &str, &str)] = &[
-    (
-        ".dir",
-        "",
-        "Directory recordings are written under. Setting the table enables recording.",
-    ),
-    (
-        ".path",
-        "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4",
-        "Where each completed segment lands under `dir`.",
-    ),
-    (
-        ".queue_size",
-        "128",
-        "Segments queued for writing before new ones are dropped.",
-    ),
-    (
-        ".max_pending",
-        "256MiB",
-        "Open segments, queued jobs, and the active write together.",
-    ),
+const RECORD_FIELDS: &[TableKey<'static>] = &[
+    TableKey {
+        suffix: ".dir",
+        default: "",
+        description: "Directory recordings are written under. Setting the table enables recording.",
+    },
+    TableKey {
+        suffix: ".path",
+        default: "{stream}/{publication}/{time:%Y/%m/%d}/{rendition}_{segment}.mp4",
+        description: "Where each completed segment lands under `dir`.",
+    },
+    TableKey {
+        suffix: ".queue_size",
+        default: "128",
+        description: "Segments queued for writing before new ones are dropped.",
+    },
+    TableKey {
+        suffix: ".max_pending",
+        default: "256MiB",
+        description: "Open segments, queued jobs, and the active write together.",
+    },
 ];
 
 /// `[hook.<name>]` keys, as `HookEndpointAppConfig` accepts them.
-const HOOK_FIELDS: &[(&str, &str, &str)] = &[
-    (".<name>.url", "", "Where deliveries are posted."),
-    (
-        ".<name>.events",
-        "",
-        "Events this destination receives; required.",
-    ),
-    (
-        ".<name>.token",
-        "",
-        "Bearer credential: inline, `${VAR}`, or `{ file = \"/path\" }`.",
-    ),
-    (
-        ".<name>.signing_secret",
-        "",
-        "`whsec_` key signing each delivery.",
-    ),
-    (
-        ".<name>.queue_size",
-        "1000",
-        "Events held before the oldest is dropped.",
-    ),
-    (
-        ".<name>.max_in_flight",
-        "8",
-        "Distinct streams delivered at once.",
-    ),
-    (
-        ".<name>.max_attempts",
-        "5",
-        "Attempts per event, the first included.",
-    ),
-    (
-        ".<name>.client_cert",
-        "",
-        "PEM certificate chain presented to this endpoint.",
-    ),
-    (".<name>.client_key", "", "PEM private key for that chain."),
-    (
-        ".<name>.ca",
-        "",
-        "PEM authority to trust instead of the platform store.",
-    ),
+const HOOK_FIELDS: &[TableKey<'static>] = &[
+    TableKey {
+        suffix: ".<name>.url",
+        default: "",
+        description: "Where deliveries are posted.",
+    },
+    TableKey {
+        suffix: ".<name>.events",
+        default: "",
+        description: "Events this destination receives; required.",
+    },
+    TableKey {
+        suffix: ".<name>.token",
+        default: "",
+        description: "Bearer credential: inline, `${VAR}`, or `{ file = \"/path\" }`.",
+    },
+    TableKey {
+        suffix: ".<name>.signing_secret",
+        default: "",
+        description: "`whsec_` key signing each delivery.",
+    },
+    TableKey {
+        suffix: ".<name>.queue_size",
+        default: "1000",
+        description: "Events held before the oldest is dropped.",
+    },
+    TableKey {
+        suffix: ".<name>.max_in_flight",
+        default: "8",
+        description: "Distinct streams delivered at once.",
+    },
+    TableKey {
+        suffix: ".<name>.max_attempts",
+        default: "5",
+        description: "Attempts per event, the first included.",
+    },
+    TableKey {
+        suffix: ".<name>.client_cert",
+        default: "",
+        description: "PEM certificate chain presented to this endpoint.",
+    },
+    TableKey {
+        suffix: ".<name>.client_key",
+        default: "",
+        description: "PEM private key for that chain.",
+    },
+    TableKey {
+        suffix: ".<name>.ca",
+        default: "",
+        description: "PEM authority to trust instead of the platform store.",
+    },
 ];
 
 /// Hooks and the client they deliver with, which carries their own deadline.
@@ -387,9 +317,9 @@ pub struct ResolvedHooks {
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error(transparent)]
-    Loading(#[from] rushls_config::ConfigError),
+    Loading(#[from] rushls_common::config::ConfigError),
     #[error("could not build outbound client: {0}")]
-    Outbound(#[from] rushls_outbound::OutboundError),
+    Outbound(#[from] rushls_common::outbound::OutboundError),
     #[error("invalid configuration: {0}")]
     Invalid(String),
     #[error("invalid SRT encryption configuration: {0}")]
@@ -401,7 +331,7 @@ impl ConfigError {
     /// exit status. In particular, `--help` and `--version` remain successful.
     pub fn exit(self) -> ! {
         match self {
-            Self::Loading(rushls_config::ConfigError::Sources(error)) => error.exit(),
+            Self::Loading(rushls_common::config::ConfigError::Sources(error)) => error.exit(),
             // Configuration is resolved before a `Node` exists, so this cannot
             // use the observer. The binary initializes tracing before loading
             // configuration, which keeps this startup diagnostic timestamped.
@@ -529,7 +459,7 @@ impl AppConfig {
         // still beats it; withholding it from resolution is how.
         let from_cli = matches!(
             loaded.sources.get("log.level"),
-            Some(rushls_config::Source::Cli)
+            Some(rushls_common::config::Source::Cli)
         );
         let env = env
             .into_iter()
@@ -704,7 +634,7 @@ pub struct ServerAppConfig {
         long,
         env,
         default_value = "10s",
-        value_parser = rushls_config::parse_duration,
+        value_parser = rushls_common::config::parse_duration,
         serde(use_value_parser)
     )]
     pub shutdown_grace: Duration,
@@ -745,7 +675,7 @@ pub struct PlaybackAuthAppConfig {
         long,
         env,
         default_value = "30s",
-        value_parser = rushls_config::parse_duration,
+        value_parser = rushls_common::config::parse_duration,
         serde(use_value_parser)
     )]
     leeway: Duration,
@@ -830,7 +760,7 @@ pub struct HttpAuthAppConfig {
         long,
         env,
         default_value = "2s",
-        value_parser = rushls_config::parse_duration,
+        value_parser = rushls_common::config::parse_duration,
         serde(use_value_parser)
     )]
     timeout: Duration,
@@ -958,36 +888,6 @@ fn resolve_hooks(
     }))
 }
 
-/// A TOML table of entries keyed by the name an operator chose.
-///
-/// `conf` hands a table-valued parameter over as its own TOML text rather than
-/// as a parsed value, so each of these has to parse itself. Generic because the
-/// three that exist — hook endpoints, static publishers, policy profiles —
-/// differ in nothing but what they hold.
-#[derive(Debug, Deserialize)]
-#[serde(transparent)]
-pub struct TomlTable<T>(BTreeMap<String, T>);
-
-// Hand-written rather than derived: an empty table is meaningful for every `T`,
-// and deriving would demand `T: Default` for no reason.
-impl<T> Default for TomlTable<T> {
-    fn default() -> Self {
-        Self(BTreeMap::new())
-    }
-}
-
-impl<T: serde::de::DeserializeOwned> FromStr for TomlTable<T> {
-    type Err = toml::de::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        toml::from_str(value).map_err(|mut error| {
-            // A hook table can contain credentials beside the invalid field.
-            error.set_input(None);
-            error
-        })
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookEndpointAppConfig {
@@ -1054,7 +954,7 @@ impl HookEndpointAppConfig {
             &format!("the signing secret for hook `{name}`"),
             self.signing_secret.as_ref(),
         )?
-        .map(|secret| rushls_hooks::SigningSecret::parse(&secret))
+        .map(|secret| rushls_common::hooks::SigningSecret::parse(&secret))
         .transpose()
         .map_err(|error| invalid(error.to_string()))?;
 
@@ -1139,7 +1039,7 @@ impl OutboundTlsAppConfig {
                 ClientIdentity::new(
                     certificate.clone(),
                     key.clone(),
-                    Arc::new(rushls_tls::IgnoreTlsEvents),
+                    Arc::new(rushls_common::tls::IgnoreTlsEvents),
                 )
                 .map_err(|error| invalid(format!("{label}: {error}")))?,
             ),
@@ -1525,31 +1425,6 @@ impl DiskAppConfig {
         };
         Ok(())
     }
-}
-
-/// One TOML value handed over as its own text.
-///
-/// `conf` gives a table-valued parameter as raw TOML rather than as a parsed
-/// value, so each of these parses itself. The same shape also lets an
-/// environment override carry a TOML fragment, which is what keeps a
-/// structured predicate overridable rather than file-only.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(transparent)]
-pub struct TomlValue<T>(T);
-
-impl<T: serde::de::DeserializeOwned> FromStr for TomlValue<T> {
-    type Err = toml::de::Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        // Wrapped in a key so a bare inline table parses as a document, which
-        // is the form both a file fragment and an environment value take.
-        toml::from_str::<Wrapper<T>>(&format!("value = {value}")).map(|wrapper| Self(wrapper.value))
-    }
-}
-
-#[derive(Deserialize)]
-struct Wrapper<T> {
-    value: T,
 }
 
 /// A rate written as a multiple of wall clock: "1x", "0.5x", "2x".
@@ -2166,7 +2041,7 @@ pub struct SrtAppConfig {
         long,
         env,
         default_value = "120ms",
-        value_parser = rushls_config::parse_duration,
+        value_parser = rushls_common::config::parse_duration,
         serde(use_value_parser)
     )]
     latency: Duration,
@@ -2263,86 +2138,6 @@ impl MoqAppConfig {
         }
         Ok(())
     }
-}
-
-/// A duration that may be explicitly disabled.
-///
-/// "No timeout" has to stay expressible: a trusted link on a controlled
-/// network is a legitimate reason to wait indefinitely, and without `"off"` an
-/// operator who wants that is pushed into writing an absurd number instead —
-/// which reads as a mistake and behaves like one if it is ever reached.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct OptionalDuration(pub Option<Duration>);
-
-/// A byte limit that may be explicitly lifted.
-///
-/// Like [`OptionalDuration`]'s "off": a trusted deployment may reasonably opt
-/// out of enforcement, and spelling that as an absurd number reads as a
-/// mistake. Usage is still accounted and reported either way.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct OptionalBytes(pub Option<ByteSize>);
-
-impl std::fmt::Display for OptionalBytes {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            Some(bytes) => write!(formatter, "{bytes}"),
-            None => formatter.write_str("unlimited"),
-        }
-    }
-}
-
-fn parse_optional_bytes(value: &str) -> Result<OptionalBytes, String> {
-    let trimmed = value.trim();
-    if trimmed.eq_ignore_ascii_case("unlimited") {
-        return Ok(OptionalBytes(None));
-    }
-    trimmed.parse().map(|bytes| OptionalBytes(Some(bytes)))
-}
-
-impl std::fmt::Display for OptionalDuration {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            Some(duration) => write!(formatter, "{}", humantime::format_duration(duration)),
-            None => formatter.write_str("off"),
-        }
-    }
-}
-
-/// An address that may be explicitly disabled.
-///
-/// Mirrors [`OptionalDuration`]: turning one listener off is how an operator
-/// says "HTTPS only", and an absurd address is not a way to spell that.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct OptionalAddress(pub Option<SocketAddr>);
-
-impl std::fmt::Display for OptionalAddress {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            Some(address) => write!(formatter, "{address}"),
-            None => formatter.write_str("off"),
-        }
-    }
-}
-
-fn parse_optional_address(value: &str) -> Result<OptionalAddress, String> {
-    let trimmed = value.trim();
-    if trimmed.eq_ignore_ascii_case("off") {
-        return Ok(OptionalAddress(None));
-    }
-    trimmed
-        .parse()
-        .map(|address| OptionalAddress(Some(address)))
-        .map_err(|error| format!("{error}"))
-}
-
-fn parse_optional_duration(value: &str) -> Result<OptionalDuration, String> {
-    let trimmed = value.trim();
-    if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none") {
-        return Ok(OptionalDuration(None));
-    }
-    humantime::parse_duration(trimmed)
-        .map(|duration| OptionalDuration(Some(duration)))
-        .map_err(|error| error.to_string())
 }
 
 #[derive(Conf)]
@@ -2777,7 +2572,7 @@ pub struct CorsAppConfig {
         long,
         env,
         default_value = "10min",
-        value_parser = rushls_config::parse_duration,
+        value_parser = rushls_common::config::parse_duration,
         serde(use_value_parser)
     )]
     max_age: Duration,
@@ -2826,7 +2621,7 @@ pub struct HttpsAppConfig {
         long,
         env,
         default_value = "5s",
-        value_parser = rushls_config::parse_duration,
+        value_parser = rushls_common::config::parse_duration,
         serde(use_value_parser)
     )]
     handshake_timeout: Duration,
@@ -3006,8 +2801,8 @@ impl LogAppConfig {
             .map(|(_, value)| value.to_string_lossy().trim().to_owned())
             .filter(|value| !value.is_empty());
         let Some(filter) = rust_log else {
-            // `rushls` matches by prefix, so it covers the workspace crates
-            // (`rushls_config`, `rushls_tls`, ...) as well as the binary.
+            // `rushls` matches by prefix, so it covers `rushls_common` as well as
+            // the binary.
             return Ok(LogSettings {
                 filter: format!("{},rushls={}", Self::DEPENDENCIES, self.level),
                 format: self.format,
@@ -3237,10 +3032,8 @@ fn read_credential(
     source: Option<&TextSource>,
     cli_file: Option<&PathBuf>,
 ) -> Result<Option<String>, ConfigError> {
-    match cli_file {
-        Some(path) => read_text(label, Some(&TextSource::File(path.clone()))),
-        None => read_text(label, source),
-    }
+    rushls_common::config::read_credential(label, source, cli_file.map(PathBuf::as_path))
+        .map_err(ConfigError::from)
 }
 
 fn nonzero_bytes(label: &str, value: ByteSize) -> Result<usize, ConfigError> {

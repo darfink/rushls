@@ -1,15 +1,35 @@
-# rushls-config
+# rushls-common
+
+Infrastructure shared by [Rushls](https://github.com/darfink/rushls) and its
+sibling services. Every module is behind a feature of the same name, so a
+dependent compiles only what it uses. Nothing here chooses application policy
+or logs: reporting stays with each application's own events.
+
+| Feature | Module | Provides |
+| --- | --- | --- |
+| `config` | `config` | Layered configuration loading over `conf` schemas |
+| `outbound` | `outbound` | A pooled HTTP client for operator-configured services, with optional client TLS |
+| `hooks` | `hooks` | Ordered, best-effort lifecycle event delivery (CloudEvents JSON) |
+| `tls` | `tls` | TLS termination with certificates that rotate under a running listener |
+| `axum` | `tls` | `axum::serve::Listener` for the TLS listener |
+| `metrics` | `metrics` | Prometheus endpoint helpers: bearer tokens and label escaping |
+| `proxy-protocol` | `proxy_protocol` | PROXY protocol v1 and v2 headers, read ahead of a TCP stream |
+| `accept` | `accept` | Accept-loop error classification and backoff |
+
+`outbound` enables `tls`, and `hooks` enables `outbound`.
+
+## Configuration
 
 Configuration loading independent of application policy. Application schemas use
 `conf::Conf` with Serde support. The loader owns file discovery, interpolation,
 source precedence, environment warnings, and source metadata.
 
-## Application integration
+### Application integration
 
 ```rust
 use std::path::PathBuf;
 use conf::Conf;
-use rushls_config::{Loader, SecretString};
+use rushls_common::config::{Loader, SecretString};
 
 #[derive(Conf)]
 #[conf(serde, name = "example", env_prefix = "EXAMPLE_")]
@@ -36,7 +56,7 @@ The example accepts `EXAMPLE_LISTEN`, `--listen`, and the TOML key `listen`.
 Application validation runs after loading. The shared crate does not construct
 services, choose media policies, or start background tasks.
 
-## Source contract
+### Source contract
 
 Values resolve in this order, with later sources overriding earlier sources:
 
@@ -69,7 +89,7 @@ about undeclared application-prefixed names.
 Schemas can explicitly contain maps with operator-defined keys. Those maps
 retain their own validation of entry fields.
 
-## Interpolation
+### Interpolation
 
 Interpolation applies to TOML string values, including strings inside arrays
 and tables. It never changes keys or table names.
@@ -88,11 +108,11 @@ trigger another interpolation pass. Fallback values are not recursively expanded
 Interpolation runs before overrides, so unresolved file references still fail
 when another source overrides the field.
 
-## Credentials and diagnostics
+### Credentials and diagnostics
 
 Secret fields use `#[conf(env, secret)]` and `SecretString` for redacted Debug
 output and Serde type errors. Existing string fields can use
-`serde(deserialize_with = "rushls_config::deserialize_secret")` for error redaction. `conf` disallows inline CLI arguments on fields marked secret.
+`serde(deserialize_with = "rushls_common::config::deserialize_secret")` for error redaction. `conf` disallows inline CLI arguments on fields marked secret.
 
 Credentials use one `TextSource` field each: a literal string (including
 `"${VAR}"` interpolation) or `{ file = "/path" }`. The value's shape selects
@@ -107,11 +127,33 @@ TOML syntax diagnostics omit source lines. Interpolation diagnostics omit the
 value being expanded. Help and version remain available with broken configuration.
 Applications own diagnostic output and exit handling.
 
-## Dependencies and tests
+### Dependencies and tests
 
 This crate depends on parsing and filesystem libraries. It has no dependency
 on HTTP, hooks, TLS, or the application.
 
 ```sh
-cargo test -p rushls-config --locked
+cargo test -p rushls-common --all-features --locked
 ```
+
+### Shared schema vocabulary
+
+Applications use the same value shapes, so the same spelling means the same
+thing in Rushls and Routmp:
+
+| Item | Purpose |
+| --- | --- |
+| `OptionalDuration` | A duration, or `"off"`/`"none"` where waiting indefinitely is legitimate |
+| `OptionalAddress` | A listener address, or `"off"` |
+| `OptionalBytes` | A byte limit, or `"unlimited"` |
+| `TomlTable<T>` | An open namespace keyed by operator-chosen names, such as `[hook.<name>]` |
+| `TomlValue<T>` | A structured value handed over as TOML text, overridable from the environment |
+| `read_credential` | A `TextSource` credential whose CLI flag names a file |
+
+Two modules keep documentation tied to the schema:
+
+- `reference::reference_markdown` renders a configuration reference from the
+  `conf` schema. Applications commit the output and test that it is current.
+- `example::AnnotatedExample` reads an annotated example file, commented
+  settings included, so a test can check that the example documents every
+  option and that every documented value parses.

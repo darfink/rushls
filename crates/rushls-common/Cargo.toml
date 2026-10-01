@@ -1,0 +1,71 @@
+[package]
+name = "rushls-common"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Configuration, outbound HTTP, lifecycle hooks, rotating TLS, and listener helpers shared by Rushls services"
+readme = "README.md"
+include = ["/src/**/*.rs", "/README.md", "/LICENSE"]
+
+[features]
+# Accept-loop error classification and backoff.
+accept = ["dep:libc"]
+# Layered configuration loading over `conf` schemas.
+config = ["dep:conf", "dep:directories", "dep:toml", "dep:serde", "dep:thiserror", "dep:humantime", "dep:bytesize"]
+# Ordered, best-effort lifecycle event delivery.
+hooks = ["outbound", "dep:ring", "dep:base64", "dep:serde", "dep:serde_json", "dep:time", "dep:uuid", "tokio/rt"]
+# Prometheus endpoint helpers.
+metrics = ["dep:subtle"]
+# HTTP client for operator-configured services, with optional client TLS.
+outbound = ["tls", "dep:bytes", "dep:derive_more", "dep:http", "dep:http-body-util", "dep:hyper-rustls", "dep:hyper-util", "dep:rustls-native-certs"]
+# PROXY protocol v1 and v2 headers.
+proxy-protocol = ["dep:thiserror", "dep:tokio", "tokio/io-util"]
+# TLS termination with certificates that rotate under a running listener.
+tls = ["dep:arc-swap", "dep:notify", "dep:notify-debouncer-full", "dep:rustls", "dep:thiserror", "dep:tokio", "dep:tokio-rustls", "tokio/net", "tokio/rt", "tokio/time", "tokio/sync"]
+# Implements `axum::serve::Listener` for the TLS listener.
+axum = ["tls", "dep:axum"]
+
+[dependencies]
+arc-swap = { workspace = true, optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
+base64 = { version = "0.22", optional = true }
+bytes = { workspace = true, optional = true }
+bytesize = { workspace = true, optional = true }
+conf = { workspace = true, optional = true }
+# Redacts bearer tokens from `Debug`, so a credential cannot reach a log
+# through a derived formatter.
+derive_more = { workspace = true, optional = true }
+directories = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+humantime = { workspace = true, optional = true }
+hyper-rustls = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
+notify = { workspace = true, optional = true }
+notify-debouncer-full = { workspace = true, optional = true }
+ring = { version = "0.17", optional = true }
+rustls = { workspace = true, optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+subtle = { version = "2", optional = true }
+thiserror = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
+# `rt` for the `JoinSet` that holds one in-flight hook request per subject.
+tokio = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+parking_lot.workspace = true
+rcgen = "0.14"
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+all-features = true

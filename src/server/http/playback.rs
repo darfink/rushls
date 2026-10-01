@@ -21,7 +21,7 @@ use jsonwebtoken::{
     Algorithm, DecodingKey, Validation, decode, decode_header,
     jwk::{AlgorithmParameters, EllipticCurve, Jwk, JwkSet, KeyAlgorithm},
 };
-use rushls_metrics::bearer_token;
+use rushls_common::metrics::bearer_token;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::task::AbortHandle;

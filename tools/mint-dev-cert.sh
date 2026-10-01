@@ -14,7 +14,7 @@
 # Run daily:
 #   0 7 * * *  /path/to/rushls/tools/mint-dev-cert.sh
 #
-# rushls picks it up without a restart: rushls-tls watches the containing directory
+# rushls picks it up without a restart: rushls_common::tls watches the containing directory
 # and swaps an ArcSwap, so live sessions keep the key they negotiated with.
 set -eu
 

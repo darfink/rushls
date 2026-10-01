@@ -1072,7 +1072,7 @@ struct RtmpsListener {
     config: RtmpConfig,
     proxy_protocol: bool,
     /// Dropping it would silently stop certificate reloads.
-    _watch: rushls_tls::CertificateWatch,
+    _watch: rushls_common::tls::CertificateWatch,
 }
 
 impl IngestListener for RtmpsListener {
@@ -1184,7 +1184,7 @@ async fn run_connection<L: IngestListener>(
 
 /// Accepts publishers until `stop`, then lets what is in flight finish.
 /// How long an ingest listener waits after a failed `accept` before retrying.
-/// Matches the TLS listener in `rushls-tls`.
+/// Matches the TLS listener in `rushls_common::tls`.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 async fn run_ingest<L: IngestListener>(
@@ -1530,7 +1530,7 @@ mod tests {
             let (settings, certificate) = fixtures::write_pair(&directory, "origin.test");
             let (tls, watch) = http::rotating_ingest_server_config(
                 TlsSettings {
-                    min_version: rushls_tls::TlsVersion::Tls12,
+                    min_version: rushls_common::tls::TlsVersion::Tls12,
                     ..settings
                 },
                 ProcessMeters::default(),

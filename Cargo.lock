@@ -2318,11 +2318,7 @@ dependencies = [
  "ring",
  "rsrt",
  "rtmpx",
- "rushls-config",
- "rushls-hooks",
- "rushls-metrics",
- "rushls-outbound",
- "rushls-tls",
+ "rushls-common",
  "rustls",
  "scuffle-av1",
  "scuffle-h265",
@@ -2345,76 +2341,40 @@ dependencies = [
 ]
 
 [[package]]
-name = "rushls-config"
-version = "0.1.0"
-dependencies = [
- "bytesize",
- "conf",
- "directories",
- "humantime",
- "serde",
- "tempfile",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "rushls-hooks"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "bytes",
- "derive_more",
- "http",
- "parking_lot",
- "ring",
- "rushls-outbound",
- "serde",
- "serde_json",
- "thiserror",
- "time",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "rushls-metrics"
-version = "0.1.0"
-dependencies = [
- "subtle",
-]
-
-[[package]]
-name = "rushls-outbound"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bytes",
- "derive_more",
- "http",
- "http-body-util",
- "hyper-rustls",
- "hyper-util",
- "rustls",
- "rustls-native-certs",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "rushls-tls"
+name = "rushls-common"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "base64 0.22.1",
+ "bytes",
+ "bytesize",
+ "conf",
+ "derive_more",
+ "directories",
+ "http",
+ "http-body-util",
+ "humantime",
+ "hyper-rustls",
+ "hyper-util",
+ "libc",
  "notify",
  "notify-debouncer-full",
+ "parking_lot",
  "rcgen",
+ "ring",
  "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
  "thiserror",
+ "time",
  "tokio",
  "tokio-rustls",
+ "toml",
+ "uuid",
 ]
 
 [[package]]

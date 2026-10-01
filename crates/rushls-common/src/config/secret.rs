@@ -1,4 +1,4 @@
-use crate::ConfigError;
+use crate::config::ConfigError;
 use std::{fmt, path::PathBuf, str::FromStr};
 
 /// Configuration credentials stay redacted even when the whole schema is logged.

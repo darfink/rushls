@@ -13,7 +13,7 @@ use serde::Serialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::{Occurrence, Subject};
+use crate::hooks::{Occurrence, Subject};
 
 /// Structured-mode CloudEvents, as the specification names it.
 pub const CONTENT_TYPE: &str = "application/cloudevents+json";
