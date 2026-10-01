@@ -4,8 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
 description = "Configuration loading for Rushls"
+include = ["/src/**/*.rs", "/README.md", "/LICENSE"]
 
 [dependencies]
 conf.workspace = true

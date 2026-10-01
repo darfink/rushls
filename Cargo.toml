@@ -4,9 +4,15 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "A low-latency HLS origin with RTMP, SRT, and Media over QUIC ingest"
 readme = "README.md"
+keywords = ["hls", "streaming", "rtmp", "srt", "moq"]
+categories = ["multimedia::video", "network-programming", "command-line-utilities"]
+# Ship only what builds and documents the binary; tests, tooling, and CI stay in
+# the repository. `rushls.example.toml` is embedded by `--print-config-example`.
+include = ["/src/**/*.rs", "/build.rs", "/rushls.example.toml", "/README.md", "/LICENSE"]
 
 [features]
 allocation-counting = []
@@ -126,17 +132,18 @@ default-members = ["."]
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
-publish = false
+repository = "https://github.com/darfink/rushls"
+homepage = "https://github.com/darfink/rushls"
 
 # Common dependency versions for the application and its infrastructure crates.
 [workspace.dependencies]
 # Internal
-rushls-config = { path = "crates/rushls-config" }
-rushls-outbound = { path = "crates/rushls-outbound" }
-rushls-hooks = { path = "crates/rushls-hooks" }
+rushls-config = { path = "crates/rushls-config", version = "0.1.0" }
+rushls-outbound = { path = "crates/rushls-outbound", version = "0.1.0" }
+rushls-hooks = { path = "crates/rushls-hooks", version = "0.1.0" }
 rtmpx = "3.1"
-rushls-tls = { path = "crates/rushls-tls" }
-rushls-metrics = { path = "crates/rushls-metrics" }
+rushls-tls = { path = "crates/rushls-tls", version = "0.1.0" }
+rushls-metrics = { path = "crates/rushls-metrics", version = "0.1.0" }
 
 # External
 conf = "0.4"

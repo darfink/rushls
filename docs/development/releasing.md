@@ -62,6 +62,26 @@ It publishes the draft only after successful upload. Prerelease versions become 
 Published release assets are not overwritten on a rerun; an incomplete draft can be retried.
 Tag creation is a separate operator action. Adding this workflow does not create a release.
 
+## crates.io
+
+After the GitHub Release is published, the **Publish to crates.io** job publishes the workspace.
+`cargo publish --workspace` verifies every package first, then uploads the internal crates
+(`rushls-config`, `rushls-metrics`, `rushls-outbound`, `rushls-tls`, `rushls-hooks`) before `rushls`.
+The `rushls` binary depends on them, so they must share its release.
+Bump an internal crate's version, and its `version` in `[workspace.dependencies]`, when its code changes.
+An upload is permanent; it can be yanked but not replaced.
+
+The first release has no crates to attach a trusted publisher to:
+
+1. Create a crates.io API token with the `publish-new` and `publish-update` scopes, restricted to `rushls*`, with a short expiry.
+2. Store it as the `CARGO_REGISTRY_TOKEN` secret of the `crates-io` environment.
+3. After the release, add a trusted publisher to each of the six crates on crates.io:
+   repository `darfink/rushls`, workflow `ci.yaml`, environment `crates-io`.
+4. Delete the secret and revoke the token. Later releases authenticate through OIDC.
+
+If the job fails after some uploads, rerun the remaining crates locally with
+`cargo publish --workspace --exclude <published crate> ...` from the tagged commit.
+
 Container tags follow this policy:
 
 - `edge`: latest passing main-branch build.

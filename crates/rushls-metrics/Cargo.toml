@@ -4,8 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 description = "Prometheus endpoint primitives for Rushls"
+include = ["/src/**/*.rs", "/LICENSE"]
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
 
 [dependencies]
 subtle = "2"

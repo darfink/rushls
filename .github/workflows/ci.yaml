@@ -338,3 +338,35 @@ jobs:
           fi
           gh release upload "$RELEASE_TAG" ./*.tar.gz ./*.zip checksums.sha256 --clobber
           gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE" --latest="$([ "$PRERELEASE" = false ] && echo true || echo false)"
+
+  crates:
+    name: Publish to crates.io
+    # Last, because an upload is permanent (it can only be yanked): every
+    # validation gate, the container, and the GitHub Release must succeed first.
+    needs: [release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: crates-io
+    permissions:
+      contents: read
+      # Exchanged for a short-lived crates.io token through trusted publishing.
+      id-token: write
+    env:
+      # Trusted publishing can only be configured for crates that already exist.
+      # The first release authenticates with this scoped token instead; delete
+      # the secret once each crate has a trusted publisher.
+      BOOTSTRAP_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+        if: env.BOOTSTRAP_TOKEN == ''
+      # Workspace publishing verifies every package before uploading any, and
+      # uploads the internal crates before the `rushls` crate that depends on them.
+      - name: Publish workspace crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || env.BOOTSTRAP_TOKEN }}
+        run: cargo publish --workspace --locked

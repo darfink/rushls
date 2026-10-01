@@ -4,8 +4,9 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish.workspace = true
+repository.workspace = true
 description = "Best-effort, per-subject-ordered delivery of lifecycle events to operator-configured endpoints"
+include = ["/src/**/*.rs", "/LICENSE"]
 
 [dependencies]
 ring = "0.17"
