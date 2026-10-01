@@ -34,9 +34,8 @@ Complete these checks before a broad production rollout:
   See [release procedures](docs/development/releasing.md).
 - [x] Add MIT licensing and scan tracked files and reachable Git history for credentials.
   See the [review scope and findings](docs/development/reviews/credentials-2026-09-23.md).
-- [ ] Verify the final Windows storage cleanup fix and extracted ZIP smoke test on CI.
-  The previous native run passed 1,009 Rushls tests; one cleanup race required a fix.
-  GitHub blocked the verification run because of account billing or spending limits.
+- [x] Verify the final Windows storage cleanup fix and extracted ZIP smoke test on CI.
+  Passed in the October 1, 2026 main-branch run, with all five archive smoke tests.
 - [ ] Publish the first version tag after the five-target archive matrix passes.
 - [ ] Submit the hls.js pending-part correction upstream and track its release.
   The official player's clean control also fails; this is not limited to faulty publishers.
