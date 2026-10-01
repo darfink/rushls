@@ -103,7 +103,7 @@ http://127.0.0.1:8080/live/demo/index.m3u8
 ```
 
 The playlist appears once Rushls has seen enough media to plan segments, usually a few seconds.
-Safari and recent Chrome play the URL directly. Other browsers, such as Firefox, need a JavaScript player:
+Safari plays the URL directly, and so does recent Chrome, without low latency. Other browsers, such as Firefox, need a JavaScript player:
 open [`examples/player/index.html`](examples/player/index.html), a single page that loads [hls.js](https://github.com/video-dev/hls.js) from a CDN.
 If the file has irregular keyframes, use the [encoding recipe](docs/publishing.md#prepare-a-test-file).
 

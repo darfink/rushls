@@ -29,6 +29,18 @@ This happens with valid media, not only with gaps in the input.
 The Chrome check uses a [local correction](../tools/patches/hls.js/README.md) of hls.js, which has not been submitted upstream yet.
 Release archives do not include a player, so a site that plays Rushls with hls.js uses its own copy.
 
+## Chrome without hls.js
+
+Chrome 154 plays an HLS URL in a plain `<video>` element, but not as Low-Latency HLS.
+It downloads whole segments, reloads playlists without blocking, and never requests parts,
+so it plays about three segments behind the live edge (18 seconds with the default 6-second segments).
+
+It also fails a live playlist that has fewer than three segments, with `DEMUXER_ERROR_COULD_NOT_PARSE`.
+A viewer who opens a stream in its first three segments sees that error; reloading after that works.
+The same happens with static files and no Rushls involved, so this is Chrome's behaviour, not a problem with the media.
+
+For low latency, and for playback from the start of a stream, use hls.js in Chrome and other browsers.
+
 ## Gaps in the input
 
 With `publish.strict = false`, holes in the input are served as `EXT-X-GAP` (see [Input handling](input-handling.md)).
