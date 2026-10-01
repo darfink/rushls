@@ -210,10 +210,6 @@ pub enum RuntimeError {
     Tls(#[from] TlsError),
     #[error(transparent)]
     Disk(#[from] DiskError),
-    #[error("RTMP listener failed: {0}")]
-    Rtmp(std::io::Error),
-    #[error("RTMPS listener failed: {0}")]
-    Rtmps(std::io::Error),
     #[error("SRT listener stopped unexpectedly")]
     SrtStopped,
     #[error("MOQ listener stopped unexpectedly")]
@@ -867,14 +863,18 @@ async fn bind_http(address: SocketAddr) -> Result<TcpListener, RuntimeError> {
 
 /// What one `accept` produced.
 ///
-/// Three outcomes rather than a `Result`, because "this peer went away" and
-/// "this listener is finished" are not the same event and only one of them
-/// stops the node.
+/// Four outcomes rather than a `Result`, because "this peer went away", "the
+/// listener could not accept just now", and "this listener is finished" are
+/// different events and only the last one stops the node.
 enum Accepted<C> {
     Connection(C),
     /// The peer never got as far as being a publisher. Reported and forgotten;
     /// how often it happens is up to whoever is connecting.
     Refused(String),
+    /// The socket's `accept` failed, but the listener is still usable. Covers
+    /// descriptor exhaustion (`EMFILE`, `ENFILE`) and a peer that reset while
+    /// still queued; neither is a reason to stop ingest for every publisher.
+    Failed(String),
     /// The listener itself can no longer accept, which fails the process.
     Stopped(RuntimeError),
 }
@@ -1001,7 +1001,7 @@ impl IngestListener for RtmpListener {
             Ok((stream, peer)) => {
                 Accepted::Connection((stream, peer, self.config, self.proxy_protocol))
             }
-            Err(error) => Accepted::Stopped(RuntimeError::Rtmp(error)),
+            Err(error) => Accepted::Failed(error.to_string()),
         }
     }
 
@@ -1096,7 +1096,7 @@ impl IngestListener for RtmpsListener {
                 self.proxy_protocol,
                 self.acceptor.clone(),
             )),
-            Err(error) => Accepted::Stopped(RuntimeError::Rtmps(error)),
+            Err(error) => Accepted::Failed(error.to_string()),
         }
     }
 
@@ -1183,6 +1183,10 @@ async fn run_connection<L: IngestListener>(
 }
 
 /// Accepts publishers until `stop`, then lets what is in flight finish.
+/// How long an ingest listener waits after a failed `accept` before retrying.
+/// Matches the TLS listener in `rushls-tls`.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
+
 async fn run_ingest<L: IngestListener>(
     mut listener: L,
     services: Services,
@@ -1233,6 +1237,16 @@ async fn run_ingest<L: IngestListener>(
                             protocol: L::PROTOCOL,
                             reason,
                         });
+                        continue;
+                    }
+                    Accepted::Failed(reason) => {
+                        services.events.emit(NodeEvent::ListenerAcceptFailed {
+                            protocol: L::PROTOCOL,
+                            reason,
+                        });
+                        // Retrying at once would spin a core while descriptors
+                        // stay exhausted; the pause gives sessions time to end.
+                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
                         continue;
                     }
                     Accepted::Stopped(error) => return Err(error),
@@ -1386,6 +1400,109 @@ mod tests {
     };
 
     use super::*;
+
+    /// Keeps every node event, for tests that assert on what was reported.
+    #[derive(Default)]
+    struct Recorder(parking_lot::Mutex<Vec<NodeEvent>>);
+
+    impl EventObserver for Recorder {
+        fn observe(&self, _session: crate::domain::SessionId, _event: SessionEvent) {}
+
+        fn observe_node(&self, event: NodeEvent) {
+            self.0.lock().push(event);
+        }
+    }
+
+    impl Recorder {
+        /// Waits for an event, since connections are handled on their own tasks.
+        async fn find<T>(&self, pick: impl Fn(&NodeEvent) -> Option<T>) -> Option<T> {
+            for _ in 0..200 {
+                if let Some(found) = self.0.lock().iter().find_map(&pick) {
+                    return Some(found);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            None
+        }
+    }
+
+    /// A failed `accept` is reported and retried; only a stopped listener ends
+    /// ingest. Descriptor exhaustion used to take the whole node down.
+    #[tokio::test]
+    async fn a_failed_accept_is_reported_and_retried() -> Result<(), RuntimeError> {
+        /// Replays scripted outcomes, then reports the listener as stopped.
+        struct Scripted(std::collections::VecDeque<Accepted<()>>);
+
+        impl IngestListener for Scripted {
+            type Connection = ();
+            type Identified = ();
+
+            const PROTOCOL: Protocol = Protocol::Rtmp;
+
+            fn accept(&mut self) -> impl Future<Output = Accepted<()>> + Send {
+                std::future::ready(
+                    self.0
+                        .pop_front()
+                        .unwrap_or(Accepted::Stopped(RuntimeError::SrtStopped)),
+                )
+            }
+
+            fn identify(
+                (): (),
+            ) -> impl Future<Output = Result<(SocketAddr, ()), TransportError>> + Send {
+                // The script never yields a connection, so nothing reaches here.
+                std::future::pending()
+            }
+
+            fn handshake(
+                (): (),
+                _client: SocketAddr,
+            ) -> impl Future<Output = Result<Box<dyn PendingPublish>, TransportError>> + Send
+            {
+                // The script never yields a connection, so nothing reaches here.
+                std::future::pending()
+            }
+        }
+
+        let recorder = Arc::new(Recorder::default());
+        let node = node_with_events(
+            NodeConfig::default(),
+            Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>),
+        )?;
+        let (_stop, stop_rx) = watch::channel(false);
+        let script = [
+            Accepted::Failed("Too many open files".into()),
+            Accepted::Failed("Too many open files".into()),
+        ];
+        let outcome = run_ingest(
+            Scripted(script.into()),
+            node.services().clone(),
+            Arc::new(SessionConfig::default()),
+            PendingPublishers::new(1),
+            None,
+            stop_rx,
+        )
+        .await;
+
+        // Reaching the end of the script proves both failures were survived.
+        assert!(matches!(outcome, Err(RuntimeError::SrtStopped)));
+        let failures = recorder
+            .0
+            .lock()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    NodeEvent::ListenerAcceptFailed {
+                        protocol: Protocol::Rtmp,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(failures, 2);
+        Ok(())
+    }
 
     mod rtmps {
         use std::io::IoSlice;
@@ -1656,17 +1773,6 @@ mod tests {
 
     #[tokio::test]
     async fn an_immediate_shutdown_stops_every_runtime_task() -> Result<(), RuntimeError> {
-        #[derive(Default)]
-        struct Recorder(parking_lot::Mutex<Vec<NodeEvent>>);
-
-        impl EventObserver for Recorder {
-            fn observe(&self, _session: crate::domain::SessionId, _event: SessionEvent) {}
-
-            fn observe_node(&self, event: NodeEvent) {
-                self.0.lock().push(event);
-            }
-        }
-
         let directory = crate::server::http::fixtures::scratch("moq-runtime");
         let (tls, _) = crate::server::http::fixtures::write_pair(&directory, "origin.test");
         let recorder = Arc::new(Recorder::default());
@@ -1704,30 +1810,6 @@ mod tests {
     #[tokio::test]
     async fn proxied_clients_are_counted_per_address() -> Result<(), Box<dyn std::error::Error>> {
         use tokio::io::AsyncWriteExt;
-
-        #[derive(Default)]
-        struct Recorder(parking_lot::Mutex<Vec<NodeEvent>>);
-
-        impl EventObserver for Recorder {
-            fn observe(&self, _session: crate::domain::SessionId, _event: SessionEvent) {}
-
-            fn observe_node(&self, event: NodeEvent) {
-                self.0.lock().push(event);
-            }
-        }
-
-        impl Recorder {
-            /// Waits for an event, since connections are handled on their own tasks.
-            async fn find<T>(&self, pick: impl Fn(&NodeEvent) -> Option<T>) -> Option<T> {
-                for _ in 0..200 {
-                    if let Some(found) = self.0.lock().iter().find_map(&pick) {
-                        return Some(found);
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                None
-            }
-        }
 
         let recorder = Arc::new(Recorder::default());
         let config = NodeConfig {
