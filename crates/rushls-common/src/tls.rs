@@ -163,6 +163,11 @@ pub enum TlsError {
         path: PathBuf,
         source: notify::Error,
     },
+    /// Rotation runs as a Tokio task, so loading certificates needs a runtime.
+    /// An error rather than a panic: configuration is often resolved before
+    /// one exists, and that is a caller mistake worth a clear message.
+    #[error("certificate rotation needs a Tokio runtime; load {path} from inside one")]
+    NoRuntime { path: PathBuf },
 }
 
 impl From<TlsError> for io::Error {
@@ -436,6 +441,10 @@ impl CertificateWatch {
         provider: Arc<CryptoProvider>,
         observer: Arc<O>,
     ) -> Result<Self, TlsError> {
+        // Checked before watching anything, so a refusal leaves nothing behind.
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| TlsError::NoRuntime {
+            path: settings.certificate.clone(),
+        })?;
         let (sender, receiver) = mpsc::unbounded_channel();
         let mut debouncer = new_debouncer(DEBOUNCE, None, move |result: DebounceEventResult| {
             // The receiver going away means the listener is gone; there is
@@ -461,7 +470,7 @@ impl CertificateWatch {
                 })?;
         }
 
-        let pump = tokio::spawn(reload_on_change(
+        let pump = runtime.spawn(reload_on_change(
             settings, resolver, provider, observer, receiver,
         ));
         Ok(Self {
@@ -889,6 +898,22 @@ mod tests {
                 Arc::new(IgnoreTlsEvents),
             ),
             Err(TlsError::Unreadable { .. })
+        ));
+    }
+
+    #[test]
+    fn a_client_identity_outside_a_runtime_is_an_error_not_a_panic() {
+        // Configuration is often resolved before a runtime starts; spawning
+        // the rotation task there used to panic with "no reactor running".
+        let directory = scratch("client-identity-no-runtime");
+        let (settings, _) = write_pair(&directory, "client.internal");
+        assert!(matches!(
+            ClientIdentity::new(
+                settings.certificate,
+                settings.key,
+                Arc::new(IgnoreTlsEvents),
+            ),
+            Err(TlsError::NoRuntime { .. })
         ));
     }
 
