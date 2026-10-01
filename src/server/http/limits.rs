@@ -237,7 +237,9 @@ impl Drop for ConnectionObservation {
     }
 }
 
-pub async fn serve<L: axum::serve::Listener>(
+/// Serves until `shutdown`, then drains. Returns an error only when the
+/// listener can no longer accept, after draining the connections it has.
+pub async fn serve<L: super::HttpListener>(
     mut listener: L,
     router: Router,
     budget: HttpBudget,
@@ -246,12 +248,20 @@ pub async fn serve<L: axum::serve::Listener>(
     let mut connections = JoinSet::new();
     let (stop, stopped) = watch::channel(false);
     tokio::pin!(shutdown);
+    let mut failure = None;
     loop {
         tokio::select! {
             biased;
             () = &mut shutdown => break,
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
-            (io, _) = listener.accept() => {
+            accepted = listener.accept() => {
+                let io = match accepted {
+                    Ok((io, _)) => io,
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                };
                 // Never queue admitted sockets behind a semaphore: that would
                 // turn the waiting sockets themselves into unbounded state.
                 let Ok(permit) = Arc::clone(&budget.connections).try_acquire_owned() else {
@@ -308,7 +318,7 @@ pub async fn serve<L: axum::serve::Listener>(
     while connections.join_next().await.is_some() {}
     // Runtime bounds this drain. Dropping this future also drops the JoinSet,
     // aborting sockets still blocked on an unresponsive client.
-    Ok(())
+    failure.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]

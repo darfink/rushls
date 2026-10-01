@@ -56,10 +56,11 @@ impl rushls_common::tls::TlsObserver for NodeTlsObserver {
         });
     }
 
-    fn accept_failed(&self, reason: &str) {
+    fn accept_failed(&self, reason: &str, failures: u64) {
         self.events.emit(NodeEvent::ListenerAcceptFailed {
             protocol: self.protocol,
             reason: reason.to_owned(),
+            failures,
         });
     }
 

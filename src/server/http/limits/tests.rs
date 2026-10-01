@@ -131,12 +131,22 @@ async fn connection_budget_is_shared_between_listeners_and_recovers() -> Result<
     let router = Router::new().route("/", get(|| async { StatusCode::NO_CONTENT }));
     let (stop_a, stopped_a) = oneshot::channel();
     let (stop_b, stopped_b) = oneshot::channel();
-    let a = tokio::spawn(serve(first, router.clone(), budget.clone(), async {
-        let _ = stopped_a.await;
-    }));
-    let b = tokio::spawn(serve(second, router, budget.clone(), async {
-        let _ = stopped_b.await;
-    }));
+    let a = tokio::spawn(serve(
+        crate::server::http::TcpHttpListener::from(first),
+        router.clone(),
+        budget.clone(),
+        async {
+            let _ = stopped_a.await;
+        },
+    ));
+    let b = tokio::spawn(serve(
+        crate::server::http::TcpHttpListener::from(second),
+        router,
+        budget.clone(),
+        async {
+            let _ = stopped_b.await;
+        },
+    ));
     let mut held = TcpStream::connect(first_address).await?;
     assert!(fetch_headers(&mut held).await?.starts_with("HTTP/1.1 204"));
     let mut rejected = TcpStream::connect(second_address).await?;
@@ -168,7 +178,7 @@ async fn partial_protocol_preface_has_a_deadline() -> Result<(), Box<dyn Error>>
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(serve(
-        listener,
+        crate::server::http::TcpHttpListener::from(listener),
         Router::new(),
         budget.clone(),
         std::future::pending(),
@@ -214,7 +224,7 @@ async fn http2_multiplexing_obeys_the_request_budget() -> Result<(), Box<dyn Err
         &budget,
     );
     let server = tokio::spawn(serve(
-        listener,
+        crate::server::http::TcpHttpListener::from(listener),
         router,
         budget.clone(),
         std::future::pending(),

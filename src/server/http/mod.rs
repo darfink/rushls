@@ -22,6 +22,7 @@
 mod body;
 mod cors;
 mod limits;
+mod listener;
 pub mod playback;
 mod tls;
 
@@ -67,6 +68,7 @@ pub use playback::{PlaybackGate, PlaybackSettings, PlaybackStartError};
 
 use body::{RangeOutcome, StoredMediaBody, parse_range};
 
+pub use listener::{HttpListener, TcpHttpListener};
 pub use tls::{TlsError, TlsListener, TlsSettings};
 pub(crate) use tls::{rotating_ingest_server_config, rotating_quic_server_config};
 
@@ -256,8 +258,7 @@ pub async fn serve<L, P>(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()>
 where
-    L: axum::serve::Listener,
-    L::Addr: std::fmt::Debug,
+    L: HttpListener,
     P: Application,
 {
     let budget = HttpBudget::new(config.limits);
@@ -287,8 +288,7 @@ pub async fn serve_with_budget<L, P>(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()>
 where
-    L: axum::serve::Listener,
-    L::Addr: std::fmt::Debug,
+    L: HttpListener,
     P: Application,
 {
     let router = router(

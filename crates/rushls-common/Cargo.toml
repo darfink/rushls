@@ -23,7 +23,7 @@ outbound = ["tls", "dep:bytes", "dep:derive_more", "dep:http", "dep:http-body-ut
 # PROXY protocol v1 and v2 headers.
 proxy-protocol = ["dep:thiserror", "dep:tokio", "tokio/io-util"]
 # TLS termination with certificates that rotate under a running listener.
-tls = ["dep:arc-swap", "dep:notify", "dep:notify-debouncer-full", "dep:rustls", "dep:thiserror", "dep:tokio", "dep:tokio-rustls", "tokio/net", "tokio/rt", "tokio/time", "tokio/sync"]
+tls = ["accept", "dep:arc-swap", "dep:notify", "dep:notify-debouncer-full", "dep:rustls", "dep:thiserror", "dep:tokio", "dep:tokio-rustls", "tokio/net", "tokio/rt", "tokio/time", "tokio/sync"]
 # Implements `axum::serve::Listener` for the TLS listener.
 axum = ["tls", "dep:axum"]
 

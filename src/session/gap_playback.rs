@@ -209,7 +209,7 @@ async fn live_av_gap_browser_origin() -> Result<(), Box<dyn std::error::Error + 
     )?;
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(serve(
-        listener,
+        crate::server::http::TcpHttpListener::from(listener),
         node.application(),
         HttpConfig::default(),
         None,

@@ -26,6 +26,8 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+
+use crate::accept::{AcceptErrors, Next};
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use rustls::{
@@ -64,8 +66,18 @@ pub trait TlsObserver: Send + Sync + 'static {
     /// Reported separately because it is otherwise invisible: nothing breaks
     /// until the certificate expires, which may be months away.
     fn certificate_watch_lost(&self, _reason: &str) {}
-    /// The listener could not accept a connection.
-    fn accept_failed(&self, _reason: &str) {}
+    /// The listener could not accept connections and is retrying.
+    ///
+    /// `failures` counts attempts since the previous report, this one
+    /// included: a persistent failure is summarised every
+    /// [`REPORT_INTERVAL`](crate::accept::REPORT_INTERVAL) rather than reported
+    /// once per attempt.
+    fn accept_failed(&self, _reason: &str, _failures: u64) {}
+    /// The listening socket is unusable and the listener has stopped accepting.
+    ///
+    /// [`TlsListener::accept_tls`] also returns the error; this exists for the
+    /// `axum` listener, which has no way to.
+    fn listener_failed(&self, _reason: &str) {}
     fn handshake_completed(&self) {}
     fn handshake_failed(&self) {}
 }
@@ -317,6 +329,7 @@ pub struct TlsListener<O: TlsObserver> {
     handshakes: JoinSet<Option<(TlsStream<TcpStream>, SocketAddr)>>,
     settings: TlsSettings,
     observer: Arc<O>,
+    errors: AcceptErrors,
     _watcher: CertificateWatch,
 }
 
@@ -340,6 +353,7 @@ impl<O: TlsObserver> TlsListener<O> {
             handshakes: JoinSet::new(),
             settings,
             observer,
+            errors: AcceptErrors::default(),
             _watcher: watcher,
         })
     }
@@ -354,7 +368,12 @@ impl<O: TlsObserver> TlsListener<O> {
     /// Handshakes run as spawned tasks under a deadline and a fixed ceiling
     /// rather than inline, so one slow client cannot hold up every other
     /// connection waiting to be accepted.
-    pub async fn accept_tls(&mut self) -> (TlsStream<TcpStream>, SocketAddr) {
+    ///
+    /// Temporary accept failures are retried with a backoff and reported
+    /// through the observer. An error is returned only when the listening
+    /// socket itself is unusable, so the caller can stop instead of retrying
+    /// forever.
+    pub async fn accept_tls(&mut self) -> io::Result<(TlsStream<TcpStream>, SocketAddr)> {
         loop {
             tokio::select! {
                 // Accepting stops at capacity rather than queueing: refusing to
@@ -364,14 +383,25 @@ impl<O: TlsObserver> TlsListener<O> {
                     if self.handshakes.len() < self.settings.maximum_pending_handshakes =>
                 {
                     let (stream, peer) = match accepted {
-                        Ok(accepted) => accepted,
-                        // An accept error is never fatal to the listener, and
-                        // spinning on it would burn a core.
-                        Err(error) => {
-                            self.observer.accept_failed(&error.to_string());
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            continue;
+                        Ok(accepted) => {
+                            self.errors.succeeded();
+                            accepted
                         }
+                        Err(error) => match self.errors.failed(&error) {
+                            Next::Stop => {
+                                self.observer.listener_failed(&error.to_string());
+                                return Err(error);
+                            }
+                            // Retrying at once would spin a core while
+                            // descriptors stay exhausted.
+                            Next::Retry { pause, report } => {
+                                if let Some(failures) = report {
+                                    self.observer.accept_failed(&error.to_string(), failures);
+                                }
+                                tokio::time::sleep(pause).await;
+                                continue;
+                            }
+                        },
                     };
                     let acceptor = self.acceptor.clone();
                     let deadline = self.settings.handshake_timeout;
@@ -391,7 +421,7 @@ impl<O: TlsObserver> TlsListener<O> {
 
                 Some(joined) = self.handshakes.join_next(), if !self.handshakes.is_empty() => {
                     if let Ok(Some(ready)) = joined {
-                        return ready;
+                        return Ok(ready);
                     }
                 }
             }
@@ -409,8 +439,14 @@ impl<O: TlsObserver> axum::serve::Listener for TlsListener<O> {
     type Io = TlsStream<TcpStream>;
     type Addr = SocketAddr;
 
+    /// `axum` cannot be told a listener has failed, so a fatal error parks
+    /// this listener after [`TlsObserver::listener_failed`]. A caller that must
+    /// stop on it should accept with [`TlsListener::accept_tls`] instead.
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        self.accept_tls().await
+        match self.accept_tls().await {
+            Ok(accepted) => accepted,
+            Err(_) => std::future::pending().await,
+        }
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {

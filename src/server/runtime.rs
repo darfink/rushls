@@ -1,6 +1,9 @@
 use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
-use rushls_common::proxy_protocol::{self, HeaderError};
+use rushls_common::{
+    accept::{AcceptErrors, Next},
+    proxy_protocol::{self, HeaderError},
+};
 
 use thiserror::Error;
 use tokio::{
@@ -211,6 +214,10 @@ pub enum RuntimeError {
     Tls(#[from] TlsError),
     #[error(transparent)]
     Disk(#[from] DiskError),
+    #[error("RTMP listener can no longer accept: {0}")]
+    Rtmp(std::io::Error),
+    #[error("RTMPS listener can no longer accept: {0}")]
+    Rtmps(std::io::Error),
     #[error("SRT listener stopped unexpectedly")]
     SrtStopped,
     #[error("MOQ listener stopped unexpectedly")]
@@ -578,6 +585,7 @@ impl Node {
                 ..self.config.rtmp
             },
             proxy_protocol: self.config.rtmps_proxy_protocol,
+            errors: AcceptErrors::default(),
             _watch: watch,
         }))
     }
@@ -695,7 +703,7 @@ impl Node {
         if let Some(listener) = http_listener {
             report_bound(events, Protocol::Http, listener.local_addr());
             tasks.spawn(run_http(
-                listener,
+                http::TcpHttpListener::new(listener, events.clone(), Protocol::Http),
                 Arc::clone(&self.application),
                 self.config.http.clone(),
                 http_budget.clone(),
@@ -747,7 +755,7 @@ impl Node {
         if let Some(listener) = metrics_listener {
             report_bound(events, Protocol::Http, listener.local_addr());
             tasks.spawn(run_http(
-                listener,
+                http::TcpHttpListener::new(listener, events.clone(), Protocol::Http),
                 Arc::clone(&self.application),
                 self.config.http.clone(),
                 http_budget.clone(),
@@ -789,6 +797,7 @@ impl Node {
                 tcp: ingest.rtmp,
                 config: self.config.rtmp,
                 proxy_protocol: self.config.rtmp_proxy_protocol,
+                errors: AcceptErrors::default(),
             },
             self.services.clone(),
             Arc::clone(&session_config),
@@ -875,9 +884,38 @@ enum Accepted<C> {
     /// The socket's `accept` failed, but the listener is still usable. Covers
     /// descriptor exhaustion (`EMFILE`, `ENFILE`) and a peer that reset while
     /// still queued; neither is a reason to stop ingest for every publisher.
-    Failed(String),
+    /// Accept again after `pause`, reporting `report` first when present.
+    Retry {
+        pause: Duration,
+        report: Option<AcceptFailure>,
+    },
     /// The listener itself can no longer accept, which fails the process.
     Stopped(RuntimeError),
+}
+
+/// A summarised run of accept failures, see [`AcceptErrors`].
+struct AcceptFailure {
+    reason: String,
+    failures: u64,
+}
+
+/// What a failed TCP `accept` means for an ingest listener: retry with a
+/// backoff, or stop the node when the socket itself is unusable.
+fn tcp_accept_failed<C>(
+    errors: &mut AcceptErrors,
+    error: std::io::Error,
+    stopped: impl FnOnce(std::io::Error) -> RuntimeError,
+) -> Accepted<C> {
+    match errors.failed(&error) {
+        Next::Stop => Accepted::Stopped(stopped(error)),
+        Next::Retry { pause, report } => Accepted::Retry {
+            pause,
+            report: report.map(|failures| AcceptFailure {
+                reason: error.to_string(),
+                failures,
+            }),
+        },
+    }
 }
 
 /// One ingest transport, reduced to what the accept loop needs to know.
@@ -989,6 +1027,7 @@ struct RtmpListener {
     tcp: TcpListener,
     config: RtmpConfig,
     proxy_protocol: bool,
+    errors: AcceptErrors,
 }
 
 impl IngestListener for RtmpListener {
@@ -1000,9 +1039,10 @@ impl IngestListener for RtmpListener {
     async fn accept(&mut self) -> Accepted<Self::Connection> {
         match self.tcp.accept().await {
             Ok((stream, peer)) => {
+                self.errors.succeeded();
                 Accepted::Connection((stream, peer, self.config, self.proxy_protocol))
             }
-            Err(error) => Accepted::Failed(error.to_string()),
+            Err(error) => tcp_accept_failed(&mut self.errors, error, RuntimeError::Rtmp),
         }
     }
 
@@ -1092,6 +1132,7 @@ struct RtmpsListener {
     acceptor: tokio_rustls::TlsAcceptor,
     config: RtmpConfig,
     proxy_protocol: bool,
+    errors: AcceptErrors,
     /// Dropping it would silently stop certificate reloads.
     _watch: rushls_common::tls::CertificateWatch,
 }
@@ -1110,14 +1151,17 @@ impl IngestListener for RtmpsListener {
 
     async fn accept(&mut self) -> Accepted<Self::Connection> {
         match self.tcp.accept().await {
-            Ok((stream, peer)) => Accepted::Connection((
-                stream,
-                peer,
-                self.config,
-                self.proxy_protocol,
-                self.acceptor.clone(),
-            )),
-            Err(error) => Accepted::Failed(error.to_string()),
+            Ok((stream, peer)) => {
+                self.errors.succeeded();
+                Accepted::Connection((
+                    stream,
+                    peer,
+                    self.config,
+                    self.proxy_protocol,
+                    self.acceptor.clone(),
+                ))
+            }
+            Err(error) => tcp_accept_failed(&mut self.errors, error, RuntimeError::Rtmps),
         }
     }
 
@@ -1204,10 +1248,6 @@ async fn run_connection<L: IngestListener>(
 }
 
 /// Accepts publishers until `stop`, then lets what is in flight finish.
-/// How long an ingest listener waits after a failed `accept` before retrying.
-/// Matches the TLS listener in `rushls_common::tls`.
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
-
 async fn run_ingest<L: IngestListener>(
     mut listener: L,
     services: Services,
@@ -1260,14 +1300,17 @@ async fn run_ingest<L: IngestListener>(
                         });
                         continue;
                     }
-                    Accepted::Failed(reason) => {
-                        services.events.emit(NodeEvent::ListenerAcceptFailed {
-                            protocol: L::PROTOCOL,
-                            reason,
-                        });
+                    Accepted::Retry { pause, report } => {
+                        if let Some(AcceptFailure { reason, failures }) = report {
+                            services.events.emit(NodeEvent::ListenerAcceptFailed {
+                                protocol: L::PROTOCOL,
+                                reason,
+                                failures,
+                            });
+                        }
                         // Retrying at once would spin a core while descriptors
                         // stay exhausted; the pause gives sessions time to end.
-                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                        tokio::time::sleep(pause).await;
                         continue;
                     }
                     Accepted::Stopped(error) => return Err(error),
@@ -1317,8 +1360,7 @@ async fn run_http<L>(
     shutdown: Duration,
 ) -> Result<(), RuntimeError>
 where
-    L: axum::serve::Listener,
-    L::Addr: std::fmt::Debug,
+    L: http::HttpListener,
 {
     let served = http::serve_with_budget(
         listener,
@@ -1492,8 +1534,25 @@ mod tests {
         )?;
         let (_stop, stop_rx) = watch::channel(false);
         let script = [
-            Accepted::Failed("Too many open files".into()),
-            Accepted::Failed("Too many open files".into()),
+            Accepted::Retry {
+                pause: Duration::from_millis(1),
+                report: Some(AcceptFailure {
+                    reason: "Too many open files".into(),
+                    failures: 1,
+                }),
+            },
+            // Inside the report interval: retried without another event.
+            Accepted::Retry {
+                pause: Duration::from_millis(1),
+                report: None,
+            },
+            Accepted::Retry {
+                pause: Duration::from_millis(1),
+                report: Some(AcceptFailure {
+                    reason: "Too many open files".into(),
+                    failures: 2,
+                }),
+            },
         ];
         let outcome = run_ingest(
             Scripted(script.into()),
@@ -1521,7 +1580,7 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(failures, 2);
+        assert_eq!(failures, 2, "one event per report, not per attempt");
         Ok(())
     }
 
@@ -1567,6 +1626,7 @@ mod tests {
                         ..RtmpConfig::default()
                     },
                     proxy_protocol: false,
+                    errors: AcceptErrors::default(),
                     _watch: watch,
                 },
                 certificate,

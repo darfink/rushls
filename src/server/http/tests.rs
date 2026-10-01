@@ -284,7 +284,7 @@ impl Harness {
             MetricsMode::Disabled => None,
         };
         let served = tokio::spawn(serve(
-            listener,
+            crate::server::http::TcpHttpListener::from(listener),
             origin,
             config,
             metrics,
@@ -2102,7 +2102,7 @@ mod end_to_end {
         let address = listener.local_addr().expect("listener has an address");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(serve(
-            listener,
+            crate::server::http::TcpHttpListener::from(listener),
             node.application(),
             HttpConfig::default(),
             None,
@@ -2214,7 +2214,7 @@ mod end_to_end {
         let address = http.local_addr().expect("listener has an address");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(serve(
-            http,
+            crate::server::http::TcpHttpListener::from(http),
             node.application(),
             HttpConfig::default(),
             None,
@@ -2399,7 +2399,7 @@ mod end_to_end {
         let address = http.local_addr().expect("listener has an address");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(serve(
-            http,
+            crate::server::http::TcpHttpListener::from(http),
             node.application(),
             HttpConfig::default(),
             None,
@@ -2454,7 +2454,7 @@ mod end_to_end {
         let address = listener.local_addr().expect("listener has an address");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(serve(
-            listener,
+            crate::server::http::TcpHttpListener::from(listener),
             node.application(),
             HttpConfig::default(),
             None,
@@ -2529,7 +2529,7 @@ mod end_to_end {
         let address = listener.local_addr().expect("listener has an address");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(serve(
-            listener,
+            crate::server::http::TcpHttpListener::from(listener),
             node.application(),
             HttpConfig::default(),
             None,
@@ -2638,7 +2638,7 @@ mod end_to_end {
         let address = listener.local_addr().expect("listener has an address");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(serve(
-            listener,
+            crate::server::http::TcpHttpListener::from(listener),
             node.application(),
             HttpConfig::default(),
             None,

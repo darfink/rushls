@@ -311,8 +311,12 @@ impl EventObserver for TracingEvents {
                     "listener bound but has no local address"
                 );
             }
-            NodeEvent::ListenerAcceptFailed { protocol, reason } => {
-                error!(protocol = %protocol, reason = %reason, "listener could not accept");
+            NodeEvent::ListenerAcceptFailed {
+                protocol,
+                reason,
+                failures,
+            } => {
+                error!(%protocol, %reason, failures, "listener could not accept; retrying");
             }
         }
     }

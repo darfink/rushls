@@ -185,7 +185,7 @@ impl Origin {
                 ))
             }
             None => tokio::spawn(serve(
-                listener,
+                rushls::server::http::TcpHttpListener::from(listener),
                 application,
                 HttpConfig::default(),
                 None,

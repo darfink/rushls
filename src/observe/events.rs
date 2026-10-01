@@ -285,11 +285,17 @@ pub enum NodeEvent {
     /// Only interesting because it makes an ephemeral port unknowable, which
     /// is the one case where nothing else can report the address.
     ListenerAddressUnavailable { protocol: Protocol, reason: String },
-    /// A listener could not accept, and will retry shortly.
+    /// A listener could not accept, and is retrying with a backoff.
     ///
     /// Local rather than remote: the peer is gone by definition, so this is
-    /// descriptor exhaustion or something like it.
-    ListenerAcceptFailed { protocol: Protocol, reason: String },
+    /// descriptor exhaustion or something like it. A persistent failure is
+    /// summarised every few seconds; `failures` counts the attempts since the
+    /// previous report.
+    ListenerAcceptFailed {
+        protocol: Protocol,
+        reason: String,
+        failures: u64,
+    },
 }
 
 /// Which listener an event is about.
