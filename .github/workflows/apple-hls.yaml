@@ -33,12 +33,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install GnuPG
         run: brew install gnupg
+      # Apple does not allow redistribution, so the encrypted installer lives in
+      # a private repository, read with a deploy key scoped to it alone. Kept
+      # outside `target/`, so no cache or report artifact can pick it up.
+      - name: Fetch encrypted Apple HLS tools
+        uses: actions/checkout@v7
+        with:
+          repository: darfink/rushls-ci-tools
+          ssh-key: ${{ secrets.APPLE_HLS_TOOLS_SSH_KEY }}
+          persist-credentials: false
+          path: .ci-tools
       - name: Install Apple HLS tools
         env:
-          # A public repository cannot hold the installer, so it lives in a
-          # private repository; this read-only token downloads from there.
-          GH_TOKEN: ${{ secrets.APPLE_HLS_TOOLS_TOKEN || github.token }}
-          APPLE_HLS_TOOLS_URL: ${{ vars.APPLE_HLS_TOOLS_URL }}
+          APPLE_HLS_TOOLS_URL: file://${{ github.workspace }}/.ci-tools/${{ vars.APPLE_HLS_TOOLS_FILE }}
           APPLE_HLS_TOOLS_SHA256: ${{ vars.APPLE_HLS_TOOLS_SHA256 }}
           APPLE_HLS_TOOLS_PASSPHRASE: ${{ secrets.APPLE_HLS_TOOLS_PASSPHRASE }}
         run: tools/install-apple-hls-tools.sh

@@ -35,7 +35,7 @@ Installer 1.26.143.14 requires macOS 26, despite the macOS 15 requirement in its
 
 Configure these repository variables for Apple validation:
 
-- `APPLE_HLS_TOOLS_URL`: The download URL for an installer or its GPG-encrypted copy.
+- `APPLE_HLS_TOOLS_FILE`: The installer's file name in `rushls-ci-tools`, or its GPG-encrypted copy.
 - `APPLE_HLS_TOOLS_SHA256`: The SHA-256 of the decrypted installer.
 - `APPLE_HLS_RUNNER`: Optional macOS runner label; defaults to `macos-26`.
 
@@ -45,10 +45,9 @@ The compact fixture targets standard hosted runners; the space check accounts fo
 A storage prerequisite failure does not count as a completed audit.
 
 `tools/install-apple-hls-tools.sh` downloads, verifies, and installs the package.
-Rushls stores the encrypted installer as an asset in the `ci-tools` release of a private repository,
-because Apple does not allow redistribution and this repository is public.
-`APPLE_HLS_TOOLS_URL` points at that asset. The `APPLE_HLS_TOOLS_TOKEN` Actions secret is a fine-grained
-token with read-only `contents` access to that repository only; the job downloads with it.
+Apple does not allow redistribution and this repository is public,
+so the encrypted installer is committed to the private `darfink/rushls-ci-tools` repository.
+The workflow checks it out with a read-only deploy key stored in the `APPLE_HLS_TOOLS_SSH_KEY` secret.
 The `APPLE_HLS_TOOLS_PASSPHRASE` Actions secret contains its decryption key.
 The workflow decrypts the installer in a private temporary directory and checks the original SHA-256 before installation.
 The installer and key are excluded from caches and report artifacts. Temporary installer files are removed when the script exits.
