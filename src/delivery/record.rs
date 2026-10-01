@@ -120,7 +120,7 @@ impl Shared {
     }
     fn reserve(self: &Arc<Self>, bytes: usize) -> Option<Reservation> {
         self.bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
                     .filter(|total| *total <= self.maximum)
             })

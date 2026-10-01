@@ -127,6 +127,10 @@ must_use_candidate = "allow"
 doc_markdown = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# Added to pedantic in Rust 1.99. Its suggested replacement for
+# `assert!(x.is_empty())` is `assert_eq!(x, [] as [T; 0])`, which is noisier,
+# and most of these asserts already carry a message naming what was expected.
+assert_is_empty = "allow"
 
 [workspace]
 resolver = "3"

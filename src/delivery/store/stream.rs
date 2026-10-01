@@ -1011,11 +1011,11 @@ impl LiveStream {
             ManifestClass::Media,
             self.media_revision().saturating_add(1),
         );
-        let _ =
-            self.media_revision
-                .fetch_update(Ordering::Release, Ordering::Relaxed, |revision| {
-                    Some(revision.saturating_add(1))
-                });
+        let _ = self
+            .media_revision
+            .try_update(Ordering::Release, Ordering::Relaxed, |revision| {
+                Some(revision.saturating_add(1))
+            });
     }
 
     fn emit_clip(&self, event: Option<StreamEvent>) {
