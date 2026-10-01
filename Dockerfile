@@ -26,7 +26,15 @@ RUN --mount=type=cache,id=rushls-cargo-registry,target=/usr/local/cargo/registry
     cargo build --release --locked -p rushls \
   && install -Dm755 target/release/rushls /usr/local/bin/rushls
 
-FROM debian:trixie-slim AS runtime
+# The runtime image has no package manager or coreutils to prepare
+# directories with, so the writable state directory is made here and copied.
+RUN install -d -o 65532 -g 65532 /state/var/lib/rushls
+
+# Distroless `cc` carries exactly what the binary links (glibc, libgcc) plus CA
+# roots for outbound HTTPS: the admission service, JWKS, and hooks. The `debug`
+# variant adds a BusyBox shell at /busybox for `docker exec`; `nonroot` runs as
+# UID/GID 65532.
+FROM gcr.io/distroless/cc-debian13:debug-nonroot AS runtime
 
 ARG GIT_SHA=
 LABEL org.opencontainers.image.title="Rushls" \
@@ -35,12 +43,6 @@ LABEL org.opencontainers.image.title="Rushls" \
       org.opencontainers.image.documentation="https://github.com/darfink/rushls#readme" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.revision=$GIT_SHA
-
-# CA roots verify outbound HTTPS: the admission service, JWKS, and hooks.
-RUN apt-get update \
-  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
 
 # The builder copies the artifact out of its persistent Cargo target cache.
 COPY --from=builder /usr/local/bin/rushls /usr/local/bin/rushls
@@ -53,7 +55,7 @@ ENV RUSHLS_CONFIG=/etc/rushls/rushls.toml
 # A writable home for DVR spill and recordings, owned by the runtime user. A
 # named volume mounted here inherits that ownership; a bind mount must be
 # writable by 65532. XDG_CACHE_HOME puts the default `disk.dir` here too.
-RUN install -d -o 65532 -g 65532 /var/lib/rushls
+COPY --from=builder --chown=65532:65532 /state/ /
 ENV XDG_CACHE_HOME=/var/lib/rushls/cache
 WORKDIR /var/lib/rushls
 
@@ -61,8 +63,8 @@ WORKDIR /var/lib/rushls
 # RTMPS (1936/tcp), HTTPS, and MoQ (UDP) are off until configured with a certificate.
 EXPOSE 1935/tcp 9000/udp 8080/tcp
 
-# No privileged port is required. A numeric identity also works in minimal
-# Kubernetes environments without /etc/passwd.
+# No privileged port is required. The base image already runs as 65532; the
+# numeric identity is repeated so it holds even where /etc/passwd is absent.
 USER 65532:65532
 
 # Rushls handles SIGTERM itself, draining hooks and recordings for
