@@ -276,21 +276,6 @@ const HOOK_FIELDS: &[TableKey<'static>] = &[
         description: "`whsec_` key signing each delivery.",
     },
     TableKey {
-        suffix: ".<name>.queue_size",
-        default: "1000",
-        description: "Events held before the oldest is dropped.",
-    },
-    TableKey {
-        suffix: ".<name>.max_in_flight",
-        default: "8",
-        description: "Distinct streams delivered at once.",
-    },
-    TableKey {
-        suffix: ".<name>.max_attempts",
-        default: "5",
-        description: "Attempts per event, the first included.",
-    },
-    TableKey {
         suffix: ".<name>.client_cert",
         default: "",
         description: "PEM certificate chain presented to this endpoint.",
@@ -853,6 +838,18 @@ const HOOK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest response this node will read from a hook endpoint.
 const HOOK_MAXIMUM_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Events held for one destination before the oldest is dropped. Delivery is
+/// best-effort, so this bounds memory for a destination that is down rather
+/// than promising a backlog.
+const HOOK_QUEUE_CAPACITY: usize = 1_000;
+
+/// Distinct streams delivered at once. One request per stream is the ordering
+/// rule, so this is also the concurrency.
+const HOOK_MAX_IN_FLIGHT: usize = 8;
+
+/// Attempts per event, the first included.
+const HOOK_MAX_ATTEMPTS: u32 = 5;
+
 /// Builds the configured destinations, or nothing when none are named.
 fn resolve_hooks(
     endpoints: Option<TomlTable<HookEndpointAppConfig>>,
@@ -898,16 +895,6 @@ pub struct HookEndpointAppConfig {
     /// Required rather than defaulting to everything, so a consumer written
     /// today cannot be sent an event type added after it.
     events: Vec<String>,
-    /// Events held for this endpoint before the oldest is dropped.
-    #[serde(default = "default_queue_size")]
-    queue_size: usize,
-    /// Distinct streams delivered at once. One request per stream is the
-    /// ordering rule, so this is also the concurrency.
-    #[serde(default = "default_max_in_flight")]
-    max_in_flight: usize,
-    /// Attempts per event, the first included.
-    #[serde(default = "default_max_attempts")]
-    max_attempts: u32,
     /// Bearer credential presented to this endpoint.
     #[serde(default)]
     token: Option<TextSource>,
@@ -920,18 +907,6 @@ pub struct HookEndpointAppConfig {
     client_key: Option<PathBuf>,
     /// Path to a PEM authority to trust instead of the platform store.
     ca: Option<PathBuf>,
-}
-
-fn default_queue_size() -> usize {
-    1_000
-}
-
-fn default_max_in_flight() -> usize {
-    8
-}
-
-fn default_max_attempts() -> u32 {
-    5
 }
 
 impl HookEndpointAppConfig {
@@ -983,9 +958,9 @@ impl HookEndpointAppConfig {
             name: Arc::from(name),
             endpoint: Endpoint::parse(&self.url).map_err(|error| invalid(error.to_string()))?,
             events,
-            queue_capacity: self.queue_size,
-            maximum_in_flight: self.max_in_flight,
-            maximum_attempts: self.max_attempts,
+            queue_capacity: HOOK_QUEUE_CAPACITY,
+            maximum_in_flight: HOOK_MAX_IN_FLIGHT,
+            maximum_attempts: HOOK_MAX_ATTEMPTS,
             bearer: token
                 .map(|token| BearerToken::new(&token))
                 .transpose()

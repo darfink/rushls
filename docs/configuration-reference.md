@@ -158,9 +158,6 @@ See [rushls.example.toml](../rushls.example.toml) for an annotated file.
 | `hook.<name>.events` | — | — | — | Events this destination receives; required. |
 | `hook.<name>.token` | — | — | — | Bearer credential: inline, `${VAR}`, or `{ file = "/path" }`. |
 | `hook.<name>.signing_secret` | — | — | — | `whsec_` key signing each delivery. |
-| `hook.<name>.queue_size` | `1000` | — | — | Events held before the oldest is dropped. |
-| `hook.<name>.max_in_flight` | `8` | — | — | Distinct streams delivered at once. |
-| `hook.<name>.max_attempts` | `5` | — | — | Attempts per event, the first included. |
 | `hook.<name>.client_cert` | — | — | — | PEM certificate chain presented to this endpoint. |
 | `hook.<name>.client_key` | — | — | — | PEM private key for that chain. |
 | `hook.<name>.ca` | — | — | — | PEM authority to trust instead of the platform store. |

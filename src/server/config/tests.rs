@@ -1258,7 +1258,6 @@ name = "studio"
 [hook.automation]
 url = "http://automation:9000/events"
 events = ["session.started", "session.ended", "segment.ready"]
-max_attempts = 2
 "#,
     )??;
 
@@ -1270,7 +1269,7 @@ max_attempts = 2
     );
     let hook = hooks.config.hooks.first().ok_or("one endpoint")?;
     assert_eq!(&*hook.name, "automation");
-    assert_eq!(hook.maximum_attempts, 2);
+    assert_eq!(hook.maximum_attempts, super::HOOK_MAX_ATTEMPTS);
     assert_eq!(
         hook.events,
         [Kind::SessionStarted, Kind::SessionEnded, Kind::SegmentReady]
@@ -1293,17 +1292,13 @@ events = ["session.exploded"]
 url = "http://automation:9000/events"
 events = []
 "#;
-    let no_attempts = r#"
+    // Delivery depth is compiled in, so the former settings are refused like
+    // any other unknown key rather than silently ignored.
+    let delivery_tuning = r#"
 [hook.automation]
 url = "http://automation:9000/events"
 events = ["session.ended"]
-max_attempts = 0
-"#;
-    let no_queue = r#"
-[hook.automation]
-url = "http://automation:9000/events"
-events = ["session.ended"]
-queue_size = 0
+max_attempts = 3
 "#;
     let unusable_url = r#"
 [hook.automation]
@@ -1311,13 +1306,7 @@ url = "automation:9000"
 events = ["session.ended"]
 "#;
 
-    for configuration in [
-        unknown_event,
-        no_events,
-        no_attempts,
-        no_queue,
-        unusable_url,
-    ] {
+    for configuration in [unknown_event, no_events, delivery_tuning, unusable_url] {
         assert!(
             resolve_toml(configuration)?.is_err(),
             "expected a startup error for:{configuration}"
@@ -2341,9 +2330,6 @@ client_cert = "/client.pem"
 [hook.example]
 url = "http://hook"
 events = ["session.ended"]
-queue_size = 15
-max_in_flight = 2
-max_attempts = 3
 client_cert = "/hook.pem"
 [record]
 dir = "/archive"
@@ -2370,10 +2356,6 @@ fn concise_settings_match_file_environment_and_cli_names() -> Result<(), Box<dyn
     assert_eq!(auth.client_cert, Some(PathBuf::from("/client.pem")));
     assert_eq!(super::nonzero_bytes("test", auth.max_response)?, 32 * 1024);
     let hook = &config.hook.as_ref().ok_or("hook")?.0["example"];
-    assert_eq!(
-        (hook.queue_size, hook.max_in_flight, hook.max_attempts),
-        (15, 2, 3)
-    );
     assert_eq!(hook.client_cert, Some(PathBuf::from("/hook.pem")));
     let record = &config.record.as_ref().ok_or("record")?.0;
     assert_eq!(
@@ -2462,7 +2444,7 @@ fn malformed_secret_documents_do_not_print_credentials() -> Result<(), Box<dyn E
         "[metrics]\ntoken = 918273645",
         "[publish.auth]\ntoken = 918273645",
         "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\ntoken = 918273645",
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\ntoken = 'sensitive-token'\nqueue_size = 'bad'",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\ntoken = 'sensitive-token'\nclient_cert = 5",
     ] {
         let error = load_toml(text)?.err().ok_or("invalid document accepted")?;
         let diagnostic = format!("{error:?} {error}");
@@ -2669,7 +2651,6 @@ fn the_reference_lists_only_keys_the_tables_accept() -> Result<(), Box<dyn Error
         let key = key.trim_start_matches(".<name>.");
         let value = match key {
             "events" => "['session.ended']",
-            "queue_size" | "max_in_flight" | "max_attempts" => "1",
             _ => "'value'",
         };
         writeln!(hook, "{key} = {value}")?;
