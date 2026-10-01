@@ -7,7 +7,7 @@
 
 use std::{future::Future, io, net::SocketAddr};
 
-use rushls_common::accept::{AcceptErrors, Next};
+use rushls_common::accept::{AcceptErrors, AcceptHealth, Next};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
@@ -39,6 +39,13 @@ impl TcpHttpListener {
             events,
             protocol,
         }
+    }
+
+    /// Feeds this listener's accept failures into readiness.
+    #[must_use]
+    pub fn with_health(mut self, health: AcceptHealth) -> Self {
+        self.errors = AcceptErrors::with_health(health);
+        self
     }
 }
 

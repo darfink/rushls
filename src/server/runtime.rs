@@ -691,7 +691,7 @@ impl Node {
         readiness: &Readiness,
         stop_rx: watch::Receiver<bool>,
     ) -> Result<(), RuntimeError> {
-        self.spawn_ingest(tasks, ingest, &stop_rx);
+        self.spawn_ingest(tasks, ingest, readiness, &stop_rx);
 
         // Metrics are served on a viewer listener only when the operator gave
         // them that same address. Matching HTTP or HTTPS is one transport, not
@@ -703,7 +703,8 @@ impl Node {
         if let Some(listener) = http_listener {
             report_bound(events, Protocol::Http, listener.local_addr());
             tasks.spawn(run_http(
-                http::TcpHttpListener::new(listener, events.clone(), Protocol::Http),
+                http::TcpHttpListener::new(listener, events.clone(), Protocol::Http)
+                    .with_health(readiness.listener()),
                 Arc::clone(&self.application),
                 self.config.http.clone(),
                 http_budget.clone(),
@@ -735,7 +736,8 @@ impl Node {
                 settings,
                 self.services.meters.clone(),
                 events.clone(),
-            )?;
+            )?
+            .with_health(readiness.listener());
             report_bound(events, Protocol::Https, listener.local_addr());
             tasks.spawn(run_http(
                 listener,
@@ -783,6 +785,7 @@ impl Node {
         &self,
         tasks: &mut JoinSet<Result<(), RuntimeError>>,
         ingest: IngestListeners,
+        readiness: &Readiness,
         stop_rx: &watch::Receiver<bool>,
     ) {
         let maximum_pending = self.config.maximum_pending_publishers_per_listener();
@@ -797,7 +800,7 @@ impl Node {
                 tcp: ingest.rtmp,
                 config: self.config.rtmp,
                 proxy_protocol: self.config.rtmp_proxy_protocol,
-                errors: AcceptErrors::default(),
+                errors: AcceptErrors::with_health(readiness.listener()),
             },
             self.services.clone(),
             Arc::clone(&session_config),
@@ -805,7 +808,8 @@ impl Node {
             per_address.clone(),
             stop_rx.clone(),
         ));
-        if let Some(rtmps) = ingest.rtmps {
+        if let Some(mut rtmps) = ingest.rtmps {
+            rtmps.errors = AcceptErrors::with_health(readiness.listener());
             tasks.spawn(run_ingest(
                 rtmps,
                 self.services.clone(),

@@ -40,6 +40,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use rushls_common::accept::AcceptHealth;
+
 use axum::{
     Router,
     body::Body,
@@ -163,8 +165,20 @@ impl<P> Clone for HttpState<P> {
 /// Liveness needs no mutable state: successfully handling its request already
 /// proves that the HTTP task and runtime are responsive. Readiness differs
 /// during startup and graceful shutdown, so process wiring owns this latch.
+///
+/// It also fails while any TCP listener has been failing to accept for a
+/// sustained period, so a load balancer stops sending connections this node
+/// would refuse. Liveness does not: a restart would cut every live session,
+/// and the usual cause, a full descriptor table, clears as sessions end.
 #[derive(Clone, Debug, Default)]
-pub struct Readiness(Arc<AtomicBool>);
+pub struct Readiness(Arc<ReadinessState>);
+
+#[derive(Debug, Default)]
+struct ReadinessState {
+    ready: AtomicBool,
+    /// One per listener, registered while the listeners are set up.
+    listeners: parking_lot::Mutex<Vec<AcceptHealth>>,
+}
 
 impl Readiness {
     pub fn ready() -> Self {
@@ -174,15 +188,27 @@ impl Readiness {
     }
 
     pub fn mark_ready(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.ready.store(true, Ordering::Release);
     }
 
     pub fn mark_not_ready(&self) {
-        self.0.store(false, Ordering::Release);
+        self.0.ready.store(false, Ordering::Release);
+    }
+
+    /// A new listener's accept health, counted from now on.
+    pub fn listener(&self) -> AcceptHealth {
+        let health = AcceptHealth::default();
+        self.0.listeners.lock().push(health.clone());
+        health
     }
 
     pub fn is_ready(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.ready.load(Ordering::Acquire) && !self.is_accept_failing()
+    }
+
+    /// Whether some listener has been failing to accept persistently.
+    pub fn is_accept_failing(&self) -> bool {
+        self.0.listeners.lock().iter().any(AcceptHealth::is_failing)
     }
 }
 
@@ -373,7 +399,7 @@ async fn handle<P: Application>(
 }
 
 async fn liveness(method: Method) -> Response {
-    health_response(&method, true)
+    health_response(&method, true, "")
 }
 
 /// The MOQ certificate's SHA-256, hex encoded, for `serverCertificateHashes`.
@@ -434,7 +460,12 @@ async fn readiness_probe<P: Application>(
     State(service): State<HttpState<P>>,
     method: Method,
 ) -> Response {
-    health_response(&method, service.readiness.is_ready())
+    let reason = if service.readiness.is_accept_failing() {
+        "accept failing\n"
+    } else {
+        "not ready\n"
+    };
+    health_response(&method, service.readiness.is_ready(), reason)
 }
 
 async fn metrics_totals<P: Application>(
@@ -466,7 +497,8 @@ fn metrics_probe(
     }
 }
 
-fn health_response(method: &Method, healthy: bool) -> Response {
+/// `reason` is the body when unhealthy, so a probe log says why.
+fn health_response(method: &Method, healthy: bool, reason: &'static str) -> Response {
     if !matches!(*method, Method::GET | Method::HEAD) {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
@@ -489,7 +521,7 @@ fn health_response(method: &Method, healthy: bool) -> Response {
             ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
-        if healthy { "ok\n" } else { "not ready\n" },
+        if healthy { "ok\n" } else { reason },
     )
         .into_response()
 }

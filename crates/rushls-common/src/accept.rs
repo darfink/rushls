@@ -16,9 +16,20 @@
 //! Nothing here logs. A persistent failure would otherwise produce one line per
 //! attempt, so [`AcceptErrors`] says when a summary is due and the application
 //! reports it through its own events or logs.
+//!
+//! A temporary failure that never clears, such as a descriptor table that
+//! stays full, would otherwise leave a process that refuses every connection
+//! while its probes report it healthy. [`AcceptHealth`] turns that into a
+//! readiness failure, so a load balancer stops sending new connections. It
+//! never fails liveness: a restart would cut every live session, and the usual
+//! cure is those sessions ending and freeing descriptors.
 
 use std::{
     io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -30,6 +41,22 @@ pub const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
 pub const MAXIMUM_BACKOFF: Duration = Duration::from_secs(1);
 /// How often a persistent failure is reported after its first occurrence.
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long `accept` must keep failing before [`AcceptHealth`] reports it.
+///
+/// Long enough that a burst of aborted connections or a brief descriptor spike
+/// never takes a replica out of rotation; short enough that one which cannot
+/// accept anyone stops being sent connections.
+pub const PERSISTENT_FAILURE: Duration = Duration::from_secs(30);
+
+/// Without a failure for this long, a run of failures has ended.
+///
+/// Needed because recovery is not always observable as a success: once
+/// readiness fails, the load balancer stops sending connections, so no
+/// `accept` may succeed for a long time. A quiet listener is a recovered one.
+/// The backoff tops out at [`MAXIMUM_BACKOFF`], so a continuing failure is
+/// never this quiet.
+pub const QUIET_AFTER_FAILURE: Duration = Duration::from_secs(10);
 
 /// Whether an `accept` error leaves the listener unusable.
 pub fn is_fatal(error: &io::Error) -> bool {
@@ -69,6 +96,8 @@ pub struct AcceptErrors {
     /// Failures since the last report, included in the next one.
     unreported: u64,
     last_reported: Option<Instant>,
+    /// Shared with a readiness probe, when the listener has one.
+    health: Option<AcceptHealth>,
 }
 
 impl Default for AcceptErrors {
@@ -77,11 +106,20 @@ impl Default for AcceptErrors {
             backoff: INITIAL_BACKOFF,
             unreported: 0,
             last_reported: None,
+            health: None,
         }
     }
 }
 
 impl AcceptErrors {
+    /// Also records failures and successes in `health`, for readiness.
+    pub fn with_health(health: AcceptHealth) -> Self {
+        Self {
+            health: Some(health),
+            ..Self::default()
+        }
+    }
+
     /// Records a failure and says whether, and when, to accept again.
     pub fn failed(&mut self, error: &io::Error) -> Next {
         self.failed_at(error, Instant::now())
@@ -90,6 +128,9 @@ impl AcceptErrors {
     fn failed_at(&mut self, error: &io::Error, now: Instant) -> Next {
         if is_fatal(error) {
             return Next::Stop;
+        }
+        if let Some(health) = &self.health {
+            health.failed_at(now);
         }
         self.unreported += 1;
         let due = self
@@ -110,9 +151,85 @@ impl AcceptErrors {
     /// a caller that announces recovery.
     pub fn succeeded(&mut self) -> bool {
         let recovered = self.last_reported.is_some();
-        *self = Self::default();
+        if let Some(health) = &self.health {
+            health.succeeded();
+        }
+        self.backoff = INITIAL_BACKOFF;
+        self.unreported = 0;
+        self.last_reported = None;
         recovered
     }
+}
+
+/// Whether one listener has been failing to accept for long enough that its
+/// process should stop receiving new connections.
+///
+/// Cheap to clone and lock-free, because a readiness probe reads it while the
+/// accept loop writes it. Feed it through [`AcceptErrors::with_health`].
+#[derive(Clone, Debug)]
+pub struct AcceptHealth(Arc<HealthState>);
+
+#[derive(Debug)]
+struct HealthState {
+    /// The clock the two instants below are measured on.
+    origin: Instant,
+    /// Milliseconds since `origin`, plus one, when the current run of
+    /// failures began; zero when there is none.
+    failing_since: AtomicU64,
+    /// Milliseconds since `origin`, plus one, of the latest failure.
+    failed_at: AtomicU64,
+}
+
+impl Default for AcceptHealth {
+    fn default() -> Self {
+        Self(Arc::new(HealthState {
+            origin: Instant::now(),
+            failing_since: AtomicU64::new(0),
+            failed_at: AtomicU64::new(0),
+        }))
+    }
+}
+
+impl AcceptHealth {
+    /// Whether `accept` has failed continuously for [`PERSISTENT_FAILURE`],
+    /// most recently within [`QUIET_AFTER_FAILURE`].
+    pub fn is_failing(&self) -> bool {
+        self.is_failing_at(Instant::now())
+    }
+
+    fn is_failing_at(&self, now: Instant) -> bool {
+        let since = self.0.failing_since.load(Ordering::Relaxed);
+        let last = self.0.failed_at.load(Ordering::Relaxed);
+        if since == 0 || last == 0 {
+            return false;
+        }
+        self.millis(now).saturating_sub(last) <= millis(QUIET_AFTER_FAILURE)
+            && last.saturating_sub(since) >= millis(PERSISTENT_FAILURE)
+    }
+
+    fn failed_at(&self, now: Instant) {
+        let now = self.millis(now);
+        let last = self.0.failed_at.swap(now, Ordering::Relaxed);
+        // A failure after a quiet spell starts a new run rather than
+        // extending one that has already ended.
+        if last == 0 || now.saturating_sub(last) > millis(QUIET_AFTER_FAILURE) {
+            self.0.failing_since.store(now, Ordering::Relaxed);
+        }
+    }
+
+    fn succeeded(&self) {
+        self.0.failing_since.store(0, Ordering::Relaxed);
+        self.0.failed_at.store(0, Ordering::Relaxed);
+    }
+
+    /// Plus one, so zero can mean "never".
+    fn millis(&self, now: Instant) -> u64 {
+        millis(now.saturating_duration_since(self.0.origin)) + 1
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(all(test, unix))]
@@ -167,6 +284,50 @@ mod tests {
                 report: Some(1)
             }
         ));
+    }
+
+    #[test]
+    fn readiness_fails_only_after_persistent_failure_and_recovers() {
+        let health = AcceptHealth::default();
+        let mut errors = AcceptErrors::with_health(health.clone());
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+
+        // One failure a second, as the capped backoff produces.
+        for second in 0..30 {
+            errors.failed_at(&os(libc::EMFILE), at(second));
+        }
+        assert!(
+            !health.is_failing_at(at(29)),
+            "29 seconds of failure is still a burst"
+        );
+        errors.failed_at(&os(libc::EMFILE), at(30));
+        assert!(health.is_failing_at(at(30)), "30 seconds is persistent");
+
+        assert!(
+            !health.is_failing_at(at(41)),
+            "ten seconds without a failure ends the run"
+        );
+        errors.failed_at(&os(libc::EMFILE), at(42));
+        assert!(
+            !health.is_failing_at(at(42)),
+            "a failure after a quiet spell starts a new run"
+        );
+
+        for second in 43..=72 {
+            errors.failed_at(&os(libc::EMFILE), at(second));
+        }
+        assert!(health.is_failing_at(at(72)));
+        errors.succeeded();
+        assert!(!health.is_failing_at(at(72)), "a success ends the run");
+    }
+
+    #[test]
+    fn a_fatal_error_does_not_count_as_a_failing_run() {
+        let health = AcceptHealth::default();
+        let mut errors = AcceptErrors::with_health(health.clone());
+        assert_eq!(errors.failed(&os(libc::EBADF)), Next::Stop);
+        assert!(!health.is_failing());
     }
 
     #[test]

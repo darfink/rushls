@@ -317,6 +317,10 @@ Restart the service after configuration changes; there is no general configurati
 
 Use `/health/live` and `/health/ready` on the HTTP(S) listener for probes.
 Readiness is an origin readiness check, not proof that a particular stream exists or decodes correctly.
+If an RTMP, RTMPS, HTTP, or HTTPS listener keeps failing to accept connections for 30 seconds, for example because the process has run out of file descriptors, readiness fails with `accept failing`.
+It passes again after the next successful accept, or after 10 seconds without a failure.
+Liveness does not change, because a restart would cut every live session; the node recovers as sessions end and free descriptors.
+A listening socket that is itself unusable stops the node with an error instead.
 Restrict metrics access with a private listener and bearer token.
 Start with [metrics documentation](metrics.md) and the [Prometheus/Grafana examples](../examples/monitoring).
 

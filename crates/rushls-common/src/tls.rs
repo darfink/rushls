@@ -27,7 +27,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 
-use crate::accept::{AcceptErrors, Next};
+use crate::accept::{AcceptErrors, AcceptHealth, Next};
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, new_debouncer};
 use rustls::{
@@ -356,6 +356,13 @@ impl<O: TlsObserver> TlsListener<O> {
             errors: AcceptErrors::default(),
             _watcher: watcher,
         })
+    }
+
+    /// Feeds this listener's accept failures into a readiness probe.
+    #[must_use]
+    pub fn with_health(mut self, health: AcceptHealth) -> Self {
+        self.errors = AcceptErrors::with_health(health);
+        self
     }
 
     /// Mirrors the trait method so callers need not import the trait to ask.
