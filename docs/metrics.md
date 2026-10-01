@@ -250,7 +250,9 @@ Host CPU, RSS, filesystem space, file descriptors, and network saturation remain
 
 ## Queries and dashboard
 
-The [Grafana dashboard](../examples/monitoring/dashboard.json) uses the new names and a Prometheus datasource selected at import.
+The [Grafana dashboard](../examples/monitoring/README.md) gives an overview of ingest, output health, viewers, retention, and hooks.
+A second [diagnostics dashboard](../examples/monitoring/diagnostics.json) follows one stream through a reported stall.
+Both select a Prometheus data source at import.
 The [alert rules](../examples/monitoring/alerts.yml) provide initial thresholds for evaluation, not universal playback guarantees.
 A five-second scrape interval is a reasonable starting point for these examples.
 Detailed cadence still comes from commit observations, so short incidents do not depend solely on scrape frequency.

@@ -548,7 +548,7 @@ signing_secret = { file = "/run/secrets/hook-signing" }   # optional: signs each
 format = "json"
 ```
 
-- `/metrics` has totals, `/metrics/streams` has per-stream detail. `/health/live` and `/health/ready` serve probes. See [metrics](docs/metrics.md) and the [monitoring examples](examples/monitoring).
+- `/metrics` has totals, `/metrics/streams` has per-stream detail. `/health/live` and `/health/ready` serve probes. See [metrics](docs/metrics.md), and import the [Grafana dashboard](examples/monitoring).
 - Hooks are signed CloudEvents with metadata and paths, not media. See [hooks](docs/admission-and-hooks.md#lifecycle-hooks).
 - `[log] level` sets how much Rushls logs; `RUST_LOG` overrides it for dependencies too.
 - Stop with SIGTERM (Ctrl+C on Windows). Give the supervisor more time than `shutdown_grace`, so hooks and recordings can drain.
