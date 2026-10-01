@@ -7,3 +7,12 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+  # One monthly PR for compatible updates, so dependency churn costs one CI run.
+  # Semver-incompatible bumps arrive separately, since they usually need code changes.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo:
+        update-types: [minor, patch]

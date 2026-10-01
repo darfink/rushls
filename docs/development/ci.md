@@ -1,6 +1,6 @@
 # CI validation
 
-The **CI and release** workflow uses Node 24 actions. Dependabot checks for action updates each week.
+The **CI and release** workflow uses Node 24 actions. Dependabot checks for action updates each week and for Cargo updates each month, grouping compatible updates into one pull request.
 Rust toolchain installation uses a composite action, with no JavaScript runtime.
 
 ## Checks and prerequisites
@@ -8,7 +8,7 @@ Rust toolchain installation uses a composite action, with no JavaScript runtime.
 | Job | Checks | Prerequisites |
 | --- | --- | --- |
 | Validate documentation examples | Commands extracted from README/publishing guide, all advertised A/V renditions decoded, caption text verified in WebVTT | FFmpeg, GStreamer, pinned model-free gst-captions plugin |
-| Validate code | Workspace tests, all features, Clippy, formatting, Python unit tests | Rust and Python |
+| Validate code | Workflow lint (actionlint with shellcheck), workspace tests, all features, Clippy, formatting, Python unit tests | Rust, Python, shellcheck |
 | Validate media | Ignored decoder tests, recording, RTMP ingest, video GAP fixture export | FFmpeg, including AudioToolbox AAC |
 | Validate Chrome playback (patched hls.js) | Patched-player unit tests; live control and GAP streams, rendition switches, completion; official-release compatibility | Chrome, matching ChromeDriver, Node.js 24, pinned hls.js source and patch |
 | Validate Apple HLS | Packaging cases, playlist diagnostics, two-hour live authoring audit | macOS, Apple HLS tools, FFmpeg, trusted localhost TLS |
