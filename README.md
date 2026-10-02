@@ -13,8 +13,9 @@
 
 Rushls is a live streaming origin that does one thing: **HLS and Low-Latency HLS, the way Apple specifies them.**
 
-There are plenty of open-source media servers. Most treat HLS as one output among many,
-and few produce HLS that passes Apple's validation once a stream carries more than one video and one audio track.
+There are plenty of open-source media servers, and most treat HLS as one output among many.
+Almost none of them accept **multitrack** ingest, several video renditions and audio languages in one publication,
+and the rare ones that do produce HLS that fails Apple's own validation.
 Rushls is built for exactly that case. Publish **one** RTMP or SRT stream that carries an encoding ladder,
 alternate audio languages, and captions, and Rushls serves it as **one adaptive HLS presentation**:
 viewers switch bitrate, pick a language, and turn on subtitles.
@@ -181,7 +182,7 @@ All documentation is indexed in [docs](docs/README.md).
 ## Publishing
 
 The samples below all produce a playlist at `/live/NAME/index.m3u8`.
-File examples use an H.264/AAC `input.mp4`. Tested versions and more recipes are in the [publishing guide](docs/publishing.md).
+File examples use an H.264/AAC `input.mp4`. More recipes, and the tools they need, are in the [publishing guide](docs/publishing.md).
 
 ### FFmpeg
 
@@ -228,7 +229,7 @@ gst-launch-1.0 -e filesrc location=input.mp4 ! qtdemux name=d \
   srtsink uri='srt://127.0.0.1:9000?mode=caller&streamid=publish:live/gstreamer' sync=true
 ```
 
-For RTMP from a file, use FFmpeg: GStreamer's MP4-to-FLV remux produced overlapping startup timestamps in our tests.
+For RTMP from a file, use FFmpeg: remuxing MP4 to FLV in GStreamer can start with overlapping timestamps.
 
 ### OBS Studio
 
