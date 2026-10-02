@@ -4,11 +4,10 @@ These recipes target the bundled loopback configuration and unauthenticated loca
 Use one publisher at a time for each stream name.
 The examples use POSIX shell syntax.
 
-## Tested tools
+## Tools
 
-The recipe validation uses FFmpeg 9.0.1, GStreamer 1.28.6, and `moq-cli 0.10.0` on macOS.
-FFmpeg must include `libx264`, the AAC encoder, and SRT support for the SRT commands.
-Different FFmpeg distributions include different transports, even with the same version number.
+FFmpeg must include `libx264`, the AAC encoder, and, for the SRT recipes, SRT support.
+Builds differ in which protocols they include, even at the same version, so check yours:
 
 ```sh
 ffmpeg -version
@@ -18,9 +17,8 @@ gst-launch-1.0 --version
 moq --version
 ```
 
-The SRT protocol must appear in FFmpeg's protocol list.
-On the validation host, Homebrew's `ffmpeg-full` provides SRT; the default `ffmpeg` binary does not.
-Select the SRT-enabled executable in your `PATH` before using the recipes.
+`srt` must appear in FFmpeg's protocol list. Some packages leave it out:
+on macOS, Homebrew's `ffmpeg` does not include SRT and `ffmpeg-full` does.
 
 Start Rushls with the example configuration, which binds every listener to loopback:
 
@@ -46,12 +44,11 @@ ffmpeg -f lavfi -i testsrc2=size=640x360:rate=30 \
 ```
 
 The later file recipes use this fixture.
-A direct GStreamer MP4-to-FLV remux failed on this host with overlapping startup timestamps, including with this fixture.
-Use the synthetic RTMP pipeline below or FFmpeg for RTMP file publishing.
-This is a conversion-path finding, not a blanket restriction on reordered video in Rushls.
+To publish a file over RTMP, use FFmpeg: remuxing MP4 to FLV in GStreamer can start with overlapping timestamps.
 
-For an existing file, inspect its codecs, frame rate, and keyframes before using stream copy.
-`-c copy` does not repair timestamps, change codecs, or align keyframes.
+> [!WARNING]
+> `-c copy` sends a file's media unchanged. It does not fix timestamps, change codecs, or move keyframes.
+> Before using it on your own file, check its codecs, frame rate, and keyframe interval with `ffprobe`.
 
 ## FFmpeg
 
@@ -161,7 +158,7 @@ For another frame rate, adjust the GOP length to preserve the intended keyframe 
 
 ### Enhanced RTMP
 
-The same encoded ladder can use Enhanced RTMP with FFmpeg 9.0.1:
+The same encoded ladder can use Enhanced RTMP, which needs an FFmpeg whose FLV muxer writes multiple tracks (9.0 or later):
 
 <!-- verify: {"id":"ladder-rtmp","stream":"ladder","video":2,"audio":1} -->
 ```sh
@@ -174,8 +171,7 @@ ffmpeg -re -i input.mp4 \
   -f flv rtmp://127.0.0.1:1935/live/ladder
 ```
 
-Older FLV muxers can reject multiple tracks or lack the required Enhanced RTMP messages.
-The tested version is not a claim about the earliest compatible FFmpeg release.
+Older FLV muxers reject multiple tracks or do not send the Enhanced RTMP messages.
 Rushls supports OneTrack and packed ManyTracks messages.
 The publisher controls their wire representation; these commands do not use a synthetic Rushls test publisher.
 
@@ -219,12 +215,12 @@ Select H.264 video, AAC audio, and a two-second keyframe interval.
 Playback uses `http://127.0.0.1:8080/live/obs/index.m3u8`.
 
 With admission enabled, the application supplies the stream key and selects the resulting playback ID.
-This documents conventional RTMP field mapping. This overhaul does not certify an OBS version or its multitrack mode.
+These fields follow the usual RTMP mapping. OBS's own multitrack mode is not covered.
 
 ## Media over QUIC
 
 Use the [MoQ guide](moq.md) for the exact `moq-lite-05` contract.
-The tested client is `moq-cli 0.10.0`, whose executable is `moq`.
+The examples use `moq-cli` 0.10, whose executable is `moq`.
 
 For a public deployment, configure a certificate that covers the origin hostname and is trusted by the client:
 
@@ -346,24 +342,8 @@ Decoder success is separate from browser playback, switching, seek behavior, and
 
 ## Recipe verification
 
-On 2026-09-24, local Rushls tests produced these results with the versions listed at the start of this guide:
-
-| Recipe | Observed HLS output | Decode check |
-| --- | --- | --- |
-| FFmpeg RTMP file | One video variant, one audio rendition | Both passed |
-| FFmpeg SRT file | One video variant, one audio rendition | Both passed |
-| FFmpeg two-size ladder, Enhanced RTMP | 640×360 and 320×180 variants, one audio rendition | All three passed |
-| FFmpeg two-size ladder, SRT | 640×360 and 320×180 variants, one audio rendition | All three passed |
-| FFmpeg alternate audio, SRT | One video variant, `en` and `es` audio renditions | All three passed |
-| GStreamer live RTMP | One video variant, one audio rendition | Both passed |
-| GStreamer SRT file | One video variant, one audio rendition | Both passed |
-| Native MoQ file import | One video variant, one audio rendition | Both passed |
-
-Each check decoded two seconds from every advertised audio/video child playlist while publishing.
-Local tests substituted free loopback ports and unique stream names to run without listener conflicts.
-MoQ used a disposable self-signed certificate with client verification disabled only for that local test.
-These checks establish publication, track discovery, playlist output, and initial decoding; they do not certify long-duration playback or every player.
-OBS instructions describe field mapping and were not exercised in an OBS session.
-
-Local logs, master playlists, and JSON results reside under `target/readme-validation/` and are not part of a clone.
-The failed GStreamer MP4-to-FLV remux is excluded from the recommended recipes.
+CI runs the recipes in this guide and the README that carry a `verify` marker, against a fresh Rushls build, on every change.
+For each one, it checks the advertised video and audio renditions, audio languages and caption text where the recipe sets them,
+and decodes two seconds of every audio and video playlist. See [`tools/check-doc-examples.py`](../tools/check-doc-examples.py).
+This proves publication, track discovery, and initial decoding. It does not prove long-duration playback or support in every player.
+The OBS and MoQ recipes are not run in CI.
