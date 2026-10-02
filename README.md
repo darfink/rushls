@@ -25,27 +25,11 @@ viewers switch bitrate, pick a language, and turn on subtitles.
 - **Checked by Apple's own tools.** Every main-branch build runs Apple's `mediastreamvalidator` and `hlsreport`, including a two-hour live DVR audit. A failure blocks the release.
 - **DVR, scrubbing, and recording.** A rolling window in memory with disk spill, I-frame playlists for fast seeking, and recording of every segment to disk.
 - **CDN-ready.** `Cache-Control` follows the HLS specification's caching recommendations.
-- **Built for operation.** Publisher admission webhook, JWT playback authorization, signed lifecycle hooks, and Prometheus metrics.
+- **Built for operation.** Publisher admission webhook, JWT playback authorization, signed lifecycle hooks, Prometheus metrics, and a ready-to-import [Grafana dashboard](examples/monitoring/).
 - **One self-contained binary.** No FFmpeg, no libsrt — completely standalone.
 
 Rushls packages media; it does not transcode. Your encoder produces the renditions, and Rushls turns them into HLS.
-For example, this one FFmpeg command publishes a 720p and a 360p rendition with English and Spanish audio,
-from a test pattern, so it runs as is:
-
-<!-- verify: {"id":"multitrack","stream":"event","video":2,"audio":2,"languages":["en","es"]} -->
-```sh
-ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 \
-  -f lavfi -i sine=frequency=440 -f lavfi -i sine=frequency=660 \
-  -filter_complex '[0:v]split=2[hd][v];[v]scale=640:360[sd]' \
-  -map '[hd]' -map '[sd]' -map 1:a -map 2:a \
-  -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 60 -sc_threshold 0 -bf 0 \
-  -b:v:0 3000k -b:v:1 800k -c:a aac -b:a 128k \
-  -metadata:s:a:0 language=eng -metadata:s:a:1 language=spa \
-  -f mpegts 'srt://127.0.0.1:9000?mode=caller&streamid=publish:live/event&pkt_size=1316'
-```
-
-Viewers of `http://127.0.0.1:8080/live/event/index.m3u8` get both sizes and both languages.
-[Publishing](docs/publishing.md) has the same over Enhanced RTMP, with GStreamer, and with captions.
+The [quick start](#quick-start) publishes a two-rendition, two-language stream with one command.
 
 ```text
 OBS / FFmpeg / GStreamer / MoQ publisher
@@ -108,24 +92,30 @@ Start the server. It runs without a configuration file:
 rushls
 ```
 
-Publish a test pattern with a tone from another terminal:
+From another terminal, publish a test pattern as a 720p and a 360p rendition, with English and Spanish audio.
+This uses SRT, so FFmpeg must be built with it (`ffmpeg -protocols` lists `srt`):
 
-<!-- verify: {"id":"quickstart","stream":"demo","video":1,"audio":1} -->
+<!-- verify: {"id":"quickstart","stream":"event","video":2,"audio":2,"languages":["en","es"]} -->
 ```sh
-ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 \
-  -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 60 -c:a aac \
-  -f flv rtmp://127.0.0.1:1935/live/demo
+ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 \
+  -f lavfi -i sine=frequency=440 -f lavfi -i sine=frequency=660 \
+  -filter_complex '[0:v]split=2[hd][v];[v]scale=640:360[sd]' \
+  -map '[hd]' -map '[sd]' -map 1:a -map 2:a \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 60 -sc_threshold 0 -bf 0 \
+  -b:v:0 3000k -b:v:1 800k -c:a aac -b:a 128k \
+  -metadata:s:a:0 language=eng -metadata:s:a:1 language=spa \
+  -f mpegts 'srt://127.0.0.1:9000?mode=caller&streamid=publish:live/event&pkt_size=1316'
 ```
 
-Play it in Safari, VLC, or any HLS player:
+Play it in Safari, VLC, or any HLS player. The player can switch between both sizes and both languages:
 
 ```text
-http://127.0.0.1:8080/live/demo/index.m3u8
+http://127.0.0.1:8080/live/event/index.m3u8
 ```
 
 The playlist appears after a few seconds, once Rushls has enough media to plan segments.
 For a browser test page, open [`examples/player/index.html`](examples/player/index.html); [Players](docs/players.md) covers player support.
-To publish your own file or encoder instead, see [Publishing](#publishing).
+To publish your own file or encoder, see [Publishing](#publishing). [The publishing guide](docs/publishing.md) also covers RTMP, GStreamer, and captions.
 
 > [!WARNING]
 > Without a configuration file, Rushls listens on all interfaces (RTMP 1935, SRT 9000, HTTP 8080) and **anyone who can reach it may publish**.
@@ -139,11 +129,8 @@ Rushls runs without a file. To change anything, generate the annotated example, 
 rushls --print-config-example > rushls.toml
 ```
 
-Edit what you need, then validate it. `--check` shows the listeners and the memory plan, and exits:
-
-```sh
-rushls --check
-```
+> [!TIP]
+> Run `rushls --check` after you edit the file. It validates the configuration, shows the listeners and the memory plan, and exits.
 
 Rushls reads the first configuration file it finds:
 
@@ -176,7 +163,7 @@ rushls --http-listen 127.0.0.1:18080
 ```
 
 The exceptions are tables whose keys you name yourself, such as profiles, hooks, and playback claims, and `[record]`: those are file-only.
-`rushls --help` lists every flag, and the [reference](docs/configuration-reference.md) every variable.
+`rushls --help` lists every flag. The [configuration reference](docs/configuration-reference.md) lists every setting with its environment variable.
 
 ### Values
 

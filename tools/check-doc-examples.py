@@ -16,7 +16,7 @@ import urllib.request
 DOCUMENTS = ('README.md', 'docs/publishing.md')
 REQUIRED = {'fixture', 'quickstart', 'ffmpeg-rtmp', 'ffmpeg-srt', 'gstreamer-rtmp',
             'gstreamer-srt', 'ladder-srt', 'ladder-rtmp', 'alternate-audio', 'gstreamer-languages',
-            'captions', 'multitrack'}
+            'captions'}
 MARKER = re.compile(r'<!-- verify: (.*?) -->\s*```sh\r?\n(.*?)^```', re.M | re.S)
 
 
