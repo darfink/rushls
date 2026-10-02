@@ -227,6 +227,13 @@ fn discovered_paths_are_ordered_and_unique() -> Result<(), Box<dyn Error>> {
         Some(&std::env::current_dir()?.join("fixture.toml"))
     );
     assert_eq!(paths.iter().collect::<BTreeSet<_>>().len(), paths.len());
+    if cfg!(unix) {
+        assert_eq!(
+            paths.last(),
+            Some(&std::path::PathBuf::from("/etc/fixture/fixture.toml")),
+            "the system-wide file is the last resort"
+        );
+    }
     Ok(())
 }
 

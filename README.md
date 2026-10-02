@@ -133,6 +133,7 @@ Rushls reads the first configuration file it finds:
 2. `RUSHLS_CONFIG`
 3. `./rushls.toml` in the working directory
 4. `~/.config/rushls/rushls.toml` (on macOS, `~/Library/Application Support/rushls/`; on Windows, `%APPDATA%\rushls\config\`)
+5. `/etc/rushls/rushls.toml` (Linux and macOS)
 
 With Docker, mount yours over the bundled one:
 
@@ -161,7 +162,7 @@ Profiles, hooks, recording, and playback claims can only be set in the file. `ru
 ### Values
 
 Any string in the file can refer to the environment: `"${VAR}"`, `"${VAR:-fallback}"` for a default, and `$$` for a literal `$`.
-An undefined variable without a fallback is an error, not an empty string.
+As in a shell, the fallback applies when `VAR` is unset or empty. An unset variable without a fallback is an error, not an empty string.
 A credential can also come from a file, which keeps it out of the configuration and out of process listings:
 
 ```toml

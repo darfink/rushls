@@ -27,7 +27,7 @@ Rushls loads the first file it finds:
    | macOS | `~/Library/Application Support/rushls` |
    | Windows | `%LOCALAPPDATA%\rushls\config`, then `%APPDATA%\rushls\config` |
 
-A system service usually sets `RUSHLS_CONFIG`, for example to `/etc/rushls/rushls.toml` as the container image does.
+5. `/etc/rushls/rushls.toml`, on Linux and macOS: the usual place for a system service.
 
 It logs which file it used, or that it used the compiled defaults.
 
@@ -93,8 +93,8 @@ token = { file = "/run/secrets/metrics-token" }   # a mounted file (preferred)
 A mounted file keeps the secret out of process listings and out of a committed configuration file.
 Trailing CR/LF characters are removed from files; spaces are kept.
 
-`${VAR}` works in any string value. An undefined variable is an error rather than an empty string;
-write `${VAR:-fallback}` for a default, and `$$` for a literal `$`.
+`${VAR}` works in any string value. An unset variable is an error rather than an empty string;
+write `${VAR:-fallback}` for a default, and `$$` for a literal `$`. As in a shell, the fallback also applies when `VAR` is set but empty.
 In the environment, a value shaped like `{ file = "/path" }` names a file: `RUSHLS_METRICS_TOKEN='{ file = "/run/secrets/metrics" }'`.
 
 On the command line, a credential flag always takes a file path, such as `--metrics-token /run/secrets/metrics`,

@@ -1329,6 +1329,8 @@ working credential.
 **An undefined variable is an error, not an empty string.** Substituting `""`
 into a token would silently disable the check it was protecting. Where an empty
 value is genuinely wanted, `${VAR:-fallback}` says so explicitly.
+The fallback follows the shell: it also applies to a variable that is set but
+empty, because orchestrators commonly define unused variables as empty.
 
 Environment overrides take the same two spellings: a value that parses as
 `{ file = "/path" }` names a file, and anything else is literal, so

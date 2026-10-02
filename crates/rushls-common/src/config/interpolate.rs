@@ -102,6 +102,12 @@ impl Environment {
         }
 
         match self.0.get(name) {
+            // `:-` means what it means in a shell: unset *or empty* takes the
+            // fallback. Orchestrators often define a variable as empty rather
+            // than leaving it out, and that should not silently win.
+            Some(value) if value.is_empty() && fallback.is_some() => {
+                Ok(fallback.unwrap_or_default().to_owned())
+            }
             Some(value) => Ok(value.clone()),
             // An undefined variable is an error rather than an empty string.
             // Substituting `""` into a token would silently disable the check
@@ -172,7 +178,17 @@ mod tests {
         assert_eq!(
             expand("${NAME:-local}", &[("NAME", "studio")]),
             Ok("studio".into()),
-            "a fallback applies only when the variable is absent"
+            "a set variable wins over its fallback"
+        );
+        assert_eq!(
+            expand("${NAME:-local}", &[("NAME", "")]),
+            Ok("local".into()),
+            "as in a shell, an empty variable takes the fallback too"
+        );
+        assert_eq!(
+            expand("${NAME}", &[("NAME", "")]),
+            Ok(String::new()),
+            "without a fallback, a deliberately empty variable stays empty"
         );
     }
 

@@ -11,7 +11,7 @@ use conf::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use thiserror::Error;
 
@@ -232,7 +232,9 @@ impl Loader {
             .collect()
     }
 
-    /// Discovery order is working directory, local config, then roaming config.
+    /// Discovery order is working directory, local config, roaming config,
+    /// then, on Unix, the system-wide `/etc/<name>/<name>.toml` where a
+    /// packaged service conventionally keeps it.
     pub fn config_paths(&self) -> Vec<PathBuf> {
         let filename = format!("{}.toml", self.name);
         let mut paths = Vec::new();
@@ -246,6 +248,9 @@ impl Loader {
                     paths.push(path);
                 }
             }
+        }
+        if cfg!(unix) {
+            paths.push(Path::new("/etc").join(self.name).join(&filename));
         }
         paths
     }

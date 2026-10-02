@@ -97,7 +97,7 @@ and tables. It never changes keys or table names.
 | Syntax | Meaning |
 | --- | --- |
 | `${NAME}` | Required environment variable |
-| `${NAME:-fallback}` | Literal fallback when the variable is absent |
+| `${NAME:-fallback}` | Literal fallback when the variable is unset or empty, as in a shell |
 | `$$` | Literal dollar sign |
 | `$NAME` | Literal text |
 
