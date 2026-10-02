@@ -106,6 +106,7 @@ fn output_within(
         }
         if started.elapsed() > deadline {
             eprintln!("mediastreamvalidator ran past {deadline:?}; killing it");
+            capture_hang(child.id());
             child.kill()?;
             break child.wait()?;
         }
@@ -116,6 +117,34 @@ fn output_within(
         stdout: stdout.join().unwrap_or_default(),
         stderr: stderr.join().unwrap_or_default(),
     })
+}
+
+/// Records what a hung validator was doing, before it is killed.
+///
+/// The tool is closed source, so its stacks and open sockets are the only
+/// evidence of why it stopped; they go next to the reports CI uploads.
+fn capture_hang(pid: u32) {
+    let directory =
+        std::env::var_os("RUSHLS_TEST_REPORT_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    for (tool, args) in [
+        ("sample", vec![pid.to_string(), "3".to_owned()]),
+        (
+            "lsof",
+            vec!["-nP".to_owned(), "-p".to_owned(), pid.to_string()],
+        ),
+    ] {
+        let path = directory.join(format!("validator-hang-{stamp}-{tool}.txt"));
+        match Command::new(tool).args(&args).output() {
+            Ok(output) => {
+                let _ = fs::write(&path, [output.stdout, output.stderr].concat());
+                eprintln!("wrote {}", path.display());
+            }
+            Err(error) => eprintln!("could not run {tool}: {error}"),
+        }
+    }
 }
 
 fn crashed_without_report(error: &str) -> bool {
