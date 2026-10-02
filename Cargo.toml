@@ -148,7 +148,7 @@ homepage = "https://github.com/darfink/rushls"
 [workspace.dependencies]
 # Internal
 rushls-common = { path = "crates/rushls-common", version = "0.1.0" }
-rtmpx = "3.1"
+rtmpx = "3.1.1"
 
 # External
 conf = "0.4"

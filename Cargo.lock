@@ -2308,9 +2308,9 @@ dependencies = [
 
 [[package]]
 name = "rtmpx"
-version = "3.1.0"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdbbfbe8a7455ee3c57acfe50723ac7b05fe4a285a4c1c4acfb805d84d6983df"
+checksum = "e2950dfb8c61a06109f964c5ac48c674d9096b0af041cedc80ac5fc3035eb67f"
 dependencies = [
  "byteorder",
  "bytes",
