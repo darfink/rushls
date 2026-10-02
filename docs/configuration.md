@@ -120,14 +120,14 @@ listen = "[::]:1936"
 
 [https]
 listen = "[::]:8443"
-version = { min = "1.2" }   # default: TLS 1.3 only
+min_version = "1.2"         # default: TLS 1.3 only
 
 [tls]
 cert = "/etc/rushls/tls/fullchain.pem"
 key  = "/etc/rushls/tls/private-key.pem"
 ```
 
-`https.version` takes `min` and `max`, each `"1.2"` or `"1.3"`. It does not affect RTMPS, which always accepts both, or MoQ, which always uses TLS 1.3.
+`https.min_version` is `"1.3"` or `"1.2"`; TLS 1.3 is always accepted. It does not affect RTMPS, which always accepts both, or MoQ, which always uses TLS 1.3.
 Configuring `[https]`, RTMPS, or MoQ without `[tls]` stops startup; a `[tls]` that nothing uses logs a warning.
 
 ### Behind a proxy

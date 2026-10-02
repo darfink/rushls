@@ -270,7 +270,7 @@ The authoring fixture keeps its 2,000 kb/s default variant; it does not reorder 
 
 ## TLS versions and the legacy report tool
 
-HTTPS defaults to TLS 1.3. Under `[https]`, set `version = { min = "1.2", max = "1.2" }` for TLS 1.2 only.
+HTTPS defaults to TLS 1.3. Under `[https]`, set `min_version = "1.2"` to also accept TLS 1.2.
 Set only the minimum to `"1.2"` to accept both versions, with TLS 1.3 preferred.
 
 For the Apple audit, supply trusted certificate paths and set:

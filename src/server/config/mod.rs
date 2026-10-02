@@ -2579,10 +2579,12 @@ impl CorsAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct HttpsAppConfig {
-    /// Accepted protocol range: `{ min = "1.3", max = "1.3" }`. Set min to
-    /// "1.2" for older clients.
-    #[conf(flatten, prefix)]
-    version: TlsVersionAppConfig,
+    /// Oldest accepted TLS version: "1.3", or "1.2" for older clients.
+    ///
+    /// One bound rather than a range: rustls speaks only 1.2 and 1.3, and a
+    /// listener that refuses 1.3 has no use.
+    #[conf(parameter, long, env, default_value = "1.3", serde(use_value_parser))]
+    min_version: TlsVersion,
     /// Address serving HTTPS, bound independently of the cleartext listener.
     #[conf(parameter, long, env, default_value = "[::]:8443")]
     listen: SocketAddr,
@@ -2610,24 +2612,8 @@ pub struct HttpsAppConfig {
     max_handshakes: usize,
 }
 
-#[derive(Conf)]
-#[conf(serde)]
-pub struct TlsVersionAppConfig {
-    /// Lowest accepted HTTPS version: "1.2" or "1.3".
-    #[conf(parameter, long, env, default_value = "1.3", serde(use_value_parser))]
-    min: TlsVersion,
-    /// Highest accepted HTTPS version: "1.2" or "1.3".
-    #[conf(parameter, long, env, default_value = "1.3", serde(use_value_parser))]
-    max: TlsVersion,
-}
-
 impl HttpsAppConfig {
     fn resolve(&self, tls: &TlsFiles) -> Result<(SocketAddr, TlsSettings), ConfigError> {
-        if self.version.min > self.version.max {
-            return Err(ConfigError::Invalid(
-                "https.version.min must not exceed https.version.max".to_owned(),
-            ));
-        }
         if self.max_handshakes == 0 {
             return Err(ConfigError::Invalid(
                 "https.max_handshakes must be at least one, or no \
@@ -2643,8 +2629,8 @@ impl HttpsAppConfig {
                 key: tls.key.clone(),
                 handshake_timeout: self.handshake_timeout,
                 maximum_pending_handshakes: self.max_handshakes,
-                min_version: self.version.min,
-                max_version: self.version.max,
+                min_version: self.min_version,
+                max_version: TlsVersion::Tls13,
             },
         ))
     }

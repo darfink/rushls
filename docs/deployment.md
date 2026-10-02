@@ -159,7 +159,6 @@ listen = "off"
 
 [https]
 listen = "0.0.0.0:8443"
-version = { min = "1.3", max = "1.3" }
 handshake_timeout = "5s"
 max_handshakes = 256
 

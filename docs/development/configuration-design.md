@@ -145,20 +145,13 @@ cert = "/etc/rushls/tls/fullchain.pem"
 key  = "/etc/rushls/tls/private-key.pem"
 ```
 
-HTTPS accepts TLS 1.3 by default. Under `[https]`, `version` groups the protocol bounds:
+HTTPS accepts TLS 1.3 by default. `https.min_version = "1.2"` also accepts TLS 1.2, with 1.3 preferred.
 
-```toml
-version = { min = "1.3", max = "1.3" }
-```
-
-Both bounds accept `"1.2"` or `"1.3"` and default to `"1.3"`.
-Use `version = { min = "1.2" }` to accept both versions, with TLS 1.3 preferred.
-Use `version = { min = "1.2", max = "1.2" }` for a TLS 1.2-only listener.
-The minimum cannot exceed the maximum.
-
-CLI uses `--https-version-min` and `--https-version-max`.
-Environment variables use `RUSHLS_HTTPS_VERSION_MIN` and `RUSHLS_HTTPS_VERSION_MAX`.
-These bounds do not affect QUIC or outbound clients.
+One setting rather than a `{ min, max }` range: rustls speaks only 1.2 and 1.3,
+so a range has three meaningful values, and the one it adds, a 1.2-only
+listener, has no legitimate use. A list of versions would allow the same
+nonsense. The flag is `--https-min-version`, the variable `RUSHLS_HTTPS_MIN_VERSION`.
+It does not affect QUIC or outbound clients.
 
 
 Direct exposure has two shared limits under `[http]`: `max_connections`

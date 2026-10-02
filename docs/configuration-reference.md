@@ -101,8 +101,7 @@ See [rushls.example.toml](../rushls.example.toml) for an annotated file.
 
 | Setting | Default | Environment | CLI | Description |
 |---|---|---|---|---|
-| `https.version.min` | `1.3` | `RUSHLS_HTTPS_VERSION_MIN` | `--https-version-min` | Lowest accepted HTTPS version: "1.2" or "1.3". |
-| `https.version.max` | `1.3` | `RUSHLS_HTTPS_VERSION_MAX` | `--https-version-max` | Highest accepted HTTPS version: "1.2" or "1.3". |
+| `https.min_version` | `1.3` | `RUSHLS_HTTPS_MIN_VERSION` | `--https-min-version` | Oldest accepted TLS version: "1.3", or "1.2" for older clients. |
 | `https.listen` | `[::]:8443` | `RUSHLS_HTTPS_LISTEN` | `--https-listen` | Address serving HTTPS, bound independently of the cleartext listener. |
 | `https.handshake_timeout` | `5s` | `RUSHLS_HTTPS_HANDSHAKE_TIMEOUT` | `--https-handshake-timeout` | Bounds a connection that completes TCP and then stalls mid-handshake. |
 | `https.max_handshakes` | `256` | `RUSHLS_HTTPS_MAX_HANDSHAKES` | `--https-max-handshakes` | Handshakes admitted at once, which is what stops a flood from growing the task set without bound. |

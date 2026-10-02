@@ -1571,7 +1571,7 @@ key = "{}"
 }
 
 #[test]
-fn tls_version_bounds_resolve_and_reject_invalid_ranges() -> Result<(), Box<dyn Error>> {
+fn https_min_version_resolves_from_every_source() -> Result<(), Box<dyn Error>> {
     use rushls_common::tls::TlsVersion::{Tls12, Tls13};
     let certificate = TempConfig::new("certificate")?;
     let key = TempConfig::new("key")?;
@@ -1580,52 +1580,37 @@ fn tls_version_bounds_resolve_and_reject_invalid_ranges() -> Result<(), Box<dyn 
         certificate.path, key.path
     );
     for (toml, args, env, expected) in [
-        (base.clone(), vec![], vec![], (Tls13, Tls13)),
+        (base.clone(), vec![], vec![], Tls13),
         (
-            format!("{base}version = {{ min = \"1.2\" }}\n"),
+            format!("{base}min_version = \"1.2\"\n"),
             vec![],
             vec![],
-            (Tls12, Tls13),
+            Tls12,
         ),
-        (
-            format!("{base}version = {{ min = \"1.2\", max = \"1.2\" }}\n"),
-            vec![],
-            vec![],
-            (Tls12, Tls12),
-        ),
-        (
-            base.clone(),
-            vec!["--https-version-min=1.2", "--https-version-max=1.2"],
-            vec![],
-            (Tls12, Tls12),
-        ),
+        (base.clone(), vec!["--https-min-version=1.2"], vec![], Tls12),
         (
             base.clone(),
             vec![],
-            vec![
-                ("RUSHLS_HTTPS_VERSION_MIN", "1.2"),
-                ("RUSHLS_HTTPS_VERSION_MAX", "1.2"),
-            ],
-            (Tls12, Tls12),
+            vec![("RUSHLS_HTTPS_MIN_VERSION", "1.2")],
+            Tls12,
         ),
         (
-            format!("{base}version = {{ min = \"1.2\" }}\n"),
-            vec!["--https-version-min=1.3"],
+            format!("{base}min_version = \"1.2\"\n"),
+            vec!["--https-min-version=1.3"],
             vec![],
-            (Tls13, Tls13),
+            Tls13,
         ),
     ] {
         let resolved = resolve_with(&toml, &args, &env)??;
         let tls = resolved.node.http.tls.unwrap();
-        assert_eq!((tls.min_version, tls.max_version), expected);
+        // The maximum is always the newest version rustls speaks.
+        assert_eq!((tls.min_version, tls.max_version), (expected, Tls13));
     }
-    let invalid = resolve_toml(&format!("{base}version = {{ max = \"1.2\" }}\n"))?;
-    assert!(
-        matches!(invalid, Err(ConfigError::Invalid(message)) if message.contains("https.version.min must not exceed https.version.max"))
-    );
     for version in ["1.0", "1.1", "1.4", "garbage"] {
-        assert!(load_toml(&format!("{base}version = {{ min = {version:?} }}\n"))?.is_err());
+        assert!(load_toml(&format!("{base}min_version = {version:?}\n"))?.is_err());
     }
+    // The former range table is refused rather than silently ignored.
+    assert!(load_toml(&format!("{base}version = {{ min = \"1.2\" }}\n"))?.is_err());
     Ok(())
 }
 
@@ -2693,7 +2678,7 @@ fn an_rtmps_listener_uses_the_shared_certificate() -> Result<(), Box<dyn Error>>
     let (settings, _) = write_pair(&directory, "origin.internal");
     let resolved = resolve_toml(&format!(
         "[ingest.rtmps]\nlisten = '127.0.0.1:1936'\nproxy_protocol = true\n\
-         [https]\nversion = {{ min = '1.3', max = '1.3' }}\n\
+         [https]\nmin_version = '1.3'\n\
          [tls]\ncert = \"{}\"\nkey = \"{}\"\n",
         fixtures::toml_path_contents(&settings.certificate),
         fixtures::toml_path_contents(&settings.key)
