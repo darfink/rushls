@@ -14,8 +14,8 @@
 Rushls is a live streaming origin that does one thing: **HLS and Low-Latency HLS, the way Apple specifies them.**
 
 There are plenty of open-source media servers, and most treat HLS as one output among many.
-Almost none of them accept **multitrack** ingest, several video renditions and audio languages in one publication,
-and the rare ones that do produce HLS that fails Apple's own validation.
+It shows: their HLS fails Apple's own validation, or they lack essentials such as **multitrack** ingest,
+several video renditions and audio languages in one publication. Usually both.
 Rushls is built for exactly that case. Publish **one** RTMP or SRT stream that carries an encoding ladder,
 alternate audio languages, and captions, and Rushls serves it as **one adaptive HLS presentation**:
 viewers switch bitrate, pick a language, and turn on subtitles.
@@ -29,6 +29,23 @@ viewers switch bitrate, pick a language, and turn on subtitles.
 - **One self-contained binary.** No FFmpeg, no libsrt — completely standalone.
 
 Rushls packages media; it does not transcode. Your encoder produces the renditions, and Rushls turns them into HLS.
+For example, this one FFmpeg command publishes a 720p and a 360p rendition with English and Spanish audio,
+from a test pattern, so it runs as is:
+
+<!-- verify: {"id":"multitrack","stream":"event","video":2,"audio":2,"languages":["en","es"]} -->
+```sh
+ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 \
+  -f lavfi -i sine=frequency=440 -f lavfi -i sine=frequency=660 \
+  -filter_complex '[0:v]split=2[hd][v];[v]scale=640:360[sd]' \
+  -map '[hd]' -map '[sd]' -map 1:a -map 2:a \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 60 -sc_threshold 0 -bf 0 \
+  -b:v:0 3000k -b:v:1 800k -c:a aac -b:a 128k \
+  -metadata:s:a:0 language=eng -metadata:s:a:1 language=spa \
+  -f mpegts 'srt://127.0.0.1:9000?mode=caller&streamid=publish:live/event&pkt_size=1316'
+```
+
+Viewers of `http://127.0.0.1:8080/live/event/index.m3u8` get both sizes and both languages.
+[Publishing](docs/publishing.md) has the same over Enhanced RTMP, with GStreamer, and with captions.
 
 ```text
 OBS / FFmpeg / GStreamer / MoQ publisher
@@ -91,12 +108,13 @@ Start the server. It runs without a configuration file:
 rushls
 ```
 
-Publish an H.264/AAC file from another terminal:
+Publish a test pattern with a tone from another terminal:
 
 <!-- verify: {"id":"quickstart","stream":"demo","video":1,"audio":1} -->
 ```sh
-ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 \
-  -c copy -f flv rtmp://127.0.0.1:1935/live/demo
+ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p -g 60 -c:a aac \
+  -f flv rtmp://127.0.0.1:1935/live/demo
 ```
 
 Play it in Safari, VLC, or any HLS player:
@@ -107,7 +125,7 @@ http://127.0.0.1:8080/live/demo/index.m3u8
 
 The playlist appears after a few seconds, once Rushls has enough media to plan segments.
 For a browser test page, open [`examples/player/index.html`](examples/player/index.html); [Players](docs/players.md) covers player support.
-If the file has irregular keyframes, use the [encoding recipe](docs/publishing.md#prepare-a-test-file).
+To publish your own file or encoder instead, see [Publishing](#publishing).
 
 > [!WARNING]
 > Without a configuration file, Rushls listens on all interfaces (RTMP 1935, SRT 9000, HTTP 8080) and **anyone who can reach it may publish**.
@@ -144,8 +162,8 @@ docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 \
 
 ### Overrides
 
-An environment variable or a command-line flag overrides a single setting in the file. The command line wins over the environment.
-The variable is `RUSHLS_` followed by the setting path in capitals, and the flag is the path with dashes:
+Every setting in the file also has an environment variable and a command-line flag, named after its path:
+`RUSHLS_` plus the path in capitals, and the path with dashes. Either one overrides the file, and the command line wins over the environment. For example:
 
 | File | Environment | Command line |
 | --- | --- | --- |
@@ -157,7 +175,8 @@ RUSHLS_HTTP_LISTEN=127.0.0.1:18080 rushls
 rushls --http-listen 127.0.0.1:18080
 ```
 
-Profiles, hooks, recording, and playback claims can only be set in the file. `rushls --help` lists every flag.
+The exceptions are tables whose keys you name yourself, such as profiles, hooks, and playback claims, and `[record]`: those are file-only.
+`rushls --help` lists every flag, and the [reference](docs/configuration-reference.md) every variable.
 
 ### Values
 
@@ -417,11 +436,27 @@ See [reverse proxies and CDNs](docs/deployment.md#reverse-proxies-and-cdns) for 
 
 ### Cloudflare
 
-Cloudflare decides what to cache by file extension unless a Cache Rule says otherwise. For the stream paths:
+Cloudflare caches by file extension, and its default list leaves out playlists, parts, and subtitles.
+Add a Cache Rule for the stream paths (**Caching → Cache Rules**), with this expression:
 
-1. Add a Cache Rule that makes them eligible for cache, with **Edge TTL** set to use the origin's `Cache-Control` header.
-2. Keep the query string in the cache key (the default). `_HLS_msn`, `_HLS_part`, and `_HLS_skip` name different playlist states.
-3. Check Cloudflare's terms for your plan: they restrict serving video through the standard CDN on some plans.
+```text
+(http.request.uri.path.extension in {"m3u8" "m4s" "mp4" "vtt"})
+```
+
+Then set:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Cache eligibility | Eligible for cache | |
+| Edge TTL | Use cache-control header if present, bypass cache if not | Rushls sets it on every response, 404s included |
+| Browser TTL | Respect origin TTL | |
+| Cache key | Leave the query string in (the default) | `_HLS_msn`, `_HLS_part`, and `_HLS_skip` name different playlist states |
+| Vary | Normalize values | Playlists vary on `Accept-Encoding` only |
+
+Leave **Respect Strong ETags** off. Playlists carry a strong ETag, distinct for each compression, so it stays correct either way,
+and media has no ETag at all because it never changes.
+
+Check Cloudflare's terms for your plan: they restrict serving video through the standard CDN on some plans.
 
 ### Cloudflare with playback authorization
 
