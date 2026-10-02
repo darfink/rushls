@@ -69,19 +69,69 @@ pub fn validate(url: &str, expect: &Expect) -> Result<(), String> {
     Err(last)
 }
 
+/// How long past its own `--timeout` the validator may run before it is killed.
+///
+/// The validator sometimes ignores `--timeout` and blocks forever in
+/// `dispatch_group_wait`, which once held a CI job until its 45-minute limit.
+/// A killed run writes no JSON, so it is retried like a crash.
+const VALIDATOR_GRACE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Runs `command` to completion, or kills it after `deadline`.
+fn output_within(
+    mut command: Command,
+    deadline: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Drained on their own threads, so a chatty child cannot fill a pipe and
+    // block before the deadline check sees it.
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buffer);
+            }
+            buffer
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+    let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() > deadline {
+            eprintln!("mediastreamvalidator ran past {deadline:?}; killing it");
+            child.kill()?;
+            break child.wait()?;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
 fn crashed_without_report(error: &str) -> bool {
     error.contains("wrote no JSON")
 }
 
 fn validate_once(url: &str, expect: &Expect) -> Result<(), String> {
     let report = temporary_path(expect.name, "json");
-    let output = Command::new("mediastreamvalidator")
+    let mut command = Command::new("mediastreamvalidator");
+    command
         .arg("--timeout")
         .arg(SCAN_TIMEOUT.as_secs().to_string())
         .arg("--validation-data-path")
         .arg(&report)
-        .arg(url)
-        .output()
+        .arg(url);
+    let output = output_within(command, SCAN_TIMEOUT + VALIDATOR_GRACE)
         .map_err(|error| format!("mediastreamvalidator failed to start: {error}"))?;
     let json = fs::read_to_string(&report).ok();
 
