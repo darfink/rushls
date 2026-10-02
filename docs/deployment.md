@@ -312,6 +312,33 @@ Grant this service user access to the configured directories and secrets.
 The native service identity differs from the container's numeric identity.
 Restart the service after configuration changes; there is no general configuration reload endpoint.
 
+## Kubernetes
+
+[`examples/kubernetes/rushls.yaml`](../examples/kubernetes/rushls.yaml) runs one origin:
+a ConfigMap with the configuration, a Deployment, a LoadBalancer Service for RTMP and SRT, and a ClusterIP Service for viewers and metrics.
+
+```sh
+kubectl create secret generic rushls --from-literal=metrics-token="$(openssl rand -hex 32)"
+kubectl apply -f examples/kubernetes/rushls.yaml
+```
+
+The manifest makes these choices:
+
+- **One replica, replaced rather than overlapped.** A stream lives on the origin its publisher reached.
+  A second replica behind the same Service would answer viewers with 404 for streams on the other one.
+  On an update the old pod drains, and publishers reconnect to the new one.
+- **Probes.** Readiness and startup use `/health/ready`, liveness uses `/health/live`.
+- **Shutdown.** A five-second `preStop` pause lets load balancers see the failed readiness before Rushls stops accepting.
+  `terminationGracePeriodSeconds` covers that pause plus `shutdown_grace`.
+- **Memory.** `memory.total` caps retained media below the container limit, so the origin refuses new streams instead of being killed.
+- **Publisher addresses.** `externalTrafficPolicy: Local` keeps the publisher's address for admission and `limits.publishers_per_address`.
+  Behind a proxy that rewrites addresses, enable [`proxy_protocol`](#encryption-and-certificates) instead.
+- **Hardening.** The pod runs as UID 65532 with a read-only root filesystem; `/var/lib/rushls` is an `emptyDir` for DVR spill and recordings.
+  Use a PersistentVolumeClaim there if recordings must survive the pod.
+
+Add `[publish.auth]` before exposing the ingest Service, and serve viewers through an Ingress or a CDN.
+Configuration changes need a restart: `kubectl rollout restart deploy/rushls`.
+
 ## Monitoring and rollout
 
 Use `/health/live` and `/health/ready` on the HTTP(S) listener for probes.

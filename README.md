@@ -80,6 +80,8 @@ docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 ghcr.io/darfink/rushl
 
 `latest` is the newest stable release; `edge` follows `main`. See [installation](docs/installation.md) for platforms and image tags.
 
+For Kubernetes, start from [the example manifest](examples/kubernetes/rushls.yaml); [Deployment](docs/deployment.md#kubernetes) explains it.
+
 ## Quick start
 
 Start the server. It runs without a configuration file:

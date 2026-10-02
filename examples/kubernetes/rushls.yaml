@@ -1,0 +1,134 @@
+# One Rushls origin on Kubernetes. See docs/deployment.md#kubernetes.
+#
+#   kubectl create secret generic rushls --from-literal=metrics-token="$(openssl rand -hex 32)"
+#   kubectl apply -f rushls.yaml
+#
+# One replica on purpose: a stream lives on the origin its publisher reached,
+# so a second replica behind the same Service would serve viewers 404s for
+# streams published to the other one.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rushls
+data:
+  rushls.toml: |
+    # Drain this long on SIGTERM; terminationGracePeriodSeconds must be longer.
+    shutdown_grace = "30s"
+
+    [ingest.rtmp]
+    listen = "0.0.0.0:1935"
+
+    [ingest.srt]
+    listen = "0.0.0.0:9000"
+
+    # Every publisher may publish until this is configured.
+    # [publish.auth]
+    # url   = "http://admission.default.svc:8000/rushls"
+    # token = "${ADMISSION_TOKEN}"
+
+    [http]
+    listen = "0.0.0.0:8080"
+
+    [memory]
+    total = "6GiB"                    # below the container memory limit
+
+    [metrics]
+    listen = "0.0.0.0:9090"
+    token  = "${METRICS_TOKEN}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rushls
+  labels: {app.kubernetes.io/name: rushls}
+spec:
+  replicas: 1
+  # Replace rather than overlap: two origins would split publishers and viewers.
+  # Publishers reconnect to the new pod once it is ready.
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: rushls}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: rushls}
+    spec:
+      # shutdown_grace (30s) plus the preStop pause, with margin.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: rushls
+          image: ghcr.io/darfink/rushls:v0.1.0
+          env:
+            - name: METRICS_TOKEN
+              valueFrom:
+                secretKeyRef: {name: rushls, key: metrics-token}
+          ports:
+            - {name: rtmp, containerPort: 1935, protocol: TCP}
+            - {name: srt, containerPort: 9000, protocol: UDP}
+            - {name: http, containerPort: 8080, protocol: TCP}
+            - {name: metrics, containerPort: 9090, protocol: TCP}
+          startupProbe:
+            httpGet: {path: /health/ready, port: http}
+            periodSeconds: 1
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /health/ready, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health/live, port: http}
+            periodSeconds: 10
+            failureThreshold: 6
+          lifecycle:
+            # Readiness fails as soon as SIGTERM arrives, but load balancers
+            # notice a few seconds later; keep accepting until they have.
+            preStop:
+              sleep: {seconds: 5}
+          resources:
+            # Keep the limit above memory.total in the configuration, which
+            # caps retained media; the rest covers buffers and the runtime.
+            requests: {cpu: "1", memory: 2Gi}
+            limits: {memory: 8Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/rushls, readOnly: true}
+            # DVR spill, recordings, and the default cache directory.
+            - {name: state, mountPath: /var/lib/rushls}
+      volumes:
+        - name: config
+          configMap: {name: rushls}
+        - name: state
+          emptyDir: {}
+---
+# Publishers: RTMP over TCP and SRT over UDP on one external address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rushls-ingest
+spec:
+  type: LoadBalancer
+  # Keep the publisher's address, which admission and per-address limits use.
+  externalTrafficPolicy: Local
+  selector: {app.kubernetes.io/name: rushls}
+  ports:
+    - {name: rtmp, port: 1935, targetPort: rtmp, protocol: TCP}
+    - {name: srt, port: 9000, targetPort: srt, protocol: UDP}
+---
+# Viewers, usually behind an Ingress or a CDN, and Prometheus.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rushls
+  labels: {app.kubernetes.io/name: rushls}
+spec:
+  selector: {app.kubernetes.io/name: rushls}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+    - {name: metrics, port: 9090, targetPort: metrics}
