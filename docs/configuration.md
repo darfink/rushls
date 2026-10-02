@@ -19,8 +19,15 @@ Rushls loads the first file it finds:
 1. `--config PATH` (fails if the file is missing)
 2. `RUSHLS_CONFIG` (same)
 3. `./rushls.toml` in the working directory
-4. `rushls.toml` in the platform local configuration directory
-5. `rushls.toml` in the platform configuration directory
+4. `rushls.toml` in your user configuration directory:
+
+   | Platform | Directory |
+   | --- | --- |
+   | Linux | `$XDG_CONFIG_HOME/rushls`, which defaults to `~/.config/rushls` |
+   | macOS | `~/Library/Application Support/rushls` |
+   | Windows | `%LOCALAPPDATA%\rushls\config`, then `%APPDATA%\rushls\config` |
+
+A system service usually sets `RUSHLS_CONFIG`, for example to `/etc/rushls/rushls.toml` as the container image does.
 
 It logs which file it used, or that it used the compiled defaults.
 
@@ -93,7 +100,8 @@ In the environment, a value shaped like `{ file = "/path" }` names a file: `RUSH
 On the command line, a credential flag always takes a file path, such as `--metrics-token /run/secrets/metrics`,
 because any user on the machine can read process arguments.
 The credentials with flags are `ingest.srt.passphrase`, `publish.auth.token`, `playback.auth.secret`, and `metrics.token`.
-Hook credentials are file-only.
+Hook `token` and `signing_secret` take the same three forms in TOML, so `token = "${HOOK_TOKEN}"` reads an environment variable.
+They have no `RUSHLS_` variable or flag of their own, because the hook's name is yours to choose.
 
 ## Listeners
 
