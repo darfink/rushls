@@ -27,8 +27,19 @@ use crate::{
     },
 };
 
+/// moq-lite versions this origin speaks, newest first.
+///
 /// Pinned so a browser and this origin never silently negotiate an IETF draft.
-const MOQ_LITE_05: &str = "moq-lite-05";
+/// moq-lite-07 stays out while moq-net ships it only as `moq-lite-07-wip`: its
+/// wire format can still change, so no publisher can rely on it yet.
+const MOQ_LITE: [&str; 2] = ["moq-lite-06", "moq-lite-05"];
+
+/// The newest supported version a client offers, if any.
+fn select_version(offered: &[&str]) -> Option<&'static str> {
+    MOQ_LITE
+        .into_iter()
+        .find(|supported| offered.contains(supported))
+}
 
 /// Resource, idle, and TLS policy for one MOQ listener.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,7 +103,10 @@ impl MoqListener {
         config: MoqConfig,
     ) -> Result<Self, TransportError> {
         let mut tls = Arc::unwrap_or_clone(tls);
-        tls.alpn_protocols = vec![b"h3".to_vec(), MOQ_LITE_05.as_bytes().to_vec()];
+        tls.alpn_protocols = std::iter::once("h3")
+            .chain(MOQ_LITE)
+            .map(|protocol| protocol.as_bytes().to_vec())
+            .collect();
         let quic = web_transport_quinn::quinn::crypto::rustls::QuicServerConfig::try_from(tls)
             .map_err(|error| {
                 TransportError::Handshake(
@@ -260,10 +274,10 @@ async fn setup(
     config: MoqConfig,
 ) -> Result<MoqPendingPublish, TransportError> {
     let remote_address = connection.remote_address();
-    let (session, partial) = accept_transport(connection).await?;
+    let (session, partial, selected) = accept_transport(connection).await?;
 
-    let version =
-        moq_net::Version::from_str(MOQ_LITE_05).expect("moq-lite-05 is a supported version string");
+    let version = moq_net::Version::from_str(selected)
+        .expect("every MOQ_LITE entry is a moq-net version string");
     let moq_request = moq_net::Server::new()
         .with_versions(version.into())
         .accept_request(std::time::Instant::now(), session)
@@ -336,7 +350,7 @@ async fn setup(
             client: ClientInfo {
                 remote_address,
                 encoder: None,
-                protocol_version: Some(MOQ_LITE_05.to_owned()),
+                protocol_version: Some(selected.to_owned()),
             },
         },
         origin,
@@ -347,24 +361,27 @@ async fn setup(
     })
 }
 
-/// Select the same pinned protocol through the transport's negotiation surface.
+/// Select a supported moq-lite version through the transport's negotiation
+/// surface: the ALPN for raw QUIC, the CONNECT protocol list for WebTransport.
 async fn accept_transport(
     connection: web_transport_quinn::quinn::Connection,
 ) -> Result<
     (
         web_transport_quinn::Session,
         crate::source::moq::identity::PartialIdentity,
+        &'static str,
     ),
     TransportError,
 > {
     let raw = web_transport_quinn::Session::raw(connection.clone());
-    let result = if raw.protocol() == Some(MOQ_LITE_05) {
+    let result = if let Some(selected) = raw.protocol().and_then(|alpn| select_version(&[alpn])) {
         (
             raw,
             crate::source::moq::identity::PartialIdentity {
                 resource: None,
                 credential: None,
             },
+            selected,
         )
     } else {
         let request = web_transport_quinn::Request::accept(connection)
@@ -372,16 +389,18 @@ async fn accept_transport(
             .map_err(|error| {
                 TransportError::Handshake(format!("WebTransport CONNECT failed: {error}").into())
             })?;
-        if !request
-            .protocols
-            .iter()
-            .any(|protocol| protocol == MOQ_LITE_05)
-        {
+        let Some(selected) = select_version(
+            &request
+                .protocols
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        ) else {
             let _ = request.reject(StatusCode::BAD_REQUEST).await;
             return Err(TransportError::Handshake(
-                "WebTransport requires moq-lite-05".into(),
+                "WebTransport requires moq-lite-06 or moq-lite-05".into(),
             ));
-        }
+        };
         let partial = match from_webtransport_url(&request.url) {
             Ok(partial) => partial,
             Err(error) => {
@@ -390,12 +409,12 @@ async fn accept_transport(
             }
         };
         let session = request
-            .respond(web_transport_quinn::proto::ConnectResponse::OK.with_protocol(MOQ_LITE_05))
+            .respond(web_transport_quinn::proto::ConnectResponse::OK.with_protocol(selected))
             .await
             .map_err(|error| {
                 TransportError::Handshake(format!("WebTransport CONNECT failed: {error}").into())
             })?;
-        (session, partial)
+        (session, partial, selected)
     };
     Ok(result)
 }
@@ -454,7 +473,7 @@ mod tests {
     use crate::observe::{Events, ProcessMeters, Protocol};
     use web_transport_quinn::{proto::ConnectRequest, quinn};
 
-    async fn negotiate(raw: bool) -> Result<(), Box<dyn std::error::Error>> {
+    async fn negotiate(raw: bool, version: &str) -> Result<(), Box<dyn std::error::Error>> {
         let directory = crate::server::http::fixtures::scratch("moq-handshake");
         let (settings, certificate) =
             crate::server::http::fixtures::write_pair(&directory, "127.0.0.1");
@@ -481,7 +500,7 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
             tls.alpn_protocols = vec![if raw {
-                MOQ_LITE_05.as_bytes().to_vec()
+                version.as_bytes().to_vec()
             } else {
                 b"h3".to_vec()
             }];
@@ -499,14 +518,14 @@ mod tests {
                             "https://127.0.0.1:{}/",
                             address.port()
                         ))?)
-                        .with_protocol(MOQ_LITE_05),
+                        .with_protocol(version),
                     )
                     .await?
             };
-            assert_eq!(transport.protocol(), Some(MOQ_LITE_05));
-            let version = moq_net::Version::from_str(MOQ_LITE_05)?;
+            assert_eq!(transport.protocol(), Some(version));
+            let moq_version = moq_net::Version::from_str(version)?;
             let (session, driver) = moq_net::Client::new()
-                .with_versions(version.into())
+                .with_versions(moq_version.into())
                 .with_publisher(&origin)
                 .connect(std::time::Instant::now(), transport)
                 .await?;
@@ -534,6 +553,7 @@ mod tests {
         assert_eq!(request.resource.namespace.as_deref(), Some("live"));
         assert_eq!(request.resource.name, "camera");
         assert_eq!(request.credential.expose(), b"camera");
+        assert_eq!(request.client.protocol_version.as_deref(), Some(version));
         Box::new(pending)
             .reject(PublishRejection::Forbidden)
             .await?;
@@ -546,13 +566,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webtransport_selects_lite05_and_root_uses_announcement()
+    async fn webtransport_selects_each_version_and_root_uses_announcement()
     -> Result<(), Box<dyn std::error::Error>> {
-        negotiate(false).await
+        for version in MOQ_LITE {
+            negotiate(false, version).await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn raw_quic_negotiates_lite05() -> Result<(), Box<dyn std::error::Error>> {
-        negotiate(true).await
+    async fn raw_quic_negotiates_each_version() -> Result<(), Box<dyn std::error::Error>> {
+        for version in MOQ_LITE {
+            negotiate(true, version).await?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_newest_offered_version_wins_and_unfinished_ones_are_refused() {
+        assert_eq!(
+            select_version(&["moq-lite-05", "moq-lite-06"]),
+            Some("moq-lite-06")
+        );
+        assert_eq!(select_version(&["moq-lite-05"]), Some("moq-lite-05"));
+        assert_eq!(select_version(&["moq-lite-07-wip", "moqt-22"]), None);
     }
 }

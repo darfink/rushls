@@ -185,7 +185,7 @@ the resource name. An empty CONNECT path falls back to the moq-lite SETUP path.
 If both paths are empty, the first broadcast announcement supplies the resource.
 The origin rejects a second broadcast on the same connection.
 
-The listener accepts `moq-lite-05` over WebTransport (`https://`) and raw QUIC
+The listener accepts `moq-lite-06` and `moq-lite-05` over WebTransport (`https://`) and raw QUIC
 (`moqt://`). WebTransport selects the version in the CONNECT response.
 Raw QUIC selects the version through TLS ALPN. See [MOQ ingestion](../moq.md)
 for supported media formats and a local publish test.

@@ -24,7 +24,7 @@ pub struct PublishIdentity {
 
 /// What the WebTransport CONNECT URL contributed, before SETUP is considered.
 ///
-/// An empty path is not a failure: moq-lite-05 can still name the resource in
+/// An empty path is not a failure: moq-lite can still name the resource in
 /// SETUP, and that is the fallback when a client dials the origin root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PartialIdentity {

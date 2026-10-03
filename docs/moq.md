@@ -2,9 +2,10 @@
 
 Rushls ingests Media over QUIC (MoQ) publications in the hang format and serves them as HLS.
 
-The origin accepts `moq-lite-05` over WebTransport and raw QUIC on the same UDP port.
-WebTransport uses `h3` ALPN and selects `moq-lite-05` in the CONNECT response.
-Raw QUIC uses `moq-lite-05` ALPN directly. Other protocol versions fail negotiation.
+The origin accepts `moq-lite-06` and `moq-lite-05` over WebTransport and raw QUIC on the same UDP port.
+WebTransport uses `h3` ALPN and selects the newest of the two that the client offers in the CONNECT response.
+Raw QUIC uses the version's ALPN directly. Other protocol versions fail negotiation.
+`moq-lite-07` is not accepted yet: the MoQ library still marks its wire format as work in progress.
 
 One connection carries one publication. The CONNECT URL supplies the resource when its path is not empty.
 Otherwise, the SETUP path supplies the resource. If both paths are empty, the first broadcast announcement supplies the resource.
@@ -13,7 +14,8 @@ A WebTransport `token` query parameter supplies the credential. Without that par
 ## Media formats
 
 The origin reads `catalog.json` and subscribes to each audio, video, and text rendition.
-The first catalog fixes the track set. Track and container changes fail ingestion.
+The first catalog fixes the track set. Track, codec, and container changes fail ingestion.
+A video frame rate that a later catalog declares for the first time is accepted; a change to a declared rate fails.
 During discovery, the origin accepts an OpusHead that replaces an omitted Opus description.
 It recalculates the first audible timestamp from the encoder delay before discovery ends.
 After discovery, decoder configuration changes fail ingestion.
@@ -65,7 +67,7 @@ The cache's usage is therefore charged to `memory.per_publisher` as it grows, on
 
 ## Local publish test
 
-This test requires FFmpeg, `moq-cli 0.10.0`, and a certificate for `localhost`.
+This test requires FFmpeg, `moq-cli 0.13`, and a certificate for `localhost`.
 Replace the certificate paths in this configuration:
 
 ```toml
@@ -105,9 +107,9 @@ ffmpeg -hide_banner -loglevel error -re \
   -f lavfi -i sine=frequency=440:sample_rate=48000 \
   -t 30 -c:v libx264 -preset veryfast -g 30 -pix_fmt yuv420p \
   -c:a aac -ar 48000 -ac 2 -f mpegts - \
-| moq --client-connect https://localhost:4443/ \
-    --broadcast my-stream --client-version moq-lite-05 \
-    --client-tls-disable-verify import ts
+| moq --connect https://localhost:4443/ \
+    --broadcast my-stream --connect-version moq-lite-06 \
+    --connect-tls-insecure import ts
 ```
 
 The verification flag is for this local certificate test. Production clients must verify the server certificate.

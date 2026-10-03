@@ -219,8 +219,8 @@ These fields follow the usual RTMP mapping. OBS's own multitrack mode is not cov
 
 ## Media over QUIC
 
-Use the [MoQ guide](moq.md) for the exact `moq-lite-05` contract.
-The examples use `moq-cli` 0.10, whose executable is `moq`.
+Use the [MoQ guide](moq.md) for the exact `moq-lite` contract.
+The examples use `moq-cli` 0.13, whose executable is `moq`.
 
 For a public deployment, configure a certificate that covers the origin hostname and is trusted by the client:
 
@@ -235,15 +235,15 @@ key = "/run/secrets/private-key.pem"
 
 ```sh
 ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts - \
-  | moq --client-connect https://origin.example.com:4433/ \
-      --broadcast live/moq --client-version moq-lite-05 import ts
+  | moq --connect https://origin.example.com:4433/ \
+      --broadcast live/moq --connect-version moq-lite-06 import ts
 ```
 
 The corresponding HTTP playback path is `/live/moq/index.m3u8` when admission does not remap the stream.
 The `https` URL selects WebTransport. The transport uses UDP, not the ordinary HTTP listener.
 
 For an isolated local test, create a disposable certificate and configure its paths under `[tls]`.
-The existing [local MoQ recipe](moq.md#local-publish-test) uses `--client-tls-disable-verify` for that test only.
+The existing [local MoQ recipe](moq.md#local-publish-test) uses `--connect-tls-insecure` for that test only.
 Production publishers must verify certificates.
 MoQ browser publishing has a manual Chrome procedure in the [MoQ guide](moq.md#browser-publish-test); it does not run in CI.
 

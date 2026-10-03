@@ -472,6 +472,9 @@ impl PacketSource for MoqPacketSource {
                             if let Some(frozen) = &self.fingerprint {
                                 frozen.diff(&next.fingerprint)?;
                             }
+                            // Adopt what the catalog may add late, such as a
+                            // frame rate, so a later change to it still fails.
+                            self.fingerprint = Some(next.fingerprint);
                             continue;
                         }
                         Incoming::Catalog(None) => continue,

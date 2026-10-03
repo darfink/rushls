@@ -392,7 +392,7 @@ is that one setting for every protocol; MoQ uses the same derivation for QUIC
 idle versus SETUP/CONNECT.
 
 **`[ingest.moq]` is a third ingest listener, off by default.** WebTransport or raw QUIC with
-moq-lite-05, one broadcast per publication. LOC and legacy Hang frames are accepted. Listen stays `"off"` so a node
+moq-lite-06 and moq-lite-05, one broadcast per publication. LOC and legacy Hang frames are accepted. Listen stays `"off"` so a node
 boots without certificates. Turning it on requires `[tls]`; the
 QUIC `ServerConfig` is TLS 1.3 with `h3` ALPN and the same rotating resolver
 as HTTPS, never the HTTPS config itself. Handshake runs on the connection

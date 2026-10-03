@@ -265,15 +265,15 @@ cert = "/run/secrets/fullchain.pem"
 key = "/run/secrets/private-key.pem"
 ```
 
-Publish with `moq-cli` 0.10.0:
+Publish with `moq-cli` 0.13:
 
 ```sh
 ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts - \
-  | moq --client-connect https://origin.example.com:4433/ \
-      --broadcast live/moq --client-version moq-lite-05 import ts
+  | moq --connect https://origin.example.com:4433/ \
+      --broadcast live/moq --connect-version moq-lite-06 import ts
 ```
 
-Rushls speaks `moq-lite-05` only. See [MoQ](docs/moq.md) for catalog requirements.
+Rushls speaks `moq-lite-06` and `moq-lite-05`. See [MoQ](docs/moq.md) for catalog requirements.
 
 To try it from a browser, [`tools/browser-moq-publish.html`](tools/browser-moq-publish.html) publishes your camera, microphone, and typed captions over WebTransport.
 A local origin has no publicly trusted certificate, so the page pins it with WebTransport's `serverCertificateHashes`,
@@ -350,7 +350,7 @@ Input protocols and codecs. Output is always HLS with CMAF (fragmented MP4) segm
 | CEA-608/708 in video | ✅ | ✅ | ✅ | H.264 and HEVC; declared in the playlist, not converted to WebVTT |
 | MP3, AC-3, E-AC-3, VP9, VVC | ❌ | ❌ | ❌ | |
 
-SRT carries MPEG-TS only. MoQ uses `moq-lite-05`. Rushls has no RTSP, WebRTC, or WHIP ingest, and no RTMP or SRT playback.
+SRT carries MPEG-TS only. MoQ uses `moq-lite-06` or `moq-lite-05`. Rushls has no RTSP, WebRTC, or WHIP ingest, and no RTMP or SRT playback.
 For the widest player support, publish H.264 and AAC-LC. Player support for HEVC, AV1, Opus, and FLAC in HLS varies; see [players](docs/players.md).
 
 ## HLS features
@@ -655,7 +655,7 @@ The per-address limit covers RTMP, SRT, and MoQ together, and counts IPv6 client
 | DVR shorter than requested | Total bitrate, memory and disk limits, and free disk space |
 | Recording fails | Directory ownership, free space, and hard-link support on the filesystem |
 | HTTP works but the browser does not play | CORS, mixed HTTP/HTTPS content, the player library, and browser codec support |
-| MoQ connection rejected | `moq-lite-05`, certificate trust, UDP reachability, and catalog format |
+| MoQ connection rejected | `moq-lite-06` or `moq-lite-05`, certificate trust, UDP reachability, and catalog format |
 
 Player-specific behaviour is covered in [players](docs/players.md).
 

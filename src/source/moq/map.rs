@@ -53,7 +53,7 @@ impl CatalogFingerprint {
                 if frozen.codec != later.codec
                     || frozen.extradata != later.extradata
                     || frozen.container != later.container
-                    || frozen.parameters != later.parameters
+                    || !same_parameters(&frozen.parameters, &later.parameters)
                 {
                     return Err(SourceError::CodecParametersChanged {
                         track_id: frozen.id,
@@ -63,6 +63,32 @@ impl CatalogFingerprint {
             return Ok(());
         }
         Err(SourceError::TrackSetChanged)
+    }
+}
+
+/// Whether a later catalog describes the same configuration.
+///
+/// One exception to exact equality: a frame rate declared only after
+/// discovery. Publishers such as moq-cli 0.13 measure it and add it to the
+/// catalog a few seconds in. Discovery already planned without it, so the late
+/// value adds nothing to act on. A declared rate that changes still fails.
+fn same_parameters(frozen: &MediaParameters, later: &MediaParameters) -> bool {
+    match (frozen, later) {
+        (
+            MediaParameters::Video {
+                width,
+                height,
+                frame_rate: None,
+                video_delay,
+            },
+            MediaParameters::Video {
+                width: later_width,
+                height: later_height,
+                frame_rate: Some(_),
+                video_delay: later_delay,
+            },
+        ) => width == later_width && height == later_height && video_delay == later_delay,
+        _ => frozen == later,
     }
 }
 
@@ -770,6 +796,32 @@ mod tests {
         let next = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
         assert!(matches!(
             first.fingerprint.diff(&next.fingerprint),
+            Err(SourceError::CodecParametersChanged { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_frame_rate_declared_after_discovery_is_not_a_change() -> Result<(), SourceError> {
+        // Inline parameter sets, as moq-cli sends: only the catalog can
+        // declare the rate before the first keyframe.
+        let mut video = BTreeMap::from([(
+            "video".into(),
+            rendition(serde_json::json!({
+                "codec": "avc3.64000a",
+                "container": { "kind": "loc" },
+                "codedWidth": 16,
+                "codedHeight": 16,
+            })),
+        )]);
+        let first = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
+        video.get_mut("video").expect("track").framerate = Some(30.0);
+        let declared = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
+        first.fingerprint.diff(&declared.fingerprint)?;
+        video.get_mut("video").expect("track").framerate = Some(25.0);
+        let changed = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
+        assert!(matches!(
+            declared.fingerprint.diff(&changed.fingerprint),
             Err(SourceError::CodecParametersChanged { .. })
         ));
         Ok(())
