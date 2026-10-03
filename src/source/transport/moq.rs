@@ -176,8 +176,27 @@ pub struct MoqPendingPublish {
     /// The receive cache's pool, so the source can charge what it holds.
     pool: moq_net::cache::Pool,
     session: moq_net::Session,
-    driver: JoinHandle<Result<(), moq_net::Error>>,
+    /// The session and origin state machines, polled on their own tasks.
+    drivers: Drivers,
     config: MoqConfig,
+}
+
+/// moq-net never spawns or reads the clock: each driver is a state machine
+/// that someone has to poll. These tasks are that someone.
+///
+/// Accepting detaches them, because they must outlive the handshake for as long
+/// as the session and origin they drive; each ends by itself once its session
+/// closes or its origin is dropped. Rejecting aborts them at once.
+struct Drivers {
+    session: JoinHandle<moq_net::Error>,
+    origin: JoinHandle<moq_net::Error>,
+}
+
+impl Drivers {
+    fn abort(&self) {
+        self.session.abort();
+        self.origin.abort();
+    }
 }
 
 impl MoqPendingPublish {
@@ -247,7 +266,7 @@ async fn setup(
         moq_net::Version::from_str(MOQ_LITE_05).expect("moq-lite-05 is a supported version string");
     let moq_request = moq_net::Server::new()
         .with_versions(version.into())
-        .accept_request(session)
+        .accept_request(std::time::Instant::now(), session)
         .await
         .map_err(|error| {
             TransportError::Handshake(format!("moq-lite SETUP failed: {error}").into())
@@ -257,31 +276,44 @@ async fn setup(
     // Bound the model's cache target as well as the batches we retain. The
     // dependency treats this as an eviction target, not a hard allocation cap,
     // so the source also charges the pool's usage to the publisher budget.
-    let pool = moq_net::cache::Pool::new(crate::source::PipelineMemory::TRANSPORT as u64);
-    let origin = moq_net::origin::Info::new(moq_net::Origin::random())
-        .with_pool(pool.clone())
-        .with_cache_duration(Duration::from_secs(30))
-        .produce();
-    let (session, driver) = moq_request
-        .with_subscriber(origin.clone())
-        .ok()
-        .await
-        .map_err(|error| {
-            TransportError::Handshake(format!("moq-lite session failed: {error}").into())
-        })?;
-    let driver = tokio::spawn(driver);
+    let pool = moq_net::cache::Pool::new(
+        moq_net::cache::Config::default()
+            .with_capacity(crate::source::PipelineMemory::TRANSPORT as u64)
+            .with_expiry(moq_net::cache::DEFAULT_EXPIRY),
+    );
+    let mut origin_config = moq_net::origin::Config::default();
+    origin_config.pool = pool.clone();
+    origin_config.cache_duration = Duration::from_secs(30);
+    let (origin, origin_driver) = moq_net::origin::Producer::new(origin_config);
+    let origin_driver = tokio::spawn(moq_net::time::run(origin_driver));
+    let (session, driver) = match moq_request.with_subscriber(origin.clone()).ok().await {
+        Ok(session) => session,
+        Err(error) => {
+            origin_driver.abort();
+            return Err(TransportError::Handshake(
+                format!("moq-lite session failed: {error}").into(),
+            ));
+        }
+    };
+    let drivers = Drivers {
+        session: tokio::spawn(moq_net::time::run(driver)),
+        origin: origin_driver,
+    };
     // Root connections name their publication in ANNOUNCE, not SETUP. The
     // source later gets a new cursor, which replays the origin's live announcements.
     let mut announced = origin.consume().announced();
     let identity_path = if partial.resource.is_none() && setup_path.trim_matches('/').is_empty() {
         loop {
-            let announce = announced.next().await.ok_or_else(|| {
-                TransportError::Handshake(
+            let Some(announce) = announced.next().await else {
+                drivers.abort();
+                return Err(TransportError::Handshake(
                     "MOQ publisher closed before announcing a broadcast".into(),
-                )
-            })?;
-            if announce.broadcast.is_some() {
-                break announce.path.to_string();
+                ));
+            };
+            // An announcement is a route to a prefix; a broadcast announces its
+            // own path, so an active route names the publication.
+            if announce.kind.is_active() {
+                break announce.prefix.to_string();
             }
         }
     } else {
@@ -291,6 +323,7 @@ async fn setup(
         Ok(identity) => identity,
         Err(error) => {
             session.abort(moq_net::Error::Unauthorized);
+            drivers.abort();
             return Err(error);
         }
     };
@@ -309,7 +342,7 @@ async fn setup(
         origin,
         pool,
         session,
-        driver,
+        drivers,
         config,
     })
 }
@@ -399,7 +432,7 @@ impl PendingPublish for MoqPendingPublish {
     ) -> BoxFuture<'static, Result<(), TransportError>> {
         Box::pin(async move {
             self.session.abort(abort_reason(rejection));
-            self.driver.abort();
+            self.drivers.abort();
             Ok(())
         })
     }
@@ -435,11 +468,10 @@ mod tests {
             MoqListener::bind("127.0.0.1:0".parse()?, tls, watch, MoqConfig::default())?;
         let address = listener.local_address()?;
         let client = async {
-            let origin = moq_net::Origin::random().produce();
-            let broadcast = origin.create_broadcast(
-                "live/camera",
-                moq_net::broadcast::Route::new().with_announce(true),
-            )?;
+            let (origin, origin_driver) =
+                moq_net::origin::Producer::new(moq_net::origin::Config::default());
+            let origin_driver = tokio::spawn(moq_net::time::run(origin_driver));
+            let broadcast = origin.publish("live/camera", moq_net::origin::Route::default())?;
             let mut roots = rustls::RootCertStore::empty();
             roots.add(rustls::pki_types::CertificateDer::from(certificate))?;
             let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -476,10 +508,15 @@ mod tests {
             let (session, driver) = moq_net::Client::new()
                 .with_versions(version.into())
                 .with_publisher(&origin)
-                .connect(transport)
+                .connect(std::time::Instant::now(), transport)
                 .await?;
-            let driver = tokio::spawn(driver);
-            Ok::<_, Box<dyn std::error::Error>>((session, driver, origin, broadcast))
+            let driver = tokio::spawn(moq_net::time::run(driver));
+            Ok::<_, Box<dyn std::error::Error>>((
+                session,
+                [driver, origin_driver],
+                origin,
+                broadcast,
+            ))
         };
         let server = async {
             let incoming = listener.accept().await.ok_or("listener closed")?;
@@ -491,7 +528,7 @@ mod tests {
             tokio::join!(Box::pin(client), Box::pin(server))
         })
         .await?;
-        let (session, driver, _origin, mut broadcast) = client?;
+        let (session, drivers, _origin, broadcast) = client?;
         let pending = pending?;
         let request = pending.publish_request()?;
         assert_eq!(request.resource.namespace.as_deref(), Some("live"));
@@ -500,9 +537,9 @@ mod tests {
         Box::new(pending)
             .reject(PublishRejection::Forbidden)
             .await?;
-        broadcast.finish();
+        broadcast.close();
         session.abort(moq_net::Error::Cancel);
-        driver.abort();
+        drivers.iter().for_each(JoinHandle::abort);
         drop(listener);
         std::fs::remove_dir_all(directory)?;
         Ok(())

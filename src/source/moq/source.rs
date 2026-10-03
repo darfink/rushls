@@ -33,6 +33,8 @@ pub struct MoqPacketSource {
     broadcast: Option<moq_net::broadcast::Consumer>,
     catalog: Option<catalog::Reader>,
     tracks: Vec<LiveTrack>,
+    /// Where announced broadcasts are resolved.
+    origin: Option<moq_net::origin::Consumer>,
     announced: Option<moq_net::announce::Consumer>,
     broadcast_path: Option<String>,
     /// Held so the transport stays open for as long as this source does.
@@ -123,6 +125,7 @@ impl MoqPacketSource {
         limits.validate()?;
         Ok(Self {
             announced: Some(origin.announced()),
+            origin: Some(origin.clone()),
             _session: session,
             cache: Some(CacheCharge { pool, held: None }),
             ..Self::empty(limits, meters)
@@ -138,6 +141,7 @@ impl MoqPacketSource {
             broadcast: None,
             catalog: None,
             tracks: Vec::new(),
+            origin: None,
             announced: None,
             broadcast_path: None,
             _session: None,
@@ -168,7 +172,7 @@ impl MoqPacketSource {
         let broadcast = self.broadcast.as_ref().expect("broadcast just stored");
         let track = broadcast.track(catalog::TRACK_NAME).map_err(classify_net)?;
         let subscriber = track
-            .subscribe(Some(catalog::Reader::subscription()))
+            .subscribe(catalog::Reader::subscription())
             .await
             .map_err(classify_net)?;
         self.catalog = Some(catalog::Reader::new(
@@ -182,16 +186,26 @@ impl MoqPacketSource {
         let announced = self.announced.as_mut().ok_or_else(|| {
             SourceError::Input("MOQ ingest has no broadcast and no origin to wait on".into())
         })?;
-        loop {
+        let path = loop {
             let Some(announce) = announced.next().await else {
                 return Err(DiscoveryProblem::Abandoned.into());
             };
-            let Some(broadcast) = announce.broadcast else {
-                continue;
-            };
-            self.broadcast_path = Some(announce.path.to_string());
-            return Ok(broadcast);
-        }
+            // An announcement is a route to a prefix, and a broadcast announces
+            // its own path; the origin resolves that path to the broadcast.
+            if announce.kind.is_active() {
+                break announce.prefix.to_string();
+            }
+        };
+        let origin = self
+            .origin
+            .as_ref()
+            .expect("an announce cursor comes from an origin");
+        let broadcast = origin
+            .routed_broadcast(path.as_str())
+            .await
+            .map_err(classify_net)?;
+        self.broadcast_path = Some(path);
+        Ok(broadcast)
     }
 
     async fn subscribe_tracks(&mut self, mapped: &MappedCatalog) -> Result<(), SourceError> {
@@ -203,11 +217,7 @@ impl MoqPacketSource {
             let name = rendition_name(track)?;
             let consumer = broadcast.track(name).map_err(classify_net)?;
             let subscriber = consumer
-                .subscribe(Some(
-                    moq_net::track::Subscription::default()
-                        .with_ordered(true)
-                        .with_latency_max(std::time::Duration::from_secs(30)),
-                ))
+                .subscribe(loc::Reader::subscription())
                 .await
                 .map_err(classify_net)?;
             let reader = loc::Reader::new(subscriber, mapped.legacy[index]);
@@ -546,8 +556,8 @@ impl MoqPacketSource {
             match announced.poll_next(waiter) {
                 Poll::Ready(Some(announce)) => {
                     return Poll::Ready(Ok(Incoming::Announce {
-                        path: announce.path.to_string(),
-                        present: announce.broadcast.is_some(),
+                        path: announce.prefix.to_string(),
+                        present: announce.kind.is_active(),
                     }));
                 }
                 Poll::Ready(None) => {
@@ -742,7 +752,7 @@ mod tests {
         fixture.publish_frame("opus", 0, &[0xFC]);
         let discovery = source.discover(discovery_limits()).await?;
         fixture.finish_media();
-        fixture.producer.finish();
+        fixture.producer.close();
 
         let mut packets = Vec::new();
         while source.fill(&mut packets).await? == InputState::Open {}
@@ -807,7 +817,7 @@ mod tests {
         fixture.publish_legacy_frame("captions", 1_000_000, b"hello");
         fixture.publish_legacy_frame("captions", 2_500_000, b"");
         fixture.finish_media();
-        fixture.producer.finish();
+        fixture.producer.close();
         let mut packets = Vec::new();
         while source.fill(&mut packets).await? == InputState::Open {}
         assert_eq!(
@@ -832,7 +842,7 @@ mod tests {
         let discovery = source.discover(discovery_limits()).await?;
         fixture.publish_legacy_frame("captions", 4_500_000, b"next");
         fixture.finish_media();
-        fixture.producer.finish();
+        fixture.producer.close();
 
         let mut packets = Vec::new();
         while source.fill(&mut packets).await? == InputState::Open {}
@@ -854,7 +864,7 @@ mod tests {
         fixture.publish_frame("opus", 0, &[0xFC]);
         source.discover(discovery_limits()).await?;
         fixture.finish_media();
-        fixture.producer.finish();
+        fixture.producer.close();
 
         let mut packets = Vec::new();
         let mut state = InputState::Open;
@@ -866,7 +876,7 @@ mod tests {
     }
     #[tokio::test]
     async fn discovery_deadline_includes_waiting_for_a_broadcast() -> Result<(), SourceError> {
-        let origin = moq_net::Origin::random().produce();
+        let (origin, _driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
         let meters = crate::observe::SessionMeters::new(crate::observe::ProcessMeters::default());
         let mut source = MoqPacketSource::from_origin(
             &origin.consume(),
@@ -895,11 +905,13 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::domain::{PipelineBudget, Stage};
 
-        let pool = moq_net::cache::Pool::new(64 * 1024 * 1024);
+        let pool = moq_net::cache::Pool::new(
+            moq_net::cache::Config::default().with_capacity(64 * 1024 * 1024),
+        );
         let mut info = moq_net::broadcast::Info::new();
-        info.origin = moq_net::origin::Info::new(moq_net::Origin::random()).with_pool(pool.clone());
-        let mut broadcast = info.produce();
-        let mut track = broadcast.create_track("video", None)?;
+        info.pool = pool.clone();
+        let broadcast = info.produce();
+        let track = broadcast.create_track("video", None)?;
         let mut group = track.append_group()?;
         group.write_frame(moq_net::Timestamp::ZERO, vec![0_u8; 1024 * 1024])?;
         let cached = usize::try_from(pool.used())?;

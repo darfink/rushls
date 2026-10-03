@@ -70,16 +70,16 @@ ring = "0.17"
 # deliberately not used: it is a CLI-oriented helper (clap, websocket, tcp)
 # and its default features pull aws-lc-rs.
 web-transport-quinn = { version = "0.12.1", default-features = false, features = ["ring"] }
-moq-net = "0.2.18"
+moq-net = "0.3.8"
 # LOC frame codec only: a varint property block and the codec bitstream, with
 # `bytes` and `moq-net` as its whole dependency tree. The catalog it pairs with
 # is parsed in `source::moq::catalog`; taking `hang` and `moq-mux` for those two
 # jobs would add a container-conversion stack (MP4, MPEG-TS, MKV, FLV) that
 # this origin never reaches, for a draft schema it refuses most of anyway.
-moq-loc = "0.2.5"
+moq-loc = "0.2.17"
 # Shared with moq-net: poll several track readers under one waiter without
 # cancelling in-flight reads.
-kio = { version = "0.5.7", features = ["time"] }
+kio = "0.6.2"
 url.workspace = true
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

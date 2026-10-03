@@ -206,14 +206,19 @@ pub fn audio_codec(codec: &str) -> Option<AudioCodec> {
 
 /// Reads catalog versions from the track a publisher serves them on.
 pub struct Reader {
-    subscriber: moq_net::track::Subscriber,
+    /// Sequence order: a catalog superseded before it arrived is skipped,
+    /// because only the newest version describes the publication.
+    groups: moq_net::track::Ordered,
+    /// The newest catalog version, until its first frame arrives.
+    group: Option<moq_net::group::Consumer>,
     maximum_bytes: usize,
 }
 
 impl Reader {
     pub fn new(subscriber: moq_net::track::Subscriber, maximum_bytes: usize) -> Self {
         Self {
-            subscriber,
+            groups: subscriber.ordered(),
+            group: None,
             maximum_bytes,
         }
     }
@@ -229,8 +234,24 @@ impl Reader {
     /// document and the rest of the group — if a publisher ever writes one — is
     /// not part of it.
     pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Catalog>, ReadError>> {
-        let Some(frame) = ready!(self.subscriber.poll_read_frame(waiter))? else {
-            return Poll::Ready(Ok(None));
+        let frame = loop {
+            // A newer version replaces one whose first frame is still on its way.
+            match self.groups.poll_next_group(waiter)? {
+                Poll::Ready(Some(group)) => self.group = Some(group),
+                Poll::Ready(None) if self.group.is_none() => return Poll::Ready(Ok(None)),
+                Poll::Ready(None) | Poll::Pending => {}
+            }
+            let Some(group) = &mut self.group else {
+                return Poll::Pending;
+            };
+            match ready!(group.poll_read_frame(waiter))? {
+                Some(frame) => {
+                    self.group = None;
+                    break frame;
+                }
+                // An empty group carries no catalog; wait for the next one.
+                None => self.group = None,
+            }
         };
         if frame.payload.len() > self.maximum_bytes {
             return Poll::Ready(Err(ReadError::Malformed(

@@ -61,6 +61,16 @@ impl Reader {
         }
     }
 
+    /// What to ask for when subscribing to a media track.
+    ///
+    /// Arrival order with a 30 s age budget. The dependency abandons a group
+    /// once a newer one is older than the budget allows, and its default budget
+    /// is zero; this reader reorders groups itself and fails on a real gap, so
+    /// the dependency must not give up on a late group first.
+    pub fn subscription() -> moq_net::track::Subscription {
+        moq_net::track::Subscription::default().with_max_age(Duration::from_secs(30))
+    }
+
     /// Reads a text track, where an empty cue is how a publisher clears the
     /// display. Legacy's end marker only exists on audio and video, so here the
     /// same bytes are a cue and must reach the WebVTT writer.
@@ -216,7 +226,7 @@ mod tests {
     async fn missing_groups_are_not_silently_skipped() -> Result<(), Box<dyn std::error::Error>> {
         let (mut fixture, _source) = super::super::fixtures::Fixture::new();
         let consumer = fixture.track("video").consume();
-        let subscriber = consumer.subscribe(None).await?;
+        let subscriber = consumer.subscribe(Reader::subscription()).await?;
         let mut reader = Reader::new(subscriber, false);
         fixture.publish_frame("video", 0, &[1]);
         assert!(
@@ -236,7 +246,11 @@ mod tests {
     #[tokio::test]
     async fn late_groups_are_delivered_in_sequence() -> Result<(), Box<dyn std::error::Error>> {
         let (mut fixture, _) = super::super::fixtures::Fixture::new();
-        let subscriber = fixture.track("video").consume().subscribe(None).await?;
+        let subscriber = fixture
+            .track("video")
+            .consume()
+            .subscribe(Reader::subscription())
+            .await?;
         let mut reader = Reader::new(subscriber, false);
         fixture.publish_frame("video", 0, &[1]);
         kio::wait(|waiter| reader.poll_read(waiter)).await?;
@@ -270,7 +284,11 @@ mod tests {
     #[tokio::test]
     async fn a_second_gap_gets_its_own_deadline() -> Result<(), Box<dyn std::error::Error>> {
         let (mut fixture, _) = super::super::fixtures::Fixture::new();
-        let subscriber = fixture.track("video").consume().subscribe(None).await?;
+        let subscriber = fixture
+            .track("video")
+            .consume()
+            .subscribe(Reader::subscription())
+            .await?;
         let mut reader = Reader::new(subscriber, false);
         fixture.publish_frame("video", 0, &[1]);
         kio::wait(|waiter| reader.poll_read(waiter)).await?;

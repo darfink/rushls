@@ -1451,7 +1451,6 @@ checksum = "3033155c4fffcd86959a9ebdfbcadbed7ec4bfcc2fb545469778f791adf704eb"
 dependencies = [
  "loom",
  "smallvec",
- "web-async",
 ]
 
 [[package]]
@@ -1626,28 +1625,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72cb66e188bf8de7ffeac66793063efe2c8144462c372664715d8eedb80b662e"
 dependencies = [
  "bytes",
- "moq-net 0.3.8",
+ "moq-net",
  "thiserror",
-]
-
-[[package]]
-name = "moq-net"
-version = "0.2.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86ad048a4e4a740707f780cdd30e8e70297ab44776733faeea79bcf22aebe8a4"
-dependencies = [
- "arrayvec",
- "bytes",
- "futures",
- "kio 0.5.9",
- "num_enum",
- "rand 0.10.3",
- "serde",
- "slab",
- "thiserror",
- "tracing",
- "web-async",
- "web-transport-trait",
 ]
 
 [[package]]
@@ -2358,10 +2337,10 @@ dependencies = [
  "isolang",
  "jsonwebtoken",
  "junction",
- "kio 0.5.9",
+ "kio 0.6.2",
  "libc",
  "moq-loc",
- "moq-net 0.2.22",
+ "moq-net",
  "notify",
  "notify-debouncer-full",
  "nz",

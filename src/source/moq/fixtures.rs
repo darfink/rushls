@@ -13,7 +13,7 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new() -> (Self, MoqPacketSource) {
-        let mut producer = moq_net::broadcast::Info::new().produce();
+        let producer = moq_net::broadcast::Info::new().produce();
         let catalog = producer
             .create_track(catalog::TRACK_NAME, moq_net::track::Info::default())
             .expect("catalog track");
@@ -87,7 +87,7 @@ impl Fixture {
     }
 
     pub fn finish_media(&mut self) {
-        for (_, mut producer) in self.tracks.drain() {
+        for (_, producer) in self.tracks.drain() {
             producer.finish().expect("LOC tracks finish");
         }
     }
