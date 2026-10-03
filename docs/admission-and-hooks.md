@@ -61,12 +61,25 @@ Rushls does not retry the request. A reconnect creates a new admission attempt.
 
 ## Lifecycle hooks
 
-Hooks use `application/cloudevents+json`. Subscriptions use these names:
+Hooks use `application/cloudevents+json`. A hook subscribes to events by name in its `events` list.
 
-- `session.started`
-- `session.ended`
-- `stream.available`
-- `stream.unavailable`
+Events describe one of two lifetimes. A *session* is one publisher connection, from admission until it stops.
+A *stream* is what viewers play. It can outlive a session: if the encoder reconnects, the stream stays playable
+and a new session starts.
+
+| Event | Sent when |
+| --- | --- |
+| `session.started` | A publisher passes [admission](#admission) and claims the stream, before any media arrives. A rejected publisher sends no events. |
+| `stream.available` | The first playlist a viewer can load is written. Sent once per stream, not again when a publisher reconnects. |
+| `segment.ready` | A segment is complete and can be fetched, for every segment of every rendition. |
+| `session.degraded` | Rushls first repairs a hole on a track of this session. See [input handling](input-handling.md#hooks-logs-and-metrics). |
+| `session.recovered` | A degraded track has carried 30 seconds of clean media. |
+| `session.ended` | The publisher stops for any reason: it ended the stream, dropped, was replaced or stopped, or failed. Viewers can still play the stream. |
+| `stream.unavailable` | The stream has had no publisher for the length of `hls.window`, and Rushls removes it. Viewers get 404 from here on. Never sent for a stream that never became available. |
+
+A typical publication sends `session.started`, `stream.available`, `segment.ready` per segment, `session.ended`,
+then `stream.unavailable`. Events for one stream are delivered in order.
+To act when a broadcast is over, use `stream.unavailable`: `session.ended` also fires for an encoder that reconnects.
 
 The wire type includes a schema version (`rushls.<kind>.v1`). New fields, such as
 the `protocol`, `resource`, and `client` details on session events, are additive
