@@ -17,7 +17,7 @@ can run either half on its own.
 
     [hook.dev]
     url = "http://127.0.0.1:8081/events"
-    events = ["session.started", "stream.available", "session.ended"]
+    events = ["publisher.started", "stream.available", "publisher.ended"]
 
 This is a development tool. It has no authentication of its own, answers every
 caller, and should not be reachable from anywhere you do not control.
@@ -156,7 +156,7 @@ class Handler(BaseHTTPRequestHandler):
         kind = event.get("type", "?")
         data = event.get("data", {})
         detail = ""
-        if kind.endswith("session.ended.v1"):
+        if kind.endswith("publisher.ended.v1"):
             detail = (
                 f" after {data.get('duration_ms', '?')}ms"
                 f", {data.get('outcome', '?')}"

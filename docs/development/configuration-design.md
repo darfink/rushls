@@ -1140,7 +1140,7 @@ The call runs inside the admission deadline and never retries. A timeout,
 non-success status, malformed response, or deny refuses the publisher.
 A publisher can reconnect for a new admission attempt.
 
-Both `session.started` and `session.ended` hooks carry the same observed
+Both `publisher.started` and `publisher.ended` hooks carry the same observed
 `protocol`, `resource`, and `client` shape as the auth request. They also carry
 the authorized `stream_id` and `principal`. Credentials never enter lifecycle
 events. The auth service controls the grant, while the node controls observed

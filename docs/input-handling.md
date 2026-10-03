@@ -76,11 +76,11 @@ Recordings contain the shortened segments around a hole and no file for the miss
 
 ## Hooks, logs, and metrics
 
-Subscribe to `session.degraded`, `session.recovered`, and `session.ended` through a [hook](admission-and-hooks.md#lifecycle-hooks).
+Subscribe to `publisher.degraded`, `publisher.recovered`, and `publisher.ended` through a [hook](admission-and-hooks.md#lifecycle-hooks).
 
-- `session.degraded` reports the first accepted hole on a track. Later holes update totals without a new event.
-- `session.recovered` follows 30 seconds of clean media on that track. A publication ending does not count as recovery.
-- `session.ended` carries final totals, including episodes still open, in its `compensation` array.
+- `publisher.degraded` reports the first accepted hole on a track. Later holes update totals without a new event.
+- `publisher.recovered` follows 30 seconds of clean media on that track. A publication ending does not count as recovery.
+- `publisher.ended` carries final totals, including episodes still open, in its `compensation` array.
 
 Each `compensation` object names the `media_kind`, `track_id`, `codec`, `method` (`gap`, or `unverified_cadence`
 when a cadence declaration could not be validated), a rational `timebase`, and exact durations and hole counts
@@ -93,7 +93,7 @@ See [Metrics](metrics.md).
 
 ## When a publication is rejected
 
-A timing failure ends the publication and is reported in `session.ended` with `outcome = "failed"`,
+A timing failure ends the publication and is reported in `publisher.ended` with `outcome = "failed"`,
 a human-readable `diagnostic`, and a `timestamp_issue` object:
 
 | Field | Meaning |

@@ -12,7 +12,7 @@
 //! A stream outlives any single publisher: a reconnect within
 //! `inactive_stream_retention` ends one session and starts another while
 //! viewers keep playing. Events are therefore named after which of the two they
-//! describe, so that a consumer acting on `session.ended` cannot mistake an
+//! describe, so that a consumer acting on `publisher.ended` cannot mistake an
 //! encoder hiccup for a broadcast finishing.
 //!
 //! Every event carries the stream as its subject, so one ordered stream of
@@ -38,12 +38,12 @@ pub enum Kind {
     #[display("segment.ready")]
     SegmentReady,
     /// A publisher was admitted and registered.
-    #[display("session.started")]
-    SessionStarted,
-    #[display("session.degraded")]
-    SessionDegraded,
-    #[display("session.recovered")]
-    SessionRecovered,
+    #[display("publisher.started")]
+    PublisherStarted,
+    #[display("publisher.degraded")]
+    PublisherDegraded,
+    #[display("publisher.recovered")]
+    PublisherRecovered,
     /// The stream can be played.
     #[display("stream.available")]
     StreamAvailable,
@@ -51,20 +51,20 @@ pub enum Kind {
     #[display("stream.unavailable")]
     StreamUnavailable,
     /// A publisher stopped, for any reason.
-    #[display("session.ended")]
-    SessionEnded,
+    #[display("publisher.ended")]
+    PublisherEnded,
 }
 
 impl Kind {
     /// Every kind, so a subscription list can be validated against one place.
     pub const ALL: [Self; 7] = [
         Self::SegmentReady,
-        Self::SessionStarted,
-        Self::SessionDegraded,
-        Self::SessionRecovered,
+        Self::PublisherStarted,
+        Self::PublisherDegraded,
+        Self::PublisherRecovered,
         Self::StreamAvailable,
         Self::StreamUnavailable,
-        Self::SessionEnded,
+        Self::PublisherEnded,
     ];
 }
 
@@ -121,7 +121,7 @@ impl From<SessionEnd> for Outcome {
 
 /// A publisher was admitted.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionStarted {
+pub struct PublisherStarted {
     pub stream: StreamId,
     pub session: SessionId,
     pub principal: String,
@@ -136,7 +136,7 @@ pub struct SessionStarted {
 ///
 /// Names no session. A stream can be made playable by one publisher and kept
 /// playable across a reconnect by another, so attributing it to a session would
-/// be picking one arbitrarily; the preceding `session.started` for this stream
+/// be picking one arbitrarily; the preceding `publisher.started` for this stream
 /// is the publisher that did it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamAvailable {
@@ -148,7 +148,7 @@ pub struct StreamAvailable {
 /// The end of the *stream's* life, not a publisher's: it fires when the
 /// reconnect window closes and the store retires the stream, which is the
 /// moment viewers begin getting 404s. A publisher disconnecting produces
-/// `session.ended` and nothing more, because viewers keep playing.
+/// `publisher.ended` and nothing more, because viewers keep playing.
 ///
 /// Never emitted for a stream that was never playable.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,7 +158,7 @@ pub struct StreamUnavailable {
 
 /// A publisher stopped.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionEnded {
+pub struct PublisherEnded {
     pub compensation: Vec<crate::domain::CompensationStatus>,
     pub stream: StreamId,
     pub session: SessionId,
@@ -185,7 +185,7 @@ pub struct SessionEnded {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionRecovery {
+pub struct PublisherRecovery {
     pub stream: StreamId,
     pub session: SessionId,
     pub status: crate::domain::CompensationStatus,
@@ -218,24 +218,24 @@ pub struct SegmentReady {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     SegmentReady(SegmentReady),
-    SessionDegraded(SessionRecovery),
-    SessionRecovered(SessionRecovery),
-    SessionStarted(SessionStarted),
+    PublisherDegraded(PublisherRecovery),
+    PublisherRecovered(PublisherRecovery),
+    PublisherStarted(PublisherStarted),
     StreamAvailable(StreamAvailable),
     StreamUnavailable(StreamUnavailable),
-    SessionEnded(SessionEnded),
+    PublisherEnded(PublisherEnded),
 }
 
 impl Event {
     pub fn kind(&self) -> Kind {
         match self {
             Self::SegmentReady(_) => Kind::SegmentReady,
-            Self::SessionStarted(_) => Kind::SessionStarted,
-            Self::SessionDegraded(_) => Kind::SessionDegraded,
-            Self::SessionRecovered(_) => Kind::SessionRecovered,
+            Self::PublisherStarted(_) => Kind::PublisherStarted,
+            Self::PublisherDegraded(_) => Kind::PublisherDegraded,
+            Self::PublisherRecovered(_) => Kind::PublisherRecovered,
             Self::StreamAvailable(_) => Kind::StreamAvailable,
             Self::StreamUnavailable(_) => Kind::StreamUnavailable,
-            Self::SessionEnded(_) => Kind::SessionEnded,
+            Self::PublisherEnded(_) => Kind::PublisherEnded,
         }
     }
 
@@ -245,11 +245,11 @@ impl Event {
     pub fn stream(&self) -> &StreamId {
         match self {
             Self::SegmentReady(event) => &event.stream,
-            Self::SessionStarted(event) => &event.stream,
-            Self::SessionDegraded(event) | Self::SessionRecovered(event) => &event.stream,
+            Self::PublisherStarted(event) => &event.stream,
+            Self::PublisherDegraded(event) | Self::PublisherRecovered(event) => &event.stream,
             Self::StreamAvailable(event) => &event.stream,
             Self::StreamUnavailable(event) => &event.stream,
-            Self::SessionEnded(event) => &event.stream,
+            Self::PublisherEnded(event) => &event.stream,
         }
     }
 
@@ -259,9 +259,9 @@ impl Event {
     /// exists to keep.
     pub fn session(&self) -> Option<SessionId> {
         match self {
-            Self::SessionStarted(event) => Some(event.session),
-            Self::SessionDegraded(event) | Self::SessionRecovered(event) => Some(event.session),
-            Self::SessionEnded(event) => Some(event.session),
+            Self::PublisherStarted(event) => Some(event.session),
+            Self::PublisherDegraded(event) | Self::PublisherRecovered(event) => Some(event.session),
+            Self::PublisherEnded(event) => Some(event.session),
             Self::SegmentReady(_) | Self::StreamAvailable(_) | Self::StreamUnavailable(_) => None,
         }
     }
@@ -341,7 +341,7 @@ impl Projector {
                         reached_running: false,
                     },
                 );
-                Some(Event::SessionStarted(SessionStarted {
+                Some(Event::PublisherStarted(PublisherStarted {
                     stream: stream.clone(),
                     session,
                     principal: principal.clone(),
@@ -360,7 +360,7 @@ impl Projector {
                 } else {
                     tracked.compensation.push(notice.status.clone());
                 }
-                let event = SessionRecovery {
+                let event = PublisherRecovery {
                     stream: tracked.stream.clone(),
                     session,
                     status: notice.status.clone(),
@@ -368,10 +368,10 @@ impl Projector {
                 match notice.transition {
                     crate::domain::RecoveryTransition::Degraded
                     | crate::domain::RecoveryTransition::Unavailable => {
-                        Some(Event::SessionDegraded(event))
+                        Some(Event::PublisherDegraded(event))
                     }
                     crate::domain::RecoveryTransition::Recovered => {
-                        Some(Event::SessionRecovered(event))
+                        Some(Event::PublisherRecovered(event))
                     }
                     crate::domain::RecoveryTransition::Compensated => None,
                 }
@@ -381,7 +381,7 @@ impl Projector {
                 // store's answer, not the pipeline's, and it is reported
                 // through [`Self::project_stream`]. All this remembers is
                 // whether this publisher got that far, which is what
-                // `session.ended` carries as `was_available`.
+                // `publisher.ended` carries as `was_available`.
                 self.live.lock().get_mut(&session)?.reached_running = true;
                 None
             }
@@ -420,7 +420,7 @@ impl Projector {
         timestamp_issue: Option<Box<crate::domain::TimestampIssue>>,
     ) -> Option<Event> {
         let tracked = self.live.lock().remove(&session)?;
-        Some(Event::SessionEnded(SessionEnded {
+        Some(Event::PublisherEnded(PublisherEnded {
             compensation: tracked.compensation,
             stream: tracked.stream,
             session,
@@ -462,14 +462,14 @@ mod tests {
             },
         );
 
-        assert!(matches!(started, Some(Event::SessionStarted(_))));
+        assert!(matches!(started, Some(Event::PublisherStarted(_))));
         assert!(
             running.is_none(),
             "a running pipeline is not the same fact as a playable stream: \
              what a viewer can fetch is the store's answer, and it arrives \
              through `project_stream`"
         );
-        let Some(Event::SessionEnded(ended)) = ended else {
+        let Some(Event::PublisherEnded(ended)) = ended else {
             panic!("a session that ran reports how it stopped");
         };
         assert_eq!(ended.stream, StreamId::new("live/camera"));
@@ -495,7 +495,7 @@ mod tests {
             },
         );
 
-        let Some(Event::SessionEnded(ended)) = ended else {
+        let Some(Event::PublisherEnded(ended)) = ended else {
             panic!("a failed session still reports an end");
         };
         assert_eq!(ended.outcome, Outcome::Failed);
@@ -524,7 +524,7 @@ mod tests {
         let restarted = projector.project(second, &accepted("live/camera"));
         let running = projector.project(second, &SessionEvent::Running);
 
-        assert!(matches!(restarted, Some(Event::SessionStarted(_))));
+        assert!(matches!(restarted, Some(Event::PublisherStarted(_))));
         assert!(
             running.is_none(),
             "viewers never lost the stream, so nothing about the stream \

@@ -79,10 +79,12 @@ impl Occurrence for Event {
                     "discontinuity": segment.discontinuity,
                 })
             }
-            Event::SessionDegraded(event) | Event::SessionRecovered(event) => serde_json::json!({
-                "stream_id": event.stream.0.as_str(), "session_id": session_id(event.session), "compensation": recovery_data(&event.status),
-            }),
-            Event::SessionStarted(started) => serde_json::json!({
+            Event::PublisherDegraded(event) | Event::PublisherRecovered(event) => {
+                serde_json::json!({
+                    "stream_id": event.stream.0.as_str(), "session_id": session_id(event.session), "compensation": recovery_data(&event.status),
+                })
+            }
+            Event::PublisherStarted(started) => serde_json::json!({
                 "stream_id": started.stream.0.as_str(),
                 "session_id": session_id(started.session),
                 "principal": started.principal,
@@ -100,7 +102,7 @@ impl Occurrence for Event {
             Event::StreamUnavailable(unavailable) => serde_json::json!({
                 "stream_id": unavailable.stream.0.as_str(),
             }),
-            Event::SessionEnded(ended) => {
+            Event::PublisherEnded(ended) => {
                 let mut body = serde_json::json!({
                     "stream_id": ended.stream.0.as_str(),
                     "session_id": session_id(ended.session),

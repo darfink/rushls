@@ -247,7 +247,7 @@ impl HlsPublisher for StorePublisher {
         if self.lease.write_encoded(media.into_retained(), gzip)? {
             // The store commit has released its mutation lock by here.
             // Emitting inline gives this transition causal order with the
-            // later `session.ended` emitted by the same session task.
+            // later `publisher.ended` emitted by the same session task.
             if let Some(events) = &self.events
                 && self.lease.live().claim_availability()
             {

@@ -567,7 +567,7 @@ token = { file = "/run/secrets/metrics-token" }
 
 [hook.operations]
 url = "https://hooks.example.com/rushls"
-events = ["session.started", "session.ended", "stream.available", "segment.ready"]
+events = ["publisher.started", "publisher.ended", "stream.available", "segment.ready"]
 signing_secret = { file = "/run/secrets/hook-signing" }   # optional: signs each event
 
 [log]

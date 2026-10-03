@@ -1879,7 +1879,7 @@ async fn timestamp_failures_report_once_during_preroll_and_live()
             .iter()
             .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
             .filter_map(|event| {
-                if let Event::SessionEnded(end) = event {
+                if let Event::PublisherEnded(end) = event {
                     Some(end)
                 } else {
                     None
@@ -2019,11 +2019,11 @@ async fn audio_repairs_report_during_preroll_and_live_and_survive_a_failing_batc
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, Event::SessionDegraded(_)))
+                .filter(|event| matches!(event, Event::PublisherDegraded(_)))
                 .count(),
             1
         );
-        let Event::SessionEnded(end) = events.last().ok_or("end event")? else {
+        let Event::PublisherEnded(end) = events.last().ok_or("end event")? else {
             panic!("ended");
         };
         assert_eq!(end.outcome, Outcome::Failed);
@@ -2115,7 +2115,7 @@ async fn input_modes_report_cadence_holes_through_sessions()
             let ended = events
                 .iter()
                 .find_map(|event| {
-                    if let Event::SessionEnded(end) = event {
+                    if let Event::PublisherEnded(end) = event {
                         Some(end)
                     } else {
                         None
@@ -2159,7 +2159,7 @@ async fn input_modes_report_cadence_holes_through_sessions()
             assert_eq!(
                 events
                     .iter()
-                    .filter(|e| matches!(e, Event::SessionEnded(_)))
+                    .filter(|e| matches!(e, Event::PublisherEnded(_)))
                     .count(),
                 1
             );
@@ -2225,18 +2225,18 @@ async fn audio_gaps_publish_during_preroll_and_live_then_report_clean_recovery()
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, Event::SessionDegraded(_)))
+                .filter(|event| matches!(event, Event::PublisherDegraded(_)))
                 .count(),
             1
         );
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, Event::SessionRecovered(_)))
+                .filter(|event| matches!(event, Event::PublisherRecovered(_)))
                 .count(),
             1
         );
-        let Event::SessionEnded(end) = events.last().ok_or("ended event")? else {
+        let Event::PublisherEnded(end) = events.last().ok_or("ended event")? else {
             panic!("ended");
         };
         assert_eq!(end.compensation[0].total_ticks, 6144);
@@ -2304,18 +2304,18 @@ async fn video_gap_notices_survive_later_batch_failure_in_preroll_and_live()
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, Event::SessionDegraded(_)))
+                .filter(|event| matches!(event, Event::PublisherDegraded(_)))
                 .count(),
             1
         );
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, Event::SessionEnded(_)))
+                .filter(|event| matches!(event, Event::PublisherEnded(_)))
                 .count(),
             1
         );
-        let Event::SessionEnded(end) = events.last().ok_or("end event")? else {
+        let Event::PublisherEnded(end) = events.last().ok_or("end event")? else {
             panic!("session ended")
         };
         assert_eq!(end.compensation.len(), 1);

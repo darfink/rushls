@@ -63,37 +63,37 @@ Rushls does not retry the request. A reconnect creates a new admission attempt.
 
 Hooks use `application/cloudevents+json`. A hook subscribes to events by name in its `events` list.
 
-Events describe one of two lifetimes. A *session* is one publisher connection, from admission until it stops.
-A *stream* is what viewers play. It can outlive a session: if the encoder reconnects, the stream stays playable
-and a new session starts.
+Events describe one of two lifetimes. `publisher.*` events cover one publisher connection, from admission until it stops.
+`stream.*` events cover what viewers play. A stream can outlive a publisher: if the encoder reconnects, the stream stays playable
+and a new publisher starts, with a new `session_id`.
 
 | Event | Sent when |
 | --- | --- |
-| `session.started` | A publisher passes [admission](#admission) and claims the stream, before any media arrives. A rejected publisher sends no events. |
+| `publisher.started` | A publisher passes [admission](#admission) and claims the stream, before any media arrives. A rejected publisher sends no events. |
 | `stream.available` | The first playlist a viewer can load is written. Sent once per stream, not again when a publisher reconnects. |
 | `segment.ready` | A segment is complete and can be fetched, for every segment of every rendition. |
-| `session.degraded` | Rushls first repairs a hole on a track of this session. See [input handling](input-handling.md#hooks-logs-and-metrics). |
-| `session.recovered` | A degraded track has carried 30 seconds of clean media. |
-| `session.ended` | The publisher stops for any reason: it ended the stream, dropped, was replaced or stopped, or failed. Viewers can still play the stream. |
+| `publisher.degraded` | Rushls first repairs a hole on one of this publisher's tracks. See [input handling](input-handling.md#hooks-logs-and-metrics). |
+| `publisher.recovered` | A degraded track has carried 30 seconds of clean media. |
+| `publisher.ended` | The publisher stops for any reason: it ended the stream, dropped, was replaced or stopped, or failed. Viewers can still play the stream. |
 | `stream.unavailable` | The stream has had no publisher for the length of `hls.window`, and Rushls removes it. Viewers get 404 from here on. Never sent for a stream that never became available. |
 
-A typical publication sends `session.started`, `stream.available`, `segment.ready` per segment, `session.ended`,
+A typical publication sends `publisher.started`, `stream.available`, `segment.ready` per segment, `publisher.ended`,
 then `stream.unavailable`. Events for one stream are delivered in order.
-To act when a broadcast is over, use `stream.unavailable`: `session.ended` also fires for an encoder that reconnects.
+To act when a broadcast is over, use `stream.unavailable`: `publisher.ended` also fires for an encoder that reconnects.
 
 The wire type includes a schema version (`rushls.<kind>.v1`). New fields, such as
-the `protocol`, `resource`, and `client` details on session events, are additive
+the `protocol`, `resource`, and `client` details on publisher events, are additive
 and keep the version: consumers must accept and ignore fields they do not
 recognize. Only a breaking change, removing or renaming a field or changing its
 type or meaning, moves the type to `.v2`. Subscriptions name the kind
-(`session.started`), so one subscription receives every version of that event.
+(`publisher.started`), so one subscription receives every version of that event.
 
 ```json
 {
   "specversion": "1.0",
   "id": "0198abc0-0000-7000-8000-000000000002",
   "source": "origin-1",
-  "type": "rushls.session.started.v1",
+  "type": "rushls.publisher.started.v1",
   "subject": "events/main",
   "time": "2026-09-11T12:00:00Z",
   "datacontenttype": "application/json",
@@ -112,7 +112,7 @@ type or meaning, moves the type to `.v2`. Subscriptions name the kind
 }
 ```
 
-`session.ended` repeats those identity fields and adds:
+`publisher.ended` repeats those identity fields and adds:
 
 ```json
 {
@@ -125,14 +125,14 @@ type or meaning, moves the type to `.v2`. Subscriptions name the kind
 
 `outcome` is `ended`, `interrupted`, `replaced`, `cancelled`, `unhealthy`, or
 `failed`. `diagnostic` is optional human-readable detail, not a stable code.
-The existing `was_available` field means this session reached its running
+`was_available` means this publisher reached its running
 pipeline state. Stream playability belongs to `stream.available` instead.
 
 Stream events carry `stream_id` in `data`, and `stream.available` adds
 `playlist_path`, the multivariant playlist's server path such as
 `/live/camera/index.m3u8`. Like `segment.ready` paths, it is rooted rather than
 absolute: join it to the origin or CDN the consumer uses. Stream events do not
-name a session, because a stream can remain playable across publisher
+name a publisher, because a stream can remain playable across publisher
 reconnects. Credentials
 never appear in lifecycle events. Session IDs are decimal strings to preserve
 64-bit precision. They are process-local and can repeat after a restart.
@@ -148,7 +148,7 @@ and remain redacted in debug output and configuration errors.
 ```toml
 [hook.automation]
 url = "https://automation.example.internal/rushls"
-events = ["session.started", "session.ended"]
+events = ["publisher.started", "publisher.ended"]
 signing_secret = { file = "/run/secrets/rushls-webhook-signing" }
 ```
 

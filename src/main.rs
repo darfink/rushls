@@ -467,7 +467,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // Dispatchers outlive the node deliberately. `serve` returns once every
-    // session has ended, which is also when the last `session.ended` has been
+    // session has ended, which is also when the last `publisher.ended` has been
     // queued, so draining afterwards is what gives those events their chance.
     let (stop, stopped) = watch::channel(false);
     let delivering = dispatchers.map(|dispatchers| tokio::spawn(dispatchers.run(stopped)));

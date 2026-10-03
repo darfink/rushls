@@ -16,7 +16,7 @@ use crate::{
     domain::{SessionId, StreamId},
     observe::{
         EventObserver, Events, NodeEvent, SessionEnd, SessionEvent, StreamEvent,
-        lifecycle::{self, Event, Projector, SessionStarted},
+        lifecycle::{self, Event, Projector, PublisherStarted},
     },
     outbound::{ClientConfig, Endpoint, HttpClient},
 };
@@ -90,7 +90,7 @@ fn hook(address: SocketAddr, events: &[lifecycle::Kind]) -> HookConfig {
 }
 
 fn started(stream: &str, session: u64) -> Event {
-    Event::SessionStarted(SessionStarted {
+    Event::PublisherStarted(PublisherStarted {
         stream: StreamId::new(stream),
         session: SessionId(session.try_into().expect("a nonzero session id")),
         principal: "studio-camera".into(),
@@ -163,7 +163,7 @@ async fn an_event_arrives_as_a_cloudevent_naming_its_stream() {
     let address = start(recorder.clone()).await;
 
     deliver(
-        hook(address, &[lifecycle::Kind::SessionStarted]),
+        hook(address, &[lifecycle::Kind::PublisherStarted]),
         &[started("live/camera", 7)],
         1,
         &recorder,
@@ -176,7 +176,7 @@ async fn an_event_arrives_as_a_cloudevent_naming_its_stream() {
         .cloned()
         .expect("one event arrived");
     assert_eq!(body["specversion"], "1.0");
-    assert_eq!(body["type"], "rushls.session.started.v1");
+    assert_eq!(body["type"], "rushls.publisher.started.v1");
     assert_eq!(body["source"], "urn:rushls:node:test");
     assert_eq!(body["subject"], "live/camera");
     assert_eq!(body["datacontenttype"], "application/json");
@@ -242,9 +242,9 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
     assert_eq!(
         recorder.types(),
         [
-            "rushls.session.started.v1",
+            "rushls.publisher.started.v1",
             "rushls.stream.available.v1",
-            "rushls.session.ended.v1",
+            "rushls.publisher.ended.v1",
             "rushls.stream.unavailable.v1",
         ],
         "both lifetimes arrive interleaved on one ordered stream: the +         publisher stops before the stream does"
@@ -280,7 +280,7 @@ async fn a_dropped_event_is_reported_through_the_node_observer() {
     let log = NodeLog::default();
 
     deliver_reporting(
-        hook(address, &[lifecycle::Kind::SessionStarted]),
+        hook(address, &[lifecycle::Kind::PublisherStarted]),
         &[started("live/camera", 1)],
         1,
         &recorder,
@@ -306,7 +306,7 @@ async fn a_dropped_event_is_reported_through_the_node_observer() {
         dropped,
         (
             "test".to_owned(),
-            lifecycle::Kind::SessionStarted,
+            lifecycle::Kind::PublisherStarted,
             "rejected"
         )
     );
@@ -316,7 +316,7 @@ async fn a_dropped_event_is_reported_through_the_node_observer() {
 async fn only_subscribed_events_are_delivered() {
     let recorder = Recorder::default();
     let address = start(recorder.clone()).await;
-    let ended = Event::SessionEnded(lifecycle::SessionEnded {
+    let ended = Event::PublisherEnded(lifecycle::PublisherEnded {
         compensation: Vec::new(),
         timestamp_issue: None,
         stream: StreamId::new("live/camera"),
@@ -330,14 +330,14 @@ async fn only_subscribed_events_are_delivered() {
     });
 
     deliver(
-        hook(address, &[lifecycle::Kind::SessionEnded]),
+        hook(address, &[lifecycle::Kind::PublisherEnded]),
         &[started("live/camera", 1), ended],
         1,
         &recorder,
     )
     .await;
 
-    assert_eq!(recorder.types(), ["rushls.session.ended.v1"]);
+    assert_eq!(recorder.types(), ["rushls.publisher.ended.v1"]);
 }
 
 #[test]
@@ -368,8 +368,8 @@ fn a_projected_session_reaches_the_hooks_it_subscribed_to() {
     assert_eq!(
         kinds,
         [
-            lifecycle::Kind::SessionStarted,
-            lifecycle::Kind::SessionEnded,
+            lifecycle::Kind::PublisherStarted,
+            lifecycle::Kind::PublisherEnded,
         ],
         "a session's events describe the publisher only; what viewers can +         reach is the store's to report"
     );
@@ -381,7 +381,7 @@ fn timestamp_issue_hook_preserves_exact_ticks_and_is_absent_for_other_failures()
         Codec, MediaKind, Timebase, TimestampField, TimestampIssue, TimestampIssueCode, TrackId,
     };
     use rushls_common::hooks::Occurrence;
-    let mut ended = lifecycle::SessionEnded {
+    let mut ended = lifecycle::PublisherEnded {
         compensation: Vec::new(),
         stream: StreamId::new("live/camera"),
         session: SessionId(nz::u64!(1)),
@@ -394,7 +394,7 @@ fn timestamp_issue_hook_preserves_exact_ticks_and_is_absent_for_other_failures()
         timestamp_issue: None,
     };
     assert!(
-        Event::SessionEnded(ended.clone())
+        Event::PublisherEnded(ended.clone())
             .data()
             .get("timestamp_issue")
             .is_none()
@@ -414,7 +414,7 @@ fn timestamp_issue_hook_preserves_exact_ticks_and_is_absent_for_other_failures()
         maximum: None,
         missing_ticks: Some(u64::MAX),
     }));
-    let data = Event::SessionEnded(ended).data();
+    let data = Event::PublisherEnded(ended).data();
     let issue = &data["timestamp_issue"];
     assert_eq!(issue["code"], "audio_gap");
     assert_eq!(issue["recovery_rejection"], "maximum_hole");
@@ -468,7 +468,7 @@ fn recovery_hooks_preserve_exact_values_and_only_emit_episode_transitions()
             },
         )
         .ok_or("degraded event")?;
-    assert_eq!(degraded.kind().to_string(), "session.degraded");
+    assert_eq!(degraded.kind().to_string(), "publisher.degraded");
     assert_eq!(
         degraded.data()["compensation"]["total_ticks"],
         "9007199254740993"
@@ -503,7 +503,7 @@ fn recovery_hooks_preserve_exact_values_and_only_emit_episode_transitions()
             },
         )
         .ok_or("recovered event")?;
-    assert_eq!(recovered.kind().to_string(), "session.recovered");
+    assert_eq!(recovered.kind().to_string(), "publisher.recovered");
     let ended = projector
         .project(
             session,
@@ -515,12 +515,12 @@ fn recovery_hooks_preserve_exact_values_and_only_emit_episode_transitions()
     assert_eq!(ended.data()["compensation"][0]["episode_holes"], "2");
     assert_eq!(ended.data()["compensation"][0]["degraded"], false);
     assert_eq!(
-        "session.degraded".parse::<lifecycle::Kind>()?,
-        lifecycle::Kind::SessionDegraded
+        "publisher.degraded".parse::<lifecycle::Kind>()?,
+        lifecycle::Kind::PublisherDegraded
     );
     assert_eq!(
-        "session.recovered".parse::<lifecycle::Kind>()?,
-        lifecycle::Kind::SessionRecovered
+        "publisher.recovered".parse::<lifecycle::Kind>()?,
+        lifecycle::Kind::PublisherRecovered
     );
     Ok(())
 }

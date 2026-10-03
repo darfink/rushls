@@ -161,7 +161,7 @@ listen = "127.0.0.1:8080"                  # example (loopback); default "0.0.0.
 # Event delivery, one table per destination name.
 # [hook.billing]                           # example
 # url            = "http://billing.example.internal/rushls"
-# events         = ["session.ended"]       # also session.started, stream.available, segment.ready, ...
+# events         = ["publisher.ended"]       # also publisher.started, stream.available, segment.ready, ...
 # token          = { file = "/run/secrets/rushls-webhook" }
 # signing_secret = "${WEBHOOK_SIGNING_SECRET}"  # whsec_ plus base64 of 32+ random bytes
 # client_cert    = "/etc/rushls/hooks/client.pem"

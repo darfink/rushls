@@ -934,7 +934,7 @@ async fn a_hook_may_present_its_own_identity() -> Result<(), Box<dyn Error>> {
         r#"
 [hook.archive]
 url = "https://archive.internal/rushls"
-events = ["session.started"]
+events = ["publisher.started"]
 client_cert = "{}"
 client_key = "{}"
 ca = "{}"
@@ -963,7 +963,7 @@ async fn a_hook_without_tls_material_shares_the_process_client() -> Result<(), B
         r#"
 [hook.automation]
 url = "http://automation.internal/rushls"
-events = ["session.started"]
+events = ["publisher.started"]
 "#,
     )??;
 
@@ -986,7 +986,7 @@ async fn half_a_client_certificate_pair_is_refused_for_a_hook_too() -> Result<()
         r#"
 [hook.archive]
 url = "https://archive.internal/rushls"
-events = ["session.started"]
+events = ["publisher.started"]
 client_cert = "{}"
 "#,
         fixtures::toml_path_contents(&settings.certificate),
@@ -1009,7 +1009,7 @@ fn keys_for_unbuilt_features_are_refused_by_name() -> Result<(), Box<dyn Error>>
         // Mutual TLS to the admission service.
         "[publish.auth]\nurl = \"http://auth\"\nclient_cert = \"/x.pem\"\n",
         // Payload-carrying hooks.
-        "[hook.archive]\nurl = \"http://archive\"\nevents = [\"session.started\"]\npayload = true\n",
+        "[hook.archive]\nurl = \"http://archive\"\nevents = [\"publisher.started\"]\npayload = true\n",
     ] {
         assert!(
             resolve_toml(configuration)?.is_err(),
@@ -1257,7 +1257,7 @@ name = "studio"
 
 [hook.automation]
 url = "http://automation:9000/events"
-events = ["session.started", "session.ended", "segment.ready"]
+events = ["publisher.started", "publisher.ended", "segment.ready"]
 "#,
     )??;
 
@@ -1272,9 +1272,13 @@ events = ["session.started", "session.ended", "segment.ready"]
     assert_eq!(hook.maximum_attempts, super::HOOK_MAX_ATTEMPTS);
     assert_eq!(
         hook.events,
-        [Kind::SessionStarted, Kind::SessionEnded, Kind::SegmentReady]
-            .into_iter()
-            .collect(),
+        [
+            Kind::PublisherStarted,
+            Kind::PublisherEnded,
+            Kind::SegmentReady
+        ]
+        .into_iter()
+        .collect(),
         "a subscription is exactly what was asked for, never widened"
     );
     Ok(())
@@ -1297,13 +1301,13 @@ events = []
     let delivery_tuning = r#"
 [hook.automation]
 url = "http://automation:9000/events"
-events = ["session.ended"]
+events = ["publisher.ended"]
 max_attempts = 3
 "#;
     let unusable_url = r#"
 [hook.automation]
 url = "automation:9000"
-events = ["session.ended"]
+events = ["publisher.ended"]
 "#;
 
     for configuration in [unknown_event, no_events, delivery_tuning, unusable_url] {
@@ -2129,13 +2133,13 @@ fn recording_patterns_and_hook_signing_are_validated_at_startup() -> Result<(), 
         "[record]\ndir = '/archive'\nqueue_size = 0",
         "[record]\ndir = '/archive'\nmax_pending = 0",
         "[record]\ndir = '/archive'\nunknown = 1",
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = 'bad-secret'",
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = { file = '/missing' }",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['publisher.started']\nsigning_secret = 'bad-secret'",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['publisher.started']\nsigning_secret = { file = '/missing' }",
     ] {
         assert!(!matches!(resolve_toml(config), Ok(Ok(_))), "{config}");
     }
     let signed = resolve_toml(
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = 'whsec_BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc='\n",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['publisher.started']\nsigning_secret = 'whsec_BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc='\n",
     )??;
     assert!(signed.hooks.is_some());
     Ok(())
@@ -2151,7 +2155,7 @@ fn secret_files_tolerate_a_trailing_newline() -> Result<(), Box<dyn Error>> {
     let signing = TempConfig::new("whsec_BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\n")?;
     let token = TempConfig::new("hunter2\n")?;
     let resolved = resolve_toml(&format!(
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = {{ file = '{}' }}\ntoken = {{ file = '{}' }}\n",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['publisher.started']\nsigning_secret = {{ file = '{}' }}\ntoken = {{ file = '{}' }}\n",
         fixtures::toml_path_contents(&signing.path),
         fixtures::toml_path_contents(&token.path),
     ))??;
@@ -2161,7 +2165,7 @@ fn secret_files_tolerate_a_trailing_newline() -> Result<(), Box<dyn Error>> {
     // names the format rather than the whitespace it once carried.
     let malformed = TempConfig::new("whsec_not+base64!\n")?;
     let Err(error) = resolve_toml(&format!(
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\nsigning_secret = {{ file = '{}' }}\n",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['publisher.started']\nsigning_secret = {{ file = '{}' }}\n",
         fixtures::toml_path_contents(&malformed.path),
     ))?
     else {
@@ -2314,7 +2318,7 @@ max_response = "32KiB"
 client_cert = "/client.pem"
 [hook.example]
 url = "http://hook"
-events = ["session.ended"]
+events = ["publisher.ended"]
 client_cert = "/hook.pem"
 [record]
 dir = "/archive"
@@ -2428,8 +2432,8 @@ fn malformed_secret_documents_do_not_print_credentials() -> Result<(), Box<dyn E
     for text in [
         "[metrics]\ntoken = 918273645",
         "[publish.auth]\ntoken = 918273645",
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\ntoken = 918273645",
-        "[hook.test]\nurl = 'http://localhost'\nevents = ['session.started']\ntoken = 'sensitive-token'\nclient_cert = 5",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['publisher.started']\ntoken = 918273645",
+        "[hook.test]\nurl = 'http://localhost'\nevents = ['publisher.started']\ntoken = 'sensitive-token'\nclient_cert = 5",
     ] {
         let error = load_toml(text)?.err().ok_or("invalid document accepted")?;
         let diagnostic = format!("{error:?} {error}");
@@ -2635,7 +2639,7 @@ fn the_reference_lists_only_keys_the_tables_accept() -> Result<(), Box<dyn Error
     for super::TableKey { suffix: key, .. } in super::HOOK_FIELDS {
         let key = key.trim_start_matches(".<name>.");
         let value = match key {
-            "events" => "['session.ended']",
+            "events" => "['publisher.ended']",
             _ => "'value'",
         };
         writeln!(hook, "{key} = {value}")?;
