@@ -141,6 +141,13 @@ async fn rtmp_h264_aac_441_mono() -> TestResult {
     run("rtmp_h264_aac_441_mono", publish::rtmp_h264_aac_441_mono()?).await
 }
 
+/// Audio 133 ms behind the first keyframe. Segments after the first must not
+/// be held to the first one's shorter span, which once ended the publication.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rtmp_h264_late_aac() -> TestResult {
+    run("rtmp_h264_late_aac", publish::rtmp_h264_late_aac()?).await
+}
+
 /// 5.1, which the audio rendition must advertise as `CHANNELS="6"`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rtmp_h264_aac_51() -> TestResult {

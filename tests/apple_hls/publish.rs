@@ -103,6 +103,20 @@ pub fn rtmp_h264_aac_441_mono() -> Result<Box<dyn PendingPublish>, String> {
     ))
 }
 
+/// Audio that starts 133 ms after the first keyframe, as encoders that
+/// buffer audio commonly publish. Its first segment is shorter than the
+/// video's; every later one spans the full cadence on the shared grid, and
+/// the leading silence is an empty edit, not a shifted timeline.
+pub fn rtmp_h264_late_aac() -> Result<Box<dyn PendingPublish>, String> {
+    let mut events = flv::ingress_events(H264_AAC_FLV)?;
+    for event in &mut events {
+        if let IngressEvent::Audio { timestamp, .. } = event {
+            *timestamp += 133;
+        }
+    }
+    Ok(rtmp_events(events, &[]))
+}
+
 /// 5.1 audio, which the audio rendition must advertise as `CHANNELS="6"`.
 pub fn rtmp_h264_aac_51() -> Result<Box<dyn PendingPublish>, String> {
     Ok(rtmp_events(flv::ingress_events(H264_AAC_51_FLV)?, &[]))
