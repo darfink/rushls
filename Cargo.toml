@@ -98,7 +98,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "http1", "tls12", "logging"] }
 uuid = { version = "1.24.0", features = ["v7"] }
 base64 = "0.22"
-tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+tower-http = { version = "0.7", default-features = false, features = ["cors"] }
 h264-reader = "0.9.0"
 scuffle-h265 = "0.2.2"
 scuffle-av1 = "0.1.4"
