@@ -19,6 +19,9 @@ Complete these checks before a broad production rollout:
 - [x] Review ELST/PDT offsets and reconnect fetch grace. Add HTTP regressions for
   real CMAF A/V offsets and priming, part/segment/init fetch deadlines after reconnect,
   and blocking reloads across successor publication and rendition retirement.
+- [ ] Run `tools/av-sync/check-av-sync.py` before releases that touch muxing or timing.
+  It measures real A/V sync in Chrome (hls.js, Shaka) and native Safari for late audio
+  and B-frames. Safari needs a loopback audio device such as BlackHole.
 - [ ] Complete the supported codec/player matrix for startup, seeking, live playback,
   and rendition switching around GAPs. Record transient freezes and skips separately
   from persistent stalls. Track results in the [player matrix](docs/development/gap-validation/README.md)
@@ -49,6 +52,10 @@ These limits remain explicit in the supported scope:
   Windows recording requires hard-link support and has the documented directory-metadata durability limitation.
 - Official hls.js 1.7.3 can stall on valid live streams around rendition switches and ENDLIST.
   Required Chrome validation uses the documented local player patch pending upstream adoption.
+- hls.js 1.7.3 in Safari stalls on short ended streams: it buffers from about 4 s,
+  reports `bufferSeekOverHole`, then stops at the first segment end with `bufferStalledError`.
+  Chrome with hls.js and native Safari play the same streams. The fault predates the
+  `tfdt` start-offset change. `tools/av-sync/check-av-sync.py` leaves this player out.
 - GStreamer 1.28 passes clean live playback. GAP recovery remains a failing diagnostic;
   its parser expects a colon after EXT-X-GAP, which is a likely cause.
 

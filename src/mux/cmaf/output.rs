@@ -71,10 +71,11 @@ pub(super) struct CmafOutput {
     roll: Option<super::roll::RollRecovery>,
     video: crate::media::video_config::VideoProperties,
     pending: Vec<PendingSample>,
-    /// The first decode time on the shared presentation clock. Only a start
-    /// before the origin (priming, or a reordered picture's earlier DTS)
-    /// moves this track's media clock; see [`media_shift`].
+    /// The first sample's decode and presentation times on the shared
+    /// presentation clock; together they fix the media clock, see
+    /// [`media_shift`].
     first_decode: Option<TickTimestamp>,
+    first_pts: Option<TickTimestamp>,
     initialized: bool,
     sequence: u32,
 }
@@ -122,6 +123,7 @@ impl CmafOutput {
             ),
             pending: Vec::new(),
             first_decode: None,
+            first_pts: None,
             initialized: false,
             sequence: 1,
         })
@@ -165,6 +167,7 @@ impl CmafOutput {
         );
         if self.first_decode.is_none() {
             self.first_decode = Some(dts);
+            self.first_pts = Some(pts);
         }
         if !self.initialized {
             self.video.observe_hdr(
@@ -182,6 +185,10 @@ impl CmafOutput {
             None => self.pending_charge = Some(charge),
         }
         self.pending.push(sample);
+    }
+
+    fn media_shift(&self) -> TickTimestamp {
+        media_shift(self.first_decode.unwrap_or(0), self.first_pts.unwrap_or(0))
     }
 
     fn is_video(&self) -> bool {
@@ -218,7 +225,7 @@ impl CmafOutput {
         // Builder intermediates here are a few KiB and are not accounted.
         let init = build_init_segment(std::slice::from_ref(&self.spec), self.spec.timescale)
             .map_err(mux)?;
-        let elst = edit_list(media_shift(self.first_decode.unwrap_or(0)));
+        let elst = edit_list(self.media_shift());
         let bytes = with_cmaf_init(&init, elst, self.roll.is_some(), &self.video)?;
         if bytes.capacity() > charge.bytes() {
             return Err("CMAF initialization exceeded its reserved bound".into());
@@ -233,7 +240,7 @@ impl CmafOutput {
         }
         // Media time = shared presentation time + shift, so tfdt never goes
         // negative and a track that starts late keeps its later tfdt.
-        let origin = -media_shift(self.first_decode.unwrap_or(0));
+        let origin = -self.media_shift();
         let video = self.is_video();
         let styp = SegmentTypeBox {
             major_brand: *b"msdh",
@@ -573,17 +580,26 @@ fn codec_config(track: &DiscoveredTrack) -> Result<CodecConfig, Box<str>> {
 }
 
 /// How far this track's media clock runs ahead of the shared presentation
-/// clock: the distance its first decode time lies before the shared origin.
+/// clock, chosen so the first fragment's `tfdt` is exactly the shared time at
+/// which the track's first sample presents (or zero, if that is before the
+/// origin).
 ///
-/// Everything that decodes before the origin is either AAC/Opus priming or
-/// a reordered picture's early DTS, and the edit's `media_time` hides exactly
-/// that span. A track that starts at or after the origin needs no shift: its
-/// late start is carried by `tfdt` alone, because hls.js and Shaka read
-/// sample times from `tfdt` and Chrome's MSE ignores empty edits. Its priming,
-/// if any, then presents just before its audible start, as Apple's own
-/// segmenters do: an edit can only hide media before presentation zero.
-fn media_shift(first_decode: TickTimestamp) -> TickTimestamp {
-    first_decode.min(0).saturating_neg()
+/// Players treat a segment's `tfdt` as where it starts: hls.js and Shaka read
+/// it and never parse `elst`, Shaka sets `timestampOffset = playlist position
+/// - tfdt`, and Chrome's MSE ignores empty edits. So the shift has two parts:
+///
+/// - the first picture's composition offset, which an edit has always hidden
+///   for reordered video;
+/// - whatever presents before the shared origin: AAC/Opus priming of a track
+///   that starts there, which the edit hides.
+///
+/// A track that starts late carries its delay in `tfdt` alone. Its priming,
+/// if any, presents just before its audible start, as in Apple's own
+/// segmenters: an edit can only hide media before presentation zero.
+fn media_shift(first_decode: TickTimestamp, first_pts: TickTimestamp) -> TickTimestamp {
+    first_pts
+        .saturating_sub(first_decode)
+        .saturating_add(first_pts.min(0).saturating_neg())
 }
 
 /// The single non-empty edit that maps presentation zero to `media_time`.
@@ -870,17 +886,35 @@ mod tests {
     }
 
     #[test]
-    fn only_a_start_before_the_origin_shifts_the_media_clock() {
-        // Priming or a reordered DTS before the origin is hidden by one edit.
-        assert_eq!(media_shift(-312), 312);
-        let edits = edit_list(media_shift(-312)).expect("priming before the origin");
-        assert_eq!(edits.entries.len(), 1);
-        assert_eq!(edits.entries[0].segment_duration, 0);
-        assert_eq!(edits.entries[0].media_time, 312);
-        // A start at or after the origin is a later tfdt, never an edit.
-        for first_decode in [0, 900, 48_000] {
-            assert_eq!(media_shift(first_decode), 0);
-            assert!(edit_list(media_shift(first_decode)).is_none());
+    fn the_first_tfdt_is_where_the_track_presents() {
+        // (first DTS, first PTS) -> shift. The first tfdt is DTS + shift.
+        for (first_decode, first_pts, shift, tfdt) in [
+            // Priming before the origin is hidden by one edit.
+            (-312, -312, 312, 0),
+            // A late track, with or without priming, needs no edit.
+            (0, 0, 0, 0),
+            (900, 900, 0, 900),
+            (48_000, 48_000, 0, 48_000),
+            // Reordered video at the origin hides its composition offset.
+            (-6_000, 0, 6_000, 0),
+            // Reordered video that starts late: the same composition offset,
+            // never less, so tfdt equals its presentation start.
+            (-4_110, 1_890, 6_000, 1_890),
+            (900, 6_900, 6_000, 6_900),
+        ] {
+            assert_eq!(
+                media_shift(first_decode, first_pts),
+                shift,
+                "{first_decode}/{first_pts}"
+            );
+            assert_eq!(first_decode + shift, tfdt, "{first_decode}/{first_pts}");
+            let edits = edit_list(shift);
+            assert_eq!(edits.is_some(), shift != 0);
+            if let Some(edits) = edits {
+                assert_eq!(edits.entries.len(), 1);
+                assert_eq!(edits.entries[0].segment_duration, 0);
+                assert_eq!(edits.entries[0].media_time, shift);
+            }
         }
     }
 }

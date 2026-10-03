@@ -56,7 +56,7 @@ not build them until a publisher needs them.
 
 ## Timing (two different elst cases)
 
-Delayed start and encoder priming are handled differently. A delayed start is a later `tfdt` on the shared clock. Only media that decodes before the shared origin (priming, or a reordered picture's earlier DTS) shifts the track's media clock, through one non-empty edit. The muxer never writes an empty edit, because hls.js and Shaka read sample times from `tfdt` and Chrome's MSE ignores empty edits.
+Delayed start and encoder priming are handled differently. A delayed start is a later `tfdt` on the shared clock. A track's first `tfdt` is the shared time its first sample presents at, so the media clock shifts, through one non-empty edit, only by the first picture's composition offset and by priming that presents before the shared origin. The muxer never writes an empty edit: hls.js and Shaka read sample times from `tfdt`, Shaka places each segment's `tfdt` at its playlist position, and Chrome's MSE ignores empty edits. `tools/av-sync/check-av-sync.py` measures the result in Chrome and Safari.
 
 | Feature | Status | Notes |
 |---|---|---|

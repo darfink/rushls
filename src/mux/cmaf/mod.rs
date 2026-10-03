@@ -1936,6 +1936,61 @@ mod tests {
         );
     }
 
+    /// Late video with B-frames keeps its full composition-offset edit, so
+    /// its first `tfdt` is where it presents. Shaka places a segment's `tfdt`
+    /// at its playlist position, so a smaller edit (one that only lifts the
+    /// decode time to zero) played this case about 20 ms early in Chrome.
+    #[test]
+    fn a_later_reordered_video_start_presents_at_its_tfdt() {
+        // The shared presentation start, and the first picture's reorder delay.
+        const LATE: i64 = 1_980;
+        const REORDER: i64 = 100;
+        let sink = discarded_events();
+        let timebase = Timebase::hz90k();
+        let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
+            .expect("fixture presentation validates");
+        let mut started = started(
+            &input,
+            vec![video_plan(0, timebase).presentation_origin(-LATE).build()],
+            &sink,
+        );
+        let mut media = Vec::new();
+        for sample in [
+            sample_with_dts(0, 0, -REORDER, true),
+            sample_with_dts(0, 8_192, 8_192 - REORDER, false),
+        ] {
+            started
+                .muxer
+                .push(sample, &mut media)
+                .expect("late reordered video packages");
+        }
+
+        let [
+            PackagedMedia::Initialization(initialization),
+            PackagedMedia::Chunk(chunk),
+        ] = media.as_slice()
+        else {
+            panic!("expected initialization and one chunk, got {media:?}");
+        };
+        assert_eq!(edit_list(&initialization.payload), [(0, REORDER)]);
+        assert_eq!(chunk.media_start, LATE);
+        let demuxed = demux_cmaf(&concat_cmaf_bytes(&media));
+        let first = demuxed.tracks[0]
+            .samples
+            .first()
+            .expect("late reordered video demuxes a sample");
+        assert_eq!(
+            first.dts,
+            Some(LATE),
+            "the first tfdt is the shared time the picture presents at"
+        );
+        assert_eq!(
+            first.pts.map(|pts| pts - REORDER),
+            Some(LATE),
+            "after the edit, the first picture presents at its shared-clock position"
+        );
+    }
+
     /// Late audio needs no edit, even when it declares priming. An edit can
     /// only hide media before presentation zero, so for a late track it would
     /// be a pure shift that hls.js (which skips `elst`) misplaces. The late
