@@ -176,6 +176,15 @@ jobs:
       - name: Patched player — live control and GAP playback (required)
         id: patched
         run: python3 tools/run-live-gap-ci.py --driver "$RUNNER_TEMP/chromedriver" --hls-js target/live-gap-reports/player/hls.patched.js --output target/live-gap-reports/patched
+      - name: A/V sync in hls.js and Shaka (required)
+        id: av_sync
+        if: ${{ !cancelled() && steps.player.outcome == 'success' }}
+        run: |
+          cargo build --locked
+          python3 tools/av-sync/check-av-sync.py --browsers chrome --headless \
+            --chromedriver "$RUNNER_TEMP/chromedriver" \
+            --hls-js target/live-gap-reports/player/hls.patched.js \
+            --output target/live-gap-reports/av-sync.json
       - name: Official hls.js 1.7.3 compatibility (informational)
         id: official
         if: ${{ !cancelled() && steps.player.outcome == 'success' }}
@@ -187,6 +196,7 @@ jobs:
           PLAYER_OUTCOME: ${{ steps.player.outcome }}
           PATCHED_OUTCOME: ${{ steps.patched.outcome }}
           OFFICIAL_OUTCOME: ${{ steps.official.outcome }}
+          AV_SYNC_OUTCOME: ${{ steps.av_sync.outcome }}
         run: |
           {
             echo '## Chrome playback'
@@ -196,8 +206,9 @@ jobs:
             echo "| Patched player build and upstream unit tests | $PLAYER_OUTCOME | Required |"
             echo "| Patched player: control, GAPs, rendition switches | $PATCHED_OUTCOME | Required |"
             echo "| Official hls.js 1.7.3 compatibility | $OFFICIAL_OUTCOME | Informational; pending upstream part-loading correction |"
+            echo "| A/V sync with late audio and B-frames (patched hls.js, Shaka) | $AV_SYNC_OUTCOME | Required |"
             echo ''
-            echo 'The live-gap-playback artifact contains both player reports, the source patch, unit-test log, and build provenance. A patched-player pass does not imply official-release compatibility.'
+            echo 'The live-gap-playback artifact contains both player reports, the A/V sync measurements (av-sync.json), the source patch, unit-test log, and build provenance. A patched-player pass does not imply official-release compatibility.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()

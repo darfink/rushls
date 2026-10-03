@@ -10,7 +10,7 @@ Rust toolchain installation uses a composite action, with no JavaScript runtime.
 | Validate documentation examples | Commands extracted from README/publishing guide, all advertised A/V renditions decoded, caption text verified in WebVTT | FFmpeg, GStreamer, pinned model-free gst-captions plugin |
 | Validate code | Workflow lint (actionlint with shellcheck), workspace tests, all features, Clippy, formatting, Python unit tests | Rust, Python, shellcheck |
 | Validate media | Ignored decoder tests, recording, RTMP ingest, video GAP fixture export | FFmpeg, including AudioToolbox AAC |
-| Validate Chrome playback (patched hls.js) | Patched-player unit tests; live control and GAP streams, rendition switches, completion; official-release compatibility | Chrome, matching ChromeDriver, Node.js 24, pinned hls.js source and patch |
+| Validate Chrome playback (patched hls.js) | Patched-player unit tests; live control and GAP streams, rendition switches, completion; official-release compatibility; A/V sync in hls.js and Shaka | Chrome, matching ChromeDriver, Node.js 24, pinned hls.js source and patch, FFmpeg |
 | Validate Apple HLS | Packaging cases, playlist diagnostics, two-hour live authoring audit | macOS, Apple HLS tools, FFmpeg, trusted localhost TLS |
 | Validate GStreamer playback | Live control stream; decoded audio/video and end-of-stream | FFmpeg, GStreamer 1.28+ hlsdemux2, PyGObject |
 
@@ -212,7 +212,11 @@ All upstream unit tests and both patched-player playback cases must pass before 
 The unchanged official 1.7.3 release runs separately as an informational compatibility check.
 Its failure is visible in the job summary and is not treated as successful playback.
 
-The `live-gap-playback` artifact contains both sets of reports, the patch, the unit-test log, and build provenance.
+The job also runs `tools/av-sync/check-av-sync.py` with headless Chrome, using the patched hls.js and a pinned Shaka release.
+It publishes flash/beep streams with late audio and B-frames, and fails when any case drifts more than 15 ms from the same player's baseline.
+Native Safari is measured with the same tool locally; it needs a loopback audio device, so it is not part of CI.
+
+The `live-gap-playback` artifact contains both sets of reports, the A/V sync measurements (`av-sync.json`), the patch, the unit-test log, and build provenance.
 No Rust playback assertion is relaxed for the patched build.
 Remove the local patch and make the official release blocking again once an upstream release includes the correction.
 

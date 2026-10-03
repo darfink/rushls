@@ -19,9 +19,9 @@ Complete these checks before a broad production rollout:
 - [x] Review ELST/PDT offsets and reconnect fetch grace. Add HTTP regressions for
   real CMAF A/V offsets and priming, part/segment/init fetch deadlines after reconnect,
   and blocking reloads across successor publication and rendition retirement.
-- [ ] Run `tools/av-sync/check-av-sync.py` before releases that touch muxing or timing.
-  It measures real A/V sync in Chrome (hls.js, Shaka) and native Safari for late audio
-  and B-frames. Safari needs a loopback audio device such as BlackHole.
+- [ ] Run `tools/av-sync/check-av-sync.py --browsers safari` before releases that touch
+  muxing or timing. CI covers Chrome (hls.js, Shaka); native Safari needs a loopback
+  audio device such as BlackHole, so it runs locally.
 - [ ] Complete the supported codec/player matrix for startup, seeking, live playback,
   and rendition switching around GAPs. Record transient freezes and skips separately
   from persistent stalls. Track results in the [player matrix](docs/development/gap-validation/README.md)

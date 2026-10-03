@@ -45,8 +45,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-HLS_JS = 'https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js'
-SHAKA = 'https://cdn.jsdelivr.net/npm/shaka-player@5.2.12/dist/shaka-player.compiled.js'
+# Pinned by Subresource Integrity, so a changed CDN file fails to load
+# rather than silently changing what is measured. --hls-js replaces the
+# first with a local build, as CI's patched player.
+HLS_JS = ('https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js',
+          'sha384-cciJ0zi8d1uMKC2zJd7jvPY4HQt7W4ByUI/FlMkltvBi31aW61rcpVBhpmW8/NwX')
+SHAKA = ('https://cdn.jsdelivr.net/npm/shaka-player@5.2.12/dist/shaka-player.compiled.js',
+         'sha384-dC+HTy8lAr0Y9PZngIX8OfKQQ3JnR04Xs2ut3jQ1jxUXT1TZ23BTbPbTjM2cj4H0')
 
 # name -> (B-frames, audio delay in seconds). `base` needs no edit and no
 # tfdt offset, so every player should agree on it.
@@ -65,7 +70,7 @@ PLAYERS = {
 }
 
 PAGE = f'''<!doctype html><meta charset="utf-8"><title>Rushls A/V sync</title>
-<script src="{HLS_JS}"></script><script src="{SHAKA}"></script>
+HLS_SCRIPT<script src="{SHAKA[0]}" integrity="{SHAKA[1]}" crossorigin="anonymous"></script>
 <button id="go">start</button><video id="v" playsinline width="320" height="180"></video>
 <script>
 const WORKLET = `registerProcessor('beep', class extends AudioWorkletProcessor {{
@@ -154,10 +159,14 @@ class Proxy(http.server.BaseHTTPRequestHandler):
     """Serves the page and relays /live/ to Rushls, so the media is
     same-origin and WebAudio may read it."""
     origin = ''
+    page = b''
+    hls_bundle = None
 
     def do_GET(self):
-        if not self.path.startswith('/live/'):
-            body, status, kind = PAGE.encode(), 200, 'text/html'
+        if self.path == '/hls.js' and self.hls_bundle is not None:
+            body, status, kind = self.hls_bundle, 200, 'text/javascript'
+        elif not self.path.startswith('/live/'):
+            body, status, kind = self.page, 200, 'text/html'
         else:
             try:
                 with urllib.request.urlopen(self.origin + self.path, timeout=30) as reply:
@@ -293,7 +302,9 @@ def main():
     parser.add_argument('--rushls', type=Path, default=Path('target/debug/rushls'))
     parser.add_argument('--ffmpeg', default='ffmpeg')
     parser.add_argument('--chromedriver', type=Path, default=Path('target/chromedriver'))
-    parser.add_argument('--chrome', default='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+    parser.add_argument('--chrome', help='Chrome binary; by default ChromeDriver finds it')
+    parser.add_argument('--headless', action='store_true', help='run Chrome headless, as in CI')
+    parser.add_argument('--hls-js', type=Path, help='local hls.js build instead of the pinned release')
     parser.add_argument('--browsers', default='chrome,safari')
     parser.add_argument('--players', help='comma-separated subset, e.g. native,shaka')
     parser.add_argument('--cases', default=','.join(CASES),
@@ -332,6 +343,12 @@ def main():
             sys.exit('a publisher failed; see ' + str(work / 'rushls.log'))
 
         Proxy.origin = f'http://127.0.0.1:{http_port}'
+        if args.hls_js:
+            Proxy.hls_bundle = args.hls_js.read_bytes()
+            hls_script = '<script src="/hls.js"></script>'
+        else:
+            hls_script = f'<script src="{HLS_JS[0]}" integrity="{HLS_JS[1]}" crossorigin="anonymous"></script>'
+        Proxy.page = PAGE.replace('HLS_SCRIPT', hls_script).encode()
         server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Proxy)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         page = f'http://127.0.0.1:{server.server_address[1]}/'
@@ -341,10 +358,12 @@ def main():
         if 'chrome' in browsers:
             processes.append(subprocess.Popen([str(args.chromedriver), f'--port={chrome_port}'],
                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            options = {'args': ['--autoplay-policy=no-user-gesture-required', '--mute-audio']
+                       + (['--headless=new'] if args.headless else [])}
+            if args.chrome:
+                options['binary'] = args.chrome
             drivers['chrome'] = {'url': f'http://127.0.0.1:{chrome_port}', 'capabilities': {
-                'browserName': 'chrome',
-                'goog:chromeOptions': {'binary': args.chrome,
-                                       'args': ['--autoplay-policy=no-user-gesture-required', '--mute-audio']}}}
+                'browserName': 'chrome', 'goog:chromeOptions': options}}
         if 'safari' in browsers:
             processes.append(subprocess.Popen(['safaridriver', '-p', str(safari_port)],
                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
