@@ -1621,40 +1621,20 @@ dependencies = [
 
 [[package]]
 name = "moq-loc"
-version = "0.2.17"
+version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72cb66e188bf8de7ffeac66793063efe2c8144462c372664715d8eedb80b662e"
+checksum = "7f7fc2b068b575202f0e76192bbdb31b0cecddee6e14db15846d6b7c45225bd7"
 dependencies = [
  "bytes",
- "moq-net 0.3.8",
+ "moq-net",
  "thiserror",
 ]
 
 [[package]]
 name = "moq-net"
-version = "0.2.22"
+version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86ad048a4e4a740707f780cdd30e8e70297ab44776733faeea79bcf22aebe8a4"
-dependencies = [
- "arrayvec",
- "bytes",
- "futures",
- "kio 0.5.9",
- "num_enum",
- "rand 0.10.3",
- "serde",
- "slab",
- "thiserror",
- "tracing",
- "web-async",
- "web-transport-trait",
-]
-
-[[package]]
-name = "moq-net"
-version = "0.3.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5284f94a82a0964da21da41838b11943fccc2a6df524232b99da1d2d05dcc30d"
+checksum = "787f2e97c3952a8f2455c9580f93106f66173b926726355ad65ba03afdbd754d"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -2361,7 +2341,7 @@ dependencies = [
  "kio 0.5.9",
  "libc",
  "moq-loc",
- "moq-net 0.2.22",
+ "moq-net",
  "notify",
  "notify-debouncer-full",
  "nz",
