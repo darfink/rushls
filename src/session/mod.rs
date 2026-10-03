@@ -334,8 +334,8 @@ async fn pipeline(
         presentation: &presentation,
         segmentation: &preroll.segmentation,
         // One origin is captured for the complete muxer publication. The CMAF
-        // muxer remains responsible for any output edit lists needed to align
-        // tracks; delivery only advances this wall time by packaged timing.
+        // muxer places every track on one shared clock in `tfdt`; delivery
+        // only advances this wall time by packaged timing.
         time_anchor: std::time::SystemTime::now(),
         events: context.events(),
         budget: context.meters().budget(),

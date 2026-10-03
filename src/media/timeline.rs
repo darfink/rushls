@@ -80,8 +80,9 @@ pub enum TimelineCalibrationError {
 /// This runs on discovery metadata alone, so it is a planning step rather than
 /// part of pre-roll: it needs no media to flow. The origin is the *earliest*
 /// audio/video start. Tracks that begin later retain a positive offset, which
-/// a pass-through MP4 muxer represents with an empty edit instead of clipping
-/// media from the earlier track.
+/// the CMAF muxer carries in `tfdt` instead of clipping media from the earlier
+/// track. It never uses an empty edit: HLS players read sample times from
+/// `tfdt`, and Chrome's MSE ignores empty edits.
 ///
 /// Subtitle cues do not establish the publication epoch. They are sparse,
 /// frequently have no discovery-time `start_time` on a live input, and the

@@ -1888,8 +1888,11 @@ mod tests {
         ));
     }
 
+    /// A track that starts after the shared origin says so in `tfdt`. hls.js
+    /// and Shaka time samples from `tfdt` alone, and Chrome's MSE ignores an
+    /// empty edit, so an empty edit over a zero `tfdt` plays the track early.
     #[test]
-    fn a_genuine_later_video_start_is_exposed_as_positive_media_start() {
+    fn a_later_video_start_is_carried_by_tfdt_not_an_empty_edit() {
         let sink = discarded_events();
         let timebase = Timebase::hz90k();
         let input = validate(&catalog(vec![track(timebase)]), &StreamPolicy::permissive())
@@ -1907,21 +1910,117 @@ mod tests {
                 .expect("offset video packages");
         }
 
+        let [
+            PackagedMedia::Initialization(initialization),
+            PackagedMedia::Chunk(chunk),
+        ] = media.as_slice()
+        else {
+            panic!("expected initialization and one chunk, got {media:?}");
+        };
+        assert_eq!(
+            edit_list(&initialization.payload),
+            [],
+            "video without reordering needs no edit, and a late start is never an empty edit"
+        );
+        assert_eq!(chunk.media_start, 1_980);
+        assert_eq!(chunk.duration, FRAME);
+        let demuxed = demux_cmaf(&concat_cmaf_bytes(&media));
+        let first = demuxed.tracks[0]
+            .samples
+            .first()
+            .expect("offset video demuxes a sample");
+        assert_eq!(
+            (first.dts, first.pts),
+            (Some(1_980), Some(1_980)),
+            "tfdt places the first frame at its shared-clock position"
+        );
+    }
+
+    /// Late audio needs no edit, even when it declares priming. An edit can
+    /// only hide media before presentation zero, so for a late track it would
+    /// be a pure shift that hls.js (which skips `elst`) misplaces. The late
+    /// start lives in `tfdt`, and the priming frame presents just before the
+    /// audible start, as it does in Apple's own segmenters.
+    #[test]
+    fn a_later_audio_start_needs_no_edit_even_with_priming() {
+        const PRIMING: i64 = 1_024;
+        // The audible start sits 2048 ticks after the shared origin.
+        const LATE: i64 = 2_048;
+        let sink = discarded_events();
+        let timebase = Timebase::new(nz::u32!(1), nz::u32!(48_000));
+        let audio = TrackBuilder::new(0, MediaKind::Audio)
+            .timebase(timebase)
+            .parameters(MediaParameters::Audio {
+                sample_rate: nz::u32!(48_000),
+                channels: nz::u16!(1),
+                frame_size: Some(nz::u32!(1_024)),
+                bit_depth: None,
+                timing: AudioTiming {
+                    initial_padding_samples: 1_024,
+                    ..AudioTiming::default()
+                },
+            })
+            .codec(crate::domain::Codec::Aac)
+            .codec_extradata(AAC_EXTRADATA.to_vec())
+            .build();
+        let input = validate(&catalog(vec![audio]), &StreamPolicy::permissive())
+            .expect("audio fixture validates");
+        let mut started = started(
+            &input,
+            vec![
+                audio_plan(timebase, 8, 2)
+                    .presentation_origin(-LATE)
+                    .build(),
+            ],
+            &sink,
+        );
+        let mut media = Vec::new();
+        for sample in [
+            trimmed_audio_sample(
+                -PRIMING,
+                AudioTrim {
+                    leading_samples: 1_024,
+                    trailing_samples: 0,
+                },
+            ),
+            trimmed_audio_sample(0, AudioTrim::default()),
+            trimmed_audio_sample(1_024, AudioTrim::default()),
+            trimmed_audio_sample(2_048, AudioTrim::default()),
+        ] {
+            started
+                .muxer
+                .push(sample, &mut media)
+                .expect("late primed AAC packages");
+        }
+
+        let initialization = media
+            .iter()
+            .find_map(|event| match event {
+                PackagedMedia::Initialization(initialization) => Some(initialization),
+                _ => None,
+            })
+            .expect("delayed initialization is emitted");
+        assert_eq!(
+            edit_list(&initialization.payload),
+            [],
+            "a late track carries neither an empty edit nor a priming shift"
+        );
         assert!(matches!(
-            media.as_slice(),
-            [
-                PackagedMedia::Initialization(initialization),
-                PackagedMedia::Chunk(chunk)
-            ] if initialization
-                .payload
-                .as_bytes()
-                .windows(4)
-                .any(|window| window == b"elst")
-                && edit_list(&initialization.payload).first().map(|entry| entry.1)
-                    == Some(-1)
-                && chunk.media_start == 1_980
-                && chunk.duration == FRAME
+            media.iter().find(|event| matches!(event, PackagedMedia::Chunk(_))),
+            Some(PackagedMedia::Chunk(chunk)) if chunk.media_start == LATE
         ));
+        let demuxed = demux_cmaf(&concat_cmaf_bytes(&media));
+        let samples = &demuxed.tracks[0].samples;
+        assert_eq!(
+            samples.first().and_then(|primed| primed.pts),
+            Some(LATE - PRIMING),
+            "the priming frame presents just before the audible start"
+        );
+        assert_eq!(
+            samples.get(1).and_then(|audible| audible.pts),
+            Some(LATE),
+            "the first audible frame presents at its shared-clock position"
+        );
     }
 
     #[test]

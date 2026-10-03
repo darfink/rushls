@@ -56,13 +56,13 @@ not build them until a publisher needs them.
 
 ## Timing (two different elst cases)
 
-Delayed start and encoder priming are not the same edit list.
+Delayed start and encoder priming are handled differently. A delayed start is a later `tfdt` on the shared clock. Only media that decodes before the shared origin (priming, or a reordered picture's earlier DTS) shifts the track's media clock, through one non-empty edit. The muxer never writes an empty edit, because hls.js and Shaka read sample times from `tfdt` and Chrome's MSE ignores empty edits.
 
 | Feature | Status | Notes |
 |---|---|---|
-| Different first PTS per track (RTMP and MPEG-TS) | **done** | Each track records its first presentation timestamp. Audio adds declared priming to the encoded timestamp. RTMP video includes its composition offset. Mux rebases by a shared `presentation_origin_pts`. A later-starting track gets an empty edit (`media_time = -1`) and a positive chunk `media_start`. Covered by `audio_and_video_keep_their_relative_offset_through_packaging` and `a_genuine_later_video_start_is_exposed_as_positive_media_start`. RTMP discovery asserts video `first_pts = 0`, audio `21`. |
+| Different first PTS per track (RTMP and MPEG-TS) | **done** | Each track records its first presentation timestamp. Audio adds declared priming to the encoded timestamp. RTMP video includes its composition offset. Mux rebases by a shared `presentation_origin_pts`. A later-starting track keeps a later `tfdt` and a positive chunk `media_start`, with no empty edit. Covered by `audio_and_video_keep_their_relative_offset_through_packaging`, `a_later_video_start_is_carried_by_tfdt_not_an_empty_edit`, `a_later_audio_start_needs_no_edit_even_with_priming`, and `http_cmaf_timestamps_and_pdt_share_one_clock_without_empty_edits`. RTMP discovery asserts video `first_pts = 0`, audio `21`. |
 | AAC skip-samples / `initial_padding` | **mapped** (mux) / **gap** (ingest) | Mux writes priming into `elst` when `AudioTiming.initial_padding_samples` or packet `AudioTrim` is set. AAC adapters leave both default. Relevant for **file-originated AAC** (MP4/MKV encoder delay, often 1024 or 2112 for HE). **Live RTMP/TS AAC-LC almost never carries skip-samples**; a later first audio PTS is delayed start, not priming. Skip until file-origin AAC is an ingest source. |
-| Opus `pre_skip` | **done** (RTMP and mono/stereo TS) | `OpusHead` bytes 10–11 contain little-endian pre-skip, after the eight-byte signature. The shared parser preserves gain and channel mapping. Normalization emits leading trim once. CMAF writes `dOps` version 0 and an edit that selects past priming. Delayed starts and priming can coexist. TS takes priming from its first PES control header. |
+| Opus `pre_skip` | **done** (RTMP and mono/stereo TS) | `OpusHead` bytes 10–11 contain little-endian pre-skip, after the eight-byte signature. The shared parser preserves gain and channel mapping. Normalization emits leading trim once. CMAF writes `dOps` version 0 and an edit that selects past priming. On a delayed track, priming presents just before the audible start, as in Apple's segmenters: an edit can only hide media before presentation zero. TS takes priming from its first PES control header. |
 | Declared `video_delay` (B-frame reorder depth) | **done** (H.264/HEVC) | Shared SPS parsers read H.264 VUI reorder limits and HEVC sub-layer ordering. Real B-frame fixtures cover both. Missing declarations retain zero; AV1 delay inference remains a gap. |
 
 ## CMAF writer extras avformat got for free
@@ -70,7 +70,7 @@ Delayed start and encoder priming are not the same edit list.
 | Feature | Status | Notes |
 |---|---|---|
 | Init + fragments, no `sidx`, delayed `moov` | **done** | |
-| Edit lists: priming, delayed start, composition offset | **done** | Regression tests cover priming with a delayed start and delayed video with a composition offset. Packet-only leading trim also reaches the edit list. Opus final trim shortens the last fragment sample duration. |
+| Edit lists: priming, delayed start, composition offset | **done** | At most one non-empty edit per track, for priming or a composition offset before the origin. A delayed start is a later `tfdt`. Regression tests cover delayed audio with priming, delayed video, and the PDT-to-`tfdt` mapping over HTTP. Packet-only leading trim also reaches the edit list. Opus final trim shortens the last fragment sample duration. |
 | Opus random-access pre-roll | **done** (boxes) | Init roll descriptions and per-fragment sample groups count enough preceding packets for 80 ms, including variable durations across fragment boundaries. Startup uses a conservative description when history is unavailable. Unit tests check roll distances. Live start-of-stream playback is proven; mid-window join and DVR seek against those roll groups are not separately proven. |
 | `colr` / `pasp` / HDR (`mdcv`/`clli`) | **done** (H.264/HEVC startup) | SPS/VUI supplies color and aspect. Static HDR SEI seen before init emission supplies mastering display and content light boxes. Real fixtures check serialized values. AV1 visual metadata and changes after init remain gaps. |
 

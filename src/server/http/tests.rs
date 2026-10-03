@@ -3658,8 +3658,66 @@ async fn blocking_reload_survives_reconnect_or_ends_when_its_rendition_retires()
     Ok(())
 }
 
+/// Every `EXT-X-PART` of `playlist`, fetched and joined in order.
+async fn concatenated_parts(
+    address: SocketAddr,
+    base: &str,
+    playlist: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut parts = Vec::new();
+    for line in playlist
+        .lines()
+        .filter(|line| line.starts_with("#EXT-X-PART:"))
+    {
+        let uri = line
+            .split("URI=\"")
+            .nth(1)
+            .ok_or("missing part URI")?
+            .split('"')
+            .next()
+            .ok_or("missing part URI")?;
+        let part = request(address, "GET", &format!("{base}/{uri}"), &[]).await;
+        assert_eq!(part.status, 200);
+        parts.extend_from_slice(&part.body);
+    }
+    Ok(parts)
+}
+
+/// The PDT names the first presented sample: the first whose raw timestamp,
+/// less the edit's `media_time`, is not negative. Measured from the shared
+/// anchor, that position must equal the PDT for every playlist alike.
+fn assert_pdt_names_first_presented_sample(
+    kind: &str,
+    pdt: &str,
+    edits: &[(u64, i64)],
+    samples: &[transmux::Sample],
+    timescale: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let skipped = edits.first().map_or(0, |&(_, media_time)| media_time);
+    let presented = samples
+        .iter()
+        .filter_map(|sample| sample.pts)
+        .map(|pts| pts - skipped)
+        .find(|&pts| pts >= 0)
+        .ok_or("no presented sample")?;
+    let presented =
+        Duration::from_secs_f64(f64::from(u32::try_from(presented)?) / f64::from(timescale));
+    assert_eq!(
+        humantime::parse_rfc3339(pdt)?.duration_since(crate::delivery::hls::fixtures::anchor())?,
+        presented,
+        "{kind}: PDT and media timestamps disagree"
+    );
+    Ok(())
+}
+
+/// HLS requires every playlist to map PROGRAM-DATE-TIME onto media timestamps
+/// the same way (RFC 8216bis §6.2.4), and players read those timestamps from
+/// `tfdt`: hls.js and Shaka never parse `elst`, and Chrome's MSE ignores an
+/// empty edit. So a track that starts late must say so in `tfdt`. The only
+/// edit allowed is a single non-empty one that hides priming or a composition
+/// offset, which Chrome does apply.
 #[tokio::test]
-async fn http_cmaf_edit_lists_and_pdt_preserve_priming_and_av_offset()
+async fn http_cmaf_timestamps_and_pdt_share_one_clock_without_empty_edits()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::{domain::Payload, mux::fixtures::edit_list};
     use broadcast_common::Unpackage;
@@ -3671,9 +3729,30 @@ async fn http_cmaf_edit_lists_and_pdt_preserve_priming_and_av_offset()
     for event in media {
         write(&lease, event);
     }
-    for (rendition, kind, pdt, edit, frame_ticks, count) in [
-        (0, "audio", "2023-11-14T22:13:20Z", 1_024, 1_024, 5),
-        (1, "video", "2023-11-14T22:13:20.5Z", 0, 8_192, 2),
+    // Audio is audible at the shared origin behind 1024 samples of priming;
+    // video starts half a second later. `first_tfdt` is the raw clock the
+    // first sample sits on.
+    for (rendition, kind, pdt, edits, timescale, frame_ticks, count, first_tfdt) in [
+        (
+            0,
+            "audio",
+            "2023-11-14T22:13:20Z",
+            vec![(0, 1_024)],
+            48_000,
+            1_024,
+            5,
+            0,
+        ),
+        (
+            1,
+            "video",
+            "2023-11-14T22:13:20.5Z",
+            vec![],
+            16_384,
+            8_192,
+            2,
+            8_192,
+        ),
     ] {
         let base = format!("/live/camera/{rendition}");
         let reply = request(harness.address, "GET", &format!("{base}/{kind}.m3u8"), &[]).await;
@@ -3696,12 +3775,12 @@ async fn http_cmaf_edit_lists_and_pdt_preserve_priming_and_av_offset()
             .ok_or("missing segment")?;
         let init = request(harness.address, "GET", &format!("{base}/{init_uri}"), &[]).await;
         assert_eq!(init.status, 200);
-        let edits = edit_list(&Payload::from(init.body.clone()));
-        if rendition == 0 {
-            assert_eq!(edits, [(0, edit)]);
-        } else {
-            assert_eq!(edits, [(8_192, -1), (0, edit)]);
-        }
+        let served_edits = edit_list(&Payload::from(init.body.clone()));
+        assert!(
+            served_edits.iter().all(|&(_, media_time)| media_time >= 0),
+            "{kind} carries an empty edit: {served_edits:?}"
+        );
+        assert_eq!(served_edits, edits, "{kind} edit list");
         let segment = request(
             harness.address,
             "GET",
@@ -3710,22 +3789,7 @@ async fn http_cmaf_edit_lists_and_pdt_preserve_priming_and_av_offset()
         )
         .await;
         assert_eq!(segment.status, 200);
-        let mut parts = Vec::new();
-        for line in playlist
-            .lines()
-            .filter(|line| line.starts_with("#EXT-X-PART:"))
-        {
-            let uri = line
-                .split("URI=\"")
-                .nth(1)
-                .ok_or("missing part URI")?
-                .split('"')
-                .next()
-                .ok_or("missing part URI")?;
-            let part = request(harness.address, "GET", &format!("{base}/{uri}"), &[]).await;
-            assert_eq!(part.status, 200);
-            parts.extend_from_slice(&part.body);
-        }
+        let parts = concatenated_parts(harness.address, &base, playlist).await?;
         assert_eq!(
             parts, segment.body,
             "parts and complete segment contain identical timing"
@@ -3735,14 +3799,15 @@ async fn http_cmaf_edit_lists_and_pdt_preserve_priming_and_av_offset()
         let demuxed = transmux::Fmp4Demux::new().unpackage(&bytes)?;
         let samples = &demuxed.tracks[0].samples;
         assert_eq!(samples.len(), count);
-        // Encoded clocks start at zero. ELST removes AAC priming and delays
-        // video by 8192/16384 s; PDT describes those presented positions.
+        // Every track sits on one shared clock. A late start is a later
+        // `tfdt`, never a zero `tfdt` behind an empty edit.
         for (index, sample) in samples.iter().enumerate() {
-            let pts = i64::try_from(index)? * frame_ticks;
-            assert_eq!(sample.pts, Some(pts));
-            assert_eq!(sample.dts, Some(pts));
+            let pts = first_tfdt + i64::try_from(index)? * frame_ticks;
+            assert_eq!(sample.pts, Some(pts), "{kind} sample {index}");
+            assert_eq!(sample.dts, Some(pts), "{kind} sample {index}");
             assert_eq!(sample.duration, Some(u32::try_from(frame_ticks)?));
         }
+        assert_pdt_names_first_presented_sample(kind, pdt, &edits, samples, timescale)?;
     }
     harness.stop().await;
     Ok(())

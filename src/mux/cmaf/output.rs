@@ -70,10 +70,11 @@ pub(super) struct CmafOutput {
     nal_length_bytes: usize,
     roll: Option<super::roll::RollRecovery>,
     video: crate::media::video_config::VideoProperties,
-    padding_ticks: u64,
     pending: Vec<PendingSample>,
+    /// The first decode time on the shared presentation clock. Only a start
+    /// before the origin (priming, or a reordered picture's earlier DTS)
+    /// moves this track's media clock; see [`media_shift`].
     first_decode: Option<TickTimestamp>,
-    first_pts: Option<TickTimestamp>,
     initialized: bool,
     sequence: u32,
 }
@@ -119,10 +120,8 @@ impl CmafOutput {
                 track.codec,
                 track.codec_extradata.as_bytes(),
             ),
-            padding_ticks: padding_ticks(track)?,
             pending: Vec::new(),
             first_decode: None,
-            first_pts: None,
             initialized: false,
             sequence: 1,
         })
@@ -166,13 +165,6 @@ impl CmafOutput {
         );
         if self.first_decode.is_none() {
             self.first_decode = Some(dts);
-            self.first_pts = Some(pts);
-            if let NormalizedMedia::Audio(audio) = sample {
-                // Normalized audio uses one tick per decoded sample.
-                self.padding_ticks = self
-                    .padding_ticks
-                    .max(u64::from(audio.trim.leading_samples));
-            }
         }
         if !self.initialized {
             self.video.observe_hdr(
@@ -226,11 +218,7 @@ impl CmafOutput {
         // Builder intermediates here are a few KiB and are not accounted.
         let init = build_init_segment(std::slice::from_ref(&self.spec), self.spec.timescale)
             .map_err(mux)?;
-        let elst = edit_list(
-            self.padding_ticks,
-            self.first_decode.unwrap_or(0),
-            self.first_pts.unwrap_or(0),
-        );
+        let elst = edit_list(media_shift(self.first_decode.unwrap_or(0)));
         let bytes = with_cmaf_init(&init, elst, self.roll.is_some(), &self.video)?;
         if bytes.capacity() > charge.bytes() {
             return Err("CMAF initialization exceeded its reserved bound".into());
@@ -243,7 +231,9 @@ impl CmafOutput {
         if self.pending.is_empty() {
             return Ok(Payload::default());
         }
-        let origin = self.first_decode.unwrap_or(0);
+        // Media time = shared presentation time + shift, so tfdt never goes
+        // negative and a track that starts late keeps its later tfdt.
+        let origin = -media_shift(self.first_decode.unwrap_or(0));
         let video = self.is_video();
         let styp = SegmentTypeBox {
             major_brand: *b"msdh",
@@ -582,43 +572,39 @@ fn codec_config(track: &DiscoveredTrack) -> Result<CodecConfig, Box<str>> {
     }
 }
 
-fn edit_list(
-    padding_ticks: u64,
-    first_decode: TickTimestamp,
-    first_pts: TickTimestamp,
-) -> Option<EditListBox> {
-    // tfdt is rebased by first_decode. Select the first audible/composed
-    // sample in that media clock, then retain its offset on the shared clock.
-    // Priming and a delayed track start can both be present.
-    let audible_start = first_pts.checked_add_unsigned(padding_ticks)?;
-    let media_time = audible_start.checked_sub(first_decode)?;
-    let mut entries = Vec::new();
-    if audible_start > 0 {
-        entries.push(EditListEntry {
-            segment_duration: u64::try_from(audible_start).ok()?,
-            media_time: -1,
-            media_rate_integer: 1,
-            media_rate_fraction: 0,
-        });
-    }
-    if entries.is_empty() && media_time == 0 {
+/// How far this track's media clock runs ahead of the shared presentation
+/// clock: the distance its first decode time lies before the shared origin.
+///
+/// Everything that decodes before the origin is either AAC/Opus priming or
+/// a reordered picture's early DTS, and the edit's `media_time` hides exactly
+/// that span. A track that starts at or after the origin needs no shift: its
+/// late start is carried by `tfdt` alone, because hls.js and Shaka read
+/// sample times from `tfdt` and Chrome's MSE ignores empty edits. Its priming,
+/// if any, then presents just before its audible start, as Apple's own
+/// segmenters do: an edit can only hide media before presentation zero.
+fn media_shift(first_decode: TickTimestamp) -> TickTimestamp {
+    first_decode.min(0).saturating_neg()
+}
+
+/// The single non-empty edit that maps presentation zero to `media_time`.
+///
+/// Never an empty edit, and never more than one entry: Chrome applies only a
+/// first entry with a non-negative `media_time`, and HLS players that skip
+/// `elst` entirely see the same timeline whenever the shift is zero.
+fn edit_list(media_time: TickTimestamp) -> Option<EditListBox> {
+    if media_time == 0 {
         return None;
     }
-    entries.push(EditListEntry {
-        segment_duration: 0,
-        media_time,
-        media_rate_integer: 1,
-        media_rate_fraction: 0,
-    });
-    let version = u8::from(entries.iter().any(|entry| {
-        entry.segment_duration > u64::from(u32::MAX)
-            || entry.media_time < i64::from(i32::MIN)
-            || entry.media_time > i64::from(i32::MAX)
-    }));
+    let version = u8::from(media_time > i64::from(i32::MAX));
     Some(EditListBox {
         version,
         flags: 0,
-        entries,
+        entries: vec![EditListEntry {
+            segment_duration: 0,
+            media_time,
+            media_rate_integer: 1,
+            media_rate_fraction: 0,
+        }],
     })
 }
 
@@ -755,35 +741,6 @@ fn media_timescale(timebase: Timebase) -> Result<u32, Box<str>> {
     Ok(den / num)
 }
 
-fn padding_ticks(track: &DiscoveredTrack) -> Result<u64, Box<str>> {
-    let MediaParameters::Audio {
-        sample_rate,
-        timing,
-        ..
-    } = track.parameters
-    else {
-        return Ok(0);
-    };
-    samples_to_ticks(
-        timing.initial_padding_samples,
-        sample_rate.get(),
-        track.timebase,
-    )
-}
-
-fn samples_to_ticks(samples: u32, sample_rate: u32, timebase: Timebase) -> Result<u64, Box<str>> {
-    if samples == 0 {
-        return Ok(0);
-    }
-    let numerator = u128::from(samples) * u128::from(timebase.den().get());
-    let denominator = u128::from(sample_rate) * u128::from(timebase.num().get());
-    if !numerator.is_multiple_of(denominator) {
-        return Err("audio priming cannot be represented exactly in the track timebase".into());
-    }
-    u64::try_from(numerator / denominator)
-        .map_err(|_| Box::<str>::from("audio priming overflowed the media timescale"))
-}
-
 fn record_body(bytes: &[u8], fourcc: [u8; 4]) -> &[u8] {
     if bytes.len() >= 8 && bytes[4..8] == fourcc {
         &bytes[8..]
@@ -839,15 +796,15 @@ mod tests {
         let budget = PipelineBudget::with_reserve(1024 * 1024, 256 * 1024);
         let mut output = h264_output(budget.clone())?;
         let init_charge = budget.used();
-        output.first_decode = Some(100);
+        output.first_decode = Some(0);
         let mut expected = Vec::new();
         for index in 0..6 {
             let data = Bytes::from_static(if index % 2 == 0 { H264_IDR } else { H264_P });
             let charge = output.reserve(data.len())?;
             output.admit(
                 PendingSample {
-                    dts: 100 + index,
-                    pts: 102 + index,
+                    dts: index,
+                    pts: index + 2,
                     duration: 1,
                     random_access: index % 2 == 0,
                     data,
@@ -913,21 +870,17 @@ mod tests {
     }
 
     #[test]
-    fn delayed_audio_keeps_both_priming_and_movie_offset() {
-        let edits = edit_list(312, 48_000, 48_000).expect("delayed primed audio");
-        assert_eq!(edits.entries.len(), 2);
-        assert_eq!(edits.entries[0].segment_duration, 48_312);
-        assert_eq!(edits.entries[0].media_time, -1);
-        assert_eq!(edits.entries[1].media_time, 312);
-        let edits = edit_list(312, -312, -312).expect("priming before origin");
+    fn only_a_start_before_the_origin_shifts_the_media_clock() {
+        // Priming or a reordered DTS before the origin is hidden by one edit.
+        assert_eq!(media_shift(-312), 312);
+        let edits = edit_list(media_shift(-312)).expect("priming before the origin");
         assert_eq!(edits.entries.len(), 1);
+        assert_eq!(edits.entries[0].segment_duration, 0);
         assert_eq!(edits.entries[0].media_time, 312);
-    }
-
-    #[test]
-    fn delayed_reordered_video_keeps_composition_offset() {
-        let edits = edit_list(0, 900, 1_000).expect("delayed reordered video");
-        assert_eq!(edits.entries[0].segment_duration, 1_000);
-        assert_eq!(edits.entries[1].media_time, 100);
+        // A start at or after the origin is a later tfdt, never an edit.
+        for first_decode in [0, 900, 48_000] {
+            assert_eq!(media_shift(first_decode), 0);
+            assert!(edit_list(media_shift(first_decode)).is_none());
+        }
     }
 }
