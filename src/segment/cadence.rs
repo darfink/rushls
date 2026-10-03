@@ -407,7 +407,10 @@ impl CadenceObserver {
         target: Target,
         videos: Option<&VideoSelection>,
     ) -> Result<Option<TrackSegmentationPlan>, CadenceError> {
-        let (segmentation_origin, segment_duration) = match track.kind {
+        // The first segment and the cadence after it usually match, but not
+        // for audio that starts away from the video keyframe: its first
+        // segment runs from its own first access unit to the shared boundary.
+        let (segmentation_origin, first_duration, segment_duration) = match track.kind {
             MediaKind::Video => {
                 let Some(selection) = videos else {
                     return Err(CadenceError::NoSegmentationBoundary);
@@ -421,7 +424,7 @@ impl CadenceObserver {
                 let Some(origin) = track.segmentation_origin else {
                     return Ok(None);
                 };
-                (origin, boundary.start)
+                (origin, boundary.start, boundary.start)
             }
             MediaKind::Audio => {
                 let Some(origin) = track.segmentation_origin else {
@@ -433,17 +436,22 @@ impl CadenceObserver {
                     }
                     return Ok(None);
                 };
-                (origin, boundary.start)
+                // Later segments follow the target's cadence, not this first
+                // span: audio that starts 100 ms after the keyframe has a
+                // short first segment and full-length ones after it. The
+                // boundary tolerance covers snapping each cut to an access unit.
+                let cadence = self.target_ticks(track_index, target)?;
+                (origin, boundary.start, cadence)
             }
             MediaKind::Subtitle => {
                 let duration = self.target_ticks(track_index, target)?;
-                (track.presentation_origin, duration)
+                (track.presentation_origin, duration, duration)
             }
         };
         let segment_duration =
             NonZero::new(segment_duration).ok_or(CadenceError::NoSegmentationBoundary)?;
         let first_segment_boundary_pts = segmentation_origin
-            .checked_add_unsigned(segment_duration.get())
+            .checked_add_unsigned(first_duration)
             .ok_or(CadenceError::TimestampOverflow(track.track_id))?;
         let part_duration = NonZero::new(
             track.timebase.duration_to_ticks_floor(
@@ -891,19 +899,58 @@ mod tests {
             .expect("video and audio are ready");
         let audio = &plans[1];
 
-        assert_eq!(audio.segment_duration.get() % AUDIO_FRAME, 0);
-        assert_eq!(
-            audio.first_segment_boundary_pts,
-            audio.segmentation_origin_pts
-                + i64::try_from(audio.segment_duration.get()).expect("segment duration fits i64")
-        );
+        // The first cut snaps to the audio grid; the cadence stays the video's.
+        let first =
+            (audio.first_segment_boundary_pts - audio.segmentation_origin_pts).cast_unsigned();
+        assert_eq!(first % AUDIO_FRAME, 0);
         assert!(
-            Duration::from_secs(4).abs_diff(
-                audio
-                    .timebase
-                    .ticks_to_duration(audio.segment_duration.get())
-            ) <= audio.timebase.ticks_to_duration(AUDIO_FRAME)
+            Duration::from_secs(4).abs_diff(audio.timebase.ticks_to_duration(first))
+                <= audio.timebase.ticks_to_duration(AUDIO_FRAME)
         );
+        assert_eq!(
+            audio
+                .timebase
+                .ticks_to_duration(audio.segment_duration.get()),
+            Duration::from_secs(4)
+        );
+    }
+
+    /// Audio that starts after the keyframe has a short first segment. Later
+    /// ones span the full video cadence, so that span must fit the ceiling.
+    #[test]
+    fn late_audio_ceiling_follows_the_video_cadence() {
+        let mut observer = observer(
+            &[(0, MediaKind::Video), (1, MediaKind::Audio)],
+            Duration::from_secs(8),
+        );
+        observe_video(&mut observer, 0, 0, true);
+        observe_video(&mut observer, 0, 4 * VIDEO_SECOND, true);
+        // About 133 ms late and off the frame grid, as moq-cli 0.10 sends it.
+        let late = 6_400;
+        for frame in 0..=200 {
+            let pts = late + frame * AUDIO_FRAME;
+            observer
+                .observe(&audio_sample(1, pts.cast_signed(), AUDIO_FRAME))
+                .expect("audio is observable");
+        }
+
+        let plans = observer
+            .plan()
+            .expect("search succeeds")
+            .expect("video and audio are ready");
+        let audio = &plans[1];
+
+        let first =
+            (audio.first_segment_boundary_pts - audio.segmentation_origin_pts).cast_unsigned();
+        assert!(audio.timebase.ticks_to_duration(first) < Duration::from_secs(4));
+        // A steady-state segment snaps both ends up to the audio grid, so it
+        // can span the cadence plus nearly one frame.
+        let steady = audio
+            .timebase
+            .duration_to_ticks_ceil(Duration::from_secs(4))
+            + AUDIO_FRAME
+            - 1;
+        assert!(steady <= audio.maximum_segment_ticks(Duration::ZERO));
     }
 
     #[test]
