@@ -7,6 +7,12 @@ contain breaking changes; they are listed first.
 
 ## [Unreleased]
 
+### Fixed
+
+- The release workflow publishes only the workspace crates whose version is
+  not yet on crates.io. In 0.2.0, the unchanged `rushls-common` stopped the
+  automatic upload, and `rushls` 0.2.0 was published by hand.
+
 ## [0.2.0] - 2026-10-04
 
 ### Breaking changes

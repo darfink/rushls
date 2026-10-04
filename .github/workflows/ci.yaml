@@ -391,4 +391,14 @@ jobs:
       - name: Publish workspace crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token || env.BOOTSTRAP_TOKEN }}
-        run: cargo publish --workspace --locked
+        run: |
+          # Crates whose version is already on crates.io are skipped; cargo
+          # would otherwise refuse the whole workspace.
+          mapfile -t excluded < <(python3 tools/unpublished-crates.py)
+          members=$(cargo metadata --format-version 1 --no-deps --locked | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["workspace_members"]))')
+          if [ "${#excluded[@]}" -ge "$members" ]; then
+            echo 'Every workspace crate version is already on crates.io.'
+            exit 0
+          fi
+          # shellcheck disable=SC2068
+          cargo publish --workspace --locked ${excluded[@]}
