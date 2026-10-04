@@ -40,7 +40,7 @@ docker run --rm -p 1935:1935 -p 9000:9000/udp -p 8080:8080 ghcr.io/darfink/rushl
 | `edge` | The latest passing build of `main` |
 | `sha-<commit>` | The build of one exact commit |
 
-The image is Linux AMD64 only, and runs as UID/GID `65532:65532`.
+The image is built for Linux AMD64 and ARM64, and runs as UID/GID `65532:65532`.
 It is based on distroless `cc` with a BusyBox shell, so `docker exec -it <container> sh` works for debugging; there is no package manager.
 It ships [a configuration](../examples/container/rushls.toml) that listens on all container interfaces and lets anyone publish;
 mount your own at `/etc/rushls/rushls.toml` for anything public. See [Deployment](deployment.md) for volumes and secrets.

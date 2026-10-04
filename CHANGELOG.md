@@ -7,6 +7,11 @@ contain breaking changes; they are listed first.
 
 ## [Unreleased]
 
+### Added
+
+- The container image is published for Linux ARM64 as well as AMD64, under
+  the same tags.
+
 ### Fixed
 
 - The release workflow publishes only the workspace crates whose version is

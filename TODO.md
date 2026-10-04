@@ -84,7 +84,7 @@ Evaluate these separately from release validation:
 
 - [x] Port recording and store ownership to Windows, with native tests and ZIP packaging.
 - [ ] Add signed/notarized release binaries and evaluate static Linux builds.
-- [ ] Add multi-architecture container publication.
+- [x] Add multi-architecture container publication (Linux AMD64 and ARM64).
 
 - [ ] Support coordinated midstream discontinuities and a defined subset of compatible
   codec/configuration changes. Define timestamp-reset semantics before adding recovery.
