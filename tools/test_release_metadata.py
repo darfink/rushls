@@ -23,8 +23,11 @@ class ReleaseMetadataTests(unittest.TestCase):
             git('commit', '--allow-empty', '-m', 'main')
             git('update-ref', 'refs/remotes/origin/main', 'HEAD')
 
+            changelog = '# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-10-02\n\nFirst release.\n\n[0.1.0]: https://example.invalid\n'
+
             def exercise(version, ref):
                 (root / 'Cargo.toml').write_text(f'[package]\nversion = "{version}"\n')
+                (root / 'CHANGELOG.md').write_text(changelog)
                 output = root / 'output'
                 output.write_text('')
                 result = subprocess.run([sys.executable, str(SCRIPT)], cwd=root, capture_output=True,
@@ -35,6 +38,12 @@ class ReleaseMetadataTests(unittest.TestCase):
             code, output = exercise('0.1.0', 'refs/tags/v0.1.0')
             self.assertEqual(code, 0)
             self.assertIn('ghcr.io/example/rushls:latest\n', output)
+            # The version's changelog section, without the link list, is the release notes.
+            self.assertIn('notes<<RELEASE_NOTES\nFirst release.\nRELEASE_NOTES\n', output)
+            # A tag whose version has no changelog section is refused.
+            changelog = changelog.replace('## [0.1.0]', '## [0.0.9]')
+            self.assertNotEqual(exercise('0.1.0', 'refs/tags/v0.1.0')[0], 0)
+            changelog = changelog.replace('## [0.0.9]', '## [0.1.0]')
             code, output = exercise('0.1.0-rc.1', 'refs/tags/v0.1.0-rc.1')
             self.assertEqual(code, 0)
             self.assertIn('prerelease=true', output)

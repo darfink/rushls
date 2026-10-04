@@ -273,6 +273,11 @@ def run_browser(browser, driver, page, loopback, args, report):
         for name in args.cases:
             result = measure(driver, page, mode, name, args.listen, loopback)
             found = offsets(result)
+            if len(found) < 3:
+                # The first Safari session of a run sometimes plays without
+                # being measured; one fresh session is enough to recover.
+                result = measure(driver, page, mode, name, args.listen, loopback)
+                found = offsets(result)
             rows[name] = {'offsets_ms': found, 'errors': result['errors'],
                           'flashes': result['flashes'], 'beeps': result['beeps'],
                           'playing': result['playing'],
