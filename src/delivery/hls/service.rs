@@ -30,7 +30,7 @@ use crate::{
             media::media_playlist, multivariant::multivariant_playlist,
             timing::blocking_reload_deadline,
         },
-        uri::{Resource, TOKEN_QUERYPARAM, UriBase, parse_path},
+        uri::{Resource, TOKEN_QUERYPARAM, UriBase},
     },
     delivery::{EdgeCondition, Origin, Reuse, uri::ContentType},
     domain::{RenditionId, StreamId},
@@ -244,22 +244,20 @@ impl Service {
         self.config.cache_control.missing(target, blocking)
     }
 
-    /// Resolves and serves one HLS manifest request target.
-    pub async fn serve_path(
+    /// Serves an already resolved manifest without reinterpreting its URL.
+    pub async fn serve_manifest(
         &self,
-        path: &str,
+        stream: &StreamId,
+        resource: Resource,
         query: Option<&str>,
     ) -> Result<Response, DeliveryFailure> {
-        let Ok(named) = parse_path(path) else {
-            return Err(self.unrouted(DeliveryError::UnknownResource));
-        };
         let directives = match parse_directives(query) {
             Ok(directives) => directives,
             Err(error) => return Err(self.unrouted(error)),
         };
         self.serve(
-            &named.stream,
-            Request::new(named.resource, directives.blocking)
+            stream,
+            Request::new(resource, directives.blocking)
                 .with_skip(directives.skip)
                 .with_query_variables(
                     self.config.query_variables && query_has_nonempty_token(query),
@@ -828,6 +826,54 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn publisher_and_playlist_service_keep_the_advertised_retention_floor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            delivery::hls::{
+                PublisherFactory, RetentionPolicy, StoreLimits, StorePublisherFactory,
+                TargetDurationMultiple,
+                fixtures::{direct_segment, presentation, six_second_start, timebase},
+            },
+            domain::Payload,
+            mux::fixtures::config_with_maximum,
+        };
+        let id = stream_id();
+        let retain = Duration::from_secs(36);
+        let store = StreamStore::new(StoreLimits {
+            retention: RetentionPolicy {
+                retain: retain.into(),
+                maximum_payload_bytes: 4,
+                maximum_segments: 3,
+                ..RetentionPolicy::default()
+            },
+            ..StoreLimits::default()
+        });
+        let mut rendition = video(0);
+        rendition.config = config_with_maximum(timebase(), 6, 12, None);
+        let factory = StorePublisherFactory::new(store.clone())
+            .with_timing(TargetDurationMultiple::integer(3).into(), retain.into());
+        let mut publisher = factory.start(&id, presentation(vec![rendition]))?;
+        publisher.write(initialization(0, 1))?;
+        let payload = Payload::from(vec![7]);
+        for segment in 0..12 {
+            let media = direct_segment(0, segment, six_second_start(segment), 6, payload.clone());
+            publisher.write(media)?;
+        }
+        let service = origin(&store);
+        let response = service
+            .serve(&id, video_playlist(None))
+            .await
+            .map_err(|failure| failure.error)?;
+        let manifest = playlist(&response);
+        assert!(manifest.contains("#EXT-X-TARGETDURATION:12\n"));
+        assert!(manifest.contains("HOLD-BACK=36,"));
+        assert_eq!(manifest.matches("#EXTINF:6,\n").count(), 6);
+        let live = store.get(&id).ok_or("stream")?;
+        assert_eq!(live.retention_depth().held, retain);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn initial_readiness_expiration_is_not_a_blocking_reload() {
         use crate::observe::{Operation, OperationOutcome};
         let store = StreamStore::default();
@@ -1353,7 +1399,11 @@ mod tests {
             .await
             .expect("an unknown skip value is a full playlist");
         let via_query = origin
-            .serve_path("/live/camera/0/video.m3u8", Some("_HLS_skip=nope"))
+            .serve_manifest(
+                &stream_id(),
+                video_playlist(None).resource,
+                Some("_HLS_skip=nope"),
+            )
             .await
             .expect("unknown skip must not 400");
 
@@ -1404,15 +1454,13 @@ mod tests {
         let _lease = lease(&store, vec![video(0)]);
         let policy = CacheControlPolicy::default();
 
+        let resource = Resource::MediaPlaylist(RenditionId(9), MediaKind::Video);
         let skip_only = origin
-            .serve_path("/live/camera/9/video.m3u8", Some("_HLS_skip=YES"))
+            .serve_manifest(&stream_id(), resource, Some("_HLS_skip=YES"))
             .await
             .expect_err("no such rendition");
         let skip_and_block = origin
-            .serve_path(
-                "/live/camera/9/video.m3u8",
-                Some("_HLS_skip=YES&_HLS_msn=1"),
-            )
+            .serve_manifest(&stream_id(), resource, Some("_HLS_skip=YES&_HLS_msn=1"))
             .await
             .expect_err("no such rendition");
 
@@ -1631,7 +1679,7 @@ mod cache_tests {
         let retired = store.maintain().retired;
 
         assert_eq!(
-            origin.remove_streams(&retired),
+            origin.remove_streams(retired.iter().map(|(stream, _)| stream)),
             1,
             "a cache entry per stream retained forever is a leak with the \
              lifetime of the process"

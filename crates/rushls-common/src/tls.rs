@@ -196,6 +196,13 @@ impl From<TlsError> for io::Error {
 #[derive(Debug)]
 pub struct CertificateResolver(ArcSwap<CertifiedKey>);
 
+impl CertificateResolver {
+    /// The leaf selected for new handshakes, including only accepted rotations.
+    pub fn leaf(&self) -> Option<CertificateDer<'static>> {
+        self.0.load().cert.first().cloned()
+    }
+}
+
 impl ResolvesServerCert for CertificateResolver {
     fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(self.0.load_full())
@@ -467,6 +474,7 @@ impl<O: TlsObserver> axum::serve::Listener for TlsListener<O> {
 /// reloads, so its lifetime has to be tied to whatever depends on the material
 /// staying current.
 pub struct CertificateWatch {
+    resolver: Arc<CertificateResolver>,
     _debouncer: Debouncer<notify::RecommendedWatcher, RecommendedCache>,
     pump: tokio::task::JoinHandle<()>,
 }
@@ -478,6 +486,11 @@ impl Drop for CertificateWatch {
 }
 
 impl CertificateWatch {
+    /// Shares the listener's active certificate without reopening its files.
+    pub fn resolver(&self) -> Arc<CertificateResolver> {
+        Arc::clone(&self.resolver)
+    }
+
     pub fn start<O: TlsObserver>(
         settings: TlsSettings,
         resolver: Arc<CertificateResolver>,
@@ -514,9 +527,14 @@ impl CertificateWatch {
         }
 
         let pump = runtime.spawn(reload_on_change(
-            settings, resolver, provider, observer, receiver,
+            settings,
+            Arc::clone(&resolver),
+            provider,
+            observer,
+            receiver,
         ));
         Ok(Self {
+            resolver,
             _debouncer: debouncer,
             pump,
         })

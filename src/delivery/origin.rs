@@ -131,15 +131,8 @@ impl Origin {
                 }
             }
             MediaResource::Part(_, part, _) => {
-                if let Some(stored) = live.part(rendition, part) {
-                    if stored.gap {
-                        return Err(DeliveryError::UnknownResource);
-                    }
-                    MediaObject {
-                        body: MediaBody::single(self.load_held(&stored.payload).await?),
-                        gzip: self.load_optional_gzip(stored.gzip.as_ref()).await?,
-                        contract,
-                    }
+                let stored = if let Some(stored) = live.part(rendition, part) {
+                    stored
                 } else {
                     // Only the preload-hinted frontier is expected to arrive.
                     // An older absent part expired and a far-future identity was
@@ -160,14 +153,18 @@ impl Origin {
                             Operation::HintedPart,
                         )
                         .await?;
-                    let stored = live
-                        .part(rendition, part)
-                        .ok_or(DeliveryError::UnknownResource)?;
-                    MediaObject {
-                        body: MediaBody::single(self.load_held(&stored.payload).await?),
-                        gzip: self.load_optional_gzip(stored.gzip.as_ref()).await?,
-                        contract,
-                    }
+                    live.part(rendition, part)
+                        .ok_or(DeliveryError::UnknownResource)?
+                };
+                // A hinted identity can arrive as a GAP. Apply the same
+                // availability check whether it was present or waited for.
+                if stored.gap {
+                    return Err(DeliveryError::UnknownResource);
+                }
+                MediaObject {
+                    body: MediaBody::single(self.load_held(&stored.payload).await?),
+                    gzip: self.load_optional_gzip(stored.gzip.as_ref()).await?,
+                    contract,
                 }
             }
         };

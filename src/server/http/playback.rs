@@ -28,12 +28,9 @@ use tokio::task::AbortHandle;
 use urlencoding::decode as percent_decode;
 
 use crate::{
-    delivery::{
-        hls::uri::{TOKEN_QUERYPARAM, parse_path},
-        uri::parse_media_path,
-    },
-    domain::StreamId,
+    delivery::hls::uri::TOKEN_QUERYPARAM,
     outbound::{Endpoint, HttpClient, Response as OutboundResponse},
+    server::http::ViewerRequest,
 };
 
 const DEFAULT_JWKS_REFRESH: Duration = Duration::from_mins(5);
@@ -317,26 +314,24 @@ impl PlaybackGate {
     /// drift from the bytes it keys its cache by.
     pub fn authorize(
         &self,
-        path: &str,
-        query: Option<&str>,
+        request: &ViewerRequest,
         headers: &HeaderMap,
     ) -> Result<(), PlaybackDenial> {
-        self.authorize_inner(path, query, headers)
+        self.authorize_inner(request, headers)
             .inspect_err(|denial| self.meters.deny(*denial))
     }
 
     fn authorize_inner(
         &self,
-        path: &str,
-        query: Option<&str>,
+        request: &ViewerRequest,
         headers: &HeaderMap,
     ) -> Result<(), PlaybackDenial> {
-        let token = presented_token(headers, query)?;
+        let token = presented_token(headers, request.uri().query())?;
         let claims = self.decode(&token)?;
         if !self.extra_claims_match(&claims) {
             return Err(PlaybackDenial::Unauthorized);
         }
-        if let Some(stream) = requested_stream(path)
+        if let Some(stream) = request.stream()
             && !stream_claim_matches(&claims, &self.stream_claim, stream.as_str())
         {
             return Err(PlaybackDenial::Forbidden);
@@ -426,15 +421,6 @@ fn first_query_value<'a>(query: Option<&'a str>, name: &str) -> Option<&'a str> 
                 let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
                 (key == name).then_some(value)
             })
-    })
-}
-
-fn requested_stream(path: &str) -> Option<StreamId> {
-    parse_path(path).ok().map(|named| named.stream).or_else(|| {
-        parse_media_path(path)
-            .ok()
-            .flatten()
-            .map(|named| named.stream)
     })
 }
 
@@ -630,7 +616,17 @@ mod tests {
                 format!("Bearer {bearer}").parse().expect("ascii"),
             );
         }
-        gate.authorize(path, query, &headers)
+        gate.authorize(
+            &ViewerRequest::new(
+                format!(
+                    "{path}{}",
+                    query.map_or(String::new(), |query| format!("?{query}"))
+                )
+                .parse()
+                .expect("valid test URI"),
+            ),
+            &headers,
+        )
     }
 
     #[test]
@@ -730,8 +726,11 @@ mod tests {
         headers.insert(header::AUTHORIZATION, "Basic abc".parse().expect("ascii"));
         assert_eq!(
             gate().authorize(
-                "/live/camera/index.m3u8",
-                Some(&format!("token={jwt}")),
+                &ViewerRequest::new(
+                    format!("/live/camera/index.m3u8?token={jwt}")
+                        .parse()
+                        .expect("valid test URI")
+                ),
                 &headers
             ),
             Err(PlaybackDenial::Unauthorized)

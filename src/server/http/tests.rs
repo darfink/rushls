@@ -6,104 +6,24 @@
 //! with the right `Content-Range`, that a blocked request keeps its connection
 //! open, and that shutdown lets an in-flight blocking reload finish.
 
-use std::{fmt::Write as _, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
 };
 
-use crate::delivery::hls::{
-    StreamStore,
-    fixtures::{
+use crate::{
+    delivery::hls::fixtures::{
         PART_BYTES, chunk, initialization, lease, video, video_with_cadence, write, write_segment,
     },
-};
-use crate::{
-    observe::{HlsMeters, OriginMeters, ProcessMeters},
-    server::metrics::{MetricsEndpoint, MetricsReader, MetricsToken},
-    session::Registry,
+    server::metrics::MetricsToken,
 };
 
-use super::{AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, Readiness, serve};
-
-/// A raw HTTP/1.1 response, parsed just enough to assert on.
-struct Reply {
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Reply {
-    /// Every value sent for one field name, joined the way a comma-separated
-    /// list field means them.
-    ///
-    /// `Vary` arrives as more than one line here: the origin sets its own
-    /// content-negotiation field and the CORS middleware adds its own, which
-    /// HTTP treats as equivalent to one combined list.
-    fn joined(&self, name: &str) -> Option<String> {
-        let values: Vec<&str> = self
-            .headers
-            .iter()
-            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-            .collect();
-        (!values.is_empty()).then(|| values.join(", "))
-    }
-
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str())
-    }
-}
-
-/// Speaks HTTP/1.1 by hand rather than pulling in a client crate.
-///
-/// Each request is a few lines, and a hand-written one can assert on exactly
-/// what came back — including that a HEAD carried no body at all, which a
-/// client library would hide behind its own response type.
-async fn request(address: SocketAddr, method: &str, target: &str, extra: &[(&str, &str)]) -> Reply {
-    let mut stream = TcpStream::connect(address).await.expect("the origin is up");
-    let mut head = format!("{method} {target} HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n");
-    for (name, value) in extra {
-        let _ = write!(head, "{name}: {value}\r\n");
-    }
-    head.push_str("\r\n");
-    stream
-        .write_all(head.as_bytes())
-        .await
-        .expect("the request is sent");
-
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("the response completes");
-    let split = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("the response has headers");
-    let head = String::from_utf8_lossy(&raw[..split]).to_string();
-    let body = raw[split + 4..].to_vec();
-
-    let mut lines = head.lines();
-    let status = lines
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("the status line parses");
-    let headers = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
-        .collect();
-    Reply {
-        status,
-        headers,
-        body,
-    }
-}
+use super::{
+    AllowedOrigins, CorsConfig, HttpConfig, OriginPattern, Readiness,
+    fixtures::{HttpHarness as Harness, HttpOptions, MetricsMode, Reply, publish_camera, request},
+};
 
 /// Several requests down one kept-alive connection, framed only by
 /// `Content-Length`.
@@ -142,189 +62,36 @@ async fn read_declared(stream: &mut TcpStream, pending: &mut Vec<u8>) -> Reply {
         pending.extend_from_slice(&chunk[..read]);
     };
 
-    let head = String::from_utf8_lossy(&pending[..split]).to_string();
-    let mut lines = head.lines();
-    let status = lines
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .expect("the status line parses");
-    let headers: Vec<(String, String)> = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
-        .collect();
-    let Some((_, declared)) = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-    else {
-        panic!("a response with no declared length cannot be framed on a reused connection: {head}")
-    };
+    let mut reply = Reply::parse_head(&pending[..split]);
+    let declared = reply.header("content-length").unwrap_or_else(|| {
+        panic!(
+            "a response with no declared length cannot be framed on a reused connection: {}",
+            String::from_utf8_lossy(&pending[..split])
+        )
+    });
     let length: usize = declared.parse().expect("a declared length is a number");
 
     let start = split + 4;
     while pending.len() < start + length {
         let mut chunk = [0_u8; 4096];
-        let read = stream.read(&mut chunk).await.expect("the body arrives");
+        let read = stream.read(&mut chunk).await.expect("the response arrives");
         assert!(read > 0, "the origin closed mid-body");
         pending.extend_from_slice(&chunk[..read]);
     }
-    let body = pending[start..start + length].to_vec();
+    reply.body = pending[start..start + length].to_vec();
     pending.drain(..start + length);
-    Reply {
-        status,
-        headers,
-        body,
-    }
-}
-
-/// A running origin, its store, and the handle that stops it.
-struct Harness {
-    address: SocketAddr,
-    store: StreamStore,
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    served: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
-}
-
-enum MetricsMode {
-    Disabled,
-    Enabled(Option<MetricsToken>),
-}
-
-impl Harness {
-    async fn start() -> Self {
-        Self::start_with(HttpConfig::default()).await
-    }
-
-    async fn start_with(config: HttpConfig) -> Self {
-        Self::start_config(config, MetricsMode::Disabled).await
-    }
-
-    async fn start_with_metrics(config: HttpConfig, token: Option<MetricsToken>) -> Self {
-        Self::start_config(config, MetricsMode::Enabled(token)).await
-    }
-
-    async fn start_config(config: HttpConfig, metrics: MetricsMode) -> Self {
-        Self::start_config_with_readiness(config, metrics, Readiness::ready()).await
-    }
-
-    async fn start_with_readiness(readiness: Readiness) -> Self {
-        Self::start_config_with_readiness(HttpConfig::default(), MetricsMode::Disabled, readiness)
-            .await
-    }
-
-    async fn start_config_with_readiness(
-        config: HttpConfig,
-        metrics: MetricsMode,
-        readiness: Readiness,
-    ) -> Self {
-        Self::start_gated(config, metrics, readiness, None).await
-    }
-
-    async fn start_with_playback(playback: Arc<super::PlaybackGate>) -> Self {
-        Self::start_gated(
-            HttpConfig::default(),
-            MetricsMode::Disabled,
-            Readiness::ready(),
-            Some(playback),
-        )
-        .await
-    }
-
-    async fn start_with_playback_and_metrics(playback: Arc<super::PlaybackGate>) -> Self {
-        Self::start_gated(
-            HttpConfig::default(),
-            MetricsMode::Enabled(None),
-            Readiness::ready(),
-            Some(playback),
-        )
-        .await
-    }
-
-    async fn start_gated(
-        config: HttpConfig,
-        metrics: MetricsMode,
-        readiness: Readiness,
-        playback: Option<Arc<super::PlaybackGate>>,
-    ) -> Self {
-        let hls = crate::delivery::hls::service::Config {
-            query_variables: playback.is_some(),
-            ..crate::delivery::hls::service::Config::default()
-        };
-        Self::start_hls(config, metrics, readiness, playback, hls).await
-    }
-
-    async fn start_hls(
-        config: HttpConfig,
-        metrics: MetricsMode,
-        readiness: Readiness,
-        playback: Option<Arc<super::PlaybackGate>>,
-        hls: crate::delivery::hls::service::Config,
-    ) -> Self {
-        let store = StreamStore::default();
-        let origin = super::fixtures::application_with(&store, hls);
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("an ephemeral port is available");
-        let address = listener.local_addr().expect("the listener is bound");
-        let (shutdown, signal) = tokio::sync::oneshot::channel();
-        let metrics = match metrics {
-            MetricsMode::Enabled(token) => {
-                let mut reader = MetricsReader::new(
-                    ProcessMeters::default(),
-                    OriginMeters::default(),
-                    HlsMeters::default(),
-                    Registry::default(),
-                    store.clone(),
-                );
-                if let Some(gate) = &playback {
-                    reader = reader.with_playback(gate.meters());
-                }
-                Some(MetricsEndpoint::new(reader, token))
-            }
-            MetricsMode::Disabled => None,
-        };
-        let served = tokio::spawn(serve(
-            crate::server::http::TcpHttpListener::from(listener),
-            origin,
-            config,
-            metrics,
-            playback,
-            readiness,
-            async {
-                let _ = signal.await;
-            },
-        ));
-        Self {
-            address,
-            store,
-            shutdown: Some(shutdown),
-            served: Some(served),
-        }
-    }
-
-    async fn advance_retention(&self, duration: Duration) {
-        // Advance between requests only; auto-advancing a real socket's
-        // timeout while the OS delivers its response would mask HTTP behavior.
-        tokio::time::pause();
-        tokio::time::advance(duration).await;
-        tokio::time::resume();
-        self.store.maintain();
-    }
-
-    async fn stop(mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(served) = self.served.take() {
-            let _ = served.await;
-        }
-    }
+    reply
 }
 
 #[tokio::test]
 async fn liveness_is_always_available_and_readiness_tracks_runtime_state() {
     let readiness = Readiness::default();
-    let harness = Harness::start_with_readiness(readiness.clone()).await;
+    let harness = HttpOptions {
+        readiness: readiness.clone(),
+        ..HttpOptions::default()
+    }
+    .start()
+    .await;
 
     let live = request(harness.address, "GET", "/health/live", &[]).await;
     assert_eq!(live.status, 200);
@@ -360,7 +127,12 @@ async fn health_endpoints_reject_methods_that_cannot_be_probes() {
 
 #[tokio::test]
 async fn enabled_metrics_can_be_exposed_without_authentication() {
-    let harness = Harness::start_with_metrics(HttpConfig::default(), None).await;
+    let harness = HttpOptions {
+        metrics: MetricsMode::Enabled(None),
+        ..HttpOptions::default()
+    }
+    .start()
+    .await;
 
     let reply = request(harness.address, "GET", "/metrics", &[]).await;
 
@@ -405,10 +177,11 @@ async fn metrics_are_absent_unless_the_endpoint_is_enabled() {
 
 #[tokio::test]
 async fn metrics_require_the_configured_bearer_token() {
-    let harness = Harness::start_with_metrics(
-        HttpConfig::default(),
-        Some(MetricsToken::new("scrape-secret")),
-    )
+    let harness = HttpOptions {
+        metrics: MetricsMode::Enabled(Some(MetricsToken::new("scrape-secret"))),
+        ..HttpOptions::default()
+    }
+    .start()
     .await;
 
     let missing = request(harness.address, "GET", "/metrics", &[]).await;
@@ -457,9 +230,7 @@ async fn metrics_require_the_configured_bearer_token() {
 #[tokio::test]
 async fn a_playlist_is_served_with_its_media_type_and_half_a_target_duration() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     let reply = request(harness.address, "GET", "/live/camera/0/video.m3u8", &[]).await;
 
@@ -605,9 +376,7 @@ fn each_playlist_encoding_validates_as_a_different_entity() {
 #[tokio::test]
 async fn an_unchanged_playlist_revalidates_without_its_body() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     let first = request(harness.address, "GET", "/live/camera/0/video.m3u8", &[]).await;
     let tag = first
@@ -667,9 +436,7 @@ async fn an_unchanged_playlist_revalidates_without_its_body() {
 #[tokio::test]
 async fn revalidating_one_encoding_never_answers_for_the_other() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     let identity = request(harness.address, "GET", "/live/camera/0/video.m3u8", &[]).await;
     let encoded = request(
@@ -781,9 +548,7 @@ fn a_playlist_refuses_ranges_and_asks_not_to_be_transformed() {
 #[tokio::test]
 async fn media_still_advertises_and_serves_ranges() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     let whole = request(harness.address, "GET", "/live/camera/0/segment/1.m4s", &[]).await;
     let partial = request(
@@ -810,9 +575,7 @@ async fn media_still_advertises_and_serves_ranges() {
 #[tokio::test]
 async fn every_playlist_declares_its_length_so_a_reused_connection_stays_framed() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     // A client that keeps its connection reads the multivariant playlist, then
     // the media playlist it names, then reloads it — all without reconnecting.
@@ -853,9 +616,7 @@ async fn every_playlist_declares_its_length_so_a_reused_connection_stays_framed(
 #[tokio::test]
 async fn a_gzipped_playlist_also_declares_its_length() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     let encoded = request(
         harness.address,
@@ -879,9 +640,7 @@ async fn a_gzipped_playlist_also_declares_its_length() {
 #[tokio::test]
 async fn a_playlist_is_gzipped_for_a_client_that_accepts_it() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     let plain = request(harness.address, "GET", "/live/camera/0/video.m3u8", &[]).await;
     let encoded = request(
@@ -925,9 +684,7 @@ async fn a_playlist_is_gzipped_for_a_client_that_accepts_it() {
 #[tokio::test]
 async fn a_client_refusing_gzip_is_answered_in_the_encoding_it_asked_for() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     // `q=0` is a refusal, and it outranks the wildcard beside it.
     let refused = request(
@@ -954,9 +711,7 @@ async fn a_client_refusing_gzip_is_answered_in_the_encoding_it_asked_for() {
 #[tokio::test]
 async fn already_compressed_media_is_neither_gzipped_nor_negotiated() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     let reply = request(
         harness.address,
@@ -1021,16 +776,17 @@ fn playback_token_from(claims: &serde_json::Value) -> String {
     .expect("a test token encodes")
 }
 
-fn publish_camera(harness: &Harness) {
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+fn playback_options() -> HttpOptions {
+    HttpOptions {
+        playback: Some(playback_gate()),
+        ..HttpOptions::default()
+    }
 }
 
 #[tokio::test]
 async fn ungated_playlists_remain_public_and_omit_queryparam() {
     let harness = Harness::start().await;
-    publish_camera(&harness);
+    drop(publish_camera(&harness.store));
 
     let reply = request(harness.address, "GET", "/live/camera/index.m3u8", &[]).await;
     assert_eq!(reply.status, 200);
@@ -1050,8 +806,8 @@ async fn ungated_playlists_remain_public_and_omit_queryparam() {
 
 #[tokio::test]
 async fn a_missing_or_empty_query_token_is_unauthorized_before_any_playlist() {
-    let harness = Harness::start_with_playback(playback_gate()).await;
-    publish_camera(&harness);
+    let harness = playback_options().start().await;
+    drop(publish_camera(&harness.store));
 
     for target in [
         "/live/camera/index.m3u8",
@@ -1073,8 +829,8 @@ async fn a_missing_or_empty_query_token_is_unauthorized_before_any_playlist() {
 
 #[tokio::test]
 async fn a_bearer_token_serves_the_ungated_playlist_form_without_public_caching() {
-    let harness = Harness::start_with_playback(playback_gate()).await;
-    publish_camera(&harness);
+    let harness = playback_options().start().await;
+    drop(publish_camera(&harness.store));
     let jwt = playback_token("live/camera");
 
     let reply = request(
@@ -1121,8 +877,8 @@ async fn a_bearer_token_serves_the_ungated_playlist_form_without_public_caching(
 
 #[tokio::test]
 async fn a_query_token_serves_the_queryparam_form_gzipped_identically_for_two_viewers() {
-    let harness = Harness::start_with_playback(playback_gate()).await;
-    publish_camera(&harness);
+    let harness = playback_options().start().await;
+    drop(publish_camera(&harness.store));
     let first = playback_token("live/camera");
     let second = playback_token_from(&serde_json::json!({
         "iss": PLAYBACK_ISS,
@@ -1189,10 +945,8 @@ async fn a_query_token_serves_the_queryparam_form_gzipped_identically_for_two_vi
 
 #[tokio::test]
 async fn a_query_token_still_honours_a_blocking_reload() {
-    let harness = Harness::start_with_playback(playback_gate()).await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let harness = playback_options().start().await;
+    let lease = publish_camera(&harness.store);
     write(&lease, chunk(0, 1, 0, 6));
     let jwt = playback_token("live/camera");
 
@@ -1222,8 +976,8 @@ async fn a_query_token_still_honours_a_blocking_reload() {
 
 #[tokio::test]
 async fn claim_failures_are_unauthorized_and_a_wrong_stream_is_forbidden() {
-    let harness = Harness::start_with_playback(playback_gate()).await;
-    publish_camera(&harness);
+    let harness = playback_options().start().await;
+    drop(publish_camera(&harness.store));
 
     let expired = playback_token_from(&serde_json::json!({
         "iss": PLAYBACK_ISS,
@@ -1259,8 +1013,8 @@ async fn claim_failures_are_unauthorized_and_a_wrong_stream_is_forbidden() {
 
 #[tokio::test]
 async fn the_header_is_verified_when_both_are_present_and_the_query_still_selects_queryparam() {
-    let harness = Harness::start_with_playback(playback_gate()).await;
-    publish_camera(&harness);
+    let harness = playback_options().start().await;
+    drop(publish_camera(&harness.store));
     let header = playback_token("live/camera");
     let query = playback_token("live/other");
 
@@ -1280,7 +1034,7 @@ async fn the_header_is_verified_when_both_are_present_and_the_query_still_select
 
 #[tokio::test]
 async fn health_and_cors_preflight_stay_ungated() {
-    let harness = Harness::start_with_playback(playback_gate()).await;
+    let harness = playback_options().start().await;
 
     let live = request(harness.address, "GET", "/health/live", &[]).await;
     assert_eq!(live.status, 200);
@@ -1301,9 +1055,150 @@ async fn health_and_cors_preflight_stay_ungated() {
 }
 
 #[tokio::test]
+async fn encoded_viewer_urls_share_auth_delivery_and_stream_attribution()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = HttpOptions {
+        metrics: MetricsMode::Enabled(None),
+        ..playback_options()
+    }
+    .start()
+    .await;
+    drop(publish_camera(&harness.store));
+    let authorization = format!("Bearer {}", playback_token("live/camera"));
+    let other = format!("Bearer {}", playback_token("live/other"));
+    for path in [
+        "/live%2Fcamera/index.m3u8",
+        "/live/%63amera/0/video.m3u8",
+        "//live//camera//0/init/1.mp4",
+        "/live%2fcamera/0/segment/1.m4s",
+        "/live/camera/index.m3u8/",
+        "/live/camera/0/init/1.mp4/",
+    ] {
+        let reply = request(
+            harness.address,
+            "GET",
+            path,
+            &[("Authorization", &authorization)],
+        )
+        .await;
+        assert_eq!(reply.status, 200, "{path}");
+        assert!(
+            !reply
+                .header("cache-control")
+                .is_some_and(|value| value.contains("public"))
+        );
+        let denied = request(harness.address, "GET", path, &[("Authorization", &other)]).await;
+        assert_eq!(denied.status, 403, "{path}");
+        assert_eq!(denied.header("cache-control"), Some("no-store"));
+    }
+    for path in [
+        "/live/%zz/index.m3u8",
+        "/live/%FF/index.m3u8",
+        "/live/%/0/segment/1.m4s",
+        "/live/camera/nope/video.m3u8",
+        "/live/camera/0/segment/nope.m4s",
+        "/live/camera/%30/video.m3u8",
+        "/live/camera/index%2em3u8",
+    ] {
+        assert_eq!(
+            request(harness.address, "GET", path, &[]).await.status,
+            401,
+            "{path}"
+        );
+        let reply = request(
+            harness.address,
+            "GET",
+            path,
+            &[("Authorization", &authorization)],
+        )
+        .await;
+        assert_eq!(reply.status, 404, "{path}");
+        assert!(!reply.body.starts_with(b"#EXTM3U"));
+    }
+    let metrics = request(harness.address, "GET", "/metrics/streams", &[]).await;
+    let metrics = String::from_utf8(metrics.body)?;
+    for resource in ["playlist", "media"] {
+        for status in [200, 403] {
+            assert!(metrics.contains(&format!(
+                "rushls_stream_http_responses_total{{stream=\"live/camera\",resource=\"{resource}\",method=\"GET\",status=\"{status}\"}} 3"
+            )), "{metrics}");
+        }
+    }
+    assert!(
+        !metrics.contains("status=\"404\""),
+        "malformed paths must not acquire stream labels"
+    );
+    harness.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn quic_fingerprint_tracks_only_the_active_certificate()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::fixtures::{
+        QuicHarness, TLS_HOST, scratch, self_signed, write_atomically, write_pair,
+    };
+
+    let directory = scratch("quic-fingerprint");
+    let (settings, first) = write_pair(&directory, TLS_HOST);
+    let harness = QuicHarness::start(settings.clone()).await?;
+
+    let first_hash = harness.leaf_hash(&first).await?;
+    let reply = harness
+        .fingerprint(&[("Origin", "https://player.example")])
+        .await;
+    assert_eq!(reply.body, first_hash.as_bytes());
+    assert_eq!(reply.header("cache-control"), Some("no-cache"));
+    assert_eq!(reply.header("access-control-allow-origin"), Some("*"));
+    let head = request(harness.address, "HEAD", "/certificate.sha256", &[]).await;
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    assert_eq!(head.header("content-length"), Some("64"));
+    let post = request(harness.address, "POST", "/certificate.sha256", &[]).await;
+    assert_eq!(post.status, 405);
+
+    // Replace just the leaf with another valid PEM. Its mismatched key must
+    // keep both QUIC and the pin endpoint on the previously accepted leaf.
+    let foreign = self_signed("other.test");
+    write_atomically(&settings.certificate, foreign.cert.pem().as_bytes());
+    harness
+        .events
+        .certificate_rejected(Duration::from_secs(5))
+        .await?;
+    assert_eq!(harness.leaf_hash(&first).await?, first_hash);
+    assert_eq!(harness.fingerprint(&[]).await.body, first_hash.as_bytes());
+    std::fs::remove_file(&settings.certificate)?;
+    assert_eq!(harness.fingerprint(&[]).await.body, first_hash.as_bytes());
+
+    let (_, second) = write_pair(&directory, TLS_HOST);
+    let second_hash = super::leaf_fingerprint(&second.as_slice().into());
+    assert_ne!(first_hash, second_hash);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let reply = harness.fingerprint(&[]).await;
+            if reply.body == second_hash.as_bytes() {
+                break;
+            }
+            assert_eq!(reply.body, first_hash.as_bytes());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    assert_eq!(harness.leaf_hash(&second).await?, second_hash);
+    harness.stop().await?;
+    std::fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn playback_denials_are_counted_by_status_only() {
-    let harness = Harness::start_with_playback_and_metrics(playback_gate()).await;
-    publish_camera(&harness);
+    let harness = HttpOptions {
+        metrics: MetricsMode::Enabled(None),
+        ..playback_options()
+    }
+    .start()
+    .await;
+    drop(publish_camera(&harness.store));
     let other = playback_token("live/other");
 
     let unauthorized = request(harness.address, "GET", "/live/camera/index.m3u8", &[]).await;
@@ -1357,8 +1252,13 @@ async fn an_es256_pem_admits_a_viewer() {
     )
     .expect("an ES256 token encodes");
 
-    let harness = Harness::start_with_playback(gate).await;
-    publish_camera(&harness);
+    let harness = HttpOptions {
+        playback: Some(gate),
+        ..HttpOptions::default()
+    }
+    .start()
+    .await;
+    drop(publish_camera(&harness.store));
     let reply = request(
         harness.address,
         "GET",
@@ -1389,9 +1289,7 @@ async fn a_multivariant_playlist_names_its_renditions() {
 #[tokio::test]
 async fn a_segment_is_immutable_and_carries_its_true_length() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     let reply = request(harness.address, "GET", "/live/camera/0/segment/1.m4s", &[]).await;
 
@@ -1419,9 +1317,7 @@ async fn a_segment_is_immutable_and_carries_its_true_length() {
 #[tokio::test]
 async fn a_head_request_answers_with_the_headers_and_no_body() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     let reply = request(harness.address, "HEAD", "/live/camera/0/segment/1.m4s", &[]).await;
 
@@ -1439,9 +1335,7 @@ async fn a_head_request_answers_with_the_headers_and_no_body() {
 #[tokio::test]
 async fn a_byte_range_is_answered_from_the_buffers_it_spans() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
     let total = 6 * PART_BYTES;
 
     let reply = request(
@@ -1480,9 +1374,7 @@ async fn a_byte_range_is_answered_from_the_buffers_it_spans() {
 #[tokio::test]
 async fn unknown_resources_and_bad_directives_are_told_apart() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
 
     // Absence is worth remembering, and a directive naming it is worth
     // remembering longer; a malformed request is the client's to fix and is
@@ -1539,9 +1431,7 @@ async fn unknown_resources_and_bad_directives_are_told_apart() {
 #[tokio::test]
 async fn a_blocking_reload_holds_the_connection_until_its_part_arrives() {
     let harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let lease = publish_camera(&harness.store);
     write(&lease, chunk(0, 1, 0, 6));
 
     let address = harness.address;
@@ -1623,9 +1513,7 @@ async fn an_unsatisfiable_wait_ends_in_503_with_a_retry_hint() {
 #[tokio::test]
 async fn shutdown_lets_an_in_flight_blocking_reload_finish() {
     let mut harness = Harness::start().await;
-    let lease = lease(&harness.store, vec![video(0)]);
-    write(&lease, initialization(0, 1));
-    write_segment(&lease, 0, 0, 0);
+    let lease = publish_camera(&harness.store);
     write(&lease, chunk(0, 1, 0, 6));
 
     let address = harness.address;
@@ -1642,21 +1530,21 @@ async fn shutdown_lets_an_in_flight_blocking_reload_finish() {
 
     // Shutdown begins while a viewer is parked mid-reload. Dropping it here is
     // what turns a routine restart into a visible stall for every viewer.
-    let shutdown = harness.shutdown.take().expect("the harness holds it");
-    let served = harness.served.take().expect("the harness holds it");
-    let _ = shutdown.send(());
+    harness.begin_shutdown();
 
     write(&lease, chunk(0, 1, 1, 7));
     let reply = held.await.expect("the request task ran");
     assert_eq!(reply.status, 200);
 
-    let _ = served.await;
+    harness.stop().await;
 }
 
 mod end_to_end {
     use std::{
         fs,
         io::Cursor,
+        net::SocketAddr,
+        num::NonZeroUsize,
         path::Path,
         process::Command,
         sync::Arc,
@@ -1665,15 +1553,14 @@ mod end_to_end {
 
     use crate::{
         admission::{
-            ClientInfo, IngestProtocol, OpenStreamAuthenticator, PresentedCredential, PublishGrant,
-            PublishRequest, PublishResource, StreamPolicy,
+            IngestProtocol, OpenStreamAuthenticator, PublishGrant, PublishRequest, StreamPolicy,
         },
         delivery::hls::service::PlaylistReadiness,
         domain::BoxFuture,
         observe::{Events, SourceMeters},
         segment::SegmentationPolicy,
         server::{Node, NodeConfig},
-        session::{PendingPermit, SessionOutcome, run_session},
+        session::{PendingPermit, SessionConfig, SessionOutcome, run_session},
         source::{
             AcceptedPublish, IngressEvent, InputLimits, InputState, MpegTsConfig,
             MpegTsPacketSource, PendingPublish, PublishRejection, ReadInput, RtmpPacketSource,
@@ -1682,19 +1569,17 @@ mod end_to_end {
         },
     };
 
-    use super::{HttpConfig, Readiness, TcpListener, request, serve};
+    use super::{Harness, HttpOptions, request};
 
-    struct RtmpAacPublish {
-        request: PublishRequest,
-        frames: usize,
-        input: crate::source::InputLimits,
-        caption_name: Vec<u8>,
-        captions: Vec<(u32, Vec<u8>)>,
+    struct RtmpPublish {
+        input: InputLimits,
+        events: Vec<IngressEvent>,
+        capacity: NonZeroUsize,
     }
 
-    impl PendingPublish for RtmpAacPublish {
+    impl PendingPublish for RtmpPublish {
         fn publish_request(&self) -> Result<PublishRequest, TransportError> {
-            Ok(self.request.clone())
+            Ok(publish_request(IngestProtocol::Rtmp))
         }
 
         fn accept(
@@ -1703,13 +1588,15 @@ mod end_to_end {
             meters: Arc<dyn SourceMeters>,
         ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
             Box::pin(async move {
-                let (reader, writer) = channel(nz::usize!(64 * 1024));
-                for event in rtmp_aac_events(self.frames, &self.caption_name, &self.captions) {
+                let (reader, writer) = channel(self.capacity);
+                for event in self.events {
                     writer
                         .send(event)
                         .await
                         .map_err(|error| TransportError::Accept(error.to_string().into()))?;
                 }
+                // What `on_unpublish` sends, and what a clean session close
+                // sends. Nothing about this path is specific to a test.
                 writer.finish(InputState::Closed);
                 let source = RtmpPacketSource::new(reader, self.input, meters)
                     .map_err(|error| TransportError::Accept(error.to_string().into()))?;
@@ -1728,70 +1615,20 @@ mod end_to_end {
         }
     }
 
-    fn publish_request() -> PublishRequest {
-        PublishRequest {
-            protocol: IngestProtocol::Rtmp,
-            resource: PublishResource {
-                namespace: Some("live".into()),
-                name: "camera".into(),
-            },
-            credential: PresentedCredential::new("secret"),
-            client: ClientInfo {
-                remote_address: "127.0.0.1:1935".parse().expect("constant is valid"),
-                encoder: Some("checked-in fixture".into()),
-                protocol_version: None,
-            },
-        }
+    fn publish_request(protocol: IngestProtocol) -> PublishRequest {
+        let mut request = crate::admission::fixtures::publish_request("secret");
+        request.protocol = protocol;
+        request.resource.name = "camera".into();
+        request.client.encoder = Some("checked-in fixture".into());
+        request
     }
 
-    fn publish_two_one_track_aac(input: crate::source::InputLimits) -> Box<dyn PendingPublish> {
-        Box::new(RtmpTwoAacPublish {
-            request: publish_request(),
-            frames: 20,
+    fn publish_aac(input: InputLimits, events: Vec<IngressEvent>) -> Box<dyn PendingPublish> {
+        Box::new(RtmpPublish {
             input,
+            events,
+            capacity: nz::usize!(64 * 1024),
         })
-    }
-
-    struct RtmpTwoAacPublish {
-        request: PublishRequest,
-        frames: usize,
-        input: crate::source::InputLimits,
-    }
-
-    impl PendingPublish for RtmpTwoAacPublish {
-        fn publish_request(&self) -> Result<PublishRequest, TransportError> {
-            Ok(self.request.clone())
-        }
-
-        fn accept(
-            self: Box<Self>,
-            grant: PublishGrant,
-            meters: Arc<dyn SourceMeters>,
-        ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
-            Box::pin(async move {
-                let (reader, writer) = channel(nz::usize!(64 * 1024));
-                for event in rtmp_two_one_track_aac_events(self.frames) {
-                    writer
-                        .send(event)
-                        .await
-                        .map_err(|error| TransportError::Accept(error.to_string().into()))?;
-                }
-                writer.finish(InputState::Closed);
-                let source = RtmpPacketSource::new(reader, self.input, meters)
-                    .map_err(|error| TransportError::Accept(error.to_string().into()))?;
-                Ok(AcceptedPublish {
-                    source: Box::new(source),
-                    grant,
-                })
-            })
-        }
-
-        fn reject(
-            self: Box<Self>,
-            _rejection: PublishRejection,
-        ) -> BoxFuture<'static, Result<(), TransportError>> {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     fn rtmp_two_one_track_aac_events(frames: usize) -> Vec<IngressEvent> {
@@ -1829,20 +1666,13 @@ mod end_to_end {
         events
     }
 
-    fn publish_mpegts(bytes: &'static [u8]) -> Box<dyn PendingPublish> {
-        let mut request = publish_request();
-        request.protocol = IngestProtocol::Srt;
-        Box::new(MpegTsFilePublish { request, bytes })
-    }
-
     struct MpegTsFilePublish {
-        request: PublishRequest,
         bytes: &'static [u8],
     }
 
     impl PendingPublish for MpegTsFilePublish {
         fn publish_request(&self) -> Result<PublishRequest, TransportError> {
-            Ok(self.request.clone())
+            Ok(publish_request(IngestProtocol::Srt))
         }
 
         fn accept(
@@ -1873,37 +1703,10 @@ mod end_to_end {
         }
     }
 
-    fn publish(input: crate::source::InputLimits) -> Box<dyn PendingPublish> {
-        Box::new(RtmpAacPublish {
-            request: publish_request(),
-            frames: 20,
-            input,
-            caption_name: Vec::new(),
-            captions: Vec::new(),
-        })
-    }
-
-    fn publish_captions(
-        input: crate::source::InputLimits,
-        name: &[u8],
-        cues: &[(u32, &[u8])],
-    ) -> Box<dyn PendingPublish> {
-        Box::new(RtmpAacPublish {
-            request: publish_request(),
-            frames: 20,
-            input,
-            caption_name: name.to_vec(),
-            captions: cues
-                .iter()
-                .map(|(timestamp, text)| (*timestamp, text.to_vec()))
-                .collect(),
-        })
-    }
-
     fn rtmp_aac_events(
         frames: usize,
         caption_name: &[u8],
-        captions: &[(u32, Vec<u8>)],
+        captions: &[(u32, &[u8])],
     ) -> Vec<IngressEvent> {
         use crate::mux::fixtures::{AAC_EXTRADATA, AAC_FRAME, AAC_FRAME_SAMPLES};
 
@@ -1947,7 +1750,7 @@ mod end_to_end {
             while emitted < captions.len() && captions[emitted].0 <= timestamp {
                 events.push(IngressEvent::Script {
                     timestamp: captions[emitted].0,
-                    payload: encode_cue(caption_name, &captions[emitted].1),
+                    payload: encode_cue(caption_name, captions[emitted].1),
                 });
                 emitted += 1;
             }
@@ -1956,18 +1759,18 @@ mod end_to_end {
         while emitted < captions.len() {
             events.push(IngressEvent::Script {
                 timestamp: captions[emitted].0,
-                payload: encode_cue(caption_name, &captions[emitted].1),
+                payload: encode_cue(caption_name, captions[emitted].1),
             });
             emitted += 1;
         }
         events
     }
 
-    fn node() -> (Node, crate::session::SessionConfig) {
+    fn node() -> (Node, SessionConfig) {
         node_with_policy(StreamPolicy::permissive())
     }
 
-    fn node_with_policy(policy: StreamPolicy) -> (Node, crate::session::SessionConfig) {
+    fn node_with_policy(policy: StreamPolicy) -> (Node, SessionConfig) {
         let mut config = NodeConfig::default();
         // Eight AAC units per segment and four per part keep the fixture small
         // while giving pre-roll enough cadence evidence for both boundaries.
@@ -1988,7 +1791,7 @@ mod end_to_end {
     }
 
     /// Cadence that locks on the 8 s Apple MPEG-TS fixtures (1 s GOPs).
-    fn node_for_one_second_gops() -> (Node, crate::session::SessionConfig) {
+    fn node_for_one_second_gops() -> (Node, SessionConfig) {
         let mut config = NodeConfig::default();
         config.session.segmentation =
             SegmentationPolicy::latency_first(Duration::from_secs(2), Duration::from_millis(500));
@@ -2002,6 +1805,25 @@ mod end_to_end {
         )
         .expect("node configuration is valid");
         (node, session)
+    }
+
+    /// Exposes a finished publication through the same HTTP application viewers use.
+    async fn serve_publication(
+        node: &Node,
+        session: &SessionConfig,
+        pending: Box<dyn PendingPublish>,
+    ) -> Harness {
+        let outcome = run_session(
+            pending,
+            node.services(),
+            session,
+            PendingPermit::unlimited(),
+        )
+        .await;
+        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+        HttpOptions::default()
+            .start_application(node.application(), node.store().clone())
+            .await
     }
 
     fn media_uris(playlist: &str) -> Vec<&str> {
@@ -2066,10 +1888,8 @@ mod end_to_end {
         }
     }
 
-    async fn fetch_media_and_delta(address: std::net::SocketAddr) -> String {
-        let media = request(address, "GET", "/live/camera/0/audio.m3u8", &[]).await;
-        assert_eq!(media.status, 200);
-        let media = String::from_utf8(media.body).expect("media playlist is text");
+    async fn fetch_media_and_delta(address: SocketAddr) -> String {
+        let media = fetch_text(address, "0/audio.m3u8").await;
         assert!(media.contains("#EXT-X-MAP:"));
         assert!(media.contains("segment/"));
         assert!(
@@ -2080,56 +1900,24 @@ mod end_to_end {
             !media.contains("#EXT-X-SKIP"),
             "a non-skip client fetches the full URL: {media}"
         );
-        let skipped = request(
-            address,
-            "GET",
-            "/live/camera/0/audio.m3u8?_HLS_skip=YES",
-            &[],
-        )
-        .await;
-        assert_eq!(skipped.status, 200);
-        assert_delta_matches_full(
-            &media,
-            &String::from_utf8(skipped.body).expect("delta playlist is text"),
-        );
+        let skipped = fetch_text(address, "0/audio.m3u8?_HLS_skip=YES").await;
+        assert_delta_matches_full(&media, &skipped);
         media
     }
 
-    async fn assert_published_audio_is_http_playable(node: Node) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("ephemeral HTTP listener binds");
-        let address = listener.local_addr().expect("listener has an address");
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve(
-            crate::server::http::TcpHttpListener::from(listener),
-            node.application(),
-            HttpConfig::default(),
-            None,
-            None,
-            Readiness::ready(),
-            async {
-                let _ = stopped.await;
-            },
-        ));
+    #[tokio::test]
+    async fn rtmp_through_normalization_cmaf_hls_and_http_is_playable() {
+        let (node, session) = node();
+        let pending = publish_aac(session.input, rtmp_aac_events(20, &[], &[]));
+        let server = serve_publication(&node, &session, pending).await;
+        let address = server.address;
 
-        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
-        assert_eq!(multivariant.status, 200);
-        assert!(
-            String::from_utf8(multivariant.body)
-                .expect("the multivariant playlist is text")
-                // The fixture publishes audio alone, and the playlist name says
-                // so without anyone having to resolve rendition 0 first.
-                .contains("\n0/audio.m3u8\n")
-        );
+        let multivariant = fetch_text(address, "index.m3u8").await;
+        // The fixture publishes audio alone, and the playlist name says
+        // so without anyone having to resolve rendition 0 first.
+        assert!(multivariant.contains("\n0/audio.m3u8\n"));
         let media = fetch_media_and_delta(address).await;
-        let initialization = media
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("#EXT-X-MAP:URI=\"")
-                    .and_then(|value| value.strip_suffix('"'))
-            })
-            .expect("media playlist names its initialization");
+        let initialization = initialization_uri(&media);
         let segment = media
             .lines()
             .find(|line| {
@@ -2139,39 +1927,14 @@ mod end_to_end {
                         .is_some_and(|ext: &std::ffi::OsStr| ext.eq_ignore_ascii_case("m4s"))
             })
             .expect("media playlist names a segment");
-        let initialization = request(
-            address,
-            "GET",
-            &format!("/live/camera/0/{initialization}"),
-            &[],
-        )
-        .await;
-        let segment = request(address, "GET", &format!("/live/camera/0/{segment}"), &[]).await;
-        assert_eq!((initialization.status, segment.status), (200, 200));
-        validate_with_ffprobe(&initialization.body, &segment.body);
+        let initialization = fetch_bytes(address, &format!("0/{initialization}")).await;
+        let segment = fetch_bytes(address, &format!("0/{segment}")).await;
+        validate_with_ffprobe(&initialization, &segment);
 
         validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"))
             .await;
 
-        let _ = shutdown.send(());
-        server
-            .await
-            .expect("HTTP task did not panic")
-            .expect("HTTP server stopped cleanly");
-    }
-
-    #[tokio::test]
-    async fn rtmp_through_normalization_cmaf_hls_and_http_is_playable() {
-        let (node, session) = node();
-        let outcome = run_session(
-            publish(session.input),
-            node.services(),
-            &session,
-            PendingPermit::unlimited(),
-        )
-        .await;
-        assert_eq!(outcome, Ok(SessionOutcome::Ended));
-        assert_published_audio_is_http_playable(node).await;
+        server.stop().await;
     }
 
     /// A graceful RTMP unpublish must end the playlist even mid-segment.
@@ -2195,49 +1958,23 @@ mod end_to_end {
         ));
 
         let (node, session) = node_for_one_second_gops();
-        let outcome = run_session(
-            Box::new(FlvPublish {
-                request: publish_request(),
-                flv: FLV,
-                input: session.input,
-            }),
-            node.services(),
-            &session,
-            PendingPermit::unlimited(),
-        )
-        .await;
-        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+        // Publishes a checked-in FLV's tags as RTMP ingress, then closes cleanly.
+        let pending = Box::new(RtmpPublish {
+            input: session.input,
+            events: flv_ingress_events(FLV),
+            capacity: nz::usize!(4 * 1024 * 1024),
+        });
+        let server = serve_publication(&node, &session, pending).await;
+        let address = server.address;
 
-        let http = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("ephemeral HTTP listener binds");
-        let address = http.local_addr().expect("listener has an address");
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve(
-            crate::server::http::TcpHttpListener::from(http),
-            node.application(),
-            HttpConfig::default(),
-            None,
-            None,
-            Readiness::ready(),
-            async {
-                let _ = stopped.await;
-            },
-        ));
-
-        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
-        assert_eq!(multivariant.status, 200);
-        let multivariant =
-            String::from_utf8(multivariant.body).expect("the multivariant playlist is text");
+        let multivariant = fetch_text(address, "index.m3u8").await;
         let uris = media_playlist_uris(&multivariant);
         assert!(
             !uris.is_empty(),
             "the presentation names media:\n{multivariant}"
         );
         for uri in uris {
-            let media = request(address, "GET", &format!("/live/camera/{uri}"), &[]).await;
-            assert_eq!(media.status, 200, "GET {uri}");
-            let playlist = String::from_utf8(media.body).expect("media playlist is text");
+            let playlist = fetch_text(address, &uri).await;
             assert!(
                 playlist.contains("#EXT-X-ENDLIST"),
                 "a graceful RTMP unpublish must end {uri}:\n{playlist}"
@@ -2249,56 +1986,7 @@ mod end_to_end {
             );
         }
 
-        let _ = shutdown.send(());
-        server
-            .await
-            .expect("HTTP task did not panic")
-            .expect("HTTP server stopped cleanly");
-    }
-
-    /// Publishes a checked-in FLV's tags as RTMP ingress, then closes cleanly.
-    struct FlvPublish {
-        request: PublishRequest,
-        flv: &'static [u8],
-        input: crate::source::InputLimits,
-    }
-
-    impl PendingPublish for FlvPublish {
-        fn publish_request(&self) -> Result<PublishRequest, TransportError> {
-            Ok(self.request.clone())
-        }
-
-        fn accept(
-            self: Box<Self>,
-            grant: crate::admission::PublishGrant,
-            meters: Arc<dyn crate::observe::SourceMeters>,
-        ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
-            Box::pin(async move {
-                let (reader, writer) = crate::source::channel(nz::usize!(4 * 1024 * 1024));
-                for event in flv_ingress_events(self.flv) {
-                    writer
-                        .send(event)
-                        .await
-                        .map_err(|error| TransportError::Accept(error.to_string().into()))?;
-                }
-                // What \`on_unpublish\` sends, and what a clean session close
-                // sends. Nothing about this path is specific to a test.
-                writer.finish(InputState::Closed);
-                let source = RtmpPacketSource::new(reader, self.input, meters)
-                    .map_err(|error| TransportError::Accept(error.to_string().into()))?;
-                Ok(AcceptedPublish {
-                    source: Box::new(source),
-                    grant,
-                })
-            })
-        }
-
-        fn reject(
-            self: Box<Self>,
-            _rejection: PublishRejection,
-        ) -> BoxFuture<'static, Result<(), TransportError>> {
-            Box::pin(async { Ok(()) })
-        }
+        server.stop().await;
     }
 
     /// Splits an FLV into audio and video tag bodies as RTMP ingress events.
@@ -2384,90 +2072,34 @@ mod end_to_end {
         // is the orderly encoder stop that must write EXT-X-ENDLIST.
         drop(caller);
 
-        let outcome = run_session(
-            Box::new(pending),
-            node.services(),
-            &session,
-            PendingPermit::unlimited(),
-        )
-        .await;
-        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+        let server = serve_publication(&node, &session, Box::new(pending)).await;
+        let address = server.address;
 
-        let http = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("ephemeral HTTP listener binds");
-        let address = http.local_addr().expect("listener has an address");
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve(
-            crate::server::http::TcpHttpListener::from(http),
-            node.application(),
-            HttpConfig::default(),
-            None,
-            None,
-            Readiness::ready(),
-            async {
-                let _ = stopped.await;
-            },
-        ));
-
-        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
-        assert_eq!(multivariant.status, 200);
-        let multivariant =
-            String::from_utf8(multivariant.body).expect("the multivariant playlist is text");
+        let multivariant = fetch_text(address, "index.m3u8").await;
         let uris = media_playlist_uris(&multivariant);
         assert!(
             !uris.is_empty(),
             "the presentation names at least one media playlist:\n{multivariant}"
         );
         for uri in uris {
-            let media = request(address, "GET", &format!("/live/camera/{uri}"), &[]).await;
-            assert_eq!(media.status, 200, "GET {uri}");
-            let playlist = String::from_utf8(media.body).expect("media playlist is text");
+            let playlist = fetch_text(address, &uri).await;
             assert!(
                 playlist.contains("#EXT-X-ENDLIST"),
                 "graceful SRT close must end {uri}:\n{playlist}"
             );
         }
 
-        let _ = shutdown.send(());
-        server
-            .await
-            .expect("HTTP task did not panic")
-            .expect("HTTP server stopped cleanly");
+        server.stop().await;
     }
 
     #[tokio::test]
     async fn rtmp_one_track_two_aac_are_separate_http_variants() {
         let (node, session) = node();
-        let outcome = run_session(
-            publish_two_one_track_aac(session.input),
-            node.services(),
-            &session,
-            PendingPermit::unlimited(),
-        )
-        .await;
-        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+        let pending = publish_aac(session.input, rtmp_two_one_track_aac_events(20));
+        let server = serve_publication(&node, &session, pending).await;
+        let address = server.address;
 
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("ephemeral HTTP listener binds");
-        let address = listener.local_addr().expect("listener has an address");
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve(
-            crate::server::http::TcpHttpListener::from(listener),
-            node.application(),
-            HttpConfig::default(),
-            None,
-            None,
-            Readiness::ready(),
-            async {
-                let _ = stopped.await;
-            },
-        ));
-
-        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
-        assert_eq!(multivariant.status, 200);
-        let body = String::from_utf8(multivariant.body).expect("the multivariant playlist is text");
+        let body = fetch_text(address, "index.m3u8").await;
         assert!(
             body.contains("\n0/audio.m3u8\n"),
             "first OneTrack AAC is a variant:\n{body}"
@@ -2482,15 +2114,7 @@ mod end_to_end {
         );
 
         for rendition in ["0", "1"] {
-            let media = request(
-                address,
-                "GET",
-                &format!("/live/camera/{rendition}/audio.m3u8"),
-                &[],
-            )
-            .await;
-            assert_eq!(media.status, 200, "rendition {rendition}");
-            let playlist = String::from_utf8(media.body).expect("media playlist is text");
+            let playlist = fetch_text(address, &format!("{rendition}/audio.m3u8")).await;
             assert!(
                 playlist.contains("#EXT-X-MAP:"),
                 "rendition {rendition}: {playlist}"
@@ -2500,11 +2124,7 @@ mod end_to_end {
         validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"))
             .await;
 
-        let _ = shutdown.send(());
-        server
-            .await
-            .expect("HTTP task did not panic")
-            .expect("HTTP server stopped cleanly");
+        server.stop().await;
     }
 
     #[tokio::test]
@@ -2514,35 +2134,11 @@ mod end_to_end {
             "/tests/apple_hls/fixtures/h264_dual_video.ts"
         ));
         let (node, session) = node_for_one_second_gops();
-        let outcome = run_session(
-            publish_mpegts(MPEG_TS),
-            node.services(),
-            &session,
-            PendingPermit::unlimited(),
-        )
-        .await;
-        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+        let pending = Box::new(MpegTsFilePublish { bytes: MPEG_TS });
+        let server = serve_publication(&node, &session, pending).await;
+        let address = server.address;
 
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("ephemeral HTTP listener binds");
-        let address = listener.local_addr().expect("listener has an address");
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve(
-            crate::server::http::TcpHttpListener::from(listener),
-            node.application(),
-            HttpConfig::default(),
-            None,
-            None,
-            Readiness::ready(),
-            async {
-                let _ = stopped.await;
-            },
-        ));
-
-        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
-        assert_eq!(multivariant.status, 200);
-        let body = String::from_utf8(multivariant.body).expect("the multivariant playlist is text");
+        let body = fetch_text(address, "index.m3u8").await;
         let variants = stream_inf_uris(&body);
         assert_eq!(
             variants.len(),
@@ -2568,10 +2164,8 @@ mod end_to_end {
             "the video group is the variants themselves:\n{body}"
         );
 
-        for uri in &variants {
-            let media = request(address, "GET", &format!("/live/camera/{uri}"), &[]).await;
-            assert_eq!(media.status, 200, "GET {uri}");
-            let playlist = String::from_utf8(media.body).expect("media playlist is text");
+        for uri in variants {
+            let playlist = fetch_text(address, uri).await;
             assert!(
                 playlist.contains("#EXT-X-MAP:") && playlist.contains("#EXT-X-ENDLIST"),
                 "pre-roll locked and the closed input ended {uri}:\n{playlist}"
@@ -2581,11 +2175,7 @@ mod end_to_end {
         validate_with_mediastreamvalidator(&format!("http://{address}/live/camera/index.m3u8"))
             .await;
 
-        let _ = shutdown.send(());
-        server
-            .await
-            .expect("HTTP task did not panic")
-            .expect("HTTP server stopped cleanly");
+        server.stop().await;
     }
 
     #[tokio::test]
@@ -2623,36 +2213,11 @@ mod end_to_end {
             (120, b"second caption"),
             (200, b"third caption"),
         ];
-        let outcome = run_session(
-            publish_captions(session.input, name, &cues),
-            node.services(),
-            &session,
-            PendingPermit::unlimited(),
-        )
-        .await;
-        assert_eq!(outcome, Ok(SessionOutcome::Ended));
+        let pending = publish_aac(session.input, rtmp_aac_events(20, name, &cues));
+        let server = serve_publication(&node, &session, pending).await;
+        let address = server.address;
 
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("ephemeral HTTP listener binds");
-        let address = listener.local_addr().expect("listener has an address");
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve(
-            crate::server::http::TcpHttpListener::from(listener),
-            node.application(),
-            HttpConfig::default(),
-            None,
-            None,
-            Readiness::ready(),
-            async {
-                let _ = stopped.await;
-            },
-        ));
-
-        let multivariant = request(address, "GET", "/live/camera/index.m3u8", &[]).await;
-        assert_eq!(multivariant.status, 200);
-        let multivariant =
-            String::from_utf8(multivariant.body).expect("the multivariant playlist is text");
+        let multivariant = fetch_text(address, "index.m3u8").await;
         let subtitles = multivariant
             .lines()
             .filter(|line| line.contains("TYPE=SUBTITLES"))
@@ -2663,20 +2228,12 @@ mod end_to_end {
             })
             .expect("captions are declared as a subtitle rendition");
 
-        let media = request(address, "GET", &format!("/live/camera/{subtitles}"), &[]).await;
-        assert_eq!(media.status, 200);
-        let media = String::from_utf8(media.body).expect("media playlist is text");
+        let media = fetch_text(address, &subtitles).await;
 
         // The WEBVTT header is delivered once through EXT-X-MAP, so segment
         // bodies carry cues alone.
-        let initialization = media
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("#EXT-X-MAP:URI=\"")
-                    .and_then(|value| value.strip_suffix('"'))
-            })
-            .expect("the subtitle playlist names its initialization");
-        let header = fetch(address, &relative_to(&subtitles, initialization)).await;
+        let initialization = initialization_uri(&media);
+        let header = fetch_text(address, &relative_to(&subtitles, initialization)).await;
         assert!(header.starts_with("WEBVTT"), "initialization:\n{header}");
 
         // Concatenated across the rendition: this cadence is far shorter than
@@ -2686,22 +2243,31 @@ mod end_to_end {
             .lines()
             .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
         {
-            body.push_str(&fetch(address, &relative_to(&subtitles, segment)).await);
+            body.push_str(&fetch_text(address, &relative_to(&subtitles, segment)).await);
         }
 
-        let _ = shutdown.send(());
-        server
-            .await
-            .expect("HTTP task did not panic")
-            .expect("HTTP server stopped cleanly");
+        server.stop().await;
         body
     }
 
     /// Fetches one rendition-relative path, requiring a 200.
-    async fn fetch(address: std::net::SocketAddr, path: &str) -> String {
-        let response = request(address, "GET", &format!("/live/camera/{path}"), &[]).await;
-        assert_eq!(response.status, 200, "GET {path}");
-        String::from_utf8(response.body).expect("WebVTT resources are text")
+    async fn fetch_bytes(address: SocketAddr, path: &str) -> Vec<u8> {
+        let target = format!("/live/camera/{path}");
+        let response = request(address, "GET", &target, &[]).await;
+        assert_eq!(response.status, 200, "GET {target}");
+        response.body
+    }
+
+    async fn fetch_text(address: SocketAddr, path: &str) -> String {
+        String::from_utf8(fetch_bytes(address, path).await)
+            .unwrap_or_else(|error| panic!("{path} must be UTF-8: {error}"))
+    }
+
+    fn initialization_uri(playlist: &str) -> &str {
+        playlist
+            .lines()
+            .find_map(|line| line.strip_prefix("#EXT-X-MAP:URI=\"")?.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("media playlist must name its initialization:\n{playlist}"))
     }
 
     /// Resolves a URI named relative to its media playlist.
@@ -2854,15 +2420,19 @@ async fn a_preflight_is_answered_without_reaching_the_origin() {
 
 #[tokio::test]
 async fn an_allowlisted_origin_is_echoed_and_the_response_says_it_varies() {
-    let harness = Harness::start_with(HttpConfig {
-        cors: CorsConfig {
-            allowed_origins: AllowedOrigins::Only(vec![
-                OriginPattern::parse("https://player.example").expect("the pattern is valid"),
-            ]),
-            ..CorsConfig::default()
+    let harness = HttpOptions {
+        config: HttpConfig {
+            cors: CorsConfig {
+                allowed_origins: AllowedOrigins::Only(vec![
+                    OriginPattern::parse("https://player.example").expect("the pattern is valid"),
+                ]),
+                ..CorsConfig::default()
+            },
+            ..HttpConfig::default()
         },
-        ..HttpConfig::default()
-    })
+        ..HttpOptions::default()
+    }
+    .start()
     .await;
     let _lease = lease(&harness.store, vec![video(0)]);
 
@@ -2905,15 +2475,19 @@ async fn an_allowlisted_origin_is_echoed_and_the_response_says_it_varies() {
 
 #[tokio::test]
 async fn a_wildcard_allowlist_admits_subdomains_and_refuses_lookalikes() {
-    let harness = Harness::start_with(HttpConfig {
-        cors: CorsConfig {
-            allowed_origins: AllowedOrigins::Only(vec![
-                OriginPattern::parse("https://*.example.com").expect("the pattern is valid"),
-            ]),
-            ..CorsConfig::default()
+    let harness = HttpOptions {
+        config: HttpConfig {
+            cors: CorsConfig {
+                allowed_origins: AllowedOrigins::Only(vec![
+                    OriginPattern::parse("https://*.example.com").expect("the pattern is valid"),
+                ]),
+                ..CorsConfig::default()
+            },
+            ..HttpConfig::default()
         },
-        ..HttpConfig::default()
-    })
+        ..HttpOptions::default()
+    }
+    .start()
     .await;
     let _lease = lease(&harness.store, vec![video(0)]);
 
@@ -2941,15 +2515,20 @@ async fn a_wildcard_allowlist_admits_subdomains_and_refuses_lookalikes() {
 
 #[tokio::test]
 async fn a_double_wildcard_admits_any_depth_but_still_not_the_apex() {
-    let harness = Harness::start_with(HttpConfig {
-        cors: CorsConfig {
-            allowed_origins: AllowedOrigins::Only(vec![
-                OriginPattern::parse("https://**.video.example.com").expect("the pattern is valid"),
-            ]),
-            ..CorsConfig::default()
+    let harness = HttpOptions {
+        config: HttpConfig {
+            cors: CorsConfig {
+                allowed_origins: AllowedOrigins::Only(vec![
+                    OriginPattern::parse("https://**.video.example.com")
+                        .expect("the pattern is valid"),
+                ]),
+                ..CorsConfig::default()
+            },
+            ..HttpConfig::default()
         },
-        ..HttpConfig::default()
-    })
+        ..HttpOptions::default()
+    }
+    .start()
     .await;
     let _lease = lease(&harness.store, vec![video(0)]);
 
@@ -3014,248 +2593,85 @@ mod tls {
         time::{Duration, Instant},
     };
 
-    use parking_lot::Mutex;
-    use rustls::{
-        ClientConfig, DigitallySignedStruct, SignatureScheme,
-        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-        crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
-        pki_types::{CertificateDer, ServerName, UnixTime},
-    };
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpStream,
-    };
-    use tokio_rustls::TlsConnector;
-
     use crate::{
         delivery::hls::{
             StreamStore,
             fixtures::{lease, video},
         },
-        observe::{HlsMeters, NodeEvent, OriginMeters, ProcessMeters},
-        server::{
-            http::fixtures::{
-                NodeEventRecorder, application, scratch, write_atomically, write_pair,
-            },
-            metrics::{MetricsEndpoint, MetricsReader},
-        },
-        session::Registry,
+        observe::{NodeEvent, ProcessMeters},
     };
 
-    use super::super::{HttpConfig, Readiness, TlsSettings, bind_tls, serve};
-    use tokio::net::TcpListener;
-
-    /// Accepts any certificate and remembers what it was handed.
-    ///
-    /// The alternative — trusting the generated certificate as a root — does
-    /// not work for a self-signed leaf, and would in any case answer a
-    /// different question than the one these tests ask.
-    #[derive(Debug)]
-    struct Capturing {
-        presented: Mutex<Vec<Vec<u8>>>,
-        provider: Arc<CryptoProvider>,
-    }
-
-    impl ServerCertVerifier for Capturing {
-        fn verify_server_cert(
-            &self,
-            end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            self.presented.lock().push(end_entity.to_vec());
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            verify_tls12_signature(
-                message,
-                cert,
-                dss,
-                &self.provider.signature_verification_algorithms,
-            )
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            verify_tls13_signature(
-                message,
-                cert,
-                dss,
-                &self.provider.signature_verification_algorithms,
-            )
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            self.provider
-                .signature_verification_algorithms
-                .supported_schemes()
-        }
-    }
+    use super::super::{
+        TlsSettings, bind_tls,
+        fixtures::{
+            HttpHarness, HttpOptions, MetricsMode, NodeEventRecorder, Reply, TLS_HOST, application,
+            ephemeral_tcp, request_on, scratch, self_signed, tls_connect, write_atomically,
+            write_pair,
+        },
+    };
 
     /// A TLS origin, plus the recorder its process events land in.
     struct TlsHarness {
-        address: std::net::SocketAddr,
-        store: StreamStore,
+        server: HttpHarness,
         events: Arc<NodeEventRecorder>,
-        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-        served: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     }
 
     impl TlsHarness {
-        async fn start(settings: TlsSettings) -> Self {
-            Self::start_with_metrics(settings, None).await
-        }
-
-        async fn start_with_metrics(
-            settings: TlsSettings,
-            metrics: Option<MetricsEndpoint>,
-        ) -> Self {
+        async fn start(settings: TlsSettings, options: HttpOptions) -> Self {
             let store = StreamStore::default();
-            let origin = application(&store);
-            let tcp = TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("an ephemeral port is available");
+            let tcp = ephemeral_tcp().await;
             let address = tcp.local_addr().expect("the listener is bound");
             let (recorder, events) = NodeEventRecorder::install();
             let listener = bind_tls(tcp, settings, ProcessMeters::default(), events)
                 .expect("the certificate loads");
-            let config = HttpConfig::default();
-            let (shutdown, signal) = tokio::sync::oneshot::channel();
-            let served = tokio::spawn(serve(
-                listener,
-                origin,
-                config,
-                metrics,
-                None,
-                Readiness::ready(),
-                async {
-                    let _ = signal.await;
-                },
-            ));
             Self {
-                address,
-                store,
+                server: options.spawn(listener, address, application(&store), store),
                 events: recorder,
-                shutdown: Some(shutdown),
-                served: Some(served),
             }
         }
 
         /// Handshakes once, returning the certificate presented and the
         /// protocol ALPN settled on.
         async fn handshake(&self, offer: &[&[u8]]) -> (Vec<u8>, Option<Vec<u8>>) {
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let verifier = Arc::new(Capturing {
-                presented: Mutex::new(Vec::new()),
-                provider: Arc::clone(&provider),
-            });
-            let mut config = ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .expect("the default versions are supported")
-                .dangerous()
-                .with_custom_certificate_verifier(
-                    Arc::clone(&verifier) as Arc<dyn ServerCertVerifier>
-                )
-                .with_no_client_auth();
-            config.alpn_protocols = offer.iter().map(|name| name.to_vec()).collect();
-
-            let stream = TcpStream::connect(self.address)
-                .await
-                .expect("the origin is up");
-            let name = ServerName::try_from("origin.test").expect("a valid name");
-            let stream = TlsConnector::from(Arc::new(config))
-                .connect(name, stream)
+            let stream = tls_connect(self.server.address, offer)
                 .await
                 .expect("the handshake completes");
-            let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
-            let presented = verifier
-                .presented
-                .lock()
-                .first()
-                .cloned()
+            let connection = stream.get_ref().1;
+            let alpn = connection.alpn_protocol().map(<[u8]>::to_vec);
+            let presented = connection
+                .peer_certificates()
+                .and_then(|chain| chain.first())
                 .expect("the server presented a certificate");
-            (presented, alpn)
+            (presented.to_vec(), alpn)
         }
 
-        /// Handshakes until the expected certificate shows up, or gives up.
+        /// Checks the initial leaf, rotates it, then waits for the new leaf.
         ///
         /// Polling rather than sleeping a fixed interval: the reload is gated
         /// on a filesystem notification and a debounce, and pinning the test to
         /// a guessed duration would make it flaky on a loaded machine without
         /// making it any stricter.
-        async fn await_certificate(&self, expected: &[u8]) -> bool {
+        async fn assert_rotation(&self, first: &[u8], rotate: impl FnOnce() -> Vec<u8>) {
+            assert_eq!(self.handshake(&[b"http/1.1"]).await.0, first);
+            let expected = rotate();
+            assert_ne!(first, expected, "the rotation produced a new certificate");
+
             let deadline = Instant::now() + Duration::from_secs(20);
             while Instant::now() < deadline {
                 if self.handshake(&[b"http/1.1"]).await.0 == expected {
-                    return true;
+                    return;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            false
+            panic!("the rotated certificate was never presented");
         }
 
-        async fn stop(mut self) {
-            if let Some(shutdown) = self.shutdown.take() {
-                let _ = shutdown.send(());
-            }
-            if let Some(served) = self.served.take() {
-                let _ = served.await;
-            }
+        /// Offers HTTP/1.1 alone so the reply uses the same wire format the
+        /// cleartext tests parse. HTTP/2 negotiation is asserted separately.
+        async fn get(&self, target: &str) -> Result<Reply, std::io::Error> {
+            let stream = tls_connect(self.server.address, &[b"http/1.1"]).await?;
+            Ok(request_on(stream, "GET", target, &[]).await)
         }
-    }
-
-    /// One HTTPS GET, spoken by hand over the TLS stream.
-    ///
-    /// HTTP/1.1 is offered alone so the reply is the same wire format the
-    /// cleartext tests parse; that ALPN can also settle on h2 is asserted
-    /// separately.
-    async fn https_get(harness: &TlsHarness, target: &str) -> String {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let verifier = Arc::new(Capturing {
-            presented: Mutex::new(Vec::new()),
-            provider: Arc::clone(&provider),
-        });
-        let mut config = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .expect("the default versions are supported")
-            .dangerous()
-            .with_custom_certificate_verifier(verifier as Arc<dyn ServerCertVerifier>)
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-        let stream = TcpStream::connect(harness.address)
-            .await
-            .expect("the origin is up");
-        let name = ServerName::try_from("origin.test").expect("a valid name");
-        let mut stream = TlsConnector::from(Arc::new(config))
-            .connect(name, stream)
-            .await
-            .expect("the handshake completes");
-        stream
-            .write_all(
-                format!("GET {target} HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
-            )
-            .await
-            .expect("the request is sent");
-        let mut raw = Vec::new();
-        stream
-            .read_to_end(&mut raw)
-            .await
-            .expect("the response completes");
-        String::from_utf8_lossy(&raw).into_owned()
     }
 
     fn loaded_certificates(harness: &TlsHarness) -> usize {
@@ -3268,75 +2684,62 @@ mod tls {
     }
 
     #[tokio::test]
-    async fn a_playlist_is_served_over_tls_and_alpn_offers_http_2() {
+    async fn a_playlist_is_served_over_tls_and_alpn_offers_http_2()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = scratch("serves");
-        let (settings, _) = write_pair(&directory, "origin.test");
-        let harness = TlsHarness::start(settings).await;
-        let _lease = lease(&harness.store, vec![video(0)]);
+        let (settings, _) = write_pair(&directory, TLS_HOST);
+        let harness = TlsHarness::start(settings, HttpOptions::default()).await;
+        let _lease = lease(&harness.server.store, vec![video(0)]);
 
-        let response = https_get(&harness, "/live/camera/index.m3u8").await;
-        assert!(
-            response.starts_with("HTTP/1.1 200"),
-            "expected a playlist, got: {response}"
-        );
-        assert!(response.contains("#EXT-X-STREAM-INF:"));
+        let response = harness.get("/live/camera/index.m3u8").await?;
+        assert_eq!(response.status, 200);
+        assert!(std::str::from_utf8(&response.body)?.contains("#EXT-X-STREAM-INF:"));
 
         // The reason to terminate TLS in-process at all: a browser reaches
         // HTTP/2 only this way, and the Low-Latency profile expects it.
         let (_, alpn) = harness.handshake(&[b"h2", b"http/1.1"]).await;
         assert_eq!(alpn.as_deref(), Some(b"h2".as_slice()));
 
-        harness.stop().await;
+        harness.server.stop().await;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn metrics_are_served_over_tls() {
+    async fn metrics_are_served_over_tls() -> Result<(), Box<dyn std::error::Error>> {
         // Sharing `[https] listen` is how scrapes happen over HTTPS: the
         // same router, the same certificate, no second metrics listener.
         let directory = scratch("metrics-https");
-        let (settings, _) = write_pair(&directory, "origin.test");
-        let metrics = MetricsEndpoint::new(
-            MetricsReader::new(
-                ProcessMeters::default(),
-                OriginMeters::default(),
-                HlsMeters::default(),
-                Registry::default(),
-                StreamStore::default(),
-            ),
-            None,
-        );
-        let harness = TlsHarness::start_with_metrics(settings, Some(metrics)).await;
+        let (settings, _) = write_pair(&directory, TLS_HOST);
+        let harness = TlsHarness::start(
+            settings,
+            HttpOptions {
+                metrics: MetricsMode::Enabled(None),
+                ..HttpOptions::default()
+            },
+        )
+        .await;
+        let response = harness.get("/metrics").await?;
+        assert_eq!(response.status, 200);
+        assert!(std::str::from_utf8(&response.body)?.contains("rushls_active_sessions"));
 
-        let response = https_get(&harness, "/metrics").await;
-        assert!(
-            response.starts_with("HTTP/1.1 200"),
-            "expected metrics over TLS, got: {response}"
-        );
-        assert!(response.contains("rushls_active_sessions"));
-
-        harness.stop().await;
+        harness.server.stop().await;
+        Ok(())
     }
 
     #[tokio::test]
     async fn a_rotated_certificate_is_presented_without_a_restart() {
         let directory = scratch("rotates");
-        let (settings, first) = write_pair(&directory, "origin.test");
-        let harness = TlsHarness::start(settings.clone()).await;
+        let (settings, first) = write_pair(&directory, TLS_HOST);
+        let harness = TlsHarness::start(settings.clone(), HttpOptions::default()).await;
 
-        assert_eq!(harness.handshake(&[b"http/1.1"]).await.0, first);
-
-        let (_, second) = write_pair(&directory, "origin.test");
-        assert_ne!(first, second, "the rotation produced a new certificate");
-
-        assert!(
-            harness.await_certificate(&second).await,
-            "the rotated certificate was never presented"
-        );
+        harness
+            .assert_rotation(&first, || write_pair(&directory, TLS_HOST).1)
+            .await;
         // Once at startup and once for the rotation: the event stream alone
         // answers which certificate this process is serving.
         assert_eq!(loaded_certificates(&harness), 2);
 
-        harness.stop().await;
+        harness.server.stop().await;
     }
 
     /// The deployment this feature exists for.
@@ -3350,38 +2753,37 @@ mod tls {
     async fn a_projected_secret_rotates_even_though_no_event_names_the_certificate() {
         let directory = scratch("projected");
         let (settings, first) =
-            crate::server::http::fixtures::write_projected_pair(&directory, "origin.test");
-        let harness = TlsHarness::start(settings).await;
+            crate::server::http::fixtures::write_projected_pair(&directory, TLS_HOST);
+        let harness = TlsHarness::start(settings, HttpOptions::default()).await;
 
-        assert_eq!(harness.handshake(&[b"http/1.1"]).await.0, first);
+        harness
+            .assert_rotation(&first, || {
+                crate::server::http::fixtures::write_projected_pair(&directory, TLS_HOST).1
+            })
+            .await;
 
-        let (_, second) =
-            crate::server::http::fixtures::write_projected_pair(&directory, "origin.test");
-        assert_ne!(first, second, "the rotation produced a new certificate");
-
-        assert!(
-            harness.await_certificate(&second).await,
-            "a secret-mount rotation was never picked up"
-        );
-
-        harness.stop().await;
+        harness.server.stop().await;
     }
 
     #[tokio::test]
-    async fn a_broken_rotation_leaves_the_previous_certificate_serving() {
+    async fn a_broken_rotation_leaves_the_previous_certificate_serving()
+    -> Result<(), tokio::time::error::Elapsed> {
         let directory = scratch("broken");
-        let (settings, first) = write_pair(&directory, "origin.test");
-        let harness = TlsHarness::start(settings.clone()).await;
+        let (settings, first) = write_pair(&directory, TLS_HOST);
+        let harness = TlsHarness::start(settings.clone(), HttpOptions::default()).await;
 
         // A key that belongs to some other certificate: the shape a rotation
         // takes when only one of the two files has landed.
-        let elsewhere = scratch("broken-source");
-        let (foreign, _) = write_pair(&elsewhere, "other.test");
-        let key = std::fs::read(&foreign.key).expect("the foreign key is readable");
-        write_atomically(&settings.key, &key);
+        let foreign = self_signed("other.test");
+        write_atomically(
+            &settings.key,
+            foreign.signing_key.serialize_pem().as_bytes(),
+        );
 
-        let rejected = await_rejection(&harness).await;
-        assert!(rejected, "the mismatched pair was never reported");
+        harness
+            .events
+            .certificate_rejected(Duration::from_secs(20))
+            .await?;
         assert_eq!(
             harness.handshake(&[b"http/1.1"]).await.0,
             first,
@@ -3389,23 +2791,8 @@ mod tls {
         );
         assert_eq!(loaded_certificates(&harness), 1);
 
-        harness.stop().await;
-    }
-
-    async fn await_rejection(harness: &TlsHarness) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < deadline {
-            if harness
-                .events
-                .recorded()
-                .iter()
-                .any(|event| matches!(event, NodeEvent::CertificateRejected { .. }))
-            {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        false
+        harness.server.stop().await;
+        Ok(())
     }
 
     #[tokio::test]
@@ -3416,9 +2803,7 @@ mod tls {
             key: directory.join("absent.key"),
             ..TlsSettings::default()
         };
-        let tcp = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("an ephemeral port is available");
+        let tcp = ephemeral_tcp().await;
         let (_, events) = NodeEventRecorder::install();
 
         assert!(bind_tls(tcp, settings, ProcessMeters::default(), events).is_err());
@@ -3446,19 +2831,18 @@ async fn iframe_manifest_ranges_fetch_only_the_opening_avc_sample()
         project::PlaylistPolicy,
         service::Config,
     };
-    let harness = Harness::start_hls(
-        HttpConfig::default(),
-        MetricsMode::Disabled,
-        Readiness::default(),
-        None,
-        Config {
+    let harness = HttpOptions {
+        readiness: Readiness::default(),
+        hls: Config {
             playlist: PlaylistPolicy {
                 iframe_playlists: true,
                 ..PlaylistPolicy::default()
             },
             ..Config::default()
         },
-    )
+        ..HttpOptions::default()
+    }
+    .start()
     .await;
     let lease = lease(&harness.store, vec![video(0)]);
     write(&lease, initialization(0, 1));
@@ -3514,9 +2898,7 @@ async fn iframe_manifest_ranges_fetch_only_the_opening_avc_sample()
 async fn reconnect_keeps_resource_urls_until_their_fetch_deadlines()
 -> Result<(), Box<dyn std::error::Error>> {
     let harness = Harness::start().await;
-    let first = lease(&harness.store, vec![video(0)]);
-    write(&first, initialization(0, 1));
-    write_segment(&first, 0, 0, 0);
+    let _publication = publish_camera(&harness.store);
     let paths = ["init/1.mp4", "part/1.m4s", "segment/1.m4s"];
     let mut original = Vec::new();
     for path in paths {
@@ -3622,9 +3004,7 @@ async fn blocking_reload_survives_reconnect_or_ends_when_its_rendition_retires()
 -> Result<(), Box<dyn std::error::Error>> {
     for retire in [false, true] {
         let harness = Harness::start().await;
-        let first = lease(&harness.store, vec![video(0)]);
-        write(&first, initialization(0, 1));
-        write_segment(&first, 0, 0, 0);
+        let _publication = publish_camera(&harness.store);
         let address = harness.address;
         let held = tokio::spawn(async move {
             request(

@@ -2,7 +2,7 @@
 """Measure audio/video sync of Rushls output in real browsers.
 
 Publishes flash/beep streams over RTMP, then plays each one in Chrome
-(hls.js and Shaka) and Safari (native HLS). Every second the
+(hls.js and Shaka) and Safari (native HLS). At irregular intervals the
 source shows one white frame and starts a 50 ms beep at the same instant.
 The page timestamps flashes with requestVideoFrameCallback on the media
 timeline, and the tool reports beep - flash.
@@ -19,13 +19,14 @@ requestVideoFrameCallback for some streams that it still renders.
 A browser adds a constant audio pipeline latency, so cases are compared
 with the `base` case in the same player: no B-frames and no audio delay,
 so its output needs no edit and no tfdt offset. A case passes when its
-median offset is within the tolerance of that baseline.
+median offset is within the tolerance of that baseline. A baseline at least
+400 ms out of sync fails even when every case has the same delay.
 
 Requires FFmpeg with libx264, Chrome with a matching ChromeDriver
 (tools/install-chrome-driver.py), and, for Safari, `safaridriver --enable`,
 the Swift toolchain, and a loopback device such as BlackHole 2ch. macOS may
 ask for microphone access the first time the loopback records.
-No CI minutes: everything runs locally.
+CI runs the headless Chrome check with the patched HLS player.
 
     python3 tools/av-sync/check-av-sync.py --rushls target/debug/rushls \\
         --chromedriver target/chromedriver
@@ -33,6 +34,7 @@ No CI minutes: everything runs locally.
 import argparse
 import http.server
 import json
+import math
 import os
 import socket
 import statistics
@@ -206,17 +208,34 @@ def webdriver(base, path, data=None, method=None):
         return json.load(reply)['value']
 
 
+def marker_frames(seconds):
+    """Increasing gaps make event identity recoverable after startup or loss.
+
+    A periodic flash/beep train aliases whole-period sync errors to zero.
+    Start after one second so both detectors can settle before the first pulse.
+    """
+    frame, gap = 30, 25
+    while frame < seconds * 30:
+        yield frame
+        frame += gap
+        gap += 5
+
+
 def publish(ffmpeg, rtmp, name, bframes, delay, seconds):
-    video = "color=c=black:s=320x180:r=30,drawbox=c=white:t=fill:enable='eq(mod(n\\,30)\\,0)'"
-    # aevalsrc's t starts at the delayed input's start, so `t + delay` is the
-    # absolute time: beeps land on whole seconds, exactly with the flashes.
-    audio = f"aevalsrc='if(lt(mod(t+{delay}\\,1)\\,0.05)\\,sin(2*PI*1000*t)\\,0)':s=48000:c=mono"
+    frames = list(marker_frames(seconds))
+    flashes = '+'.join(f'eq(n\\,{frame})' for frame in frames)
+    video = f"color=c=black:s=320x180:r=30,drawbox=c=white:t=fill:enable='{flashes}'"
+    # The delayed input's clock starts at zero. Both signals mark absolute
+    # source time, so late track startup is not an intentional A/V error.
+    beeps = '+'.join(f'between(t+{delay}\\,{frame / 30}\\,{frame / 30 + 0.05})'
+                     for frame in frames)
+    audio = f"aevalsrc='if({beeps}\\,sin(2*PI*1000*t)\\,0)':s=48000:c=mono"
     return subprocess.Popen(
         [ffmpeg, '-hide_banner', '-loglevel', 'error',
          '-re', '-f', 'lavfi', '-i', video,
          '-re', '-itsoffset', str(delay), '-f', 'lavfi', '-i', audio,
          '-t', str(seconds), '-c:v', 'libx264', '-preset', 'veryfast', '-bf', str(bframes),
-         '-g', '30', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k',
+         '-g', '30', '-sc_threshold', '0', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '128k',
          '-f', 'flv', f'{rtmp}/live/{name}'],
     )
 
@@ -250,17 +269,33 @@ def measure(driver, page, mode, name, listen, loopback=None):
 
 
 def offsets(result):
-    """beep - nearest flash, in milliseconds, skipping the first flash: it
-    can fall in startup, before audio plays."""
-    flashes = result['flashes']
-    found = []
-    for beep in result['beeps']:
-        if not flashes or beep < flashes[0] + 0.5:
-            continue
-        flash = min(flashes, key=lambda time: abs(time - beep))
-        if abs(beep - flash) < 0.4:
-            found.append((beep - flash) * 1000)
-    return found
+    """Align the irregular trains by consensus, allowing missing detections.
+
+    Each pair votes for a signed delay. With gaps above 0.8 s and a matching
+    radius of 80 ms, a cluster cannot reuse an event. Refuse tied alignments
+    and sparse data rather than guessing an event's identity.
+    """
+    flashes, beeps = result['flashes'], result['beeps']
+    if any(not math.isfinite(t) for t in flashes + beeps):
+        return []
+    if any(b - a < 0.5 for times in (flashes, beeps) for a, b in zip(times, times[1:])):
+        return []
+    # Legacy periodic captures cannot distinguish zero from whole-period lag.
+    for times in (flashes, beeps):
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        if not gaps or max(gaps) - min(gaps) < 0.1:
+            return []
+    deltas = sorted(beep - flash for beep in beeps for flash in flashes)
+    clusters = [tuple(d for d in deltas if abs(d - candidate) <= 0.08)
+                for candidate in deltas]
+    if not clusters:
+        return []
+    best = max(clusters, key=len)
+    center = statistics.median(best)
+    if len(best) < 3 or any(len(c) == len(best) and abs(statistics.median(c) - center) > 0.08
+                            for c in clusters):
+        return []
+    return [delta * 1000 for delta in best]
 
 
 def run_browser(browser, driver, page, loopback, args, report):
@@ -288,9 +323,15 @@ def run_browser(browser, driver, page, loopback, args, report):
             median = row['median_ms']
             if median is None or baseline is None:
                 verdict, failed = 'NO DATA', True
+            elif abs(baseline) >= 400:
+                # Floor the quality of the reference itself: a shared whole-second
+                # error cancels out of every relative measurement. The former
+                # 400 ms matching window leaves ample room for device latency.
+                verdict, failed = f'FAIL baseline {baseline:+.1f} ms', True
             else:
                 drift = median - baseline
-                ok = abs(drift) <= args.tolerance_ms
+                ok = (abs(drift) <= args.tolerance_ms and len(row['offsets_ms']) >= 3
+                      and row['playing'] and not row['errors'])
                 failed |= not ok
                 verdict = f"{'ok  ' if ok else 'FAIL'} {drift:+7.1f} ms vs base"
             spread = (f"{min(row['offsets_ms']):+.0f}..{max(row['offsets_ms']):+.0f}"
@@ -313,7 +354,7 @@ def main():
     parser.add_argument('--browsers', default='chrome,safari')
     parser.add_argument('--players', help='comma-separated subset, e.g. native,shaka')
     parser.add_argument('--cases', default=','.join(CASES),
-                        type=lambda text: [name for name in text.split(',') if name in CASES],
+                        type=lambda text: text.split(','),
                         help='comma-separated subset; keep `base`, every verdict compares to it')
     parser.add_argument('--seconds', type=int, default=14, help='published media per case')
     parser.add_argument('--listen', type=float, default=12, help='playback measured per player')
@@ -322,6 +363,11 @@ def main():
                         help='output device that Safari plays into while it is measured')
     parser.add_argument('--output', type=Path, help='write all measurements as JSON')
     args = parser.parse_args()
+    unknown = set(args.cases).difference(CASES)
+    if unknown:
+        parser.error("unknown cases: " + ", ".join(sorted(unknown)))
+    if 'base' not in args.cases:
+        parser.error("include the base case for per-player comparison")
 
     work = Path(tempfile.mkdtemp(prefix='rushls-av-sync-'))
     rtmp_port, srt_port, http_port, chrome_port, safari_port = (free_port() for _ in range(5))

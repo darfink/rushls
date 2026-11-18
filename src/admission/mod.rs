@@ -24,7 +24,7 @@ pub use open::OpenStreamAuthenticator;
 pub use predicate::{Bounds, Codecs, FrameBox, Resolution};
 
 #[cfg(test)]
-mod fixtures;
+pub(crate) mod fixtures;
 
 pub use crate::domain::{ClientInfo, IngestProtocol, PublishResource};
 
@@ -43,11 +43,36 @@ impl PresentedCredential {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[debug("PublishRequest {{ protocol: {protocol:?}, client: {client:?}, .. }}")]
 pub struct PublishRequest {
     pub protocol: IngestProtocol,
     pub resource: PublishResource,
     pub credential: PresentedCredential,
     pub client: ClientInfo,
+}
+
+impl PublishRequest {
+    /// The wire resource can double as a credential. Keep it inside admission
+    /// unless the entire value is safe to send to lifecycle consumers.
+    pub fn into_publisher_context(
+        mut self,
+        grant: &PublishGrant,
+    ) -> crate::domain::PublisherContext {
+        let secret = std::str::from_utf8(self.credential.expose())
+            .ok()
+            .filter(|s| !s.is_empty());
+        let safe = |value: &str| secret.is_none_or(|key| !value.contains(key));
+        if !safe(&self.resource.name) {
+            self.resource.name = "[redacted]".into();
+        }
+        self.resource.namespace = self.resource.namespace.filter(|s| safe(s));
+        crate::domain::PublisherContext {
+            public_stream: safe(grant.stream_id.as_str()) && safe(&grant.principal.0),
+            resource: self.resource,
+            protocol: self.protocol,
+            client: self.client,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Display, Eq, Hash, Ord, PartialEq, PartialOrd)]

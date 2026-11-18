@@ -5,13 +5,13 @@ use crate::{
         Payload, TickDuration, Timebase, TrackId, fixtures::TrackBuilder,
     },
     media::{
-        NormalizeError, NormalizedMedia, NormalizerFactory, PresentationPlan, StartedNormalizer,
-        SubtitleSample, TimelineCalibration, calibrate, fixtures::presentation,
+        NormalizeError, NormalizedMedia, PresentationPlan, StartedNormalizer, SubtitleSample,
+        TimelineCalibration, calibrate, fixtures::presentation,
     },
     source::Packet,
 };
 
-use super::PassThroughNormalizerFactory;
+use super::start_normalizer;
 
 fn packet(track_id: u32, pts: Option<i64>, dts: Option<i64>, duration: Option<i64>) -> Packet {
     Packet {
@@ -38,8 +38,7 @@ fn started_from(
     input: PresentationPlan,
 ) -> (StartedNormalizer, PresentationPlan, TimelineCalibration) {
     let timeline = calibrate(&input).expect("input timeline calibrates");
-    let started = PassThroughNormalizerFactory
-        .start(&input, &timeline, crate::domain::InputMode::Permissive)
+    let started = start_normalizer(&input, &timeline, crate::domain::InputMode::Permissive)
         .expect("normalization starts");
     (started, input, timeline)
 }
@@ -817,7 +816,7 @@ fn reordered_video_accepts_backward_pts_with_increasing_explicit_dts() -> Result
 fn limited(tracks: Vec<DiscoveredTrack>) -> Result<StartedNormalizer, NormalizeError> {
     let input = presentation(tracks);
     let timeline = calibrate(&input).expect("fixture calibrates");
-    PassThroughNormalizerFactory.start(&input, &timeline, crate::domain::InputMode::Permissive)
+    start_normalizer(&input, &timeline, crate::domain::InputMode::Permissive)
 }
 
 fn timing_issue(error: NormalizeError) -> crate::domain::TimestampIssue {
@@ -1084,11 +1083,8 @@ fn source_duration_limit_is_not_rounded_to_the_output_clock() -> Result<(), Norm
             .build();
         let input = presentation(vec![video]);
         let timeline = calibrate(&input).expect("fixture calibrates");
-        let mut started = PassThroughNormalizerFactory.start(
-            &input,
-            &timeline,
-            crate::domain::InputMode::Permissive,
-        )?;
+        let mut started =
+            start_normalizer(&input, &timeline, crate::domain::InputMode::Permissive)?;
         let mut out = Vec::new();
         started
             .normalizer
@@ -1448,7 +1444,7 @@ fn mode_start(
     let input = presentation(vec![track]);
     let timeline =
         calibrate(&input).map_err(|e| NormalizeError::InvalidPlan(e.to_string().into()))?;
-    PassThroughNormalizerFactory.start(&input, &timeline, mode)
+    start_normalizer(&input, &timeline, mode)
 }
 #[test]
 fn declared_cadence_modes_distinguish_late_early_and_nominal() -> Result<(), NormalizeError> {

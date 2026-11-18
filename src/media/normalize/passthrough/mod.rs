@@ -6,8 +6,8 @@ use crate::{
         TimebaseProjection, TrackId,
     },
     media::{
-        MediaNormalizer, NormalizeError, NormalizedMedia, NormalizerFactory, PresentationPlan,
-        StartedNormalizer, TimelineCalibration, TrackTimeline,
+        MediaNormalizer, NormalizeError, NormalizedMedia, PresentationPlan, StartedNormalizer,
+        TimelineCalibration, TrackTimeline,
     },
     source::Packet,
 };
@@ -23,82 +23,79 @@ use audio::AudioNormalizer;
 use subtitle::SubtitleNormalizer;
 use video::VideoNormalizer;
 
-/// Builds the production pass-through timing normalizer.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PassThroughNormalizerFactory;
+/// Builds the pass-through normalizer for one validated, calibrated presentation.
+///
+/// Takes no meters: volume is counted by the loop that drives the normalizer,
+/// once per batch, which is both cheaper and closer to the truth than having
+/// each stage report itself.
+pub fn start_normalizer(
+    presentation: &PresentationPlan,
+    timeline: &TimelineCalibration,
+    input_mode: crate::domain::InputMode,
+) -> Result<StartedNormalizer, NormalizeError> {
+    let mut tracks = Vec::with_capacity(presentation.tracks().len());
+    let mut projected_timelines = Vec::with_capacity(presentation.tracks().len());
+    let mut normalizers = Vec::with_capacity(presentation.tracks().len());
 
-impl NormalizerFactory for PassThroughNormalizerFactory {
-    fn start(
-        &self,
-        presentation: &PresentationPlan,
-        timeline: &TimelineCalibration,
-        input_mode: crate::domain::InputMode,
-    ) -> Result<StartedNormalizer, NormalizeError> {
-        let mut tracks = Vec::with_capacity(presentation.tracks().len());
-        let mut projected_timelines = Vec::with_capacity(presentation.tracks().len());
-        let mut normalizers = Vec::with_capacity(presentation.tracks().len());
-
-        for track in presentation.tracks() {
-            let input_timeline = timeline
-                .get(track.id)
-                .ok_or_else(|| invalid_plan(format!("{} has no calibrated timeline", track.id)))?;
-            if input_timeline.timebase != track.timebase {
-                return Err(invalid_plan(format!(
-                    "{} discovery and calibration timebases differ",
-                    track.id
-                )));
-            }
-            let output_timebase = normalized_timebase(track)?;
-            let projection = TimebaseProjection::new(track.timebase, output_timebase);
-
-            let mut projected = track.clone();
-            projected.video_cadence = if track.video_cadence == crate::domain::VideoCadence::Unknown
-            {
-                crate::media::cadence::inspect(track)
-            } else {
-                track.video_cadence
-            };
-            projected.timebase = output_timebase;
-            projected.first_pts = track
-                .first_pts
-                .map(|pts| project_timestamp(projection, pts, track.id, "first PTS"))
-                .transpose()?;
-            let cadence = projected.video_cadence;
-            tracks.push(projected);
-            projected_timelines.push(TrackTimeline {
-                track_id: track.id,
-                timebase: output_timebase,
-                origin_pts: project_timestamp(
-                    projection,
-                    input_timeline.origin_pts,
-                    track.id,
-                    "presentation origin",
-                )?,
-            });
-            normalizers.push(TrackNormalizer::new(
-                track,
-                output_timebase,
-                input_mode,
-                cadence,
-            )?);
+    for track in presentation.tracks() {
+        let input_timeline = timeline
+            .get(track.id)
+            .ok_or_else(|| invalid_plan(format!("{} has no calibrated timeline", track.id)))?;
+        if input_timeline.timebase != track.timebase {
+            return Err(invalid_plan(format!(
+                "{} discovery and calibration timebases differ",
+                track.id
+            )));
         }
+        let output_timebase = normalized_timebase(track)?;
+        let projection = TimebaseProjection::new(track.timebase, output_timebase);
 
-        let presentation = presentation
-            .with_projected_tracks(tracks)
-            .map_err(|error| invalid_plan(error.to_string()))?;
-        let timeline = TimelineCalibration {
-            timing_authority: timeline.timing_authority,
-            tracks: projected_timelines,
+        let mut projected = track.clone();
+        projected.video_cadence = if track.video_cadence == crate::domain::VideoCadence::Unknown {
+            crate::media::cadence::inspect(track)
+        } else {
+            track.video_cadence
         };
-        Ok(StartedNormalizer {
-            normalizer: Box::new(PassThroughNormalizer {
-                tracks: normalizers,
-                finished: false,
-            }),
-            presentation,
-            timeline,
-        })
+        projected.timebase = output_timebase;
+        projected.first_pts = track
+            .first_pts
+            .map(|pts| project_timestamp(projection, pts, track.id, "first PTS"))
+            .transpose()?;
+        let cadence = projected.video_cadence;
+        tracks.push(projected);
+        projected_timelines.push(TrackTimeline {
+            track_id: track.id,
+            timebase: output_timebase,
+            origin_pts: project_timestamp(
+                projection,
+                input_timeline.origin_pts,
+                track.id,
+                "presentation origin",
+            )?,
+        });
+        normalizers.push(TrackNormalizer::new(
+            track,
+            output_timebase,
+            input_mode,
+            cadence,
+        )?);
     }
+
+    let presentation = presentation
+        .with_projected_tracks(tracks)
+        .map_err(|error| invalid_plan(error.to_string()))?;
+    let timeline = TimelineCalibration {
+        timing_authority: timeline.timing_authority,
+        tracks: projected_timelines,
+    };
+    Ok(StartedNormalizer {
+        normalizer: Box::new(PassThroughNormalizer {
+            tracks: normalizers,
+            finished: false,
+        }),
+        presentation,
+        timeline,
+    })
 }
 
 fn normalized_timebase(track: &DiscoveredTrack) -> Result<Timebase, NormalizeError> {

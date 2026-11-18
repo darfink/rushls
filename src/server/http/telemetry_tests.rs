@@ -1,17 +1,9 @@
 //! Exercise attribution through the same admission and body boundaries as HTTP.
 use super::*;
 use crate::{
-    delivery::hls::{
-        StreamStore,
-        fixtures::{initialization, lease, video, write, write_segment},
-    },
+    delivery::hls::StreamStore,
     domain::StreamId,
-    observe::{
-        HlsMeters, OriginMeters,
-        http::{HttpFailure, HttpMethod, HttpResource},
-    },
-    server::metrics::MetricsReader,
-    session::Registry,
+    observe::http::{HttpFailure, HttpMethod, HttpResource},
 };
 use axum::http::Request;
 use http_body_util::BodyExt;
@@ -21,17 +13,9 @@ use tower::ServiceExt;
 #[tokio::test(start_paused = true)]
 async fn stream_http_attributes_failures_and_bounds_label_lifetime() -> Result<(), Box<dyn Error>> {
     let store = StreamStore::default();
-    let publication = lease(&store, vec![video(0)]);
-    write(&publication, initialization(0, 1));
-    write_segment(&publication, 0, 0, 0);
+    let publication = fixtures::publish_camera(&store);
     let application = fixtures::application(&store);
-    let reader = MetricsReader::new(
-        ProcessMeters::default(),
-        OriginMeters::default(),
-        HlsMeters::default(),
-        Registry::default(),
-        store.clone(),
-    );
+    let reader = fixtures::metrics_reader(&store);
     let totals = reader.http_meters();
     let budget = HttpBudget::new(HttpLimits::default()).with_meters(totals.clone());
     let endpoint = MetricsEndpoint::new(reader, None);
@@ -53,6 +37,9 @@ async fn stream_http_attributes_failures_and_bounds_label_lifetime() -> Result<(
         ("/live/camera/999/video.m3u8", "GET", 404),
         ("/live/camera/0/video.m3u8?_HLS_msn=invalid", "GET", 400),
         ("/live/unpublished/index.m3u8", "GET", 404),
+        ("/live/%zz/0/segment/1.m4s", "GET", 404),
+        ("/live/camera/nope/video.m3u8", "GET", 404),
+        ("/live/camera/unknown", "GET", 404),
     ] {
         let response = router
             .clone()
@@ -89,10 +76,22 @@ async fn stream_http_attributes_failures_and_bounds_label_lifetime() -> Result<(
         scoped.failures[&(HttpResource::Playlist, HttpFailure::InvalidDirective)],
         1
     );
+    let totals = totals.snapshot();
     assert_eq!(
-        totals.snapshot().failures[&(HttpResource::Playlist, HttpFailure::UnknownStream)],
+        totals.failures[&(HttpResource::Playlist, HttpFailure::UnknownStream)],
         1
     );
+    // Malformed paths keep their node-level buckets without a stream label.
+    for (resource, expected) in [
+        (HttpResource::Media, 2),
+        (HttpResource::Playlist, 3),
+        (HttpResource::Other, 1),
+    ] {
+        assert_eq!(
+            totals.responses[&(resource, HttpMethod::Get, 404)],
+            expected
+        );
+    }
     let rendered = endpoint.render_streams();
     assert!(rendered.contains("rushls_stream_http_responses_total{stream=\"live/camera\",resource=\"media\",method=\"GET\",status=\"404\"} 1"));
     assert!(rendered.contains("rushls_stream_http_handler_duration_seconds_bucket{stream=\"live/camera\",resource=\"media\",le=\"+Inf\"} 3"));

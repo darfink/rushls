@@ -120,9 +120,10 @@ pub fn video_catalog() -> TrackCatalog {
 pub fn publisher() -> super::PublisherContext {
     super::PublisherContext {
         protocol: super::IngestProtocol::Rtmp,
+        public_stream: true,
         resource: super::PublishResource {
             namespace: Some("live".into()),
-            name: "presented-key".into(),
+            name: "[redacted]".into(),
         },
         client: super::ClientInfo {
             remote_address: "127.0.0.1:1935".parse().expect("constant address"),

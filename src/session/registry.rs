@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::{
     admission::{Principal, PublishGrant, TakeoverPolicy},
+    delivery::store::{LiveStream, StreamStore},
     domain::{SessionId, StreamId, TrackCounts},
     observe::{Events, MeterSnapshot, SessionMeters},
 };
@@ -36,6 +37,8 @@ pub struct SessionShared {
     id: SessionId,
     stream: StreamId,
     principal: Principal,
+    pub(super) stop: StopToken,
+    pub(super) public_stream: bool,
     meters: SessionMeters,
     status: RwLock<Status>,
 }
@@ -133,13 +136,7 @@ struct Inner {
     maximum: usize,
     /// `memory.total`, and what each session commits against it.
     memory: Option<(crate::domain::MemoryLedger, usize)>,
-    sessions: RwLock<HashMap<SessionId, Entry>>,
-}
-
-#[derive(Debug)]
-struct Entry {
-    shared: Arc<SessionShared>,
-    stop: StopToken,
+    sessions: RwLock<HashMap<SessionId, Arc<SessionShared>>>,
 }
 
 impl Registry {
@@ -191,7 +188,20 @@ impl Registry {
         &self,
         grant: &PublishGrant,
         meters: SessionMeters,
-        stop: StopToken,
+        store: &StreamStore,
+        public_stream: bool,
+    ) -> Result<Registration, RegistryError> {
+        store.with_retained_stream(&grant.stream_id, |retained| {
+            self.register_publisher(grant, meters, public_stream, retained)
+        })
+    }
+
+    fn register_publisher(
+        &self,
+        grant: &PublishGrant,
+        meters: SessionMeters,
+        mut public_stream: bool,
+        retained: Option<&LiveStream>,
     ) -> Result<Registration, RegistryError> {
         let mut sessions = self.inner.sessions.write();
         let takeover = self.check(&sessions, grant)?;
@@ -209,11 +219,16 @@ impl Registry {
                 }
             })
             .transpose()?;
-        let displaced: Vec<_> = sessions
+        // Publish the stop before another registration can observe the new owner.
+        let mut displaced = 0;
+        for entry in sessions
             .values()
-            .filter(|entry| entry.shared.stream == grant.stream_id)
-            .map(|entry| entry.stop.clone())
-            .collect();
+            .filter(|entry| entry.stream == grant.stream_id)
+        {
+            public_stream &= entry.public_stream;
+            entry.stop.stop(StopReason::Replaced);
+            displaced += 1;
+        }
 
         let raw_id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let id = SessionId(NonZeroU64::new(raw_id).expect("session id counter wrapped"));
@@ -221,30 +236,22 @@ impl Registry {
             id,
             stream: grant.stream_id.clone(),
             principal: grant.principal.clone(),
+            stop: StopToken::new(),
+            // Inherit privacy even if the previous publisher is still discovering
+            // or has already left a retained stream in its reconnect window.
+            public_stream: retained
+                .map_or(public_stream, |live| live.restrict_hooks(public_stream)),
             meters,
             status: RwLock::new(Status {
                 phase: Phase::Accepted,
                 tracks: TrackCounts::default(),
             }),
         });
-        sessions.insert(
-            id,
-            Entry {
-                shared: Arc::clone(&shared),
-                stop,
-            },
-        );
-        drop(sessions);
-
-        let displaced_count = displaced.len();
-        for stop in displaced {
-            stop.stop(StopReason::Replaced);
-        }
-
+        sessions.insert(id, Arc::clone(&shared));
         Ok(Registration {
             registry: self.clone(),
             shared,
-            displaced: displaced_count,
+            displaced,
             _memory: memory,
         })
     }
@@ -252,14 +259,14 @@ impl Registry {
     /// Returns whether admitting `grant` is a takeover of a running session.
     fn check(
         &self,
-        sessions: &HashMap<SessionId, Entry>,
+        sessions: &HashMap<SessionId, Arc<SessionShared>>,
         grant: &PublishGrant,
     ) -> Result<bool, RegistryError> {
         let mut incumbent = false;
         let mut draining = false;
         for entry in sessions
             .values()
-            .filter(|entry| entry.shared.stream == grant.stream_id)
+            .filter(|entry| entry.stream == grant.stream_id)
         {
             incumbent = true;
             draining |= entry.stop.reason().is_some();
@@ -302,7 +309,7 @@ impl Registry {
             .sessions
             .read()
             .values()
-            .map(|entry| entry.shared.snapshot())
+            .map(|entry| entry.snapshot())
             .collect()
     }
 
@@ -346,12 +353,8 @@ impl Registration {
         self.displaced
     }
 
-    pub fn context(&self, events: &Events, stop: StopToken) -> SessionContext {
-        SessionContext::new(
-            Arc::clone(&self.shared),
-            events.scoped(self.shared.id),
-            stop,
-        )
+    pub fn context(&self, events: &Events) -> SessionContext {
+        SessionContext::new(Arc::clone(&self.shared), events.scoped(self.shared.id))
     }
 }
 
@@ -363,10 +366,7 @@ impl Drop for Registration {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        admission::{StreamPolicy, TakeoverPolicy},
-        observe::ProcessMeters,
-    };
+    use crate::{admission::StreamPolicy, observe::ProcessMeters};
 
     use super::*;
 
@@ -378,36 +378,54 @@ mod tests {
         }
     }
 
-    fn grant_with_takeovers(stream: &str, takeovers: TakeoverPolicy) -> PublishGrant {
-        PublishGrant {
-            policy: StreamPolicy {
-                takeovers,
-                ..StreamPolicy::permissive()
-            },
-            ..grant(stream)
-        }
-    }
-
     fn try_register(
         registry: &Registry,
-        stream: &str,
-        stop: StopToken,
+        grant: &PublishGrant,
     ) -> Result<Registration, RegistryError> {
         registry.register(
-            &grant(stream),
+            grant,
             SessionMeters::new(ProcessMeters::default()),
-            stop,
+            &StreamStore::default(),
+            true,
         )
     }
 
-    fn register(registry: &Registry, stream: &str, stop: StopToken) -> Registration {
-        try_register(registry, stream, stop).expect("the registry has room")
+    fn register(registry: &Registry, stream: &str) -> Result<Registration, RegistryError> {
+        try_register(registry, &grant(stream))
+    }
+
+    fn register_with_stop(
+        registry: &Registry,
+        stream: &str,
+    ) -> Result<(Registration, StopToken), RegistryError> {
+        let registration = register(registry, stream)?;
+        let stop = registration.shared.stop.clone();
+        Ok((registration, stop))
+    }
+
+    fn assert_registration_rejected(
+        registry: &Registry,
+        grant: &PublishGrant,
+        error: RegistryError,
+    ) {
+        assert_eq!(
+            registry.preflight(grant),
+            Err(error.clone()),
+            "preflight for {}",
+            grant.stream_id,
+        );
+        assert_eq!(
+            try_register(registry, grant).map(|_| ()),
+            Err(error),
+            "registration for {}",
+            grant.stream_id,
+        );
     }
 
     #[test]
-    fn registration_lifetime_bounds_visibility() {
+    fn registration_lifetime_bounds_visibility() -> Result<(), RegistryError> {
         let registry = Registry::default();
-        let registration = register(&registry, "live/camera", StopToken::new());
+        let registration = register(&registry, "live/camera")?;
         registration.shared().set_phase(Phase::Running);
         registration.shared().set_tracks(TrackCounts {
             audio: 1,
@@ -422,39 +440,40 @@ mod tests {
 
         drop(registration);
         assert!(registry.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn a_second_publisher_of_a_stream_displaces_the_first() {
+    fn a_second_publisher_of_a_stream_displaces_the_first() -> Result<(), RegistryError> {
         let registry = Registry::default();
-        let incumbent_stop = StopToken::new();
-        let _incumbent = register(&registry, "live/camera", incumbent_stop.clone());
+        let (_incumbent, incumbent_stop) = register_with_stop(&registry, "live/camera")?;
 
-        let takeover = register(&registry, "live/camera", StopToken::new());
+        let takeover = register(&registry, "live/camera")?;
 
         assert_eq!(takeover.displaced(), 1);
         assert_eq!(incumbent_stop.reason(), Some(StopReason::Replaced));
+        Ok(())
     }
 
     #[test]
-    fn publishers_of_different_streams_coexist() {
+    fn publishers_of_different_streams_coexist() -> Result<(), RegistryError> {
         let registry = Registry::default();
-        let first_stop = StopToken::new();
-        let _first = register(&registry, "live/one", first_stop.clone());
+        let (_first, first_stop) = register_with_stop(&registry, "live/one")?;
 
-        let second = register(&registry, "live/two", StopToken::new());
+        let second = register(&registry, "live/two")?;
 
         assert_eq!(second.displaced(), 0);
         assert_eq!(first_stop.reason(), None);
         assert_eq!(registry.len(), 2);
+        Ok(())
     }
 
     #[test]
-    fn sessions_commit_their_budget_against_the_node_total() {
+    fn sessions_commit_their_budget_against_the_node_total() -> Result<(), RegistryError> {
         let ledger = crate::domain::MemoryLedger::new(250);
         let registry = Registry::with_memory(8, Some((ledger.clone(), 100)));
-        let first = register(&registry, "live/one", StopToken::new());
-        let _second = register(&registry, "live/two", StopToken::new());
+        let first = register(&registry, "live/one")?;
+        let _second = register(&registry, "live/two")?;
         assert_eq!(ledger.committed(), 200);
 
         // A third would take the committed total past 250, although the
@@ -464,109 +483,88 @@ mod tests {
             committed: 200,
             limit: 250,
         };
-        assert_eq!(registry.preflight(&grant("live/three")), Err(full.into()));
-        assert_eq!(
-            try_register(&registry, "live/three", StopToken::new()).map(|_| ()),
-            Err(full.into())
-        );
+        assert_registration_rejected(&registry, &grant("live/three"), full.into());
 
         // A takeover replaces a session that already holds its share, so it
         // is admitted and briefly overcommits while the incumbent drains.
-        let takeover = register(&registry, "live/one", StopToken::new());
+        let takeover = register(&registry, "live/one")?;
         assert_eq!(ledger.committed(), 300);
         drop((first, takeover));
         assert_eq!(ledger.committed(), 100);
+        Ok(())
     }
 
     #[test]
-    fn a_full_registry_turns_new_publishers_away() {
+    fn a_full_registry_turns_new_publishers_away() -> Result<(), RegistryError> {
         let registry = Registry::with_capacity(1);
-        let _held = register(&registry, "live/one", StopToken::new());
+        let _held = register(&registry, "live/one")?;
 
-        assert_eq!(
-            registry.preflight(&grant("live/two")),
-            Err(AtCapacity { maximum: 1 }.into())
+        assert_registration_rejected(
+            &registry,
+            &grant("live/two"),
+            AtCapacity { maximum: 1 }.into(),
         );
-        assert_eq!(
-            try_register(&registry, "live/two", StopToken::new()).map(|_| ()),
-            Err(AtCapacity { maximum: 1 }.into())
-        );
+        Ok(())
     }
 
     #[test]
-    fn capacity_never_blocks_a_publisher_reclaiming_its_own_stream() {
+    fn capacity_never_blocks_a_publisher_reclaiming_its_own_stream() -> Result<(), RegistryError> {
         let registry = Registry::with_capacity(1);
-        let incumbent_stop = StopToken::new();
-        let _incumbent = register(&registry, "live/one", incumbent_stop.clone());
+        let (_incumbent, incumbent_stop) = register_with_stop(&registry, "live/one")?;
 
         assert_eq!(registry.preflight(&grant("live/one")), Ok(()));
-        let takeover = register(&registry, "live/one", StopToken::new());
+        let takeover = register(&registry, "live/one")?;
 
         assert_eq!(takeover.displaced(), 1);
         assert_eq!(incumbent_stop.reason(), Some(StopReason::Replaced));
+        Ok(())
     }
 
     #[test]
-    fn only_one_takeover_may_wait_for_a_stream_to_drain() {
+    fn only_one_takeover_may_wait_for_a_stream_to_drain() -> Result<(), RegistryError> {
         let registry = Registry::with_capacity(1);
-        let incumbent_stop = StopToken::new();
-        let _incumbent = register(&registry, "live/one", incumbent_stop);
-        let _takeover = register(&registry, "live/one", StopToken::new());
+        let _incumbent = register(&registry, "live/one")?;
+        let _takeover = register(&registry, "live/one")?;
 
-        assert_eq!(
-            registry.preflight(&grant("live/one")),
-            Err(RegistryError::TakeoverInProgress {
+        assert_registration_rejected(
+            &registry,
+            &grant("live/one"),
+            RegistryError::TakeoverInProgress {
                 stream: StreamId::new("live/one"),
-            })
+            },
         );
-        assert_eq!(
-            try_register(&registry, "live/one", StopToken::new()).map(|_| ()),
-            Err(RegistryError::TakeoverInProgress {
-                stream: StreamId::new("live/one"),
-            })
-        );
+        Ok(())
     }
 
     #[test]
-    fn a_policy_can_protect_the_incumbent_from_takeover() {
+    fn a_policy_can_protect_the_incumbent_from_takeover() -> Result<(), RegistryError> {
         let registry = Registry::default();
-        let incumbent_stop = StopToken::new();
-        let _incumbent = register(&registry, "live/one", incumbent_stop.clone());
-        let denied = grant_with_takeovers("live/one", TakeoverPolicy::Deny);
+        let (_incumbent, incumbent_stop) = register_with_stop(&registry, "live/one")?;
+        let mut denied = grant("live/one");
+        denied.policy.takeovers = TakeoverPolicy::Deny;
 
-        assert_eq!(
-            registry.preflight(&denied),
-            Err(RegistryError::AlreadyPublished {
+        assert_registration_rejected(
+            &registry,
+            &denied,
+            RegistryError::AlreadyPublished {
                 stream: StreamId::new("live/one"),
-            })
-        );
-        assert_eq!(
-            registry
-                .register(
-                    &denied,
-                    SessionMeters::new(ProcessMeters::default()),
-                    StopToken::new(),
-                )
-                .map(|_| ()),
-            Err(RegistryError::AlreadyPublished {
-                stream: StreamId::new("live/one"),
-            })
+            },
         );
         assert_eq!(incumbent_stop.reason(), None);
         assert_eq!(registry.len(), 1);
+        Ok(())
     }
 
     #[test]
-    fn shutdown_stops_every_session() {
+    fn shutdown_stops_every_session() -> Result<(), RegistryError> {
         let registry = Registry::default();
-        let first_stop = StopToken::new();
-        let second_stop = StopToken::new();
-        let _first = register(&registry, "live/one", first_stop.clone());
-        let _second = register(&registry, "live/two", second_stop.clone());
+        let (_first, first_stop) = register_with_stop(&registry, "live/one")?;
+        let (_second, second_stop) = register_with_stop(&registry, "live/two")?;
 
         registry.stop_all(StopReason::Cancelled);
 
         assert_eq!(first_stop.reason(), Some(StopReason::Cancelled));
         assert_eq!(second_stop.reason(), Some(StopReason::Cancelled));
+        Ok(())
     }
 }

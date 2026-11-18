@@ -10,14 +10,14 @@
 //! generations are left untouched.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, SyncSender, TrySendError},
+        mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
 };
@@ -128,7 +128,7 @@ impl From<Payload> for HeldBytes {
 /// Process-wide spill worker and generation directory.
 pub struct DiskTier {
     shared: Arc<DiskShared>,
-    jobs: Option<SyncSender<SpillJob>>,
+    jobs: Option<Sender<DiskWork>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -142,9 +142,9 @@ struct DiskShared {
     write_gate: Mutex<()>,
     spills_failed: AtomicU64,
     operations: crate::observe::OperationMeters,
-    /// In-flight and retired epochs. A successor may reuse the public stream
-    /// id, so retirement deletes one epoch and waits for its jobs first.
-    epochs: Mutex<HashMap<(StreamId, u64), EpochJobs>>,
+    /// Only directories for accepted spills can enqueue removal. Claiming a
+    /// directory here coalesces all of its segment files and gzip sidecars.
+    directories: Mutex<HashMap<u64, HashSet<RenditionId>>>,
     read_bytes: Arc<Semaphore>,
     /// Exclusive lock on `dir`. Dropped with the generation so a peer cannot
     /// reap files while a spill is still finishing.
@@ -152,10 +152,12 @@ struct DiskShared {
     owner: Option<File>,
 }
 
-#[derive(Default)]
-struct EpochJobs {
-    pending: usize,
-    reap: bool,
+enum DiskWork {
+    Spill(SpillJob),
+    Remove {
+        epoch: u64,
+        rendition: Option<RenditionId>,
+    },
 }
 
 impl std::fmt::Debug for DiskTier {
@@ -169,6 +171,7 @@ impl std::fmt::Debug for DiskTier {
 
 pub struct SpillJob {
     pub live: std::sync::Weak<super::stream::LiveStream>,
+    /// Diagnostic label for failed writes.
     pub stream: StreamId,
     /// Distinguishes two `LiveStream` values that share a public stream id.
     pub epoch: u64,
@@ -209,8 +212,6 @@ pub enum DiskError {
     Write { path: PathBuf, source: io::Error },
     #[error("could not read {path}: {source}")]
     Read { path: PathBuf, source: io::Error },
-    #[error("stream name {0} is not a safe disk path")]
-    UnsafeStream(StreamId),
     #[error("disk retention directory {path} is in use by another rushls process")]
     InUse { path: PathBuf },
 }
@@ -243,7 +244,7 @@ impl DiskTier {
             source,
         })?;
 
-        let (jobs, rx) = mpsc::sync_channel(SPILL_QUEUE_BOUND);
+        let (jobs, rx) = mpsc::channel();
         let shared = Arc::new(DiskShared {
             generation: generation.clone(),
             maximum_payload_bytes: limits.maximum_payload_bytes,
@@ -253,7 +254,7 @@ impl DiskTier {
             write_gate: Mutex::new(()),
             spills_failed: AtomicU64::new(0),
             operations: crate::observe::OperationMeters::default(),
-            epochs: Mutex::new(HashMap::new()),
+            directories: Mutex::new(HashMap::new()),
             read_bytes: Arc::new(Semaphore::new(MAX_IN_FLIGHT_READ_BYTES as usize)),
             _lock: lock,
             owner: Some(owner),
@@ -311,17 +312,22 @@ impl DiskTier {
         let Some(jobs) = self.jobs.as_ref() else {
             return false;
         };
-        self.shared.note_enqueued(&job.stream, job.epoch);
-        self.shared.pending.fetch_add(1, Ordering::Relaxed);
-        match jobs.try_send(job) {
-            Ok(()) => true,
-            Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => {
-                self.shared.note_finished(&job.stream, job.epoch);
-                self.shared.pending.fetch_sub(1, Ordering::Relaxed);
-                drop(job);
-                false
-            }
+        // Serialize admission across streams. The FIFO also accepts one small
+        // cleanup request per previously admitted directory, even when the
+        // payload queue is full and the publisher holds the stream lock.
+        let mut directories = self.shared.directories.lock();
+        if self.queue_is_full() {
+            return false;
         }
+        let epoch = job.epoch;
+        let rendition = job.rendition;
+        self.shared.pending.fetch_add(1, Ordering::Relaxed);
+        if jobs.send(DiskWork::Spill(job)).is_err() {
+            self.shared.pending.fetch_sub(1, Ordering::Relaxed);
+            return false;
+        }
+        directories.entry(epoch).or_default().insert(rendition);
+        true
     }
 
     /// Reads a spilled payload into RAM.
@@ -369,12 +375,29 @@ impl DiskTier {
         Ok(Payload::from(result))
     }
 
-    /// Drops one LiveStream's files, after any in-flight spill for that epoch.
-    ///
-    /// The public stream id may already belong to a successor, so this never
-    /// deletes sibling epoch directories.
-    pub fn remove_stream(&self, stream: &StreamId, epoch: u64) {
-        self.shared.request_reap(stream, epoch);
+    /// Pruning holds the same stream lock as spill admission. Once pruned,
+    /// this durable rendition cannot enqueue another write behind its removal.
+    pub fn remove_rendition(&self, epoch: u64, rendition: RenditionId) {
+        let mut directories = self.shared.directories.lock();
+        if directories
+            .get_mut(&epoch)
+            .is_some_and(|ids| ids.remove(&rendition))
+        {
+            self.enqueue_removal(epoch, Some(rendition));
+        }
+    }
+
+    /// Removes only this retired epoch, after its previously admitted work.
+    pub fn remove_stream(&self, epoch: u64) {
+        if self.shared.directories.lock().remove(&epoch).is_some() {
+            self.enqueue_removal(epoch, None);
+        }
+    }
+
+    fn enqueue_removal(&self, epoch: u64, rendition: Option<RenditionId>) {
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send(DiskWork::Remove { epoch, rendition });
+        }
     }
 }
 
@@ -400,15 +423,20 @@ impl Drop for DiskShared {
     }
 }
 
-fn spill_loop(shared: &DiskShared, rx: &Receiver<SpillJob>) {
-    while let Ok(job) = rx.recv() {
+fn spill_loop(shared: &DiskShared, rx: &Receiver<DiskWork>) {
+    while let Ok(work) = rx.recv() {
+        let job = match work {
+            DiskWork::Spill(job) => job,
+            DiskWork::Remove { epoch, rendition } => {
+                shared.remove_directory(epoch, rendition);
+                continue;
+            }
+        };
         // Upgrade before any write: a retired stream's public id may already
         // belong to a new LiveStream, and those paths must not be reused.
         let live = job.live.upgrade();
         if let Some(live) = &live {
-            if shared.is_reaping(&job.stream, job.epoch) {
-                live.abort_spill(job.rendition, job.segment);
-            } else {
+            if shared.owns_directory(job.epoch, job.rendition) {
                 let measurement = shared
                     .operations
                     .start(crate::observe::Operation::DiskWrite);
@@ -419,7 +447,11 @@ fn spill_loop(shared: &DiskShared, rx: &Receiver<SpillJob>) {
                     crate::observe::OperationOutcome::Error
                 });
                 match result {
-                    Ok(outcome) => live.finish_spill(&outcome),
+                    Ok(outcome) => {
+                        if !live.finish_spill(&outcome) {
+                            forget_spilled(&outcome.objects);
+                        }
+                    }
                     Err(error) => {
                         shared.spills_failed.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
@@ -430,11 +462,10 @@ fn spill_loop(shared: &DiskShared, rx: &Receiver<SpillJob>) {
                         live.fail_spill(job.rendition, job.segment);
                     }
                 }
+            } else {
+                live.abort_spill(job.rendition, job.segment);
             }
         }
-        shared.note_finished(&job.stream, job.epoch);
-        // Only after any deferred epoch reap: a zero count must mean every
-        // effect of the job, including removing a retired epoch, is done.
         shared.pending.fetch_sub(1, Ordering::Release);
         // Release payload references before admitting more publisher bytes.
         drop(job);
@@ -448,12 +479,7 @@ fn spill_loop(shared: &DiskShared, rx: &Receiver<SpillJob>) {
 fn write_job(shared: &DiskShared, job: &SpillJob) -> Result<SpillOutcome, DiskError> {
     #[cfg(test)]
     let _gate = shared.write_gate.lock();
-    let path = shared.object_path(
-        &job.stream,
-        job.epoch,
-        job.rendition,
-        &format!("segment-{}.bin", job.segment.0),
-    )?;
+    let path = shared.segment_path(job.epoch, job.rendition, job.segment)?;
     // Sequential slices avoid allocating a second, segment-sized buffer.
     write_atomic_slices(
         &path,
@@ -510,78 +536,46 @@ fn write_job(shared: &DiskShared, job: &SpillJob) -> Result<SpillOutcome, DiskEr
 }
 
 impl DiskShared {
-    fn lock_epochs(&self) -> parking_lot::MutexGuard<'_, HashMap<(StreamId, u64), EpochJobs>> {
-        self.epochs.lock()
+    fn owns_directory(&self, epoch: u64, rendition: RenditionId) -> bool {
+        self.directories
+            .lock()
+            .get(&epoch)
+            .is_some_and(|ids| ids.contains(&rendition))
     }
 
-    fn note_enqueued(&self, stream: &StreamId, epoch: u64) {
-        self.lock_epochs()
-            .entry((stream.clone(), epoch))
-            .or_default()
-            .pending += 1;
+    // Epochs are unique within a generation. Keeping them as siblings means
+    // retiring one stream can never traverse another stream's spill files.
+    fn epoch_dir(&self, epoch: u64) -> PathBuf {
+        self.generation.join(format!("epoch-{epoch}"))
     }
 
-    fn is_reaping(&self, stream: &StreamId, epoch: u64) -> bool {
-        self.lock_epochs()
-            .get(&(stream.clone(), epoch))
-            .is_some_and(|jobs| jobs.reap)
+    fn rendition_dir(&self, epoch: u64, rendition: RenditionId) -> PathBuf {
+        self.epoch_dir(epoch)
+            .join(format!("rendition-{}", rendition.0))
     }
 
-    fn request_reap(&self, stream: &StreamId, epoch: u64) {
-        let key = (stream.clone(), epoch);
-        let mut epochs = self.lock_epochs();
-        let entry = epochs.entry(key.clone()).or_default();
-        entry.reap = true;
-        if entry.pending != 0 {
-            return;
-        }
-        epochs.remove(&key);
-        drop(epochs);
-        self.remove_epoch_dir(stream, epoch);
-    }
-
-    fn note_finished(&self, stream: &StreamId, epoch: u64) {
-        let key = (stream.clone(), epoch);
-        let mut epochs = self.lock_epochs();
-        let Some(entry) = epochs.get_mut(&key) else {
-            return;
+    fn remove_directory(&self, epoch: u64, rendition: Option<RenditionId>) {
+        #[cfg(test)]
+        let _gate = self.write_gate.lock();
+        let path = match rendition {
+            Some(rendition) => self.rendition_dir(epoch, rendition),
+            None => self.epoch_dir(epoch),
         };
-        entry.pending = entry.pending.saturating_sub(1);
-        let reap = entry.reap && entry.pending == 0;
-        if entry.pending == 0 {
-            epochs.remove(&key);
-        }
-        drop(epochs);
-        if reap {
-            self.remove_epoch_dir(stream, epoch);
-        }
+        let _ = fs::remove_dir_all(path);
     }
 
-    fn remove_epoch_dir(&self, stream: &StreamId, epoch: u64) {
-        let Ok(relative) = stream_relative(stream) else {
-            return;
-        };
-        let stream_dir = self.generation.join(relative);
-        let _ = fs::remove_dir_all(stream_dir.join(format!("epoch-{epoch}")));
-        // Leave sibling epochs (a republished stream with the same public id).
-        let _ = fs::remove_dir(&stream_dir);
-    }
-
-    fn object_path(
+    fn segment_path(
         &self,
-        stream: &StreamId,
         epoch: u64,
         rendition: RenditionId,
-        name: &str,
+        segment: SegmentId,
     ) -> Result<PathBuf, DiskError> {
-        let mut path = self.generation.join(stream_relative(stream)?);
-        path.push(format!("epoch-{epoch}"));
-        path.push(format!("rendition-{}", rendition.0));
+        let mut path = self.rendition_dir(epoch, rendition);
         fs::create_dir_all(&path).map_err(|source| DiskError::Create {
             path: path.clone(),
             source,
         })?;
-        path.push(name);
+        path.push(format!("segment-{}.bin", segment.0));
         Ok(path)
     }
 }
@@ -643,12 +637,13 @@ fn write_atomic_inner<'a>(
     Ok(())
 }
 
-pub(crate) fn forget_spilled(objects: &[SpilledObject]) {
-    for object in objects {
+fn forget_spilled(objects: &[SpilledObject]) {
+    // Every part of this job refers to a range in the same file or sidecar.
+    if let Some(object) = objects.first() {
         let _ = fs::remove_file(&*object.payload.path);
-        if let Some(gzip) = &object.gzip {
-            let _ = fs::remove_file(&*gzip.path);
-        }
+    }
+    if let Some(gzip) = objects.iter().find_map(|object| object.gzip.as_ref()) {
+        let _ = fs::remove_file(&*gzip.path);
     }
 }
 
@@ -711,26 +706,6 @@ fn reap_dead_generations(root: &Path) {
     }
 }
 
-fn stream_relative(stream: &StreamId) -> Result<PathBuf, DiskError> {
-    let mut path = PathBuf::from("streams");
-    let mut any = false;
-    for segment in stream.as_str().split('/') {
-        if !crate::delivery::filesystem::safe_component(std::ffi::OsStr::new(segment)) {
-            return Err(DiskError::UnsafeStream(stream.clone()));
-        }
-        if Path::new(segment).is_absolute() {
-            return Err(DiskError::UnsafeStream(stream.clone()));
-        }
-        path.push(segment);
-        any = true;
-    }
-    if any {
-        Ok(path)
-    } else {
-        Err(DiskError::UnsafeStream(stream.clone()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -738,25 +713,18 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::domain::{Payload, RenditionId, StreamId};
-
-    use super::{
-        super::{LiveStream, RetentionPolicy, SegmentId},
-        *,
+    use crate::{
+        delivery::hls::fixtures::stream_id,
+        domain::{Payload, RenditionId, StreamId},
     };
 
-    fn scratch(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "rushls-disk-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("scratch dir");
-        path
-    }
+    use super::{
+        super::{
+            LiveStream, RetentionPolicy, SegmentId,
+            fixtures::{close_disk, scratch_disk, wait_until},
+        },
+        *,
+    };
 
     #[cfg(unix)]
     fn fifo(root: &Path, name: &str) -> PathBuf {
@@ -770,21 +738,32 @@ mod tests {
     }
 
     fn wait_idle(tier: &DiskTier) {
-        let start = Instant::now();
-        while tier.spill_pending() != 0 {
-            assert!(
-                start.elapsed() < Duration::from_secs(2),
-                "timed out waiting for the spill worker"
-            );
-            thread::sleep(Duration::from_millis(2));
-        }
+        wait_until("the spill worker", || tier.spill_pending() == 0);
     }
 
-    fn epoch_dir(tier: &DiskTier, stream: &StreamId, epoch: u64) -> PathBuf {
-        tier.shared
-            .generation
-            .join(stream_relative(stream).expect("test stream names are safe"))
-            .join(format!("epoch-{epoch}"))
+    fn live_stream(tier: &Arc<DiskTier>) -> Arc<LiveStream> {
+        let live = Arc::new(LiveStream::new(
+            stream_id(),
+            RetentionPolicy::default(),
+            Some(Arc::clone(tier)),
+        ));
+        live.attach_handle(Arc::downgrade(&live));
+        live
+    }
+
+    fn segment_job(live: Option<&Arc<LiveStream>>) -> SpillJob {
+        SpillJob {
+            live: live.map_or_else(Weak::new, Arc::downgrade),
+            stream: stream_id(),
+            epoch: live.map_or(1, |live| live.disk_epoch()),
+            rendition: RenditionId(0),
+            segment: SegmentId(0),
+            objects: vec![SpillObject {
+                kind: SpillKind::Segment,
+                payload: Payload::from(vec![1, 2, 3]),
+                gzip: None,
+            }],
+        }
     }
 
     /// Opens a directory whose previous owner was just dropped.
@@ -834,11 +813,8 @@ mod tests {
     #[test]
     fn process_locks_reject_live_writers_and_reap_crashed_writers()
     -> Result<(), Box<dyn std::error::Error>> {
-        let root = scratch("process-ownership");
-        let limits = DiskLimits {
-            directory: root.clone(),
-            maximum_payload_bytes: 1024,
-        };
+        let limits = scratch_disk("process-ownership", 1024)?;
+        let root = &limits.directory;
         let tier = DiskTier::open(&limits)?;
         let run_child = |busy: bool| -> std::io::Result<std::process::ExitStatus> {
             let mut child = std::process::Command::new(std::env::current_exe()?);
@@ -848,7 +824,7 @@ mod tests {
                     "delivery::store::disk::tests::ownership_child",
                     "--nocapture",
                 ])
-                .env("RUSHLS_TEST_OWNER_DIRECTORY", &root);
+                .env("RUSHLS_TEST_OWNER_DIRECTORY", root);
             if busy {
                 child.env("RUSHLS_TEST_OWNER_BUSY", "1");
             } else {
@@ -859,7 +835,7 @@ mod tests {
         assert!(run_child(true)?.success());
         drop(tier);
         assert!(run_child(false)?.success());
-        let stale = fs::read_dir(&root)?
+        let stale = fs::read_dir(root)?
             .filter_map(std::result::Result::ok)
             .map(|entry| entry.path())
             .find(|path| path.join("crash-evidence").exists())
@@ -875,32 +851,29 @@ mod tests {
     }
 
     #[test]
-    fn reap_removes_a_dead_generation_and_leaves_a_live_one() {
-        let root = scratch("reap");
+    fn reap_removes_a_dead_generation_and_leaves_a_live_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = scratch_disk("reap", 1024)?;
+        let root = &limits.directory;
         let dead = root.join("dead-gen");
-        fs::create_dir_all(&dead).unwrap();
-        fs::write(dead.join("owner.lock"), "").unwrap();
-        fs::write(dead.join("orphan.bin"), b"x").unwrap();
+        fs::create_dir_all(&dead)?;
+        fs::write(dead.join("owner.lock"), "")?;
+        fs::write(dead.join("orphan.bin"), b"x")?;
 
         let peer = root.join("peer-gen");
-        fs::create_dir_all(&peer).unwrap();
+        fs::create_dir_all(&peer)?;
         let peer_owner = OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
-            .open(peer.join("owner.lock"))
-            .unwrap();
-        peer_owner.lock().unwrap();
+            .open(peer.join("owner.lock"))?;
+        peer_owner.lock()?;
 
         let unrelated = root.join("not-a-generation");
-        fs::create_dir_all(&unrelated).unwrap();
-        fs::write(unrelated.join("keep.bin"), b"x").unwrap();
+        fs::create_dir_all(&unrelated)?;
+        fs::write(unrelated.join("keep.bin"), b"x")?;
 
-        let live = DiskTier::open(&DiskLimits {
-            directory: root.clone(),
-            maximum_payload_bytes: 1024,
-        })
-        .expect("open");
+        let live = DiskTier::open(&limits)?;
 
         assert!(!dead.exists(), "an unheld owner lock permits crash cleanup");
         assert!(
@@ -918,149 +891,88 @@ mod tests {
         );
         drop(live);
         drop(peer_owner);
-        let _ = fs::remove_dir_all(root);
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
-    fn a_second_process_cannot_share_the_directory() {
-        let root = scratch("lock");
-        let live = DiskTier::open(&DiskLimits {
-            directory: root.clone(),
-            maximum_payload_bytes: 1024,
-        })
-        .expect("open");
-        let again = DiskTier::open(&DiskLimits {
-            directory: root.clone(),
-            maximum_payload_bytes: 1024,
-        });
+    fn a_second_process_cannot_share_the_directory() -> Result<(), Box<dyn std::error::Error>> {
+        let limits = scratch_disk("lock", 1024)?;
+        let live = DiskTier::open(&limits)?;
+        let again = DiskTier::open(&limits);
         assert!(
             matches!(again, Err(DiskError::InUse { .. })),
             "two nodes on one dir fail at boot rather than reap each other"
         );
         drop(live);
-        let reopened = open_after_release(&DiskLimits {
-            directory: root.clone(),
-            maximum_payload_bytes: 1024,
-        });
+        let reopened = open_after_release(&limits);
         assert!(
             reopened.is_ok(),
             "joining the worker on drop releases the directory lock: {:?}",
             reopened.as_ref().err()
         );
         drop(reopened);
-        let _ = fs::remove_dir_all(root);
+        fs::remove_dir_all(limits.directory)?;
+        Ok(())
     }
 
     #[test]
-    fn a_dead_spill_job_does_not_create_stream_files() {
-        let root = scratch("stale-job");
-        let tier = DiskTier::open(&DiskLimits {
-            directory: root.clone(),
-            maximum_payload_bytes: 1024,
-        })
-        .expect("open");
-        let enqueued = tier.try_enqueue(SpillJob {
-            live: Weak::new(),
-            stream: StreamId::new("live/camera"),
-            epoch: 1,
-            rendition: RenditionId(0),
-            segment: SegmentId(0),
-            objects: vec![SpillObject {
-                kind: SpillKind::Segment,
-                payload: Payload::from(vec![1, 2, 3]),
-                gzip: None,
-            }],
-        });
+    fn a_dead_spill_job_does_not_create_stream_files() -> Result<(), Box<dyn std::error::Error>> {
+        let limits = scratch_disk("stale-job", 1024)?;
+        let tier = DiskTier::open(&limits)?;
+        let enqueued = tier.try_enqueue(segment_job(None));
         assert!(enqueued, "the bounded queue accepts a single job");
         wait_idle(&tier);
         assert!(
-            !tier.shared.generation.join("streams").exists(),
-            "a job whose stream is gone must not write under that stream id"
+            !tier.shared.epoch_dir(1).exists(),
+            "a job whose stream is gone must not create an epoch directory"
         );
         drop(tier);
-        let _ = fs::remove_dir_all(root);
+        fs::remove_dir_all(limits.directory)?;
+        Ok(())
     }
 
     #[test]
-    fn retiring_an_epoch_waits_for_its_jobs_and_leaves_siblings() {
-        let root = scratch("reap-epoch");
-        let tier = DiskTier::open(&DiskLimits {
-            directory: root.clone(),
-            maximum_payload_bytes: 1024,
-        })
-        .expect("open");
-        let stream = StreamId::new("live/camera");
-        let live = Arc::new(LiveStream::new(
-            stream.clone(),
-            RetentionPolicy::default(),
-            Some(Arc::clone(&tier)),
-        ));
-        live.attach_handle(Arc::downgrade(&live));
+    fn retiring_an_epoch_waits_for_its_jobs_and_leaves_siblings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = scratch_disk("reap-epoch", 1024)?;
+        let tier = DiskTier::open(&limits)?;
+        let live = live_stream(&tier);
         let epoch = live.disk_epoch();
-        let sibling = epoch_dir(&tier, &stream, epoch ^ 1);
-        fs::create_dir_all(&sibling).expect("sibling epoch");
-        fs::write(sibling.join("keep.bin"), b"x").expect("marker");
+        let sibling = tier.shared.epoch_dir(epoch ^ 1);
+        fs::create_dir_all(&sibling)?;
+        fs::write(sibling.join("keep.bin"), b"x")?;
+        let retired = tier.shared.epoch_dir(epoch);
+        fs::create_dir_all(&retired)?;
+        fs::write(retired.join("retired.bin"), b"x")?;
 
-        let enqueued = tier.try_enqueue(SpillJob {
-            live: Arc::downgrade(&live),
-            stream: stream.clone(),
-            epoch,
-            rendition: RenditionId(0),
-            segment: SegmentId(0),
-            objects: vec![SpillObject {
-                kind: SpillKind::Segment,
-                payload: Payload::from(vec![1, 2, 3]),
-                gzip: None,
-            }],
-        });
+        let enqueued = tier.try_enqueue(segment_job(Some(&live)));
         assert!(enqueued, "the bounded queue accepts a single job");
-        tier.remove_stream(&stream, epoch);
-        wait_idle(&tier);
-        assert!(
-            !epoch_dir(&tier, &stream, epoch).exists(),
-            "the retired epoch is gone after its spill jobs finish"
-        );
+        tier.remove_stream(epoch);
+        wait_until("the worker removes the retired epoch", || !retired.exists());
+        assert_eq!(tier.spill_pending(), 0);
         assert!(
             sibling.join("keep.bin").exists(),
             "a successor epoch under the same stream id is left alone"
         );
         drop(live);
-        drop(tier);
-        let _ = fs::remove_dir_all(root);
+        close_disk(tier);
+        fs::remove_dir_all(limits.directory)?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn a_failed_spill_write_is_counted() {
-        let root = scratch("spill-fail");
-        let tier = DiskTier::open(&DiskLimits {
-            directory: root.clone(),
-            maximum_payload_bytes: 1024,
-        })
-        .expect("open");
-        let stream = StreamId::new("live/camera");
-        let live = Arc::new(LiveStream::new(
-            stream.clone(),
-            RetentionPolicy::default(),
-            Some(Arc::clone(&tier)),
-        ));
-        live.attach_handle(Arc::downgrade(&live));
-        let epoch = live.disk_epoch();
-        let epoch_path = epoch_dir(&tier, &stream, epoch);
-        fs::create_dir_all(epoch_path.parent().expect("epoch parent")).expect("stream dir");
-        fs::write(&epoch_path, b"not a directory").expect("block epoch path");
+    async fn a_failed_spill_write_is_counted() -> Result<(), Box<dyn std::error::Error>> {
+        let limits = scratch_disk("spill-fail", 1024)?;
+        let tier = DiskTier::open(&limits)?;
+        let live = live_stream(&tier);
+        let (publication, _) = live.attach(&crate::delivery::hls::fixtures::presentation(vec![
+            crate::delivery::hls::fixtures::video(0),
+        ]));
+        let epoch_path = tier.shared.epoch_dir(live.disk_epoch());
+        fs::write(&epoch_path, b"not a directory")?;
 
-        let enqueued = tier.try_enqueue(SpillJob {
-            live: Arc::downgrade(&live),
-            stream: stream.clone(),
-            epoch,
-            rendition: RenditionId(0),
-            segment: SegmentId(0),
-            objects: vec![SpillObject {
-                kind: SpillKind::Segment,
-                payload: Payload::from(vec![1, 2, 3]),
-                gzip: None,
-            }],
-        });
+        let enqueued = tier.try_enqueue(segment_job(Some(&live)));
         assert!(enqueued, "the bounded queue accepts a single job");
         wait_idle(&tier);
         assert_eq!(
@@ -1069,22 +981,21 @@ mod tests {
             "a write that cannot create its epoch directory is a failed spill"
         );
         assert_eq!(
-            live.ready(0).await,
+            live.ready(publication).await,
             Err(crate::delivery::store::StoreWriteError::DiskSpillFailed)
         );
         drop(live);
-        drop(tier);
-        let _ = fs::remove_dir_all(root);
+        close_disk(tier);
+        fs::remove_dir_all(limits.directory)?;
+        Ok(())
     }
 
     #[tokio::test]
     async fn disk_reads_wait_for_capacity_on_every_platform()
     -> Result<(), Box<dyn std::error::Error>> {
-        let root = scratch("portable-read-budget");
-        let tier = DiskTier::open(&DiskLimits {
-            directory: root.clone(),
-            maximum_payload_bytes: 1024,
-        })?;
+        let limits = scratch_disk("portable-read-budget", 1024)?;
+        let root = &limits.directory;
+        let tier = DiskTier::open(&limits)?;
         let path = root.join("payload.bin");
         fs::write(&path, b"payload")?;
         let held = Arc::clone(&tier.shared.read_bytes)
@@ -1113,19 +1024,44 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_failed_gzip_spill_removes_the_plain_payload_and_temporary_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = scratch_disk("gzip-fail", 1024)?;
+        let tier = DiskTier::open(&limits)?;
+        let mut job = segment_job(None);
+        job.segment = SegmentId(1);
+        job.objects[0].payload = Payload::from(vec![1; 10]);
+        job.objects[0].gzip = Some(Payload::from(vec![2; 5]));
+        let path = tier
+            .shared
+            .segment_path(job.epoch, job.rendition, job.segment)?;
+        let gzip_path = path.with_extension("bin.gz");
+        // Fail the sidecar rename after the plain payload has been written.
+        fs::create_dir(&gzip_path)?;
+        assert!(matches!(
+            write_job(&tier.shared, &job),
+            Err(DiskError::Write { .. })
+        ));
+        assert!(!path.exists());
+        assert!(!path.with_extension("tmp").exists());
+        assert!(!gzip_path.with_extension("tmp").exists());
+        drop(tier);
+        fs::remove_dir_all(limits.directory)?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn in_flight_disk_reads_wait_on_the_byte_semaphore() {
-        let root = scratch("sem");
-        let tier = DiskTier::open(&DiskLimits {
-            directory: root.clone(),
-            maximum_payload_bytes: 1024,
-        })
-        .expect("open");
+    async fn in_flight_disk_reads_wait_on_the_byte_semaphore()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = scratch_disk("sem", 1024)?;
+        let root = &limits.directory;
+        let tier = DiskTier::open(&limits)?;
 
-        let path_a = fifo(&root, "a");
-        let path_b = fifo(&root, "b");
-        let path_c = fifo(&root, "c");
+        let path_a = fifo(root, "a");
+        let path_b = fifo(root, "b");
+        let path_c = fifo(root, "c");
         let read_a = DiskRef {
             offset: 0,
             path: Arc::new(path_a.clone()),
@@ -1164,7 +1100,7 @@ mod tests {
         std::thread::spawn(move || {
             let _ = fs::write(&path_a, [0_u8; 16]);
         });
-        first.await.expect("join").expect("read a");
+        first.await??;
         assert!(
             !third.is_finished(),
             "completing one read is not enough while the second still holds permits"
@@ -1173,20 +1109,30 @@ mod tests {
             let _ = fs::write(&path_b, [0_u8; 16]);
             let _ = fs::write(&path_c, [0_u8; 16]);
         });
-        second.await.expect("join").expect("read b");
-        third.await.expect("join").expect("read c");
+        second.await??;
+        third.await??;
         drop(tier);
-        let _ = fs::remove_dir_all(root);
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
-    fn hostile_stream_names_are_refused_rather_than_escaped() {
-        for name in ["../etc", "/abs", "a//b", ""] {
-            assert!(
-                stream_relative(&StreamId::new(name)).is_err(),
-                "{name} must not become a disk path"
-            );
+    fn spill_paths_are_independent_of_public_stream_names() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let limits = scratch_disk("spill-path", 1024)?;
+        let tier = DiskTier::open(&limits)?;
+        let mut job = segment_job(None);
+        let expected = tier
+            .shared
+            .rendition_dir(job.epoch, job.rendition)
+            .join("segment-0.bin");
+        for name in ["live/camera", "../etc", "/abs", "a//b", ""] {
+            job.stream = StreamId::new(name);
+            let outcome = write_job(&tier.shared, &job)?;
+            assert_eq!(outcome.objects[0].payload.path.as_ref(), &expected);
         }
-        assert!(stream_relative(&StreamId::new("live/camera")).is_ok());
+        drop(tier);
+        fs::remove_dir_all(limits.directory)?;
+        Ok(())
     }
 }

@@ -15,7 +15,7 @@ use std::{
     num::NonZeroU64,
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -76,6 +76,8 @@ enum SpillState {
     /// Continue down to the low watermark, even after crossing below high.
     Draining,
     Failed,
+    /// No further writes may follow the epoch's queued directory removal.
+    Retired,
 }
 
 /// Protect manifest reuse during sustained DVR spilling. The extra gap below
@@ -125,7 +127,7 @@ pub struct LiveStream {
     /// Latched per *stream* rather than per publication, which is the whole
     /// point: a publisher reconnecting within the idle window resumes a stream
     /// viewers never lost, and announcing it again would say something untrue.
-    announced: AtomicBool,
+    hook_state: AtomicU8,
     telemetry: Mutex<PublicationTelemetry>,
     operations: crate::observe::OperationMeters,
     /// Lives only as long as this retained stream; arbitrary viewer paths
@@ -238,7 +240,7 @@ impl LiveStream {
             }),
             snapshot: ArcSwap::from_pointee(snapshot),
             media_revision: AtomicU64::new(0),
-            announced: AtomicBool::new(false),
+            hook_state: AtomicU8::new(0),
             telemetry: Mutex::new(PublicationTelemetry::default()),
             operations: crate::observe::OperationMeters::default(),
             http: crate::observe::http::HttpMeters::default(),
@@ -338,22 +340,36 @@ impl LiveStream {
         })
     }
 
+    /// All retained media shares this route across reconnects. Once a publisher
+    /// uses a credential in it, withhold stream subjects until retirement.
+    pub(crate) fn restrict_hooks(&self, public: bool) -> bool {
+        if !public {
+            self.hook_state.fetch_or(Self::WITHHELD, Ordering::AcqRel);
+        }
+        self.hook_state.load(Ordering::Acquire) & Self::WITHHELD == 0
+    }
+
+    const ANNOUNCED: u8 = 1;
+    const WITHHELD: u8 = 2;
+
     /// Claims the first-time transition to playable, latching it.
     ///
     /// Returns true exactly once per stream, for whoever should announce it.
     pub fn claim_availability(&self) -> bool {
         // Media writes call this for the lifetime of the stream. Once the
         // answer is known, avoid re-reading every rendition's live edge.
-        if self.announced.load(Ordering::Relaxed) {
-            return false;
-        }
-        self.is_playable() && !self.announced.swap(true, Ordering::Relaxed)
+        self.hook_state.load(Ordering::Acquire) == 0
+            && self.is_playable()
+            && self
+                .hook_state
+                .compare_exchange(0, Self::ANNOUNCED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
     }
 
     /// Whether this stream was ever announced playable, so its retirement is
     /// worth reporting. A stream that never served anything cannot stop.
     pub fn was_announced(&self) -> bool {
-        self.announced.load(Ordering::Relaxed)
+        self.hook_state.load(Ordering::Acquire) & Self::ANNOUNCED != 0
     }
 
     pub fn is_ended(&self) -> bool {
@@ -669,7 +685,7 @@ impl LiveStream {
             combinations: Arc::clone(&presentation.combinations),
             closed_captions: Arc::clone(&presentation.closed_captions),
         });
-        state.prune_retired(now, self.limits, self.disk_capacity);
+        self.prune_retired(&mut state, now);
         state.prune_publication_anchors();
         state.recalculate_retained_bytes();
         state.bump_catalog();
@@ -786,6 +802,7 @@ impl LiveStream {
         if now.saturating_duration_since(idle_since) < duration {
             return false;
         }
+        state.spill_state = SpillState::Retired;
         if state.ended {
             return true;
         }
@@ -800,11 +817,66 @@ impl LiveStream {
         true
     }
 
+    /// Retired topology has a separate count bound because empty or tiny
+    /// generations can evade the payload budget during publication churn.
+    /// Capacity pressure removes a whole ended playlist: the live three-segment
+    /// floor must not protect every historical generation indefinitely.
+    fn prune_retired(&self, state: &mut StreamState, now: Instant) -> bool {
+        const MAXIMUM_RETIRED_RENDITIONS: usize = 64;
+        let before = state.renditions.len();
+        self.prune_expired_renditions(state, now);
+        state.recalculate_retained_bytes();
+        let mut retired = state
+            .renditions
+            .iter()
+            .filter(|rendition| rendition.retired)
+            .count();
+        while retired > 0
+            && (retired > MAXIMUM_RETIRED_RENDITIONS
+                || ((self.disk_capacity == 0 || state.spill_state == SpillState::Failed)
+                    && state.retained_payload_bytes > self.limits.maximum_payload_bytes)
+                || (self.disk_capacity > 0 && state.retained_disk_bytes > self.disk_capacity)
+                || state.memory_resident_parts() > self.limits.maximum_parts
+                || state.memory_resident_segments() > self.limits.maximum_segments)
+        {
+            let index = state
+                .renditions
+                .iter()
+                .position(|rendition| rendition.retired)
+                .expect("retired count matches renditions");
+            self.remove_rendition_files(state.renditions.remove(index).rendition_id);
+            retired -= 1;
+            state.recalculate_retained_bytes();
+        }
+        let changed = state.renditions.len() != before;
+        if changed {
+            state.prune_publication_anchors();
+        }
+        changed
+    }
+
+    fn prune_expired_renditions(&self, state: &mut StreamState, now: Instant) -> bool {
+        let before = state.renditions.len();
+        for expired in state
+            .renditions
+            .extract_if(.., |rendition| rendition.retirement_expired(now))
+        {
+            self.remove_rendition_files(expired.rendition_id);
+        }
+        state.renditions.len() != before
+    }
+
+    fn remove_rendition_files(&self, rendition: RenditionId) {
+        if let Some(disk) = &self.disk {
+            disk.remove_rendition(self.disk_epoch, rendition);
+        }
+    }
+
     pub fn sweep_expired(&self) {
         let mut state = self.state.write();
         let now = Instant::now();
         let changed = state.sweep_expired(now);
-        if state.prune_retired(now, self.limits, self.disk_capacity) {
+        if self.prune_retired(&mut state, now) {
             state.bump_catalog();
             state.bump_media_catalog();
             self.commit(state, Catalog::Republished, []);
@@ -870,8 +942,17 @@ impl LiveStream {
             &media,
             PackagedMedia::Segment(_) | PackagedMedia::SegmentCompleted(_) | PackagedMedia::Gap(_)
         );
-        let dropped_for =
+        let (dropped_for, pruned_for_capacity) =
             self.reclaim_for_write(&mut state, now, additional, additional_parts, adds_segment);
+        let index = if pruned_for_capacity {
+            state
+                .renditions
+                .iter()
+                .position(|item| item.rendition_id == rendition_id)
+                .expect("validated active rendition survives retired topology pruning")
+        } else {
+            index
+        };
 
         // Reserve headroom before publishing the new media. A concurrent
         // render must not cache bytes that this write is about to displace.
@@ -890,7 +971,8 @@ impl LiveStream {
         );
         let observation = PublicationTelemetry::interval(&media);
         state.renditions[index].apply(publication, media, gzip, now, self.limits);
-        let ready = completes_media
+        let ready = (completes_media
+            && self.hook_state.load(Ordering::Acquire) & Self::WITHHELD == 0)
             .then(|| state.renditions[index].ready_segment(&self.id))
             .flatten();
         state.pending_observation = Some((rendition_id, observation));
@@ -905,7 +987,7 @@ impl LiveStream {
         );
         let update = state.renditions[index].commit(false);
         // Pruning can move Vec indices, so it belongs after the indexed write.
-        let retired_changed = state.prune_retired(now, self.limits, self.disk_capacity);
+        let retired_changed = self.prune_retired(&mut state, now) || pruned_for_capacity;
         if retired_changed {
             state.bump_media_catalog();
         }
@@ -936,7 +1018,7 @@ impl LiveStream {
         additional: usize,
         additional_parts: usize,
         adds_segment: bool,
-    ) -> Option<RetentionClipReason> {
+    ) -> (Option<RetentionClipReason>, bool) {
         // Make room rather than refuse. Every budget here bounds *retention*,
         // and the only honest way to hold a bound while media keeps arriving
         // is to drop the oldest media rather than the newest — which is what
@@ -976,7 +1058,11 @@ impl LiveStream {
             }
         };
         let mut dropped_for = None;
+        let mut pruned = false;
         if capacity_reason(state).is_some() {
+            // Release expired playlists before considering individual victims
+            // so their bytes cannot force a live sibling out of retention.
+            pruned = self.prune_expired_renditions(state, now);
             let mut reclaimed = state.sweep_expired(now);
             // Expiry may satisfy a limit. Report only the limit that still
             // requires dropping media after that ordinary cleanup.
@@ -991,7 +1077,7 @@ impl LiveStream {
                 self.advance_media_revision();
             }
         }
-        dropped_for
+        (dropped_for, pruned)
     }
 
     pub fn end(&self, publication: u64) -> bool {
@@ -1104,7 +1190,7 @@ impl LiveStream {
             self.maybe_spill();
             {
                 let state = self.state.read();
-                if state.publication != publication {
+                if state.publication != publication || state.spill_state == SpillState::Retired {
                     return Ok(());
                 }
                 if state.spill_state == SpillState::Failed {
@@ -1141,7 +1227,9 @@ impl LiveStream {
         };
         loop {
             let mut state = self.state.write();
-            if state.spill_state == SpillState::Failed || disk.queue_is_full() {
+            if matches!(state.spill_state, SpillState::Failed | SpillState::Retired)
+                || disk.queue_is_full()
+            {
                 return;
             }
             if state.retained_payload_bytes > self.spill_watermarks.high {
@@ -1211,50 +1299,57 @@ impl LiveStream {
         }
     }
 
-    pub fn finish_spill(&self, outcome: &SpillOutcome) {
+    /// Returns whether this stream still owns the completed files.
+    pub fn finish_spill(&self, outcome: &SpillOutcome) -> bool {
         let clip = {
             let mut state = self.state.write();
-            let applied = state
+            let Some(rendition) = state
                 .renditions
                 .iter_mut()
                 .find(|item| item.rendition_id == outcome.rendition)
-                .is_some_and(|rendition| rendition.finish_spill(outcome));
-            if applied {
-                if let Some(rendition) = state
-                    .renditions
-                    .iter_mut()
-                    .find(|item| item.rendition_id == outcome.rendition)
-                {
-                    rendition.publish_snapshot();
-                }
-                state.recalculate_retained_bytes();
-                // Spills enqueued before the disk counter caught up can land over
-                // cap; treat that as the same full-disk backpressure as a write.
-                let mut shed = false;
-                while self.disk_capacity > 0
-                    && state.retained_disk_bytes > self.disk_capacity
-                    && state.shed_oldest()
-                {
-                    shed = true;
-                }
-                // Moving identical bytes to disk does not change a manifest.
-                // Invalidating here would re-render every live playlist for
-                // each spill completion, even with protected cache capacity.
-                if shed {
-                    self.advance_media_revision();
-                }
-                self.take_clip_event(&mut state, shed.then_some(RetentionClipReason::Disk))
-            } else {
-                super::disk::forget_spilled(&outcome.objects);
-                None
+            else {
+                return false;
+            };
+            if !rendition.finish_spill(outcome) {
+                return false;
             }
+            rendition.publish_snapshot();
+            state.recalculate_retained_bytes();
+            // Spills enqueued before the disk counter caught up can land over
+            // cap; treat that as the same full-disk backpressure as a write.
+            let mut shed = false;
+            while self.disk_capacity > 0
+                && state.retained_disk_bytes > self.disk_capacity
+                && state.shed_oldest()
+            {
+                shed = true;
+            }
+            // Moving identical bytes to disk does not change a manifest.
+            // Invalidating here would re-render every live playlist for
+            // each spill completion, even with protected cache capacity.
+            if shed {
+                self.advance_media_revision();
+            }
+            self.take_clip_event(&mut state, shed.then_some(RetentionClipReason::Disk))
         };
         self.emit_clip(clip);
+        true
     }
 
     pub fn fail_spill(&self, rendition: RenditionId, segment: SegmentId) {
-        self.abort_spill(rendition, segment);
-        self.state.write().spill_state = SpillState::Failed;
+        let mut state = self.state.write();
+        let Some(owner) = state
+            .renditions
+            .iter_mut()
+            .find(|item| item.rendition_id == rendition)
+        else {
+            // The retired rendition's write cannot backpressure a live sibling.
+            return;
+        };
+        owner.abort_spill(segment);
+        if state.spill_state != SpillState::Retired {
+            state.spill_state = SpillState::Failed;
+        }
     }
 
     pub fn abort_spill(&self, rendition: RenditionId, segment: SegmentId) {
@@ -1303,6 +1398,11 @@ impl StreamState {
     fn sweep_expired(&mut self, now: Instant) -> bool {
         let mut changed = false;
         for rendition in &mut self.renditions {
+            // Pruning this entire directory follows in the same mutation. Skip
+            // per-segment file releases under the stream lock at that deadline.
+            if rendition.retirement_expired(now) {
+                continue;
+            }
             let before = rendition.retained_object_counts();
             rendition.sweep_expired(now);
             rendition.forget_unreachable_initializations();
@@ -1313,50 +1413,6 @@ impl StreamState {
         }
         self.prune_publication_anchors();
         self.recalculate_retained_bytes();
-        changed
-    }
-
-    /// Retired topology has a separate count bound because empty or tiny
-    /// generations can evade the payload budget during publication churn.
-    /// Capacity pressure removes a whole ended playlist: the live three-segment
-    /// floor must not protect every historical generation indefinitely.
-    fn prune_retired(
-        &mut self,
-        now: Instant,
-        limits: RetentionPolicy,
-        disk_capacity: usize,
-    ) -> bool {
-        const MAXIMUM_RETIRED_RENDITIONS: usize = 64;
-        let before = self.renditions.len();
-        self.renditions
-            .retain(|rendition| !rendition.retirement_expired(now));
-        self.recalculate_retained_bytes();
-        let mut retired = self
-            .renditions
-            .iter()
-            .filter(|rendition| rendition.retired)
-            .count();
-        while retired > 0
-            && (retired > MAXIMUM_RETIRED_RENDITIONS
-                || ((disk_capacity == 0 || self.spill_state == SpillState::Failed)
-                    && self.retained_payload_bytes > limits.maximum_payload_bytes)
-                || (disk_capacity > 0 && self.retained_disk_bytes > disk_capacity)
-                || self.memory_resident_parts() > limits.maximum_parts
-                || self.memory_resident_segments() > limits.maximum_segments)
-        {
-            let index = self
-                .renditions
-                .iter()
-                .position(|rendition| rendition.retired)
-                .expect("retired count matches renditions");
-            self.renditions.remove(index);
-            retired -= 1;
-            self.recalculate_retained_bytes();
-        }
-        let changed = self.renditions.len() != before;
-        if changed {
-            self.prune_publication_anchors();
-        }
         changed
     }
 

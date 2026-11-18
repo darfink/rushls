@@ -167,20 +167,38 @@ pub async fn run_session(
     let SessionAdmission {
         source,
         grant,
-        publisher,
+        mut publisher,
     } = admitted??;
     services.meters.session_started();
 
-    let stop = StopToken::new();
-    let registration = services.sessions.register(&grant, meters, stop.clone())?;
-    let context = registration.context(&services.events, stop);
+    let registration = services.sessions.register(
+        &grant,
+        meters,
+        services.publishers.store(),
+        publisher.public_stream,
+    )?;
+    let public_stream = registration.shared().public_stream;
+    publisher.public_stream = public_stream;
+    let context = registration.context(&services.events);
     context.emit(SessionEvent::Accepted {
         stream: grant.stream_id.clone(),
         principal: grant.principal.to_string(),
         publisher,
     });
 
-    let result = pipeline(&context, source, &grant, services, config).await;
+    let startup = prepare(&context, source, &grant, services, config, public_stream);
+    // Cancelling startup drops discovery or preroll immediately. The store also
+    // checks the stop token under its lease lock for a takeover racing a poll.
+    let result = tokio::select! {
+        biased;
+        reason = context.stop().stopped() => Ok(supervise::finish_stopped(&context, reason)),
+        prepared = startup => match (prepared, context.stop().reason()) {
+            (Ok(live), _) => run_live(live, &context, services, config.supervision).await,
+            (Err(SessionError::Delivery(HlsError::Superseded)), Some(reason)) =>
+                Ok(supervise::finish_stopped(&context, reason)),
+            (Err(error), _) => Err(error),
+        }
+    };
     report(&context, services, &result);
     result
 }
@@ -228,11 +246,7 @@ async fn admit(
         });
     }
 
-    let publisher = crate::domain::PublisherContext {
-        protocol: request.protocol,
-        resource: request.resource,
-        client: request.client,
-    };
+    let publisher = request.into_publisher_context(&grant);
     let AcceptedPublish { source, grant } = pending.accept(grant, meters.source_view()).await?;
     Ok(SessionAdmission {
         source,
@@ -242,33 +256,14 @@ async fn admit(
 }
 
 /// The stages an admitted publication passes through.
-fn start_normalization(
-    context: &SessionContext,
-    presentation: &crate::media::PresentationPlan,
-    grant: &PublishGrant,
-    services: &Services,
-) -> Result<crate::media::StartedNormalizer, SessionError> {
-    context.enter(Phase::Calibrating);
-    let timeline = media::calibrate(presentation)?;
-    context.emit(SessionEvent::TimelineCalibrated {
-        authority: timeline.timing_authority,
-    });
-    let normalized =
-        services
-            .normalizers
-            .start(presentation, &timeline, grant.policy.input_mode)?;
-    record_track_timing(context, &normalized.presentation, &normalized.timeline);
-
-    Ok(normalized)
-}
-
-async fn pipeline(
+async fn prepare(
     context: &SessionContext,
     mut source: Box<dyn PacketSource>,
     grant: &PublishGrant,
     services: &Services,
     config: &SessionConfig,
-) -> Result<SessionOutcome, SessionError> {
+    public_stream: bool,
+) -> Result<LiveSession, SessionError> {
     context.enter(Phase::Discovering);
     // Enforced from out here as well as passed in: a source that hangs while
     // probing cannot be relied upon to honour its own limit.
@@ -288,7 +283,14 @@ async fn pipeline(
         counts: presentation.counts(),
     });
 
-    let normalized = start_normalization(context, &presentation, grant, services)?;
+    context.enter(Phase::Calibrating);
+    let timeline = media::calibrate(&presentation)?;
+    context.emit(SessionEvent::TimelineCalibrated {
+        authority: timeline.timing_authority,
+    });
+    let normalized =
+        services.start_normalizer(&presentation, &timeline, grant.policy.input_mode)?;
+    record_track_timing(context, &normalized.presentation, &normalized.timeline);
     let presentation = normalized.presentation;
     let timeline = normalized.timeline;
 
@@ -330,7 +332,7 @@ async fn pipeline(
         &preroll.buffered,
         context.meters().media_view(),
     )?;
-    let started = services.muxers.start(crate::mux::MuxerStartRequest {
+    let started = services.start_muxer(crate::mux::MuxerStartRequest {
         presentation: &presentation,
         segmentation: &preroll.segmentation,
         // One origin is captured for the complete muxer publication. The CMAF
@@ -340,23 +342,15 @@ async fn pipeline(
         events: context.events(),
         budget: context.meters().budget(),
     })?;
-    context.emit(SessionEvent::SegmentationContract {
-        desired_segment: config.segmentation.desired_segment_duration,
-        desired_part: config.segmentation.desired_part_duration,
-        selected_segment: preroll.segmentation.longest_segment_duration(),
-        selected_part: preroll
-            .segmentation
-            .iter()
-            .map(|track| track.timebase.ticks_to_duration(track.part_duration.get()))
-            .max()
-            .unwrap_or_default(),
-        maximum_segment: config.segmentation.maximum_segment_duration,
-        maximum_part: config.segmentation.maximum_part_duration,
-        jitter: config.segmentation.late_boundary,
-    });
-    let publisher = services
-        .publishers
-        .start(context.stream(), Arc::clone(&started.presentation))?;
+    report_segmentation(context, &preroll.segmentation, config.segmentation);
+    let permission = crate::delivery::store::PublicationPermit {
+        public_stream,
+        is_current: &|| context.stop().reason().is_none(),
+    };
+    let publisher =
+        services
+            .publishers
+            .start_if_current(context.stream(), started.presentation, permission)?;
     let tail = MediaTail::new(
         started.muxer,
         publisher,
@@ -365,10 +359,24 @@ async fn pipeline(
     )
     .with_input_mode(grant.policy.input_mode);
 
+    Ok(LiveSession::new(
+        head,
+        tail,
+        pacer,
+        preroll.buffered,
+        preroll.input_state,
+    ))
+}
+
+async fn run_live(
+    mut live: LiveSession,
+    context: &SessionContext,
+    services: &Services,
+    policy: SupervisionPolicy,
+) -> Result<SessionOutcome, SessionError> {
     context.enter(Phase::Running);
     context.emit(SessionEvent::Running);
-    let mut live = LiveSession::new(head, tail, pacer, preroll.buffered, preroll.input_state);
-    let supervised = supervise(&mut live, context, config.supervision).await;
+    let supervised = supervise(&mut live, context, policy).await;
 
     // A real failure decides the session's fate before the drain gets a say:
     // draining a broken pipeline is best-effort by definition, and letting it
@@ -408,6 +416,26 @@ fn finish_live(
         }
     }
     Ok(())
+}
+
+fn report_segmentation(
+    context: &SessionContext,
+    plan: &segment::SegmentationPlan,
+    policy: segment::SegmentationPolicy,
+) {
+    context.emit(SessionEvent::SegmentationContract {
+        desired_segment: policy.desired_segment_duration,
+        desired_part: policy.desired_part_duration,
+        selected_segment: plan.longest_segment_duration(),
+        selected_part: plan
+            .iter()
+            .map(|track| track.timebase.ticks_to_duration(track.part_duration.get()))
+            .max()
+            .unwrap_or_default(),
+        maximum_segment: policy.maximum_segment_duration,
+        maximum_part: policy.maximum_part_duration,
+        jitter: policy.late_boundary,
+    });
 }
 
 fn record_track_timing(

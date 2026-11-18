@@ -15,7 +15,10 @@ use derive_more::Display;
 use urlencoding::{Encoded, decode};
 
 use crate::{
-    delivery::store::{InitializationId, PartId, SegmentId},
+    delivery::{
+        hls::uri as hls,
+        store::{InitializationId, PartId, SegmentId},
+    },
     domain::{MediaKind, RenditionId, StreamId},
     mux::MediaSegmentFormat,
 };
@@ -272,52 +275,85 @@ pub enum ResourcePathError {
     InvalidIdentifier,
 }
 
+/// The viewer namespace resolved once for authorization, attribution and delivery.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MediaResourcePath {
+pub struct ViewerPath {
     pub stream: StreamId,
-    pub resource: MediaResource,
+    pub resource: ViewerResource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ViewerResource {
+    Media(MediaResource),
+    Hls(hls::Resource),
 }
 
 const MAXIMUM_PATH_BYTES: usize = 2_048;
 const MAXIMUM_PATH_SEGMENTS: usize = 32;
 
-/// Resolves a shared media path, leaving manifest paths to their adapter.
-pub fn parse_media_path(path: &str) -> Result<Option<MediaResourcePath>, ResourcePathError> {
-    let segment_count = validate_path(path)?;
-    let mut tail = path.split('/').filter(|segment| !segment.is_empty()).rev();
-    let Some(name) = tail.next() else {
-        return Ok(None);
-    };
-    let Some(directory) = tail.next() else {
-        return Ok(None);
-    };
-    if !matches!(
-        directory,
-        INITIALIZATION_DIRECTORY | SEGMENT_DIRECTORY | PART_DIRECTORY
-    ) {
-        return Ok(None);
+impl ViewerPath {
+    pub fn parse(path: &str) -> Result<Self, ResourcePathError> {
+        if path.len() > MAXIMUM_PATH_BYTES {
+            return Err(ResourcePathError::Unrecognized);
+        }
+        // Bound the component list without allocating. Empty components have
+        // always been ignored, including a trailing slash after the leaf.
+        let mut segments = [""; MAXIMUM_PATH_SEGMENTS];
+        let mut count = 0;
+        for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+            if matches!(segment, "." | "..") {
+                return Err(ResourcePathError::Unrecognized);
+            }
+            *segments
+                .get_mut(count)
+                .ok_or(ResourcePathError::Unrecognized)? = segment;
+            count += 1;
+        }
+        let [prefix @ .., name] = &segments[..count] else {
+            return Err(ResourcePathError::Unrecognized);
+        };
+        let (identifier, extension) = name
+            .rsplit_once('.')
+            .ok_or(ResourcePathError::Unrecognized)?;
+
+        // Select the namespace by the leaf. A stream component named
+        // `segment`, `part` or `init` can still lead to an HLS manifest.
+        let (stream, resource) = if extension == hls::PLAYLIST_EXTENSION {
+            let (stream, resource) = hls::parse_manifest(prefix, name)?;
+            (stream, ViewerResource::Hls(resource))
+        } else {
+            let [stream @ .., rendition, directory] = prefix else {
+                return Err(ResourcePathError::Unrecognized);
+            };
+            let resource = parse_media_leaf(rendition, directory, identifier, extension)?;
+            (stream, ViewerResource::Media(resource))
+        };
+        Ok(Self {
+            stream: parse_stream(stream)?,
+            resource,
+        })
     }
-    let rendition = tail.next().ok_or(ResourcePathError::Unrecognized)?;
-    let (identifier, extension) = name
-        .rsplit_once('.')
-        .ok_or(ResourcePathError::Unrecognized)?;
+}
+
+fn parse_media_leaf(
+    rendition: &str,
+    directory: &str,
+    identifier: &str,
+    extension: &str,
+) -> Result<MediaResource, ResourcePathError> {
     let format = spelled_by(directory, extension).ok_or(ResourcePathError::Unrecognized)?;
     let rendition = parse_rendition(rendition)?;
     let identifier = identifier
         .parse::<u64>()
         .map_err(|_| ResourcePathError::InvalidIdentifier)?;
-    let resource = match directory {
+    Ok(match directory {
         INITIALIZATION_DIRECTORY => {
             MediaResource::Initialization(rendition, InitializationId(identifier), format)
         }
         SEGMENT_DIRECTORY => MediaResource::Segment(rendition, SegmentId(identifier), format),
         PART_DIRECTORY => MediaResource::Part(rendition, PartId(identifier), format),
-        _ => unreachable!("the directory was matched above"),
-    };
-    Ok(Some(MediaResourcePath {
-        stream: parse_stream(path, segment_count - 3)?,
-        resource,
-    }))
+        _ => unreachable!("the directory has a packaging spelling"),
+    })
 }
 
 fn spelled_by(directory: &str, extension: &str) -> Option<MediaSegmentFormat> {
@@ -333,40 +369,19 @@ fn spelled_by(directory: &str, extension: &str) -> Option<MediaSegmentFormat> {
     })
 }
 
-fn parse_rendition(value: &str) -> Result<RenditionId, ResourcePathError> {
+pub(in crate::delivery) fn parse_rendition(value: &str) -> Result<RenditionId, ResourcePathError> {
     value
         .parse()
         .map(RenditionId)
         .map_err(|_| ResourcePathError::InvalidIdentifier)
 }
 
-pub(crate) fn validate_path(path: &str) -> Result<usize, ResourcePathError> {
-    if path.len() > MAXIMUM_PATH_BYTES {
+fn parse_stream(segments: &[&str]) -> Result<StreamId, ResourcePathError> {
+    if segments.is_empty() {
         return Err(ResourcePathError::Unrecognized);
     }
-    let mut count = 0;
-    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
-        count += 1;
-        if count > MAXIMUM_PATH_SEGMENTS || matches!(segment, "." | "..") {
-            return Err(ResourcePathError::Unrecognized);
-        }
-    }
-    Ok(count)
-}
-
-pub(crate) fn parse_stream(
-    path: &str,
-    stream_segments: usize,
-) -> Result<StreamId, ResourcePathError> {
-    if stream_segments == 0 {
-        return Err(ResourcePathError::Unrecognized);
-    }
-    let mut stream = String::with_capacity(path.len());
-    for segment in path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .take(stream_segments)
-    {
+    let mut stream = String::new();
+    for segment in segments {
         if !stream.is_empty() {
             stream.push('/');
         }
@@ -422,17 +437,29 @@ mod tests {
     #[test]
     fn shared_media_is_parsed_from_the_right() {
         assert_eq!(
-            parse_media_path("/live/camera/3/segment/7.m4s"),
-            Ok(Some(MediaResourcePath {
+            ViewerPath::parse("/live/camera/3/segment/7.m4s"),
+            Ok(ViewerPath {
                 stream: StreamId::new("live/camera"),
-                resource: MediaResource::Segment(
+                resource: ViewerResource::Media(MediaResource::Segment(
                     RenditionId(3),
                     SegmentId(7),
                     MediaSegmentFormat::Cmaf,
-                ),
-            }))
+                )),
+            })
         );
-        assert_eq!(parse_media_path("/live/camera/index.m3u8"), Ok(None));
+    }
+
+    #[test]
+    fn manifest_stream_names_can_overlap_media_directories() -> Result<(), ResourcePathError> {
+        for name in ["init", "part", "segment"] {
+            let parsed = ViewerPath::parse(&format!("/live/{name}/index.m3u8"))?;
+            assert_eq!(parsed.stream.as_str(), format!("live/{name}"));
+            assert_eq!(
+                parsed.resource,
+                ViewerResource::Hls(hls::Resource::Multivariant)
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -536,17 +563,57 @@ mod tests {
     }
 
     #[test]
+    fn only_the_stream_prefix_is_decoded_once() -> Result<(), ResourcePathError> {
+        for leaf in ["index.m3u8", "0/segment/1.m4s"] {
+            let encoded = format!("/live//a%252Fb/%E2%98%83/{leaf}/");
+            assert_eq!(ViewerPath::parse(&encoded)?.stream.as_str(), "live/a%2Fb/☃");
+        }
+        for path in [
+            "/live/camera/%30/video.m3u8",
+            "/live/camera/0/%73egment/1.m4s",
+            "/live/camera/0/segment/%31.m4s",
+            "/live/camera/index%2em3u8",
+        ] {
+            assert!(ViewerPath::parse(path).is_err(), "{path}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn viewer_paths_keep_their_size_and_component_limits() {
+        let components = format!("/{}index.m3u8", "a/".repeat(MAXIMUM_PATH_SEGMENTS - 1));
+        let bytes = format!(
+            "/{}/index.m3u8",
+            "a".repeat(MAXIMUM_PATH_BYTES - "/".len() - "/index.m3u8".len())
+        );
+        for valid in [&components, &bytes] {
+            assert!(ViewerPath::parse(valid).is_ok());
+        }
+        for invalid in [
+            format!("/a{components}"),
+            format!("/{bytes}"),
+            "/live/./camera/index.m3u8".into(),
+            "/live/../camera/0/segment/1.m4s".into(),
+        ] {
+            assert_eq!(
+                ViewerPath::parse(&invalid),
+                Err(ResourcePathError::Unrecognized)
+            );
+        }
+    }
+
+    #[test]
     fn malformed_shared_paths_are_rejected() {
         assert_eq!(
-            parse_media_path("/live/camera/0/segment/nope.m4s"),
+            ViewerPath::parse("/live/camera/0/segment/nope.m4s"),
             Err(ResourcePathError::InvalidIdentifier)
         );
         assert_eq!(
-            parse_media_path("/live/camera/0/init/1.ts"),
+            ViewerPath::parse("/live/camera/0/init/1.ts"),
             Err(ResourcePathError::Unrecognized)
         );
         assert_eq!(
-            parse_media_path("/live/%zz/0/segment/1.m4s"),
+            ViewerPath::parse("/live/%zz/0/segment/1.m4s"),
             Err(ResourcePathError::Unrecognized)
         );
     }
@@ -556,9 +623,7 @@ mod tests {
         let mut state = 0x8d5e_3d8b_2c1a_4f6f_u64;
         for _ in 0..4_000 {
             let path = crate::test_fuzz::string(&mut state, 64);
-            // Whatever the answer, the parser must answer: valid, invalid, or
-            // "not mine" — never a panic.
-            let _ = parse_media_path(&path);
+            let _ = ViewerPath::parse(&path);
         }
     }
 }

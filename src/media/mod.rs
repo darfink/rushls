@@ -26,10 +26,7 @@ pub mod fixtures;
 
 pub use captions::{CaptionReconciliation, CaptionVerifier};
 pub use density::{MediaDensityError, MediaDensityWindow};
-pub use normalize::{
-    MediaNormalizer, NormalizeError, NormalizerFactory, PassThroughNormalizerFactory,
-    StartedNormalizer,
-};
+pub use normalize::{MediaNormalizer, NormalizeError, StartedNormalizer, start_normalizer};
 pub use pacer::{MediaPacer, PacingError};
 pub use sample::{AudioSample, MissingInterval, NormalizedMedia, SubtitleSample, VideoSample};
 pub use stream::{MediaError, SampleSource};

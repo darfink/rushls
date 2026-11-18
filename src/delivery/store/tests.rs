@@ -1,10 +1,17 @@
 use std::{
+    ops::Range,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
 use crate::{
-    delivery::{Origin, uri::MediaResource},
+    delivery::{
+        Origin,
+        hls::fixtures::{
+            direct_segment, initialization, six_second_start, stream_id as stream, write,
+        },
+        uri::MediaResource,
+    },
     domain::{
         MediaKind, Payload, RenditionId, SessionId, StreamId, Timebase, fixtures::TrackBuilder,
     },
@@ -13,12 +20,15 @@ use crate::{
         InitializationSegment, MediaSegmentFormat, PackagedChunk, PackagedMedia,
         PackagedPresentation, PackagedRendition, PackagedSegment, PackagedSegmentCompletion,
         PackagingRenditionId, PackagingSegmentId, RenditionConfig, RenditionKey,
-        fixtures::{RenditionBuilder, config, presentation_at},
+        fixtures::{RenditionBuilder, config, config_with_maximum, presentation_at},
     },
     observe::{EventObserver, Events, RetentionClipReason, SessionEvent, StreamEvent},
 };
 
-use super::*;
+use super::{
+    fixtures::{limits, remove_disk, scratch_disk, spill_limits, wait_until},
+    *,
+};
 
 /// A one-tick timebase, so a test can say "six seconds" as `6`.
 ///
@@ -27,26 +37,6 @@ use super::*;
 /// dividing by ninety thousand.
 fn timebase() -> Timebase {
     Timebase::new(nz::u32!(1), nz::u32!(1))
-}
-
-fn stream() -> StreamId {
-    StreamId::new("live/camera")
-}
-
-fn limits() -> StoreLimits {
-    StoreLimits {
-        maximum_streams: 8,
-        independent_segments: false,
-        memory: None,
-        retention: RetentionPolicy {
-            // Six six-second segments. Pinned rather than taken from the
-            // default so these fixtures describe a window of a known size,
-            // independent of whatever `retain` a shipped file chooses.
-            retain: Duration::from_secs(36).into(),
-            ..RetentionPolicy::default()
-        },
-        disk: None,
-    }
 }
 
 fn store() -> StreamStore {
@@ -108,16 +98,7 @@ fn presentation_with(
     rendition_config: RenditionConfig,
     time_anchor: SystemTime,
 ) -> Arc<PackagedPresentation> {
-    let input = validated(vec![
-        TrackBuilder::new(0, MediaKind::Video)
-            .timebase(rendition_config.timebase)
-            .build(),
-    ]);
-    let rendition = RenditionBuilder::new(local_id, MediaKind::Video)
-        .key(key)
-        .config(rendition_config)
-        .build();
-    Arc::new(presentation_at(time_anchor, &input, vec![rendition]))
+    presentation_with_all(&[(local_id, key, rendition_config)], time_anchor)
 }
 
 /// Several renditions in one publication, each with its own cadence.
@@ -149,14 +130,6 @@ fn presentation_with_all(
 /// step `EXT-X-TARGETDURATION` rounding turns on.
 fn milliseconds() -> Timebase {
     Timebase::new(nz::u32!(1), nz::u32!(1_000))
-}
-
-fn initialization(rendition: u32, byte: u8) -> PackagedMedia {
-    PackagedMedia::Initialization(InitializationSegment {
-        rendition_id: PackagingRenditionId(rendition),
-        version: u64::from(byte),
-        payload: Payload::from(vec![byte]),
-    })
 }
 
 fn chunk(
@@ -191,21 +164,36 @@ fn completion(rendition: u32, segment: u64, start: i64, duration: u64) -> Packag
     })
 }
 
-fn direct(rendition: u32, segment: u64, start: i64, duration: u64, bytes: usize) -> PackagedMedia {
-    PackagedMedia::Segment(PackagedSegment {
-        rendition_id: PackagingRenditionId(rendition),
-        packaging_segment_id: PackagingSegmentId(segment),
-        media_start: start,
+fn gap(media_start: i64, duration: u64, parts: Vec<u64>) -> PackagedMedia {
+    PackagedMedia::Gap(crate::mux::PackagedGap {
+        rendition_id: PackagingRenditionId(0),
+        packaging_segment_id: PackagingSegmentId(1),
+        media_start,
         duration,
-        independent: true,
-        // Fill pattern is opaque to the store; only length matters for bitrate.
-        // Use the low byte so long-running tests can keep monotonic packaging ids.
-        payload: Payload::from(vec![segment.to_le_bytes()[0]; bytes]),
+        parts,
     })
 }
 
-fn write(lease: &StreamLease, media: PackagedMedia) {
-    assert_eq!(lease.write(media), Ok(true));
+fn direct(rendition: u32, segment: u64, start: i64, duration: u64, bytes: usize) -> PackagedMedia {
+    // Fill pattern is opaque to the store; only length matters for bitrate.
+    // Use the low byte so long-running tests can keep monotonic packaging ids.
+    direct_segment(
+        rendition,
+        segment,
+        start,
+        duration,
+        Payload::from(vec![segment.to_le_bytes()[0]; bytes]),
+    )
+}
+
+fn six_second_segment(id: u64, bytes: usize) -> PackagedMedia {
+    direct(0, id, six_second_start(id), 6, bytes)
+}
+
+fn write_direct_history(lease: &StreamLease, ids: Range<u64>, bytes: usize) {
+    for id in ids {
+        write(lease, six_second_segment(id, bytes));
+    }
 }
 
 #[derive(Clone, Default)]
@@ -262,6 +250,30 @@ fn configure(lease: &StreamLease, rendition: u32, chunked: bool) {
     write(lease, initialization(rendition, 1));
 }
 
+fn initialized_lease(store: &StreamStore, chunked: bool) -> StreamLease {
+    let lease = lease(store, &[(0, chunked)]);
+    configure(&lease, 0, chunked);
+    lease
+}
+
+fn keyed_lease(store: &StreamStore, key: &str, chunked: bool) -> Result<StreamLease, StoreFull> {
+    store.lease(
+        stream(),
+        &keyed_presentation(0, key, chunked, SystemTime::UNIX_EPOCH),
+    )
+}
+
+fn publish_keyed_segment(
+    store: &StreamStore,
+    key: &str,
+    version: u8,
+) -> Result<StreamLease, StoreFull> {
+    let lease = keyed_lease(store, key, false)?;
+    write(&lease, initialization(0, version));
+    write(&lease, six_second_segment(0, 1));
+    Ok(lease)
+}
+
 #[test]
 fn new_streams_commit_their_budget_against_the_node_total() {
     let ledger = crate::domain::MemoryLedger::new(250);
@@ -299,32 +311,46 @@ fn new_streams_commit_their_budget_against_the_node_total() {
 }
 
 #[test]
-fn a_retain_below_the_protocol_floor_is_raised_to_it() {
-    let mut limits = limits();
-    // Nine seconds against six-second segments is one and a half targets,
-    // below the three a live playlist must carry. It is raised rather than
-    // refused, so the window holds three segments and not one.
-    limits.retention.retain = Duration::from_secs(9).into();
-    let store = StreamStore::new(limits);
-    let lease = lease(&store, &[(0, false)]);
-    configure(&lease, 0, false);
+fn a_retain_below_the_protocol_floor_is_raised_to_the_advertised_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let six = config(timebase(), 6, None);
+    let twelve = config_with_maximum(timebase(), 6, 12, None);
+    let solo = [(0, "camera", six)];
+    let wider = [(0, "camera", twelve)];
+    let shared = [(0, "camera", six), (1, "sibling", twelve)];
 
-    for id in 0..3 {
-        write(
-            &lease,
-            direct(
-                0,
-                id,
-                i64::try_from(id).expect("fixture id fits i64") * 6,
-                6,
-                1,
-            ),
-        );
+    // Nine seconds against six-second segments is one and a half targets.
+    // The floor is three targets, including when a sibling sets a wider target.
+    for (renditions, retain, published, target) in [
+        (solo.as_slice(), 9, 3, 6),
+        (wider.as_slice(), 1, 12, 12),
+        (shared.as_slice(), 1, 12, 12),
+    ] {
+        for capacity_pressure in [false, true] {
+            let mut settings = limits();
+            settings.retention.retain = Duration::from_secs(retain).into();
+            if capacity_pressure {
+                settings.retention.maximum_segments = 3;
+                settings.retention.maximum_payload_bytes = 4;
+            }
+            let store = StreamStore::new(settings);
+            let presentation = presentation_with_all(renditions, SystemTime::UNIX_EPOCH);
+            let lease = store.lease(stream(), &presentation)?;
+            write(&lease, initialization(0, 1));
+            write_direct_history(&lease, 0..published, 1);
+
+            let snapshot = lease.live().rendition(RenditionId(0)).ok_or("rendition")?;
+            let visible = target * 3 / 6;
+            assert_eq!(snapshot.contract.target_duration.get(), target);
+            assert_eq!(snapshot.segments.len(), usize::try_from(visible)?);
+            assert_eq!(snapshot.segments[0].msn, Msn(published - visible + 1));
+            assert_eq!(
+                lease.live().retention_depth().held,
+                Duration::from_secs(target * 3)
+            );
+        }
     }
-
-    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
-    assert_eq!(snapshot.segments.len(), 3);
-    assert_eq!(snapshot.segments[0].msn, Msn(1));
+    Ok(())
 }
 
 #[test]
@@ -878,8 +904,7 @@ fn rendition_start_offsets_are_preserved_without_cross_track_rejection() {
 #[tokio::test(start_paused = true)]
 async fn part_tags_and_resources_have_distinct_retention_deadlines() {
     let store = store();
-    let lease = lease(&store, &[(0, true)]);
-    configure(&lease, 0, true);
+    let lease = initialized_lease(&store, true);
     write(&lease, chunk(0, 0, 0, 0, 1, 1));
     write(&lease, completion(0, 0, 0, 1));
     let part_id = PartId(1);
@@ -888,11 +913,7 @@ async fn part_tags_and_resources_have_distinct_retention_deadlines() {
     // advancing the live edge by a whole segment means publishing the parts
     // that actually compose one.
     for id in 1..=4 {
-        let start = 1 + (i64::try_from(id).expect("fixture id fits i64") - 1) * 6;
-        for index in 0..6 {
-            write(&lease, chunk(0, id, index, start + i64::from(index), 1, 1));
-        }
-        write(&lease, completion(0, id, start, 6));
+        write_segment(&lease, 0, id, 1 + six_second_start(id - 1));
     }
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
     assert!(
@@ -910,10 +931,9 @@ async fn longer_part_fetch_grace_covers_delayed_readers_without_extending_tags()
     let mut limits = limits();
     limits.retention.part_fetch_grace_period = Duration::from_secs(60).into();
     let store = StreamStore::new(limits);
-    let lease = lease(&store, &[(0, true)]);
-    configure(&lease, 0, true);
+    let lease = initialized_lease(&store, true);
     for segment in 0..6 {
-        write_segment(&lease, 0, segment, i64::try_from(segment).unwrap() * 6);
+        write_segment(&lease, 0, segment, six_second_start(segment));
     }
     let first = PartId(1);
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
@@ -932,16 +952,10 @@ async fn longer_part_fetch_grace_covers_delayed_readers_without_extending_tags()
 #[test]
 fn part_tag_retention_never_exposes_only_a_parent_segment_suffix() {
     let store = store();
-    let lease = lease(&store, &[(0, true)]);
-    configure(&lease, 0, true);
+    let lease = initialized_lease(&store, true);
 
     for id in 0..3 {
-        write_segment(
-            &lease,
-            0,
-            id,
-            i64::try_from(id).expect("fixture id fits i64") * 6,
-        );
+        write_segment(&lease, 0, id, six_second_start(id));
     }
 
     // At 21 seconds the first parts of segment zero are individually older
@@ -980,19 +994,9 @@ async fn removed_segments_obey_their_availability_deadline() {
     // fetching just before departure keeps the segment for one target
     // duration, and no longer.
     let store = store();
-    let lease = lease(&store, &[(0, false)]);
-    configure(&lease, 0, false);
+    let lease = initialized_lease(&store, false);
     for id in 0..7 {
-        write(
-            &lease,
-            direct(
-                0,
-                id,
-                i64::try_from(id).expect("fixture id fits i64") * 6,
-                6,
-                1,
-            ),
-        );
+        write(&lease, six_second_segment(id, 1));
         if id < 6 {
             tokio::time::advance(Duration::from_secs(6)).await;
         }
@@ -1030,8 +1034,7 @@ fn live_window_never_falls_below_three_target_durations() {
     // rather than whichever default is current.
     limits.retention.retain = Duration::from_secs(18).into();
     let store = StreamStore::new(limits);
-    let lease = lease(&store, &[(0, false)]);
-    configure(&lease, 0, false);
+    let lease = initialized_lease(&store, false);
     for id in 0..19 {
         write(
             &lease,
@@ -1133,18 +1136,7 @@ fn a_stream_over_its_segment_budget_sheds_rather_than_failing_the_write() {
     let store = StreamStore::new(limits);
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
-    for id in 0..6 {
-        write(
-            &lease,
-            direct(
-                0,
-                id,
-                i64::try_from(id).expect("fixture id fits i64") * 6,
-                6,
-                0,
-            ),
-        );
-    }
+    write_direct_history(&lease, 0..6, 0);
 
     assert_eq!(lease.write(direct(0, 6, 36, 6, 0)), Ok(true));
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
@@ -1168,18 +1160,7 @@ fn byte_pressure_clips_the_playlist_until_the_write_fits() {
     let store = StreamStore::new(limits);
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
-    for id in 0..20 {
-        write(
-            &lease,
-            direct(
-                0,
-                id,
-                i64::try_from(id).expect("fixture id fits i64") * 6,
-                6,
-                10,
-            ),
-        );
-    }
+    write_direct_history(&lease, 0..20, 10);
 
     let depth = lease.live().retention_depth();
     assert!(
@@ -1212,18 +1193,7 @@ fn memory_pressure_emits_one_clip_event() {
     let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
-    for id in 0..20 {
-        write(
-            &lease,
-            direct(
-                0,
-                id,
-                i64::try_from(id).expect("fixture id fits i64") * 6,
-                6,
-                10,
-            ),
-        );
-    }
+    write_direct_history(&lease, 0..20, 10);
     let clips = log.clips();
     assert_eq!(clips.len(), 1, "{clips:?}");
     assert!(
@@ -1245,18 +1215,7 @@ fn retain_trim_does_not_emit_a_clip_event() {
     let store = StreamStore::new(limits()).with_events(Events::new(Arc::new(log.clone())));
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
-    for id in 0..10 {
-        write(
-            &lease,
-            direct(
-                0,
-                id,
-                i64::try_from(id).expect("fixture id fits i64") * 6,
-                6,
-                10,
-            ),
-        );
-    }
+    write_direct_history(&lease, 0..10, 10);
     assert_eq!(
         lease.live().retention_depth().held,
         Duration::from_secs(36),
@@ -1310,18 +1269,7 @@ fn object_pressure_emits_one_clip_event() {
     let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
-    for id in 0..8 {
-        write(
-            &lease,
-            direct(
-                0,
-                id,
-                i64::try_from(id).expect("fixture id fits i64") * 6,
-                6,
-                0,
-            ),
-        );
-    }
+    write_direct_history(&lease, 0..8, 0);
     let clips = log.clips();
     assert_eq!(clips.len(), 1, "{clips:?}");
     assert!(
@@ -1344,18 +1292,7 @@ fn the_playlist_floor_may_remain_over_the_byte_cap() {
     let store = StreamStore::new(limits);
     let lease = lease(&store, &[(0, false)]);
     configure(&lease, 0, false);
-    for id in 0..3 {
-        write(
-            &lease,
-            direct(
-                0,
-                id,
-                i64::try_from(id).expect("fixture id fits i64") * 6,
-                6,
-                100,
-            ),
-        );
-    }
+    write_direct_history(&lease, 0..3, 100);
 
     let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
     assert_eq!(
@@ -1863,7 +1800,7 @@ async fn a_reconnect_does_not_announce_a_stream_viewers_never_lost() {
 
     assert_eq!(
         store.maintain().retired,
-        vec![stream()],
+        vec![(stream(), true)],
         "the reconnect window closing is the stream's own end, and the only \
          point at which viewers begin getting 404s"
     );
@@ -1881,8 +1818,8 @@ async fn a_stream_that_never_served_anything_never_became_unavailable() {
     .await;
 
     assert_eq!(
-        store.maintain(),
-        Maintenance::default(),
+        store.maintain().retired,
+        vec![(stream(), false)],
         "a stream viewers could never reach cannot stop being reachable"
     );
     assert_eq!(store.len(), 0, "it is still retired, just not announced");
@@ -1957,30 +1894,6 @@ fn retention_depth_survives_the_publisher_leaving() {
     assert_eq!(idle.held, Duration::from_secs(6));
 }
 
-fn scratch_disk(name: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "rushls-store-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos())
-    ));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).expect("scratch disk dir");
-    path
-}
-
-fn wait_until(description: &str, ready: impl Fn() -> bool) {
-    let start = std::time::Instant::now();
-    while !ready() {
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "timed out waiting for {description}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-}
-
 #[test]
 fn publication_anchors_survive_until_the_last_sibling_is_shed() {
     let mut limits = limits();
@@ -1991,22 +1904,12 @@ fn publication_anchors_survive_until_the_last_sibling_is_shed() {
     let store = StreamStore::new(limits);
     let first = lease(&store, &[(0, false)]);
     configure(&first, 0, false);
-    for id in 0..6 {
-        write(
-            &first,
-            direct(0, id, i64::try_from(id).expect("id") * 6, 6, 10),
-        );
-    }
+    write_direct_history(&first, 0..6, 10);
     drop(first);
 
     let second = lease(&store, &[(0, false)]);
     configure(&second, 0, false);
-    for id in 6..15 {
-        write(
-            &second,
-            direct(0, id, i64::try_from(id).expect("id") * 6, 6, 10),
-        );
-    }
+    write_direct_history(&second, 6..15, 10);
 
     let catalog = second.live().snapshot();
     assert_eq!(
@@ -2017,26 +1920,15 @@ fn publication_anchors_survive_until_the_last_sibling_is_shed() {
 }
 
 #[tokio::test]
-async fn spill_keeps_playlist_duration_and_serves_the_same_payload() {
-    let directory = scratch_disk("spill");
-    let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2).into();
+async fn spill_keeps_playlist_duration_and_serves_the_same_payload()
+-> Result<(), Box<dyn std::error::Error>> {
+    let scratch = scratch_disk("spill", 10_000)?;
     // Init plus four 10-byte parents. The fifth write must spill rather than clip.
-    limits.retention.maximum_payload_bytes = 41;
-    limits.disk = Some(DiskLimits {
-        directory: directory.clone(),
-        maximum_payload_bytes: 10_000,
-    });
+    let limits = spill_limits(&scratch, Duration::from_hours(2), 41);
     let log = StreamLog::default();
     let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
-    let lease = lease(&store, &[(0, false)]);
-    configure(&lease, 0, false);
-    for id in 0..8 {
-        write(
-            &lease,
-            direct(0, id, i64::try_from(id).expect("id") * 6, 6, 10),
-        );
-    }
+    let lease = initialized_lease(&store, false);
+    write_direct_history(&lease, 0..8, 10);
 
     wait_until("oldest media spills to disk", || {
         lease.live().retained_disk_bytes() > 0
@@ -2074,15 +1966,16 @@ async fn spill_keeps_playlist_duration_and_serves_the_same_payload() {
         log.clips().is_empty(),
         "spilling preserves history and must stay quiet"
     );
-    drop(store);
-    let _ = std::fs::remove_dir_all(directory);
+    drop(origin);
+    drop(lease);
+    remove_disk(store, scratch)?;
+    Ok(())
 }
 
 #[test]
 fn gzip_sidecars_count_against_the_memory_cap() {
     let store = store();
-    let lease = lease(&store, &[(0, false)]);
-    configure(&lease, 0, false);
+    let lease = initialized_lease(&store, false);
     assert_eq!(lease.live().retained_payload_bytes(), 1);
 
     assert_eq!(
@@ -2114,27 +2007,12 @@ fn gzip_sidecars_count_against_the_memory_cap() {
 }
 
 #[tokio::test]
-async fn gzip_sidecars_count_against_the_disk_cap() {
-    let directory = scratch_disk("gzip");
-    let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2).into();
-    limits.retention.maximum_payload_bytes = 12;
-    limits.disk = Some(DiskLimits {
-        directory: directory.clone(),
-        maximum_payload_bytes: 10_000,
-    });
+async fn gzip_sidecars_count_against_the_disk_cap() -> Result<(), Box<dyn std::error::Error>> {
+    let scratch = scratch_disk("gzip", 10_000)?;
+    let limits = spill_limits(&scratch, Duration::from_hours(2), 12);
     let store = StreamStore::new(limits);
-    let lease = lease(&store, &[(0, false)]);
-    configure(&lease, 0, false);
-    for id in 0..4 {
-        assert_eq!(
-            lease.write_encoded(
-                direct(0, id, i64::try_from(id).expect("id") * 6, 6, 10,),
-                Some(Payload::from(vec![1; 20])),
-            ),
-            Ok(true)
-        );
-    }
+    let lease = initialized_lease(&store, false);
+    write_encoded_history(&lease, 0..4, 10, &Payload::from(vec![1; 20]))?;
     wait_until("gzip-bearing parents spill", || {
         lease.live().retained_disk_bytes() >= 30
     });
@@ -2142,24 +2020,73 @@ async fn gzip_sidecars_count_against_the_disk_cap() {
         lease.live().retained_disk_bytes() >= 30,
         "payload plus gzip sidecar both charge the disk tier"
     );
-    drop(store);
-    let _ = std::fs::remove_dir_all(directory);
+    drop(lease);
+    remove_disk(store, scratch)?;
+    Ok(())
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_republished_stream_serves_its_own_spilled_payload() {
-    let directory = scratch_disk("republish");
-    let mut limits = limits();
-    limits.retention.maximum_payload_bytes = 12;
-    limits.disk = Some(DiskLimits {
-        directory: directory.clone(),
-        maximum_payload_bytes: 10_000,
-    });
+async fn nested_streams_own_separate_spill_directories() -> Result<(), Box<dyn std::error::Error>> {
+    let scratch = scratch_disk("nested-streams", 10_000)?;
+    let store = StreamStore::try_new(spill_limits(&scratch, Duration::from_secs(36), 12))?;
+    let publish = |name: &StreamId, bytes: usize| -> Result<_, Box<dyn std::error::Error>> {
+        let lease = store.lease(name.clone(), &packaged_presentation(&[(0, false)]))?;
+        configure(&lease, 0, false);
+        write_direct_history(&lease, 0..2, bytes);
+        wait_until("oldest segment spills", || {
+            lease.live().retained_disk_bytes() > 0
+        });
+        let snapshot = lease.live().rendition(RenditionId(0)).ok_or("rendition")?;
+        let oldest = &snapshot.segments[0];
+        let StoredSegmentKind::Media(SegmentBody::Contiguous(HeldBytes::Disk(file))) = &oldest.kind
+        else {
+            panic!("oldest segment must be on disk");
+        };
+        Ok((lease, oldest.id, file.path.clone()))
+    };
+    let parent = StreamId::new("live/camera");
+    let child = StreamId::new("live/camera/backup");
+    let (first, _, first_path) = publish(&parent, 10)?;
+    let (second, segment, second_path) = publish(&child, 7)?;
+    drop(first);
+    tokio::time::advance(Duration::from_secs(37)).await;
+    assert_eq!(store.maintain().retired, vec![(parent, false)]);
+    wait_until("retired segment disappears", || !first_path.exists());
+    let object = Origin::new(store.clone())
+        .media(
+            &child,
+            MediaResource::Segment(RenditionId(0), segment, MediaSegmentFormat::Cmaf),
+            Duration::ZERO,
+        )
+        .await?;
+    let mut frames = object.body.into_frames();
+    assert_eq!(frames.next().ok_or("segment bytes")?.as_ref(), &[0; 7]);
+    assert!(frames.next().is_none());
+    // Cleanup owns an epoch and its renditions. All epochs must be siblings,
+    // even when one public stream name is a prefix of another.
+    let first_epoch = first_path
+        .ancestors()
+        .nth(2)
+        .ok_or("first epoch directory")?;
+    let second_epoch = second_path
+        .ancestors()
+        .nth(2)
+        .ok_or("second epoch directory")?;
+    assert_ne!(first_epoch, second_epoch);
+    assert_eq!(first_epoch.parent(), second_epoch.parent());
+    drop(second);
+    remove_disk(store, scratch)?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_republished_stream_serves_its_own_spilled_payload()
+-> Result<(), Box<dyn std::error::Error>> {
+    let scratch = scratch_disk("republish", 10_000)?;
+    let limits = spill_limits(&scratch, Duration::from_secs(36), 12);
     let store = StreamStore::new(limits.clone());
-    let first = lease(&store, &[(0, false)]);
-    configure(&first, 0, false);
-    write(&first, direct(0, 0, 0, 6, 10));
-    write(&first, direct(0, 1, 6, 6, 10));
+    let first = initialized_lease(&store, false);
+    write_direct_history(&first, 0..2, 10);
     wait_until("the first publication spills", || {
         first.live().retained_disk_bytes() > 0
     });
@@ -2172,12 +2099,10 @@ async fn a_republished_stream_serves_its_own_spilled_payload() {
         limits.retention.retain.resolve(Duration::from_secs(6)) + Duration::from_secs(1),
     )
     .await;
-    assert_eq!(store.maintain().retired, vec![stream()]);
+    assert_eq!(store.maintain().retired, vec![(stream(), true)]);
 
-    let second = lease(&store, &[(0, false)]);
-    configure(&second, 0, false);
-    write(&second, direct(0, 0, 0, 6, 7));
-    write(&second, direct(0, 1, 6, 6, 7));
+    let second = initialized_lease(&store, false);
+    write_direct_history(&second, 0..2, 7);
     wait_until("the successor spills", || {
         second.live().retained_disk_bytes() > 0
     });
@@ -2201,29 +2126,32 @@ async fn a_republished_stream_serves_its_own_spilled_payload() {
         7,
         "a new LiveStream with the same public id must not serve the predecessor's bytes"
     );
-    drop(store);
-    let _ = std::fs::remove_dir_all(directory);
+    drop(origin);
+    drop(second);
+    remove_disk(store, scratch)?;
+    Ok(())
 }
 
 #[test]
-fn both_tiers_full_hides_and_drops_so_held_falls() {
-    let directory = scratch_disk("both-full");
-    let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2).into();
-    limits.retention.maximum_payload_bytes = 41;
-    limits.disk = Some(DiskLimits {
-        directory: directory.clone(),
-        maximum_payload_bytes: 30,
+fn full_disk_and_memory_shorten_the_playlist_and_emit_one_clip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let scratch = scratch_disk("disk-clip", 30)?;
+    let log = StreamLog::default();
+    let limits = spill_limits(&scratch, Duration::from_hours(2), 41);
+    let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
+    let lease = initialized_lease(&store, false);
+    write_direct_history(&lease, 0..12, 10);
+    wait_until("disk cap clips the playlist", || {
+        log.clips().iter().any(|event| {
+            matches!(
+                event,
+                StreamEvent::RetentionClipped {
+                    reason: RetentionClipReason::Disk,
+                    ..
+                }
+            )
+        })
     });
-    let store = StreamStore::new(limits);
-    let lease = lease(&store, &[(0, false)]);
-    configure(&lease, 0, false);
-    for id in 0..12 {
-        write(
-            &lease,
-            direct(0, id, i64::try_from(id).expect("id") * 6, 6, 10),
-        );
-    }
     wait_until("spills drain and extra history is dropped", || {
         let live = lease.live();
         live.retained_disk_bytes() <= 30
@@ -2238,139 +2166,21 @@ fn both_tiers_full_hides_and_drops_so_held_falls() {
         depth.held < Duration::from_secs(72),
         "twelve parents cannot all remain named"
     );
-    drop(store);
-    let _ = std::fs::remove_dir_all(directory);
-}
-
-#[test]
-fn disk_pressure_emits_one_clip_event() {
-    let directory = scratch_disk("disk-clip");
-    let log = StreamLog::default();
-    let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2).into();
-    limits.retention.maximum_payload_bytes = 41;
-    limits.disk = Some(DiskLimits {
-        directory: directory.clone(),
-        maximum_payload_bytes: 30,
-    });
-    let store = StreamStore::new(limits).with_events(Events::new(Arc::new(log.clone())));
-    let lease = lease(&store, &[(0, false)]);
-    configure(&lease, 0, false);
-    for id in 0..12 {
-        write(
-            &lease,
-            direct(0, id, i64::try_from(id).expect("id") * 6, 6, 10),
-        );
-    }
-    wait_until("disk cap clips the playlist", || {
-        log.clips().iter().any(|event| {
-            matches!(
-                event,
-                StreamEvent::RetentionClipped {
-                    reason: RetentionClipReason::Disk,
-                    ..
-                }
-            )
-        })
-    });
-    assert_eq!(log.clips().len(), 1, "{:?}", log.clips());
+    let clips = log.clips();
+    assert_eq!(clips.len(), 1, "{clips:?}");
     drop(lease);
-    drop(store);
-    let _ = std::fs::remove_dir_all(directory);
+    remove_disk(store, scratch)?;
+    Ok(())
 }
 
 #[tokio::test]
-async fn live_edge_parts_stay_in_memory_and_do_not_wait_on_spill() {
-    let directory = scratch_disk("live-edge");
-    let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2).into();
-    limits.retention.maximum_payload_bytes = 200;
-    limits.disk = Some(DiskLimits {
-        directory: directory.clone(),
-        maximum_payload_bytes: 10_000,
-    });
+async fn spilled_chunked_parents_keep_byte_offsets_and_open_parts_stay_in_memory()
+-> Result<(), Box<dyn std::error::Error>> {
+    let scratch = scratch_disk("range-spill", 10_000)?;
+    let limits = spill_limits(&scratch, Duration::from_hours(2), 200);
     let store = StreamStore::new(limits);
-    let lease = lease(&store, &[(0, true)]);
-    configure(&lease, 0, true);
-    for id in 0..6 {
-        for index in 0..6 {
-            write(
-                &lease,
-                chunk(
-                    0,
-                    id,
-                    index,
-                    i64::try_from(id).expect("id") * 6 + i64::from(index),
-                    1,
-                    10,
-                ),
-            );
-        }
-        write(
-            &lease,
-            completion(0, id, i64::try_from(id).expect("id") * 6, 6),
-        );
-    }
-    wait_until("completed parents spill", || {
-        lease.live().retained_disk_bytes() > 0
-    });
-    write(&lease, chunk(0, 6, 0, 36, 1, 10));
-    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
-    let part_id = snapshot.open_segment.as_ref().unwrap().parts[0].id;
-    let part = lease
-        .live()
-        .part(RenditionId(0), part_id)
-        .expect("open part is fetchable");
-    assert!(
-        part.payload.is_memory(),
-        "the live edge never leaves RAM for disk"
-    );
-    let origin = Origin::new(store.clone());
-    let object = origin
-        .media(
-            &stream(),
-            MediaResource::Part(RenditionId(0), part_id, MediaSegmentFormat::Cmaf),
-            Duration::ZERO,
-        )
-        .await
-        .expect("open-part GET is memory-resident");
-    assert_eq!(object.body.len(), 10);
-    drop(store);
-    let _ = std::fs::remove_dir_all(directory);
-}
-
-#[tokio::test]
-async fn a_range_of_a_spilled_chunked_parent_keeps_byte_offsets() {
-    let directory = scratch_disk("range-spill");
-    let mut limits = limits();
-    limits.retention.retain = Duration::from_hours(2).into();
-    limits.retention.maximum_payload_bytes = 200;
-    limits.disk = Some(DiskLimits {
-        directory: directory.clone(),
-        maximum_payload_bytes: 10_000,
-    });
-    let store = StreamStore::new(limits);
-    let lease = lease(&store, &[(0, true)]);
-    configure(&lease, 0, true);
-    for id in 0..6 {
-        for index in 0..6 {
-            write(
-                &lease,
-                chunk(
-                    0,
-                    id,
-                    index,
-                    i64::try_from(id).expect("id") * 6 + i64::from(index),
-                    1,
-                    10,
-                ),
-            );
-        }
-        write(
-            &lease,
-            completion(0, id, i64::try_from(id).expect("id") * 6, 6),
-        );
-    }
+    let lease = initialized_lease(&store, true);
+    write_chunked_spill_history(&lease, 0..6, None)?;
     wait_until("completed parents spill", || {
         lease.live().retained_disk_bytes() > 0
     });
@@ -2387,6 +2197,27 @@ async fn a_range_of_a_spilled_chunked_parent_keeps_byte_offsets() {
         })
         .expect("a completed parent spilled");
     let origin = Origin::new(store.clone());
+    write(&lease, chunk(0, 6, 0, 36, 1, 10));
+    let snapshot = lease.live().rendition(RenditionId(0)).unwrap();
+    let part_id = snapshot.open_segment.as_ref().unwrap().parts[0].id;
+    let part = lease
+        .live()
+        .part(RenditionId(0), part_id)
+        .expect("open part is fetchable");
+    assert!(
+        part.payload.is_memory(),
+        "the live edge never leaves RAM for disk"
+    );
+    let object = origin
+        .media(
+            &stream(),
+            MediaResource::Part(RenditionId(0), part_id, MediaSegmentFormat::Cmaf),
+            Duration::ZERO,
+        )
+        .await
+        .expect("open-part GET is memory-resident");
+    assert_eq!(object.body.len(), 10);
+
     let object = origin
         .media(
             &stream(),
@@ -2402,33 +2233,26 @@ async fn a_range_of_a_spilled_chunked_parent_keeps_byte_offsets() {
         .expect("a loaded parent is rangeable");
     let prefix: Vec<u8> = clipped.into_frames().flatten().collect();
     assert_eq!(prefix, &full[..10]);
-    drop(store);
-    let _ = std::fs::remove_dir_all(directory);
+    drop(origin);
+    drop(lease);
+    remove_disk(store, scratch)?;
+    Ok(())
 }
 
 #[tokio::test]
 async fn burst_spill_waits_without_discarding_history() -> Result<(), Box<dyn std::error::Error>> {
     for (count, queued) in [(60, 12), (80, 32), (120, 32)] {
-        let directory = scratch_disk("burst-spill");
-        let mut limits = limits();
-        limits.retention.retain = Duration::from_mins(15).into();
-        limits.retention.maximum_payload_bytes = 641;
-        limits.disk = Some(DiskLimits {
-            directory: directory.clone(),
-            maximum_payload_bytes: 10_000,
-        });
+        let scratch = scratch_disk("burst-spill", 10_000)?;
+        let limits = spill_limits(&scratch, Duration::from_mins(15), 641);
         let store = StreamStore::new(limits);
-        let lease = lease(&store, &[(0, false)]);
-        configure(&lease, 0, false);
+        let lease = initialized_lease(&store, false);
         let disk = store.disk().expect("disk configured");
         let mut ready = Box::pin(lease.ready());
         let (pending, retained, blocked) = {
             let _pause = disk.pause_writes();
             // Model a bounded batch already accepted by the publisher. A slow
             // worker must neither schedule all history nor evict queued data.
-            for id in 0..count {
-                write(&lease, direct(0, id, i64::try_from(id)? * 6, 6, 10));
-            }
+            write_direct_history(&lease, 0..count, 10);
             let mut context = std::task::Context::from_waker(std::task::Waker::noop());
             let blocked = std::future::Future::poll(ready.as_mut(), &mut context).is_pending();
             (
@@ -2461,48 +2285,48 @@ async fn burst_spill_waits_without_discarding_history() -> Result<(), Box<dyn st
         );
         assert_eq!(snapshot.segments[0].msn, Msn(1));
         drop(lease);
-        drop(store);
-        let _ = std::fs::remove_dir_all(directory);
+        remove_disk(store, scratch)?;
     }
     Ok(())
 }
 
-fn write_distinct_parts(lease: &StreamLease, id: u64) -> Result<(), Box<dyn std::error::Error>> {
-    for index in 0..6 {
-        let mut media = chunk(
-            0,
-            id,
-            index,
-            i64::try_from(id)? * 6 + i64::from(index),
-            1,
-            10,
-        );
-        if let PackagedMedia::Chunk(chunk) = &mut media {
-            chunk.payload = Payload::from(vec![u8::try_from(index)?; 10]);
+/// The parts have distinct bytes so the disk-range tests can check offsets.
+fn write_chunked_spill_history(
+    lease: &StreamLease,
+    ids: Range<u64>,
+    gzip: Option<&Payload>,
+) -> Result<(), StoreWriteError> {
+    for id in ids {
+        let start = six_second_start(id);
+        for index in 0..6 {
+            let media = chunk(0, id, index, start + i64::from(index), 1, 10);
+            assert!(lease.write_encoded(media, gzip.cloned())?);
         }
-        write(lease, media);
+        write(lease, completion(0, id, start, 6));
     }
-    write(lease, completion(0, id, i64::try_from(id)? * 6, 6));
+    Ok(())
+}
+
+fn write_encoded_history(
+    lease: &StreamLease,
+    ids: Range<u64>,
+    bytes: usize,
+    gzip: &Payload,
+) -> Result<(), StoreWriteError> {
+    for id in ids {
+        assert!(lease.write_encoded(six_second_segment(id, bytes), Some(gzip.clone()))?);
+    }
     Ok(())
 }
 
 #[tokio::test(start_paused = true)]
 async fn spilled_parts_share_a_segment_file_until_fetch_grace_expires()
 -> Result<(), Box<dyn std::error::Error>> {
-    let directory = scratch_disk("segment-file");
-    let mut limits = limits();
-    limits.retention.retain = Duration::from_mins(15).into();
-    limits.retention.maximum_payload_bytes = 301;
-    limits.disk = Some(DiskLimits {
-        directory: directory.clone(),
-        maximum_payload_bytes: 10_000,
-    });
+    let scratch = scratch_disk("segment-file", 10_000)?;
+    let limits = spill_limits(&scratch, Duration::from_mins(15), 301);
     let store = StreamStore::new(limits);
-    let lease = lease(&store, &[(0, true)]);
-    configure(&lease, 0, true);
-    for id in 0..8 {
-        write_distinct_parts(&lease, id)?;
-    }
+    let lease = initialized_lease(&store, true);
+    write_chunked_spill_history(&lease, 0..8, None)?;
     wait_until("segment spill finishes", || {
         lease.live().retained_payload_bytes() <= 301
     });
@@ -2579,8 +2403,7 @@ async fn spilled_parts_share_a_segment_file_until_fetch_grace_expires()
     assert_eq!(clipped, vec![0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2]);
     drop(origin);
     drop(lease);
-    drop(store);
-    let _ = std::fs::remove_dir_all(directory);
+    remove_disk(store, scratch)?;
     Ok(())
 }
 
@@ -2613,7 +2436,7 @@ async fn iframe_ranges_survive_disk_spill_and_remain_fetchable()
         project::{PlaylistDelta, PlaylistPolicy, media::iframe_playlist},
         uri::PlaylistUris,
     };
-    let directory = scratch_disk("iframe-spill");
+    let scratch = scratch_disk("iframe-spill", 100_000)?;
     let payload = hls::cmaf_fragment(true)?;
     let expected = super::iframe::prefix_len(
         crate::domain::MediaKind::Video,
@@ -2621,13 +2444,11 @@ async fn iframe_ranges_survive_disk_spill_and_remain_fetchable()
         payload.as_bytes(),
     )
     .ok_or("missing frame index")?;
-    let mut limits = limits();
-    limits.retention.retain = Duration::from_secs(180).into();
-    limits.retention.maximum_payload_bytes = payload.len() * 6 * 4 + 1;
-    limits.disk = Some(DiskLimits {
-        directory: directory.clone(),
-        maximum_payload_bytes: 100_000,
-    });
+    let limits = spill_limits(
+        &scratch,
+        Duration::from_secs(180),
+        payload.len() * 6 * 4 + 1,
+    );
     let store = StreamStore::new(limits);
     let lease = hls::lease(&store, vec![hls::video(0)]);
     hls::write(&lease, hls::initialization(0, 1));
@@ -2685,18 +2506,9 @@ async fn iframe_ranges_survive_disk_spill_and_remain_fetchable()
         assert!(clipped.ends_with(crate::mux::fixtures::H264_IDR));
         assert_eq!(clipped.len(), usize::try_from(frame.length.get())?);
     }
-    let disk = Arc::clone(store.disk().ok_or("missing disk tier")?);
     drop(origin);
     drop(lease);
-    drop(store);
-    // A spill worker can briefly retain the last live stream. Keep the tier
-    // here until it releases that stream, then join it before deleting locked
-    // files (Windows correctly refuses deletion while they are still owned).
-    wait_until("disk worker releases stream", || {
-        Arc::strong_count(&disk) == 1
-    });
-    drop(disk);
-    std::fs::remove_dir_all(directory)?;
+    remove_disk(store, scratch)?;
     Ok(())
 }
 
@@ -2704,23 +2516,12 @@ async fn iframe_ranges_survive_disk_spill_and_remain_fetchable()
 async fn retired_rendition_expires_without_renewal_on_reconnect()
 -> Result<(), Box<dyn std::error::Error>> {
     let store = store();
-    let first = store.lease(
-        stream(),
-        &keyed_presentation(0, "old", false, SystemTime::UNIX_EPOCH),
-    )?;
-    write(&first, initialization(0, 1));
-    write(&first, direct(0, 0, 0, 6, 1));
+    let first = publish_keyed_segment(&store, "old", 1)?;
     let held = first.live().snapshot();
-    let second = store.lease(
-        stream(),
-        &keyed_presentation(0, "new", false, SystemTime::UNIX_EPOCH),
-    )?;
+    let second = keyed_lease(&store, "new", false)?;
     // retain=36s, target=6s, part grace=18s: final window lives for 54s.
     tokio::time::advance(Duration::from_secs(53)).await;
-    let third = store.lease(
-        stream(),
-        &keyed_presentation(0, "new", false, SystemTime::UNIX_EPOCH),
-    )?;
+    let third = keyed_lease(&store, "new", false)?;
     third.live().sweep_expired();
     assert!(third.live().segment(RenditionId(0), SegmentId(1)).is_some());
     let before = third.live().snapshot();
@@ -2747,17 +2548,7 @@ async fn publication_churn_bounds_retired_topology_without_reusing_ids()
 -> Result<(), Box<dyn std::error::Error>> {
     let store = store();
     for generation in 0..200 {
-        let lease = store.lease(
-            stream(),
-            &keyed_presentation(
-                0,
-                &format!("camera/{generation}"),
-                false,
-                SystemTime::UNIX_EPOCH,
-            ),
-        )?;
-        write(&lease, initialization(0, 1));
-        write(&lease, direct(0, 0, 0, 6, 1));
+        let lease = publish_keyed_segment(&store, &format!("camera/{generation}"), 1)?;
         let snapshot = lease.live().snapshot();
         assert!(snapshot.renditions.len() <= 65);
         assert_eq!(
@@ -2779,17 +2570,7 @@ fn retired_playlist_floor_does_not_defeat_memory_capacity() -> Result<(), Box<dy
         ..limits()
     });
     for generation in 0..20 {
-        let lease = store.lease(
-            stream(),
-            &keyed_presentation(
-                0,
-                &format!("camera/{generation}"),
-                false,
-                SystemTime::UNIX_EPOCH,
-            ),
-        )?;
-        write(&lease, initialization(0, 1));
-        write(&lease, direct(0, 0, 0, 6, 1));
+        let lease = publish_keyed_segment(&store, &format!("camera/{generation}"), 1)?;
         assert!(lease.live().retained_payload_bytes() <= 4);
     }
     Ok(())
@@ -2803,21 +2584,9 @@ async fn sustained_dvr_spilling_keeps_current_playlists_cached()
         service::{Config, Request, Service},
         uri::Resource,
     };
-    let directory = scratch_disk("dvr-cache");
-    let store = StreamStore::new(StoreLimits {
-        retention: RetentionPolicy {
-            retain: Duration::from_hours(2).into(),
-            maximum_payload_bytes: 1024 * 1024,
-            ..limits().retention
-        },
-        disk: Some(DiskLimits {
-            directory: directory.clone(),
-            maximum_payload_bytes: 8 * 1024 * 1024,
-        }),
-        ..limits()
-    });
-    let lease = lease(&store, &[(0, false)]);
-    configure(&lease, 0, false);
+    let scratch = scratch_disk("dvr-cache", 8 * 1024 * 1024)?;
+    let store = StreamStore::new(spill_limits(&scratch, Duration::from_hours(2), 1024 * 1024));
+    let lease = initialized_lease(&store, false);
     let hls = Service::new(Arc::new(Origin::new(store.clone())), Config::default());
     let full = Request::new(
         Resource::MediaPlaylist(RenditionId(0), MediaKind::Video),
@@ -2825,10 +2594,7 @@ async fn sustained_dvr_spilling_keeps_current_playlists_cached()
     );
     let requests = [full, full.with_skip(PlaylistDelta::SkipV2)];
     for segment in 0..100 {
-        write(
-            &lease,
-            direct(0, segment, i64::try_from(segment)? * 6, 6, 32 * 1024),
-        );
+        write(&lease, six_second_segment(segment, 32 * 1024));
         // Viewers fetch while any spill is still running. Moving media to disk
         // must not evict these current versions or invalidate their cache keys.
         for request in requests {
@@ -2863,8 +2629,7 @@ async fn sustained_dvr_spilling_keeps_current_playlists_cached()
     assert_eq!(snapshot.segments[0].msn, Msn(1));
     drop(hls);
     drop(lease);
-    drop(store);
-    let _ = std::fs::remove_dir_all(directory);
+    remove_disk(store, scratch)?;
     Ok(())
 }
 
@@ -2873,21 +2638,9 @@ async fn manifest_allowance_survives_an_in_flight_spill_cycle()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::delivery::memory::ManifestClass;
     use bytes::Bytes;
-    let directory = scratch_disk("spill-cache-allowance");
-    let store = StreamStore::new(StoreLimits {
-        retention: RetentionPolicy {
-            retain: Duration::from_hours(2).into(),
-            maximum_payload_bytes: 1024 * 1024,
-            ..limits().retention
-        },
-        disk: Some(DiskLimits {
-            directory: directory.clone(),
-            maximum_payload_bytes: 8 * 1024 * 1024,
-        }),
-        ..limits()
-    });
-    let lease = lease(&store, &[(0, false)]);
-    configure(&lease, 0, false);
+    let scratch = scratch_disk("spill-cache-allowance", 8 * 1024 * 1024)?;
+    let store = StreamStore::new(spill_limits(&scratch, Duration::from_hours(2), 1024 * 1024));
+    let lease = initialized_lease(&store, false);
     let budget = lease.live().memory_budget();
     let manifest = budget
         .insert(
@@ -2899,12 +2652,7 @@ async fn manifest_allowance_survives_an_in_flight_spill_cycle()
         .ok_or("manifest allowance")?;
     {
         let _pause = store.disk().ok_or("disk")?.pause_writes();
-        for segment in 0..26 {
-            write(
-                &lease,
-                direct(0, segment, i64::try_from(segment)? * 6, 6, 32 * 1024),
-            );
-        }
+        write_direct_history(&lease, 0..26, 32 * 1024);
         assert!(
             store.disk().ok_or("disk")?.spill_pending() > 0,
             "spill starts before RAM is saturated"
@@ -2920,32 +2668,58 @@ async fn manifest_allowance_survives_an_in_flight_spill_cycle()
     assert!(manifest.get().is_some());
     assert_eq!(budget.usage().1, 128 * 1024);
     drop(lease);
-    drop(store);
-    let _ = std::fs::remove_dir_all(directory);
+    remove_disk(store, scratch)?;
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn explicit_gap_preserves_parts_and_exposes_unavailable_resources()
 -> Result<(), Box<dyn std::error::Error>> {
+    use crate::delivery::{
+        DeliveryError,
+        hls::{PublishOutcome, PublisherFactory, StorePublisherFactory},
+    };
+
+    let id = stream();
     let store = store();
-    let lease = lease(&store, &[(0, true)]);
-    configure(&lease, 0, true);
-    write(&lease, chunk(0, 0, 0, 0, 1, 1));
-    write(&lease, completion(0, 0, 0, 1));
-    write(
-        &lease,
-        PackagedMedia::Gap(crate::mux::PackagedGap {
-            rendition_id: PackagingRenditionId(0),
-            packaging_segment_id: PackagingSegmentId(1),
-            media_start: 1,
-            duration: 2,
-            parts: vec![1, 1],
-        }),
+    let origin = Origin::new(store.clone());
+    let factory = StorePublisherFactory::new(store.clone());
+    let mut publisher = factory.start(&id, packaged_presentation(&[(0, true)]))?;
+    for media in [
+        initialization(0, 1),
+        chunk(0, 0, 0, 0, 1, 1),
+        completion(0, 0, 0, 1),
+    ] {
+        assert_eq!(publisher.write(media)?, PublishOutcome::Published);
+    }
+
+    let gap_part_id = PartId(2);
+    let gap_part = MediaResource::Part(RenditionId(0), gap_part_id, MediaSegmentFormat::Cmaf);
+    let mut held = Box::pin(origin.media(&id, gap_part, Duration::from_secs(18)));
+    tokio::select! {
+        biased;
+        result = &mut held => panic!("unexpected early return {result:?}"),
+        () = std::future::ready(()) => ()
+    }
+    assert_eq!(
+        publisher.write(gap(1, 2, vec![1, 1]))?,
+        PublishOutcome::Published
     );
-    write(&lease, chunk(0, 2, 0, 3, 1, 1));
-    write(&lease, completion(0, 2, 3, 1));
-    let snapshot = lease.live().rendition(RenditionId(0)).ok_or("rendition")?;
+    let waited = held.await;
+    let immediate = origin.media(&id, gap_part, Duration::ZERO).await;
+    assert_eq!(waited, Err(DeliveryError::UnknownResource));
+    assert_eq!(waited, immediate);
+
+    assert_eq!(
+        publisher.write(chunk(0, 2, 0, 3, 1, 1))?,
+        PublishOutcome::Published
+    );
+    assert_eq!(
+        publisher.write(completion(0, 2, 3, 1))?,
+        PublishOutcome::Published
+    );
+    let live = store.get(&id).ok_or("stream")?;
+    let snapshot = live.rendition(RenditionId(0)).ok_or("rendition")?;
     assert_eq!(snapshot.segments.len(), 3);
     assert_eq!(
         snapshot
@@ -2959,26 +2733,24 @@ async fn explicit_gap_preserves_parts_and_exposes_unavailable_resources()
     let gap = &snapshot.segments[1];
     let parts = snapshot.segments.parts(gap);
     assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0].id, gap_part_id);
     assert!(
         parts
             .iter()
             .all(|p| p.gap && !p.independent && p.payload.is_empty())
     );
     assert_eq!(snapshot.segments.parts(&snapshot.segments[0]).len(), 1);
-    let origin = Origin::new(store.clone());
-    for resource in [
-        MediaResource::Segment(RenditionId(0), gap.id, MediaSegmentFormat::Cmaf),
-        MediaResource::Part(RenditionId(0), parts[0].id, MediaSegmentFormat::Cmaf),
-    ] {
-        assert!(matches!(
-            origin.media(&stream(), resource, Duration::ZERO).await,
-            Err(crate::delivery::DeliveryError::UnknownResource)
-        ));
+    let gap_segment = MediaResource::Segment(RenditionId(0), gap.id, MediaSegmentFormat::Cmaf);
+    for resource in [gap_segment, gap_part] {
+        assert_eq!(
+            origin.media(&id, resource, Duration::ZERO).await,
+            Err(DeliveryError::UnknownResource)
+        );
     }
     assert!(
         origin
             .media(
-                &stream(),
+                &id,
                 MediaResource::Part(RenditionId(0), PartId(1), MediaSegmentFormat::Cmaf),
                 Duration::ZERO
             )
@@ -2996,8 +2768,7 @@ async fn explicit_gap_preserves_parts_and_exposes_unavailable_resources()
 fn malformed_explicit_gap_does_not_advance_the_playlist() -> Result<(), Box<dyn std::error::Error>>
 {
     let store = store();
-    let lease = lease(&store, &[(0, true)]);
-    configure(&lease, 0, true);
+    let lease = initialized_lease(&store, true);
     write(&lease, chunk(0, 0, 0, 0, 1, 1));
     write(&lease, completion(0, 0, 0, 1));
     let before = lease.live().rendition(RenditionId(0)).ok_or("rendition")?;
@@ -3007,17 +2778,7 @@ fn malformed_explicit_gap_does_not_advance_the_playlist() -> Result<(), Box<dyn 
         (1, 2, vec![2]),
         (i64::MAX, 1, vec![1]),
     ] {
-        assert!(
-            lease
-                .write(PackagedMedia::Gap(crate::mux::PackagedGap {
-                    rendition_id: PackagingRenditionId(0),
-                    packaging_segment_id: PackagingSegmentId(1),
-                    media_start: start,
-                    duration,
-                    parts,
-                }))
-                .is_err()
-        );
+        assert!(lease.write(gap(start, duration, parts)).is_err());
         let after = lease.live().rendition(RenditionId(0)).ok_or("rendition")?;
         assert_eq!(before.live_edge, after.live_edge);
         assert_eq!(before.segments, after.segments);
@@ -3144,13 +2905,7 @@ fn required_independence_rejects_dependent_starts_across_takeovers()
         // Dependent later parts remain valid when the segment starts at a RAP.
         write_segment(&lease, 0, 0, 0);
         write(&lease, direct(1, 0, 0, 6, 3));
-        lease.write(PackagedMedia::Gap(crate::mux::PackagedGap {
-            rendition_id: PackagingRenditionId(0),
-            packaging_segment_id: PackagingSegmentId(1),
-            media_start: 6,
-            duration: 6,
-            parts: vec![1; 6],
-        }))?;
+        lease.write(gap(6, 6, vec![1; 6]))?;
         let PackagedMedia::Chunk(mut resumed) = chunk(0, 2, 0, 12, 1, 3) else {
             unreachable!()
         };
@@ -3161,5 +2916,209 @@ fn required_independence_rejects_dependent_starts_across_takeovers()
         ));
         write_segment(&lease, 0, 2, 12);
     }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn retired_spill_files_are_removed_on_expiry_or_topology_pressure()
+-> Result<(), Box<dyn std::error::Error>> {
+    for chunked in [false, true] {
+        for capacity_prune in [false, true] {
+            let scratch = scratch_disk("review-retired", 10_000)?;
+            let mut settings = spill_limits(&scratch, Duration::from_secs(60), 181);
+            settings.retention.part_tag_retention = Duration::ZERO.into();
+            let store = StreamStore::new(settings);
+            let disk = store.disk().ok_or("disk tier")?.clone();
+            let first = keyed_lease(&store, "old", chunked)?;
+            write(&first, initialization(0, 1));
+            if chunked {
+                write_chunked_spill_history(&first, 0..8, Some(&Payload::from(vec![7; 5])))?;
+            } else {
+                write_encoded_history(&first, 0..8, 30, &Payload::from(vec![7; 15]))?;
+            }
+            wait_until("spill finishes", || {
+                disk.spill_pending() == 0 && first.live().retained_payload_bytes() <= 181
+            });
+            let snapshot = first.live().rendition(RenditionId(0)).ok_or("rendition")?;
+            let oldest = &snapshot.segments[0];
+            let (payload, gzip) = match &oldest.kind {
+                StoredSegmentKind::Media(SegmentBody::Contiguous(HeldBytes::Disk(payload))) => {
+                    (payload, oldest.gzip.as_ref())
+                }
+                StoredSegmentKind::Media(SegmentBody::Chunked(parts)) => {
+                    let HeldBytes::Disk(payload) = &parts[0].payload else {
+                        panic!("oldest part must spill");
+                    };
+                    (payload, parts[0].gzip.as_ref())
+                }
+                _ => panic!("oldest segment must spill"),
+            };
+            let path = payload.path.clone();
+            let Some(HeldBytes::Disk(gzip)) = gzip else {
+                panic!("gzip sidecar must spill");
+            };
+            let gzip_path = gzip.path.clone();
+            assert!(path.exists());
+            assert!(gzip_path.exists());
+            // An already-open transfer survives unlink; retained snapshots do
+            // not extend the disk budget after the owner is pruned.
+            #[cfg(unix)]
+            let mut in_flight = std::fs::File::open(&*path)?;
+            let mut successor = publish_keyed_segment(&store, "new", 2)?;
+            drop(first);
+            let sibling_locator = if capacity_prune {
+                // Churn reaches the independent 64-rendition bound before
+                // part grace can compact the shared segment files.
+                for generation in 0..64 {
+                    successor = publish_keyed_segment(&store, &format!("new/{generation}"), 2)?;
+                }
+                None
+            } else {
+                write_direct_history(&successor, 1..8, 40);
+                let sibling_file = || {
+                    let snapshot = successor.live().rendition(RenditionId(1))?;
+                    let StoredSegmentKind::Media(SegmentBody::Contiguous(HeldBytes::Disk(locator))) =
+                        &snapshot.segments[0].kind
+                    else {
+                        return None;
+                    };
+                    Some(locator.clone())
+                };
+                wait_until("a live sibling spills", || sibling_file().is_some());
+                let locator = sibling_file().ok_or("sibling spill")?;
+                tokio::time::advance(Duration::from_secs(180)).await;
+                successor.live().sweep_expired();
+                assert_eq!(successor.live().snapshot().renditions.len(), 1);
+                Some(locator)
+            };
+            successor.ready().await?;
+            let directory = path.parent().ok_or("rendition directory")?;
+            wait_until(
+                "the worker removes the retired directory and finishes spilling",
+                || !directory.exists() && disk.spill_pending() == 0,
+            );
+            assert!(successor.live().rendition(RenditionId(0)).is_none());
+            assert_eq!(
+                successor.live().retained_payload_bytes() + successor.live().retained_disk_bytes(),
+                if capacity_prune { 65 * 2 } else { 2 + 7 * 40 },
+                "only the successor renditions remain charged"
+            );
+            if let Some(locator) = sibling_locator {
+                assert_eq!(disk.read(&locator).await?.as_bytes(), &[0]);
+            }
+            assert!(!path.exists(), "retirement must unlink the payload");
+            assert!(!gzip_path.exists(), "retirement must unlink the sidecar");
+            #[cfg(unix)]
+            {
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                in_flight.read_to_end(&mut bytes)?;
+                assert_eq!(bytes.len(), if chunked { 60 } else { 30 });
+            }
+            drop(successor);
+            drop(disk);
+            remove_disk(store, scratch)?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn target_based_part_and_segment_grace_use_the_advertised_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut settings = limits();
+    settings.retention.retain = Duration::from_secs(1).into();
+    settings.retention.part_tag_retention = TargetDurationMultiple::integer(1).into();
+    settings.retention.part_fetch_grace_period = TargetDurationMultiple::integer(1).into();
+    let store = StreamStore::new(settings);
+    let cadence = config_with_maximum(timebase(), 6, 12, Some(1));
+    let lease = store.lease(
+        stream(),
+        &presentation_with(0, "camera", cadence, SystemTime::UNIX_EPOCH),
+    )?;
+    write(&lease, initialization(0, 1));
+    for id in 0..7 {
+        write_segment(&lease, 0, id, six_second_start(id));
+    }
+    let snapshot = lease.live().rendition(RenditionId(0)).ok_or("rendition")?;
+    let fifth = snapshot
+        .segments
+        .iter()
+        .find(|segment| segment.id == SegmentId(5))
+        .ok_or("fifth segment")?;
+    assert_eq!(
+        snapshot.segments.parts(fifth).len(),
+        6,
+        "tags remain for one advertised target"
+    );
+    for (elapsed, available) in [(7, true), (5, false)] {
+        tokio::time::advance(Duration::from_secs(elapsed)).await;
+        lease.live().sweep_expired();
+        assert_eq!(
+            lease.live().part(RenditionId(0), PartId(1)).is_some(),
+            available
+        );
+        assert_eq!(
+            lease.live().segment(RenditionId(0), SegmentId(1)).is_some(),
+            available
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+// The gate deliberately blocks the spill worker while virtual time expires its owner.
+#[allow(clippy::await_holding_lock)]
+async fn pruning_a_rendition_during_a_spill_discards_late_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let scratch = scratch_disk("retired-pending", 10_000)?;
+    let settings = spill_limits(&scratch, Duration::from_secs(60), 41);
+    let store = StreamStore::new(settings);
+    let disk = store.disk().ok_or("disk")?.clone();
+    let first = keyed_lease(&store, "old", false)?;
+    write(&first, initialization(0, 1));
+    write_direct_history(&first, 0..8, 10);
+    wait_until("initial spills finish", || {
+        disk.spill_pending() == 0 && first.live().retained_payload_bytes() <= 41
+    });
+    let snapshot = first
+        .live()
+        .rendition(RenditionId(0))
+        .ok_or("old rendition")?;
+    let StoredSegmentKind::Media(SegmentBody::Contiguous(HeldBytes::Disk(locator))) =
+        &snapshot.segments[0].kind
+    else {
+        panic!("oldest segment spilled");
+    };
+    let rendition_directory = locator
+        .path
+        .parent()
+        .ok_or("rendition directory")?
+        .to_path_buf();
+    let paused = disk.pause_writes();
+    write_encoded_history(&first, 8..12, 10, &Payload::from(vec![7; 5]))?;
+    assert!(disk.spill_pending() > 0);
+    let second = keyed_lease(&store, "new", false)?;
+    write(&second, initialization(0, 2));
+    drop(first);
+    tokio::time::advance(Duration::from_secs(180)).await;
+    second.live().sweep_expired();
+    assert!(second.live().rendition(RenditionId(0)).is_none());
+    assert_eq!(second.live().retained_disk_bytes(), 0);
+    assert_eq!(second.live().retained_payload_bytes(), 1);
+    assert!(
+        locator.path.exists(),
+        "pruning releases ownership while disk I/O is paused"
+    );
+    drop(paused);
+    wait_until("late spills and their directory are discarded", || {
+        !rendition_directory.exists() && disk.spill_pending() == 0
+    });
+    assert_eq!(disk.spills_failed(), 0);
+    assert_eq!(second.live().retained_disk_bytes(), 0);
+    second.ready().await?;
+    drop(second);
+    drop(disk);
+    remove_disk(store, scratch)?;
     Ok(())
 }

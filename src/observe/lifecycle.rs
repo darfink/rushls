@@ -327,6 +327,11 @@ impl Projector {
                 principal,
                 publisher,
             } => {
+                // Every external event requires a public subject. A private
+                // playback route stays usable without becoming a hook subject.
+                if !publisher.public_stream {
+                    return None;
+                }
                 let mut live = self.live.lock();
                 // A session id is unique per publisher, so an occupied entry
                 // would mean the pipeline emitted `Accepted` twice.

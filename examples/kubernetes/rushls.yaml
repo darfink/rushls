@@ -62,7 +62,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: rushls
-          image: ghcr.io/darfink/rushls:v0.2.0
+          image: ghcr.io/darfink/rushls:v0.3.0
           env:
             - name: METRICS_TOKEN
               valueFrom:

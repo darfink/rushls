@@ -37,7 +37,8 @@ pub trait MediaMeters: Send + Sync {
         None
     }
 
-    fn video_interval(&self, _observation: crate::domain::VideoTimestampObservation) {}
+    /// Flush source timestamp intervals once per normalizer drain.
+    fn video_intervals(&self, _observations: &[crate::domain::VideoTimestampObservation]) {}
     fn compensation(&self, _notice: &crate::domain::NormalizationNotice) {}
     fn track_input(&self, _id: crate::domain::TrackId, _bytes: usize) {}
     fn track_normalized(&self, _id: crate::domain::TrackId, _pts: i64, _duration: u64) {}
@@ -650,13 +651,21 @@ impl MediaMeters for SessionCounters {
         Some(&self.budget)
     }
 
-    fn video_interval(&self, observation: crate::domain::VideoTimestampObservation) {
-        self.process
-            .video_intervals
-            .lock()
-            .entry(format!("{:?}", observation.codec).to_lowercase())
-            .or_default()
-            .observe(observation.timebase.ticks_to_duration(observation.ticks));
+    fn video_intervals(&self, observations: &[crate::domain::VideoTimestampObservation]) {
+        if observations.is_empty() {
+            return;
+        }
+        let mut intervals = self.process.video_intervals.lock();
+        // Consecutive samples usually share a codec; resolve its label once,
+        // while retaining each observation's own timebase and histogram bucket.
+        for group in observations.chunk_by(|a, b| a.codec == b.codec) {
+            let histogram = intervals
+                .entry(format!("{:?}", group[0].codec).to_lowercase())
+                .or_default();
+            for observation in group {
+                histogram.observe(observation.timebase.ticks_to_duration(observation.ticks));
+            }
+        }
     }
 
     fn compensation(&self, notice: &crate::domain::NormalizationNotice) {
@@ -770,6 +779,46 @@ fn get(counter: &AtomicU64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_intervals_keep_codec_timebase_and_histogram_contracts() {
+        use crate::domain::{Codec, Timebase, VideoTimestampObservation};
+
+        let process = ProcessMeters::default();
+        let meters = SessionMeters::new(process.clone());
+        let media = meters.media_view();
+        media.video_intervals(&[]);
+        assert!(process.video_intervals().is_empty());
+        let observation = |codec, ticks, timebase| VideoTimestampObservation {
+            codec,
+            ticks,
+            timebase,
+        };
+        media.video_intervals(&[
+            observation(Codec::H264, 450, Timebase::hz90k()),
+            observation(Codec::H264, 40, Timebase::new(nz::u32!(1), nz::u32!(1_000))),
+            observation(
+                Codec::Hevc,
+                121_000,
+                Timebase::new(nz::u32!(1), nz::u32!(1_000)),
+            ),
+            observation(Codec::H264, 9_000, Timebase::hz90k()),
+        ]);
+        media.video_intervals(&[observation(Codec::H264, 0, Timebase::hz90k())]);
+        let intervals = process.video_intervals();
+        assert_eq!(intervals.len(), 2);
+        let (codec, histogram) = &intervals[0];
+        assert_eq!(codec, "h264");
+        assert_eq!(histogram.count, 4);
+        assert!((histogram.sum - 0.145).abs() < 1e-12);
+        assert_eq!(histogram.buckets[0], 2);
+        assert_eq!(histogram.buckets[3], 1);
+        assert_eq!(histogram.buckets[4], 1);
+        let (codec, histogram) = &intervals[1];
+        assert_eq!(codec, "hevc");
+        assert_eq!((histogram.count, histogram.sum), (1, 121.0));
+        assert_eq!(histogram.buckets, [0; 14], "overflow belongs only in +Inf");
+    }
 
     #[test]
     fn session_volume_rolls_into_process_totals() {

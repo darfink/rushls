@@ -15,6 +15,8 @@ use super::{StoreFull, StoreWriteError, StreamLease, StreamStore, gzip::gzip};
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum HlsError {
+    #[error("the publisher was displaced before acquiring its write lease")]
+    Superseded,
     #[error("failed to initialize HLS publication: {0}")]
     Initialization(Box<str>),
     #[error(transparent)]
@@ -95,10 +97,27 @@ pub trait HlsPublisher: Send {
 /// here rather than piecemeal as media events, so topology replacement and
 /// durable rendition mapping are committed before an initialization is visible.
 pub trait PublisherFactory: Send + Sync {
+    /// The retained stream determines whether a reconnect may expose its identity.
+    fn store(&self) -> &StreamStore;
+
+    #[cfg(test)]
     fn start(
         &self,
         stream: &StreamId,
         presentation: Arc<PackagedPresentation>,
+    ) -> Result<Box<dyn HlsPublisher>, HlsError> {
+        self.start_if_current(
+            stream,
+            presentation,
+            crate::delivery::store::PublicationPermit::UNRESTRICTED,
+        )
+    }
+
+    fn start_if_current(
+        &self,
+        stream: &StreamId,
+        presentation: Arc<PackagedPresentation>,
+        permit: crate::delivery::store::PublicationPermit<'_>,
     ) -> Result<Box<dyn HlsPublisher>, HlsError>;
 }
 
@@ -139,17 +158,18 @@ impl StorePublisherFactory {
         self.timing = Some((hold_back, retain));
         self
     }
-
-    pub fn store(&self) -> &StreamStore {
-        &self.store
-    }
 }
 
 impl PublisherFactory for StorePublisherFactory {
-    fn start(
+    fn store(&self) -> &StreamStore {
+        &self.store
+    }
+
+    fn start_if_current(
         &self,
         stream: &StreamId,
         presentation: Arc<PackagedPresentation>,
+        permit: crate::delivery::store::PublicationPermit<'_>,
     ) -> Result<Box<dyn HlsPublisher>, HlsError> {
         if let Some((hold_back, retain)) = self.timing {
             // The same presentation-wide value every media playlist will
@@ -195,7 +215,10 @@ impl PublisherFactory for StorePublisherFactory {
             .map(|rendition| rendition.packaging_rendition_id)
             .collect();
         Ok(Box::new(StorePublisher {
-            lease: self.store.lease(stream.clone(), &presentation)?,
+            lease: self
+                .store
+                .lease_if_current(stream.clone(), &presentation, permit)?
+                .ok_or(HlsError::Superseded)?,
             text,
             events: self.events.clone(),
         }))
@@ -409,6 +432,17 @@ mod tests {
             .start(&stream, packaged_presentation())
             .expect("takeover starts");
 
+        assert!(matches!(
+            factory.start_if_current(
+                &stream,
+                packaged_presentation(),
+                crate::delivery::store::PublicationPermit {
+                    public_stream: true,
+                    is_current: &|| false
+                }
+            ),
+            Err(HlsError::Superseded)
+        ));
         assert_eq!(
             incumbent.write(chunk()),
             Ok(PublishOutcome::Superseded),
@@ -475,7 +509,7 @@ mod tests {
             .expect("the first publication fits");
 
         assert!(matches!(
-            factory.start(&StreamId::new("b"), packaged_presentation()),
+            factory.start(&StreamId::new("b"), packaged_presentation(),),
             Err(HlsError::Capacity(StoreFull::Streams { maximum: 1 }))
         ));
     }

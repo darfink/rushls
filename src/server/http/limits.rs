@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use crate::observe::http::{HttpFailure, HttpMeters, HttpMethod, HttpObservation, HttpResource};
+use crate::{
+    delivery::uri::ViewerResource,
+    observe::http::{HttpFailure, HttpMeters, HttpMethod, HttpObservation, HttpResource},
+};
 use axum::{
     Router,
     body::Body,
@@ -110,9 +113,11 @@ pub async fn admit_application<P: super::Application>(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if let Some(meters) = application.http_meters(request.uri().path()) {
+    let viewer = super::ViewerRequest::new(request.uri().clone());
+    if let Some(meters) = application.http_meters(&viewer) {
         request.extensions_mut().insert(meters);
     }
+    request.extensions_mut().insert(viewer);
     admit(State(budget), request, next).await
 }
 
@@ -122,7 +127,18 @@ pub async fn admit(State(budget): State<HttpBudget>, request: Request, next: Nex
         "HEAD" => HttpMethod::Head,
         _ => HttpMethod::Other,
     };
-    let resource = resource(request.uri().path());
+    let resource = match request
+        .extensions()
+        .get::<super::ViewerRequest>()
+        .and_then(super::ViewerRequest::target)
+        .map(|target| target.resource)
+    {
+        Some(ViewerResource::Media(_)) => HttpResource::Media,
+        Some(ViewerResource::Hls(_)) => HttpResource::Playlist,
+        // Keep operator and malformed-path buckets in the node totals,
+        // even when there is no recognized stream to attribute.
+        None => resource(request.uri().path()),
+    };
     let mut observations = [
         Some(budget.meters.start(resource, method)),
         request

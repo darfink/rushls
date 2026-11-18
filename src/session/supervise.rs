@@ -93,7 +93,10 @@ pub async fn supervise(
     }
 }
 
-fn finish_stopped(context: &SessionContext, reason: super::StopReason) -> SessionOutcome {
+pub(super) fn finish_stopped(
+    context: &SessionContext,
+    reason: super::StopReason,
+) -> SessionOutcome {
     let outcome = SessionOutcome::from(reason);
     if outcome == SessionOutcome::Replaced {
         context.meters().process().session_replaced();

@@ -1397,7 +1397,7 @@ mod tests {
     async fn flac_live_timestamps_round_and_gaps_follow_input_mode()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::media::fixtures::{FLAC_MONO, FLAC_STEREO, flac_event, flac_parts};
-        use crate::media::{NormalizedMedia, NormalizerFactory, PassThroughNormalizerFactory};
+        use crate::media::{NormalizedMedia, start_normalizer};
         for bytes in [FLAC_MONO, FLAC_STEREO] {
             let (header, coded) = flac_parts(bytes);
             let (info, _) =
@@ -1449,8 +1449,7 @@ mod tests {
                     crate::domain::InputMode::Strict,
                     crate::domain::InputMode::Permissive,
                 ] {
-                    let mut normalized =
-                        PassThroughNormalizerFactory.start(&presentation, &timeline, mode)?;
+                    let mut normalized = start_normalizer(&presentation, &timeline, mode)?;
                     let mut out = Vec::new();
                     let mut failed = false;
                     for packet in &packets {

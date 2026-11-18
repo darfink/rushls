@@ -22,11 +22,9 @@ use crate::{
     delivery::{
         DeliveryError, DeliveryFailure, Origin, Response as DeliveryResponse, Reuse,
         store::DiskError,
-        uri::{MediaResourcePath, parse_media_path},
+        uri::{MediaResource, ViewerResource},
     },
     hooks::Hooks,
-    media::PassThroughNormalizerFactory,
-    mux::PassThroughMuxerFactory,
     observe::{Events, NodeEvent, ProcessMeters, Protocol, StreamEvent},
     session::{
         PendingPublishers, PublishersPerAddress, Registry, Services, SessionConfig, StopReason,
@@ -45,7 +43,7 @@ use crate::{
 use super::{
     http::{
         self, Application, HttpConfig, PlaybackGate, PlaybackSettings, PlaybackStartError,
-        Readiness, TlsError, TlsSettings,
+        Readiness, TlsError, TlsSettings, ViewerRequest,
     },
     metrics::{MetricsConfig, MetricsEndpoint, MetricsReader},
 };
@@ -256,33 +254,39 @@ pub struct Node {
 pub struct ViewerApplication {
     origin: Arc<Origin>,
     hls: Arc<HlsService>,
+    moq_certificate: parking_lot::RwLock<Option<Arc<rushls_common::tls::CertificateResolver>>>,
 }
 
 impl ViewerApplication {
     pub(crate) fn new(origin: Arc<Origin>, hls: Arc<HlsService>) -> Self {
-        Self { origin, hls }
+        Self {
+            origin,
+            hls,
+            moq_certificate: parking_lot::RwLock::new(None),
+        }
     }
 
     async fn serve_media(
         &self,
-        named: MediaResourcePath,
+        stream: &crate::domain::StreamId,
+        resource: MediaResource,
     ) -> Result<DeliveryResponse, DeliveryFailure> {
         let target = self
             .origin
-            .stream(&named.stream)
-            .and_then(|live| self.origin.rendition_for(&live, named.resource).ok())
+            .stream(stream)
+            .and_then(|live| self.origin.rendition_for(&live, resource).ok())
             .map(|rendition| rendition.contract.target_duration());
         let result = async {
             let live = self
                 .origin
-                .stream(&named.stream)
+                .stream(stream)
                 .ok_or(DeliveryError::UnknownStream)?;
-            let rendition = self.origin.rendition_for(&live, named.resource)?;
+            let rendition = self.origin.rendition_for(&live, resource)?;
             let object = self
                 .origin
                 .media(
-                    &named.stream,
-                    named.resource,
+                    stream,
+                    resource,
                     self.hls.media_deadline(rendition.contract),
                 )
                 .await?;
@@ -290,7 +294,7 @@ impl ViewerApplication {
             DeliveryResponse::media(
                 object.body,
                 object.gzip,
-                named.resource,
+                resource,
                 rendition.media_kind,
                 self.hls.media_reuse(Some(target)),
             )
@@ -314,24 +318,30 @@ impl ViewerApplication {
 }
 
 impl Application for ViewerApplication {
-    fn http_meters(&self, path: &str) -> Option<crate::observe::http::HttpMeters> {
-        let stream = match parse_media_path(path) {
-            Ok(Some(named)) => named.stream,
-            _ => crate::delivery::hls::uri::parse_path(path).ok()?.stream,
-        };
-        self.origin.stream(&stream).map(|live| live.http_meters())
+    fn http_meters(&self, request: &ViewerRequest) -> Option<crate::observe::http::HttpMeters> {
+        self.origin
+            .stream(request.stream()?)
+            .map(|live| live.http_meters())
+    }
+
+    fn moq_certificate(&self) -> Option<rustls::pki_types::CertificateDer<'static>> {
+        self.moq_certificate.read().as_ref()?.leaf()
     }
 
     async fn serve<'a>(
         &'a self,
-        path: &'a str,
-        query: Option<&'a str>,
+        request: &'a ViewerRequest,
     ) -> Result<DeliveryResponse, DeliveryFailure> {
-        match parse_media_path(path) {
-            Ok(Some(named)) => self.serve_media(named).await,
-            // HLS owns manifest recognition, including the distinction
-            // between a malformed name and an absent resource.
-            Ok(None) | Err(_) => self.hls.serve_path(path, query).await,
+        let Some(named) = request.target() else {
+            return Err(self.hls.unrouted(DeliveryError::UnknownResource));
+        };
+        match named.resource {
+            ViewerResource::Media(resource) => self.serve_media(&named.stream, resource).await,
+            ViewerResource::Hls(resource) => {
+                self.hls
+                    .serve_manifest(&named.stream, resource, request.uri().query())
+                    .await
+            }
         }
     }
 }
@@ -399,9 +409,9 @@ impl Node {
             .transpose()
             .map_err(RuntimeError::Recording)?;
         let mut services = Services {
+            #[cfg(test)]
+            stages: None,
             authenticator,
-            normalizers: Arc::new(PassThroughNormalizerFactory),
-            muxers: Arc::new(PassThroughMuxerFactory),
             publishers: Arc::new(
                 StorePublisherFactory::new(store.clone())
                     .with_events(events.clone())
@@ -501,8 +511,10 @@ impl Node {
             self.services.events.clone(),
             Protocol::Moq,
         )?;
+        let resolver = watch.resolver();
         let listener = MoqListener::bind(address, tls, watch, self.config.moq.clone())
             .map_err(|source| RuntimeError::BindMoq { address, source })?;
+        *self.application.moq_certificate.write() = Some(resolver);
         Ok(Some(listener))
     }
 
@@ -1430,9 +1442,11 @@ async fn run_maintenance(
             }
             _ = ticks.tick() => {
                 let reachability = store.maintain();
-                origin.remove_streams(&reachability.retired);
-                for stream in reachability.retired {
-                    events.stream(stream, StreamEvent::Retired);
+                origin.remove_streams(reachability.retired.iter().map(|(stream, _)| stream));
+                for (stream, announced) in reachability.retired {
+                    if announced {
+                        events.stream(stream, StreamEvent::Retired);
+                    }
                 }
             }
         }
@@ -1666,7 +1680,10 @@ mod tests {
 
         /// An encoder: RTMP handshake, `connect("live")`, `publish("camera")`,
         /// then it waits for the server to decide.
-        async fn publish<S: AsyncRead + AsyncWrite + Unpin>(mut io: S) -> TestResult {
+        async fn publish<S: AsyncRead + AsyncWrite + Unpin>(
+            mut io: S,
+            unpublish: bool,
+        ) -> TestResult {
             let mut handshake = Handshake::new(HandshakeRole::Client);
             io.write_all(&handshake.generate_outbound_p0_and_p1()?)
                 .await?;
@@ -1699,6 +1716,40 @@ mod tests {
                         ClientOutput::Event(ClientEvent::ConnectionRequestAccepted { .. }) => {
                             session.publish("camera", PublishMode::Live)?;
                         }
+                        ClientOutput::Event(ClientEvent::PublishRequestAccepted {
+                            stream, ..
+                        }) => {
+                            use crate::mux::fixtures::{AAC_EXTRADATA, AAC_FRAME};
+                            let config = [&[0xaf, 0][..], AAC_EXTRADATA].concat();
+                            write(
+                                &mut io,
+                                session.send_audio(
+                                    stream,
+                                    config,
+                                    rtmpx::time::RtmpTimestamp::new(0),
+                                    rtmpx::chunk_io::DropPolicy::Never,
+                                )?,
+                            )
+                            .await?;
+                            let frame = Bytes::from([&[0xaf, 1][..], AAC_FRAME].concat());
+                            for index in 0..120 {
+                                let timestamp = index * 1024 / 48; // 48 kHz AAC on RTMP's millisecond clock.
+                                write(
+                                    &mut io,
+                                    session.send_audio(
+                                        stream,
+                                        frame.clone(),
+                                        rtmpx::time::RtmpTimestamp::new(timestamp),
+                                        rtmpx::chunk_io::DropPolicy::Never,
+                                    )?,
+                                )
+                                .await?;
+                            }
+                            if !unpublish {
+                                return Ok(());
+                            }
+                            session.delete_stream(stream)?;
+                        }
                         _ => {}
                     }
                 }
@@ -1708,6 +1759,62 @@ mod tests {
                 }
                 input = Bytes::copy_from_slice(&buffer[..read]);
             }
+        }
+
+        #[tokio::test]
+        async fn socket_eof_resumes_the_playlist_and_unpublish_ends_it() -> TestResult {
+            let mut config = NodeConfig::default();
+            config.session.segmentation = crate::segment::SegmentationPolicy::latency_first(
+                Duration::from_secs(1),
+                Duration::from_millis(200),
+            );
+            let node = node(config)?;
+            for unpublish in [false, true] {
+                let (client, io) = tokio::io::duplex(128 * 1024);
+                let encoder = tokio::spawn(publish(client, unpublish));
+                let pending = RtmpPendingPublish::handshake(
+                    io,
+                    "127.0.0.1:1935".parse()?,
+                    RtmpConfig::default(),
+                )
+                .await?;
+                let result = run_session(
+                    Box::new(pending),
+                    node.services(),
+                    &node.config.session,
+                    crate::session::PendingPermit::unlimited(),
+                )
+                .await?;
+                encoder.await??;
+                let expected = if unpublish {
+                    crate::session::SessionOutcome::Ended
+                } else {
+                    crate::session::SessionOutcome::Interrupted
+                };
+                assert_eq!(result, expected);
+                assert!(
+                    !node
+                        .store()
+                        .get(&crate::domain::StreamId::new("live/camera"))
+                        .ok_or("retained RTMP stream")?
+                        .was_announced()
+                );
+                let response = node
+                    .application
+                    .serve(&ViewerRequest::new("/live/camera/0/audio.m3u8".parse()?))
+                    .await
+                    .map_err(|e| e.error)?;
+                let crate::delivery::Body::Manifest(body) = response.body else {
+                    panic!("expected media playlist")
+                };
+                let playlist = std::str::from_utf8(&body)?;
+                assert_eq!(playlist.contains("#EXT-X-ENDLIST"), unpublish);
+                assert_eq!(
+                    playlist.lines().any(|line| line == "#EXT-X-DISCONTINUITY"),
+                    unpublish
+                );
+            }
+            Ok(())
         }
 
         #[tokio::test]
@@ -1730,7 +1837,7 @@ mod tests {
                     .connect(ServerName::try_from("origin.test")?, tcp)
                     .await?;
                 // The publish outcome is decided by the test, not the encoder.
-                let _ = publish(tls).await;
+                let _ = publish(tls, false).await;
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(local)
             });
 
@@ -1754,7 +1861,7 @@ mod tests {
             let address = listener.tcp.local_addr()?;
             let encoder = tokio::spawn(async move {
                 let tcp = tokio::net::TcpStream::connect(address).await?;
-                let _ = publish(tcp).await;
+                let _ = publish(tcp, false).await;
                 Ok::<_, std::io::Error>(())
             });
 

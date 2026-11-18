@@ -3,8 +3,9 @@ use std::{sync::Arc, time::Duration};
 use crate::{
     admission::Authenticator,
     delivery::hls::PublisherFactory,
-    media::NormalizerFactory,
-    mux::MuxerFactory,
+    domain::InputMode,
+    media::{self, NormalizeError, PresentationPlan, StartedNormalizer, TimelineCalibration},
+    mux::{self, MuxError, MuxerStartRequest, StartedMuxer},
     observe::{Events, ProcessMeters},
     segment::{PrerollLimits, SegmentationPolicy},
     source::{DiscoveryLimits, InputLimits},
@@ -14,19 +15,51 @@ use super::{Registry, SupervisionPolicy};
 
 /// The collaborators every session shares, wired once at start-up.
 ///
-/// Erased to trait objects rather than threaded as type parameters. Each of
-/// these is consulted at most once per session, so the indirection is
-/// unmeasurable, and in exchange nothing about how a node is assembled leaks
-/// into the signature of the code that runs a session.
+/// The authenticator and publisher factory are trait objects so a node can
+/// choose its admission policy and recording configuration without threading
+/// their types through the session driver.
 #[derive(Clone)]
 pub struct Services {
     pub authenticator: Arc<dyn Authenticator>,
-    pub normalizers: Arc<dyn NormalizerFactory>,
-    pub muxers: Arc<dyn MuxerFactory>,
     pub publishers: Arc<dyn PublisherFactory>,
     pub sessions: Registry,
     pub meters: ProcessMeters,
     pub events: Events,
+    #[cfg(test)]
+    pub(crate) stages: Option<super::tests::StageOverrides>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::unused_self,
+        reason = "only tests can replace stage constructors"
+    )
+)]
+impl Services {
+    pub(super) fn start_normalizer(
+        &self,
+        presentation: &PresentationPlan,
+        timeline: &TimelineCalibration,
+        mode: InputMode,
+    ) -> Result<StartedNormalizer, NormalizeError> {
+        #[cfg(test)]
+        if let Some(stages) = &self.stages {
+            return stages.start_normalizer(presentation, timeline, mode);
+        }
+        media::start_normalizer(presentation, timeline, mode)
+    }
+
+    pub(super) fn start_muxer(
+        &self,
+        request: MuxerStartRequest<'_>,
+    ) -> Result<StartedMuxer, MuxError> {
+        #[cfg(test)]
+        if let Some(stages) = &self.stages {
+            return Ok(stages.start_muxer(request));
+        }
+        mux::start_muxer(request)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

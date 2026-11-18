@@ -841,10 +841,7 @@ mod tests {
             TrackId,
             fixtures::{TrackBuilder, catalog},
         },
-        media::{
-            NormalizedMedia, NormalizerFactory, PassThroughNormalizerFactory, VideoSample,
-            calibrate, validate,
-        },
+        media::{NormalizedMedia, VideoSample, calibrate, start_normalizer, validate},
         mux::{
             InitializationSegment, MuxerStartRequest, PackagedMedia,
             fixtures::{
@@ -860,7 +857,7 @@ mod tests {
         },
     };
 
-    use crate::mux::{MuxerFactory, PassThroughMuxerFactory};
+    use crate::mux::start_muxer;
 
     #[test]
     fn display_resolution_applies_sar_with_nearest_pixel_rounding()
@@ -1026,15 +1023,14 @@ mod tests {
     ) -> crate::mux::StartedMuxer {
         let segmentation =
             SegmentationPlan::new(input, plans).expect("fixture segmentation validates");
-        PassThroughMuxerFactory
-            .start(MuxerStartRequest {
-                presentation: input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events,
-                budget: &crate::domain::PipelineBudget::unlimited(),
-            })
-            .expect("the fixture CMAF output starts")
+        start_muxer(MuxerStartRequest {
+            presentation: input,
+            segmentation: &segmentation,
+            time_anchor: SystemTime::UNIX_EPOCH,
+            events,
+            budget: &crate::domain::PipelineBudget::unlimited(),
+        })
+        .expect("the fixture CMAF output starts")
     }
 
     fn start(
@@ -1064,7 +1060,7 @@ mod tests {
             SegmentBoundaryPolicy::Strict => Duration::ZERO,
             SegmentBoundaryPolicy::ExtendToRandomAccess { maximum_extension } => maximum_extension,
         };
-        PassThroughMuxerFactory.start(MuxerStartRequest {
+        start_muxer(MuxerStartRequest {
             presentation: &input,
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,
@@ -2222,9 +2218,9 @@ mod tests {
         let input = validate(&discovery.tracks, &StreamPolicy::permissive())
             .expect("fixture tracks are admitted");
         let timeline = calibrate(&input).expect("fixture timeline calibrates");
-        let mut normalized = PassThroughNormalizerFactory
-            .start(&input, &timeline, crate::domain::InputMode::Permissive)
-            .expect("fixture normalization starts");
+        let mut normalized =
+            start_normalizer(&input, &timeline, crate::domain::InputMode::Permissive)
+                .expect("fixture normalization starts");
 
         let mut packets = Vec::new();
         while source
@@ -2394,15 +2390,14 @@ mod tests {
         let segmentation = SegmentationPlan::new(&fixture.presentation, tracks)
             .expect("fixture segmentation is valid");
         let sink = discarded_events();
-        let mut mux = PassThroughMuxerFactory
-            .start(MuxerStartRequest {
-                presentation: &fixture.presentation,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events: &sink,
-                budget: &crate::domain::PipelineBudget::unlimited(),
-            })
-            .expect("presentation packages");
+        let mut mux = start_muxer(MuxerStartRequest {
+            presentation: &fixture.presentation,
+            segmentation: &segmentation,
+            time_anchor: SystemTime::UNIX_EPOCH,
+            events: &sink,
+            budget: &crate::domain::PipelineBudget::unlimited(),
+        })
+        .expect("presentation packages");
         let mut media = Vec::new();
         for sample in fixture.samples {
             mux.muxer
@@ -3311,15 +3306,14 @@ mod tests {
                 .collect(),
         )
         .expect("fixture segmentation validates");
-        let started = PassThroughMuxerFactory
-            .start(MuxerStartRequest {
-                presentation: &subtitle_input,
-                segmentation: &segmentation,
-                time_anchor: SystemTime::UNIX_EPOCH,
-                events: &sink,
-                budget: &crate::domain::PipelineBudget::unlimited(),
-            })
-            .expect("mixed CMAF and WebVTT presentation starts");
+        let started = start_muxer(MuxerStartRequest {
+            presentation: &subtitle_input,
+            segmentation: &segmentation,
+            time_anchor: SystemTime::UNIX_EPOCH,
+            events: &sink,
+            budget: &crate::domain::PipelineBudget::unlimited(),
+        })
+        .expect("mixed CMAF and WebVTT presentation starts");
         assert_eq!(
             started.presentation.renditions[1].config.segment_format,
             crate::mux::MediaSegmentFormat::WebVtt
@@ -3459,7 +3453,7 @@ mod tests {
         rate: u32,
         omit_packets: bool,
     ) -> Result<Vec<PackagedMedia>, Box<dyn std::error::Error>> {
-        let mut normalized = PassThroughNormalizerFactory.start(
+        let mut normalized = start_normalizer(
             &fixture.presentation,
             &fixture.timeline,
             crate::domain::InputMode::Permissive,

@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use parking_lot::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::{
     admission::{
@@ -8,25 +9,27 @@ use crate::{
         PublishGrant, PublishRequest, PublishResource, StreamPolicy, TakeoverPolicy,
     },
     delivery::hls::{
-        HlsError, HlsPublisher, PublishOutcome, PublisherFactory, StorePublisherFactory,
-        StreamStore,
+        HlsError, HlsPublisher, LiveStream, PublishOutcome, PublisherFactory,
+        StorePublisherFactory, StreamStore,
     },
     delivery::store::StoreWriteError,
     domain::{
-        Appender, BoxFuture, Codec, MediaKind, Payload, RenditionId, SessionId, StreamId, Timebase,
-        TrackCounts, TrackId,
+        Appender, BoxFuture, Codec, InputMode, MediaKind, Payload, RenditionId, SessionId,
+        StreamId, Timebase, TrackCounts, TrackId,
     },
     media::{
-        MediaNormalizer, NormalizeError, NormalizedMedia, NormalizerFactory, PresentationPlan,
-        StartedNormalizer, TimelineCalibration, VideoSample,
+        MediaNormalizer, NormalizeError, NormalizedMedia, PresentationPlan, StartedNormalizer,
+        TimelineCalibration, VideoSample, start_normalizer,
     },
     mux::{
-        FinishReason, InitializationSegment, MuxError, Muxer, MuxerFactory, MuxerStartRequest,
-        PackagedChunk, PackagedMedia, PackagedPresentation, PackagedSegmentCompletion,
-        PackagingRenditionId, PackagingSegmentId, StartedMuxer, fixtures as mux_fixtures,
-        fixtures::RenditionBuilder,
+        FinishReason, InitializationSegment, MuxError, Muxer, MuxerStartRequest, PackagedChunk,
+        PackagedMedia, PackagedPresentation, PackagedSegmentCompletion, PackagingRenditionId,
+        PackagingSegmentId, StartedMuxer, fixtures as mux_fixtures, fixtures::RenditionBuilder,
     },
-    observe::{EventObserver, Events, ProcessMeters, SessionEnd, SessionEvent, SourceMeters},
+    observe::{
+        EventObserver, Events, ProcessMeters, SessionEnd, SessionEvent, SourceMeters,
+        lifecycle::{Event, Kind, Outcome, Projector, PublisherEnded},
+    },
     segment::{PrerollLimits, SegmentationPolicy},
     source::{
         AcceptedPublish, BatchUnit, DensityUnit, DiscoveryLimits, DiscoveryReport, InputLimits,
@@ -42,9 +45,11 @@ use super::{
 };
 
 const SECOND: i64 = 90_000;
+const WAIT_LIMIT: Duration = Duration::from_secs(5);
 
 type CallLog = Arc<Mutex<Vec<&'static str>>>;
 type FinishLog = Arc<Mutex<Vec<FinishReason>>>;
+type SessionTask = JoinHandle<Result<SessionOutcome, SessionError>>;
 /// Captures the session's pipeline budget so tests can check it drains.
 type BudgetProbe = Arc<Mutex<Option<crate::domain::PipelineBudget>>>;
 
@@ -89,15 +94,23 @@ enum Ending {
     /// Never finishes probing, so the spine's discovery deadline is the only
     /// thing that can end the session.
     HangOnDiscovery,
+    YieldDuringDiscovery,
     /// Fails with a source error once this many batches were delivered.
     FailAfter(u32),
     /// Reports a clean end of input while still holding media back.
     LyingEof,
 }
 
+#[derive(Clone, Copy)]
+enum ScriptedTrack {
+    Video,
+    Audio,
+}
+
 struct FakeSource {
     log: CallLog,
     meters: Arc<dyn SourceMeters>,
+    track: ScriptedTrack,
     batches: VecDeque<Vec<Packet>>,
     ending: Ending,
     panics_after: Option<u32>,
@@ -111,20 +124,33 @@ impl PacketSource for FakeSource {
     ) -> BoxFuture<'_, Result<DiscoveryReport, SourceError>> {
         record(&self.log, "discover");
         let ending = self.ending;
+        let track = self.track;
         Box::pin(async move {
+            if ending == Ending::YieldDuringDiscovery {
+                tokio::task::yield_now().await;
+            }
             if ending == Ending::HangOnDiscovery {
                 std::future::pending::<()>().await;
             }
-            Ok(DiscoveryReport {
-                tracks: {
+            let track = match track {
+                ScriptedTrack::Video => {
                     let mut track = crate::domain::fixtures::track(0, MediaKind::Video);
                     if let crate::domain::MediaParameters::Video { frame_rate, .. } =
                         &mut track.parameters
                     {
                         *frame_rate = Some(crate::domain::FrameRate::new(nz::u32!(1), nz::u32!(1)));
                     }
-                    crate::domain::fixtures::catalog(vec![track])
-                },
+                    track
+                }
+                ScriptedTrack::Audio => {
+                    crate::domain::fixtures::TrackBuilder::new(0, MediaKind::Audio)
+                        .timebase(Timebase::new(nz::u32!(1), nz::u32!(48_000)))
+                        .codec_extradata(&[0x11, 0x90][..])
+                        .build()
+                }
+            };
+            Ok(DiscoveryReport {
+                tracks: crate::domain::fixtures::catalog(vec![track]),
             })
         })
     }
@@ -167,7 +193,10 @@ impl PacketSource for FakeSource {
             }
 
             match self.ending {
-                Ending::Eof | Ending::HangOnDiscovery | Ending::LyingEof => Ok(InputState::Closed),
+                Ending::Eof
+                | Ending::HangOnDiscovery
+                | Ending::YieldDuringDiscovery
+                | Ending::LyingEof => Ok(InputState::Closed),
                 Ending::Interrupted => Ok(InputState::Interrupted),
                 Ending::Stall => std::future::pending().await,
                 Ending::CodecChange => {
@@ -185,6 +214,8 @@ impl PacketSource for FakeSource {
 struct FakePending {
     log: CallLog,
     resource: &'static str,
+    credential: &'static str,
+    track: ScriptedTrack,
     batches: Vec<Vec<Packet>>,
     ending: Ending,
     panics_after: Option<u32>,
@@ -200,7 +231,7 @@ impl PendingPublish for FakePending {
                 namespace: Some("live".into()),
                 name: self.resource.into(),
             },
-            credential: PresentedCredential::new("secret"),
+            credential: PresentedCredential::new(self.credential),
             client: ClientInfo {
                 remote_address: "127.0.0.1:1935".parse().expect("constant address is valid"),
                 encoder: Some("test-encoder".into()),
@@ -223,6 +254,7 @@ impl PendingPublish for FakePending {
                 source: Box::new(FakeSource {
                     log: self.log.clone(),
                     meters,
+                    track: self.track,
                     batches: self.batches.into(),
                     ending: self.ending,
                     panics_after: self.panics_after,
@@ -271,18 +303,33 @@ impl Authenticator for FakeAuthenticator {
     }
 }
 
-struct FakeNormalizerFactory {
+type StartNormalizer = fn(
+    &PresentationPlan,
+    &TimelineCalibration,
+    InputMode,
+) -> Result<StartedNormalizer, NormalizeError>;
+
+/// Scripted stage startup for lifecycle tests, with an optional real normalizer
+/// for cases that exercise timestamp handling through the session.
+#[derive(Clone)]
+pub(crate) struct StageOverrides {
+    on_mux_start: Option<Arc<dyn Fn() + Send + Sync>>,
+    normalizer: Option<StartNormalizer>,
     log: CallLog,
+    finished: FinishLog,
     faults: Faults,
 }
 
-impl NormalizerFactory for FakeNormalizerFactory {
-    fn start(
+impl StageOverrides {
+    pub(super) fn start_normalizer(
         &self,
         presentation: &PresentationPlan,
         timeline: &TimelineCalibration,
-        _input_mode: crate::domain::InputMode,
+        mode: InputMode,
     ) -> Result<StartedNormalizer, NormalizeError> {
+        if let Some(start) = self.normalizer {
+            return start(presentation, timeline, mode);
+        }
         record(&self.log, "normalizer_start");
         Ok(StartedNormalizer {
             normalizer: Box::new(FakeNormalizer {
@@ -292,6 +339,45 @@ impl NormalizerFactory for FakeNormalizerFactory {
             presentation: presentation.clone(),
             timeline: timeline.clone(),
         })
+    }
+
+    pub(super) fn start_muxer(&self, request: MuxerStartRequest<'_>) -> StartedMuxer {
+        record(&self.log, "muxer_start");
+        if let Some(on_start) = &self.on_mux_start {
+            on_start();
+        }
+        // One-second chunks accumulated into a single segment closed at end of
+        // stream. This fake never cuts mid-publication, so its declared target
+        // covers the whole scripted run rather than a live cadence: delivery
+        // holds a rendition to the target it advertises, and a fixture that
+        // under-declared would be refused for a cadence it never had.
+        let presentation = mux_fixtures::presentation_at(
+            request.time_anchor,
+            request.presentation,
+            vec![
+                RenditionBuilder::new(0, MediaKind::Video)
+                    .key("video/main")
+                    .config(mux_fixtures::config(
+                        Timebase::hz90k(),
+                        4 * SECOND as u64,
+                        Some(SECOND as u64),
+                    ))
+                    .build(),
+            ],
+        );
+        StartedMuxer {
+            muxer: Box::new(FakeMuxer {
+                initialized: false,
+                chunks: 0,
+                segment: 0,
+                segment_start: 0,
+                pushes: 0,
+                duration: 0,
+                finished: Arc::clone(&self.finished),
+                faults: self.faults,
+            }),
+            presentation: Arc::new(presentation),
+        }
     }
 }
 
@@ -338,50 +424,6 @@ impl MediaNormalizer for FakeNormalizer {
     }
 }
 
-struct FakeMuxerFactory {
-    log: CallLog,
-    finished: FinishLog,
-    faults: Faults,
-}
-
-impl MuxerFactory for FakeMuxerFactory {
-    fn start(&self, request: MuxerStartRequest<'_>) -> Result<StartedMuxer, MuxError> {
-        record(&self.log, "muxer_start");
-        // One-second chunks accumulated into a single segment closed at end of
-        // stream. This fake never cuts mid-publication, so its declared target
-        // covers the whole scripted run rather than a live cadence: delivery
-        // holds a rendition to the target it advertises, and a fixture that
-        // under-declared would be refused for a cadence it never had.
-        let presentation = mux_fixtures::presentation_at(
-            request.time_anchor,
-            request.presentation,
-            vec![
-                RenditionBuilder::new(0, MediaKind::Video)
-                    .key("video/main")
-                    .config(mux_fixtures::config(
-                        Timebase::hz90k(),
-                        4 * SECOND as u64,
-                        Some(SECOND as u64),
-                    ))
-                    .build(),
-            ],
-        );
-        Ok(StartedMuxer {
-            muxer: Box::new(FakeMuxer {
-                initialized: false,
-                chunks: 0,
-                segment: 0,
-                segment_start: 0,
-                pushes: 0,
-                duration: 0,
-                finished: Arc::clone(&self.finished),
-                faults: self.faults,
-            }),
-            presentation: Arc::new(presentation),
-        })
-    }
-}
-
 /// Emits one part per sample; gaps close the current segment before absence.
 struct FakeMuxer {
     initialized: bool,
@@ -395,10 +437,6 @@ struct FakeMuxer {
 }
 
 impl Muxer for FakeMuxer {
-    fn expected_publication_interval(&self) -> Duration {
-        Duration::from_secs(1)
-    }
-
     fn push(
         &mut self,
         sample: NormalizedMedia,
@@ -494,12 +532,17 @@ struct FaultyPublisherFactory {
 }
 
 impl PublisherFactory for FaultyPublisherFactory {
-    fn start(
+    fn store(&self) -> &crate::delivery::store::StreamStore {
+        self.inner.store()
+    }
+
+    fn start_if_current(
         &self,
         stream: &StreamId,
         presentation: Arc<PackagedPresentation>,
+        permit: crate::delivery::store::PublicationPermit<'_>,
     ) -> Result<Box<dyn HlsPublisher>, HlsError> {
-        let inner = self.inner.start(stream, presentation)?;
+        let inner = self.inner.start_if_current(stream, presentation, permit)?;
         Ok(Box::new(FaultyPublisher {
             inner,
             writes: 0,
@@ -534,19 +577,60 @@ impl HlsPublisher for FaultyPublisher {
 
 #[derive(Default)]
 struct Recorder {
-    events: Mutex<Vec<SessionEvent>>,
+    events: Mutex<Vec<(SessionId, SessionEvent)>>,
+    streams: Mutex<Vec<crate::observe::StreamEvent>>,
 }
 
 impl EventObserver for Recorder {
-    fn observe(&self, _session: SessionId, event: SessionEvent) {
-        self.events.lock().push(event);
+    fn observe_stream(&self, _: StreamId, event: crate::observe::StreamEvent) {
+        self.streams.lock().push(event);
+    }
+
+    fn observe(&self, session: SessionId, event: SessionEvent) {
+        self.events.lock().push((session, event));
     }
 }
 
 impl Recorder {
     fn names(&self) -> Vec<&'static str> {
-        self.events.lock().iter().map(name).collect()
+        self.events
+            .lock()
+            .iter()
+            .map(|(_, event)| name(event))
+            .collect()
     }
+
+    fn last_end(&self) -> Option<SessionEnd> {
+        self.events.lock().iter().rev().find_map(|(_, event)| {
+            let SessionEvent::Ended { end } = event else {
+                return None;
+            };
+            Some(*end)
+        })
+    }
+
+    fn projected(&self) -> Vec<Event> {
+        // Replay the full history so the projector can associate each end or
+        // compensation notice with its original admission.
+        let projector = Projector::new();
+        self.events
+            .lock()
+            .iter()
+            .filter_map(|(session, event)| projector.project(*session, event))
+            .collect()
+    }
+}
+
+fn publisher_end(event: &Event) -> Option<&PublisherEnded> {
+    let Event::PublisherEnded(end) = event else {
+        return None;
+    };
+    Some(end)
+}
+
+fn assert_event_count(events: &[Event], kind: Kind, expected: usize) {
+    let count = events.iter().filter(|event| event.kind() == kind).count();
+    assert_eq!(count, expected, "unexpected number of {kind} events");
 }
 
 fn name(event: &SessionEvent) -> &'static str {
@@ -590,6 +674,30 @@ fn packet(pts: i64, random_access: bool) -> Packet {
         subtitle_position: None,
         payload: Payload::from(vec![1, 2, 3]),
     }
+}
+
+fn audio_packet(pts: i64) -> Packet {
+    Packet {
+        track_id: TrackId(0),
+        pts: Some(pts),
+        dts: Some(pts),
+        duration: Some(1024),
+        random_access: false,
+        audio_trim: crate::domain::AudioTrim::default(),
+        webvtt: crate::domain::WebVttCueMetadata::default(),
+        subtitle_position: None,
+        payload: (&[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c][..]).into(),
+    }
+}
+
+fn video_batches_before_issue(live: bool, issue_batch: Vec<Packet>) -> Vec<Vec<Packet>> {
+    // The second batch reaches the live loop only when the first batch
+    // supplies enough keyframes to lock segmentation during pre-roll.
+    let frames = if live { 3 } else { 1 };
+    let prefix = (0..frames)
+        .map(|index| packet(index * SECOND, true))
+        .collect();
+    vec![prefix, issue_batch]
 }
 
 /// Enough media for pre-roll to prove a boundary at one second, plus one more
@@ -638,12 +746,11 @@ fn config() -> SessionConfig {
 
 struct Harness {
     services: Services,
-    log: CallLog,
     finished: FinishLog,
+    log: CallLog,
     recorder: Arc<Recorder>,
     store: StreamStore,
     meters: ProcessMeters,
-    sessions: Registry,
     panics_after: Option<u32>,
     budget_probe: BudgetProbe,
 }
@@ -653,53 +760,64 @@ impl Harness {
         let log = CallLog::default();
         let finished = FinishLog::default();
         let recorder = Arc::new(Recorder::default());
-        let store = StreamStore::default();
+        let events = Events::new(recorder.clone());
+        let store = StreamStore::default().with_events(events.clone());
         let meters = ProcessMeters::default();
-        let sessions = Registry::default();
-
         let services = Services {
+            stages: Some(StageOverrides {
+                normalizer: None,
+                on_mux_start: None,
+                log: log.clone(),
+                finished: finished.clone(),
+                faults,
+            }),
             authenticator: Arc::new(FakeAuthenticator {
                 log: log.clone(),
                 rejection,
                 policy,
             }),
-            normalizers: Arc::new(FakeNormalizerFactory {
-                log: log.clone(),
-                faults,
-            }),
-            muxers: Arc::new(FakeMuxerFactory {
-                log: log.clone(),
-                finished: Arc::clone(&finished),
-                faults,
-            }),
             publishers: Arc::new(FaultyPublisherFactory {
-                inner: StorePublisherFactory::new(store.clone()),
+                inner: StorePublisherFactory::new(store.clone()).with_events(events.clone()),
                 faults,
             }),
-            sessions: sessions.clone(),
+            sessions: Registry::default(),
             meters: meters.clone(),
-            events: Events::new(Arc::clone(&recorder) as Arc<dyn EventObserver>),
+            events,
         };
 
         Self {
             services,
-            log,
             finished,
+            log,
             recorder,
             store,
             meters,
-            sessions,
             panics_after: faults.source_panics_after,
             budget_probe: BudgetProbe::default(),
         }
     }
 
     fn healthy() -> Self {
-        Self::new(None, StreamPolicy::permissive(), Faults::default())
+        Self::faulty(Faults::default())
     }
 
     fn faulty(faults: Faults) -> Self {
         Self::new(None, StreamPolicy::permissive(), faults)
+    }
+
+    fn with_normalizer(input_mode: InputMode, normalizer: StartNormalizer) -> Self {
+        let policy = StreamPolicy {
+            input_mode,
+            ..StreamPolicy::permissive()
+        };
+        let mut harness = Self::new(None, policy, Faults::default());
+        harness
+            .services
+            .stages
+            .as_mut()
+            .expect("scripted stages")
+            .normalizer = Some(normalizer);
+        harness
     }
 
     fn pending(&self, ending: Ending) -> Box<dyn PendingPublish> {
@@ -708,23 +826,28 @@ impl Harness {
 
     fn pending_for(&self, resource: &'static str, ending: Ending) -> Box<dyn PendingPublish> {
         Box::new(FakePending {
-            log: self.log.clone(),
             resource,
-            batches: scripted_batches(),
-            ending,
             panics_after: self.panics_after,
             budget_probe: Some(self.budget_probe.clone()),
+            ..self.scripted_pending(scripted_batches(), ending)
         })
     }
 
+    fn scripted_pending(&self, batches: Vec<Vec<Packet>>, ending: Ending) -> FakePending {
+        FakePending {
+            log: self.log.clone(),
+            resource: "camera",
+            credential: "secret",
+            track: ScriptedTrack::Video,
+            batches,
+            ending,
+            panics_after: None,
+            budget_probe: None,
+        }
+    }
+
     async fn run(&self, ending: Ending) -> Result<SessionOutcome, SessionError> {
-        run_session(
-            self.pending(ending),
-            &self.services,
-            &config(),
-            PendingPermit::unlimited(),
-        )
-        .await
+        self.run_with(ending, &config()).await
     }
 
     async fn run_with(
@@ -732,13 +855,61 @@ impl Harness {
         ending: Ending,
         config: &SessionConfig,
     ) -> Result<SessionOutcome, SessionError> {
+        self.run_pending(self.pending(ending), config).await
+    }
+
+    async fn run_pending(
+        &self,
+        pending: Box<dyn PendingPublish>,
+        config: &SessionConfig,
+    ) -> Result<SessionOutcome, SessionError> {
+        run_session(pending, &self.services, config, PendingPermit::unlimited()).await
+    }
+
+    async fn run_scripted_video(
+        &self,
+        batches: Vec<Vec<Packet>>,
+    ) -> Result<SessionOutcome, SessionError> {
+        let pending = self.scripted_pending(batches, Ending::Eof);
+        self.run_pending(Box::new(pending), &config()).await
+    }
+
+    async fn run_scripted_audio(
+        &self,
+        batches: Vec<Vec<Packet>>,
+    ) -> Result<SessionOutcome, SessionError> {
+        // Exercise production muxing as well as normalization for audio.
+        let pending = FakePending {
+            track: ScriptedTrack::Audio,
+            ..self.scripted_pending(batches, Ending::Eof)
+        };
+        let services = Services {
+            stages: None,
+            ..self.services.clone()
+        };
         run_session(
-            self.pending(ending),
-            &self.services,
-            config,
+            Box::new(pending),
+            &services,
+            &config(),
             PendingPermit::unlimited(),
         )
         .await
+    }
+
+    fn spawn_stalled(&self) -> SessionTask {
+        self.spawn_pending(self.pending(Ending::Stall), PendingPermit::unlimited())
+    }
+
+    fn spawn_pending(&self, pending: Box<dyn PendingPublish>, slot: PendingPermit) -> SessionTask {
+        let services = self.services.clone();
+        tokio::spawn(async move { run_session(pending, &services, &config(), slot).await })
+    }
+
+    async fn cancel(&self, session: SessionTask, role: &str) -> SessionOutcome {
+        self.services.sessions.stop_all(StopReason::Cancelled);
+        join_session(session, role)
+            .await
+            .expect("cancellation is not a failure")
     }
 
     fn calls(&self) -> Vec<&'static str> {
@@ -750,9 +921,75 @@ impl Harness {
     }
 
     /// The stream this harness publishes, whether or not it is still leased.
-    fn live(&self) -> Arc<crate::delivery::hls::LiveStream> {
+    fn live(&self) -> Arc<LiveStream> {
         self.store.get(&stream()).expect("the stream is retained")
     }
+
+    /// Waits until a session has published its first media into the store.
+    async fn await_published(&self) -> Arc<LiveStream> {
+        tokio::time::timeout(WAIT_LIMIT, async {
+            loop {
+                if let Some(live) = self.store.get(&stream())
+                    && live.snapshot().renditions.iter().any(|rendition| {
+                        let media = rendition.snapshot();
+                        media.open_segment.is_some() || media.has_completed_segment()
+                    })
+                {
+                    return live;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the session publishes")
+    }
+}
+
+async fn join_session(session: SessionTask, role: &str) -> Result<SessionOutcome, SessionError> {
+    tokio::time::timeout(WAIT_LIMIT, session)
+        .await
+        .unwrap_or_else(|_| panic!("{role} did not finish within {WAIT_LIMIT:?}"))
+        .unwrap_or_else(|error| panic!("{role} task failed to join: {error}"))
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_cannot_reveal_a_retained_publisher_key() -> Result<(), SessionError> {
+    for public_first in [false, true] {
+        let harness = Harness::healthy();
+        for (i, public) in [public_first, !public_first, true].into_iter().enumerate() {
+            // Every grant names live/camera. Only the public requests have
+            // a credential distinct from the playback route.
+            let pending = FakePending {
+                credential: if public { "separate-key" } else { "camera" },
+                ..harness.scripted_pending(scripted_batches(), Ending::Interrupted)
+            };
+            let before = harness.recorder.streams.lock().len();
+            harness.run_pending(Box::new(pending), &config()).await?;
+            assert!(harness.live().is_playable());
+            assert_eq!(harness.live().was_announced(), public_first);
+            if i == 0 && public_first {
+                let stream_events = harness.recorder.streams.lock();
+                assert!(stream_events.contains(&crate::observe::StreamEvent::Available));
+                assert!(
+                    stream_events
+                        .iter()
+                        .any(|e| matches!(e, crate::observe::StreamEvent::SegmentReady(_)))
+                );
+            } else {
+                assert_eq!(harness.recorder.streams.lock().len(), before);
+            }
+            let projected = harness.recorder.projected();
+            assert_eq!(projected.len(), if public_first { 2 } else { 0 });
+        }
+        tokio::time::advance(Duration::from_hours(1)).await;
+        assert_eq!(harness.store.maintain().retired, [(stream(), public_first)]);
+        harness.run(Ending::Eof).await?;
+        assert!(
+            harness.live().was_announced(),
+            "fresh stream may announce again"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -802,7 +1039,7 @@ async fn a_publication_runs_through_every_stage_and_releases_everything_it_held(
     assert_eq!(totals.segments_published, 1);
 
     assert_eq!(harness.finish_reasons(), [FinishReason::Final]);
-    assert!(harness.sessions.is_empty());
+    assert!(harness.services.sessions.is_empty());
     assert_eq!(harness.store.leased(), 0, "the write lease is released");
     assert!(
         harness.live().is_ended(),
@@ -825,17 +1062,7 @@ async fn an_interrupted_input_flushes_media_without_ending_the_stream() {
         !harness.live().is_ended(),
         "delivery remains resumable while the publisher reconnects"
     );
-    let ended = harness
-        .recorder
-        .events
-        .lock()
-        .iter()
-        .filter_map(|event| match event {
-            SessionEvent::Ended { end } => Some(*end),
-            _ => None,
-        })
-        .next_back();
-    assert_eq!(ended, Some(SessionEnd::Interrupted));
+    assert_eq!(harness.recorder.last_end(), Some(SessionEnd::Interrupted));
 }
 
 #[tokio::test]
@@ -904,7 +1131,7 @@ async fn a_disallowed_codec_ends_the_session_before_any_media_is_planned() {
     );
     assert_eq!(harness.recorder.names(), ["accepted", "failed"]);
     assert_eq!(harness.meters.snapshot().sessions_failed, 1);
-    assert!(harness.sessions.is_empty());
+    assert!(harness.services.sessions.is_empty());
 }
 
 #[tokio::test]
@@ -925,24 +1152,21 @@ async fn a_midstream_codec_change_is_counted_by_the_source_that_saw_it() {
     assert_eq!(totals.sessions_failed, 1);
     assert_eq!(totals.codec_parameter_changes, 1);
     assert_eq!(totals.drain_failures, 0);
-    assert!(harness.sessions.is_empty());
+    assert!(harness.services.sessions.is_empty());
     assert_eq!(harness.store.leased(), 0);
 }
 
 #[tokio::test]
 async fn an_admission_slot_is_returned_before_the_session_it_admitted_ends() {
     let harness = Harness::healthy();
-    let services = harness.services.clone();
-    let pending = harness.pending(Ending::Stall);
     // One slot, so a session still holding it would make the budget observably
     // empty for as long as the publisher stays connected.
     let publishers = PendingPublishers::new(1);
     let slot = publishers.reserve().await;
     assert_eq!(publishers.available(), 0);
 
-    let session =
-        tokio::spawn(async move { run_session(pending, &services, &config(), slot).await });
-    let live = await_published(&harness.store).await;
+    let session = harness.spawn_pending(harness.pending(Ending::Stall), slot);
+    let live = harness.await_published().await;
 
     assert_eq!(
         publishers.available(),
@@ -951,27 +1175,17 @@ async fn an_admission_slot_is_returned_before_the_session_it_admitted_ends() {
          exists to absorb connection bursts, not to shadow the session cap"
     );
 
-    harness.sessions.stop_all(StopReason::Cancelled);
-    tokio::time::timeout(Duration::from_secs(5), session)
-        .await
-        .expect("the session stops")
-        .expect("the session task succeeds")
-        .expect("cancellation is not a failure");
+    harness.cancel(session, "the session").await;
     assert!(live.is_ended());
 }
 
 #[tokio::test]
 async fn a_cancelled_session_still_leaves_a_playable_stream() {
     let harness = Harness::healthy();
-    let services = harness.services.clone();
-    let pending = harness.pending(Ending::Stall);
-
-    let session = tokio::spawn(async move {
-        run_session(pending, &services, &config(), PendingPermit::unlimited()).await
-    });
+    let session = harness.spawn_stalled();
 
     // Wait for the pipeline to reach the live loop and publish its pre-roll.
-    let live = await_published(&harness.store).await;
+    let live = harness.await_published().await;
     assert!(
         live.snapshot().renditions[0]
             .snapshot()
@@ -980,13 +1194,7 @@ async fn a_cancelled_session_still_leaves_a_playable_stream() {
             .is_some_and(|segment| segment.parts.len() >= 3)
     );
 
-    harness.sessions.stop_all(StopReason::Cancelled);
-
-    let outcome = tokio::time::timeout(Duration::from_secs(5), session)
-        .await
-        .expect("the session stops")
-        .expect("the session task succeeds")
-        .expect("cancellation is not a failure");
+    let outcome = harness.cancel(session, "the session").await;
 
     assert_eq!(outcome, SessionOutcome::Cancelled);
     assert!(
@@ -1001,38 +1209,117 @@ async fn a_cancelled_session_still_leaves_a_playable_stream() {
 }
 
 #[tokio::test]
+async fn late_discovery_cannot_take_the_successors_lease() -> Result<(), Box<dyn std::error::Error>>
+{
+    for (first_key, next_key) in [("camera", "rotated-key"), ("rotated-key", "camera")] {
+        let harness = Harness::healthy();
+        let limits = config();
+        let pending = |credential, ending| -> Box<dyn PendingPublish> {
+            Box::new(FakePending {
+                credential,
+                ..harness.scripted_pending(scripted_batches(), ending)
+            })
+        };
+        let old = harness.run_pending(pending(first_key, Ending::YieldDuringDiscovery), &limits);
+        tokio::pin!(old);
+        tokio::select! {
+            biased;
+            result = &mut old => panic!("discovery should yield: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        assert_eq!(
+            harness.services.sessions.snapshot()[0].phase,
+            super::Phase::Discovering
+        );
+
+        assert!(
+            harness.store.is_empty(),
+            "no retained stream can supply the privacy flag"
+        );
+        let successor =
+            harness.spawn_pending(pending(next_key, Ending::Stall), PendingPermit::unlimited());
+        let live = harness.await_published().await;
+        assert_eq!(old.await?, SessionOutcome::Replaced);
+        assert_eq!(harness.store.leased(), 1);
+        // Finalizing must write a new, fetchable segment through the successor's lease.
+        assert_eq!(
+            harness.cancel(successor, "the successor").await,
+            SessionOutcome::Cancelled
+        );
+        assert!(live.is_ended());
+        assert!(
+            live.snapshot().renditions[0]
+                .snapshot()
+                .has_completed_segment()
+        );
+        assert!(harness.recorder.streams.lock().is_empty());
+        // Only a formerly public predecessor owes a matching publisher-ended event.
+        assert_eq!(
+            harness.recorder.projected().len(),
+            if first_key == "camera" { 0 } else { 2 }
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_during_mux_start_preserves_the_successors_lease()
+-> Result<(), Box<dyn std::error::Error>> {
+    let harness = Harness::healthy();
+    let mut predecessor = harness.services.clone();
+    let at_mux = Arc::new(tokio::sync::Notify::new());
+    let (resume, suspended) = std::sync::mpsc::channel();
+    let reached = at_mux.clone();
+    let suspended = Mutex::new(suspended);
+    // Hold this startup poll after the outer stop check until the successor owns the lease.
+    let stages = predecessor.stages.as_mut().expect("scripted stages");
+    stages.on_mux_start = Some(Arc::new(move || {
+        reached.notify_one();
+        suspended
+            .lock()
+            .recv_timeout(WAIT_LIMIT)
+            .expect("resume predecessor");
+    }));
+    let pending = harness.pending(Ending::Stall);
+    let old = tokio::spawn(async move {
+        run_session(pending, &predecessor, &config(), PendingPermit::unlimited()).await
+    });
+
+    tokio::time::timeout(WAIT_LIMIT, at_mux.notified()).await?;
+    let successor = harness.spawn_stalled();
+    let live = harness.await_published().await;
+    resume.send(())?;
+    assert_eq!(
+        join_session(old, "the predecessor").await?,
+        SessionOutcome::Replaced
+    );
+    assert_eq!(harness.store.leased(), 1);
+    assert_eq!(harness.meters.snapshot().segments_published, 0);
+
+    // Only the successor can flush its open segment after the predecessor has returned.
+    assert_eq!(
+        harness.cancel(successor, "the successor").await,
+        SessionOutcome::Cancelled
+    );
+    assert_eq!(harness.meters.snapshot().segments_published, 1);
+    assert!(
+        live.snapshot().renditions[0]
+            .snapshot()
+            .has_completed_segment()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_second_publisher_takes_the_stream_over() {
     let harness = Harness::healthy();
-    let incumbent_services = harness.services.clone();
-    let incumbent_pending = harness.pending(Ending::Stall);
+    let incumbent = harness.spawn_stalled();
+    harness.await_published().await;
 
-    let incumbent = tokio::spawn(async move {
-        run_session(
-            incumbent_pending,
-            &incumbent_services,
-            &config(),
-            PendingPermit::unlimited(),
-        )
-        .await
-    });
-    await_published(&harness.store).await;
+    let takeover = harness.spawn_stalled();
 
-    let takeover_services = harness.services.clone();
-    let takeover_pending = harness.pending(Ending::Stall);
-    let takeover = tokio::spawn(async move {
-        run_session(
-            takeover_pending,
-            &takeover_services,
-            &config(),
-            PendingPermit::unlimited(),
-        )
+    let outcome = join_session(incumbent, "the incumbent")
         .await
-    });
-
-    let outcome = tokio::time::timeout(Duration::from_secs(5), incumbent)
-        .await
-        .expect("the incumbent stops")
-        .expect("the incumbent task succeeds")
         .expect("being replaced is not a failure");
     assert_eq!(outcome, SessionOutcome::Replaced);
     assert_eq!(harness.meters.snapshot().sessions_replaced, 1);
@@ -1051,13 +1338,8 @@ async fn a_second_publisher_takes_the_stream_over() {
         "the successor held the stream throughout the handover"
     );
 
-    await_published(&harness.store).await;
-    harness.sessions.stop_all(StopReason::Cancelled);
-    tokio::time::timeout(Duration::from_secs(5), takeover)
-        .await
-        .expect("the takeover stops")
-        .expect("the takeover task succeeds")
-        .expect("cancellation is not a failure");
+    harness.await_published().await;
+    harness.cancel(takeover, "the takeover").await;
 }
 
 #[tokio::test]
@@ -1070,18 +1352,8 @@ async fn a_stream_policy_can_reject_takeovers_before_transport_acceptance() {
         },
         Faults::default(),
     );
-    let incumbent_services = harness.services.clone();
-    let incumbent_pending = harness.pending(Ending::Stall);
-    let incumbent = tokio::spawn(async move {
-        run_session(
-            incumbent_pending,
-            &incumbent_services,
-            &config(),
-            PendingPermit::unlimited(),
-        )
-        .await
-    });
-    await_published(&harness.store).await;
+    let incumbent = harness.spawn_stalled();
+    harness.await_published().await;
 
     let error = harness
         .run(Ending::Eof)
@@ -1101,21 +1373,14 @@ async fn a_stream_policy_can_reject_takeovers_before_transport_acceptance() {
         1,
         "only the incumbent crossed the transport boundary"
     );
-    assert_eq!(harness.sessions.len(), 1);
+    assert_eq!(harness.services.sessions.len(), 1);
 
-    harness.sessions.stop_all(StopReason::Cancelled);
-    tokio::time::timeout(Duration::from_secs(5), incumbent)
-        .await
-        .expect("the incumbent stops")
-        .expect("the incumbent task succeeds")
-        .expect("cancellation is not a failure");
+    harness.cancel(incumbent, "the incumbent").await;
 }
 
 #[tokio::test]
 async fn a_stalled_publisher_is_terminated_as_unhealthy() {
     let harness = Harness::healthy();
-    let services = harness.services.clone();
-    let pending = harness.pending(Ending::Stall);
     let config = SessionConfig {
         supervision: SupervisionPolicy {
             health: HealthPolicy {
@@ -1128,7 +1393,7 @@ async fn a_stalled_publisher_is_terminated_as_unhealthy() {
 
     let error = tokio::time::timeout(
         Duration::from_secs(5),
-        run_session(pending, &services, &config, PendingPermit::unlimited()),
+        harness.run_with(Ending::Stall, &config),
     )
     .await
     .expect("supervision gives up")
@@ -1146,15 +1411,10 @@ async fn a_stalled_publisher_is_terminated_as_unhealthy() {
 #[tokio::test]
 async fn the_registry_reports_the_phase_a_session_is_in() {
     let harness = Harness::healthy();
-    let services = harness.services.clone();
-    let pending = harness.pending(Ending::Stall);
+    let session = harness.spawn_stalled();
+    harness.await_published().await;
 
-    let session = tokio::spawn(async move {
-        run_session(pending, &services, &config(), PendingPermit::unlimited()).await
-    });
-    await_published(&harness.store).await;
-
-    let snapshots = harness.sessions.snapshot();
+    let snapshots = harness.services.sessions.snapshot();
     assert_eq!(snapshots.len(), 1);
     assert_eq!(snapshots[0].stream, stream());
     assert_eq!(snapshots[0].phase, super::Phase::Running);
@@ -1167,12 +1427,7 @@ async fn the_registry_reports_the_phase_a_session_is_in() {
         }
     );
 
-    harness.sessions.stop_all(StopReason::Cancelled);
-    tokio::time::timeout(Duration::from_secs(5), session)
-        .await
-        .expect("the session stops")
-        .expect("the session task succeeds")
-        .expect("cancellation is not a failure");
+    harness.cancel(session, "the session").await;
 }
 
 #[tokio::test]
@@ -1180,17 +1435,7 @@ async fn ending_reports_a_completed_session() {
     let harness = Harness::healthy();
     harness.run(Ending::Eof).await.expect("session succeeds");
 
-    let ended = harness
-        .recorder
-        .events
-        .lock()
-        .iter()
-        .filter_map(|event| match event {
-            SessionEvent::Ended { end } => Some(*end),
-            _ => None,
-        })
-        .next_back();
-    assert_eq!(ended, Some(SessionEnd::Ended));
+    assert_eq!(harness.recorder.last_end(), Some(SessionEnd::Ended));
 }
 
 #[tokio::test]
@@ -1199,20 +1444,9 @@ async fn cancelling_still_flushes_media_the_normalizer_was_holding_back() {
         normalizer_reorders: true,
         ..Faults::default()
     });
-    let services = harness.services.clone();
-    let pending = harness.pending(Ending::Stall);
-
-    let session = tokio::spawn(async move {
-        run_session(pending, &services, &config(), PendingPermit::unlimited()).await
-    });
-    await_published(&harness.store).await;
-    harness.sessions.stop_all(StopReason::Cancelled);
-
-    tokio::time::timeout(Duration::from_secs(5), session)
-        .await
-        .expect("the session stops")
-        .expect("the session task succeeds")
-        .expect("cancellation is not a failure");
+    let session = harness.spawn_stalled();
+    harness.await_published().await;
+    harness.cancel(session, "the session").await;
 
     // Four packets were accepted; the reorder buffer was holding the last one
     // when the stop arrived. A drain that only closed the muxer would publish
@@ -1355,7 +1589,7 @@ async fn a_source_that_hangs_while_probing_does_not_hold_a_task_forever() {
         },
         ..config()
     };
-    let pending = harness.pending_for("camera", Ending::HangOnDiscovery);
+    let pending = harness.pending(Ending::HangOnDiscovery);
 
     let error = run_session(
         pending,
@@ -1377,23 +1611,16 @@ async fn a_source_that_hangs_while_probing_does_not_hold_a_task_forever() {
 
 #[tokio::test]
 async fn a_node_at_capacity_turns_a_new_publisher_away_in_the_protocol() {
-    let harness = Harness::healthy();
-    let sessions = Registry::with_capacity(1);
-    let services = Services {
-        sessions: sessions.clone(),
-        ..harness.services.clone()
-    };
-    let held = services.clone();
-    let pending = harness.pending(Ending::Stall);
-    let incumbent = tokio::spawn(async move {
-        run_session(pending, &held, &config(), PendingPermit::unlimited()).await
-    });
-    await_published(&harness.store).await;
+    let mut harness = Harness::healthy();
+    harness.services.sessions = Registry::with_capacity(1);
+    let incumbent = harness.spawn_stalled();
+    harness.await_published().await;
 
     // A different stream, so this is a genuinely new session rather than a
     // takeover of the one already running.
     let overflow = harness.pending_for("other", Ending::Eof);
-    let error = run_session(overflow, &services, &config(), PendingPermit::unlimited())
+    let error = harness
+        .run_pending(overflow, &config())
         .await
         .expect_err("a full node refuses the publication");
 
@@ -1404,12 +1631,7 @@ async fn a_node_at_capacity_turns_a_new_publisher_away_in_the_protocol() {
     );
     assert_eq!(harness.meters.snapshot().publishers_rejected, 1);
 
-    sessions.stop_all(StopReason::Cancelled);
-    tokio::time::timeout(Duration::from_secs(5), incumbent)
-        .await
-        .expect("the incumbent stops")
-        .expect("the incumbent task succeeds")
-        .expect("cancellation is not a failure");
+    harness.cancel(incumbent, "the incumbent").await;
 }
 
 /// A peer that completes its handshake and then says nothing.
@@ -1446,25 +1668,6 @@ impl PendingPublish for SilentPending {
     ) -> BoxFuture<'static, Result<(), TransportError>> {
         Box::pin(std::future::pending())
     }
-}
-
-/// Waits until a session has published its first media into the store.
-async fn await_published(store: &StreamStore) -> Arc<crate::delivery::hls::LiveStream> {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(live) = store.get(&stream())
-                && live.snapshot().renditions.iter().any(|rendition| {
-                    let media = rendition.snapshot();
-                    media.open_segment.is_some() || media.has_completed_segment()
-                })
-            {
-                return live;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the session publishes")
 }
 
 #[tokio::test]
@@ -1615,20 +1818,15 @@ async fn a_panicking_source_unwinds_registry_and_lease() {
         source_panics_after: Some(1),
         ..Faults::default()
     });
-    let services = harness.services.clone();
-    let pending = harness.pending(Ending::Stall);
-
-    let session = tokio::spawn(async move {
-        run_session(pending, &services, &config(), PendingPermit::unlimited()).await
-    });
-    let joined = tokio::time::timeout(Duration::from_secs(5), session)
+    let session = harness.spawn_stalled();
+    let joined = tokio::time::timeout(WAIT_LIMIT, session)
         .await
         .expect("the panicking session finishes unwinding")
         .expect_err("the injected panic escapes the session task");
 
     assert!(joined.is_panic(), "the panic is not caught by the pipeline");
     assert!(
-        harness.sessions.is_empty(),
+        harness.services.sessions.is_empty(),
         "unwinding removes the registry entry"
     );
     assert_eq!(harness.store.leased(), 0, "unwinding releases the lease");
@@ -1644,20 +1842,14 @@ async fn a_reconnect_storm_keeps_one_lease_and_one_durable_rendition() {
     const STORM: u32 = 5;
     let harness = Harness::healthy();
 
-    let mut incumbent: Option<tokio::task::JoinHandle<Result<SessionOutcome, SessionError>>> = None;
+    let mut incumbent = None;
     for cycle in 0..STORM {
-        let services = harness.services.clone();
-        let pending = harness.pending(Ending::Stall);
-        let session = tokio::spawn(async move {
-            run_session(pending, &services, &config(), PendingPermit::unlimited()).await
-        });
-        await_published(&harness.store).await;
+        let session = harness.spawn_stalled();
+        harness.await_published().await;
 
         if let Some(previous) = incumbent.take() {
-            let outcome = tokio::time::timeout(Duration::from_secs(5), previous)
+            let outcome = join_session(previous, "the displaced session")
                 .await
-                .expect("the displaced session stops")
-                .expect("the displaced session task succeeds")
                 .expect("displacement is not a failure");
             assert_eq!(outcome, SessionOutcome::Replaced);
             assert_eq!(
@@ -1682,15 +1874,8 @@ async fn a_reconnect_storm_keeps_one_lease_and_one_durable_rendition() {
         incumbent = Some(session);
     }
 
-    harness.sessions.stop_all(StopReason::Cancelled);
-    let final_outcome = tokio::time::timeout(
-        Duration::from_secs(5),
-        incumbent.expect("the storm has a survivor"),
-    )
-    .await
-    .expect("the survivor stops")
-    .expect("the survivor task succeeds")
-    .expect("cancellation is not a failure");
+    let survivor = incumbent.expect("the storm has a survivor");
+    let final_outcome = harness.cancel(survivor, "the survivor").await;
     assert_eq!(final_outcome, SessionOutcome::Cancelled);
     assert!(harness.live().is_ended());
     assert_eq!(harness.store.leased(), 0);
@@ -1701,19 +1886,15 @@ async fn concurrent_takeovers_resolve_to_exactly_one_survivor() {
     let harness = Harness::healthy();
     let mut sessions = Vec::new();
     for _ in 0..3 {
-        let services = harness.services.clone();
-        let pending = harness.pending(Ending::Stall);
-        sessions.push(tokio::spawn(async move {
-            run_session(pending, &services, &config(), PendingPermit::unlimited()).await
-        }));
+        sessions.push(harness.spawn_stalled());
     }
 
     // Registration is serialized by the registry lock, and each registration
     // displaces the current incumbent, so however the three interleave,
     // exactly one session survives. The losers are either displaced by a
     // later registration or refused while an incumbent is still draining.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while harness.sessions.len() != 1 {
+    tokio::time::timeout(WAIT_LIMIT, async {
+        while harness.services.sessions.len() != 1 {
             tokio::task::yield_now().await;
         }
     })
@@ -1721,15 +1902,10 @@ async fn concurrent_takeovers_resolve_to_exactly_one_survivor() {
     .expect("exactly one session survives the scramble");
     assert_eq!(harness.store.leased(), 1);
 
-    harness.sessions.stop_all(StopReason::Cancelled);
+    harness.services.sessions.stop_all(StopReason::Cancelled);
     let mut outcomes = Vec::new();
     for session in sessions {
-        outcomes.push(
-            tokio::time::timeout(Duration::from_secs(5), session)
-                .await
-                .expect("every session resolves")
-                .expect("no session task panics"),
-        );
+        outcomes.push(join_session(session, "a concurrent publisher").await);
     }
 
     assert_eq!(
@@ -1762,35 +1938,14 @@ async fn concurrent_takeovers_resolve_to_exactly_one_survivor() {
 #[tokio::test]
 async fn backward_video_timestamps_fail_before_the_offending_sample_is_published()
 -> Result<(), Box<dyn std::error::Error>> {
-    let mut policy = StreamPolicy::permissive();
-    policy.input_mode = crate::domain::InputMode::Permissive;
-    let mut harness = Harness::new(None, policy, Faults::default());
     // Exercise the production normalizer through the real session and store;
     // the test muxer publishes one part for every sample it receives.
-    harness.services.normalizers = Arc::new(crate::media::PassThroughNormalizerFactory);
-    let pending = Box::new(FakePending {
-        log: harness.log.clone(),
-        resource: "camera",
-        batches: vec![
-            vec![
-                packet(0, true),
-                packet(SECOND, true),
-                packet(2 * SECOND, true),
-            ],
-            vec![packet(SECOND, false)],
-        ],
-        ending: Ending::Eof,
-        panics_after: None,
-        budget_probe: None,
-    });
-    let error = run_session(
-        pending,
-        &harness.services,
-        &config(),
-        PendingPermit::unlimited(),
-    )
-    .await
-    .expect_err("backward input must fail the live session");
+    let harness = Harness::with_normalizer(InputMode::Permissive, start_normalizer);
+    let batches = video_batches_before_issue(true, vec![packet(SECOND, false)]);
+    let error = harness
+        .run_scripted_video(batches)
+        .await
+        .expect_err("backward input must fail the live session");
     assert!(matches!(
         error,
         SessionError::Supervision(SupervisionError::Execution(ExecutionError::Media(
@@ -1821,41 +1976,15 @@ async fn backward_video_timestamps_fail_before_the_offending_sample_is_published
 async fn timestamp_failures_report_once_during_preroll_and_live()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::domain::TimestampIssueCode;
-    use crate::observe::lifecycle::{Event, Outcome, Projector};
     for live in [false, true] {
-        let mut policy = StreamPolicy::permissive();
         // This lifecycle fixture supplies one frame per second.
-        policy.input_mode = crate::domain::InputMode::Permissive;
-        let mut harness = Harness::new(None, policy, Faults::default());
-        harness.services.normalizers = Arc::new(crate::media::PassThroughNormalizerFactory);
-        let batches = if live {
-            vec![
-                vec![
-                    packet(0, true),
-                    packet(SECOND, true),
-                    packet(2 * SECOND, true),
-                ],
-                vec![packet(4 * SECOND, true)],
-            ]
-        } else {
-            vec![vec![packet(0, true)], vec![packet(2 * SECOND, true)]]
-        };
-        let pending = Box::new(FakePending {
-            log: harness.log.clone(),
-            resource: "camera",
-            batches,
-            ending: Ending::Eof,
-            panics_after: None,
-            budget_probe: None,
-        });
-        let error = run_session(
-            pending,
-            &harness.services,
-            &config(),
-            PendingPermit::unlimited(),
-        )
-        .await
-        .expect_err("jump must fail");
+        let harness = Harness::with_normalizer(InputMode::Permissive, start_normalizer);
+        let jump_to = if live { 4 * SECOND } else { 2 * SECOND };
+        let batches = video_batches_before_issue(live, vec![packet(jump_to, true)]);
+        let error = harness
+            .run_scripted_video(batches)
+            .await
+            .expect_err("jump must fail");
         assert_eq!(
             super::timestamp_issue(&error)
                 .expect("typed issue survives wrappers")
@@ -1871,90 +2000,27 @@ async fn timestamp_failures_report_once_during_preroll_and_live()
             if live { 2 } else { 0 }
         );
         assert_eq!(harness.store.leased(), 0);
-        let projector = Projector::new();
-        let ends: Vec<_> = harness
-            .recorder
-            .events
-            .lock()
+        let events = harness.recorder.projected();
+        assert_event_count(&events, Kind::PublisherEnded, 1);
+        let end = events
             .iter()
-            .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
-            .filter_map(|event| {
-                if let Event::PublisherEnded(end) = event {
-                    Some(end)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(ends.len(), 1);
-        assert_eq!(ends[0].outcome, Outcome::Failed);
-        assert_eq!(ends[0].was_available, live);
+            .find_map(publisher_end)
+            .expect("the failed publisher's end is reported");
+        assert_eq!(end.outcome, Outcome::Failed);
+        assert_eq!(end.was_available, live);
         assert_eq!(
-            ends[0].timestamp_issue.as_ref().expect("host issue").code,
+            end.timestamp_issue.as_ref().expect("host issue").code,
             TimestampIssueCode::VideoTimestampJump
         );
     }
     Ok(())
 }
 
-/// Keep admission and transport behavior identical to the other session
-/// fixtures while exposing an audio catalog to the production normalizer.
-struct AudioPending(FakePending);
-struct AudioSource(Box<dyn PacketSource>);
-impl PendingPublish for AudioPending {
-    fn publish_request(&self) -> Result<PublishRequest, TransportError> {
-        self.0.publish_request()
-    }
-    fn accept(
-        self: Box<Self>,
-        grant: PublishGrant,
-        meters: Arc<dyn SourceMeters>,
-    ) -> BoxFuture<'static, Result<AcceptedPublish, TransportError>> {
-        Box::pin(async move {
-            let mut accepted = Box::new(self.0).accept(grant, meters).await?;
-            accepted.source = Box::new(AudioSource(accepted.source));
-            Ok(accepted)
-        })
-    }
-    fn reject(
-        self: Box<Self>,
-        rejection: PublishRejection,
-    ) -> BoxFuture<'static, Result<(), TransportError>> {
-        Box::new(self.0).reject(rejection)
-    }
-}
-impl PacketSource for AudioSource {
-    fn discover(
-        &mut self,
-        _limits: DiscoveryLimits,
-    ) -> BoxFuture<'_, Result<DiscoveryReport, SourceError>> {
-        Box::pin(async {
-            Ok(DiscoveryReport {
-                tracks: crate::domain::fixtures::catalog(vec![
-                    crate::domain::fixtures::TrackBuilder::new(0, MediaKind::Audio)
-                        .timebase(Timebase::new(nz::u32!(1), nz::u32!(48_000)))
-                        .codec_extradata(&[0x11, 0x90][..])
-                        .build(),
-                ]),
-            })
-        })
-    }
-    fn fill<'a>(
-        &'a mut self,
-        out: &'a mut dyn Appender<Packet>,
-    ) -> BoxFuture<'a, Result<InputState, SourceError>> {
-        self.0.fill(out)
-    }
-}
-
 #[tokio::test]
 async fn audio_repairs_report_during_preroll_and_live_and_survive_a_failing_batch()
 -> Result<(), Box<dyn std::error::Error>> {
-    use crate::observe::lifecycle::{Event, Outcome, Projector};
     for live in [false, true] {
-        let mut harness = Harness::healthy();
-        harness.services.normalizers = Arc::new(crate::media::PassThroughNormalizerFactory);
-        harness.services.muxers = Arc::new(crate::mux::PassThroughMuxerFactory);
+        let harness = Harness::healthy();
         let start = if live { 220 } else { 10 };
         let mut packets = Vec::new();
         for index in 0..start + 22 {
@@ -1962,38 +2028,16 @@ async fn audio_repairs_report_during_preroll_and_live_and_survive_a_failing_batc
                 continue;
             }
             let pts = i64::from(index) * 1024 + if index == start + 21 { 48_000 } else { 0 };
-            packets.push(Packet {
-                track_id: TrackId(0),
-                pts: Some(pts),
-                dts: Some(pts),
-                duration: Some(1024),
-                random_access: false,
-                audio_trim: crate::domain::AudioTrim::default(),
-                webvtt: crate::domain::WebVttCueMetadata::default(),
-                subtitle_position: None,
-                payload: (&[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c][..]).into(),
-            });
+            packets.push(audio_packet(pts));
         }
         // Put the repaired packet and the fatal successor in the same batch.
         let tail = packets.split_off(packets.len() - 2);
         let mut batches: Vec<_> = packets.into_iter().map(|packet| vec![packet]).collect();
         batches.push(tail);
-        let pending = AudioPending(FakePending {
-            log: harness.log.clone(),
-            resource: "camera",
-            batches,
-            ending: Ending::Eof,
-            panics_after: None,
-            budget_probe: None,
-        });
-        let error = run_session(
-            Box::new(pending),
-            &harness.services,
-            &config(),
-            PendingPermit::unlimited(),
-        )
-        .await
-        .expect_err("excessive gap");
+        let error = harness
+            .run_scripted_audio(batches)
+            .await
+            .expect_err("excessive gap");
         assert_eq!(
             super::timestamp_issue(&error)
                 .ok_or("timestamp issue")?
@@ -2008,24 +2052,12 @@ async fn audio_repairs_report_during_preroll_and_live_and_survive_a_failing_batc
         let repairs = harness.meters.audio_repairs();
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs[0].1.0, 1);
-        let projector = Projector::new();
-        let events: Vec<_> = harness
-            .recorder
-            .events
-            .lock()
-            .iter()
-            .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
-            .collect();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, Event::PublisherDegraded(_)))
-                .count(),
-            1
-        );
-        let Event::PublisherEnded(end) = events.last().ok_or("end event")? else {
-            panic!("ended");
-        };
+        let events = harness.recorder.projected();
+        assert_event_count(&events, Kind::PublisherDegraded, 1);
+        let end = events
+            .last()
+            .and_then(publisher_end)
+            .expect("the final lifecycle event ends the publisher after the excessive gap");
         assert_eq!(end.outcome, Outcome::Failed);
         assert_eq!(end.was_available, live);
         assert_eq!(end.compensation.len(), 1);
@@ -2041,86 +2073,39 @@ async fn audio_repairs_report_during_preroll_and_live_and_survive_a_failing_batc
     Ok(())
 }
 
-struct DeclaredCadenceFactory;
-impl NormalizerFactory for DeclaredCadenceFactory {
-    fn start(
-        &self,
-        presentation: &PresentationPlan,
-        timeline: &TimelineCalibration,
-        mode: crate::domain::InputMode,
-    ) -> Result<StartedNormalizer, NormalizeError> {
-        let mut tracks = presentation.tracks().to_vec();
-        tracks[0].video_cadence = crate::domain::VideoCadence::Fixed {
-            rate: crate::domain::FrameRate::new(nz::u32!(1), nz::u32!(1)),
-            source: crate::domain::CadenceSource::H264Vui,
-            scope: crate::domain::CadenceScope::ProgressiveFrames,
-        };
-        let presentation = presentation
-            .with_projected_tracks(tracks)
-            .map_err(|e| NormalizeError::InvalidPlan(e.to_string().into()))?;
-        crate::media::PassThroughNormalizerFactory.start(&presentation, timeline, mode)
-    }
+fn start_declared_cadence_normalizer(
+    presentation: &PresentationPlan,
+    timeline: &TimelineCalibration,
+    mode: InputMode,
+) -> Result<StartedNormalizer, NormalizeError> {
+    let mut tracks = presentation.tracks().to_vec();
+    tracks[0].video_cadence = crate::domain::VideoCadence::Fixed {
+        rate: crate::domain::FrameRate::new(nz::u32!(1), nz::u32!(1)),
+        source: crate::domain::CadenceSource::H264Vui,
+        scope: crate::domain::CadenceScope::ProgressiveFrames,
+    };
+    let presentation = presentation
+        .with_projected_tracks(tracks)
+        .map_err(|e| NormalizeError::InvalidPlan(e.to_string().into()))?;
+    start_normalizer(&presentation, timeline, mode)
 }
+
 // Keep the startup/live and strict/permissive assertions together.
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn input_modes_report_cadence_holes_through_sessions()
 -> Result<(), Box<dyn std::error::Error>> {
-    use crate::domain::{InputMode, TimestampIssueCode};
-    use crate::observe::lifecycle::{Event, Projector};
+    use crate::domain::TimestampIssueCode;
     for mode in [InputMode::Strict, InputMode::Permissive] {
         for live in [false, true] {
-            let mut policy = StreamPolicy::permissive();
-            policy.input_mode = mode;
-            let mut harness = Harness::new(None, policy, Faults::default());
-            harness.services.normalizers = Arc::new(DeclaredCadenceFactory);
-            let batches = if live {
-                vec![
-                    vec![
-                        packet(0, true),
-                        packet(SECOND, true),
-                        packet(2 * SECOND, true),
-                    ],
-                    vec![packet(3 * SECOND + SECOND / 4, true)],
-                ]
-            } else {
-                vec![
-                    vec![packet(0, true)],
-                    vec![packet(SECOND + SECOND / 4, true)],
-                ]
-            };
-            let pending = Box::new(FakePending {
-                log: harness.log.clone(),
-                resource: "camera",
-                batches,
-                ending: Ending::Eof,
-                panics_after: None,
-                budget_probe: None,
-            });
-            let outcome = run_session(
-                pending,
-                &harness.services,
-                &config(),
-                PendingPermit::unlimited(),
-            )
-            .await;
-            let projector = Projector::new();
-            let events: Vec<_> = harness
-                .recorder
-                .events
-                .lock()
-                .iter()
-                .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
-                .collect();
+            let harness = Harness::with_normalizer(mode, start_declared_cadence_normalizer);
+            let expected = if live { 3 * SECOND } else { SECOND };
+            let batches =
+                video_batches_before_issue(live, vec![packet(expected + SECOND / 4, true)]);
+            let outcome = harness.run_scripted_video(batches).await;
+            let events = harness.recorder.projected();
             let ended = events
                 .iter()
-                .find_map(|event| {
-                    if let Event::PublisherEnded(end) = event {
-                        Some(end)
-                    } else {
-                        None
-                    }
-                })
+                .find_map(publisher_end)
                 .expect("session end reported");
             if mode == InputMode::Strict {
                 let error = outcome.expect_err("strict cadence hole");
@@ -2156,13 +2141,7 @@ async fn input_modes_report_cadence_holes_through_sessions()
                 harness.meters.cadence_violations(),
                 vec![("h264".into(), 1)]
             );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|e| matches!(e, Event::PublisherEnded(_)))
-                    .count(),
-                1
-            );
+            assert_event_count(&events, Kind::PublisherEnded, 1);
             assert_eq!(harness.store.leased(), 0);
         }
     }
@@ -2172,73 +2151,26 @@ async fn input_modes_report_cadence_holes_through_sessions()
 #[tokio::test]
 async fn audio_gaps_publish_during_preroll_and_live_then_report_clean_recovery()
 -> Result<(), Box<dyn std::error::Error>> {
-    use crate::observe::lifecycle::{Event, Projector};
     for start in [10, 220] {
-        let mut harness = Harness::healthy();
-        harness.services.normalizers = Arc::new(crate::media::PassThroughNormalizerFactory);
-        harness.services.muxers = Arc::new(crate::mux::PassThroughMuxerFactory);
+        let harness = Harness::healthy();
         let batches = (0..1800)
             .filter(|index| !(start..start + 6).contains(index))
-            .map(|index| {
-                vec![Packet {
-                    track_id: TrackId(0),
-                    pts: Some(index * 1024),
-                    dts: Some(index * 1024),
-                    duration: Some(1024),
-                    random_access: false,
-                    audio_trim: crate::domain::AudioTrim::default(),
-                    webvtt: crate::domain::WebVttCueMetadata::default(),
-                    subtitle_position: None,
-                    payload: (&[0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c][..]).into(),
-                }]
-            })
+            .map(|index| vec![audio_packet(index * 1024)])
             .collect();
-        let pending = AudioPending(FakePending {
-            log: harness.log.clone(),
-            resource: "camera",
-            batches,
-            ending: Ending::Eof,
-            panics_after: None,
-            budget_probe: None,
-        });
-        run_session(
-            Box::new(pending),
-            &harness.services,
-            &config(),
-            PendingPermit::unlimited(),
-        )
-        .await?;
+        harness.run_scripted_audio(batches).await?;
         assert_eq!(harness.store.leased(), 0);
         assert!(harness.meters.timestamp_rejections().is_empty());
         assert_eq!(
             harness.meters.audio_repairs(),
             vec![(("aac".into(), "gap".into()), (1, 0.128))]
         );
-        let projector = Projector::new();
-        let events: Vec<_> = harness
-            .recorder
-            .events
-            .lock()
-            .iter()
-            .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
-            .collect();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, Event::PublisherDegraded(_)))
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, Event::PublisherRecovered(_)))
-                .count(),
-            1
-        );
-        let Event::PublisherEnded(end) = events.last().ok_or("ended event")? else {
-            panic!("ended");
-        };
+        let events = harness.recorder.projected();
+        assert_event_count(&events, Kind::PublisherDegraded, 1);
+        assert_event_count(&events, Kind::PublisherRecovered, 1);
+        let end = events
+            .last()
+            .and_then(publisher_end)
+            .expect("the final lifecycle event ends the publisher after recovery");
         assert_eq!(end.compensation[0].total_ticks, 6144);
         assert_eq!(end.compensation[0].replacement_ticks, 0);
         assert!(!end.compensation[0].degraded);
@@ -2251,39 +2183,16 @@ async fn audio_gaps_publish_during_preroll_and_live_then_report_clean_recovery()
 #[tokio::test]
 async fn video_gap_notices_survive_later_batch_failure_in_preroll_and_live()
 -> Result<(), Box<dyn std::error::Error>> {
-    use crate::observe::lifecycle::{Event, Projector};
     for live in [false, true] {
-        let mut harness = Harness::healthy();
-        harness.services.normalizers = Arc::new(DeclaredCadenceFactory);
-        let first = if live {
-            vec![
-                packet(0, true),
-                packet(SECOND, true),
-                packet(2 * SECOND, true),
-            ]
-        } else {
-            vec![packet(0, true)]
-        };
+        let harness =
+            Harness::with_normalizer(InputMode::Permissive, start_declared_cadence_normalizer);
         let expected = if live { 3 * SECOND } else { SECOND };
-        let pending = FakePending {
-            log: harness.log.clone(),
-            resource: "camera",
-            batches: vec![
-                first,
-                vec![packet(expected + SECOND / 4, true), packet(expected, true)],
-            ],
-            ending: Ending::Eof,
-            panics_after: None,
-            budget_probe: None,
-        };
-        let error = run_session(
-            Box::new(pending),
-            &harness.services,
-            &config(),
-            PendingPermit::unlimited(),
-        )
-        .await
-        .expect_err("later packet in the batch has backward DTS");
+        let later_batch = vec![packet(expected + SECOND / 4, true), packet(expected, true)];
+        let batches = video_batches_before_issue(live, later_batch);
+        let error = harness
+            .run_scripted_video(batches)
+            .await
+            .expect_err("later packet in the batch has backward DTS");
         assert_eq!(
             super::timestamp_issue(&error).ok_or("typed issue")?.code,
             crate::domain::TimestampIssueCode::VideoTimestampOrder
@@ -2293,31 +2202,13 @@ async fn video_gap_notices_survive_later_batch_failure_in_preroll_and_live()
             harness.meters.video_compensation(),
             vec![(("h264".into(), "gap".into()), (1, 0.25))]
         );
-        let projector = Projector::new();
-        let events: Vec<_> = harness
-            .recorder
-            .events
-            .lock()
-            .iter()
-            .filter_map(|event| projector.project(SessionId(nz::u64!(1)), event))
-            .collect();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, Event::PublisherDegraded(_)))
-                .count(),
-            1
-        );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, Event::PublisherEnded(_)))
-                .count(),
-            1
-        );
-        let Event::PublisherEnded(end) = events.last().ok_or("end event")? else {
-            panic!("session ended")
-        };
+        let events = harness.recorder.projected();
+        assert_event_count(&events, Kind::PublisherDegraded, 1);
+        assert_event_count(&events, Kind::PublisherEnded, 1);
+        let end = events
+            .last()
+            .and_then(publisher_end)
+            .expect("the final lifecycle event ends the publisher after the backward DTS");
         assert_eq!(end.compensation.len(), 1);
         assert_eq!(
             end.compensation[0].method,

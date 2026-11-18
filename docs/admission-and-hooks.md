@@ -77,6 +77,16 @@ and a new publisher starts, with a new `session_id`.
 | `publisher.ended` | The publisher stops for any reason: it ended the stream, dropped, was replaced or stopped, or failed. Viewers can still play the stream. |
 | `stream.unavailable` | The stream has had no publisher for the length of `hls.window`, and Rushls removes it. Viewers get 404 from here on. Never sent for a stream that never became available. |
 
+Admission sees the original credential and resource. Publisher hooks replace a resource name
+containing that credential with `[redacted]` and omit a credential-bearing namespace.
+Return a separate public `stream_id` and `principal` to receive lifecycle hooks.
+If either contains the credential, Rushls withholds the publisher hooks and stream URLs.
+This includes open RTMP admission, where the publish name also forms the playback path.
+Viewers can still use that path. Reconnects inherit this restriction until the retained stream expires.
+If an earlier publisher made the stream public, subscribers still receive its matching
+`stream.unavailable`. Operator logs and per-stream metrics contain the playback identity.
+The session acceptance log records `hooks_withheld` when a public subject is unavailable.
+
 A typical publication sends `publisher.started`, `stream.available`, `segment.ready` per segment, `publisher.ended`,
 then `stream.unavailable`. Events for one stream are delivered in order.
 To act when a broadcast is over, use `stream.unavailable`: `publisher.ended` also fires for an encoder that reconnects.

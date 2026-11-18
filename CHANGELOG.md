@@ -7,6 +7,18 @@ contain breaking changes; they are listed first.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-18
+
+### Breaking changes
+
+- To receive publisher hooks, return a public `stream_id` and `principal`
+  from admission. If either contains the publish credential, Rushls withholds
+  the publisher hooks. This includes open RTMP admission. Playback URLs still
+  work, and reconnects inherit the restriction until the stream expires.
+- For Rust integrations, use `media::start_normalizer` and `mux::start_muxer`.
+  These functions replace the factory traits and their fields on `Services`.
+  Custom publisher factories now implement `store` and `start_if_current`.
+
 ### Added
 
 - The container image is published for Linux ARM64 as well as AMD64, under
@@ -14,9 +26,36 @@ contain breaking changes; they are listed first.
 
 ### Fixed
 
+- Publisher hooks redact credential-bearing resource names and omit
+  credential-bearing namespaces. Admission still receives the original values.
+- A publisher that finishes startup after a takeover can no longer revoke
+  the new publisher's write lease.
+- After an RTMP connection drops, a publisher can reconnect to the same HLS
+  playlist. An explicit unpublish still ends the playlist with `EXT-X-ENDLIST`.
+- Retiring a rendition deletes its spilled segment files, including files from
+  writes still in progress at retirement. Retained byte counts reflect the removal.
+  Each stream has its own spill directory, so retiring one stream preserves
+  media for other streams with nested names.
+- Live playlist eviction preserves at least three advertised target durations
+  of media. A request for a GAP part returns HTTP 404 even if the client
+  requested it early through a preload hint.
+- Segment boundaries preserve fractional frame rates declared by the codec,
+  such as 24000/1001 frames per second.
+- MoQ discovery continues when an optional caption track closes. The
+  certificate fingerprint now follows the active QUIC certificate, including
+  when the listener rejects a replacement.
+- The browser A/V sync check now detects whole-second offsets between flashes
+  and beeps.
 - The release workflow publishes only the workspace crates whose version is
-  not yet on crates.io. In 0.2.0, the unchanged `rushls-common` stopped the
+  not yet on crates.io. If a version lookup fails, the workflow stops before
+  uploading any crate. In 0.2.0, the unchanged `rushls-common` stopped the
   automatic upload, and `rushls` 0.2.0 was published by hand.
+
+### Known limitation
+
+- Stock hls.js 1.7.3 can skip a playable part and stall before the end of a
+  live stream. The required Chrome playback check uses the
+  [locally patched player](https://github.com/darfink/rushls/blob/v0.3.0/tools/patches/hls.js/README.md).
 
 ## [0.2.0] - 2026-10-04
 
@@ -54,6 +93,7 @@ contain breaking changes; they are listed first.
 
 First release.
 
-[Unreleased]: https://github.com/darfink/rushls/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/darfink/rushls/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/darfink/rushls/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/darfink/rushls/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/darfink/rushls/releases/tag/v0.1.0

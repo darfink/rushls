@@ -143,7 +143,7 @@ mod tests {
             keyframe: true,
         };
         let mut inline = Inline::default();
-        let track = &mut mapped.tracks[0];
+        let track = &mut mapped.tracks[0].track;
         inline.convert(&mut frame, track.id, 1_000_000)?;
         inline.configure(track)?;
         assert!(!track.codec_extradata.is_empty());

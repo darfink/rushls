@@ -6,7 +6,7 @@ use super::{NormalizedMedia, PresentationPlan, TimelineCalibration};
 
 pub(crate) mod passthrough;
 
-pub use passthrough::PassThroughNormalizerFactory;
+pub use passthrough::start_normalizer;
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum NormalizeError {
@@ -79,18 +79,4 @@ pub struct StartedNormalizer {
     pub normalizer: Box<dyn MediaNormalizer>,
     pub presentation: PresentationPlan,
     pub timeline: TimelineCalibration,
-}
-
-/// Builds a normalizer for one validated, calibrated presentation.
-///
-/// Takes no meters: volume is counted by the loop that drives the normalizer,
-/// once per batch, which is both cheaper and closer to the truth than having
-/// each stage report itself.
-pub trait NormalizerFactory: Send + Sync {
-    fn start(
-        &self,
-        presentation: &PresentationPlan,
-        timeline: &TimelineCalibration,
-        input_mode: crate::domain::InputMode,
-    ) -> Result<StartedNormalizer, NormalizeError>;
 }

@@ -1,7 +1,7 @@
 mod exposition;
 mod publication;
 
-use std::{fmt::Write, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use rushls_common::metrics::escape_label;
 
@@ -11,7 +11,7 @@ use crate::{
     hooks::{HOOK_SERIES, HookSnapshot, Hooks},
     observe::{
         HlsMeters, HlsSnapshot, MeterSnapshot, MetricKind, OriginMeters, OriginSnapshot,
-        ProcessMeters, ProcessSnapshot, Series, counters::series,
+        ProcessMeters, ProcessSnapshot, counters::series,
     },
     server::http::playback::{PlaybackDenials, PlaybackMeters},
     session::{Registry, SessionSnapshot},
@@ -110,19 +110,17 @@ impl MetricsEndpoint {
     /// Served at `/metrics/streams` so the scraper chooses the unbounded
     /// cardinality, rather than a node-side flag.
     pub fn render_streams(&self) -> String {
-        let mut output = render_labelled(
+        let mut samples = render_labelled(
             &self.reader.sessions.snapshot(),
             &self.reader.retention_depths(),
         );
-        let mut samples = exposition::Samples::default();
         let mut streams = self.reader.store.live_streams();
         streams.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
         for (id, live) in streams {
             publication::stream(&mut samples, &id, &live, &live.publication_snapshot());
             publication::http_requests(&mut samples, &live.http_meters().snapshot(), Some(&id));
         }
-        output.push_str(&samples.finish());
-        output
+        samples.finish()
     }
 }
 
@@ -298,8 +296,6 @@ series! {
 /// reads, in `observe`. This decides only how to spell them on the wire, which
 /// is why adding a counter no longer means editing this function.
 pub fn render(snapshot: &MetricsSnapshot) -> String {
-    let mut output = String::with_capacity(4_096);
-
     let mut samples = exposition::Samples::default();
     samples.gauge(
         "rushls_build_info",
@@ -379,141 +375,97 @@ pub fn render(snapshot: &MetricsSnapshot) -> String {
     publication::http(&mut samples, &snapshot.http);
     publication::totals(&mut samples, &snapshot.publication);
     publication::operations(&mut samples, &snapshot.operations);
-    output.push_str(&samples.finish());
-    scalars(&mut output, ProcessSnapshot::SERIES, &snapshot.process);
-    scalars(&mut output, OriginSnapshot::SERIES, &snapshot.origin);
-    scalars(&mut output, HlsSnapshot::SERIES, &snapshot.hls);
-    scalars(&mut output, MetricsSnapshot::SERIES, snapshot);
-    render_retention_capacity(&mut output, snapshot);
-    render_playback(&mut output, snapshot.playback);
+    samples.series(ProcessSnapshot::SERIES, "", &snapshot.process);
+    samples.series(OriginSnapshot::SERIES, "", &snapshot.origin);
+    samples.series(HlsSnapshot::SERIES, "", &snapshot.hls);
+    samples.series(MetricsSnapshot::SERIES, "", snapshot);
+    render_retention_capacity(&mut samples, snapshot);
+    render_playback(&mut samples, snapshot.playback);
 
     if !snapshot.hooks.is_empty() {
-        render_hooks(&mut output, &snapshot.hooks);
+        render_hooks(&mut samples, &snapshot.hooks);
     }
-    output
+    samples.finish()
 }
 
 /// Sessions and per-stream retention for `/metrics/streams`.
 fn render_labelled(
     sessions: &[SessionSnapshot],
     retention: &[(StreamId, RetentionDepth)],
-) -> String {
-    let mut output = String::with_capacity(512 + retention.len() * 256 + sessions.len() * 2_048);
-    render_retention_into(&mut output, retention);
-    render_sessions(&mut output, sessions);
+) -> exposition::Samples {
     let mut samples = exposition::Samples::default();
+    render_retention_into(&mut samples, retention);
+    render_sessions(&mut samples, sessions);
     for session in sessions {
         publication::tracks(&mut samples, session);
     }
-    output.push_str(&samples.finish());
-    output
-}
-
-/// One unlabelled reading per series, each under its own metadata.
-fn scalars<S>(output: &mut String, series: &[Series<S>], source: &S) {
-    for series in series {
-        metadata(output, series.name, series.help, series.kind);
-        writeln!(output, "{} {}", series.name, (series.read)(source))
-            .expect("writing to a String cannot fail");
-    }
+    samples
 }
 
 const RETENTION_CAPACITY_BYTES: &str = "rushls_retention_capacity_bytes";
 
-fn render_retention_capacity(output: &mut String, snapshot: &MetricsSnapshot) {
-    metadata(
-        output,
-        RETENTION_CAPACITY_BYTES,
-        "Configured retention cap across currently retained streams, per tier.",
-        MetricKind::Gauge,
-    );
-    writeln!(
-        output,
-        "{RETENTION_CAPACITY_BYTES}{{tier=\"memory\"}} {}",
-        snapshot.retention_memory_capacity
-    )
-    .expect("writing to a String cannot fail");
-    writeln!(
-        output,
-        "{RETENTION_CAPACITY_BYTES}{{tier=\"disk\"}} {}",
-        snapshot.retention_disk_capacity
-    )
-    .expect("writing to a String cannot fail");
+fn render_retention_capacity(output: &mut exposition::Samples, snapshot: &MetricsSnapshot) {
+    for (tier, capacity) in [
+        ("memory", snapshot.retention_memory_capacity),
+        ("disk", snapshot.retention_disk_capacity),
+    ] {
+        output.gauge(
+            RETENTION_CAPACITY_BYTES,
+            "Configured retention cap across currently retained streams, per tier.",
+            &format!("tier=\"{tier}\""),
+            capacity,
+        );
+    }
 }
 
 const PLAYBACK_DENIED_TOTAL: &str = "rushls_playback_denied_total";
 
-fn render_playback(output: &mut String, playback: Option<PlaybackDenials>) {
+fn render_playback(output: &mut exposition::Samples, playback: Option<PlaybackDenials>) {
     let Some(denials) = playback else {
         return;
     };
-    metadata(
-        output,
-        PLAYBACK_DENIED_TOTAL,
-        "Viewer requests refused by playback authorization, labelled by HTTP status.",
-        MetricKind::Counter,
-    );
-    writeln!(
-        output,
-        "{PLAYBACK_DENIED_TOTAL}{{status=\"401\"}} {}",
-        denials.unauthorized
-    )
-    .expect("writing to a String cannot fail");
-    writeln!(
-        output,
-        "{PLAYBACK_DENIED_TOTAL}{{status=\"403\"}} {}",
-        denials.forbidden
-    )
-    .expect("writing to a String cannot fail");
-}
-
-/// One counter per hook, labelled by the name the operator configured.
-fn render_hooks(output: &mut String, hooks: &[(Arc<str>, HookSnapshot)]) {
-    for series in HOOK_SERIES {
-        metadata(output, series.name, series.help, series.kind);
-        for (hook, snapshot) in hooks {
-            writeln!(
-                output,
-                "{}{{hook=\"{}\"}} {}",
-                series.name,
-                escape_label(hook),
-                (series.read)(snapshot)
-            )
-            .expect("writing to a String cannot fail");
-        }
+    for (status, count) in [(401, denials.unauthorized), (403, denials.forbidden)] {
+        output.counter(
+            PLAYBACK_DENIED_TOTAL,
+            "Viewer requests refused by playback authorization, labelled by HTTP status.",
+            &format!("status=\"{status}\""),
+            count,
+        );
     }
 }
 
-fn metadata(output: &mut String, name: &str, help: &str, kind: MetricKind) {
-    writeln!(output, "# HELP {name} {help}").expect("writing to a String cannot fail");
-    writeln!(output, "# TYPE {name} {}", kind.as_str()).expect("writing to a String cannot fail");
+/// One counter per hook, labelled by the name the operator configured.
+fn render_hooks(output: &mut exposition::Samples, hooks: &[(Arc<str>, HookSnapshot)]) {
+    for (hook, snapshot) in hooks {
+        output.series(
+            HOOK_SERIES,
+            &format!("hook=\"{}\"", escape_label(hook)),
+            snapshot,
+        );
+    }
 }
 
 /// Per-stream series, each carrying the session's identity as labels.
 ///
-/// Metadata for every series comes first and the readings follow, rather than
-/// interleaving them per session: `# HELP` and `# TYPE` may each appear only
-/// once for a metric, however many label sets it has. Emitted even when no
-/// session is live, so the scrape still describes the series.
-fn render_sessions(output: &mut String, sessions: &[SessionSnapshot]) {
-    metadata(
-        output,
+/// Families group all sessions' readings under one `# HELP` and `# TYPE`.
+/// Metadata is emitted even when no session is live, so the scrape still
+/// describes the series.
+fn render_sessions(output: &mut exposition::Samples, sessions: &[SessionSnapshot]) {
+    output.describe(
         SESSION_INFO,
         "Identity and current lifecycle phase of an active session.",
         MetricKind::Gauge,
     );
     for series in MeterSnapshot::SERIES {
-        metadata(output, series.name, series.help, series.kind);
+        output.describe(series.name, series.help, series.kind);
     }
-    metadata(
-        output,
+    output.describe(
         SESSION_TRACKS,
         "Discovered tracks in an active session by media kind.",
         MetricKind::Gauge,
     );
 
-    metadata(
-        output,
+    output.describe(
         "rushls_session_pipeline_allocation_bytes",
         "Accounted pipeline bytes by allocation origin; shared bytes stay attributed to their first owner.",
         MetricKind::Gauge,
@@ -524,38 +476,35 @@ fn render_sessions(output: &mut String, sessions: &[SessionSnapshot]) {
             .iter()
             .zip(session.meters.pipeline_origins)
         {
-            writeln!(
-                output,
-                "rushls_session_pipeline_allocation_bytes{{{labels},origin=\"{origin}\"}} {bytes}"
-            )
-            .expect("writing to a String cannot fail");
+            output.gauge(
+                "rushls_session_pipeline_allocation_bytes",
+                "Accounted pipeline bytes by allocation origin; shared bytes stay attributed to their first owner.",
+                &format!("{labels},origin=\"{origin}\""),
+                bytes,
+            );
         }
-        writeln!(
-            output,
-            "{SESSION_INFO}{{{labels},principal=\"{}\",phase=\"{}\"}} 1",
-            escape_label(&session.principal.0),
-            session.phase
-        )
-        .expect("writing to a String cannot fail");
-        for series in MeterSnapshot::SERIES {
-            writeln!(
-                output,
-                "{}{{{labels}}} {}",
-                series.name,
-                (series.read)(&session.meters)
-            )
-            .expect("writing to a String cannot fail");
-        }
+        output.gauge(
+            SESSION_INFO,
+            "Identity and current lifecycle phase of an active session.",
+            &format!(
+                "{labels},principal=\"{}\",phase=\"{}\"",
+                escape_label(&session.principal.0),
+                session.phase
+            ),
+            1,
+        );
+        output.series(MeterSnapshot::SERIES, &labels, &session.meters);
         for (kind, count) in [
             ("audio", session.tracks.audio),
             ("subtitle", session.tracks.subtitle),
             ("video", session.tracks.video),
         ] {
-            writeln!(
-                output,
-                "{SESSION_TRACKS}{{{labels},kind=\"{kind}\"}} {count}"
-            )
-            .expect("writing to a String cannot fail");
+            output.gauge(
+                SESSION_TRACKS,
+                "Discovered tracks in an active session by media kind.",
+                &format!("{labels},kind=\"{kind}\""),
+                count,
+            );
         }
     }
 }
@@ -593,47 +542,40 @@ series! {
 const STREAM_RETAINED_BYTES: &str = "rushls_stream_retained_bytes";
 const STREAM_RETENTION_CAPACITY_BYTES: &str = "rushls_stream_retention_capacity_bytes";
 
-fn render_retention_into(output: &mut String, retention: &[(StreamId, RetentionDepth)]) {
+fn render_retention_into(
+    output: &mut exposition::Samples,
+    retention: &[(StreamId, RetentionDepth)],
+) {
     for series in STREAM_RETENTION_SERIES {
-        metadata(output, series.name, series.help, series.kind);
-        for (stream, depth) in retention {
-            writeln!(
-                output,
-                "{}{{stream=\"{}\"}} {}",
-                series.name,
-                escape_label(stream.as_str()),
-                (series.read)(depth)
-            )
-            .expect("writing to a String cannot fail");
-        }
+        output.describe(series.name, series.help, series.kind);
     }
-    metadata(
-        output,
+    output.describe(
         STREAM_RETAINED_BYTES,
         "Payload bytes this stream holds in one retention tier.",
         MetricKind::Gauge,
     );
-    metadata(
-        output,
+    output.describe(
         STREAM_RETENTION_CAPACITY_BYTES,
         "Configured cap for one retention tier of this stream.",
         MetricKind::Gauge,
     );
     for (stream, depth) in retention {
-        let stream = escape_label(stream.as_str());
+        let labels = format!("stream=\"{}\"", escape_label(stream.as_str()));
+        output.series(STREAM_RETENTION_SERIES, &labels, depth);
         for tier in depth.tiers() {
-            writeln!(
-                output,
-                "{STREAM_RETAINED_BYTES}{{stream=\"{stream}\",tier=\"{}\"}} {}",
-                tier.name, tier.bytes
-            )
-            .expect("writing to a String cannot fail");
-            writeln!(
-                output,
-                "{STREAM_RETENTION_CAPACITY_BYTES}{{stream=\"{stream}\",tier=\"{}\"}} {}",
-                tier.name, tier.capacity
-            )
-            .expect("writing to a String cannot fail");
+            let labels = format!("{labels},tier=\"{}\"", tier.name);
+            output.gauge(
+                STREAM_RETAINED_BYTES,
+                "Payload bytes this stream holds in one retention tier.",
+                &labels,
+                tier.bytes,
+            );
+            output.gauge(
+                STREAM_RETENTION_CAPACITY_BYTES,
+                "Configured cap for one retention tier of this stream.",
+                &labels,
+                tier.capacity,
+            );
         }
     }
 }
@@ -644,7 +586,6 @@ mod tests {
         admission::{Principal, PublishGrant, StreamPolicy},
         domain::StreamId,
         observe::SessionMeters,
-        session::StopToken,
     };
 
     use super::*;
@@ -667,7 +608,7 @@ mod tests {
         let session_meters = SessionMeters::new(meters.clone());
         session_meters.source_view().source_progress(512, 4);
         let registration = sessions
-            .register(&grant(), session_meters, StopToken::new())
+            .register(&grant(), session_meters, &store, true)
             .expect("the registry has room");
         let lease = store
             .lease_without_presentation(StreamId::new("live/camera"))
@@ -969,7 +910,8 @@ mod tests {
                     disk_capacity: 0,
                 },
             )],
-        );
+        )
+        .finish();
 
         assert!(
             output.contains(
@@ -1044,7 +986,7 @@ mod tests {
 
     #[test]
     fn an_empty_store_still_describes_the_labelled_series() {
-        let output = render_labelled(&[], &[]);
+        let output = render_labelled(&[], &[]).finish();
 
         assert!(output.contains("# TYPE rushls_stream_retention_max_seconds gauge\n"));
         assert!(output.contains("# TYPE rushls_stream_retained_bytes gauge\n"));

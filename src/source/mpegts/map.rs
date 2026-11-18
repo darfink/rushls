@@ -6,12 +6,13 @@
 
 use std::num::{NonZeroU16, NonZeroU32};
 
+use crate::media::video_config::VideoMetadata;
 use transmux::{CodecConfig, Sample, TrackSpec};
 
 use crate::{
     domain::{
-        AudioTiming, Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload, SourceTrackKey,
-        Timebase, TrackId,
+        AudioTiming, Codec, DiscoveredTrack, MediaParameters, Payload, SourceTrackKey, Timebase,
+        TrackId,
     },
     source::{DiscoveryProblem, Packet, SourceError},
 };
@@ -89,7 +90,7 @@ fn map_config(
             width,
             height,
         } => {
-            let parameters = video_parameters(*width, *height, avc_frame_rate(&config.config))?;
+            let parameters = video_parameters(*width, *height, VideoMetadata::avc(&config.config))?;
             let extradata = serialize_record(&config.config, "H.264 decoder configuration")?;
             Ok(Some((Codec::H264, parameters, extradata)))
         }
@@ -98,7 +99,8 @@ fn map_config(
             width,
             height,
         } => {
-            let parameters = video_parameters(*width, *height, hevc_frame_rate(&config.config))?;
+            let parameters =
+                video_parameters(*width, *height, VideoMetadata::hevc(&config.config))?;
             let extradata = serialize_record(&config.config, "H.265 decoder configuration")?;
             Ok(Some((Codec::Hevc, parameters, extradata)))
         }
@@ -145,37 +147,20 @@ fn map_config(
     }
 }
 
+// The demuxer's dimensions stay authoritative; codec timing supplies the tail
+// duration when the final PES has no successor DTS.
 fn video_parameters(
     width: u16,
     height: u16,
-    frame_rate: Option<FrameRate>,
+    metadata: Option<VideoMetadata>,
 ) -> Result<MediaParameters, SourceError> {
-    Ok(MediaParameters::Video {
-        width: nonzero_u32(u32::from(width), "video width")?,
-        height: nonzero_u32(u32::from(height), "video height")?,
-        frame_rate,
-        video_delay: 0,
-    })
-}
-
-/// H.264 VUI timing is `time_scale / (2 × num_units_in_tick)` (ITU-T H.264 §E.2.1).
-///
-/// The last access unit of a stream has no successor DTS, and a one-frame
-/// PES gets duration 0 from the demuxer. The declared cadence is what lets
-/// the pass-through normalizer time that tail.
-fn avc_frame_rate(record: &transmux::AVCDecoderConfigurationRecord) -> Option<FrameRate> {
-    let info = record.sps.first()?.decode().ok()?;
-    crate::media::video_config::h264_frame_rate(info.num_units_in_tick, info.time_scale)
-}
-
-/// HEVC VUI timing is `time_scale / num_units_in_tick` (ITU-T H.265 §E.2.1).
-fn hevc_frame_rate(record: &transmux::HEVCDecoderConfigurationRecord) -> Option<FrameRate> {
-    let info = record
-        .arrays
-        .iter()
-        .flat_map(|array| array.nalus.iter())
-        .find_map(|nal| nal.decode_sps().ok().flatten())?;
-    crate::media::video_config::hevc_frame_rate(info.num_units_in_tick, info.time_scale)
+    VideoMetadata {
+        width: u32::from(width),
+        height: u32::from(height),
+        frame_rate: metadata.and_then(|metadata| metadata.frame_rate),
+    }
+    .parameters()
+    .map_err(|field| DiscoveryProblem::NotPositive { field }.into())
 }
 
 fn aac_extradata(esds: &transmux::EsdsBox) -> Result<Payload, SourceError> {
@@ -202,10 +187,6 @@ where
         return Err(DiscoveryProblem::Missing { field }.into());
     }
     Ok(Payload::from(bytes))
-}
-
-fn nonzero_u32(value: u32, field: &'static str) -> Result<NonZeroU32, SourceError> {
-    NonZeroU32::new(value).ok_or_else(|| DiscoveryProblem::NotPositive { field }.into())
 }
 
 /// First `ISO_639_language_descriptor` (tag `0x0A`) on a PMT ES_info loop.
@@ -269,36 +250,35 @@ mod tests {
     #[test]
     fn transport_stream_headers_preserve_codec_cadence() -> Result<(), Box<dyn std::error::Error>> {
         use super::track;
-        use crate::media::fixtures::{AV1_FIXED_CADENCE, H264_FIXED_CADENCE, HEVC_FIXED_CADENCE};
+        use crate::domain::{Codec, Timebase};
+        use crate::media::fixtures::{assert_video_header, video_headers};
         use broadcast_common::Parse;
         use transmux::{CodecConfig, TrackSpec};
-        let configs = [
-            CodecConfig::Avc {
-                config: transmux::AVCConfigurationBox::parse_body(H264_FIXED_CADENCE)?,
-                width: 64,
-                height: 64,
-            },
-            CodecConfig::Hevc {
-                config: transmux::HEVCConfigurationBox::parse_body(HEVC_FIXED_CADENCE)?,
-                width: 64,
-                height: 64,
-            },
-            CodecConfig::Av1 {
-                config: transmux::Av1ConfigurationBox::parse(AV1_FIXED_CADENCE)?,
-                width: 64,
-                height: 64,
-            },
-        ];
-        for config in configs {
+        for (codec, bytes, expected) in video_headers() {
+            let config = match codec {
+                Codec::H264 => CodecConfig::Avc {
+                    config: transmux::AVCConfigurationBox::parse_body(bytes)?,
+                    width: 64,
+                    height: 64,
+                },
+                Codec::Hevc => CodecConfig::Hevc {
+                    config: transmux::HEVCConfigurationBox::parse_body(bytes)?,
+                    width: 64,
+                    height: 64,
+                },
+                Codec::Av1 => CodecConfig::Av1 {
+                    config: transmux::Av1ConfigurationBox::parse(bytes)?,
+                    width: 64,
+                    height: 64,
+                },
+                _ => unreachable!(),
+            };
             let track = track(&TrackSpec::new(1, 90000, config))?.expect("supported video");
             assert_eq!(
                 track.decoder_config_origin,
                 crate::domain::DecoderConfigOrigin::Synthesized
             );
-            assert!(matches!(
-                crate::media::cadence::inspect(&track),
-                crate::domain::VideoCadence::Fixed { .. }
-            ));
+            assert_video_header(&track, expected, Timebase::hz90k());
         }
         Ok(())
     }

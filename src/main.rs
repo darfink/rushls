@@ -38,7 +38,7 @@ impl EventObserver for TracingEvents {
                 principal,
                 publisher,
             } => {
-                info!(session = %session, stream = %stream, principal = %principal, protocol = %publisher.protocol, remote_address = %publisher.client.remote_address, "accepted");
+                info!(session = %session, stream = %stream, principal = %principal, hooks_withheld = !publisher.public_stream, protocol = %publisher.protocol, remote_address = %publisher.client.remote_address, "accepted");
             }
             SessionEvent::Displaced { stream } => {
                 info!(session = %session, stream = %stream, "displaced");

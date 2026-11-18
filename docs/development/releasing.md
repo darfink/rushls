@@ -88,4 +88,4 @@ Container tags follow this policy:
 - `v<version>`: the tagged release, including prereleases.
 - `latest`: a stable tagged release; prereleases and main-branch builds do not update it.
 
-The container currently targets Linux AMD64. Native ARM64 binaries are separate release assets.
+The container supports Linux AMD64 and ARM64 under the same tags.

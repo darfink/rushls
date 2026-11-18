@@ -5,18 +5,12 @@
 //! parsed only far enough to fill [`DiscoveredTrack`] parameters; the payload
 //! bytes themselves are already length-prefixed video or raw audio.
 
-use crate::media::video_config::{h264_frame_rate, hevc_frame_rate};
-use std::num::NonZeroU32;
-
-use broadcast_common::Parse;
+use crate::media::video_config::VideoMetadata;
 use bytes::Bytes;
 use rtmpx::{ElementaryCodec, ElementaryUnit, EncoderSummary};
 
 use crate::{
-    domain::{
-        Codec, DiscoveredTrack, FrameRate, MediaParameters, Payload, SourceTrackKey, Timebase,
-        TrackId,
-    },
+    domain::{Codec, DiscoveredTrack, MediaParameters, Payload, SourceTrackKey, Timebase, TrackId},
     source::{DiscoveryProblem, Packet, SourceError},
 };
 
@@ -30,8 +24,14 @@ pub fn track(
     hint: Option<&EncoderSummary>,
 ) -> Result<DiscoveredTrack, SourceError> {
     let (mapped, mut parameters) = match codec {
-        ElementaryCodec::Avc => (Codec::H264, video_parameters(&extradata, hint, "H.264")?),
-        ElementaryCodec::Hevc => (Codec::Hevc, video_parameters_hevc(&extradata, hint)?),
+        ElementaryCodec::Avc => (
+            Codec::H264,
+            video_parameters(Codec::H264, &extradata, hint)?,
+        ),
+        ElementaryCodec::Hevc => (
+            Codec::Hevc,
+            video_parameters(Codec::Hevc, &extradata, hint)?,
+        ),
         ElementaryCodec::Av1 => (Codec::Av1, video_parameters_from_hint(hint, "AV1")?),
         ElementaryCodec::Aac => (
             Codec::Aac,
@@ -192,41 +192,23 @@ pub(crate) fn source_key(codec: ElementaryCodec, track_id: Option<u8>) -> Source
 }
 
 fn video_parameters(
-    extradata: &[u8],
-    hint: Option<&EncoderSummary>,
-    codec: &'static str,
-) -> Result<MediaParameters, SourceError> {
-    if let Ok(record) = transmux::AVCDecoderConfigurationRecord::parse(extradata)
-        && let Some(sps) = record.sps.first()
-        && let Ok(info) = sps.decode()
-    {
-        return video_size(
-            info.width,
-            info.height,
-            h264_frame_rate(info.num_units_in_tick, info.time_scale),
-        );
-    }
-    video_parameters_from_hint(hint, codec)
-}
-
-fn video_parameters_hevc(
+    codec: Codec,
     extradata: &[u8],
     hint: Option<&EncoderSummary>,
 ) -> Result<MediaParameters, SourceError> {
-    if let Ok(record) = transmux::HEVCDecoderConfigurationRecord::parse(extradata) {
-        for array in &record.arrays {
-            for nalu in &array.nalus {
-                if let Ok(Some(info)) = nalu.decode_sps() {
-                    return video_size(
-                        info.width,
-                        info.height,
-                        hevc_frame_rate(info.num_units_in_tick, info.time_scale),
-                    );
-                }
-            }
-        }
+    if let Some(metadata) = VideoMetadata::inspect(codec, extradata) {
+        return metadata
+            .parameters()
+            .map_err(|field| DiscoveryProblem::NotPositive { field }.into());
     }
-    video_parameters_from_hint(hint, "H.265")
+    video_parameters_from_hint(
+        hint,
+        if codec == Codec::H264 {
+            "H.264"
+        } else {
+            "H.265"
+        },
+    )
 }
 
 fn video_parameters_from_hint(
@@ -242,24 +224,13 @@ fn video_parameters_from_hint(
                 _ => "video dimensions",
             },
         })?;
-    video_size(width, height, None)
-}
-
-fn video_size(
-    width: u32,
-    height: u32,
-    frame_rate: Option<FrameRate>,
-) -> Result<MediaParameters, SourceError> {
-    Ok(MediaParameters::Video {
-        width: nonzero_u32(width, "video width")?,
-        height: nonzero_u32(height, "video height")?,
-        frame_rate,
-        video_delay: 0,
-    })
-}
-
-fn nonzero_u32(value: u32, field: &'static str) -> Result<NonZeroU32, SourceError> {
-    NonZeroU32::new(value).ok_or_else(|| DiscoveryProblem::NotPositive { field }.into())
+    VideoMetadata {
+        width,
+        height,
+        frame_rate: None,
+    }
+    .parameters()
+    .map_err(|field| DiscoveryProblem::NotPositive { field }.into())
 }
 
 pub fn codec(codec: ElementaryCodec) -> Codec {
@@ -282,16 +253,18 @@ mod cadence_tests {
     use super::*;
     #[test]
     fn legacy_and_enhanced_rtmp_preserve_codec_cadence() -> Result<(), SourceError> {
-        use crate::media::fixtures::{AV1_FIXED_CADENCE, H264_FIXED_CADENCE, HEVC_FIXED_CADENCE};
+        use crate::media::fixtures::{assert_video_header, video_headers};
         let mut hint = EncoderSummary::default();
-        hint.width = Some(64);
-        hint.height = Some(64);
+        hint.width = Some(1920);
+        hint.height = Some(1080);
         hint.framerate = Some(30.0);
-        for (codec, bytes) in [
-            (ElementaryCodec::Avc, H264_FIXED_CADENCE),
-            (ElementaryCodec::Hevc, HEVC_FIXED_CADENCE),
-            (ElementaryCodec::Av1, AV1_FIXED_CADENCE),
-        ] {
+        for (codec, bytes, expected) in video_headers() {
+            let codec = match codec {
+                Codec::H264 => ElementaryCodec::Avc,
+                Codec::Hevc => ElementaryCodec::Hevc,
+                Codec::Av1 => ElementaryCodec::Av1,
+                _ => unreachable!(),
+            };
             let track = track(
                 TrackId(0),
                 codec,
@@ -299,12 +272,7 @@ mod cadence_tests {
                 None,
                 Some(&hint),
             )?;
-            let cadence = crate::media::cadence::inspect(&track);
-            assert!(matches!(cadence, crate::domain::VideoCadence::Fixed { .. }));
-            assert_eq!(
-                cadence.rate(),
-                Some(FrameRate::new(nz::u32!(25), nz::u32!(1)))
-            );
+            assert_video_header(&track, expected, TIMEBASE);
         }
         Ok(())
     }
@@ -313,7 +281,7 @@ mod cadence_tests {
 #[cfg(test)]
 mod gap_tests {
     use super::*;
-    use crate::media::{NormalizedMedia, NormalizerFactory};
+    use crate::media::{NormalizedMedia, start_normalizer};
 
     #[test]
     fn rtmp_packet_loss_reaches_exact_video_gap_detection() -> Result<(), Box<dyn std::error::Error>>
@@ -340,8 +308,7 @@ mod gap_tests {
             crate::domain::InputMode::Strict,
             crate::domain::InputMode::Permissive,
         ] {
-            let mut started =
-                crate::media::PassThroughNormalizerFactory.start(&presentation, &timeline, mode)?;
+            let mut started = start_normalizer(&presentation, &timeline, mode)?;
             assert!(matches!(
                 started.presentation.tracks()[0].video_cadence,
                 crate::domain::VideoCadence::Fixed { .. }

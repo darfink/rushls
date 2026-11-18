@@ -14,8 +14,6 @@ use rushls::admission::{OpenStreamAuthenticator, StreamPolicy};
 use rushls::delivery::hls::{StorePublisherFactory, StreamStore};
 use rushls::delivery::record::{Config as RecordConfig, Recorder, RecordingFactory};
 use rushls::domain::SessionId;
-use rushls::media::PassThroughNormalizerFactory;
-use rushls::mux::PassThroughMuxerFactory;
 use rushls::observe::{EventObserver, Events, NodeEvent, ProcessMeters, SessionEvent};
 use rushls::session::{
     PendingPermit, Registry, Services, SessionConfig, SessionError, SessionOutcome, run_session,
@@ -147,8 +145,6 @@ impl TestRig {
 
         let services = Services {
             authenticator: Arc::new(OpenStreamAuthenticator::new(StreamPolicy::permissive())),
-            normalizers: Arc::new(PassThroughNormalizerFactory),
-            muxers: Arc::new(PassThroughMuxerFactory),
             publishers: Arc::new(publishers),
             sessions: Registry::with_capacity(16),
             meters: meters.clone(),

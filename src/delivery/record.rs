@@ -235,15 +235,22 @@ pub struct RecordingFactory {
     pub recorder: Recorder,
 }
 impl PublisherFactory for RecordingFactory {
-    fn start(
+    fn store(&self) -> &crate::delivery::store::StreamStore {
+        self.inner.store()
+    }
+
+    fn start_if_current(
         &self,
         stream: &StreamId,
         presentation: Arc<PackagedPresentation>,
+        permit: crate::delivery::store::PublicationPermit<'_>,
     ) -> Result<Box<dyn HlsPublisher>, HlsError> {
         // Validate names before accepting any media, without filesystem work on
         // the media path. A fresh UUID prevents restart/reconnect collisions.
         let publication = Uuid::now_v7().to_string();
-        let inner = self.inner.start(stream, presentation.clone())?;
+        let inner = self
+            .inner
+            .start_if_current(stream, presentation.clone(), permit)?;
         let mut renditions = HashMap::new();
         for rendition in presentation.renditions.iter() {
             if let Err(error) = self.recorder.pattern.expand(

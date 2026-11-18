@@ -103,10 +103,12 @@ impl CadenceObserver {
             tracks.push(TrackCadence {
                 track_id: timing.track_id,
                 kind: source.kind(),
-                frame_rate: match source.parameters {
+                // Match normalization's codec-first rate so metadata hints cannot
+                // replace a fixed bitstream cadence or discard its fractional grid.
+                frame_rate: source.video_cadence.rate().or(match source.parameters {
                     crate::domain::MediaParameters::Video { frame_rate, .. } => frame_rate,
                     _ => None,
-                },
+                }),
                 timebase: timing.timebase,
                 timestamp_quantum: presentation.timestamp_quantum(source.id, timing.timebase),
                 presentation_origin: timing.origin_pts,
@@ -462,11 +464,14 @@ impl CadenceObserver {
         )
         .ok_or(CadenceError::InconsistentPartCadence(track.track_id))?;
 
-        let segment_period = track.frame_rate.and_then(|rate| {
+        let frame_period = track.frame_rate.map(|rate| {
             let numerator =
                 u128::from(rate.denominator().get()) * u128::from(track.timebase.den().get());
             let denominator =
                 u128::from(rate.numerator().get()) * u128::from(track.timebase.num().get());
+            (numerator, denominator)
+        });
+        let segment_period = frame_period.and_then(|(numerator, denominator)| {
             let observed = u128::from(segment_duration.get()) * denominator;
             let frames = (observed + numerator / 2) / numerator;
             let period = frames.checked_mul(numerator)?;
@@ -496,13 +501,7 @@ impl CadenceObserver {
                 // or arrive through a coarser container clock (for example FLV).
                 // Native integral timing needs no extra ceiling allowance.
                 MediaKind::Video => {
-                    let fractional_frames = track.frame_rate.is_some_and(|rate| {
-                        let numerator = u128::from(rate.denominator().get())
-                            * u128::from(track.timebase.den().get());
-                        let denominator = u128::from(rate.numerator().get())
-                            * u128::from(track.timebase.num().get());
-                        !numerator.is_multiple_of(denominator)
-                    });
+                    let fractional_frames = frame_period.is_some_and(|(n, d)| !n.is_multiple_of(d));
                     if track.timestamp_quantum > 1 || fractional_frames || segment_period.is_some()
                     {
                         track.timestamp_quantum
@@ -716,6 +715,51 @@ mod tests {
         observer
             .observe(&video(track_id, pts, VIDEO_FRAME, random_access))
             .expect("video is observable");
+    }
+
+    #[test]
+    fn fixed_codec_rate_preserves_the_fractional_segment_grid() -> Result<(), CadenceError> {
+        let rate = crate::domain::FrameRate::new(nz::u32!(24_000), nz::u32!(1_001));
+        for hint in [
+            None,
+            Some(crate::domain::FrameRate::new(nz::u32!(30), nz::u32!(1))),
+        ] {
+            let mut track = TrackBuilder::new(0, MediaKind::Video).build();
+            let crate::domain::MediaParameters::Video { frame_rate, .. } = &mut track.parameters
+            else {
+                unreachable!()
+            };
+            *frame_rate = hint;
+            track.codec_extradata = crate::media::fixtures::H264_FRACTIONAL_CADENCE.into();
+            track.video_cadence = crate::media::cadence::inspect(&track);
+            assert!(matches!(
+                track.video_cadence,
+                crate::domain::VideoCadence::Fixed { .. }
+            ));
+            assert_eq!(track.video_cadence.rate(), Some(rate));
+            let presentation = presentation(vec![track]);
+            let timeline = calibrated([(0, Timebase::hz90k(), 0)]);
+            let mut config = policy(Duration::from_secs(4));
+            config.desired_segment_duration = Duration::from_secs(1);
+            let mut observer = CadenceObserver::new(&presentation, &timeline, config)?;
+            // A 25-frame GOP is 93843.75 ticks: rounding each GOP to 93844
+            // would accumulate a tick of drift every four segments.
+            for frame in 0..=25 {
+                let pts = (frame * 15_015 + 2) / 4;
+                let next = ((frame + 1) * 15_015 + 2) / 4;
+                observer.observe(&video(
+                    0,
+                    pts,
+                    u64::try_from(next - pts).expect("positive duration"),
+                    frame % 25 == 0,
+                ))?;
+            }
+            let plans = observer.plan()?.expect("a complete GOP");
+            assert_eq!(plans[0].first_segment_boundary_pts, 93_844);
+            assert_eq!(plans[0].segment_period, Some((2_252_250_000, 24_000)));
+            assert_eq!(plans[0].boundary_tolerance, 1);
+        }
+        Ok(())
     }
 
     #[test]

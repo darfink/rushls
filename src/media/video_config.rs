@@ -1,7 +1,59 @@
 //! Video properties recovered from codec headers, shared by ingest and muxing.
 
-use crate::domain::Codec;
+use crate::domain::{Codec, FrameRate, MediaParameters};
 use broadcast_common::Parse;
+use std::num::NonZeroU32;
+
+/// Codec-derived dimensions and exact VUI rate, before transport fallbacks.
+pub struct VideoMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: Option<FrameRate>,
+}
+
+impl VideoMetadata {
+    pub fn inspect(codec: Codec, extra: &[u8]) -> Option<Self> {
+        match codec {
+            Codec::H264 => Self::avc(&transmux::AVCDecoderConfigurationRecord::parse(extra).ok()?),
+            Codec::Hevc => {
+                Self::hevc(&transmux::HEVCDecoderConfigurationRecord::parse(extra).ok()?)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn avc(record: &transmux::AVCDecoderConfigurationRecord) -> Option<Self> {
+        let info = record.sps.first()?.decode().ok()?;
+        Some(Self {
+            width: info.width,
+            height: info.height,
+            frame_rate: h264_frame_rate(info.num_units_in_tick, info.time_scale),
+        })
+    }
+
+    pub fn hevc(record: &transmux::HEVCDecoderConfigurationRecord) -> Option<Self> {
+        let info = record
+            .arrays
+            .iter()
+            .flat_map(|array| &array.nalus)
+            .find_map(|nal| nal.decode_sps().ok().flatten())?;
+        Some(Self {
+            width: info.width,
+            height: info.height,
+            frame_rate: hevc_frame_rate(info.num_units_in_tick, info.time_scale),
+        })
+    }
+
+    /// Returns the invalid field so ingest retains its discovery error contract.
+    pub fn parameters(self) -> Result<MediaParameters, &'static str> {
+        Ok(MediaParameters::Video {
+            width: NonZeroU32::new(self.width).ok_or("video width")?,
+            height: NonZeroU32::new(self.height).ok_or("video height")?,
+            frame_rate: self.frame_rate,
+            video_delay: 0,
+        })
+    }
+}
 
 #[derive(Default)]
 pub struct VideoProperties {
@@ -188,20 +240,12 @@ fn sei_number(bytes: &mut &[u8]) -> Option<usize> {
 
 /// H.264 VUI timing counts fields: a frame spans two clock ticks.
 pub fn h264_frame_rate(units: Option<u32>, scale: Option<u32>) -> Option<crate::domain::FrameRate> {
-    let units = std::num::NonZeroU32::new(units?)?;
-    let scale = std::num::NonZeroU32::new(scale?)?;
-    Some(crate::domain::FrameRate::new(
-        scale,
-        units.checked_mul(nz::u32!(2))?,
-    ))
+    super::cadence::rate(u64::from(scale?), u64::from(units?) * 2)
 }
 
 /// HEVC VUI timing counts complete frames.
 pub fn hevc_frame_rate(units: Option<u32>, scale: Option<u32>) -> Option<crate::domain::FrameRate> {
-    Some(crate::domain::FrameRate::new(
-        std::num::NonZeroU32::new(scale?)?,
-        std::num::NonZeroU32::new(units?)?,
-    ))
+    super::cadence::rate(u64::from(scale?), u64::from(units?))
 }
 
 /// Recognize closed random access in a length-prefixed AVC/HEVC access unit.

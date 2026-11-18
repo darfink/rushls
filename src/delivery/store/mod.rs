@@ -55,6 +55,8 @@ mod stream;
 pub mod telemetry;
 
 #[cfg(test)]
+mod fixtures;
+#[cfg(test)]
 mod tests;
 
 use catalog::RenditionView;
@@ -145,6 +147,21 @@ impl Default for StreamStore {
     }
 }
 
+/// Session facts checked at the instant a writer acquires the store mutation lock.
+#[derive(Clone, Copy)]
+pub struct PublicationPermit<'a> {
+    pub public_stream: bool,
+    pub is_current: &'a dyn Fn() -> bool,
+}
+
+#[cfg(test)]
+impl PublicationPermit<'_> {
+    pub const UNRESTRICTED: Self = Self {
+        public_stream: true,
+        is_current: &|| true,
+    };
+}
+
 impl StreamStore {
     pub fn new(limits: StoreLimits) -> Self {
         Self::try_new(limits).expect("disk tier is only opened when configured")
@@ -194,6 +211,29 @@ impl StreamStore {
         &self.limits
     }
 
+    /// Fixture setup with no session or takeover.
+    #[cfg(test)]
+    pub fn lease(
+        &self,
+        stream: StreamId,
+        presentation: &PackagedPresentation,
+    ) -> Result<StreamLease, StoreFull> {
+        self.lease_if_current(stream, presentation, PublicationPermit::UNRESTRICTED)
+            .map(|lease| lease.expect("unrestricted publication"))
+    }
+
+    /// Keep the retained identity stable until the registry has accepted or
+    /// rejected the publisher. Acquire this lock before the registry write lock
+    /// so an ongoing store maintenance pass never blocks registry readers.
+    pub(crate) fn with_retained_stream<R>(
+        &self,
+        stream: &StreamId,
+        register: impl FnOnce(Option<&LiveStream>) -> R,
+    ) -> R {
+        let _mutation = self.mutations.lock();
+        register(self.streams.load().get(stream).map(AsRef::as_ref))
+    }
+
     /// Takes the write lease on a stream, creating it if nobody has yet.
     ///
     /// The stream itself is *not* owned by the lease. That separation makes
@@ -206,12 +246,18 @@ impl StreamStore {
     /// Leasing revokes any outstanding lease. The displaced holder can still
     /// call [`StreamLease::write`], but its writes are dropped instead of being
     /// interleaved into its successor's media.
-    pub fn lease(
+    pub fn lease_if_current(
         &self,
         stream: StreamId,
         presentation: &PackagedPresentation,
-    ) -> Result<StreamLease, StoreFull> {
+        permit: PublicationPermit<'_>,
+    ) -> Result<Option<StreamLease>, StoreFull> {
         let _mutation = self.mutations.lock();
+        // Serialized with every successor attachment: a displaced session
+        // returning from startup can neither create a stream nor revoke its writer.
+        if !(permit.is_current)() {
+            return Ok(None);
+        }
         let current = self.streams.load_full();
         let live = if let Some(live) = current.get(&stream) {
             Arc::clone(live)
@@ -248,13 +294,14 @@ impl StreamStore {
 
         // Serialized with structural removal, so the returned lease can never
         // point at a stream that was retired between lookup and attachment.
+        live.restrict_hooks(permit.public_stream);
         let (publication, renditions) = live.attach(presentation);
-        Ok(StreamLease {
+        Ok(Some(StreamLease {
             stream,
             live,
             publication,
             renditions: Arc::new(renditions),
-        })
+        }))
     }
 
     /// Test-only lifecycle lease for metrics that do not publish media.
@@ -335,11 +382,9 @@ impl StreamStore {
             if live.retire_if_idle_for(live.retention_depth().requested) {
                 // Only a stream viewers could reach becomes unreachable. One
                 // that never served anything was never available to lose.
-                if live.was_announced() {
-                    changed.retired.push(stream.clone());
-                }
+                changed.retired.push((stream.clone(), live.was_announced()));
                 if let Some(disk) = &self.disk {
-                    disk.remove_stream(stream, live.disk_epoch());
+                    disk.remove_stream(live.disk_epoch());
                 }
                 next.get_or_insert_with(|| (*current).clone())
                     .remove(stream);
@@ -356,8 +401,9 @@ impl StreamStore {
 /// What one maintenance pass changed about stream reachability.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Maintenance {
-    /// Streams whose reconnect window closed, and which were reachable before.
-    pub retired: Vec<StreamId>,
+    /// Every removed stream must release its playlist cache. Only an announced
+    /// stream also owes consumers a matching unavailable event.
+    pub retired: Vec<(StreamId, bool)>,
 }
 
 /// A publisher's write lease on one stream.

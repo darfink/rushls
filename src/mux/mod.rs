@@ -25,7 +25,7 @@ mod webvtt;
 #[cfg(test)]
 pub mod fixtures;
 
-pub use passthrough::{PassThroughMuxerFactory, validate_timing};
+pub use passthrough::{start_muxer, validate_timing};
 pub use track::TrackPackager;
 
 pub use presentation::{
@@ -302,13 +302,6 @@ pub enum FinishReason {
 /// return value cannot express and a generic sink can only express by infecting
 /// every caller with its type.
 pub trait Muxer: Send {
-    /// Longest healthy interval between progressively publishable outputs.
-    ///
-    /// Chunked muxers report their regular chunk cadence; segment-only muxers
-    /// report their segment cadence. Supervision uses this without learning
-    /// either packaging mode.
-    fn expected_publication_interval(&self) -> Duration;
-
     fn push(
         &mut self,
         sample: NormalizedMedia,
@@ -327,12 +320,4 @@ pub trait Muxer: Send {
         reason: FinishReason,
         out: &mut dyn Appender<PackagedMedia>,
     ) -> Result<(), MuxError>;
-}
-
-pub trait MuxerFactory: Send + Sync {
-    /// Constructs both the byte producer and its authoritative output topology.
-    ///
-    /// A future transcoding muxer can therefore advertise its output ladder
-    /// without pretending those properties came from input discovery.
-    fn start(&self, request: MuxerStartRequest<'_>) -> Result<StartedMuxer, MuxError>;
 }

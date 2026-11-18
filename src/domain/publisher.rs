@@ -59,6 +59,8 @@ pub struct ClientInfo {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct PublisherContext {
     pub protocol: IngestProtocol,
+    /// False when a lifecycle subject or media URL would disclose the credential.
+    pub public_stream: bool,
     pub resource: PublishResource,
     pub client: ClientInfo,
 }

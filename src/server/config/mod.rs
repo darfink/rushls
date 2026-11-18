@@ -563,14 +563,6 @@ impl AppConfig {
                     .to_owned(),
             );
         }
-        // After `http.resolve`, which replaces the whole struct: the
-        // fingerprint route is mounted from the MOQ listener's own
-        // certificate, so it exists exactly when MOQ ingest does.
-        node.http.moq_certificate = node
-            .moq
-            .tls
-            .as_ref()
-            .map(|settings| settings.certificate.clone());
         node.metrics = self.metrics.resolve()?;
         if node.http_address.is_none() && node.https_address.is_none() {
             return Err(invalid(
@@ -2487,9 +2479,6 @@ impl HttpAppConfig {
             cors: self.cors.resolve()?,
             tls_address: https.as_ref().map(|(address, _)| *address),
             tls: https.map(|(_, settings)| settings),
-            // Filled in by the caller, which is the only place that knows
-            // whether the MOQ listener is on.
-            moq_certificate: None,
         };
         config.validate().map_err(invalid)?;
         Ok(config)

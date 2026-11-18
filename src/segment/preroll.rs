@@ -1033,8 +1033,9 @@ mod admission_tests {
             domain::{MediaKind, Payload, StreamId, fixtures::TrackBuilder},
             media::fixtures,
             mux::{
-                MuxerFactory, MuxerStartRequest, PackagedMedia, PassThroughMuxerFactory,
+                MuxerStartRequest, PackagedMedia,
                 fixtures::{H264_EXTRADATA, H264_IDR, H264_P},
+                start_muxer,
             },
         };
         let presentation = fixtures::presentation(vec![
@@ -1104,7 +1105,7 @@ mod admission_tests {
             PrerollError::Packaging(crate::mux::MuxError::Mux(_))
         ));
 
-        let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
+        let mut started = start_muxer(MuxerStartRequest {
             presentation: &presentation,
             segmentation: &admitted.segmentation,
             time_anchor: std::time::SystemTime::UNIX_EPOCH,

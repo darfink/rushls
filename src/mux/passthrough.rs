@@ -5,73 +5,68 @@ use std::sync::Arc;
 use crate::domain::MediaKind;
 
 use super::{
-    MuxError, MuxerFactory, MuxerStartRequest, PackagedPresentation, PackagingRenditionId,
-    StartedMuxer, TrackPackager, cmaf, webvtt,
+    MuxError, MuxerStartRequest, PackagedPresentation, PackagingRenditionId, StartedMuxer,
+    TrackPackager, cmaf, webvtt,
 };
 
-/// Builds one pass-through rendition per source track.
+/// Builds the muxer and its output topology with one rendition per source track.
 ///
 /// Encoded audio and video are routed to the CMAF packager while textual
 /// subtitle codecs are packaged directly as WebVTT.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PassThroughMuxerFactory;
+pub fn start_muxer(request: MuxerStartRequest<'_>) -> Result<StartedMuxer, MuxError> {
+    let mut renditions = Vec::with_capacity(request.presentation.tracks().len());
+    let mut packagers: Vec<Box<dyn TrackPackager>> =
+        Vec::with_capacity(request.presentation.tracks().len());
 
-impl MuxerFactory for PassThroughMuxerFactory {
-    fn start(&self, request: MuxerStartRequest<'_>) -> Result<StartedMuxer, MuxError> {
-        let mut renditions = Vec::with_capacity(request.presentation.tracks().len());
-        let mut packagers: Vec<Box<dyn TrackPackager>> =
-            Vec::with_capacity(request.presentation.tracks().len());
-
-        for (index, track) in request.presentation.tracks().iter().enumerate() {
-            let plan = request
-                .segmentation
-                .get(track.id)
-                .copied()
-                .ok_or_else(|| invalid(format!("segmentation plan omits {}", track.id)))?;
-            let rendition_id = PackagingRenditionId(
-                u32::try_from(index)
-                    .map_err(|_| invalid("too many tracks for packaging rendition IDs"))?,
-            );
-            let (rendition, packager) = match track.kind() {
-                MediaKind::Audio | MediaKind::Video => cmaf::build_track(
-                    rendition_id,
-                    track,
-                    plan,
-                    request
-                        .segmentation
-                        .late_boundary
-                        .saturating_add(request.segmentation.early_boundary),
-                    request.events.clone(),
-                    request.budget.clone(),
-                )?,
-                MediaKind::Subtitle => webvtt::build_track(
-                    rendition_id,
-                    track,
-                    plan,
-                    request.events.clone(),
-                    request.budget.clone(),
-                )?,
-            };
-            renditions.push(rendition);
-            packagers.push(packager);
-        }
-
-        let presentation = PackagedPresentation::with_default_topology(
-            request.time_anchor,
-            request.presentation,
-            renditions,
-        )
-        .map_err(|error| invalid(error.to_string()))?;
-        Ok(StartedMuxer {
-            muxer: Box::new(super::coordinator::Coordinator::new(
-                packagers,
-                request.presentation,
-                request.segmentation,
+    for (index, track) in request.presentation.tracks().iter().enumerate() {
+        let plan = request
+            .segmentation
+            .get(track.id)
+            .copied()
+            .ok_or_else(|| invalid(format!("segmentation plan omits {}", track.id)))?;
+        let rendition_id = PackagingRenditionId(
+            u32::try_from(index)
+                .map_err(|_| invalid("too many tracks for packaging rendition IDs"))?,
+        );
+        let (rendition, packager) = match track.kind() {
+            MediaKind::Audio | MediaKind::Video => cmaf::build_track(
+                rendition_id,
+                track,
+                plan,
+                request
+                    .segmentation
+                    .late_boundary
+                    .saturating_add(request.segmentation.early_boundary),
                 request.events.clone(),
-            )?),
-            presentation: Arc::new(presentation),
-        })
+                request.budget.clone(),
+            )?,
+            MediaKind::Subtitle => webvtt::build_track(
+                rendition_id,
+                track,
+                plan,
+                request.events.clone(),
+                request.budget.clone(),
+            )?,
+        };
+        renditions.push(rendition);
+        packagers.push(packager);
     }
+
+    let presentation = PackagedPresentation::with_default_topology(
+        request.time_anchor,
+        request.presentation,
+        renditions,
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    Ok(StartedMuxer {
+        muxer: Box::new(super::coordinator::Coordinator::new(
+            packagers,
+            request.presentation,
+            request.segmentation,
+            request.events.clone(),
+        )?),
+        presentation: Arc::new(presentation),
+    })
 }
 
 fn invalid(message: impl Into<Box<str>>) -> MuxError {
@@ -134,7 +129,7 @@ mod tests {
         },
         media::{AudioSample, NormalizedMedia, SubtitleSample, validate},
         mux::{
-            FinishReason, MediaSegmentFormat, MuxerFactory, PackagedMedia,
+            FinishReason, MediaSegmentFormat, PackagedMedia,
             fixtures::{AAC_EXTRADATA, AAC_FRAME, H264_EXTRADATA},
         },
         observe::Events,
@@ -166,7 +161,7 @@ mod tests {
         )?;
         let events = Events::default().scoped(SessionId(nz::u64!(1)));
 
-        let started = PassThroughMuxerFactory.start(MuxerStartRequest {
+        let started = start_muxer(MuxerStartRequest {
             presentation: &input,
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,
@@ -228,7 +223,7 @@ mod tests {
             ],
         )?;
         let events = Events::default().scoped(SessionId(nz::u64!(3)));
-        let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
+        let mut started = start_muxer(MuxerStartRequest {
             presentation: &input,
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,
@@ -345,7 +340,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (input, segmentation, samples) = audio_and_subtitle()?;
         let events = Events::default().scoped(SessionId(nz::u64!(2)));
-        let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
+        let mut started = start_muxer(MuxerStartRequest {
             presentation: &input,
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,

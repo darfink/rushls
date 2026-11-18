@@ -284,10 +284,11 @@ async fn real_cmaf_recordings_demux_individually_with_all_samples() -> Result {
         },
         media::{AudioSample, NormalizedMedia, VideoSample},
         mux::{
-            MuxerFactory, MuxerStartRequest, PassThroughMuxerFactory,
+            MuxerStartRequest,
             fixtures::{
                 AAC_EXTRADATA, AAC_FRAME, H264_EXTRADATA, H264_IDR, H264_P, discarded_events,
             },
+            start_muxer,
         },
         segment::{SegmentationPlan, fixtures::PlanBuilder},
     };
@@ -334,7 +335,7 @@ async fn real_cmaf_recordings_demux_individually_with_all_samples() -> Result {
         };
         let segmentation = SegmentationPlan::new(&input, vec![plan.build()])?;
         let events = discarded_events();
-        let mut started = PassThroughMuxerFactory.start(MuxerStartRequest {
+        let mut started = start_muxer(MuxerStartRequest {
             presentation: &input,
             segmentation: &segmentation,
             time_anchor: SystemTime::UNIX_EPOCH,

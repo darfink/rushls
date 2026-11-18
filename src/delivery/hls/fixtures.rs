@@ -179,19 +179,35 @@ pub fn write_segment(lease: &StreamLease, local: u32, segment: u64, start: i64) 
     );
 }
 
+/// The start of a six-second segment on the fixture's one-tick timebase.
+pub fn six_second_start(id: u64) -> i64 {
+    i64::try_from(id).expect("fixture id fits i64") * 6
+}
+
+/// Builds a contiguous segment with the supplied bytes and timing.
+pub fn direct_segment(
+    local: u32,
+    segment: u64,
+    start: i64,
+    duration: u64,
+    payload: Payload,
+) -> PackagedMedia {
+    PackagedMedia::Segment(PackagedSegment {
+        rendition_id: PackagingRenditionId(local),
+        packaging_segment_id: PackagingSegmentId(segment),
+        media_start: start,
+        duration,
+        independent: true,
+        payload,
+    })
+}
+
 /// Publishes one whole segment in a single object, as a segment-only rendition
 /// does.
 pub fn write_direct(lease: &StreamLease, local: u32, segment: u64, start: i64) {
     write(
         lease,
-        PackagedMedia::Segment(PackagedSegment {
-            rendition_id: PackagingRenditionId(local),
-            packaging_segment_id: PackagingSegmentId(segment),
-            media_start: start,
-            duration: 6,
-            independent: true,
-            payload: Payload::from(vec![7; 256]),
-        }),
+        direct_segment(local, segment, start, 6, Payload::from(vec![7; 256])),
     );
 }
 

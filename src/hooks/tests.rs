@@ -212,12 +212,18 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
 
     // What a real publication emits, in the order a session emits it.
     let session = SessionId(7.try_into().expect("a nonzero session id"));
+    let request = crate::admission::fixtures::publish_request("presented-key");
+    let grant = crate::admission::PublishGrant {
+        stream_id: StreamId::new("live/camera"),
+        principal: crate::admission::Principal("camera".into()),
+        policy: crate::admission::StreamPolicy::permissive(),
+    };
     observer.observe(
         session,
         SessionEvent::Accepted {
             stream: StreamId::new("live/camera"),
             principal: "camera".into(),
-            publisher: crate::domain::fixtures::publisher(),
+            publisher: request.into_publisher_context(&grant),
         },
     );
     observer.observe(session, SessionEvent::Running);
@@ -253,7 +259,8 @@ async fn a_node_observer_turns_a_publication_into_deliveries_and_still_reports_i
     for body in [&bodies[0], &bodies[2]] {
         assert_eq!(body["data"]["protocol"], "rtmp");
         assert_eq!(body["data"]["client"]["remote_address"], "127.0.0.1:1935");
-        assert_eq!(body["data"]["resource"]["name"], "presented-key");
+        assert_eq!(body["data"]["resource"]["name"], "[redacted]");
+        assert!(!body.to_string().contains("presented-key"));
         assert!(body["data"].get("credential").is_none());
     }
     assert_eq!(

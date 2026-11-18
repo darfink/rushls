@@ -2,10 +2,15 @@ use super::exposition::Samples;
 use crate::{
     delivery::store::{
         LiveStream,
-        telemetry::{PublicationSnapshot, PublicationTotalSnapshot},
+        telemetry::{
+            GroupTimingSnapshot, PublicationSnapshot, PublicationTotalSnapshot,
+            RenditionTimingSnapshot,
+        },
     },
-    domain::StreamId,
-    observe::{Operation, OperationOutcome, OperationSnapshot},
+    domain::{MediaKind, RenditionId, StreamId},
+    observe::{
+        Operation, OperationOutcome, OperationSnapshot, counters::series, tracks::TrackSnapshot,
+    },
 };
 use rushls_common::metrics::escape_label;
 
@@ -82,7 +87,44 @@ pub fn operations(output: &mut Samples, snapshots: &[OperationSnapshot; 7]) {
 }
 
 // Keep this declarative metric table adjacent to its HELP text.
-#[allow(clippy::too_many_lines)]
+series! {
+    RENDITION_SERIES: RenditionTimingSnapshot {
+        Gauge("rushls_rendition_output_expected",
+            "Live cadence is expected for this current continuous-media rendition.")
+            = |rendition: &RenditionTimingSnapshot| rendition.expected,
+        Gauge("rushls_rendition_output_started",
+            "Usable output arrived in the current publication.")
+            = |rendition: &RenditionTimingSnapshot| rendition.timing.last_timestamp.is_some(),
+        Gauge("rushls_rendition_startup_elapsed_seconds",
+            "Wall time awaiting first output while cadence is expected.")
+            = |rendition: &RenditionTimingSnapshot| rendition.startup_elapsed.as_secs_f64(),
+        Gauge("rushls_rendition_startup_budget_seconds",
+            "First-output deadline budget from publication attachment.")
+            = |rendition: &RenditionTimingSnapshot| rendition.timing.startup_budget.as_secs_f64(),
+        Gauge("rushls_rendition_output_overdue_seconds",
+            "Elapsed wall time beyond the current output deadline; zero when not expected.")
+            = |rendition: &RenditionTimingSnapshot| rendition.overdue.as_secs_f64(),
+        Gauge("rushls_rendition_expected_publish_interval_seconds",
+            "Planned part or segment interval, independent of observed speed.")
+            = |rendition: &RenditionTimingSnapshot| rendition.timing.interval.as_secs_f64(),
+        Gauge("rushls_rendition_publication_tolerance_seconds",
+            "Publication jitter budget added to the planned interval.")
+            = |rendition: &RenditionTimingSnapshot| rendition.timing.tolerance.as_secs_f64(),
+        Gauge("rushls_rendition_target_duration_seconds",
+            "Advertised HLS segment target duration.")
+            = |rendition: &RenditionTimingSnapshot| rendition.timing.target.as_secs_f64(),
+        Counter("rushls_rendition_media_published_seconds_total",
+            "Usable media duration committed once, excluding initialization and part-parent completion.")
+            = |rendition: &RenditionTimingSnapshot| rendition.timing.media_seconds,
+        Counter("rushls_rendition_output_deadline_misses_total",
+            "Distinct output silence episodes crossing their deadline.")
+            = |rendition: &RenditionTimingSnapshot| rendition.timing.deadline_misses,
+        Counter("rushls_rendition_timeline_breaks_total",
+            "Publications whose media timestamps stopped being contiguous.")
+            = |rendition: &RenditionTimingSnapshot| rendition.timing.timeline_breaks,
+    }
+}
+
 pub fn stream(
     output: &mut Samples,
     id: &StreamId,
@@ -98,98 +140,31 @@ pub fn stream(
     );
     for r in &snapshot.renditions {
         let t = &r.timing;
-        let labels = format!(
-            "{stream},rendition=\"{}\",kind=\"{}\"",
-            t.id,
-            kind_name(t.kind)
-        );
-        output.gauge(
-            "rushls_rendition_output_expected",
-            "Live cadence is expected for this current continuous-media rendition.",
+        let labels = rendition_labels(&stream, t.id, t.kind);
+        output.series(RENDITION_SERIES, &labels, r);
+        output.optional_gauge(
+            "rushls_rendition_part_target_seconds",
+            "Advertised HLS part target duration.",
             &labels,
-            u8::from(r.expected),
+            t.part_target.map(|part| part.as_secs_f64()),
         );
-        output.gauge(
-            "rushls_rendition_output_started",
-            "Usable output arrived in the current publication.",
+        output.optional_gauge(
+            "rushls_rendition_last_publish_timestamp_seconds",
+            "Unix time of the latest live usable-media commit.",
             &labels,
-            u8::from(t.last_timestamp.is_some()),
+            t.last_timestamp,
         );
-        output.gauge(
-            "rushls_rendition_startup_elapsed_seconds",
-            "Wall time awaiting first output while cadence is expected.",
+        output.optional_gauge(
+            "rushls_rendition_output_lag_seconds",
+            "Signed wall progress minus contiguous media progress from a common publication baseline.",
             &labels,
-            r.startup_elapsed.as_secs_f64(),
+            r.lag,
         );
-        output.gauge(
-            "rushls_rendition_startup_budget_seconds",
-            "First-output deadline budget from publication attachment.",
+        output.optional_gauge(
+            "rushls_rendition_media_end_seconds",
+            "Contiguous media end on the publication timeline; freezes across timestamp gaps.",
             &labels,
-            t.startup_budget.as_secs_f64(),
-        );
-        output.gauge(
-            "rushls_rendition_output_overdue_seconds",
-            "Elapsed wall time beyond the current output deadline; zero when not expected.",
-            &labels,
-            r.overdue.as_secs_f64(),
-        );
-        output.gauge(
-            "rushls_rendition_expected_publish_interval_seconds",
-            "Planned part or segment interval, independent of observed speed.",
-            &labels,
-            t.interval.as_secs_f64(),
-        );
-        output.gauge(
-            "rushls_rendition_publication_tolerance_seconds",
-            "Publication jitter budget added to the planned interval.",
-            &labels,
-            t.tolerance.as_secs_f64(),
-        );
-        output.gauge(
-            "rushls_rendition_target_duration_seconds",
-            "Advertised HLS segment target duration.",
-            &labels,
-            t.target.as_secs_f64(),
-        );
-        if let Some(part) = t.part_target {
-            output.gauge(
-                "rushls_rendition_part_target_seconds",
-                "Advertised HLS part target duration.",
-                &labels,
-                part.as_secs_f64(),
-            );
-        }
-        if let Some(last) = t.last_timestamp {
-            output.gauge(
-                "rushls_rendition_last_publish_timestamp_seconds",
-                "Unix time of the latest live usable-media commit.",
-                &labels,
-                last,
-            );
-        }
-        if let Some(lag) = r.lag {
-            output.gauge("rushls_rendition_output_lag_seconds", "Signed wall progress minus contiguous media progress from a common publication baseline.", &labels, lag);
-        }
-        if let Some(end) = r.media_end {
-            output.gauge(
-                "rushls_rendition_media_end_seconds",
-                "Contiguous media end on the publication timeline; freezes across timestamp gaps.",
-                &labels,
-                end,
-            );
-        }
-        output.counter("rushls_rendition_media_published_seconds_total", "Usable media duration committed once, excluding initialization and part-parent completion.", &labels, t.media_seconds);
-        output.counter(
-            "rushls_rendition_output_deadline_misses_total",
-            "Distinct output silence episodes crossing their deadline.",
-            &labels,
-            t.deadline_misses,
-        );
-        output.counter(
-            "rushls_rendition_timeline_breaks_total",
-            "Publications whose media timestamps stopped being contiguous.",
-            &labels,
-            t.timeline_breaks,
+            r.media_end,
         );
         for track in t.sources.iter() {
             output.gauge(
@@ -200,116 +175,106 @@ pub fn stream(
             );
         }
     }
-    for g in &snapshot.groups {
-        let labels = format!("{stream},group=\"{}\"", escape_label(&g.name));
-        if g.skew.is_some() {
-            let fastest = snapshot
-                .renditions
-                .iter()
-                .filter(|r| g.members.contains(&r.timing.id))
-                .filter_map(|r| r.media_end)
-                .reduce(f64::max);
-            for r in snapshot
-                .renditions
-                .iter()
-                .filter(|r| g.members.contains(&r.timing.id))
-            {
-                if let Some((fastest, end)) = fastest.zip(r.media_end) {
-                    output.gauge(
-                        "rushls_rendition_behind_fastest_seconds",
-                        "Media timeline delay behind the fastest member of this comparison group.",
-                        &format!(
-                            "{labels},rendition=\"{}\",kind=\"{}\"",
-                            r.timing.id,
-                            kind_name(r.timing.kind)
-                        ),
-                        fastest - end,
-                    );
-                }
-            }
-        }
-        if let Some(skew) = g.skew {
-            output.gauge(
-                "rushls_stream_rendition_media_skew_seconds",
-                "Fastest minus slowest contiguous media end within the active comparison group.",
-                &labels,
-                skew,
-            );
-        }
-        if let Some(spread) = g.spread {
-            output.gauge(
-                "rushls_stream_rendition_publish_spread_seconds",
-                "Most recently resolved matched-media-boundary arrival spread.",
-                &labels,
-                spread.as_secs_f64(),
-            );
-        }
-        if let Some(at) = g.spread_timestamp {
-            output.gauge(
-                "rushls_stream_rendition_publish_spread_timestamp_seconds",
-                "Unix time at which the latest matched boundary comparison resolved.",
-                &labels,
-                at,
-            );
-        }
-        output.gauge(
-            "rushls_stream_rendition_comparisons_pending",
-            "Matched-boundary comparisons still missing one or more renditions.",
-            &labels,
-            g.pending,
-        );
-        output.gauge(
-            "rushls_stream_rendition_comparison_age_seconds",
-            "Age of the oldest retained unresolved boundary comparison.",
-            &labels,
-            g.pending_age.as_secs_f64(),
-        );
-        output.counter(
-            "rushls_stream_rendition_comparisons_incomplete_total",
-            "Unresolved comparisons discarded in the current publication.",
-            &labels,
-            g.incomplete,
-        );
+    for group in &snapshot.groups {
+        comparison_group(output, &stream, group, &snapshot.renditions);
     }
     for (rendition, kind, count) in live.gap_counts() {
+        let mut labels = rendition_labels(&stream, rendition, kind);
+        labels.push_str(",reason=\"unfinished_segment\"");
         output.counter(
             "rushls_rendition_gaps_total",
             "Open segments replaced by advertised gaps at publication end.",
-            &format!(
-                "{stream},rendition=\"{rendition}\",kind=\"{}\",reason=\"unfinished_segment\"",
-                kind_name(kind)
-            ),
+            &labels,
             count,
         );
     }
     let mut minimum: Option<f64> = None;
     for (rendition, media_kind, held) in live.rendition_retention() {
-        let kind = kind_name(media_kind);
         output.gauge(
             "rushls_rendition_retention_seconds",
             "Advertised media duration for one current rendition, including open parts.",
-            &format!("{stream},rendition=\"{rendition}\",kind=\"{kind}\""),
+            &rendition_labels(&stream, rendition, media_kind),
             held.as_secs_f64(),
         );
-        if media_kind != crate::domain::MediaKind::Subtitle {
+        if media_kind != MediaKind::Subtitle {
             minimum = Some(minimum.map_or(held.as_secs_f64(), |m| m.min(held.as_secs_f64())));
         }
     }
-    if let Some(minimum) = minimum {
-        output.gauge(
-            "rushls_stream_retention_min_seconds",
-            "Shortest current continuous-media rendition duration; not a timeline intersection.",
-            &stream,
-            minimum,
-        );
+    output.optional_gauge(
+        "rushls_stream_retention_min_seconds",
+        "Shortest current continuous-media rendition duration; not a timeline intersection.",
+        &stream,
+        minimum,
+    );
+}
+
+series! {
+    GROUP_SERIES: GroupTimingSnapshot {
+        Gauge("rushls_stream_rendition_comparisons_pending",
+            "Matched-boundary comparisons still missing one or more renditions.")
+            = |group: &GroupTimingSnapshot| group.pending,
+        Gauge("rushls_stream_rendition_comparison_age_seconds",
+            "Age of the oldest retained unresolved boundary comparison.")
+            = |group: &GroupTimingSnapshot| group.pending_age.as_secs_f64(),
+        Counter("rushls_stream_rendition_comparisons_incomplete_total",
+            "Unresolved comparisons discarded in the current publication.")
+            = |group: &GroupTimingSnapshot| group.incomplete,
     }
 }
 
-pub fn kind_name(kind: crate::domain::MediaKind) -> &'static str {
+fn comparison_group(
+    output: &mut Samples,
+    stream: &str,
+    group: &GroupTimingSnapshot,
+    renditions: &[RenditionTimingSnapshot],
+) {
+    let labels = format!("{stream},group=\"{}\"", escape_label(&group.name));
+    if let Some(skew) = group.skew {
+        let members = renditions
+            .iter()
+            .filter(|r| group.members.contains(&r.timing.id));
+        let fastest = members.clone().filter_map(|r| r.media_end).reduce(f64::max);
+        for r in members {
+            if let Some((fastest, end)) = fastest.zip(r.media_end) {
+                output.gauge(
+                    "rushls_rendition_behind_fastest_seconds",
+                    "Media timeline delay behind the fastest member of this comparison group.",
+                    &rendition_labels(&labels, r.timing.id, r.timing.kind),
+                    fastest - end,
+                );
+            }
+        }
+        output.gauge(
+            "rushls_stream_rendition_media_skew_seconds",
+            "Fastest minus slowest contiguous media end within the active comparison group.",
+            &labels,
+            skew,
+        );
+    }
+    output.optional_gauge(
+        "rushls_stream_rendition_publish_spread_seconds",
+        "Most recently resolved matched-media-boundary arrival spread.",
+        &labels,
+        group.spread.map(|spread| spread.as_secs_f64()),
+    );
+    output.optional_gauge(
+        "rushls_stream_rendition_publish_spread_timestamp_seconds",
+        "Unix time at which the latest matched boundary comparison resolved.",
+        &labels,
+        group.spread_timestamp,
+    );
+    output.series(GROUP_SERIES, &labels, group);
+}
+
+fn rendition_labels(scope: &str, id: RenditionId, kind: MediaKind) -> String {
+    format!("{scope},rendition=\"{id}\",kind=\"{}\"", kind_name(kind))
+}
+
+pub fn kind_name(kind: MediaKind) -> &'static str {
     match kind {
-        crate::domain::MediaKind::Video => "video",
-        crate::domain::MediaKind::Audio => "audio",
-        crate::domain::MediaKind::Subtitle => "subtitle",
+        MediaKind::Video => "video",
+        MediaKind::Audio => "audio",
+        MediaKind::Subtitle => "subtitle",
     }
 }
 
@@ -438,6 +403,29 @@ pub fn http_requests(
     }
 }
 
+series! {
+    TRACK_SERIES: TrackSnapshot {
+        Gauge("rushls_track_source_started",
+            "Source media arrived for this validated input track.")
+            = |track: &TrackSnapshot| track.source_timestamp.is_some(),
+        Gauge("rushls_track_normalized_started",
+            "Normalization produced a sample for this input track.")
+            = |track: &TrackSnapshot| track.normalized_timestamp.is_some(),
+        Counter("rushls_track_source_packets_total",
+            "Media packets consumed by normalization for this input track.")
+            = |track: &TrackSnapshot| track.source_packets,
+        Counter("rushls_track_source_payload_bytes_total",
+            "Demultiplexed payload bytes consumed by normalization for this track.")
+            = |track: &TrackSnapshot| track.source_bytes,
+        Counter("rushls_track_normalized_samples_total",
+            "Samples emitted by normalization before pacing.")
+            = |track: &TrackSnapshot| track.normalized_samples,
+        Counter("rushls_track_normalized_media_seconds_total",
+            "Sum of normalized sample durations, before output packaging.")
+            = |track: &TrackSnapshot| track.normalized_seconds,
+    }
+}
+
 pub fn tracks(output: &mut Samples, session: &crate::session::SessionSnapshot) {
     for track in &session.track_progress {
         let labels = format!(
@@ -447,65 +435,24 @@ pub fn tracks(output: &mut Samples, session: &crate::session::SessionSnapshot) {
             track.id.0,
             kind_name(track.kind)
         );
-        output.gauge(
-            "rushls_track_source_started",
-            "Source media arrived for this validated input track.",
+        output.series(TRACK_SERIES, &labels, track);
+        output.optional_gauge(
+            "rushls_track_last_source_timestamp_seconds",
+            "Unix time of the last demultiplexed packet consumed by normalization.",
             &labels,
-            u8::from(track.source_timestamp.is_some()),
+            track.source_timestamp,
         );
-        output.gauge(
-            "rushls_track_normalized_started",
-            "Normalization produced a sample for this input track.",
+        output.optional_gauge(
+            "rushls_track_last_normalized_timestamp_seconds",
+            "Unix time of the last normalized sample before pacing.",
             &labels,
-            u8::from(track.normalized_timestamp.is_some()),
+            track.normalized_timestamp,
         );
-        if let Some(at) = track.source_timestamp {
-            output.gauge(
-                "rushls_track_last_source_timestamp_seconds",
-                "Unix time of the last demultiplexed packet consumed by normalization.",
-                &labels,
-                at,
-            );
-        }
-        if let Some(at) = track.normalized_timestamp {
-            output.gauge(
-                "rushls_track_last_normalized_timestamp_seconds",
-                "Unix time of the last normalized sample before pacing.",
-                &labels,
-                at,
-            );
-        }
-        if let Some(end) = track.normalized_end {
-            output.gauge(
-                "rushls_track_normalized_media_end_seconds",
-                "Furthest normalized presentation end, including timeline offsets.",
-                &labels,
-                end,
-            );
-        }
-        output.counter(
-            "rushls_track_source_packets_total",
-            "Media packets consumed by normalization for this input track.",
+        output.optional_gauge(
+            "rushls_track_normalized_media_end_seconds",
+            "Furthest normalized presentation end, including timeline offsets.",
             &labels,
-            track.source_packets,
-        );
-        output.counter(
-            "rushls_track_source_payload_bytes_total",
-            "Demultiplexed payload bytes consumed by normalization for this track.",
-            &labels,
-            track.source_bytes,
-        );
-        output.counter(
-            "rushls_track_normalized_samples_total",
-            "Samples emitted by normalization before pacing.",
-            &labels,
-            track.normalized_samples,
-        );
-        output.counter(
-            "rushls_track_normalized_media_seconds_total",
-            "Sum of normalized sample durations, before output packaging.",
-            &labels,
-            track.normalized_seconds,
+            track.normalized_end,
         );
     }
 }

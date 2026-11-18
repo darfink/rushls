@@ -19,16 +19,11 @@ use super::{Phase, SessionShared, StopToken};
 pub struct SessionContext {
     shared: Arc<SessionShared>,
     events: EventSink,
-    stop: StopToken,
 }
 
 impl SessionContext {
-    pub(super) fn new(shared: Arc<SessionShared>, events: EventSink, stop: StopToken) -> Self {
-        Self {
-            shared,
-            events,
-            stop,
-        }
+    pub(super) fn new(shared: Arc<SessionShared>, events: EventSink) -> Self {
+        Self { shared, events }
     }
 
     pub fn id(&self) -> SessionId {
@@ -48,7 +43,7 @@ impl SessionContext {
     }
 
     pub fn stop(&self) -> &StopToken {
-        &self.stop
+        &self.shared.stop
     }
 
     pub fn phase(&self) -> Phase {

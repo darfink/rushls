@@ -10,9 +10,8 @@
 //! WebVTT path needs nothing new to package them.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
 
-use broadcast_common::Parse;
+use crate::media::video_config::VideoMetadata;
 use bytes::Bytes;
 
 use super::{
@@ -94,13 +93,34 @@ fn same_parameters(frozen: &MediaParameters, later: &MediaParameters) -> bool {
 
 #[derive(Clone, Debug)]
 pub struct MappedCatalog {
-    pub tracks: Vec<DiscoveredTrack>,
+    pub tracks: Vec<MappedTrack>,
     pub fingerprint: CatalogFingerprint,
-    pub legacy: Vec<bool>,
-    pub inline_h264: Vec<bool>,
+}
+
+/// Framing belongs to the rendition it describes, including during refinement.
+#[derive(Clone, Debug)]
+pub struct MappedTrack {
+    pub track: DiscoveredTrack,
+    pub legacy: bool,
+    pub inline_h264: bool,
+}
+
+impl MappedTrack {
+    /// A/V must establish timing before discovery freezes. Captions may stay silent.
+    pub fn required_for_discovery(&self) -> bool {
+        self.track.kind() != crate::domain::MediaKind::Subtitle
+    }
 }
 
 impl MappedCatalog {
+    pub fn from_catalog(catalog: &catalog::Catalog) -> Result<Self, SourceError> {
+        tracks_from_catalog(
+            &catalog.video.renditions,
+            &catalog.audio.renditions,
+            &catalog.text.renditions,
+        )
+    }
+
     /// Encoders can publish OpusHead only after their first output, which starts
     /// when we subscribe. Until discovery freezes, replace the synthetic header
     /// with that real decoder configuration without losing prefetched timestamps.
@@ -119,17 +139,19 @@ impl MappedCatalog {
             let index = self
                 .tracks
                 .iter()
-                .position(|track| track.id == old.id)
+                .position(|mapped| mapped.track.id == old.id)
                 .expect("fingerprint and tracks have the same IDs");
             // Labels are descriptive, not decoder state, so they stay out of
             // the fingerprint: a newer snapshot may rename a track during
             // discovery, and renaming one after freeze changes nothing.
             self.tracks[index]
+                .track
                 .title
-                .clone_from(&next.tracks[index].title);
+                .clone_from(&next.tracks[index].track.title);
             self.tracks[index]
+                .track
                 .language
-                .clone_from(&next.tracks[index].language);
+                .clone_from(&next.tracks[index].track.language);
             // Repeated snapshots preserve timestamps and in-band video metadata.
             if old == new {
                 continue;
@@ -181,14 +203,12 @@ pub fn tracks_from_catalog(
         ));
     }
     let mut tracks = Vec::new();
-    let mut legacy = Vec::new();
     let mut fingerprint = BTreeMap::new();
     let mut next_id = 0_u32;
 
     for (name, config) in video {
         refuse_foreign_broadcast(name, config.broadcast.is_some())?;
         require_container(name, &config.container)?;
-        legacy.push(!config.container.is_loc());
         let key = source_key("video", name);
         let (codec, parameters, extradata) = video_track(name, config)?;
         let id = TrackId(next_id);
@@ -207,13 +227,16 @@ pub fn tracks_from_catalog(
             codec_extradata: Payload::from_bytes(extradata),
         };
         fingerprint.insert(key, freeze(&track, &config.container, false));
-        tracks.push(track);
+        tracks.push(MappedTrack {
+            track,
+            legacy: !config.container.is_loc(),
+            inline_h264: catalog::video_codec(&config.codec) == Some(VideoCodec::H264Inline),
+        });
     }
 
     for (name, config) in audio {
         refuse_foreign_broadcast(name, config.broadcast.is_some())?;
         require_container(name, &config.container)?;
-        legacy.push(!config.container.is_loc());
         let key = source_key("audio", name);
         let (codec, parameters, extradata) = audio_track(name, config)?;
         let id = TrackId(next_id);
@@ -234,7 +257,11 @@ pub fn tracks_from_catalog(
             codec_extradata: Payload::from_bytes(extradata),
         };
         fingerprint.insert(key, freeze(&track, &config.container, description_pending));
-        tracks.push(track);
+        tracks.push(MappedTrack {
+            track,
+            legacy: !config.container.is_loc(),
+            inline_h264: false,
+        });
     }
 
     if tracks.is_empty() {
@@ -246,22 +273,19 @@ pub fn tracks_from_catalog(
     // After audio and video, so the empty check above still requires a
     // timeline: cues are placed against picture and sound, never alone.
     for (name, config) in text {
-        legacy.push(!config.container.is_loc());
         let key = source_key("text", name);
         let track = text_track(name, config, key.clone(), TrackId(next_id))?;
         next_id += 1;
         fingerprint.insert(key, freeze(&track, &config.container, false));
-        tracks.push(track);
+        tracks.push(MappedTrack {
+            track,
+            legacy: !config.container.is_loc(),
+            inline_h264: false,
+        });
     }
 
     Ok(MappedCatalog {
         tracks,
-        legacy,
-        inline_h264: video
-            .values()
-            .map(|config| catalog::video_codec(&config.codec) == Some(VideoCodec::H264Inline))
-            .chain(std::iter::repeat_n(false, audio.len() + text.len()))
-            .collect(),
         fingerprint: CatalogFingerprint {
             tracks: fingerprint,
         },
@@ -461,37 +485,10 @@ fn video_parameters(
     extradata: &[u8],
     config: &VideoConfig,
 ) -> Result<MediaParameters, SourceError> {
-    if codec == Codec::H264
-        && let Ok(record) = transmux::AVCDecoderConfigurationRecord::parse(extradata)
-        && let Some(sps) = record.sps.first()
-        && let Ok(info) = sps.decode()
-    {
-        let mut parameters = video_size(info.width, info.height)?;
-        if let MediaParameters::Video { frame_rate, .. } = &mut parameters {
-            *frame_rate = crate::media::video_config::h264_frame_rate(
-                info.num_units_in_tick,
-                info.time_scale,
-            );
-        }
-        return Ok(parameters);
-    }
-    if codec == Codec::Hevc
-        && let Ok(record) = transmux::HEVCDecoderConfigurationRecord::parse(extradata)
-    {
-        for array in &record.arrays {
-            for nalu in &array.nalus {
-                if let Ok(Some(info)) = nalu.decode_sps() {
-                    let mut parameters = video_size(info.width, info.height)?;
-                    if let MediaParameters::Video { frame_rate, .. } = &mut parameters {
-                        *frame_rate = crate::media::video_config::hevc_frame_rate(
-                            info.num_units_in_tick,
-                            info.time_scale,
-                        );
-                    }
-                    return Ok(parameters);
-                }
-            }
-        }
+    if let Some(metadata) = VideoMetadata::inspect(codec, extradata) {
+        return metadata
+            .parameters()
+            .map_err(|field| DiscoveryProblem::NotPositive { field }.into());
     }
     let width = config.coded_width.ok_or(DiscoveryProblem::Missing {
         field: "video width",
@@ -499,22 +496,15 @@ fn video_parameters(
     let height = config.coded_height.ok_or(DiscoveryProblem::Missing {
         field: "video height",
     })?;
-    let mut parameters = video_size(width, height)?;
-    if let MediaParameters::Video { frame_rate, .. } = &mut parameters {
-        *frame_rate = config
+    VideoMetadata {
+        width,
+        height,
+        frame_rate: config
             .framerate
-            .and_then(crate::media::cadence::nominal_rate);
+            .and_then(crate::media::cadence::nominal_rate),
     }
-    Ok(parameters)
-}
-
-fn video_size(width: u32, height: u32) -> Result<MediaParameters, SourceError> {
-    Ok(MediaParameters::Video {
-        width: nonzero_u32(width, "video width")?,
-        height: nonzero_u32(height, "video height")?,
-        frame_rate: None,
-        video_delay: 0,
-    })
+    .parameters()
+    .map_err(|field| DiscoveryProblem::NotPositive { field }.into())
 }
 
 fn audio_track(
@@ -581,10 +571,6 @@ fn opus_head(config: &AudioConfig) -> Result<Bytes, SourceError> {
     Ok(Bytes::from(head))
 }
 
-fn nonzero_u32(value: u32, field: &'static str) -> Result<NonZeroU32, SourceError> {
-    NonZeroU32::new(value).ok_or_else(|| DiscoveryProblem::NotPositive { field }.into())
-}
-
 fn configuration_origin(description: Option<&Bytes>) -> crate::domain::DecoderConfigOrigin {
     if description.is_some_and(|bytes| !bytes.is_empty()) {
         crate::domain::DecoderConfigOrigin::Publisher
@@ -649,16 +635,17 @@ mod tests {
 
         let mapped = tracks_from_catalog(&video, &audio, &BTreeMap::new())?;
         assert_eq!(mapped.tracks.len(), 2);
-        assert_eq!(mapped.tracks[0].codec, Codec::H264);
+        assert_eq!(mapped.tracks[0].track.codec, Codec::H264);
         assert_eq!(
             mapped.tracks[0]
+                .track
                 .source_key
                 .as_ref()
                 .map(|key| key.0.as_ref()),
             Some("video/1080p")
         );
-        assert_eq!(mapped.tracks[1].codec, Codec::Opus);
-        assert_eq!(mapped.tracks[0].timebase, TIMEBASE);
+        assert_eq!(mapped.tracks[1].track.codec, Codec::Opus);
+        assert_eq!(mapped.tracks[0].track.timebase, TIMEBASE);
         Ok(())
     }
 
@@ -708,7 +695,7 @@ mod tests {
         let mut video = BTreeMap::new();
         video.insert("legacy".to_owned(), legacy);
         let mapped = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
-        assert_eq!(mapped.legacy, vec![true]);
+        assert!(mapped.tracks[0].legacy);
         Ok(())
     }
 
@@ -724,8 +711,8 @@ mod tests {
         let mut video = BTreeMap::new();
         video.insert("avc3".to_owned(), avc3);
         let mapped = tracks_from_catalog(&video, &BTreeMap::new(), &BTreeMap::new())?;
-        assert_eq!(mapped.inline_h264, vec![true]);
-        assert!(mapped.tracks[0].codec_extradata.is_empty());
+        assert!(mapped.tracks[0].inline_h264);
+        assert!(mapped.tracks[0].track.codec_extradata.is_empty());
         Ok(())
     }
 
@@ -834,11 +821,11 @@ mod tests {
             &BTreeMap::from([("audio".into(), opus_loc())]),
             &BTreeMap::new(),
         )?;
-        let MediaParameters::Audio { timing, .. } = mapped.tracks[0].parameters else {
+        let MediaParameters::Audio { timing, .. } = mapped.tracks[0].track.parameters else {
             panic!("audio");
         };
         assert_eq!(timing.initial_padding_samples, 0);
-        assert_eq!(mapped.tracks[0].codec_extradata.len(), 19);
+        assert_eq!(mapped.tracks[0].track.codec_extradata.len(), 19);
         Ok(())
     }
     #[test]
@@ -853,7 +840,7 @@ mod tests {
         assert!(provisional.diff(&next.fingerprint).is_err());
         mapped.refine(next)?;
         assert_eq!(
-            crate::media::opus::configuration(mapped.tracks[0].codec_extradata.as_bytes())
+            crate::media::opus::configuration(mapped.tracks[0].track.codec_extradata.as_bytes())
                 .map_err(SourceError::Demux)?
                 .pre_skip,
             312
@@ -891,15 +878,15 @@ mod tests {
         )]);
         let mut audio = BTreeMap::from([("opus".into(), opus_loc())]);
         let mut mapped = tracks_from_catalog(&video, &audio, &BTreeMap::new())?;
-        mapped.tracks[0].codec_extradata = crate::mux::fixtures::H264_EXTRADATA.into();
-        mapped.tracks[0].first_pts = Some(123);
-        let discovered_video = mapped.tracks[0].clone();
+        mapped.tracks[0].track.codec_extradata = crate::mux::fixtures::H264_EXTRADATA.into();
+        mapped.tracks[0].track.first_pts = Some(123);
+        let discovered_video = mapped.tracks[0].track.clone();
         audio.get_mut("opus").expect("audio").description =
             Some(super::super::fixtures::opus_head(312).into());
         mapped.refine(tracks_from_catalog(&video, &audio, &BTreeMap::new())?)?;
-        assert_eq!(mapped.tracks[0], discovered_video);
+        assert_eq!(mapped.tracks[0].track, discovered_video);
         mapped.refine(tracks_from_catalog(&video, &audio, &BTreeMap::new())?)?;
-        assert_eq!(mapped.tracks[0], discovered_video);
+        assert_eq!(mapped.tracks[0].track, discovered_video);
         Ok(())
     }
 
@@ -917,8 +904,8 @@ mod tests {
             ("sv".into(), labelled("Svenska \"SDH\"")),
         ]);
         let mut mapped = tracks_from_catalog(&video, &audio, &BTreeMap::new())?;
-        assert_eq!(mapped.tracks[0].title.as_deref(), Some("English"));
-        assert_eq!(mapped.tracks[1].title, None);
+        assert_eq!(mapped.tracks[0].track.title.as_deref(), Some("English"));
+        assert_eq!(mapped.tracks[1].track.title, None);
 
         // A later snapshot may rename a track without changing its decoder state.
         let renamed = BTreeMap::from([
@@ -929,10 +916,10 @@ mod tests {
         mapped.fingerprint.diff(&next.fingerprint)?;
         mapped.refine(next)?;
         assert_eq!(
-            mapped.tracks[0].title.as_deref(),
+            mapped.tracks[0].track.title.as_deref(),
             Some("English (commentary)")
         );
-        assert_eq!(mapped.tracks[1].title.as_deref(), Some("Svenska"));
+        assert_eq!(mapped.tracks[1].track.title.as_deref(), Some("Svenska"));
         Ok(())
     }
 
@@ -961,7 +948,7 @@ mod tests {
         let mapped = tracks_from_catalog(&video, &BTreeMap::new(), &text)?;
 
         // Text follows audio and video, keyed and clocked like every other track.
-        let cues = &mapped.tracks[1];
+        let cues = &mapped.tracks[1].track;
         assert_eq!(cues.id, TrackId(1));
         assert_eq!(cues.kind(), crate::domain::MediaKind::Subtitle);
         assert_eq!(cues.codec, Codec::Text);
@@ -969,8 +956,8 @@ mod tests {
         assert_eq!(cues.source_key, Some(source_key("text", "captions")));
         assert_eq!(cues.title.as_deref(), Some("English (CC)"));
         assert_eq!(cues.language.as_deref(), Some("en"));
-        assert_eq!(mapped.legacy, vec![false, true]);
-        assert_eq!(mapped.inline_h264, vec![false, false]);
+        assert!(!mapped.tracks[0].legacy && mapped.tracks[1].legacy);
+        assert!(mapped.tracks.iter().all(|track| !track.inline_h264));
 
         // A cue is a random access point wherever it sits in its group.
         let frame = loc_frame(5_000, Bytes::from_static(b"hello"), false);
@@ -1010,14 +997,16 @@ mod tests {
     #[test]
     fn catalog_video_preserves_codec_cadence_for_all_supported_codecs()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::media::fixtures::{AV1_FIXED_CADENCE, H264_FIXED_CADENCE, HEVC_FIXED_CADENCE};
-        for (codec, bytes) in [
-            ("avc1.64000a", H264_FIXED_CADENCE),
-            ("hvc1.1.6.L60.90", HEVC_FIXED_CADENCE),
-            ("av01.0.00M.08", AV1_FIXED_CADENCE),
-        ] {
+        use crate::media::fixtures::{assert_video_header, video_headers};
+        for (codec, bytes, expected) in video_headers() {
+            let codec = match codec {
+                Codec::H264 => "avc1.64000a",
+                Codec::Hevc => "hvc1.1.6.L60.90",
+                Codec::Av1 => "av01.0.00M.08",
+                _ => unreachable!(),
+            };
             let mut config: VideoConfig = serde_json::from_value(
-                serde_json::json!({"codec":codec,"codedWidth":64,"codedHeight":64,"framerate":30.0}),
+                serde_json::json!({"codec":codec,"codedWidth":1920,"codedHeight":1080,"framerate":30.0}),
             )?;
             config.description = Some(Bytes::from_static(bytes));
             let mapped = tracks_from_catalog(
@@ -1025,15 +1014,7 @@ mod tests {
                 &BTreeMap::new(),
                 &BTreeMap::new(),
             )?;
-            let cadence = crate::media::cadence::inspect(&mapped.tracks[0]);
-            assert!(
-                matches!(cadence, crate::domain::VideoCadence::Fixed { .. }),
-                "{codec}: {cadence:?}"
-            );
-            assert_eq!(
-                cadence.rate(),
-                Some(crate::domain::FrameRate::new(nz::u32!(25), nz::u32!(1)))
-            );
+            assert_video_header(&mapped.tracks[0].track, expected, TIMEBASE);
         }
         Ok(())
     }

@@ -34,7 +34,6 @@ mod telemetry_tests;
 mod tests;
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -45,19 +44,19 @@ use rushls_common::accept::AcceptHealth;
 use axum::{
     Router,
     body::Body,
-    extract::{OriginalUri, RawQuery, State},
+    extract::{Extension, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::any,
 };
 use rushls_common::metrics::bearer_token;
-use rustls::pki_types::{CertificateDer, pem::PemObject};
+use rustls::pki_types::CertificateDer;
 use tokio::net::TcpListener;
 
 use crate::{
     delivery::{
         Body as DeliveryBody, DeliveryError, DeliveryFailure, MediaBody,
-        Response as DeliveryResponse, Reuse,
+        Response as DeliveryResponse, Reuse, uri::ViewerPath,
     },
     observe::{Events, ProcessMeters, http::HttpFailure},
     server::http::playback::PlaybackDenial,
@@ -93,16 +92,6 @@ pub struct HttpConfig {
     /// Beside the certificate rather than inside `TlsSettings`, which is
     /// shared with another application that binds its own listeners.
     pub tls_address: Option<SocketAddr>,
-    /// The MOQ listener's certificate, when MOQ ingest is on.
-    ///
-    /// Present only to serve `/certificate.sha256`. A browser cannot complete
-    /// a WebTransport handshake against a certificate it does not trust, and
-    /// Chromium's QUIC path does not consult locally installed roots the way
-    /// its TCP path does, so a development origin publishes the fingerprint
-    /// its client pins with `serverCertificateHashes` instead. Absent when the
-    /// listener is off, which keeps the route off a production origin whose
-    /// publicly trusted certificate needs no pinning.
-    pub moq_certificate: Option<PathBuf>,
 }
 
 impl HttpConfig {
@@ -113,6 +102,33 @@ impl HttpConfig {
     }
 }
 
+/// One immutable URL resolution shared by every viewer request boundary.
+#[derive(Clone, Debug)]
+pub struct ViewerRequest {
+    uri: http::Uri,
+    target: Option<ViewerPath>,
+}
+
+impl ViewerRequest {
+    pub fn new(uri: http::Uri) -> Self {
+        let target = ViewerPath::parse(uri.path()).ok();
+        Self { uri, target }
+    }
+
+    /// Retains the original URL so query and tracing semantics do not change.
+    pub fn uri(&self) -> &http::Uri {
+        &self.uri
+    }
+
+    pub fn target(&self) -> Option<&ViewerPath> {
+        self.target.as_ref()
+    }
+
+    pub fn stream(&self) -> Option<&crate::domain::StreamId> {
+        self.target().map(|target| &target.stream)
+    }
+}
+
 /// The application one HTTP request target is delegated to.
 ///
 /// Owned by the transport that consumes it; implementations are composed in
@@ -120,14 +136,18 @@ impl HttpConfig {
 pub trait Application: Send + Sync + 'static {
     /// Attribute only recognized paths belonging to retained streams. Unknown
     /// streams stay in node totals, preventing viewer-controlled cardinality.
-    fn http_meters(&self, _path: &str) -> Option<crate::observe::http::HttpMeters> {
+    fn http_meters(&self, _request: &ViewerRequest) -> Option<crate::observe::http::HttpMeters> {
+        None
+    }
+
+    /// The leaf currently selected for new QUIC handshakes.
+    fn moq_certificate(&self) -> Option<CertificateDer<'static>> {
         None
     }
 
     fn serve<'a>(
         &'a self,
-        path: &'a str,
-        query: Option<&'a str>,
+        request: &'a ViewerRequest,
     ) -> impl Future<Output = Result<DeliveryResponse, DeliveryFailure>> + Send + 'a;
 }
 
@@ -142,9 +162,6 @@ struct HttpState<P> {
     metrics: Option<MetricsEndpoint>,
     readiness: Readiness,
     playback: Option<Arc<PlaybackGate>>,
-    /// Behind an `Arc` for the same reason as the CORS policy: cloned per
-    /// request, and a `PathBuf` allocates.
-    moq_certificate: Option<Arc<PathBuf>>,
 }
 
 impl<P> Clone for HttpState<P> {
@@ -155,7 +172,6 @@ impl<P> Clone for HttpState<P> {
             metrics: self.metrics.clone(),
             readiness: self.readiness.clone(),
             playback: self.playback.clone(),
-            moq_certificate: self.moq_certificate.clone(),
         }
     }
 }
@@ -226,18 +242,15 @@ fn router<P: Application>(
     readiness: Readiness,
     playback: Option<Arc<PlaybackGate>>,
 ) -> Router {
-    // One catch-all rather than a route table: a stream identity may contain
-    // slashes, so path structure is resolved by the application rather than by
-    // axum pattern matching.
-    let mut viewer = Router::new()
-        .route("/{*path}", any(handle::<P>))
-        .fallback(any(handle::<P>));
+    // A stream identity may contain slashes. The fallback hands the entire
+    // path to the viewer resolver and leaves explicit routes to axum.
+    let mut viewer = Router::new().fallback(any(handle::<P>));
     // Before the CORS layer, so the fingerprint carries the same
     // `Access-Control-Allow-Origin` as the media it belongs with: the page
     // that fetches it is served from wherever a developer keeps it, not from
-    // this origin. A static path outranks the catch-all in axum's router, so
+    // this origin. A static path outranks the fallback in axum's router, so
     // a stream may still be named `certificate.sha256` at any other depth.
-    if config.moq_certificate.is_some() {
+    if application.moq_certificate().is_some() {
         viewer = viewer.route("/certificate.sha256", any(moq_fingerprint::<P>));
     }
     if let Some(cors) = cors::layer(&config.cors) {
@@ -247,7 +260,7 @@ fn router<P: Application>(
     let mut operator = Router::new()
         .route("/health/live", any(liveness))
         .route("/health/ready", any(readiness_probe::<P>));
-    // Left to the catch-all when disabled, so `/metrics` is an ordinary
+    // Left to the viewer fallback when disabled, so `/metrics` is an ordinary
     // unknown resource rather than a route that exists and refuses.
     if metrics.is_some() {
         operator = operator
@@ -261,7 +274,6 @@ fn router<P: Application>(
         metrics,
         readiness,
         playback,
-        moq_certificate: config.moq_certificate.clone().map(Arc::new),
     })
 }
 
@@ -352,8 +364,7 @@ pub fn bind_tls(
 async fn handle<P: Application>(
     State(service): State<HttpState<P>>,
     method: Method,
-    OriginalUri(uri): OriginalUri,
-    RawQuery(query): RawQuery,
+    Extension(request): Extension<ViewerRequest>,
     headers: HeaderMap,
 ) -> Response {
     // HEAD is answered exactly like GET and then stripped of its body by the
@@ -370,16 +381,12 @@ async fn handle<P: Application>(
 
     let shared = service.playback.is_none();
     if let Some(gate) = &service.playback
-        && let Err(denial) = gate.authorize(uri.path(), query.as_deref(), &headers)
+        && let Err(denial) = gate.authorize(&request, &headers)
     {
         return playback_denied(denial);
     }
 
-    let response = match service
-        .application
-        .serve(uri.path(), query.as_deref())
-        .await
-    {
+    let response = match service.application.serve(&request).await {
         Ok(response) => response,
         Err(failure) => return error_response(failure, shared),
     };
@@ -404,11 +411,9 @@ async fn liveness(method: Method) -> Response {
 
 /// The MOQ certificate's SHA-256, hex encoded, for `serverCertificateHashes`.
 ///
-/// Read per request rather than resolved once at startup, because the
-/// certificate rotates underneath a running origin. A fingerprint that
-/// outlived its certificate would be worse than none: the browser pins
-/// exactly what this returns, and a stale hash fails the handshake with no
-/// interstitial to click through.
+/// Reads the listener's active resolver rather than its files: a replacement
+/// can be pending validation or rejected while the old certificate still
+/// serves. Publishing that replacement would make browser pinning fail.
 ///
 /// The value is not a secret. It is a digest of the certificate this origin
 /// already presents in the clear to every peer that opens a connection.
@@ -419,14 +424,12 @@ async fn moq_fingerprint<P: Application>(
     if method != Method::GET && method != Method::HEAD {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    // Absent is unreachable while the route is only mounted with a certificate
-    // configured, but answering 404 keeps that an invariant rather than a panic.
-    let Some(path) = service.moq_certificate.as_deref() else {
+    // Configuration alone cannot supply a fingerprint: a QUIC listener must
+    // have successfully loaded and bound its certificate first.
+    let Some(leaf) = service.application.moq_certificate() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(fingerprint) = leaf_fingerprint(path) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
+    let fingerprint = leaf_fingerprint(&leaf);
     (
         [
             (
@@ -440,20 +443,19 @@ async fn moq_fingerprint<P: Application>(
         .into_response()
 }
 
-/// Hex SHA-256 over the DER of the first certificate in a PEM chain.
+/// Hex SHA-256 over the active leaf certificate's DER.
 ///
 /// The leaf, because that is what a browser hashes: `serverCertificateHashes`
 /// pins one end-entity certificate rather than a chain or an issuer.
-fn leaf_fingerprint(path: &Path) -> Option<String> {
+fn leaf_fingerprint(leaf: &CertificateDer<'_>) -> String {
     use std::fmt::Write as _;
 
-    let leaf = CertificateDer::from_pem_file(path).ok()?;
     let digest = ring::digest::digest(&ring::digest::SHA256, leaf.as_ref());
     let mut hex = String::with_capacity(digest.as_ref().len() * 2);
     for byte in digest.as_ref() {
-        write!(hex, "{byte:02x}").ok()?;
+        let _ = write!(hex, "{byte:02x}");
     }
-    Some(hex)
+    hex
 }
 
 async fn readiness_probe<P: Application>(

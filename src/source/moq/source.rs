@@ -12,7 +12,7 @@
 use std::{collections::VecDeque, sync::Arc, task::Poll, time::Instant};
 
 use crate::{
-    domain::{Appender, BoxFuture, Codec, DiscoveredTrack, MediaKind, TrackCatalog, TrackId},
+    domain::{Appender, BoxFuture, Codec, DiscoveredTrack, TrackCatalog, TrackId},
     observe::SourceMeters,
     source::{
         DiscoveryLimits, DiscoveryProblem, DiscoveryReport, InputLimits, InputState, Packet,
@@ -213,14 +213,15 @@ impl MoqPacketSource {
             SourceError::Input("cannot subscribe tracks before a broadcast is announced".into())
         })?;
         self.tracks.clear();
-        for (index, track) in mapped.tracks.iter().enumerate() {
+        for mapped in &mapped.tracks {
+            let track = &mapped.track;
             let name = rendition_name(track)?;
             let consumer = broadcast.track(name).map_err(classify_net)?;
             let subscriber = consumer
                 .subscribe(loc::Reader::subscription())
                 .await
                 .map_err(classify_net)?;
-            let reader = loc::Reader::new(subscriber, mapped.legacy[index]);
+            let reader = loc::Reader::new(subscriber, mapped.legacy);
             self.tracks.push(LiveTrack {
                 id: track.id,
                 codec: track.codec,
@@ -230,7 +231,7 @@ impl MoqPacketSource {
                     reader
                 },
                 ended: false,
-                inline: mapped.inline_h264[index].then(super::h264::Inline::default),
+                inline: mapped.inline_h264.then(super::h264::Inline::default),
             });
         }
         Ok(())
@@ -281,9 +282,9 @@ impl MoqPacketSource {
             let track = mapped
                 .tracks
                 .iter_mut()
-                .find(|track| track.id == packet.track_id)
+                .find(|mapped| mapped.track.id == packet.track_id)
                 .expect("prefetched packets belong to discovered tracks");
-            record_first_pts(track, packet)?;
+            record_first_pts(&mut track.track, packet)?;
         }
         Ok(())
     }
@@ -294,13 +295,14 @@ impl MoqPacketSource {
         self.cue_floor = mapped
             .tracks
             .iter()
-            .filter(|track| track.kind() != MediaKind::Subtitle)
-            .filter_map(|track| track.first_pts)
+            .filter(|mapped| mapped.required_for_discovery())
+            .filter_map(|mapped| mapped.track.first_pts)
             .min();
         let floor = self.cue_floor;
         for track in mapped
             .tracks
             .iter_mut()
+            .map(|mapped| &mut mapped.track)
             .filter(|track| track.codec == Codec::Text)
         {
             track.first_pts = track
@@ -308,18 +310,23 @@ impl MoqPacketSource {
                 .map(|pts| floor.map_or(pts, |floor| pts.max(floor)));
         }
         for packet in &mut self.prefetch {
-            let cue = mapped
-                .tracks
-                .iter()
-                .any(|track| track.id == packet.track_id && track.codec == Codec::Text);
+            let cue = mapped.tracks.iter().any(|mapped| {
+                mapped.track.id == packet.track_id && mapped.track.codec == Codec::Text
+            });
             if cue {
                 clamp_cue(packet, self.cue_floor);
             }
         }
         self.fingerprint = Some(mapped.fingerprint);
         let catalog = DiscoveryReport {
-            tracks: TrackCatalog::new(mapped.tracks)
-                .expect("mapped catalogs are non-empty and unique"),
+            tracks: TrackCatalog::new(
+                mapped
+                    .tracks
+                    .into_iter()
+                    .map(|mapped| mapped.track)
+                    .collect(),
+            )
+            .expect("mapped catalogs are non-empty and unique"),
         };
         self.discovery = Some(catalog.clone());
         catalog
@@ -349,21 +356,16 @@ impl PacketSource for MoqPacketSource {
                     return Err(DiscoveryProblem::DeadlineExceeded.into());
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                let incoming = match tokio::time::timeout(remaining, self.next_incoming()).await {
-                    Ok(incoming) => incoming?,
-                    Err(_) => return Err(DiscoveryProblem::DeadlineExceeded.into()),
-                };
-                match incoming {
+                match tokio::time::timeout(remaining, self.next_incoming())
+                    .await
+                    .map_err(|_| DiscoveryProblem::DeadlineExceeded)??
+                {
                     Incoming::Catalog(Some(catalog)) => {
                         probed = probed.saturating_add(catalog.wire_bytes);
                         if probed > limits.maximum_probe_bytes {
                             return Err(DiscoveryProblem::ProbeLimitExceeded.into());
                         }
-                        let next = map::tracks_from_catalog(
-                            &catalog.video.renditions,
-                            &catalog.audio.renditions,
-                            &catalog.text.renditions,
-                        )?;
+                        let next = MappedCatalog::from_catalog(&catalog)?;
                         if let Some(existing) = &mut mapped {
                             existing.refine(next)?;
                             self.restore_first_pts(existing)?;
@@ -396,6 +398,7 @@ impl PacketSource for MoqPacketSource {
                         let track = mapped.tracks.get_mut(index).ok_or_else(|| {
                             SourceError::Demux("LOC frame for an unknown track".into())
                         })?;
+                        let track = &mut track.track;
                         if let Some(inline) = &mut self.tracks[index].inline {
                             inline.convert(
                                 &mut frame,
@@ -417,8 +420,12 @@ impl PacketSource for MoqPacketSource {
                             return Ok(self.store_discovery(mapped.clone()));
                         }
                     }
-                    Incoming::TrackEnded => {
-                        if self.tracks.iter().any(|track| track.ended) {
+                    Incoming::TrackEnded { index } => {
+                        // Silent or finished captions are optional during A/V startup.
+                        if mapped
+                            .as_ref()
+                            .is_none_or(|m| m.tracks[index].required_for_discovery())
+                        {
                             return Err(DiscoveryProblem::Abandoned.into());
                         }
                     }
@@ -464,11 +471,7 @@ impl PacketSource for MoqPacketSource {
                     match incoming {
                         Incoming::Frame { index, frame } => self.media_packet(index, frame)?,
                         Incoming::Catalog(Some(catalog)) => {
-                            let next = map::tracks_from_catalog(
-                                &catalog.video.renditions,
-                                &catalog.audio.renditions,
-                                &catalog.text.renditions,
-                            )?;
+                            let next = MappedCatalog::from_catalog(&catalog)?;
                             if let Some(frozen) = &self.fingerprint {
                                 frozen.diff(&next.fingerprint)?;
                             }
@@ -478,7 +481,7 @@ impl PacketSource for MoqPacketSource {
                             continue;
                         }
                         Incoming::Catalog(None) => continue,
-                        Incoming::TrackEnded => {
+                        Incoming::TrackEnded { .. } => {
                             if self.tracks.iter().all(|track| track.ended) {
                                 self.terminal = Some(InputState::Closed);
                                 break;
@@ -530,7 +533,7 @@ impl PacketSource for MoqPacketSource {
 enum Incoming {
     Catalog(Option<catalog::Catalog>),
     Frame { index: usize, frame: loc::Frame },
-    TrackEnded,
+    TrackEnded { index: usize },
     Announce { path: String, present: bool },
     Closed(InputState),
 }
@@ -585,7 +588,7 @@ impl MoqPacketSource {
                 }
                 Poll::Ready(Ok(None)) => {
                     self.tracks[index].ended = true;
-                    return Poll::Ready(Ok(Incoming::TrackEnded));
+                    return Poll::Ready(Ok(Incoming::TrackEnded { index }));
                 }
                 Poll::Ready(Err(error)) => return Poll::Ready(terminal_or_fail(error)),
                 Poll::Pending => pending = true,
@@ -607,8 +610,8 @@ fn can_freeze(mapped: &MappedCatalog) -> bool {
     mapped
         .tracks
         .iter()
-        .filter(|track| track.kind() != MediaKind::Subtitle)
-        .all(|track| track.first_pts.is_some() && !track.codec_extradata.is_empty())
+        .filter(|mapped| mapped.required_for_discovery())
+        .all(|mapped| mapped.track.first_pts.is_some() && !mapped.track.codec_extradata.is_empty())
 }
 
 /// Moves a cue that starts before the presentation up to its first instant.
@@ -675,6 +678,7 @@ fn terminal_or_fail(error: ReadError) -> Result<Incoming, SourceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::MediaKind;
 
     use crate::source::DiscoveryLimits;
 
@@ -793,6 +797,37 @@ mod tests {
             .filter(|packet| packet.track_id == text)
             .map(|packet| (packet.pts, packet.payload.as_bytes().to_vec()))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn captions_can_finish_while_audio_and_video_start()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut fixture, mut source) = Fixture::new();
+        fixture.publish_catalog(&captioned_catalog());
+        fixture.track("captions");
+        fixture.track("1080p");
+        fixture.track("opus");
+        let mut discovery = source.discover(discovery_limits());
+        let pending = std::time::Duration::from_millis(10);
+        assert!(tokio::time::timeout(pending, &mut discovery).await.is_err());
+        fixture
+            .tracks
+            .remove("captions")
+            .expect("caption track")
+            .finish()?;
+        // Drive the caption EOF before either required track has any media.
+        assert!(tokio::time::timeout(pending, &mut discovery).await.is_err());
+        fixture.publish_frame("1080p", 0, crate::mux::fixtures::H264_IDR);
+        fixture.publish_frame("opus", 0, &[0xFC]);
+        let report = discovery.await?;
+        assert_eq!(report.tracks.tracks().len(), 3);
+        fixture.finish_media();
+        fixture.producer.close();
+        let mut packets = Vec::new();
+        while source.fill(&mut packets).await? == InputState::Open {}
+        assert_eq!(packets.len(), 2);
+        assert!(cues(&report, &packets).is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -1001,11 +1036,7 @@ mod tests {
         let Incoming::Catalog(Some(catalog)) = source.next_incoming().await? else {
             panic!("catalog");
         };
-        let mapped = map::tracks_from_catalog(
-            &catalog.video.renditions,
-            &catalog.audio.renditions,
-            &catalog.text.renditions,
-        )?;
+        let mapped = MappedCatalog::from_catalog(&catalog)?;
         source.subscribe_tracks(&mapped).await?;
         for sequence in 1..5 {
             fixture.publish_frame("1080p", sequence * 33_333, crate::mux::fixtures::H264_IDR);

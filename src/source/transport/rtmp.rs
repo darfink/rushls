@@ -168,8 +168,7 @@ impl RtmpPendingPublish {
         let mut session = tokio::spawn(async move {
             let result = run_server_session(io, handler, config).await;
             match &result {
-                Ok(true) => supervisor.finish(InputState::Closed),
-                Ok(false) => supervisor.finish(InputState::Interrupted),
+                Ok(state) => supervisor.finish(*state),
                 Err(error) => supervisor.fail(error.to_string()),
             }
             result
@@ -251,10 +250,7 @@ impl PendingPublish for RtmpPendingPublish {
                 })?
                 .map_err(TransportError::Accept)?;
             Ok(AcceptedPublish {
-                source: Box::new(RtmpSessionSource {
-                    source,
-                    session: Some(session),
-                }),
+                source: Box::new(RtmpSessionSource { source, session }),
                 grant,
             })
         })
@@ -287,7 +283,7 @@ impl PendingPublish for RtmpPendingPublish {
 
 struct RtmpSessionSource {
     source: RtmpPacketSource,
-    session: Option<JoinHandle<SessionResult>>,
+    session: JoinHandle<SessionResult>,
 }
 
 impl PacketSource for RtmpSessionSource {
@@ -308,9 +304,7 @@ impl PacketSource for RtmpSessionSource {
 
 impl Drop for RtmpSessionSource {
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            session.abort();
-        }
+        self.session.abort();
     }
 }
 
@@ -519,7 +513,7 @@ impl MediaHandler {
     }
 }
 
-type SessionResult = Result<bool, Box<str>>;
+type SessionResult = Result<InputState, Box<str>>;
 
 async fn run_server_session<S>(
     mut io: S,
@@ -573,8 +567,10 @@ where
     let mut input = Bytes::from(carry);
     let mut buffer = BytesMut::new();
     loop {
-        if !process_session_input(&mut io, &mut session, &mut handler, config, &mut input).await? {
-            return Ok(false);
+        let state =
+            process_session_input(&mut io, &mut session, &mut handler, config, &mut input).await?;
+        if !state.is_open() {
+            return Ok(state);
         }
         // A leased slab remains charged through decoder and elementary-unit
         // slices. The parser never needs its own independently sized pool.
@@ -594,7 +590,7 @@ where
         }
         .map_err(|error| format!("RTMP session read failed: {error}").into_boxed_str())?;
         if count == 0 {
-            return Ok(true);
+            return Ok(InputState::Interrupted);
         }
         input = buffer.split().freeze();
         if let Some(charge) = read_charge {
@@ -612,7 +608,7 @@ async fn process_session_input<S>(
     handler: &mut MediaHandler,
     config: RtmpConfig,
     input: &mut Bytes,
-) -> Result<bool, Box<str>>
+) -> Result<InputState, Box<str>>
 where
     S: AsyncWrite + Unpin,
 {
@@ -658,7 +654,7 @@ where
                                 .map_err(|error| error.to_string().into_boxed_str())?;
                             drain_control(io, session, config.timeouts.write).await?;
                             let _ = completion.send(());
-                            return Ok(false);
+                            return Ok(InputState::Interrupted);
                         }
                     }
                 }
@@ -714,7 +710,7 @@ where
                 }
                 ServerEvent::PublishStreamFinished { stream_id, .. } => {
                     handler.on_unpublish(stream_id.get())?;
-                    return Ok(false);
+                    return Ok(InputState::Closed);
                 }
                 ServerEvent::PlayStreamRequested { request_id, .. } => {
                     session
@@ -730,7 +726,7 @@ where
             _ => {}
         }
     }
-    Ok(true)
+    Ok(InputState::Open)
 }
 
 fn publish_rejection_status(rejection: PublishRejection) -> (&'static str, &'static str) {

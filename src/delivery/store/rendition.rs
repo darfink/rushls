@@ -919,9 +919,7 @@ impl RenditionState {
             PartResource {
                 part,
                 playlist_end,
-                segment_target: config
-                    .timebase
-                    .ticks_to_duration(config.segment_target.get()),
+                segment_target: self.contract.target_duration(),
                 playlist_visible: true,
                 expires_at: None,
                 parent_retained: false,
@@ -1110,11 +1108,9 @@ impl RenditionState {
         self.retained_payload_bytes = self.retained_payload_bytes.saturating_add(payload_bytes);
         self.retain_publication(publication);
 
-        let segment_target = self.advertised_config.map_or(Duration::MAX, |config| {
-            config
-                .timebase
-                .ticks_to_duration(config.segment_target.get())
-        });
+        // Retention follows the frozen playlist promise, which can exceed
+        // this rendition's cadence because of extension budgets or siblings.
+        let segment_target = self.contract.target_duration();
         let minimum_playlist_duration = retention.minimum_playlist_duration_for(segment_target);
         let mut playlist_duration = self.visible_playlist_duration();
         while self.visible_segments.len() > MINIMUM_PLAYLIST_SEGMENTS {
@@ -1341,11 +1337,7 @@ impl RenditionState {
     /// is `retain` itself when that is longer. Capacity eviction must be able
     /// to shrink *below* `retain`; that method is the time-based trim.
     fn protocol_playlist_floor(&self) -> Duration {
-        let target = self.advertised_config.map_or(Duration::MAX, |config| {
-            config
-                .timebase
-                .ticks_to_duration(config.segment_target.get())
-        });
+        let target = self.contract.target_duration();
         target.saturating_mul(u32::try_from(MINIMUM_PLAYLIST_SEGMENTS).unwrap_or(3))
     }
 

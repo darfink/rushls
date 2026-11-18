@@ -216,7 +216,8 @@ see, and no legitimate encoder approaches them.
 bitrate it has no fixed byte meaning, so it would be a second, weaker way of writing
 `retain`. `retain` stays the time promise, the tiers stay the spend.
 
-**A disk tier.** Spilled payloads live under `{dir}/{generation}/streams/...`.
+**A disk tier.** Each stream stores its spilled media under
+`{dir}/{generation}/epoch-{epoch}/rendition-{id}/`.
 When `dir` is omitted, that is the platform cache directory (`.../rushls/dvr`).
 The catalog is not rehydrated after restart: this is process-lifetime overflow
 of `window`, not DVR that survives reboot. `held` clips when both tiers (or

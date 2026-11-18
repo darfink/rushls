@@ -102,9 +102,6 @@ impl MediaHead {
         meters: &dyn MediaMeters,
         events: Option<&EventSink>,
     ) {
-        for interval in normalizer.take_video_intervals() {
-            meters.video_interval(interval);
-        }
         for notice in normalizer.take_notices() {
             meters.compensation(&notice);
             if let Some(events) = events {
@@ -160,6 +157,8 @@ impl MediaHead {
         self.drained = true;
         let result = self.normalizer.finish(out);
         Self::report_notices(&mut *self.normalizer, &*self.meters, self.events.as_ref());
+        self.meters
+            .video_intervals(&self.normalizer.take_video_intervals());
         result?;
         Ok(())
     }
@@ -190,31 +189,45 @@ impl SampleSource for MediaHead {
                 BatchUnit::Samples,
                 self.limits.maximum_samples_per_batch,
             );
-            for mut packet in self.packets.drain(..) {
-                packet.account(self.meters.pipeline_budget())?;
-                self.meters
-                    .track_input(packet.track_id, packet.retained_payload_bytes());
-                // Inspected before normalization, while the access unit is
-                // still exactly the bytes the publisher sent. Read-only: the
-                // packet continues into the pipeline untouched.
-                if let Some(captions) = &mut self.captions
-                    && let Some(services) =
-                        captions.inspect(packet.track_id, packet.payload.as_bytes())
-                {
-                    self.declared_captions = Some(services);
+            let result = (|| {
+                for mut packet in self.packets.drain(..) {
+                    packet.account(self.meters.pipeline_budget())?;
+                    self.meters
+                        .track_input(packet.track_id, packet.retained_payload_bytes());
+                    // Inspected before normalization, while the access unit is
+                    // still exactly the bytes the publisher sent. Read-only: the
+                    // packet continues into the pipeline untouched.
+                    if let Some(captions) = &mut self.captions
+                        && let Some(services) =
+                            captions.inspect(packet.track_id, packet.payload.as_bytes())
+                    {
+                        self.declared_captions = Some(services);
+                    }
+                    let result = self.normalizer.push(packet, &mut samples);
+                    // Drain before propagating failure: prior compensation in this
+                    // batch is a fact even when no samples reach packaging.
+                    Self::report_notices(
+                        &mut *self.normalizer,
+                        &*self.meters,
+                        self.events.as_ref(),
+                    );
+                    result?;
                 }
-                let result = self.normalizer.push(packet, &mut samples);
-                // Drain before propagating failure: prior compensation in this
-                // batch is a fact even when no samples reach packaging.
-                Self::report_notices(&mut *self.normalizer, &*self.meters, self.events.as_ref());
-                result?;
-            }
+                Ok::<_, MediaError>(())
+            })();
+            // One meter lock per batch, including intervals observed before
+            // an accounting or normalization failure. Notices still emit in order.
+            self.meters
+                .video_intervals(&self.normalizer.take_video_intervals());
+            result?;
             if !state.is_open() {
                 // End of input is the only place trailing access units held for
                 // reordering can be flushed, so it happens here rather than in
                 // each of the two loops that drive this.
                 let result = self.normalizer.finish(&mut samples);
                 Self::report_notices(&mut *self.normalizer, &*self.meters, self.events.as_ref());
+                self.meters
+                    .video_intervals(&self.normalizer.take_video_intervals());
                 result?;
                 self.drained = true;
             }
@@ -616,10 +629,6 @@ mod tests {
     struct IdleMuxer;
 
     impl Muxer for IdleMuxer {
-        fn expected_publication_interval(&self) -> std::time::Duration {
-            std::time::Duration::from_secs(1)
-        }
-
         fn push(
             &mut self,
             _sample: NormalizedMedia,
@@ -657,10 +666,6 @@ mod tests {
     struct UnflushableMuxer;
 
     impl Muxer for UnflushableMuxer {
-        fn expected_publication_interval(&self) -> std::time::Duration {
-            std::time::Duration::from_secs(1)
-        }
-
         fn push(
             &mut self,
             _sample: NormalizedMedia,

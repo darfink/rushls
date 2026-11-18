@@ -11,14 +11,16 @@ use crate::{
         store::{InitializationId, PartId, SegmentId},
         uri::{
             MediaResource, PercentEncoded, ResourcePathError, append_media_leaf,
-            has_initialization, parse_stream, validate_path,
+            has_initialization, parse_rendition,
         },
     },
     domain::{MediaKind, RenditionId, StreamId},
     mux::MediaSegmentFormat,
 };
 
+pub(in crate::delivery) const PLAYLIST_EXTENSION: &str = "m3u8";
 const MULTIVARIANT_NAME: &str = "index.m3u8";
+const IFRAME_PLAYLIST_NAME: &str = "iframe.m3u8";
 const NAMED_KINDS: [MediaKind; 3] = [MediaKind::Audio, MediaKind::Subtitle, MediaKind::Video];
 /// Query parameter native HLS substitutes from `EXT-X-DEFINE:QUERYPARAM`.
 pub const TOKEN_QUERYPARAM: &str = "token";
@@ -57,44 +59,26 @@ impl Resource {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResourcePath {
-    pub stream: StreamId,
-    pub resource: Resource,
-}
-
-/// Parses only HLS manifest paths; shared media is deliberately not routed
-/// through this adapter.
-pub fn parse_path(path: &str) -> Result<ResourcePath, ResourcePathError> {
-    let segment_count = validate_path(path)?;
-    let mut tail = path.split('/').filter(|segment| !segment.is_empty()).rev();
-    let name = tail.next().ok_or(ResourcePathError::Unrecognized)?;
-    let (resource, consumed) = if name == MULTIVARIANT_NAME {
-        (Resource::Multivariant, 1)
-    } else {
-        let rendition = tail.next().ok_or(ResourcePathError::Unrecognized)?;
-        // Classify the leaf before parsing its parent: media paths belong to
-        // the shared router and must remain Unrecognized by this adapter.
-        let kind = if name == "iframe.m3u8" {
-            None
-        } else {
-            Some(media_playlist_kind(name).ok_or(ResourcePathError::Unrecognized)?)
-        };
-        let rendition = rendition
-            .parse()
-            .map(RenditionId)
-            .map_err(|_| ResourcePathError::InvalidIdentifier)?;
-        (
-            kind.map_or(Resource::IFramePlaylist(rendition), |kind| {
-                Resource::MediaPlaylist(rendition, kind)
-            }),
-            2,
-        )
+/// Resolves a playlist leaf and leaves the stream prefix for the viewer parser.
+pub(in crate::delivery) fn parse_manifest<'a, 'path>(
+    prefix: &'a [&'path str],
+    name: &str,
+) -> Result<(&'a [&'path str], Resource), ResourcePathError> {
+    if name == MULTIVARIANT_NAME {
+        return Ok((prefix, Resource::Multivariant));
+    }
+    let [stream @ .., rendition] = prefix else {
+        return Err(ResourcePathError::Unrecognized);
     };
-    Ok(ResourcePath {
-        stream: parse_stream(path, segment_count.saturating_sub(consumed))?,
-        resource,
-    })
+    // Classify the leaf before parsing its parent so unknown playlist names
+    // stay unrecognized regardless of the preceding component.
+    let resource = if name == IFRAME_PLAYLIST_NAME {
+        Resource::IFramePlaylist(parse_rendition(rendition)?)
+    } else {
+        let kind = media_playlist_kind(name).ok_or(ResourcePathError::Unrecognized)?;
+        Resource::MediaPlaylist(parse_rendition(rendition)?, kind)
+    };
+    Ok((stream, resource))
 }
 
 /// The absolute location manifests publish under, or relative names by default.
@@ -170,7 +154,7 @@ impl PlaylistUris {
     pub fn iframe_playlist(&self, rendition: RenditionId) -> String {
         let mut out = String::new();
         self.write_prefix(&mut out, None, rendition);
-        out.push_str("iframe.m3u8");
+        out.push_str(IFRAME_PLAYLIST_NAME);
         self.append_token_variable(&mut out);
         out
     }
@@ -255,7 +239,7 @@ impl RenditionUris<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::delivery::uri::{MediaResourcePath, parse_media_path};
+    use crate::delivery::uri::{ViewerPath, ViewerResource};
 
     use super::*;
 
@@ -264,8 +248,11 @@ mod tests {
         let path = multivariant_path(&StreamId::new("live/my camera"));
         assert_eq!(path, "/live/my%20camera/index.m3u8");
         assert_eq!(
-            parse_path(&path).map(|parsed| parsed.resource),
-            Ok(Resource::Multivariant),
+            ViewerPath::parse(&path),
+            Ok(ViewerPath {
+                stream: StreamId::new("live/my camera"),
+                resource: ViewerResource::Hls(Resource::Multivariant),
+            }),
             "the logged path is one the origin serves"
         );
         assert_eq!(UriBase::default().locate(&path), path);
@@ -301,23 +288,25 @@ mod tests {
     }
 
     #[test]
-    fn manifest_and_media_parsers_have_disjoint_responsibilities() {
-        assert_eq!(
-            parse_path("/live/camera/3/video.m3u8"),
-            Ok(ResourcePath {
-                stream: StreamId::new("live/camera"),
-                resource: Resource::MediaPlaylist(RenditionId(3), MediaKind::Video),
-            })
-        );
-        assert_eq!(
-            parse_path("/live/camera/3/segment/7.m4s"),
-            Err(ResourcePathError::Unrecognized)
-        );
-        assert!(matches!(
-            parse_media_path("/live/camera/3/segment/7.m4s"),
-            Ok(Some(MediaResourcePath { .. }))
-        ));
-        assert_eq!(parse_media_path("/live/camera/index.m3u8"), Ok(None));
+    fn viewer_parser_recognizes_rendition_playlists() {
+        for (name, resource) in [
+            (
+                "video.m3u8",
+                Resource::MediaPlaylist(RenditionId(3), MediaKind::Video),
+            ),
+            (
+                IFRAME_PLAYLIST_NAME,
+                Resource::IFramePlaylist(RenditionId(3)),
+            ),
+        ] {
+            assert_eq!(
+                ViewerPath::parse(&format!("/live/camera/3/{name}")),
+                Ok(ViewerPath {
+                    stream: StreamId::new("live/camera"),
+                    resource: ViewerResource::Hls(resource),
+                })
+            );
+        }
     }
 
     #[test]

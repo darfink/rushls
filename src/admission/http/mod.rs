@@ -159,7 +159,7 @@ fn service(reason: impl Into<String>) -> AdmissionError {
 /// Versioned so a service can tell which shape it is being sent without
 /// guessing from which fields are present.
 /// Additive request fields keep version 1; a breaking shape change bumps it.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct AdmissionRequest<'a> {
     version: u8,
     /// Unique per attempt, so a service that wants idempotence has a key.
@@ -190,7 +190,7 @@ impl<'a> AdmissionRequest<'a> {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct Credential {
     encoding: &'static str,
     value: String,

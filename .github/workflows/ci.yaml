@@ -460,7 +460,9 @@ jobs:
         run: |
           # Crates whose version is already on crates.io are skipped; cargo
           # would otherwise refuse the whole workspace.
-          mapfile -t excluded < <(python3 tools/unpublished-crates.py)
+          # Let the step fail before publishing if any registry lookup fails.
+          python3 tools/unpublished-crates.py > "$RUNNER_TEMP/excluded-crates"
+          mapfile -t excluded < "$RUNNER_TEMP/excluded-crates"
           members=$(cargo metadata --format-version 1 --no-deps --locked | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["workspace_members"]))')
           if [ "${#excluded[@]}" -ge "$members" ]; then
             echo 'Every workspace crate version is already on crates.io.'
