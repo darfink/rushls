@@ -59,7 +59,8 @@ The workflow and local tests do not modify Keychain or require sudo for TLS.
 For HTTPS, supply `RUSHLS_TEST_TLS_CERT`, `RUSHLS_TEST_TLS_KEY`, and `RUSHLS_TEST_TLS_HOST`.
 The hostname must resolve to `127.0.0.1`; an additional `::1` record is allowed.
 All addresses must be loopback addresses, and macOS must already trust the certificate chain.
-A public DNS record and a publicly trusted DNS-01 certificate meet these requirements without hosts-file edits.
+A public DNS record and a publicly trusted DNS-01 certificate meet these requirements for local runs.
+GitHub-hosted macOS runners map the configured hostname to loopback for the audit so public DNS outages do not interrupt playback validation.
 See [Let's Encrypt DNS-01](https://letsencrypt.org/docs/challenge-types/#dns-01-challenge).
 For CI, configure the `APPLE_HLS_TLS` secret with JSON fields `certificate` and `private_key`, plus variable `APPLE_HLS_TLS_HOST`.
 The pair changes atomically. See [certificate renewal](certificate-renewal.md) for the scheduled renewal job.
