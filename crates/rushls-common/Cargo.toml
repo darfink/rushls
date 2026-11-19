@@ -30,7 +30,7 @@ axum = ["tls", "dep:axum"]
 [dependencies]
 arc-swap = { workspace = true, optional = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"], optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 bytes = { workspace = true, optional = true }
 bytesize = { workspace = true, optional = true }
 conf = { workspace = true, optional = true }
