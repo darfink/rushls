@@ -1,12 +1,12 @@
-# Publisher auth and lifecycle API
+# Admission and hooks
 
-The auth request and session hooks share one transport identity shape.
-`protocol`, `resource`, and `client` describe the observed publisher.
-`stream_id` and `principal` describe the authorization decision.
+Rushls integrates with your application through two HTTP interfaces: **admission** (deciding whether a publisher may connect, and under which stream ID and profile) and **lifecycle hooks** (receiving CloudEvents as publishers connect, streams go live, segments finish, and broadcasts end).
+
+Both share the same publisher identity shape: `protocol`, `resource`, and `client` describe what connected, while `stream_id` and `principal` record your authorization decision.
 
 ## Admission
 
-Rushls sends one POST with `Content-Type: application/json`:
+When `[publish.auth]` is configured, Rushls sends a `POST` request with `Content-Type: application/json` for every incoming publisher:
 
 ```json
 {
@@ -23,15 +23,12 @@ Rushls sends one POST with `Content-Type: application/json`:
 }
 ```
 
-`protocol` is `rtmp`, `rtmps`, `srt`, or `moq`. `rtmps` means this node
-terminated TLS; RTMP behind an external terminator reports `rtmp`. `remote_address` is the transport peer's
-socket address, including its port. It does not claim to identify a publisher
-behind a relay. Optional transport metadata uses `null` when unavailable.
-`resource.namespace` can also be `null`.
+- `protocol` is `rtmp`, `rtmps`, `srt`, or `moq` (`rtmps` means Rushls itself terminated TLS; plain RTMP behind an external TLS terminator reports `rtmp`).
+- `remote_address` is the peer socket address and port (or the address from the PROXY protocol header when `proxy_protocol = true`). It cannot identify a publisher behind an upstream relay.
+- `resource.namespace` and optional `client` metadata fields are `null` when unavailable.
+- `request_id` identifies this admission check only; once admitted, the publishing session gets its own `session_id`.
 
-`request_id` identifies this admission attempt. It is separate from a lifecycle
-`session_id`, which exists only after admission and registration. The response
-schema follows the request's `version`. An allowing response is:
+Return HTTP `200` with a JSON decision matching the request's `version`. To allow the publisher:
 
 ```json
 {
@@ -42,61 +39,54 @@ schema follows the request's `version`. An allowing response is:
 }
 ```
 
-`stream_id` and `principal` are required, nonblank strings. `profile` is optional
-and selects a `[publish.profile.NAME]` table. Omission or `null` selects the
-default `[publish]` profile.
-A denying response is:
+`stream_id` and `principal` are required non-blank strings. `profile` is optional and selects a `[publish.profile.NAME]` table; omitting it or setting `null` applies the default `[publish]` settings.
+
+To deny the publisher:
 
 ```json
 {"decision": "deny", "reason": "subscription_inactive"}
 ```
 
-`reason` is optional human-readable text. The node does not relay it to the
-publisher. Unknown fields are refused in both response forms. The response
-cannot override the observed protocol, resource, or client details.
+`reason` is optional human-readable context for your logs and is never sent back to the publisher.
 
-Only successful HTTP responses contain decisions. Transport errors, other
-statuses, invalid JSON, unknown policies, and invalid identities fail closed.
-Rushls does not retry the request. A reconnect creates a new admission attempt.
+Unknown fields are rejected in both responses, and a response cannot override `protocol`, `resource`, or `client`.
+Admission always fails closed: transport errors, timeouts, non-2xx statuses, invalid JSON, unknown profiles, or invalid identities deny the connection without retrying. A reconnecting encoder triggers a new admission request.
 
 ## Lifecycle hooks
 
-Hooks use `application/cloudevents+json`. A hook subscribes to events by name in its `events` list.
+Configured `[hook.<name>]` endpoints receive `POST` requests with `Content-Type: application/cloudevents+json` for each event listed in `events`.
 
-Events describe one of two lifetimes. `publisher.*` events cover one publisher connection, from admission until it stops.
-`stream.*` events cover what viewers play. A stream can outlive a publisher: if the encoder reconnects, the stream stays playable
-and a new publisher starts, with a new `session_id`.
+Events track two separate lifetimes:
+
+- **`publisher.*` events** follow a single publisher connection from admission until it stops, identified by `session_id`.
+- **`stream.*` events** follow what viewers can play. A stream outlives a disconnected publisher for the length of `hls.window`, so an encoder can reconnect under a new `session_id` while the stream stays available.
 
 | Event | Sent when |
 | --- | --- |
-| `publisher.started` | A publisher passes [admission](#admission) and claims the stream, before any media arrives. A rejected publisher sends no events. |
-| `stream.available` | The first playlist a viewer can load is written. Sent once per stream, not again when a publisher reconnects. |
-| `segment.ready` | A segment is complete and can be fetched, for every segment of every rendition. |
-| `publisher.degraded` | Rushls first repairs a hole on one of this publisher's tracks. See [input handling](input-handling.md#hooks-logs-and-metrics). |
-| `publisher.recovered` | A degraded track has carried 30 seconds of clean media. |
-| `publisher.ended` | The publisher stops for any reason: it ended the stream, dropped, was replaced or stopped, or failed. Viewers can still play the stream. |
-| `stream.unavailable` | The stream has had no publisher for the length of `hls.window`, and Rushls removes it. Viewers get 404 from here on. Never sent for a stream that never became available. |
+| `publisher.started` | A publisher passes [admission](#admission) and claims the stream, before media arrives (rejected publishers emit no events) |
+| `stream.available` | The first playlist a viewer can load is ready; sent once per stream, not on reconnects |
+| `segment.ready` | Every completed segment of every rendition is ready to fetch |
+| `publisher.degraded` | Rushls first repairs a hole on one of this publisher's tracks (see [Input handling](input-handling.md#hooks-logs-and-metrics)) |
+| `publisher.recovered` | A degraded track has carried 30 seconds of clean media |
+| `publisher.ended` | The publisher stops for any reason (clean end, drop, takeover, shutdown, or failure); viewers can still play retained media |
+| `stream.unavailable` | The stream has had no publisher for `hls.window` and is retired (viewers get 404); never sent for a stream that never became available |
 
-Admission sees the original credential and resource. Publisher hooks replace a resource name
-containing that credential with `[redacted]` and omit a credential-bearing namespace.
-Return a separate public `stream_id` and `principal` to receive lifecycle hooks.
-If either contains the credential, Rushls withholds the publisher hooks and stream URLs.
-This includes open RTMP admission, where the publish name also forms the playback path.
-Viewers can still use that path. Reconnects inherit this restriction until the retained stream expires.
-If an earlier publisher made the stream public, subscribers still receive its matching
-`stream.unavailable`. Operator logs and per-stream metrics contain the playback identity.
-The session acceptance log records `hooks_withheld` when a public subject is unavailable.
+A typical broadcast emits `publisher.started` → `stream.available` → `segment.ready` (repeated) → `publisher.ended` → `stream.unavailable`.
+Events for a given stream are delivered in order.
+To react when a broadcast is truly over, listen for `stream.unavailable` rather than `publisher.ended`, which also fires when an encoder drops and reconnects.
 
-A typical publication sends `publisher.started`, `stream.available`, `segment.ready` per segment, `publisher.ended`,
-then `stream.unavailable`. Events for one stream are delivered in order.
-To act when a broadcast is over, use `stream.unavailable`: `publisher.ended` also fires for an encoder that reconnects.
+### Credential redaction and public stream IDs
 
-The wire type includes a schema version (`rushls.<kind>.v1`). New fields, such as
-the `protocol`, `resource`, and `client` details on publisher events, are additive
-and keep the version: consumers must accept and ignore fields they do not
-recognize. Only a breaking change, removing or renaming a field or changing its
-type or meaning, moves the type to `.v2`. Subscriptions name the kind
-(`publisher.started`), so one subscription receives every version of that event.
+Credentials never appear in lifecycle hooks:
+
+- Admission receives the original credential and resource, while publisher hooks replace any `resource.name` containing the credential with `[redacted]` and omit a credential-bearing `resource.namespace`.
+- **Return a public `stream_id` and `principal` that do not contain the publish credential** if you want lifecycle hooks. If either contains the credential—including with open RTMP admission, where the publish name becomes the playback path—Rushls withholds publisher hooks and stream URLs (logged as `hooks_withheld = true` on session acceptance). Playback itself still works, and reconnects inherit the restriction until the stream expires. If an earlier publisher made the stream public, subscribers still receive its `stream.unavailable`.
+
+### Event format and versioning
+
+CloudEvents `type` includes a schema version (`rushls.<kind>.v1`). Additive fields keep `.v1`, so consumers should ignore unrecognized fields; breaking changes (removing, renaming, or changing the meaning of a field) bump to `.v2`. Subscriptions name the kind without a version (such as `publisher.started`) and receive every version.
+
+Example `publisher.started` event:
 
 ```json
 {
@@ -122,7 +112,7 @@ type or meaning, moves the type to `.v2`. Subscriptions name the kind
 }
 ```
 
-`publisher.ended` repeats those identity fields and adds:
+`publisher.ended` includes those same identity fields plus:
 
 ```json
 {
@@ -133,27 +123,17 @@ type or meaning, moves the type to `.v2`. Subscriptions name the kind
 }
 ```
 
-`outcome` is `ended`, `interrupted`, `replaced`, `cancelled`, `unhealthy`, or
-`failed`. `diagnostic` is optional human-readable detail, not a stable code.
-`was_available` means this publisher reached its running
-pipeline state. Stream playability belongs to `stream.available` instead.
+- `outcome` is one of `ended`, `interrupted`, `replaced`, `cancelled`, `unhealthy`, or `failed`.
+- `diagnostic` is optional human-readable detail (not a stable error code).
+- `was_available` indicates whether this publisher reached its running pipeline state; stream playability is reported by `stream.available`.
 
-Stream events carry `stream_id` in `data`, and `stream.available` adds
-`playlist_path`, the multivariant playlist's server path such as
-`/live/camera/index.m3u8`. Like `segment.ready` paths, it is rooted rather than
-absolute: join it to the origin or CDN the consumer uses. Stream events do not
-name a publisher, because a stream can remain playable across publisher
-reconnects. Credentials
-never appear in lifecycle events. Session IDs are decimal strings to preserve
-64-bit precision. They are process-local and can repeat after a restart.
-CloudEvents IDs identify occurrences across restarts.
+Stream events carry `stream_id` in `data` and omit publisher details, since a stream can span multiple publisher sessions. `stream.available` adds `playlist_path` (such as `/live/camera/index.m3u8`), which—like paths in `segment.ready`—is rooted rather than absolute so you can join it to your origin or CDN host.
+
+`session_id` is a decimal string (preserving 64-bit precision) and is process-local, so it may repeat after a restart. Use CloudEvents `id` (paired with `source`) to identify events uniquely across restarts.
 
 ## HMAC signing
 
-Each hook can configure `signing_secret` as a string, `"${VAR}"`, or `{ file = "/path" }`.
-The value is `whsec_` followed by base64 encoding of at least 32 random bytes.
-Mounted secret files use the existing text-secret rules. Keys load at startup
-and remain redacted in debug output and configuration errors.
+To sign hook deliveries, set `signing_secret` on a hook using any supported [secret form](configuration.md#secrets) (inline string, `"${VAR}"`, or `{ file = "/path" }`):
 
 ```toml
 [hook.automation]
@@ -162,9 +142,9 @@ events = ["publisher.started", "publisher.ended"]
 signing_secret = { file = "/run/secrets/rushls-webhook-signing" }
 ```
 
-Signing follows the symmetric
-[Standard Webhooks specification](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md).
-Each signed request includes:
+The secret must start with `whsec_` followed by base64-encoded random bytes (at least 32 decoded bytes). Keys load at startup and are redacted from debug output and configuration errors.
+
+Signing follows the symmetric [Standard Webhooks specification](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md). Signed requests carry three headers:
 
 ```text
 webhook-id: <CloudEvents id>
@@ -172,25 +152,20 @@ webhook-timestamp: <delivery-attempt Unix timestamp in seconds>
 webhook-signature: v1,<base64 HMAC-SHA256>
 ```
 
-The signed bytes are:
+The HMAC-SHA256 signature is computed with the decoded key (after `whsec_`) over:
 
 ```text
 UTF8(webhook-id) + "." + UTF8(webhook-timestamp) + "." + raw HTTP body
 ```
 
-The key is the decoded secret after the `whsec_` prefix. Retries preserve the
-CloudEvents ID and body bytes. Each attempt gets a current delivery timestamp
-and a signature. The CloudEvents `time` remains the occurrence time.
+Retries keep the original CloudEvents `id`, `time`, and raw body, updating `webhook-timestamp` and `webhook-signature` on each attempt.
 
-To verify a request:
+To verify a webhook:
 
-1. Read the raw body before parsing JSON.
-2. Verify the HMAC with a Standard Webhooks verifier or a constant-time comparison.
-3. Reject delivery timestamps outside your replay window, typically five minutes.
-4. Verify that `webhook-id` matches the signed CloudEvents `id`.
+1. Read the raw HTTP body before parsing JSON.
+2. Verify `webhook-signature` using a Standard Webhooks library or a constant-time HMAC comparison.
+3. Reject `webhook-timestamp` values outside your replay window (typically 5 minutes).
+4. Confirm `webhook-id` matches the CloudEvents `id` in the body.
 5. Deduplicate verified events by `source` and `id`.
 
-A valid signature authenticates the request but does not prevent replay by
-itself. Timestamp validation and deduplication are also required. Signing can
-coexist with bearer authentication and mutual TLS. Without a signing key,
-hooks preserve their existing unsigned behavior.
+A valid signature authenticates the sender but does not stop replays on its own—always check the timestamp and deduplicate. HMAC signing works alongside bearer tokens (`token`) and mutual TLS (`client_cert`, `client_key`, `ca`). Without `signing_secret`, hooks are sent unsigned.

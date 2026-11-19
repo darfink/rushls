@@ -1,187 +1,133 @@
 # Metrics
 
-Rushls exposes node metrics at `/metrics` and stream diagnostics at `/metrics/streams`.
-The `[metrics]` configuration controls the listener and bearer authentication. Both endpoints use the same authorization rules.
+Rushls exports Prometheus metrics on two endpoints configured under `[metrics]`:
 
-## Diagnose a reported stall
+- `/metrics` for node-wide totals and histograms (bounded cardinality).
+- `/metrics/streams` for per-stream, per-rendition, and per-session detail.
 
-| Question | Measurement |
-|---|---|
-| Is a publisher still active? | `rushls_stream_publisher_active` |
-| Did the origin miss an output deadline? | `rushls_rendition_output_overdue_seconds` and `rushls_rendition_output_deadline_misses_total` |
-| Does media keep pace with real time? | `rushls_rendition_output_lag_seconds` and `rate(rushls_rendition_media_published_seconds_total[1m])` |
-| Which rendition is behind? | `rushls_rendition_behind_fastest_seconds` |
-| What is the largest media difference? | `rushls_stream_rendition_media_skew_seconds` |
-| How much later did siblings publish equivalent media? | `rushls_stream_rendition_publish_spread_seconds` |
-| Did input stop first? | Per-track source and normalization timestamps |
-| Did serving fail despite timely output? | HTTP status, body outcomes, operation timing, and public-path probe |
+Both endpoints share the listener and bearer-token settings from `[metrics]`.
 
-Output metrics describe media committed to the origin store. Rushls renders playlists on request.
-Healthy output alone does not prove healthy HTTP serving, CDN freshness, network throughput, or player decoding.
-The public-path probe supplies another observation. Player buffer and rebuffer telemetry remain external to Rushls.
+## Diagnosing a stall
+
+When viewers report buffering or a frozen stream, work down this checklist:
+
+| Question | What to check |
+| --- | --- |
+| Is a publisher still connected? | `rushls_stream_publisher_active` |
+| Did Rushls miss an output deadline? | `rushls_rendition_output_overdue_seconds` and `rushls_rendition_output_deadline_misses_total` |
+| Is output keeping up with real time? | `rushls_rendition_output_lag_seconds` and `rate(rushls_rendition_media_published_seconds_total[1m])` |
+| Which rendition fell behind? | `rushls_rendition_behind_fastest_seconds` |
+| How far apart are renditions in media time? | `rushls_stream_rendition_media_skew_seconds` |
+| How much later did sibling renditions finish the same boundary? | `rushls_stream_rendition_publish_spread_seconds` |
+| Did ingest stall first? | Per-track source and normalization timestamps |
+| Are media commits healthy while HTTP serving fails? | HTTP status codes, failure reasons, body duration, and the [public playback probe](#public-playback-probe) |
+
+Output metrics reflect media committed to the origin store (playlists are rendered on request). Healthy origin output does not by itself rule out HTTP saturation, CDN caching issues, network drops, or player decoding bugs—combine origin metrics with the playback probe and client-side telemetry.
 
 ## Publication timing
 
-Rendition measurements use `stream`, `rendition`, and `kind` labels.
-The rendition ID is the durable delivery identity, such as `rendition/0`.
-`rushls_rendition_source_info` maps each output to its source track.
-Session track metrics identify the current input session separately.
+Rendition series carry `stream`, `rendition` (the durable delivery ID, such as `rendition/0`), and `kind` labels.
+`rushls_rendition_source_info` maps each rendition back to its source track, while session track metrics track the current ingest connection separately.
 
-The successful store commit records publication time after request-facing snapshot updates.
-Commit serialization prevents displaced publishers from updating successor metrics.
-The measurement includes store work and lock delay before the commit. It precedes HTTP response and network transfer.
+Commit times are recorded when media finishes committing to the store (including store locking, before HTTP transfer).
+Deadlines, intervals, lag, and spread use monotonic time (including pacing sleeps, since viewers wait through them too); Unix timestamps are exported for cross-system correlation.
 
-Monotonic elapsed time drives deadlines, intervals, lag, and publication spread.
-Pacing sleeps remain part of elapsed time because viewers also wait through them.
-Unix timestamps support correlation across systems, but clock agreement is necessary for external age calculations.
-
-| Family | Definition |
-|---|---|
-| `rushls_rendition_output_expected` | One for active continuous audio/video output, zero for sparse subtitles or disconnected publications |
-| `rushls_rendition_output_started` | One after the first live media interval commits in the current publication |
-| `rushls_rendition_startup_elapsed_seconds` | Elapsed time awaiting first output while output is expected |
-| `rushls_rendition_startup_budget_seconds` | Maximum planned segment duration plus the publication tolerance |
+| Metric | Meaning |
+| --- | --- |
+| `rushls_rendition_output_expected` | `1` for active continuous audio/video output; `0` for sparse subtitles or disconnected publishers |
+| `rushls_rendition_output_started` | `1` once the first live media interval commits in the current publication |
+| `rushls_rendition_startup_elapsed_seconds` | Time spent waiting for first output while expected |
+| `rushls_rendition_startup_budget_seconds` | Maximum planned segment duration plus publication tolerance |
 | `rushls_rendition_expected_publish_interval_seconds` | Planned part interval, or segment interval for segment-only output |
-| `rushls_rendition_publication_tolerance_seconds` | One planned interval of additional publication tolerance |
-| `rushls_rendition_output_overdue_seconds` | Elapsed time beyond the current deadline, or zero when output is not expected |
-| `rushls_rendition_output_deadline_misses_total` | Distinct silence episodes that cross their deadline |
-| `rushls_rendition_last_publish_timestamp_seconds` | Unix time of the latest live media commit |
-| `rushls_rendition_media_published_seconds_total` | Newly committed media duration, including accepted tail media, without part-parent double counting |
+| `rushls_rendition_publication_tolerance_seconds` | Additional tolerance before a commit counts as overdue (one planned interval) |
+| `rushls_rendition_output_overdue_seconds` | Seconds past the current deadline (`0` when output is not expected) |
+| `rushls_rendition_output_deadline_misses_total` | Distinct silence episodes that crossed their deadline |
+| `rushls_rendition_last_publish_timestamp_seconds` | Unix timestamp of the latest live media commit |
+| `rushls_rendition_media_published_seconds_total` | Newly committed media duration (including tail media, without double-counting parent segments of parts) |
 | `rushls_rendition_media_end_seconds` | Contiguous media end on the publication timeline |
-| `rushls_rendition_output_lag_seconds` | Signed wall progress minus contiguous media progress from a shared baseline |
+| `rushls_rendition_output_lag_seconds` | Wall-clock progress minus contiguous media progress from the stream's shared baseline |
 | `rushls_rendition_target_duration_seconds` | Advertised HLS segment target |
-| `rushls_rendition_part_target_seconds` | Advertised part target, absent for segment-only output |
-| `rushls_rendition_timeline_breaks_total` | Publications with noncontiguous output timestamps |
-| `rushls_rendition_gaps_total` | Unfinished segments replaced by advertised gaps |
+| `rushls_rendition_part_target_seconds` | Advertised HLS part target (omitted for segment-only output) |
+| `rushls_rendition_timeline_breaks_total` | Publications that experienced non-contiguous output timestamps |
+| `rushls_rendition_gaps_total` | Unfinished segments replaced by `EXT-X-GAP` |
 
-A part-based rendition advances on each committed part. A segment-only rendition advances on each committed segment.
-Initialization, metadata changes, and part-parent completion do not advance the cadence clock.
+### How deadlines and lag work
 
-The next-output budget is the planned interval plus its exported tolerance.
-For example, a one-second interval permits two seconds between commits before overdue time increases.
-This policy measures origin output continuity. It is not a claim about a universal HLS jitter limit or actual player buffer exhaustion.
-The tolerance does not adapt to a slow publisher. It is currently fixed to one planned interval.
-
-The first continuous-media commit establishes one shared wall/media baseline.
-Each sibling retains its actual media offset. An independent baseline for each rendition would hide startup delay.
-Negative lag means available media is ahead of elapsed time. Positive lag means output is behind that baseline.
-This measurement is relative output drift, not camera capture latency.
-
-A timestamp gap freezes the contiguous edge for the rest of that publication.
-Later timestamps cannot erase missing media or make the origin appear to catch up.
-The timeline-break counter identifies this condition. A new publication resets the baseline and continuity state.
-
-The maintenance pass and stream scrapes detect deadlines during silence.
-The commit path also detects a missed deadline before resetting the silence episode.
-A shared latch prevents duplicate counting. Recovery between scrapes still increments the counter.
-Node totals survive stream removal until process restart.
-Rendition counters persist across compatible reconnects while the durable rendition remains retained.
-
-Detected input closure disables live timing before paced tail processing.
-Session shutdown, finalization, lease release, and takeover also disable the old publication.
-The origin cannot know about a remote disconnect before its transport reports it.
-Stored tail media still contributes to media-duration totals. Idle retention metrics remain available.
+- **Cadence clock:** Part-based renditions advance on every committed part; segment-only renditions advance on every committed segment. Init sections, metadata updates, and closing a parent segment whose parts already committed do not reset the clock.
+- **Overdue threshold:** A rendition becomes overdue after `expected_publish_interval + publication_tolerance` (for example, 2 seconds for a 1-second part target). Deadlines are checked both on commits and during silence, so a brief stall that recovers between scrapes still increments `rushls_rendition_output_deadline_misses_total` once.
+- **Shared lag baseline:** The first continuous-media commit establishes one wall/media baseline for the whole stream, so a slow-starting rendition cannot hide behind its own delayed baseline. Negative lag means media is slightly ahead of elapsed time; positive lag means output has drifted behind (this measures relative origin drift, not camera-to-glass latency).
+- **Timeline breaks:** A timestamp gap freezes `media_end_seconds` for the rest of that publication so later timestamps cannot disguise missing media; `rushls_rendition_timeline_breaks_total` flags this until a new publication resets continuity.
+- **Disconnects and persistence:** Orderly closure, shutdown, and takeover stop live timing before tail draining, while stored tail media still counts toward `media_published_seconds_total`. Node-wide totals survive stream retirement until process restart, and rendition counters persist across compatible reconnects while the stream stays retained.
 
 ## Rendition comparison
 
-Comparison labels add `group` to the stream identity.
-`group/<key>` compares alternatives from one topology group.
-`combination/<index>` compares continuous audio/video members in a playable combination.
-Sparse subtitles and I-frame projections do not participate.
+Comparison metrics add a `group` label: `group/<key>` compares alternatives within one HLS group (for example, video rungs or audio languages), while `combination/<index>` compares continuous audio/video tracks within a playable combination. Sparse subtitles and I-frame playlists are excluded.
 
-| Family | Definition |
-|---|---|
-| `rushls_stream_rendition_media_skew_seconds` | Maximum minus minimum contiguous media end among group members |
-| `rushls_rendition_behind_fastest_seconds` | A member's media delay behind the fastest member in that group |
-| `rushls_stream_rendition_publish_spread_seconds` | Arrival spread for the most recently resolved common media boundary |
-| `rushls_stream_rendition_publish_spread_timestamp_seconds` | Unix time when that comparison resolved |
-| `rushls_stream_rendition_comparisons_pending` | Comparisons still missing at least one member |
-| `rushls_stream_rendition_comparison_age_seconds` | Age of the oldest retained unresolved comparison |
-| `rushls_stream_rendition_comparisons_incomplete_total` | Comparisons discarded at the history limit or publication end |
+| Metric | Meaning |
+| --- | --- |
+| `rushls_stream_rendition_media_skew_seconds` | Difference between the fastest and slowest contiguous `media_end_seconds` in the group |
+| `rushls_rendition_behind_fastest_seconds` | How far one rendition trails the fastest sibling in its group |
+| `rushls_stream_rendition_publish_spread_seconds` | Wall-clock spread between the earliest and latest sibling crossing the most recent common media boundary |
+| `rushls_stream_rendition_publish_spread_timestamp_seconds` | Unix time when that boundary resolved |
+| `rushls_stream_rendition_comparisons_pending` | Common boundaries still waiting on at least one sibling |
+| `rushls_stream_rendition_comparison_age_seconds` | Age of the oldest unresolved comparison |
+| `rushls_stream_rendition_comparisons_incomplete_total` | Comparisons discarded when history filled or the publication ended |
 
-The comparison uses shared presentation time after timebase conversion. It does not compare segment IDs or last-publication timestamps.
-The first commit that crosses a common media boundary establishes arrival for each rendition.
-A resolved spread alone cannot represent a missing rendition. Pending age and per-rendition startup/overdue metrics cover that case.
+Comparisons align renditions on shared presentation time (not segment numbers or last-publish times).
+Because a resolved spread cannot show a completely missing rendition, watch `comparisons_pending`, `comparison_age_seconds`, and per-rendition overdue metrics alongside it. Likewise, `media_skew_seconds` is absent while a publisher is inactive or before all siblings have started, and a zero skew does not guarantee progress if every rendition stalled together.
 
-History is bounded to 256 intervals per rendition and 256 unresolved boundaries per comparison group.
-Discarded comparisons increment an explicit counter. Their omission must not look like a healthy zero.
-Group state resets on publication changes. A node counter preserves discarded work across those changes.
-Skew is absent until all members have a contiguous media end, and while the publisher is inactive.
-A zero skew does not establish progress: all renditions can stop together.
-
-Node histograms `rushls_output_publish_interval_seconds` and `rushls_output_publish_spread_seconds` preserve timing distributions without stream labels.
-Spread observations include both alternative groups and playable combinations. They are comparison observations, not unique media objects.
-Histograms use classic Prometheus buckets with `+Inf`, `_sum`, and `_count`.
-Publication timing histograms stay node-wide; HTTP timing histograms are also available per retained stream.
+History holds up to 256 intervals per rendition and 256 unresolved boundaries per group; any evicted comparison increments `comparisons_incomplete_total`.
+Node-wide histograms `rushls_output_publish_interval_seconds` and `rushls_output_publish_spread_seconds` track latency distributions across all streams without high-cardinality labels.
 
 ## Input, operations, and HTTP
 
-Track metrics start from the validated presentation and normalization timeline.
-Unknown track IDs cannot create new metric entries.
-Each track exports source packets, source payload bytes, normalized samples, normalized duration, and the latest timestamps.
-`rushls_track_source_started` and `rushls_track_normalized_started` distinguish missing first progress from recent progress.
+### Input tracks
 
-The source timestamp marks demultiplexed packet consumption at normalization. It is not a raw socket-arrival timestamp.
-Normalization timestamps precede pacing and packaging. These measurements locate progress boundaries but do not establish keyframe eligibility for output.
+Validated tracks export source packets, source payload bytes (media payloads, excluding transport framing), normalized samples, normalized duration, and latest timestamps.
+`rushls_track_source_started` and `rushls_track_normalized_started` distinguish a track that never produced data from one that went quiet.
+Source timestamps mark packet intake into normalization (before pacing and packaging), not raw socket arrival.
+`rushls_session_transport_loss_observable` is currently `0`; monitor transport retransmissions externally.
 
-`rushls_session_transport_loss_observable` is zero for the current source implementations.
-There is no loss counter until a transport supplies a defined measurement.
-Source bytes exclude transport overhead, and source packets are media packets rather than network packets.
-Transport retransmissions and viewer throughput require external observations.
+### Internal operations
 
-Operations use a bounded `operation` label:
+Latency-sensitive origin operations export starts, in-flight counts, outcomes (`completed`, `ended`, `expired`, `error`, `cancelled`), and duration histograms labeled by `operation`:
 
-| Operation | Boundary |
-|---|---|
-| `blocking_reload` | Explicit HLS position wait, including an immediately satisfied position |
-| `initial_readiness` | First playlist wait for usable media |
-| `hinted_part` | Request waiting for a published hinted part |
-| `playlist_projection` | Actual playlist projection on a render-cache miss |
-| `disk_read` | Retained payload disk read, including admission wait |
-| `disk_write` | Spill write after worker dequeue |
-| `store_backpressure` | Publisher readiness call awaiting store progress |
+| `operation` | Covers |
+| --- | --- |
+| `blocking_reload` | LL-HLS blocking playlist waits (`_HLS_msn` / `_HLS_part`), including immediate hits |
+| `initial_readiness` | First playlist wait until usable media exists |
+| `hinted_part` | Requests waiting for a preloaded part to finish |
+| `playlist_projection` | Playlist rendering on a cache miss |
+| `disk_read` | Reading spilled DVR media from disk (including admission wait) |
+| `disk_write` | Writing spilled DVR media after dequeue |
+| `store_backpressure` | Publisher waiting on store readiness |
 
-Each operation exports starts, in-flight work, finished outcomes, and a duration histogram.
-Outcomes are `completed`, `ended`, `expired`, `error`, and `cancelled`.
-Dropping an unfinished future records cancellation and releases its in-flight count.
-The same operation boundary owns starts and outcomes.
-Disk spill pending/capacity metrics cover queue pressure before write timing begins.
+Cancelled or dropped futures decrement in-flight counts and record `cancelled`. Disk spill queue pressure before `disk_write` is tracked by the spill pending/capacity metrics.
 
-HTTP metrics classify resources as `playlist`, `media`, `operator`, or `other` from the request path.
-Method labels are `GET`, `HEAD`, or `other`. Status labels contain response status codes.
-Paths, tokens, viewers, and arbitrary header values never become labels.
+### HTTP serving
 
-| Family | Definition |
-|---|---|
-| `rushls_http_requests_started_total` | Requests entering admission, including refusals |
-| `rushls_http_responses_total` | Response headers produced, by resource, method, and status |
-| `rushls_http_requests_finished_total` | Request/body completion, cancellation, or error |
-| `rushls_http_requests_in_flight` | Unfinished handlers and response bodies |
-| `rushls_http_body_bytes_total` | Actual encoded and ranged body bytes yielded to the HTTP stack |
-| `rushls_http_handler_duration_seconds` | Handler duration, including intentional protocol waits |
-| `rushls_http_body_duration_seconds` | Body lifetime until completion, cancellation, or error |
-| `rushls_http_admission_refusals_total` | Request or connection capacity refusals |
-| `rushls_http_connections` | Admitted HTTP connections currently open |
-| `rushls_http_connection_capacity` | Configured connection budget |
-| `rushls_http_request_capacity` | Configured request budget |
+HTTP metrics classify paths into bounded `resource` values (`playlist`, `media`, `operator`, `other`), `method` (`GET`, `HEAD`, `other`), and HTTP `status`. Request URLs, tokens, viewer IPs, and headers never appear as labels.
 
-Stream HTTP metrics are exposed only at `/metrics/streams` with the prefix `rushls_stream_http_`.
-They cover requests started, requests in flight, responses, failures, body bytes, request outcomes, and both duration histograms.
-Each family adds a `stream` label to the corresponding node metric labels.
-Only recognized playlist/media paths for an existing retained stream receive this label.
-Unknown streams remain in node totals; arbitrary request paths do not create stream entries.
-Counters survive compatible publisher reconnects while the stream is retained and disappear when the stream is retired.
-A later publication under the same name starts new counters; use `rate` or `increase` to handle resets.
+| Metric | Meaning |
+| --- | --- |
+| `rushls_http_requests_started_total` | Requests entering admission (including refusals) |
+| `rushls_http_responses_total` | Responses emitted, by `resource`, `method`, and `status` |
+| `rushls_http_requests_finished_total` | Completed, cancelled, or errored request/body lifetimes |
+| `rushls_http_requests_in_flight` | Active handlers and streaming response bodies |
+| `rushls_http_body_bytes_total` | Encoded/ranged body bytes handed to the HTTP stack |
+| `rushls_http_handler_duration_seconds` | Handler latency, including intentional LL-HLS blocking waits |
+| `rushls_http_body_duration_seconds` | Body streaming lifetime until completion, cancellation, or error |
+| `rushls_http_admission_refusals_total` | Requests or connections rejected at capacity |
+| `rushls_http_connections` | Open admitted HTTP connections |
+| `rushls_http_connection_capacity` | Configured `http.max_connections` |
+| `rushls_http_request_capacity` | Configured `http.max_requests` |
 
-`rushls_http_failures_total` and `rushls_stream_http_failures_total` add a bounded `reason` label:
-`unknown_stream`, `unknown_rendition`, `unknown_resource`, `invalid_directive`, `unsatisfied`,
-`projection`, `unauthorized`, `forbidden`, `admission`, or `other`.
-A completed HTTP body can still carry a 404 or 503; use response status and failure reason alongside body outcomes.
-`unknown_resource` does not distinguish an expired object from an object that never existed.
-These metrics do not include request URLs, tokens, media sequence numbers, or viewer identities.
-Connection refusals occur before a request identifies a stream and remain node-wide.
+Per-stream equivalents live on `/metrics/streams` under the `rushls_stream_http_` prefix with a `stream` label for recognized retained streams (requests for unknown streams stay in node totals so arbitrary URLs cannot inflate cardinality).
+Counters survive compatible reconnects and disappear when the stream retires; use `rate()` or `increase()` across restarts or new broadcasts under the same name.
 
-For a stall affecting one stream, first compare output progress with HTTP failures:
+`rushls_http_failures_total` and `rushls_stream_http_failures_total` break down failures by bounded `reason`: `unknown_stream`, `unknown_rendition`, `unknown_resource` (either expired or never existed), `invalid_directive`, `unsatisfied`, `projection`, `unauthorized`, `forbidden`, `admission`, or `other`.
+
+To inspect HTTP health for one stream:
 
 ```promql
 sum by (resource, status) (
@@ -197,144 +143,101 @@ histogram_quantile(0.95,
 )
 ```
 
-Handler time includes intentional blocking reload waits. A high value alone does not establish an incident.
-Compare body duration and cancellation with the stream's output lag and overdue metrics.
-HTTP histograms add 17 series each per observed resource class (14 finite buckets, `+Inf`, sum, and count).
-Unused resource classes are omitted from stream exports. Choose a scrape interval shorter than stream retention to capture final counters.
+Keep three caveats in mind when reading HTTP metrics:
 
-HTTP body completion does not prove viewer receipt or playback.
-A client can disconnect after the server hands bytes to its HTTP stack.
-Malformed requests rejected by the HTTP parser never enter middleware request totals.
-Connection admission counters provide evidence for sockets refused before request handling.
+- High `handler_duration_seconds` on playlists is normal under LL-HLS because blocking reloads wait for the next part; compare it against `body_duration_seconds` and output overdue metrics.
+- `rushls_media_resolved_total`, `rushls_media_resolved_bytes_total`, `rushls_hls_playlists_resolved_total`, and `rushls_hls_playlist_projections_total` measure store lookups before HTTP encoding or range slicing; use `rushls_http_*` for actual status codes and transferred bytes.
+- Even on a dedicated listener, `/metrics` shares `http.max_connections` and `http.max_requests` with viewer traffic. Alert on Prometheus `up == 0` so scrape failures under load never look like zeros.
 
-`rushls_media_resolved_total` and `rushls_media_resolved_bytes_total` measure media lookup before HTTP transformations.
-`rushls_hls_playlists_resolved_total` and `rushls_hls_playlist_projections_total` distinguish successful resolution from cache-miss projection.
-These counters do not measure transferred bytes.
-HTTP totals are authoritative for status outcomes, including middleware denials and admission refusals.
+Each stream HTTP histogram adds 17 series per active `resource` class (14 buckets, `+Inf`, `_sum`, `_count`). Keep your scrape interval shorter than `hls.window` if you want final counters before a stream retires.
 
-The dedicated metrics listener still shares the process HTTP budget with viewer listeners.
-Under saturation, scrapes can fail. Monitoring must alert on scrape failure and must not replace missing values with healthy zeros.
-A separate operator budget remains a deployment/runtime change outside this metric contract.
+## Capacity, memory, and lifecycle
 
-## Capacity and lifecycle
+Additional families cover session lifecycle, segmentation failures, recording drops, TLS handshakes, playback denials, hook delivery, and per-address limits (`rushls_publishers_address_limited_total`).
+Detailed failure text stays in logs and hook events rather than metric labels; `rushls_session_info` maps each session to its `principal`.
 
-Session lifecycle, segmentation failures, recording losses, TLS handshakes, playback denials, and hook delivery metrics remain available.
-`rushls_publishers_address_limited_total` counts connections refused by `limits.publishers_per_address`; the matching event names the address.
-These families have useful existing meanings and do not require replacement solely for naming consistency.
-Detailed failure text stays in events rather than metric labels.
-`rushls_session_info` carries principal identity. Numeric session metrics carry only session and stream identity.
+### Publisher pipeline memory
 
-`rushls_session_pipeline_capacity_bytes` reports the configured accounted-buffer limit.
-`rushls_session_pipeline_used_bytes` and `rushls_session_pipeline_peak_bytes` report
-current and peak reservations. `rushls_session_pipeline_reserve_bytes` reports
-the part of the capacity that only packaging output may use.
-`rushls_session_pipeline_capacity_bytes` is `0` for an unlimited budget.
-`rushls_session_pipeline_exhaustions_total` counts failed reservations.
-`rushls_pipeline_exhaustions_total` retains these counts after sessions finish.
-`rushls_session_pipeline_allocation_bytes{origin="transport|demux|normalization|mux|subtitle"}`
-attributes live reservations to their allocation origin. Shared bytes keep that
-origin as they move between stages. These metrics exclude native MPEG-TS/QUIC
-buffers, uninstrumented metadata, OS buffers, and allocator overhead.
-`rushls_session_pacing_active` reports pacer state, not all reasons for backpressure.
-`store_backpressure` operation metrics cover the separate store-readiness path.
+- `rushls_session_pipeline_capacity_bytes`: configured `memory.per_publisher` (`0` when `"unlimited"`).
+- `rushls_session_pipeline_used_bytes` and `rushls_session_pipeline_peak_bytes`: live and peak reservations.
+- `rushls_session_pipeline_reserve_bytes`: headroom reserved strictly for packaging output.
+- `rushls_session_pipeline_allocation_bytes{origin="transport|demux|normalization|mux|subtitle"}`: live usage attributed to where bytes were allocated (shared bytes keep their original owner across stages).
+- `rushls_session_pipeline_exhaustions_total` (per-session) and `rushls_pipeline_exhaustions_total` (node-wide): failed reservations.
+- `rushls_session_pacing_active`: whether `publish.rate.max` is actively throttling the publisher (separate from `store_backpressure`).
 
-Retention includes idle streams and separates payload, manifest, and disk bytes.
-`rushls_stream_retention_max_seconds` reports the longest advertised rendition duration.
-`rushls_stream_retention_min_seconds` reports the shortest current continuous-media rendition duration.
-`rushls_rendition_retention_seconds` exposes each current rendition separately.
-These durations are not an exact intersection of playable timeline intervals.
+Pipeline memory metrics exclude native transport buffers, uninstrumented metadata, OS socket buffers, and allocator overhead.
 
-Node lifecycle counts classify one stream inventory directly. They do not subtract independently sampled unsigned counts.
-`rushls_session_capacity`, `rushls_disk_spill_capacity`, and `rushls_build_info` provide capacity and version context.
-Host CPU, RSS, filesystem space, file descriptors, and network saturation remain the responsibility of infrastructure exporters.
+### Retention and host context
 
-## Queries and dashboard
+Retention metrics cover both active and ended streams, broken down into payload, manifest, and disk bytes:
 
-The [Grafana dashboard](../examples/monitoring/README.md) gives an overview of ingest, output health, viewers, retention, and hooks.
-A second [diagnostics dashboard](../examples/monitoring/diagnostics.json) follows one stream through a reported stall.
-Both select a Prometheus data source at import.
-The [alert rules](../examples/monitoring/alerts.yml) provide initial thresholds for evaluation, not universal playback guarantees.
-A five-second scrape interval is a reasonable starting point for these examples.
-Detailed cadence still comes from commit observations, so short incidents do not depend solely on scrape frequency.
+- `rushls_stream_retention_max_seconds`: longest advertised rendition duration.
+- `rushls_stream_retention_min_seconds`: shortest current continuous-media rendition duration.
+- `rushls_rendition_retention_seconds`: duration per rendition.
+
+`rushls_session_capacity`, `rushls_disk_spill_capacity`, and `rushls_build_info` export node limits and build metadata.
+Monitor host CPU, RSS, disk space, file descriptors, and network interfaces with your infrastructure exporter (such as `node_exporter`).
+
+## Queries, dashboards, and alerts
+
+Ready-to-import dashboards and starter rules live in [`examples/monitoring/`](../examples/monitoring/README.md):
+
+- [`dashboard.json`](../examples/monitoring/dashboard.json): fleet and node overview.
+- [`diagnostics.json`](../examples/monitoring/diagnostics.json): single-stream stall triage.
+- [`alerts.yml`](../examples/monitoring/alerts.yml): starting alert thresholds to tune for your workload.
+
+A 5-second scrape interval is a good starting point. Useful ad-hoc queries:
 
 ```promql
 # Worst current deadline lateness in each stream.
 max by (instance, stream) (rushls_rendition_output_overdue_seconds)
 
-# Media seconds per wall second, per rendition.
+# Media seconds published per wall second, per rendition.
 rate(rushls_rendition_media_published_seconds_total[1m])
 
-# Delays in the output pipeline, including cancellations and errors.
+# Time spent waiting on store backpressure.
 rate(rushls_operation_duration_seconds_sum{operation="store_backpressure"}[1m])
 
-# Actual response body throughput, excluding operator endpoints.
+# Viewer HTTP body throughput (excluding operator endpoints).
 sum by (instance, resource) (
   rate(rushls_http_body_bytes_total{resource!="operator"}[1m])
 )
 ```
 
-A single instant rate cannot diagnose every short stall. Deadline counters and histogram observations preserve those incidents.
-Prometheus also needs `up` alerts for both scrape jobs, independently of the application gauges.
-Stream cardinality depends on publisher churn and retention. Node histograms use only bounded label dimensions.
+Remember to alert on Prometheus `up == 0` for both `/metrics` and `/metrics/streams` scrape jobs.
 
 ## Public playback probe
 
-The [probe](../tools/probe_playback.py) performs one read-only pass through a public HLS URL.
-It fetches active audio/video playlists and the latest published media resource from each playlist.
-It does not fetch preload hints or pretend to implement player decoding.
+[`tools/probe_playback.py`](../tools/probe_playback.py) performs one read-only fetch through a public HLS URL (for example, through your CDN), loading every active audio/video playlist and its latest published media resource:
 
 ```sh
 python3 tools/probe_playback.py 'https://playback.example/live/stream.m3u8'
 ```
 
-`--bearer-token-file` supplies optional authorization. The probe sends that header only to the initial origin.
-Cross-origin redirects remove the authorization header. URL query credentials follow ordinary HLS URI resolution and explicit query-variable substitution.
-The output never contains URLs or tokens.
+- Pass `--bearer-token-file` for JWT-protected streams. The header is sent only to the initial origin and stripped on cross-origin redirects; query tokens follow normal HLS URI resolution and `EXT-X-DEFINE` substitution. Output never prints URLs or tokens.
+- The probe outputs Prometheus metrics covering success, total duration, playlist fetch time, media download time, bytes, and available media-end timestamps (note that its rendition labels are index-based, not Rushls's durable rendition IDs).
+- It does not fetch preload hints or decode media, and enforces request timeout, size, and rendition-count bounds so broken responses fail loudly.
 
-The probe emits success, total duration, observation time, playlist duration, media download duration, media bytes, and available media-end timestamps.
-Its rendition label is the index within that probe's topology, not Rushls' durable rendition identity.
-The probe enforces request time, playlist size, media size, and rendition-count limits.
-Unsupported playlists or responses produce failure rather than fabricated healthy measurements.
+Run it on a timer and publish the output atomically to a Prometheus textfile collector, keeping failed runs visible and alerting on probe age so a stale success cannot mask a broken cron job. Note that `EXT-X-PROGRAM-DATE-TIME` reflects the origin timeline, not a verified camera clock.
 
-An external scheduler can run the probe and publish its output through a textfile collector.
-That scheduler must replace the output atomically and retain failed results.
-Probe age must have its own alert, because an old success result does not establish current health.
-Program-date-time freshness is an origin timeline observation, not a trusted capture timestamp.
+## Timestamp rejections and gap compensation
 
-## Timestamp rejections
+When input validation rejects a stream or permissive mode repairs a hole (see [Input handling](input-handling.md)):
 
-`rushls_timestamp_rejections_total{code,media_kind}` counts failed sessions with a typed timestamp issue.
-Each session increments one series once. Labels use fixed issue codes and media kinds.
-The series appears after its first rejection. Track IDs and timestamps are available in failure events, not metric labels.
-See [input handling](input-handling.md#when-a-publication-is-rejected) for configuration and hook fields.
+- `rushls_timestamp_rejections_total{code,media_kind}`: incremented once per failed session, using bounded issue codes (exact track IDs and timestamps appear in logs and `publisher.ended` hooks).
+- `rushls_audio_repairs_total{codec,method}` and `rushls_audio_compensation_seconds_total{codec,method}`: count compensated audio holes and missing duration for `method="gap"` during normalization (including sessions that later fail downstream).
+- `rushls_video_timestamp_step_seconds{codec}`: histogram of usable source video frame intervals (useful for spotting jitter; does not prove packet loss).
+- `rushls_video_cadence_violations_total{codec}`: violations of explicitly declared fixed video cadence (including rejected streams).
+- `rushls_video_compensation_seconds_total{codec,method}`: accepted excess duration when `method="gap"`.
 
-### Audio compensation
+## Optional allocator metrics
 
-`rushls_audio_repairs_total{codec,method}` counts compensated holes during normalization.
-`rushls_audio_compensation_seconds_total{codec,method}` counts exact missing audio duration for `method="gap"`.
-Labels use bounded codec and method values. They do not include track IDs or timestamps.
-These counters describe normalization, including media that a later pipeline failure prevents from reaching playback.
-See [input handling](input-handling.md#hooks-logs-and-metrics) for policy and host notifications.
-
-## Video cadence
-
-`rushls_video_timestamp_step_seconds{codec}` is a histogram of usable source intervals, including nominal and unknown cadence.
-These observations do not prove packet loss.
-`rushls_video_cadence_violations_total{codec}` counts violations of explicitly declared cadence, including rejected input.
-`rushls_video_compensation_seconds_total{codec,method}` counts accepted excess duration; its method is `gap`.
-Unavailable validation does not increment compensation counters.
-See [input handling](input-handling.md) for policy and hooks.
-
-## Optional allocator measurements
-
-Binaries built with `--features allocation-counting` expose three additional counters:
+Binaries compiled with `--features allocation-counting` (omitted from standard release builds) expose three heap counters:
 
 | Metric | Meaning |
-|---|---|
-| `rushls_allocator_calls_total` | Successful Rust allocations and reallocations |
-| `rushls_allocator_allocated_bytes_total` | Requested bytes, including complete replacement allocations |
-| `rushls_allocator_freed_bytes_total` | Released bytes, including allocations replaced by reallocations |
+| --- | --- |
+| `rushls_allocator_calls_total` | Rust allocations and reallocations |
+| `rushls_allocator_allocated_bytes_total` | Requested bytes (including full reallocation replacements) |
+| `rushls_allocator_freed_bytes_total` | Released bytes (including replaced reallocations) |
 
-The difference between allocated and freed bytes approximates current requested Rust heap bytes.
-The counters exclude native-library allocations and allocator overhead. Their snapshots are not atomic as a group.
-Ordinary binaries omit this instrumentation. See [load validation](development/load-testing.md) for the measured workload and limits.
+`allocated - freed` approximates live Rust heap usage (excluding native allocations and allocator overhead; the three counters are not snapshotted atomically). See [Load testing](development/load-testing.md) for how they are used.

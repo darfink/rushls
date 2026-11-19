@@ -1,13 +1,11 @@
 # Publishing
 
-These recipes target the bundled loopback configuration and unauthenticated local publishing.
-Use one publisher at a time for each stream name.
-The examples use POSIX shell syntax.
+These recipes publish to the example loopback configuration with open local admission.
+Run one publisher at a time per stream name. All shell commands use POSIX syntax.
 
 ## Tools
 
-FFmpeg must include `libx264`, the AAC encoder, and, for the SRT recipes, SRT support.
-Builds differ in which protocols they include, even at the same version, so check yours:
+Before running the recipes, check that your installed tools include the codecs and protocols you need (`libx264`, AAC, and `srt` for SRT recipes):
 
 ```sh
 ffmpeg -version
@@ -17,8 +15,8 @@ gst-launch-1.0 --version
 moq --version
 ```
 
-`srt` must appear in FFmpeg's protocol list. Some packages leave it out:
-on macOS, Homebrew's `ffmpeg` does not include SRT and `ffmpeg-full` does.
+Builds vary in which protocols they compile in, even at the same version.
+For SRT, `srt` must appear in `ffmpeg -protocols`—for example, on macOS Homebrew's `ffmpeg` omits SRT while `ffmpeg-full` includes it.
 
 Start Rushls with the example configuration, which binds every listener to loopback:
 
@@ -27,12 +25,12 @@ rushls --print-config-example > rushls.toml
 rushls --config rushls.toml
 ```
 
-A stream named `live/demo` has the master playlist `http://127.0.0.1:8080/live/demo/index.m3u8`.
-An admission service can replace that name with its returned `stream_id`.
+A stream published as `live/demo` has its multivariant playlist at `http://127.0.0.1:8080/live/demo/index.m3u8`.
+When [publisher admission](admission-and-hooks.md) is enabled, your admission service chooses the playback `stream_id`.
 
 ## Prepare a test file
 
-Generate 24 seconds of H.264/AAC with a two-second GOP and no B-frames:
+Several recipes below reuse a 24-second H.264/AAC file with a 2-second keyframe interval and no B-frames:
 
 <!-- verify: {"id":"fixture"} -->
 ```sh
@@ -43,12 +41,11 @@ ffmpeg -f lavfi -i testsrc2=size=640x360:rate=30 \
   -c:a aac -b:a 128k -ar 48000 -ac 2 input.mp4
 ```
 
-The later file recipes use this fixture.
-To publish a file over RTMP, use FFmpeg: remuxing MP4 to FLV in GStreamer can start with overlapping timestamps.
+To publish an MP4 file over RTMP, use FFmpeg rather than GStreamer—remuxing MP4 to FLV in GStreamer can start with overlapping timestamps.
 
 > [!WARNING]
-> `-c copy` sends a file's media unchanged. It does not fix timestamps, change codecs, or move keyframes.
-> Before using it on your own file, check its codecs, frame rate, and keyframe interval with `ffprobe`.
+> `-c copy` sends a file's media unchanged: it does not fix timestamps, convert codecs, or align keyframes.
+> Before using `-c copy` on your own file, check its codecs, frame rate, and keyframe interval with `ffprobe`.
 
 ## FFmpeg
 
@@ -59,38 +56,37 @@ ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 \
   -c copy -f flv rtmp://127.0.0.1:1935/live/ffmpeg
 ```
 
-Playback: `http://127.0.0.1:8080/live/ffmpeg/index.m3u8`.
-`-re` paces file input. Live capture devices normally supply their own timing.
+Play at `http://127.0.0.1:8080/live/ffmpeg/index.m3u8`.
+`-re` paces file input to real time; live capture sources supply their own pacing.
 
-For video-only or audio-only publishing, map only the required track.
-Rushls accepts supported media without requiring both kinds.
+For video-only or audio-only streams, map only the track you want—Rushls does not require both.
 
 ### SRT
+
+Quote the URL so your shell leaves `&` alone:
 
 ```sh
 ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts \
   'srt://127.0.0.1:9000?mode=caller&streamid=publish:live/ffmpeg&pkt_size=1316'
 ```
 
-Playback: `http://127.0.0.1:8080/live/ffmpeg/index.m3u8`.
-The payload is MPEG-TS. Renaming a Matroska or MP4 output does not change its container.
+Play at `http://127.0.0.1:8080/live/ffmpeg/index.m3u8`.
+SRT ingest expects MPEG-TS (`-f mpegts`).
 
-Rushls accepts these stream-ID forms:
+Rushls accepts three SRT `streamid` formats:
 
-| Form | Meaning |
+| Format | Meaning |
 | --- | --- |
-| `publish:KEY` | One value supplies the resource and credential |
-| `publish:live/camera:KEY` | Explicit resource and separate credential |
-| `#!::u=KEY,r=live/camera,m=publish,t=stream` | SRT access-control convention for compatible clients |
+| `publish:KEY` | One value acts as both resource name and credential |
+| `publish:live/camera:KEY` | Explicit resource name and separate credential |
+| `#!::u=KEY,r=live/camera,m=publish,t=stream` | Standard SRT access-control format |
 
-URL-encode reserved characters in credentials and resource values.
-Keep the whole URL quoted in shell commands.
-SRT passphrase encryption is independent of these admission credentials.
-FFmpeg URL `latency` uses microseconds; Rushls TOML uses duration strings such as `"120ms"`.
+URL-encode reserved characters in credentials and resource names, and remember that SRT passphrase encryption (`ingest.srt.passphrase`) is separate from admission credentials.
+Note that FFmpeg's SRT `latency` parameter is in microseconds, whereas Rushls's `ingest.srt.latency` uses duration strings such as `"120ms"`.
 
 ## GStreamer
 
-Check the required elements:
+Verify the required plugins are installed:
 
 ```sh
 for element in qtdemux h264parse aacparse flvmux rtmpsink mpegtsmux srtsink; do
@@ -98,9 +94,7 @@ for element in qtdemux h264parse aacparse flvmux rtmpsink mpegtsmux srtsink; do
 done
 ```
 
-Distribution packages usually divide these elements across the Base, Good, Bad, and Ugly plugin sets.
-Synthetic encoding also requires `x264enc` and `avenc_aac`, often supplied by Ugly and Libav packages.
-Use element availability rather than package names as the final check.
+Distributions split these across GStreamer's Base, Good, Bad, and Ugly plugin packages (and `x264enc`/`avenc_aac` for live encoding typically come from Ugly and Libav). Checking elements with `gst-inspect-1.0` is more reliable than checking package names.
 
 ### Synthetic live RTMP source
 
@@ -115,8 +109,8 @@ gst-launch-1.0 -e \
   rtmpsink location=rtmp://127.0.0.1:1935/live/synthetic sync=true
 ```
 
-Playback: `http://127.0.0.1:8080/live/synthetic/index.m3u8`.
-Stop the pipeline with Ctrl+C. `-e` requests end-of-stream handling on interruption.
+Play at `http://127.0.0.1:8080/live/synthetic/index.m3u8`.
+Press Ctrl+C to stop (`-e` sends an orderly end-of-stream).
 
 ### SRT from the prepared file
 
@@ -128,19 +122,17 @@ gst-launch-1.0 -e filesrc location=input.mp4 ! qtdemux name=d \
   srtsink uri='srt://127.0.0.1:9000?mode=caller&streamid=publish:live/gstreamer' sync=true
 ```
 
-`alignment=7` groups seven 188-byte transport packets per output buffer.
-`sync=true` preserves file playback pacing at the sink.
+`alignment=7` packs seven 188-byte MPEG-TS packets per UDP payload (1,316 bytes), and `sync=true` paces file output in real time.
 
 ## Multitrack publishing
 
-One connection supplies all tracks for one publication.
-The publisher must send the full track set during discovery, with stable decoder configuration afterward.
-Use aligned keyframes for video variants and a shared media timeline.
-Different stream names do not combine into one ladder.
+One publisher connection supplies every track in an adaptive presentation.
+Send all tracks during startup with aligned video keyframes on a shared timeline, and keep decoder configurations steady afterward.
+Separate stream names always stay separate streams; Rushls does not merge multiple publishers into one ladder.
 
 ### Two video variants over SRT
 
-This recipe encodes two variants from the prepared 30 fps, 16:9 file:
+Encode a 360p and 180p ladder from the 30 fps `input.mp4` fixture:
 
 ```sh
 ffmpeg -re -i input.mp4 \
@@ -152,13 +144,12 @@ ffmpeg -re -i input.mp4 \
   -f mpegts 'srt://127.0.0.1:9000?mode=caller&streamid=publish:live/ladder&pkt_size=1316'
 ```
 
-Playback: `http://127.0.0.1:8080/live/ladder/index.m3u8`.
-The expected output has two video variants and a shared audio rendition.
-For another frame rate, adjust the GOP length to preserve the intended keyframe interval.
+Play at `http://127.0.0.1:8080/live/ladder/index.m3u8` to see two video variants sharing one audio rendition.
+For other frame rates, set `-g` and `-keyint_min` to `2 × fps` to keep a 2-second keyframe interval.
 
 ### Enhanced RTMP
 
-The same encoded ladder can use Enhanced RTMP, which needs an FFmpeg whose FLV muxer writes multiple tracks (9.0 or later):
+The same ladder works over Enhanced RTMP with FFmpeg 9.0 or later (whose FLV muxer writes multitrack Enhanced RTMP):
 
 <!-- verify: {"id":"ladder-rtmp","stream":"ladder","video":2,"audio":1} -->
 ```sh
@@ -171,13 +162,11 @@ ffmpeg -re -i input.mp4 \
   -f flv rtmp://127.0.0.1:1935/live/ladder
 ```
 
-Older FLV muxers reject multiple tracks or do not send the Enhanced RTMP messages.
-Rushls supports OneTrack and packed ManyTracks messages.
-The publisher controls their wire representation; these commands do not use a synthetic Rushls test publisher.
+Older FFmpeg builds reject multiple video tracks in FLV. Rushls accepts both `OneTrack` and packed `ManyTracks` Enhanced RTMP packets.
 
 ### Alternate audio over SRT
 
-Publish one video track and two audio tracks with language metadata:
+Publish one video track alongside two audio tracks tagged with ISO 639 languages:
 
 <!-- verify: {"id":"alternate-audio","stream":"languages","video":1,"audio":2,"languages":["en","es"]} -->
 ```sh
@@ -186,13 +175,10 @@ ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -map 0:a:0 \
   -f mpegts 'srt://127.0.0.1:9000?mode=caller&streamid=publish:live/languages&pkt_size=1316'
 ```
 
-Playback: `http://127.0.0.1:8080/live/languages/index.m3u8`.
-Both audio tracks contain the same test audio. Replace the second mapping with a real alternate-language source in production.
-Rushls maps MPEG-TS ISO 639 language descriptors into HLS language metadata.
-Track titles have different transport coverage; language tags do not imply arbitrary title metadata support.
+Play at `http://127.0.0.1:8080/live/languages/index.m3u8`. (This duplicates the test audio track; swap in a real second audio source in production.)
+Rushls turns MPEG-TS ISO 639 descriptors into HLS `LANGUAGE` attributes. MPEG-TS has no per-track title field, so audio tracks receive generic names such as `Audio 2`.
 
-With GStreamer, `taginject` sets each track's language, and `mpegtsmux` writes it as the ISO 639 descriptor.
-Both two-letter and three-letter codes work. This publishes the prepared file's audio twice, as English and Spanish:
+With GStreamer, place `taginject` after each parser and before `mpegtsmux` (two- and three-letter ISO 639 codes both work):
 
 <!-- verify: {"id":"gstreamer-languages","stream":"gst-languages","video":1,"audio":2,"languages":["en","es"]} -->
 ```sh
@@ -205,24 +191,20 @@ gst-launch-1.0 -e filesrc location=input.mp4 ! qtdemux name=d \
   srtsink uri='srt://127.0.0.1:9000?mode=caller&streamid=publish:live/gst-languages' sync=true
 ```
 
-Place `taginject` after the parser and before `mpegtsmux`, one per track.
-MPEG-TS has no per-track name, so a `title` tag is dropped and the rendition gets a generic name such as `Audio 2`.
-
 ## OBS Studio
 
-Use the Custom service with server `rtmp://127.0.0.1:1935/live` and stream key `obs`.
-Select H.264 video, AAC audio, and a two-second keyframe interval.
-Playback uses `http://127.0.0.1:8080/live/obs/index.m3u8`.
+In **Settings → Stream**, choose **Custom**:
 
-With admission enabled, the application supplies the stream key and selects the resulting playback ID.
-These fields follow the usual RTMP mapping. OBS's own multitrack mode is not covered.
+- **Server:** `rtmp://127.0.0.1:1935/live`
+- **Stream key:** `obs` (or the key issued by your admission service)
+- **Output:** H.264 video, AAC audio, and a 2-second keyframe interval
+
+Play at `http://127.0.0.1:8080/live/obs/index.m3u8`. OBS's own multitrack video mode is not covered here.
 
 ## Media over QUIC
 
-Use the [MoQ guide](moq.md) for the exact `moq-lite` contract.
-The examples use `moq-cli` 0.13, whose executable is `moq`.
-
-For a public deployment, configure a certificate that covers the origin hostname and is trusted by the client:
+See the [MoQ guide](moq.md) for catalog rules, captions, and browser publishing.
+This example uses `moq-cli` 0.13 (`moq`) against an origin with a trusted TLS certificate:
 
 ```toml
 [ingest.moq]
@@ -239,37 +221,23 @@ ffmpeg -re -i input.mp4 -map 0:v:0 -map 0:a:0 -c copy -f mpegts - \
       --broadcast live/moq --connect-version moq-lite-06 import ts
 ```
 
-The corresponding HTTP playback path is `/live/moq/index.m3u8` when admission does not remap the stream.
-The `https` URL selects WebTransport. The transport uses UDP, not the ordinary HTTP listener.
-
-For an isolated local test, create a disposable certificate and configure its paths under `[tls]`.
-The existing [local MoQ recipe](moq.md#local-publish-test) uses `--connect-tls-insecure` for that test only.
-Production publishers must verify certificates.
-MoQ browser publishing has a manual Chrome procedure in the [MoQ guide](moq.md#browser-publish-test); it does not run in CI.
+Without admission remapping, playback is at `/live/moq/index.m3u8`. The `https://` URL selects WebTransport over UDP (not the HTTP/HTTPS playback listener).
+For local testing with a self-signed certificate, see the [local MoQ test](moq.md#local-publish-test) and [browser publish test](moq.md#browser-publish-test).
 
 ## Captions and subtitles
 
-RTMP script messages named `onCaption` or `onTextData` can supply UTF-8 text.
-They use the RTMP millisecond timeline and must appear during discovery to create a text track.
-Messages after discovery only contribute if that track already exists.
-Rushls packages these cues as a WebVTT subtitle rendition.
+Rushls supports two caption paths:
 
-The publisher must implement these messages. Mapping a subtitle file with `ffmpeg -map` does not guarantee this wire format.
-The validation harness injects messages explicitly; it is not a generic subtitle publisher CLI.
+- **WebVTT subtitle renditions:** Over RTMP, `onCaption` or `onTextData` script messages carrying UTF-8 text (on the RTMP millisecond clock) become a WebVTT subtitle rendition—provided a message arrives during startup so Rushls knows the track exists. Over MoQ, any `utf8` text rendition declared in the catalog becomes a WebVTT rendition from the start.
+- **Closed captions (CEA-608/708):** Embedded ATSC CEA-608/708 captions inside H.264 or HEVC SEI payloads stay in the video bitstream and are declared in the multivariant playlist (`TYPE=CLOSED-CAPTIONS`). Rushls does not convert them to WebVTT. Note that a mixed-codec ladder containing a codec Rushls cannot inspect for captions prevents a global caption declaration.
 
-Embedded ATSC CEA-608/708 captions in H.264 or HEVC remain in their video access units.
-Rushls inspects supported SEI payloads for HLS caption declarations.
-It does not turn those embedded captions into a separate WebVTT track.
-A mixed ladder with an unverifiable codec can prevent a global caption declaration.
-AV1 caption extraction, MPEG-TS subtitle PIDs, and standalone WebVTT/SubRip ingestion remain unsupported.
+Mapping a subtitle file with `ffmpeg -map` does not emit RTMP `onCaption`/`onTextData` messages. AV1 caption extraction, MPEG-TS subtitle PIDs, and standalone WebVTT/SubRip uploads are not supported.
 
 ### Publish captions with gst-captions
 
-[gst-captions](https://github.com/darfink/gst-captions) provides `captionsflvmux`, which inserts `onCaption` or `onTextData` into FLV before RTMP transmission.
-It also provides optional transcription and roll-up elements.
-Rushls receives the caption messages and creates an HLS WebVTT rendition.
+The companion [gst-captions](https://github.com/darfink/gst-captions) plugin provides `captionsflvmux`, which injects `onCaption` / `onTextData` messages into FLV before RTMP transmission (as well as optional live transcription and roll-up elements).
 
-Build the model-free muxer from the revision used in Rushls CI:
+Build the model-free muxer (requires GStreamer development headers and `pkg-config`; on macOS with the official GStreamer framework, add `Versions/Current/lib/pkgconfig` to `PKG_CONFIG_PATH`):
 
 ```sh
 git clone https://github.com/darfink/gst-captions.git
@@ -280,12 +248,9 @@ export GST_PLUGIN_PATH="$PWD/target/release${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}
 gst-inspect-1.0 captionsflvmux
 ```
 
-The build needs GStreamer development headers and `pkg-config`.
-For the official macOS GStreamer framework, first set `PKG_CONFIG_PATH` to its `Versions/Current/lib/pkgconfig` directory.
-The model-free build needs no speech model or transcription backend.
-See the upstream [build instructions](https://github.com/darfink/gst-captions#build) for other installation methods.
+This build needs no speech model. See the [gst-captions build instructions](https://github.com/darfink/gst-captions#build) for other options.
 
-With Rushls running, publish 24 seconds of generated video/audio and a two-second caption:
+With Rushls running, publish 24 seconds of test video/audio alongside a 2-second subtitle cue:
 
 <!-- verify: {"id":"captions", "stream":"captions", "video":1, "audio":1, "subtitles":1, "text":"Hello from gst-captions"} -->
 ```sh
@@ -305,45 +270,36 @@ gst-launch-1.0 -e \
   filesrc location=captions.srt ! subparse ! text/x-raw,format=utf8 ! queue ! cm.text
 ```
 
-Playback: `http://127.0.0.1:8080/live/captions/index.m3u8`.
-Select the subtitle rendition in your player. The master playlist advertises `TYPE=SUBTITLES`.
-This is publisher-side conversion of an SRT subtitle file into RTMP messages, not a standalone subtitle upload endpoint in Rushls.
+Play `http://127.0.0.1:8080/live/captions/index.m3u8` and enable subtitles in your player.
 
-Use `rtmp2sink` for this pipeline; the legacy `rtmpsink` failed to deliver codec setup correctly in our test.
-Keep `streamable=true` so FLV buffers retain media timestamps.
-Keep `prime=true` so the muxer declares captions during Rushls discovery, even before the first spoken word.
-Without that early declaration, late captions cannot add a subtitle track to an already frozen publication.
-The text branch needs timestamped coverage; missing coverage can backpressure the media branch.
-Rushls resolves a script cue when the next message replaces or clears it.
-Use short cues with prompt updates rather than holding one caption open for the whole broadcast.
+A few pipeline details matter here:
 
-For live speech, upstream's `captionstranscriber ! captionsrollup` can feed `cm.text` with `input-mode=replacement`.
-That workflow requires a model and the transcription feature. The CI sample uses deterministic text and does not measure transcription quality.
+- Use `rtmp2sink` rather than the legacy `rtmpsink`, which can fail to deliver codec setup with `captionsflvmux`.
+- Keep `streamable=true` so FLV buffers keep their media timestamps.
+- Keep `prime=true` so `captionsflvmux` declares the subtitle track during Rushls startup, even if nobody speaks right away.
+- Keep cues short and update or clear them promptly: Rushls closes an open script cue when the next message replaces or clears it, and gaps in timestamp coverage on the text branch can backpressure the video/audio branch.
+
+For live speech, feed `cm.text` with `captionstranscriber ! captionsrollup` and `input-mode=replacement` (requires building `gst-captions` with its transcription feature and a speech model).
 
 ## Check the result
 
-Fetch the master playlist while the publisher is active:
+While a publisher is active, inspect the multivariant playlist:
 
 ```sh
 curl --fail http://127.0.0.1:8080/live/ladder/index.m3u8
 ```
 
-Inspect `EXT-X-STREAM-INF` for variants and `EXT-X-MEDIA` for audio and subtitle renditions.
-Resolve relative playlist URLs against the master URL.
-Decode each advertised rendition, rather than only the default variant:
+Look for `EXT-X-STREAM-INF` entries (video variants) and `EXT-X-MEDIA` entries (audio and subtitle renditions).
+Then decode a few seconds with FFmpeg:
 
 ```sh
 ffmpeg -v error -i 'http://127.0.0.1:8080/live/ladder/index.m3u8' \
   -t 5 -f null -
 ```
 
-This command checks the player's default selection. Repeat with each child playlist to check all renditions.
-Decoder success is separate from browser playback, switching, seek behavior, and perceptual quality.
+That decodes the default variant; repeat against each child playlist URL (resolved relative to the multivariant playlist) to check every rendition.
 
-## Recipe verification
+## Automated recipe verification
 
-CI runs the recipes in this guide and the README that carry a `verify` marker, against a fresh Rushls build, on every change.
-For each one, it checks the advertised video and audio renditions, audio languages and caption text where the recipe sets them,
-and decodes two seconds of every audio and video playlist. See [`tools/check-doc-examples.py`](../tools/check-doc-examples.py).
-This proves publication, track discovery, and initial decoding. It does not prove long-duration playback or support in every player.
+CI runs every recipe in this guide and [README.md](../README.md) marked with a `verify` comment against a fresh Rushls build on every change, checking the advertised renditions, audio languages, subtitle text, and 2 seconds of decoded output per track ([`tools/check-doc-examples.py`](../tools/check-doc-examples.py)).
 The OBS and MoQ recipes are not run in CI.

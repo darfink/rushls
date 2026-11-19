@@ -30,7 +30,7 @@ See [rushls.example.toml](../rushls.example.toml) for an annotated file.
 | `ingest.srt.latency` | `120ms` | `RUSHLS_INGEST_SRT_LATENCY` | `--ingest-srt-latency` | SRT receive latency; increase for unstable or long-distance networks. |
 | `ingest.srt.passphrase` | — | `RUSHLS_INGEST_SRT_PASSPHRASE` | `--ingest-srt-passphrase <PATH>` | Optional passphrase: inline, `${VAR}`, or `{ file = "/path" }`. Absent accepts unencrypted SRT. |
 | `ingest.srt.encryption` | `aes256` | `RUSHLS_INGEST_SRT_ENCRYPTION` | `--ingest-srt-encryption` | Encryption strength used when a passphrase is configured. |
-| `ingest.moq.listen` | `off` | `RUSHLS_INGEST_MOQ_LISTEN` | `--ingest-moq-listen` | Address receiving WebTransport publishers, or "off". Needs `[tls]`: WebTransport has no cleartext form, which is why it is off by default. |
+| `ingest.moq.listen` | `off` | `RUSHLS_INGEST_MOQ_LISTEN` | `--ingest-moq-listen` | Address receiving MoQ publishers (WebTransport and raw QUIC), or "off". Needs `[tls]`: QUIC has no cleartext form, which is why it is off by default. |
 
 ## [publish]
 

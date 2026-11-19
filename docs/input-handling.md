@@ -68,7 +68,7 @@ Gap resources return 404; no empty media files are created.
 When any profile is permissive, playlists omit `EXT-X-INDEPENDENT-SEGMENTS`, because media after a hole can depend on earlier media.
 This departs from Apple's authoring requirement for video playlists, and Apple's validator reports it.
 
-GAP signalling does not restore missing decoder references. Players may conceal the hole, skip it, or pause briefly,
+GAP signaling does not restore missing decoder references. Players may conceal the hole, skip it, or pause briefly,
 and support varies: Safari does not continue video-only playback past a video gap, and some hls.js startup and end-of-stream cases fail.
 See [Players](players.md). Use strict mode when a damaged stream should not be served.
 

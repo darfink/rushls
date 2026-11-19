@@ -44,7 +44,7 @@ listen = "127.0.0.1:9000"                  # example (loopback); default "0.0.0.
 # passphrase = { file = "/run/secrets/rushls-srt" }  # example; omit for unencrypted SRT
 # encryption = "aes256"                    # aes128, aes192, or aes256
 
-# [ingest.moq]                             # WebTransport; needs [tls]
+# [ingest.moq]                             # Media over QUIC (WebTransport and raw QUIC); needs [tls]
 # listen = "off"                           # e.g. "[::]:4433"
 
 # ── 2. Who may publish, and what ──────────────────────────────────────────
@@ -57,7 +57,7 @@ listen = "127.0.0.1:9000"                  # example (loopback); default "0.0.0.
 # rate     = { max = "1x", burst = "10s", min = "0.5x", window = "30s" }  # example; default: no limits
 # video     = { codecs = ["h264", "hevc", "av1"], resolution = { max = "4k" }, frame_rate = { max = 60 }, tracks = { max = 8 } }  # example
 # audio     = { codecs = ["aac", "opus", "flac"], sample_rate = ["44.1kHz", "48kHz"], channels = { max = 2 }, tracks = { max = 8 } }  # example
-# subtitles = { codecs = ["webvtt", "subrip", "text"], tracks = { max = 8 } }  # example
+# subtitles = { codecs = ["text"], tracks = { max = 8 } }  # example
 
 # Checks each publisher once, when it connects. The service returns identity
 # and may name a profile below: {"profile": "premium"}.

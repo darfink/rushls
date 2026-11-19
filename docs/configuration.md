@@ -155,6 +155,7 @@ Extra connections are closed; extra requests get `503` with `Retry-After: 1`.
 A request holds its slot while it waits for media, as a blocking playlist reload does.
 
 `[http.cors]` controls cross-origin playback. `origins` defaults to `*`; list origins to restrict it, or set `"off"`.
+Wildcards match one subdomain label (`https://*.example.com`) or any depth (`https://**.example.com`).
 `expose_headers` lists the response headers a cross-origin player can read:
 
 ```toml
@@ -264,16 +265,17 @@ segment = "6s"   # or { target = "6s", max = "2x", tolerance = "0s" }
 part    = "1s"   # or { target = "1s", max = "2x" }
 ```
 
-These are the defaults. At startup, Rushls picks the segment length from the keyframes it sees:
-the latest keyframe boundary common to every video track at or before `target`, or, if none fits, the first one up to `max`.
-`max` is a duration or a multiple of `target`. `[hls.segment]` and `[hls.part]` tables work as well.
+These are the defaults. `max` and `tolerance` take either a duration or a multiple of `target`, and `[hls.segment]` and `[hls.part]` tables work as well.
 
-Parts divide segments for Low-Latency HLS. A regular part is between 85% and 100% of the part target;
-a part that starts at a keyframe, or ends a segment, can be shorter.
+At startup, Rushls buffers briefly to inspect incoming keyframes and pick a fixed segment and part duration for the publication:
+
+- **Segments:** Rushls chooses the keyframe boundary common to every video track that is closest to `target` within `max` (preferring the shorter duration on a tie). Setting `target` and `max` to the same value prevents Rushls from growing the segment length beyond `target`. For H.264/AVC, every segment boundary must be a real IDR frame (configure closed GOPs); a transport keyframe flag or recovery-point SEI alone is not enough for independent decoding.
+- **Parts:** Parts divide segments for Low-Latency HLS. Rushls closes each regular part once it reaches 85% of its part target, keeping B-frame groups intact so adjacent parts never overlap in presentation time. Independent parts and segment tails can be shorter, and no part ever exceeds its advertised ceiling. If encoded samples or B-frame groups cannot fit safely inside `part.target`, Rushls raises the part ceiling up to `part.max`.
+- **Fixed for the publication:** Once chosen at startup, segment and part ceilings stay fixed for the life of the publication. Relative `hls.window` and `hls.hold_back` multiples scale to the chosen durations; fixed values are checked at startup against `max` so every allowed contract stays valid.
 
 ### Irregular keyframe intervals
 
-Once chosen, the segment schedule is fixed, and every later segment must end on a keyframe within `tolerance` of its planned time.
+Once chosen, the segment schedule is fixed on an anchored timeline (including fractional GOP rates like `30000/1001`), and every later segment must end on a keyframe within `tolerance` of its planned time.
 An encoder with an uneven keyframe interval (variable frame rate sources, scene-change keyframes, some OBS setups)
 misses the window and ends the publication. The error says how late the keyframe was and which tolerance would have covered it:
 
@@ -282,17 +284,18 @@ track/0: no keyframe for segment boundary at 16s (>= 4.12s late, tolerance 0s); 
 ```
 
 Fix the encoder first if you can: a fixed interval (`-g`, `-keyint_min`, and `-sc_threshold 0` in FFmpeg, or a keyframe interval in seconds in OBS)
-keeps the tolerance at zero. Otherwise raise `tolerance`, and `max` if the segment no longer fits:
+keeps the tolerance at zero. Otherwise raise `tolerance`, and raise `max` if the segment no longer fits:
 
 ```toml
 [hls]
 segment = { target = "6s", max = "2x", tolerance = "2s" }
 ```
 
-The cost applies to the whole publication. The tolerance raises `EXT-X-TARGETDURATION` by twice its value (6 s becomes 10 s here),
+The cost applies to the whole publication. Because an early cut can be followed by a late cut without resetting the planned schedule, `tolerance` raises `EXT-X-TARGETDURATION` by twice its value (6 s becomes 10 s here),
 and players without Low-Latency HLS start three target durations behind the live edge, so their latency grows by six times the tolerance.
 Low-Latency players follow parts and are unaffected. A tolerance absorbs keyframes that wobble around a steady interval;
 an encoder that settles into a different interval mid-stream still fails, because every boundary is measured from the original schedule.
+Valid media already published before a failure stays available for the DVR window.
 
 ### DVR window
 

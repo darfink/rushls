@@ -14,9 +14,8 @@
 Rushls is a live streaming origin that does one thing: **HLS and Low-Latency HLS, the way Apple specifies them.**
 
 There are plenty of open-source media servers, and most treat HLS as one output among many.
-It shows: their HLS fails Apple's own validation, or they lack essentials such as **multitrack** ingest,
-several video renditions and audio languages in one publication. Usually both.
-Rushls is built for exactly that case. Publish **one** RTMP or SRT stream that carries an encoding ladder,
+It shows: their HLS fails Apple's own validation, or they lack essentials such as **multitrack** ingest—several video renditions and audio languages in one publication. Usually both.
+Rushls is built for exactly that case. Publish **one** RTMP, SRT, or Media over QUIC stream that carries an encoding ladder,
 alternate audio languages, and captions, and Rushls serves it as **one adaptive HLS presentation**:
 viewers switch bitrate, pick a language, and turn on subtitles.
 
@@ -25,8 +24,8 @@ viewers switch bitrate, pick a language, and turn on subtitles.
 - **Checked by Apple's own tools.** Every main-branch build runs Apple's `mediastreamvalidator` and `hlsreport`, including a two-hour live DVR audit. A failure blocks the release.
 - **DVR, scrubbing, and recording.** A rolling window in memory with disk spill, I-frame playlists for fast seeking, and recording of every segment to disk.
 - **CDN-ready.** `Cache-Control` follows the HLS specification's caching recommendations.
-- **Built for operation.** Publisher admission webhook, JWT playback authorization, signed lifecycle hooks, Prometheus metrics, and a ready-to-import [Grafana dashboard](examples/monitoring/).
-- **One self-contained binary.** No FFmpeg, no libsrt — completely standalone.
+- **Built for operation.** Publisher admission webhook, JWT playback authorization, signed lifecycle hooks, Prometheus metrics, and a ready-to-import [Grafana dashboard](examples/monitoring/README.md).
+- **One self-contained binary.** No FFmpeg, no libsrt—completely standalone.
 
 Rushls packages media; it does not transcode. Your encoder produces the renditions, and Rushls turns them into HLS.
 The [quick start](#quick-start) publishes a two-rendition, two-language stream with one command.
@@ -137,7 +136,7 @@ Rushls reads the first configuration file it finds:
 1. `--config PATH`
 2. `RUSHLS_CONFIG`
 3. `./rushls.toml` in the working directory
-4. `~/.config/rushls/rushls.toml` (on macOS, `~/Library/Application Support/rushls/`; on Windows, `%APPDATA%\rushls\config\`)
+4. `~/.config/rushls/rushls.toml` (on macOS, `~/Library/Application Support/rushls/`; on Windows, `%LOCALAPPDATA%\rushls\config\`, then `%APPDATA%\rushls\config\`)
 5. `/etc/rushls/rushls.toml` (Linux and macOS)
 
 With Docker, mount yours over the bundled one:
@@ -315,7 +314,7 @@ Subtitles and captions:
 - CEA-608/708 captions inside the video need nothing extra; Rushls declares them in the playlist.
 
 > [!NOTE]
-> GStreamer has no built-in element for RTMP captions. The third-party [gst-captions](https://github.com/darfink/gst-captions) plugin adds one,
+> GStreamer has no built-in element for RTMP captions. The companion [gst-captions](https://github.com/darfink/gst-captions) plugin adds one,
 > and can send timed text or live transcription. See [publishing captions](docs/publishing.md#publish-captions-with-gst-captions).
 
 Rushls fixes the set of tracks when a publication starts. Adding a track, or changing a codec configuration mid-stream, ends the publication.
@@ -343,7 +342,7 @@ Input protocols and codecs. Output is always HLS with CMAF (fragmented MP4) segm
 | H.265 / HEVC | ✅ | ✅ | ✅ | RTMP needs Enhanced RTMP |
 | AV1 | ✅ | ✅ | ✅ | RTMP needs Enhanced RTMP; SRT needs the GStreamer AV1G mapping and an in-band sequence header |
 | AAC-LC | ✅ | ✅ | ✅ | |
-| HE-AAC v1 / v2 | ✅ | ✅ | ✅ | Explicit SBR/PS signalling only; implicit HE-AAC and AAC-LATM are not detected |
+| HE-AAC v1 / v2 | ✅ | ✅ | ✅ | Explicit SBR/PS signaling only; implicit HE-AAC and AAC-LATM are not detected |
 | Opus | ✅ | ✅ | ✅ | RTMP needs Enhanced RTMP; SRT is mono or stereo |
 | FLAC | ✅ | ❌ | ❌ | Enhanced RTMP, mono or stereo |
 | Captions → WebVTT | ✅ | ❌ | ✅ | RTMP `onCaption` / `onTextData`; MoQ `utf8` text renditions |
@@ -405,7 +404,7 @@ The [renditions example](#renditions-audio-tracks-and-subtitles) shows the FFmpe
 
 Rushls can serve viewers directly. For a large audience, put a CDN in front of it.
 Rushls sets `Cache-Control` on every response, following the caching recommendations in the [current HLS specification](https://datatracker.ietf.org/doc/html/draft-pantos-hls-rfc8216bis),
-so a CDN that honours origin headers needs no per-path TTLs:
+so a CDN that honors origin headers needs no per-path TTLs:
 
 | Response | Cached for |
 | --- | --- |
@@ -574,7 +573,7 @@ signing_secret = { file = "/run/secrets/hook-signing" }   # optional: signs each
 format = "json"
 ```
 
-- `/metrics` has totals, `/metrics/streams` has per-stream detail. `/health/live` and `/health/ready` serve probes. See [metrics](docs/metrics.md), and import the [Grafana dashboard](examples/monitoring).
+- `/metrics` has totals, `/metrics/streams` has per-stream detail. `/health/live` and `/health/ready` serve probes. See [metrics](docs/metrics.md), and import the [Grafana dashboard](examples/monitoring/README.md).
 - Hooks are signed CloudEvents with metadata and paths, not media. See [hooks](docs/admission-and-hooks.md#lifecycle-hooks).
 - `[log] level` sets how much Rushls logs; `RUST_LOG` overrides it for dependencies too.
 - Stop with SIGTERM (Ctrl+C on Windows). Give the supervisor more time than `shutdown_grace`, so hooks and recordings can drain.
@@ -657,7 +656,7 @@ The per-address limit covers RTMP, SRT, and MoQ together, and counts IPv6 client
 | HTTP works but the browser does not play | CORS, mixed HTTP/HTTPS content, the player library, and browser codec support |
 | MoQ connection rejected | `moq-lite-06` or `moq-lite-05`, certificate trust, UDP reachability, and catalog format |
 
-Player-specific behaviour is covered in [players](docs/players.md).
+Player-specific behavior is covered in [players](docs/players.md).
 
 ## Development
 
@@ -677,7 +676,7 @@ cargo test --workspace --all-features --locked
 python3 -m unittest discover -s tools -p 'test_*.py'
 ```
 
-CI also runs the tagged publishing commands in this README and checks every rendition they produce, and loads every TOML block here through the real configuration loader.
+CI also runs the publishing recipes in this README and [the publishing guide](docs/publishing.md), verifies every rendition they produce, and loads every TOML block through the real configuration loader.
 Media, browser, and Apple checks need extra tools; see [CI validation](docs/development/ci.md) and [architecture](docs/development/architecture.md).
 
 ## License

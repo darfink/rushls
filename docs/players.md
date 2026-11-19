@@ -37,7 +37,7 @@ so it plays about three segments behind the live edge (18 seconds with the defau
 
 It also fails a live playlist that has fewer than three segments, with `DEMUXER_ERROR_COULD_NOT_PARSE`.
 A viewer who opens a stream in its first three segments sees that error; reloading after that works.
-The same happens with static files and no Rushls involved, so this is Chrome's behaviour, not a problem with the media.
+The same happens with static files and no Rushls involved, so this is Chrome's behavior, not a problem with the media.
 
 For low latency, and for playback from the start of a stream, use hls.js in Chrome and other browsers.
 
@@ -49,7 +49,7 @@ Players handle them differently:
 - Safari continues past audio gaps, and continues video at the next keyframe when audio is present.
   Video-only playback ends early at a video gap.
 - hls.js continues past gaps in the tested cases, but some startup and end-of-stream cases with gaps still fail.
-- GStreamer plays the uninterrupted stream; its behaviour at a gap is not established.
+- GStreamer plays the uninterrupted stream; its behavior at a gap is not established.
 
 A gap never restores missing pictures. Players may freeze, skip, or pause briefly around it.
 

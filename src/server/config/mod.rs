@@ -2064,8 +2064,9 @@ impl SrtAppConfig {
 #[derive(Conf)]
 #[conf(serde)]
 pub struct MoqAppConfig {
-    /// Address receiving WebTransport publishers, or "off". Needs `[tls]`:
-    /// WebTransport has no cleartext form, which is why it is off by default.
+    /// Address receiving MoQ publishers (WebTransport and raw QUIC), or "off".
+    /// Needs `[tls]`: QUIC has no cleartext form, which is why it is off by
+    /// default.
     #[conf(
         parameter,
         long,

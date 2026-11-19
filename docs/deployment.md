@@ -1,47 +1,45 @@
 # Deploying Rushls
 
-This guide covers one origin instance. Capacity depends on media, workload, storage, and player behavior.
-Use measured limits for your deployment; the examples are starting values.
+This guide covers running a Rushls origin in production: ports, storage, recordings, authorization, TLS, proxies, CDNs, systemd, Kubernetes, and health probes.
+All limits below are starting points—measure actual memory, disk, and bandwidth under your own encoders and viewers.
 
 ## Configuration and network boundaries
 
-Start with the annotated configuration from the installed binary:
+Generate the annotated configuration from the binary you are deploying:
 
 ```sh
 rushls --print-config-example > production.toml
 ```
 
-The generated file binds to loopback and leaves publishing and playback unauthenticated.
-Configure admission, playback access, listener addresses, certificates, and capacity before exposing the origin.
-Each TOML snippet in this guide is a fragment. Merge tables into one configuration instead of repeating table headers.
-Use `--config` to select that file explicitly.
+Out of the box, that file binds to loopback and leaves publishing and playback open.
+Before exposing the origin, configure admission, playback authorization, listener addresses, TLS certificates, and capacity limits, then validate with `rushls --config production.toml --check`.
+The TOML snippets below are fragments—merge their tables into one file rather than repeating headers.
 
 | Listener | Transport | Example port | Encryption |
 | --- | --- | --- | --- |
-| RTMP | TCP | 1935 | None; use RTMPS |
+| RTMP | TCP | 1935 | None (prefer RTMPS or a TLS terminator) |
 | RTMPS | TCP | 1936 | Native TLS 1.2 or 1.3 |
-| SRT | UDP, IPv4 only | 9000 | SRT passphrase / AES |
+| SRT | UDP (IPv4 only) | 9000 | SRT passphrase / AES |
 | MoQ | UDP | 4433 | QUIC TLS 1.3 |
-| HTTP | TCP | 8080 | Cleartext or a private proxy backend |
-| HTTPS | TCP | 8443 | Native TLS |
+| HTTP | TCP | 8080 | Cleartext (keep behind a proxy, or turn off) |
+| HTTPS | TCP | 8443 | Native TLS 1.2 or 1.3 |
 | Metrics | TCP | 9090 | Private listener and bearer token |
 
-Only publish the ports you use. Docker requires explicit UDP mappings for SRT and MoQ.
-A normal HTTP reverse proxy does not proxy RTMP, SRT, or MoQ ingestion.
-Neither RTMP nor SRT accepts `listen = "off"`; use network isolation when a listener is unused.
-MoQ stays disabled without its certificate configuration. HTTP can use `listen = "off"`.
+Only expose the ports you actually use (Docker requires explicit `/udp` mappings for SRT and MoQ, and standard HTTP reverse proxies cannot proxy RTMP, SRT, or MoQ).
+RTMP and SRT do not accept `listen = "off"`, so keep unused ingest listeners bound to loopback or blocked by your firewall.
+MoQ stays off unless configured with `[tls]`, and HTTP can be turned off with `http.listen = "off"` when serving HTTPS directly.
 
 ## Storage and capacity
 
-DVR storage and recording have separate lifetimes:
+DVR retention and segment recording serve different jobs and have different lifetimes:
 
-| Storage | Purpose | Restart behavior | Cleanup |
+| Storage | Purpose | After a restart | Cleanup |
 | --- | --- | --- | --- |
-| Memory retention | Recent media and manifests | Lost | Time/byte retention |
-| Disk retention | Older media in the live DVR window | Catalog is not restored | Owned-generation cleanup and retention |
-| Recording directory | Persistent completed segments | Files remain | External archive policy |
+| Memory (`[memory]`) | Recent media and cached playlists | Cleared | Time and byte budgets |
+| Disk spill (`[disk]`) | Older media in the live DVR window | Cleared (old files removed) | Retention window and byte budgets |
+| Recording (`[record]`) | Permanent completed segments | Preserved on disk | External archive/expiry job |
 
-Example for a two-hour DVR window:
+A starting configuration for a two-hour DVR window:
 
 ```toml
 [hls]
@@ -59,30 +57,22 @@ per_stream = "8GiB"
 dir = "/var/lib/rushls/dvr"
 ```
 
-Estimate media bytes as total encoded bitrate × seconds ÷ 8.
-A 6 Mbps publication needs about 5.4 GB for two hours, plus overhead.
-A ladder's bitrate is the sum of all video and audio tracks retained by the origin.
-Allow space for bitrate peaks, manifests, temporary writes, and other filesystem users.
+Estimate disk per stream as `total bitrate × seconds ÷ 8`, summing every video and audio rendition in the ladder.
+A 6 Mbps ladder over two hours takes roughly 5.4 GB before headroom for bitrate spikes and temporary files.
+Because `limits.streams = 32` keeps ended streams around until their window expires, this example can commit up to 256 GiB of disk even with only 16 concurrent publishers.
+Memory budgets cap stored media and accounted pipeline buffers, not total process RSS, so leave room for the runtime, OS buffers, and allocator overhead.
 
-The example permits up to 32 retained streams, so disk budgets can approach 256 GiB in aggregate.
-Sixteen active publishers do not limit retained idle streams to sixteen.
-Memory budgets exclude some pipeline and in-flight allocations and do not cap process RSS.
-Measure actual retention depth and memory under the expected workload.
+Keep each Rushls process on its own `disk.dir` (Rushls locks the directory so two instances cannot share it), and keep `record.dir` outside `disk.dir`.
+Never treat a DVR volume as restart-persistent playback storage.
 
-Use a distinct DVR root per origin process. Ownership locks prevent concurrent Rushls instances from sharing that root.
-Keep recordings outside the DVR root. Do not treat a mounted DVR volume as restart-persistent playback state.
-
-The container runs as UID/GID `65532:65532`.
-For Linux bind mounts, create the directories and grant that identity access:
+For containers, the image runs as UID/GID `65532:65532`. On Linux hosts, prepare bind-mounted directories for that user:
 
 ```sh
 sudo install -d -o 65532 -g 65532 /srv/rushls/dvr /srv/rushls/recordings
 ```
 
-Mount `/srv/rushls` at `/var/lib/rushls` and mount secrets read-only at `/run/secrets`.
-The identity also needs permission to traverse parent directories and read certificates and secret files.
-On Windows, use a local filesystem with hard links, such as NTFS.
-Do not assume a network filesystem provides the same lock and durability behavior.
+Mount `/srv/rushls` at `/var/lib/rushls` and mount secrets read-only at `/run/secrets`, ensuring UID `65532` can traverse parent directories and read certificates and secret files.
+Use a local filesystem that supports hard links and reliable file locks (such as ext4, XFS, APFS, or NTFS on Windows) rather than a network filesystem.
 
 ## Recording operations
 
@@ -94,24 +84,18 @@ queue_size = 128
 max_pending = "256MiB"
 ```
 
-The recorder publishes completed segment files without replacing existing names.
-Each file carries decoder configuration, but codec preroll and source random access still affect standalone decoding.
-Keep publication identity in the path to separate sessions.
+Rushls writes each completed segment atomically—in-progress files use `.rushls-*.tmp` names and never overwrite existing files.
+Keep `{publication}` in `path` so reconnects and restarts never collide.
+Each MP4 segment carries its own initialization header, though codec preroll and source random-access structure still apply if you decode segments individually.
 
-Rushls does not provide an archive playback API or an automatic recording expiry policy.
-Use a separate process to index, upload, and expire completed files.
-Do not consume temporary files as completed recordings.
+Rushls does not index, serve, upload, or expire recordings. Run a separate job (such as `rclone move --exclude '.rushls-*' --min-age 1m`) to archive and prune completed files.
+Watch recording failure and backlog metrics: if `queue_size` or `max_pending` overflows, Rushls drops affected recording segments so live playback stays uninterrupted.
 
-Watch recording failures and queue pressure. Live playback can continue while the recorder drops work after an error or overflow.
-For remote archival, `segment.ready` hooks supply fetchable resource paths instead of media payloads.
-Fetch them before live retention expires. A hook does not reserve the segment indefinitely.
-
-Unix flushes file contents and directory metadata. Windows flushes contents without the same directory-entry power-loss guarantee.
-See [Windows notes](installation.md#windows).
+If you archive remotely instead of writing to local disk, subscribe a [hook](admission-and-hooks.md#lifecycle-hooks) to `segment.ready` and fetch each segment over HTTP before it leaves the DVR window.
 
 ## Authorization
 
-Publisher admission is an application service, not a list of passwords in Rushls:
+Publisher admission delegates allow/deny decisions to your own HTTP service rather than storing static stream keys in Rushls:
 
 ```toml
 [publish.auth]
@@ -121,13 +105,11 @@ timeout = "2s"
 max_response = "64KiB"
 ```
 
-The admission response chooses `stream_id`, `principal`, and an optional named profile.
-Failures deny the connection. A reconnect makes a new admission request.
-The shared token authenticates Rushls to the service; it is not the publisher's stream key.
-Use the exact [admission](admission-and-hooks.md#admission) contract.
+The `token` here authenticates Rushls to your admission service (it is not a publisher's stream key).
+Your service returns `stream_id`, `principal`, and an optional named profile; any network error, timeout, or invalid response fails closed and denies the publisher. Every reconnect triggers a fresh check.
+See [Admission and hooks](admission-and-hooks.md#admission) for the JSON schema and [`examples/admission`](../examples/admission/admission.py) for a starter service.
 
-For playback, choose one key source: a public key, JWKS URL, or HMAC secret.
-This example uses JWKS:
+Viewer playback authorization verifies signed JWTs locally using one key source (`jwks_url`, `public_key`, or `secret`):
 
 ```toml
 [playback.auth]
@@ -140,18 +122,14 @@ iss = "https://issuer.example.com"
 aud = "rushls-origin"
 ```
 
-Viewer JWTs need the stream claim, expiry, and required issuer/audience claims.
-Send `Authorization: Bearer TOKEN`, or use the supported `token` query parameter for players that cannot set headers.
-Query tokens can appear in access logs. Restrict log access and redact credentials in surrounding infrastructure.
-
-Bearer authentication needs headers on subsequent media requests, not only the first playlist request.
-Query-token playlists require HLS v11 `EXT-X-DEFINE:QUERYPARAM` substitution, including on child requests.
-Players without this support, including hls.js-light, cannot use that form. See [playback authorization](configuration.md#playback) before integrating a player or CDN.
-For JWKS deployments, allow outbound access to the issuer and monitor key refresh failures.
+Viewers pass the JWT via `Authorization: Bearer <token>` (on every playlist and media request) or via `?token=<token>`.
+Query tokens rely on HLS v11 `EXT-X-DEFINE:QUERYPARAM` substitution—players without it (including `hls.js-light`) cannot use query tokens—and they can appear in proxy and CDN access logs, so keep them short-lived, scoped to one stream, and redacted in surrounding logs.
+When using `jwks_url`, allow outbound access from Rushls to the issuer and alert on key refresh failures.
+See [Playback authorization](configuration.md#playback) for full details.
 
 ## Encryption and certificates
 
-Native HTTPS configuration:
+Serve HTTPS directly with native TLS (including HTTP/2 via ALPN):
 
 ```toml
 [http]
@@ -167,13 +145,11 @@ cert = "/run/secrets/fullchain.pem"
 key = "/run/secrets/private-key.pem"
 ```
 
-Set `min = "1.2"` when older clients require TLS 1.2. Keep `max = "1.3"` to permit modern negotiation.
-The certificate must cover the public hostname and provide the required chain.
-An external certificate manager must issue and renew it.
-Rushls reloads valid certificate replacements; an invalid replacement leaves the previous certificate active.
-Mount certificate directories so replacement files become visible inside the container.
+HTTPS defaults to TLS 1.3 only; set `min_version = "1.2"` under `[https]` if older clients need TLS 1.2 (TLS 1.3 stays accepted either way).
+Issue and renew certificates externally—Rushls watches the files and hot-reloads valid replacements, keeping the previous certificate active if a replacement is invalid.
+In containers, mount the parent directory rather than individual symlinked files so atomic renewals become visible inside the container.
 
-RTMPS is served natively with the same `[tls]` certificate:
+The same `[tls]` certificate serves RTMPS (TLS 1.2 and 1.3) and MoQ (QUIC TLS 1.3):
 
 ```toml
 [ingest.rtmps]
@@ -184,13 +160,10 @@ cert = "/run/secrets/fullchain.pem"
 key = "/run/secrets/private-key.pem"
 ```
 
-Encoders publish to `rtmps://origin.example.com:1936/live/NAME`. The listener accepts TLS 1.2 and 1.3.
-To stop accepting unencrypted RTMP, keep `ingest.rtmp.listen` on loopback or block its port.
+Encoders publish to `rtmps://origin.example.com:1936/live/NAME`. To prevent unencrypted RTMP, bind `ingest.rtmp.listen` to loopback or block port 1935 at the firewall.
 
-An external TCP TLS terminator in front of the plain RTMP listener also works.
-Do not put RTMP through an HTTP `proxy_pass` block.
-Behind a terminator, every RTMP publisher appears to come from the terminator's address.
-Configure it to send a PROXY protocol header (v1 or v2) and enable `proxy_protocol`, so admission, logs, hooks, and per-address limits see the real client:
+If you terminate TLS in front of plain RTMP (or pass TLS through a TCP load balancer to RTMPS), do not route RTMP through an HTTP `proxy_pass` block.
+Instead, use a TCP proxy that sends PROXY protocol v1 or v2 and enable `proxy_protocol` so admission, logs, hooks, and `limits.publishers_per_address` see the real client IP:
 
 ```toml
 [ingest.rtmp]
@@ -198,11 +171,10 @@ listen = "127.0.0.1:1935"
 proxy_protocol = true
 ```
 
-With HAProxy, add `send-proxy-v2` to the `server` line. With nginx `stream`, set `proxy_protocol on;`. AWS NLB target groups have a proxy protocol v2 attribute.
-Once enabled, a connection without a header is refused, so the listener must be reachable only through the proxy.
-MoQ ingest reuses the `[tls]` certificate; QUIC always requires TLS 1.3.
+In HAProxy, add `send-proxy-v2` to the `server` line; in Nginx `stream`, set `proxy_protocol on;`; on AWS NLB, enable proxy protocol v2 on the target group.
+Once enabled, any connection without a PROXY header is rejected, so keep the listener unreachable except through the proxy.
 
-SRT uses separate encryption:
+SRT uses its own passphrase encryption (independent of publisher admission):
 
 ```toml
 [ingest]
@@ -215,14 +187,11 @@ encryption = "aes256"
 latency = "120ms"
 ```
 
-SRT passphrases must satisfy the transport's 10–79-byte requirement.
-Configure a matching publisher passphrase and AES key size.
-Keep the idle timeout longer than the transport latency.
-Do not confuse encryption with publisher authorization.
+SRT passphrases must be 10–79 bytes long, must match the publisher's passphrase and AES key length, and `ingest.idle_timeout` must stay longer than `ingest.srt.latency`.
 
 ## Reverse proxies and CDNs
 
-For external HTTPS termination, keep the HTTP backend private:
+When terminating HTTPS in front of Rushls, keep the HTTP listener private and set `http.public_url` only if you want absolute URLs in playlists (leaving it empty emits relative URLs, which works cleanly behind proxies and CDNs):
 
 ```toml
 [http]
@@ -233,7 +202,7 @@ public_url = "https://video.example.com"
 origins = ["https://player.example.com"]
 ```
 
-An Nginx location inside an HTTPS server can forward playback requests:
+An Nginx location inside your HTTPS `server` block:
 
 ```nginx
 location / {
@@ -247,48 +216,33 @@ location / {
 }
 ```
 
-This fragment assumes an existing HTTPS virtual host and certificate configuration.
-It preserves the original URI and query string and disables proxy caching and buffering.
-Set timeouts above the origin's blocking-reload deadline, with network margin.
+Keep `proxy_read_timeout` comfortably above your blocking playlist reload window, and keep buffering off so LL-HLS parts reach players immediately.
 
-Before adding a CDN cache, verify these behaviors:
+Before putting a CDN in front of Rushls, verify that it:
 
-- Preserve `_HLS_msn`, `_HLS_part`, and `_HLS_skip` query parameters and distinguish their responses.
-- Forward credentials and preserve the origin's authorization and cache-control semantics.
-- Do not share playlists containing one viewer's token with other viewers.
-- Support Range requests and the origin's content types and CORS headers.
-- Honor `no-store` failures instead of caching transient missing media or overload responses.
-- Keep blocked playlist requests open and permit clients to fetch parts promptly.
-
-`public_url` controls advertised URLs. It does not configure DNS, TLS, or a reverse proxy.
-Relative URLs remain the default when it is empty.
+- Keeps `_HLS_msn`, `_HLS_part`, and `_HLS_skip` in the cache key.
+- Honors Rushls's `Cache-Control` headers, including `no-store` on transient errors.
+- Holds blocking playlist reloads open without buffering or timing them out early.
+- Supports HTTP `Range` requests (needed for I-frame scrubbing) and forwards CORS headers.
+- Never shares a viewer's token-bearing playlist with other viewers, and verifies JWTs at the edge if you cache media without tokens (see [`examples/cloudflare/playback-worker.js`](../examples/cloudflare/playback-worker.js)).
 
 ## Reconnects and shutdown
 
-Strict input validation is the default. It rejects invalid timing and dependent segment starts.
-Permissive input mode only handles the bounded cases described in [input handling](input-handling.md).
-It does not generate missing audio or video.
+Strict input validation is on by default; see [Input handling](input-handling.md) before enabling permissive gap recovery (`publish.strict = false`).
 
-`publish.takeover = true` lets a new publisher replace an active publisher with the same admitted stream ID.
-It does not combine those publishers into a multitrack presentation or replicate state across origins.
-Reconnect continuity depends on the retained stream and compatible media.
+Setting `publish.takeover = true` allows a reconnecting publisher with the same admitted `stream_id` to displace an existing session immediately instead of waiting for `ingest.stall_timeout`.
+Takeover replaces the active publisher on the same node; it never merges publishers into one ladder or replicates state across nodes.
+Across protocols, Rushls distinguishes clean shutdowns from drops: an explicit RTMP unpublish or orderly SRT close ends the playlist with `EXT-X-ENDLIST`, while a transport drop leaves the stream open for a compatible reconnect within `hls.window`.
 
-For SRT, an orderly peer shutdown closes the input and can produce `ENDLIST`.
-Idle or sequence breaks count as interruptions and preserve a reconnect opportunity within retention.
-RTMP distinguishes explicit unpublish from transport loss.
-Monitor stream lifecycle events instead of treating every disconnect as an identical event.
-
-Set a finite shutdown budget:
+Configure a finite drain budget for graceful stops:
 
 ```toml
 shutdown_grace = "10s"
 ```
 
-Send SIGTERM on Unix or Ctrl+C/Ctrl+Break on Windows.
-Allow more than ten seconds in the service manager or container orchestrator for this example.
-A forced kill bypasses normal draining.
+Send `SIGTERM` on Unix (or Ctrl+C / Ctrl+Break on Windows), and set your service manager's stop timeout higher than `shutdown_grace` so parked viewer requests, recordings, and queued hooks finish draining before a hard kill.
 
-A minimal Linux systemd service, after installing the binary and creating the `rushls` user, is:
+A minimal Linux systemd unit (after installing the binary and creating a `rushls` system user with access to your config, secrets, and storage directories):
 
 ```ini
 [Unit]
@@ -308,49 +262,35 @@ UMask=0027
 WantedBy=multi-user.target
 ```
 
-Grant this service user access to the configured directories and secrets.
-The native service identity differs from the container's numeric identity.
-Restart the service after configuration changes; there is no general configuration reload endpoint.
+There is no live config-reload endpoint; restart the service after editing configuration files (TLS certificates and JWKS keys still reload automatically).
 
 ## Kubernetes
 
-[`examples/kubernetes/rushls.yaml`](../examples/kubernetes/rushls.yaml) runs one origin:
-a ConfigMap with the configuration, a Deployment, a LoadBalancer Service for RTMP and SRT, and a ClusterIP Service for viewers and metrics.
+[`examples/kubernetes/rushls.yaml`](../examples/kubernetes/rushls.yaml) deploys one origin with a ConfigMap, Deployment, LoadBalancer Service for RTMP/SRT ingest, and ClusterIP Service for viewers and metrics:
 
 ```sh
 kubectl create secret generic rushls --from-literal=metrics-token="$(openssl rand -hex 32)"
 kubectl apply -f examples/kubernetes/rushls.yaml
 ```
 
-The manifest makes these choices:
+Key design choices in the manifest:
 
-- **One replica, replaced rather than overlapped.** A stream lives on the origin its publisher reached.
-  A second replica behind the same Service would answer viewers with 404 for streams on the other one.
-  On an update the old pod drains, and publishers reconnect to the new one.
-- **Probes.** Readiness and startup use `/health/ready`, liveness uses `/health/live`.
-- **Shutdown.** A five-second `preStop` pause lets load balancers see the failed readiness before Rushls stops accepting.
-  `terminationGracePeriodSeconds` covers that pause plus `shutdown_grace`.
-- **Memory.** `memory.total` caps retained media below the container limit, so the origin refuses new streams instead of being killed.
-- **Publisher addresses.** `externalTrafficPolicy: Local` keeps the publisher's address for admission and `limits.publishers_per_address`.
-  Behind a proxy that rewrites addresses, enable [`proxy_protocol`](#encryption-and-certificates) instead.
-- **Hardening.** The pod runs as UID 65532 with a read-only root filesystem; `/var/lib/rushls` is an `emptyDir` for DVR spill and recordings.
-  Use a PersistentVolumeClaim there if recordings must survive the pod.
+- **One replica (`Recreate` strategy):** Streams live on the origin their publisher connected to; running two replicas behind the same Service would return 404s for streams hosted on the other pod. On updates, the old pod drains and publishers reconnect to the new one.
+- **Health probes:** Startup and readiness probes hit `/health/ready`; liveness hits `/health/live`.
+- **Graceful shutdown:** A 5-second `preStop` sleep lets load balancers observe failed readiness before Rushls stops accepting connections, and `terminationGracePeriodSeconds` covers `preStop` plus `shutdown_grace`.
+- **Memory headroom:** `memory.total` sits below the container memory limit so Rushls refuses excess streams cleanly instead of being OOM-killed.
+- **Real publisher IPs:** `externalTrafficPolicy: Local` preserves publisher source addresses for admission and `limits.publishers_per_address` (behind a proxy that rewrites addresses, enable [`proxy_protocol`](#encryption-and-certificates) instead).
+- **Hardening:** Runs as UID `65532` with a read-only root filesystem and an `emptyDir` at `/var/lib/rushls` (swap in a PersistentVolumeClaim if recordings must survive pod restarts).
 
-Add `[publish.auth]` before exposing the ingest Service, and serve viewers through an Ingress or a CDN.
-Configuration changes need a restart: `kubectl rollout restart deploy/rushls`.
+Add `[publish.auth]` before exposing the ingest Service, serve viewers through an Ingress or CDN, and roll config changes with `kubectl rollout restart deploy/rushls`.
 
 ## Monitoring and rollout
 
-Use `/health/live` and `/health/ready` on the HTTP(S) listener for probes.
-Readiness is an origin readiness check, not proof that a particular stream exists or decodes correctly.
-If an RTMP, RTMPS, HTTP, or HTTPS listener keeps failing to accept connections for 30 seconds, for example because the process has run out of file descriptors, readiness fails with `accept failing`.
-It passes again after the next successful accept, or after 10 seconds without a failure.
-Liveness does not change, because a restart would cut every live session; the node recovers as sessions end and free descriptors.
-A listening socket that is itself unusable stops the node with an error instead.
-Restrict metrics access with a private listener and bearer token.
-Start with [metrics documentation](metrics.md) and the [Prometheus/Grafana examples](../examples/monitoring).
+Point load-balancer and orchestrator probes at `/health/live` and `/health/ready` on the HTTP(S) listener.
+`/health/ready` verifies origin health—not whether any individual stream exists.
+If an RTMP, RTMPS, HTTP, or HTTPS listener fails to accept connections continuously for 30 seconds (for example after exhausting file descriptors), readiness fails with `accept failing`, then recovers after the next successful accept or 10 seconds without failures.
+Liveness stays green so active broadcasts are not cut while existing connections drain; a genuinely broken listening socket stops the process with an error instead.
 
-Track admission failures, timestamp failures, stream availability, retention depth, recording failures, hook delivery, CPU, memory, and filesystem capacity.
-Test a representative publisher and player through the actual proxy/CDN before rollout.
-Include reconnects, disk pressure, and viewer load in operational validation.
-See [load validation](development/load-testing.md) for the measured harness and its limits.
+Keep `[metrics]` on a private listener with a bearer token, and start with the [metrics guide](metrics.md) and [Grafana dashboards](../examples/monitoring/README.md).
+Before going live, test a real publisher and player through your actual proxy or CDN—including reconnects, disk spill, and viewer concurrency.
+See [Load testing](development/load-testing.md) for the soak harness and its scope.

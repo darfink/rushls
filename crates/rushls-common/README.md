@@ -1,28 +1,26 @@
 # rushls-common
 
-Infrastructure shared by [Rushls](https://github.com/darfink/rushls) and its
-sibling services. Every module is behind a feature of the same name, so a
-dependent compiles only what it uses. Nothing here chooses application policy
-or logs: reporting stays with each application's own events.
+Shared infrastructure for [Rushls](https://github.com/darfink/rushls) and its sibling services.
+Every module sits behind a Cargo feature of the same name so dependents compile only what they use.
+Nothing here picks application policy or emits logs directly—reporting stays in each application's own observer.
 
 | Feature | Module | Provides |
 | --- | --- | --- |
 | `config` | `config` | Layered configuration loading over `conf` schemas |
-| `outbound` | `outbound` | A pooled HTTP client for operator-configured services, with optional client TLS |
-| `hooks` | `hooks` | Ordered, best-effort lifecycle event delivery (CloudEvents JSON) |
-| `tls` | `tls` | TLS termination with certificates that rotate under a running listener |
-| `axum` | `tls` | `axum::serve::Listener` for the TLS listener |
-| `metrics` | `metrics` | Prometheus endpoint helpers: bearer tokens and label escaping |
-| `proxy-protocol` | `proxy_protocol` | PROXY protocol v1 and v2 headers, read ahead of a TCP stream |
+| `outbound` | `outbound` | Pooled HTTP client for operator-configured endpoints, with optional client TLS |
+| `hooks` | `hooks` | Ordered, best-effort lifecycle event delivery (CloudEvents JSON + Standard Webhooks HMAC) |
+| `tls` | `tls` | TLS termination with live certificate rotation |
+| `axum` | `tls` | `axum::serve::Listener` integration for the rotating TLS listener |
+| `metrics` | `metrics` | Prometheus helpers: bearer token checks and label escaping |
+| `proxy-protocol` | `proxy_protocol` | PROXY protocol v1 and v2 header parsing ahead of a TCP stream |
 | `accept` | `accept` | Accept-loop error classification and backoff |
 
-`outbound` enables `tls`, and `hooks` enables `outbound`.
+`outbound` enables `tls`, `hooks` enables `outbound`, `tls` enables `accept`, and `axum` enables `tls`.
 
-## Configuration
+## Configuration (`config`)
 
-Configuration loading independent of application policy. Application schemas use
-`conf::Conf` with Serde support. The loader owns file discovery, interpolation,
-source precedence, environment warnings, and source metadata.
+Application-agnostic configuration loading over `conf::Conf` + Serde schemas.
+`rushls-common` handles file discovery, environment interpolation, precedence, unknown-variable warnings, and value-source tracking, while each application owns its schema, validation, and runtime wiring.
 
 ### Application integration
 
@@ -47,113 +45,68 @@ pub struct Config {
 let loaded = Loader::new("example", "EXAMPLE_").load::<Config>()?;
 ```
 
-The application declares `conf` as a direct dependency because its derive macro
-uses the `conf` crate path. The loader prefix matches the schema prefix.
-A field marked `env` derives its environment name from the field name.
-Nested structs use `#[conf(flatten, prefix)]` to derive nested names.
-The example accepts `EXAMPLE_LISTEN`, `--listen`, and the TOML key `listen`.
+Declare `conf` as a direct dependency in the application (its derive macro expands against the `conf` path) and match the loader's prefix to `env_prefix`.
+Fields marked `env` derive their environment names automatically, and nested structs use `#[conf(flatten, prefix)]`. In the example above, `listen` accepts TOML `listen`, `EXAMPLE_LISTEN`, and `--listen`.
 
-Application validation runs after loading. The shared crate does not construct
-services, choose media policies, or start background tasks.
+### Precedence and discovery
 
-### Source contract
-
-Values resolve in this order, with later sources overriding earlier sources:
+Values resolve in order, later wins:
 
 1. Compiled defaults
-2. TOML document
+2. TOML file
 3. Environment variables
-4. CLI arguments.
+4. CLI arguments
 
-File selection uses `--config`, then `<PREFIX>CONFIG`. An explicit path must
-exist. Without an explicit path, discovery selects the first file named
-`<app>.toml` in the working directory or platform configuration directories.
-The local platform directory precedes the roaming directory.
-Paths inside the document remain relative to the process working directory.
+File selection checks `--config`, then `<PREFIX>CONFIG` (an explicit path must exist). Without an explicit path, discovery picks the first `<app>.toml` found in the working directory, platform local config directory, platform roaming config directory, or `/etc/<app>/<app>.toml` on Unix. Paths inside the file stay relative to the process working directory.
 
-`explicit_only().load_from(args, env)` disables discovery and accepts source
-snapshots. Tests do not mutate the process environment or read the live shell.
-`load()` reads the live process arguments and environment.
+For deterministic tests, call `Loader::explicit_only().load_from(args, env)` to disable discovery and pass explicit argument/environment snapshots without mutating process state.
 
-Unknown CLI arguments and TOML fields fail startup. Unknown application-prefixed
-environment variables produce warnings and are ignored as configuration overrides.
-Environment names come from the derived schema, including declared aliases.
-`Loaded::warnings` contains sorted, deduplicated diagnostics with variable names
-but no values. Each application reports these diagnostics at startup.
-Variables outside the application prefix produce no warning.
-
-All environment variables remain available for explicit TOML interpolation.
-Custom interpolation inputs can use names such as `INGEST_HOST` to avoid warnings
-about undeclared application-prefixed names.
-
-Schemas can explicitly contain maps with operator-defined keys. Those maps
-retain their own validation of entry fields.
+Unknown CLI flags and unknown TOML keys fail startup. Unknown `<PREFIX>*` environment variables are ignored as overrides and returned in `Loaded::warnings` (sorted, deduplicated, names only—never values). Variables outside the prefix do not warn, so custom interpolation inputs such as `INGEST_HOST` can be used cleanly.
 
 ### Interpolation
 
-Interpolation applies to TOML string values, including strings inside arrays
-and tables. It never changes keys or table names.
+Interpolation expands inside TOML string values (including strings in arrays and tables) before overrides apply. Keys and table names are never modified.
 
 | Syntax | Meaning |
 | --- | --- |
-| `${NAME}` | Required environment variable |
-| `${NAME:-fallback}` | Literal fallback when the variable is unset or empty, as in a shell |
-| `$$` | Literal dollar sign |
+| `${NAME}` | Required environment variable (fails if unset; stays empty if explicitly set to `""`) |
+| `${NAME:-fallback}` | Literal fallback when the variable is unset or empty, as in a POSIX shell |
+| `$$` | Literal `$` |
 | `$NAME` | Literal text |
 
-Names use ASCII letters, digits, and underscores, starting with a letter or
-underscore. A defined empty value remains empty, even with a fallback.
-Inserted values are literal strings. They cannot introduce TOML fields or
-trigger another interpolation pass. Fallback values are not recursively expanded.
-Interpolation runs before overrides, so unresolved file references still fail
-when another source overrides the field.
+Variable names use ASCII letters, digits, and underscores, starting with a letter or underscore.
+Expanded values and fallbacks are literal strings—they never inject TOML syntax or trigger a second interpolation pass.
+Because interpolation runs before overrides, an unresolved reference in the file still fails even if an environment variable or CLI flag overrides that field.
 
 ### Credentials and diagnostics
 
-Secret fields use `#[conf(env, secret)]` and `SecretString` for redacted Debug
-output and Serde type errors. Existing string fields can use
-`serde(deserialize_with = "rushls_common::config::deserialize_secret")` for error redaction. `conf` disallows inline CLI arguments on fields marked secret.
+- Mark secret fields with `#[conf(env, secret)]` and `SecretString` (or `serde(deserialize_with = "rushls_common::config::deserialize_secret")`) so `Debug` output and Serde errors never leak values. `conf` also prevents passing inline CLI arguments to secret fields.
+- Use `TextSource` for credentials that accept either an inline string (including `"${VAR}"`) or `{ file = "/path" }` in TOML and environment variables. Mounted secret files strip trailing CR/LF characters while preserving spaces; inline values stay verbatim.
+- `Loaded::sources` records where each field came from (`Default`, `File`, `Environment`, `Cli`) without storing values.
+- TOML syntax errors omit source lines, interpolation errors omit expanded values, and `--help` / `--version` keep working even with a broken config file.
 
-Credentials use one `TextSource` field each: a literal string (including
-`"${VAR}"` interpolation) or `{ file = "/path" }`. The value's shape selects
-the source, so there is no separate `_file` field to conflict with. Environment
-values accept the same two spellings. `TextSource::read` returns the text.
-Mounted secret files lose trailing CR/LF characters only. Spaces remain part of
-the credential. Inline values remain unchanged.
+### Shared schema vocabulary
 
-`Loaded::sources` maps field identifiers to defaults, CLI arguments, environment
-names, or document names. It contains no configuration values.
-TOML syntax diagnostics omit source lines. Interpolation diagnostics omit the
-value being expanded. Help and version remain available with broken configuration.
-Applications own diagnostic output and exit handling.
+Shared value types keep spelling consistent across Rushls and its sibling services:
 
-### Dependencies and tests
+| Item | Purpose |
+| --- | --- |
+| `OptionalDuration` | A duration, or `"off"` / `"none"` where disabling a deadline is valid |
+| `OptionalAddress` | A socket address, or `"off"` |
+| `OptionalBytes` | A byte limit, or `"unlimited"` |
+| `TomlTable<T>` | An open table keyed by operator-chosen names, such as `[hook.<name>]` |
+| `TomlValue<T>` | A structured value parsed as TOML text, overridable via environment or CLI |
+| `read_credential` | Resolves a `TextSource` credential paired with a file-path CLI flag |
 
-This crate depends on parsing and filesystem libraries. It has no dependency
-on HTTP, hooks, TLS, or the application.
+Two helpers keep documentation locked to the schema:
+
+- `reference::reference_markdown` generates a Markdown configuration reference directly from a `conf` schema so tests can verify it stays current.
+- `example::AnnotatedExample` parses an annotated example file (commented settings included) so tests can verify every option is documented and every example value parses.
+
+## Testing
+
+The `config` feature itself depends only on parsing and filesystem crates; HTTP, hooks, and TLS dependencies are pulled in only when their features are enabled. Run the full crate test suite with:
 
 ```sh
 cargo test -p rushls-common --all-features --locked
 ```
-
-### Shared schema vocabulary
-
-Applications use the same value shapes, so the same spelling means the same
-thing in Rushls and Routmp:
-
-| Item | Purpose |
-| --- | --- |
-| `OptionalDuration` | A duration, or `"off"`/`"none"` where waiting indefinitely is legitimate |
-| `OptionalAddress` | A listener address, or `"off"` |
-| `OptionalBytes` | A byte limit, or `"unlimited"` |
-| `TomlTable<T>` | An open namespace keyed by operator-chosen names, such as `[hook.<name>]` |
-| `TomlValue<T>` | A structured value handed over as TOML text, overridable from the environment |
-| `read_credential` | A `TextSource` credential whose CLI flag names a file |
-
-Two modules keep documentation tied to the schema:
-
-- `reference::reference_markdown` renders a configuration reference from the
-  `conf` schema. Applications commit the output and test that it is current.
-- `example::AnnotatedExample` reads an annotated example file, commented
-  settings included, so a test can check that the example documents every
-  option and that every documented value parses.

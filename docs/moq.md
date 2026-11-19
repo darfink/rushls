@@ -1,74 +1,72 @@
-# MoQ
+# Media over QUIC (MoQ)
 
-Rushls ingests Media over QUIC (MoQ) publications in the hang format and serves them as HLS.
+Rushls ingests Media over QUIC (MoQ) publications in the `hang` format and serves them as HLS.
 
-The origin accepts `moq-lite-06` and `moq-lite-05` over WebTransport and raw QUIC on the same UDP port.
-WebTransport uses `h3` ALPN and selects the newest of the two that the client offers in the CONNECT response.
-Raw QUIC uses the version's ALPN directly. Other protocol versions fail negotiation.
-`moq-lite-07` is not accepted yet: the MoQ library still marks its wire format as work in progress.
+MoQ ingest is off by default because QUIC requires TLS. Enable it by setting `ingest.moq.listen` alongside `[tls]`.
+The listener accepts `moq-lite-06` and `moq-lite-05` over both WebTransport (`h3` ALPN) and raw QUIC (version ALPN directly) on the same UDP port.
+Over WebTransport, Rushls picks the newest of the two versions offered by the client; other versions fail negotiation.
+`moq-lite-07` is not accepted yet while its wire format is still changing upstream.
 
-One connection carries one publication. The CONNECT URL supplies the resource when its path is not empty.
-Otherwise, the SETUP path supplies the resource. If both paths are empty, the first broadcast announcement supplies the resource.
-A WebTransport `token` query parameter supplies the credential. Without that parameter, the resource name supplies the credential.
+One connection carries one publication. Rushls picks the stream resource from the first non-empty source in this order:
+
+1. The WebTransport `CONNECT` URL path
+2. The `SETUP` path
+3. The first broadcast announcement
+
+For credentials, a WebTransport `token` query parameter is used when present; otherwise the resource name itself acts as the credential.
 
 ## Media formats
 
-The origin reads `catalog.json` and subscribes to each audio, video, and text rendition.
-The first catalog fixes the track set. Track, codec, and container changes fail ingestion.
-A video frame rate that a later catalog declares for the first time is accepted; a change to a declared rate fails.
-During discovery, the origin accepts an OpusHead that replaces an omitted Opus description.
-It recalculates the first audible timestamp from the encoder delay before discovery ends.
-After discovery, decoder configuration changes fail ingestion.
+Rushls reads `catalog.json` and subscribes to every video, audio, and text rendition it declares.
+The first catalog fixes the track set for the publication—adding or removing tracks, or changing codecs, containers, or decoder configurations after startup, ends the publication.
+Two exceptions are allowed during startup:
+
+- A later catalog may declare a video frame rate for the first time (changing an already-declared rate fails).
+- An in-band `OpusHead` may supply a missing Opus description during discovery; Rushls recalculates the first audible timestamp from its encoder delay before locking the stream.
 
 | Input | Support |
 | --- | --- |
 | LOC | Property header and elementary payload |
 | Legacy Hang | Microsecond timestamp prefix and elementary payload |
-| H.264 `avc1` | Catalog `description` contains avcC |
-| H.264 `avc3` | First access unit contains Annex-B SPS and PPS. The origin builds avcC and converts NAL prefixes. |
-| HEVC / AV1 | Catalog `description` contains decoder configuration |
-| AAC | Catalog `description` contains AudioSpecificConfig |
-| Opus | Catalog description, or mono/stereo configuration from channel count |
-| Text `utf8` | One cue per frame, shown until the next cue; an empty cue clears it. Served as WebVTT. |
+| H.264 `avc1` | Catalog `description` carries `avcC` |
+| H.264 `avc3` | First access unit carries Annex-B SPS and PPS; Rushls builds `avcC` and converts NAL prefixes |
+| HEVC / AV1 | Catalog `description` carries decoder configuration |
+| AAC | Catalog `description` carries `AudioSpecificConfig` |
+| Opus | Catalog `description`, or mono/stereo configuration derived from channel count |
+| Text `utf8` | One cue per frame, displayed until the next cue; an empty cue clears it. Served as WebVTT |
 | Text `vtt` / `ttml` | Rejected |
 | CMAF and unknown containers | Rejected |
 | Renditions on another broadcast | Rejected |
 
-A rendition's catalog `label` (hang 0.21 and later) becomes its HLS `NAME`.
-Labels are descriptive, so a catalog update that changes only a label never ends the publication; after discovery the new label is ignored.
-Audio and video renditions have no language field in the catalog, so they carry no `LANGUAGE`; a text rendition's `lang` becomes its `LANGUAGE`.
+A rendition's catalog `label` (hang 0.21 and later) becomes its HLS `NAME`. Because labels are descriptive, a catalog update that changes only a label never ends the publication (changes after startup are ignored).
+Audio and video renditions have no language field in the catalog, so they carry no `LANGUAGE`; a text rendition's `lang` becomes its HLS `LANGUAGE`.
 
 ### Captions and subtitles
 
-A hang catalog `text` section declares caption renditions; each frame is one cue.
-A cue's timestamp is the moment it appears, on the same clock as the audio and video frames.
-That shared clock is the only synchronisation: a cue stamped when a frame is captured appears with that frame.
-The cue stays on screen until the next cue replaces it, and an empty cue clears it.
+A `hang` catalog `text` section declares caption renditions, where each frame is one cue.
+A cue's timestamp is the moment it appears, on the same clock as audio and video—that shared clock is the only synchronization, so a cue stamped when a video frame is captured appears with that frame.
+Each cue stays on screen until the next cue replaces it, and an empty cue clears it.
 
-Discovery does not wait for a cue, since captions can be silent for minutes.
-The origin subscribes from each track's latest group. For a text track, that is the caption currently on screen, which can be older than the first video frame the origin receives.
-Such a cue starts where the presentation starts, rather than failing the publication.
+Startup does not wait for a caption cue, since captions can be silent for minutes.
+Rushls subscribes from each track's latest group; if a text track already has a cue on screen from before the first video frame, that cue starts where the presentation starts rather than failing the publication.
 
-A cue must reach the origin before the part that covers its timestamp is published. A cue sent as soon as it is stamped travels with the video of the same moment, so it is in time.
-A later cue is reported as `subtitle cue too late` and appears only from the next part that is not yet published.
-Stamp each cue when it is sent, not with the time of the speech it transcribes: a transcript is always behind the audio, and its cues would all arrive late.
+Cues must arrive before the HLS part covering their timestamp is published. A cue stamped when it is sent travels alongside video from the same moment and arrives on time; a late cue logs `subtitle cue too late` and appears starting from the next unpublished part.
+For live transcription, stamp each cue when it is sent rather than with the timestamp of the speech it transcribes—transcripts always trail audio, so speech-stamped cues would consistently arrive late.
 
-MOQ supplies presentation timestamps, without decode timestamps.
-The shared normalizer reconstructs decode timestamps. Reordered H.264 requires frame timing from the SPS.
+### Timing, ordering, and buffering
 
-The reader requests ordered delivery and a 30-second retention budget.
-It consumes the current group before the next group. Out-of-order groups wait up to one second for a missing sequence.
-The reorder buffer holds at most 256 groups. A missing group beyond either limit fails ingestion.
+MoQ carries presentation timestamps without decode timestamps, so Rushls reconstructs decode timestamps during normalization. Reordered H.264 (B-frames) requires frame timing in the SPS.
 
-Discovery limits cover subscriptions, catalog bytes, and media probing.
-Packet limits apply to returned samples. The MOQ cache has a 16 MiB eviction target.
-That target is not a hard allocation limit: the dependency buffers incoming frames before the adapter checks their payload size.
-The cache's usage is therefore charged to `memory.per_publisher` as it grows, one frame behind the allocation.
+The reader requests ordered delivery with a 30-second retention budget and consumes one group at a time. Out-of-order groups wait up to 1 second for a missing sequence, up to a 256-group reorder buffer; missing a group past either limit ends the publication.
+
+The internal MoQ cache targets 16 MiB before evicting. Because the underlying transport library buffers an incoming frame before Rushls inspects its size, cache usage is charged to `memory.per_publisher` one frame behind allocation.
+
+For how Rushls chooses segment and part durations—including closed-GOP requirements and `segment.tolerance` for uneven keyframes—see [Segments and parts](configuration.md#segments-and-parts) and [Irregular keyframe intervals](configuration.md#irregular-keyframe-intervals).
 
 ## Local publish test
 
-This test requires FFmpeg, `moq-cli 0.13`, and a certificate for `localhost`.
-Replace the certificate paths in this configuration:
+This test requires FFmpeg, `moq-cli` 0.13 (executable `moq`), and a TLS certificate for `localhost`.
+Create a configuration file with your certificate paths:
 
 ```toml
 [ingest]
@@ -91,15 +89,15 @@ key = "/absolute/path/key.pem"
 listen = "127.0.0.1:18080"
 ```
 
-RTMP and SRT require socket addresses. Port zero assigns temporary ports. Their `listen` fields do not accept `"off"`.
+RTMP and SRT do not accept `"off"`, so port `0` binds temporary ports for this test.
 
-Start the origin from the repository root:
+Start Rushls from the repository root:
 
 ```sh
 cargo run -p rushls -- --config /absolute/path/moq-test.toml
 ```
 
-Publish H.264 video and AAC audio:
+Publish 30 seconds of H.264 video and AAC audio (`moq import ts` converts the MPEG-TS pipe into legacy Hang with Annex-B `avc3` video and AAC audio; Rushls does not receive raw MPEG-TS over MoQ):
 
 ```sh
 ffmpeg -hide_banner -loglevel error -re \
@@ -112,26 +110,25 @@ ffmpeg -hide_banner -loglevel error -re \
     --connect-tls-insecure import ts
 ```
 
-The verification flag is for this local certificate test. Production clients must verify the server certificate.
-The second FFmpeg input supplies audio. An audio codec option alone does not create an audio stream.
+> [!NOTE]
+> `--connect-tls-insecure` is for this local self-signed test only. Production publishers must verify the server certificate.
+> To test raw QUIC instead of WebTransport, replace `https://localhost:4443/` with `moqt://localhost:4443/`.
 
-After the origin reports `playable`, decode three seconds through HLS:
+With default 6-second segments, the stream becomes playable after roughly six seconds. Once Rushls logs `playable`, decode three seconds over HLS:
 
 ```sh
 ffmpeg -hide_banner -loglevel error \
   -i http://127.0.0.1:18080/my-stream/index.m3u8 -t 3 -f null -
 ```
 
-For raw QUIC, replace `https://localhost:4443/` with `moqt://localhost:4443/` in the publish command.
-The default segmentation settings need approximately six seconds of media before the stream becomes playable.
-
-The client imports TS into legacy Hang with Annex-B `avc3` video and AAC audio.
-The origin does not receive MPEG-TS bytes over MOQ.
-
-
 ## Browser publish test
 
-From `.`, create a development certificate and start the origin:
+[`tools/browser-moq-publish.html`](../tools/browser-moq-publish.html) publishes your camera, microphone, and typed captions from Chrome over WebTransport.
+
+Chrome does not trust locally installed root certificates for WebTransport, so the page pins the server certificate using `serverCertificateHashes`, fetching the SHA-256 fingerprint from Rushls at `/certificate.sha256` (served only while MoQ ingest is enabled).
+Chrome accepts a pinned certificate only if it is ECDSA P-256 and valid for at most 14 days. [`tools/mint-dev-cert.sh`](../tools/mint-dev-cert.sh) generates a 13-day certificate; re-run it whenever it approaches expiry, and Rushls reloads it without a restart. A production origin with a publicly trusted certificate needs no pinning.
+
+From the repository root, create the development certificate and start Rushls:
 
 ```sh
 ./tools/mint-dev-cert.sh
@@ -143,24 +140,19 @@ cargo run -- \
   --ingest-rtmp-listen 127.0.0.1:0 --ingest-srt-listen 127.0.0.1:0
 ```
 
-In another terminal, serve the test page from `tools`:
+In another terminal, serve the `tools` directory over HTTP:
 
 ```sh
-python3 -m http.server 18099 --bind 127.0.0.1
+python3 -m http.server 18099 --bind 127.0.0.1 --directory tools
 ```
 
-Open `http://localhost:18099/browser-moq-publish.html` in Chrome.
-Click **Camera + Mic**.
-Leave **Captions (utf8)** selected to also publish a caption rendition.
-Type a caption and press Enter, or select **Auto** to send one every two seconds; **Clear** removes the caption on screen.
-The subtitle rendition appears in the multivariant playlist as `English`.
-The page fetches the certificate fingerprint from the HTTP listener and pins the WebTransport certificate.
-Chrome does not consult locally installed roots for WebTransport, so the page passes the fingerprint as `serverCertificateHashes`.
-Chrome accepts a pinned certificate only if it is ECDSA P-256 and valid for at most 14 days. `mint-dev-cert.sh` creates a 13-day certificate; run it daily, and Rushls reloads it without a restart.
-Rushls serves `/certificate.sha256` only while MoQ ingest is on. A production origin with a publicly trusted certificate needs no pinning.
-The origin also accepts the IPv6 loopback address that Chrome can select for `localhost`.
+Open `http://localhost:18099/browser-moq-publish.html` in Chrome and click **Camera + Mic**:
 
-After the origin reports `playable`, decode 30 seconds of video and audio:
+- Leave **Captions (utf8)** checked to publish a subtitle track (it appears in the multivariant playlist as `English`).
+- Type a caption and press Enter, or enable **Auto** to send one every two seconds; **Clear** removes the current cue.
+- Uncheck **Audio (Opus)** before starting if you want a video-only test (and drop `-map 0:a:0` from the decode command below).
+
+Rushls also accepts the IPv6 loopback address that Chrome may choose for `localhost`. Once Rushls logs `playable`, decode 30 seconds of the stream:
 
 ```sh
 ffmpeg -hide_banner -xerror \
@@ -168,107 +160,26 @@ ffmpeg -hide_banner -xerror \
   -map 0:v:0 -map 0:a:0 -fps_mode:v passthrough -enc_time_base:v demux -f null -
 ```
 
-The output timebase preserves variable video timestamps during this decode test.
-Before capture starts, clear **Audio (Opus)** for a video-only test.
-For that test, remove `-map 0:a:0` from the decode command.
-
-Browser capture does not guarantee constant frame durations or exact keyframe intervals.
-For variable frame durations, the origin closes each regular part after it reaches 85% of the advertised part target.
-Pre-roll replays observed sample durations through the same part cutter used during publication.
-Later media must still satisfy the HLS duration limits.
-
-Late-keyframe allowance defaults to zero. Configure an explicit allowance for publishers that need it.
-The frozen segment ceiling includes that allowance. All video renditions must supply matching random-access timestamps.
-Actual decoder reconfiguration, including changed SPS/PPS, still requires a new publication.
-
+Passing `-fps_mode:v passthrough -enc_time_base:v demux` preserves variable video timestamps from browser capture.
+Because browser capture can produce uneven keyframe intervals, configure [`hls.segment` tolerance](configuration.md#irregular-keyframe-intervals) if your browser misses boundaries (tolerance defaults to `0s`).
 
 ## Browser ladder test
 
-Use the certificate and HTTP server commands above. Add these options to the origin command for two-second segments:
+To test a multi-rendition WebCodecs ladder (1080p, 720p, 360p, and stereo audio under `ladder`), reuse the certificate and HTTP server from above, and add 2-second segments and 500 ms parts to the Rushls command:
 
 ```sh
---hls-segment-target 2s --hls-part-target 500ms
+--hls-segment 2s --hls-part 500ms
 ```
 
-Open `http://localhost:18099/browser-ladder-bench.html` in Chrome and click **Synthetic 1080p**.
-Keep audio and publishing enabled. The page publishes 1080p, 720p, 360p, and stereo audio under `ladder`.
-The synthetic source includes a quiet 440 Hz tone.
-Click **Freeze source** to verify that the video pacer continues to produce frames for a static source.
+Open `http://localhost:18099/browser-ladder-bench.html` in Chrome, keep audio and publishing enabled, and click **Synthetic 1080p** (the test pattern includes a quiet 440 Hz tone).
+You can click **Freeze source** to confirm the browser pacer keeps emitting frames when the source picture is static.
 
-From `.`, verify and decode all four HLS tracks:
+From the repository root, verify and decode all four HLS tracks (requires `ffmpeg` and `ffprobe`):
 
 ```sh
 python3 tools/check-browser-ladder.py --seconds 30
 ```
 
-The checker requires FFmpeg and FFprobe. It checks codec metadata, decodes every rendition, and requires 30 seconds of output per track.
-It allows four extra seconds for different live rendition join points.
+The script checks codec metadata and decodes 30 seconds of output from every rendition, allowing up to 4 extra seconds for differing live join points.
 
-The publisher warms all video encoders before it starts the media clock.
-It also waits for all origin subscriptions. If one encoder falls behind, all renditions skip the same input frame.
-A skipped keyframe request remains pending for the next accepted frame.
-The hardware option requests `prefer-hardware`; WebCodecs does not expose which encoder backend it selects.
-
-
-## Adaptive segmentation
-
-The configuration uses target and maximum objects. These are the defaults:
-
-```toml
-[hls]
-segment = { target = "6s", max = "2x", tolerance = "0s" }
-part = { target = "1s", max = "2x" }
-```
-
-The corresponding CLI flags include `--hls-segment-target 2s` and `--hls-segment-max 3s`.
-Maxima accept absolute durations or multipliers of their configured targets.
-Equal target and maximum values forbid growth during admission.
-
-Pre-roll tries common video boundaries in order of distance from the segment target.
-It prefers the shorter duration when two boundaries are equally close.
-It waits for boundary evidence beyond the target while the input remains open and the configured maximum permits further observation.
-If the complete contract fails, admission tries the next closest boundary within the maximum.
-Audio boundaries use whole encoded samples. Audio-only input can select an earlier boundary to keep rounding within the maximum.
-Admission can select a larger part ceiling when the preferred ceiling cannot safely fit the encoded samples.
-For reordered video, it reserves space for complete B-frame groups between the 85% duration floor and the part ceiling.
-The configured part maximum still applies.
-Selected ceilings remain fixed throughout the publication.
-
-The part writer retains a bounded window before it commits a cut.
-Video cuts keep B-frame groups together so adjacent parts do not overlap in presentation time.
-It can repair nearby cuts without changing published parts or waiting for a whole segment.
-Some input sequences still require more lookahead than the window permits and terminate the publication.
-
-Both CFR and VFR use duration-based part cutting. A regular part normally reaches 85% of its ceiling.
-Independent parts and segment tails can be shorter. No part can exceed its ceiling.
-The origin preserves encoded payloads and normalizes timing. It does not create replacement frames or transcode input.
-
-The coordinator selects matching random-access points across video renditions.
-`segment.jitter` defines a symmetric window around each planned boundary.
-Its multiplier form resolves against `segment.target`.
-The planned timeline never resets after an early or late cut. The actual segment must also fit the frozen ceiling.
-The advertised ceiling includes both allowances, plus the required timestamp quantization.
-Thus, an early cut followed by a late cut can use the full combined budget.
-An observed long GOP during pre-roll does not grant extra late allowance during publication.
-
-The coordinator bounds retained samples and bytes with the publication's pre-roll limits.
-The existing stall timeout bounds wall-clock waiting. A missing required track fails the publication; topology does not change automatically.
-Valid published media remains available after failure.
-
-The `segmentation contract` event reports desired durations, selected durations, maxima, and jitter.
-Failure warnings identify the cause and applicable bounds. Metrics separately count part, boundary, and coordinator-capacity failures.
-Retention multiples and hold-back use the selected contract. Incompatible fixed values reject publication before it becomes visible.
-
-Active codec and topology changes remain unsupported. A replacement publication must satisfy the existing playlist contract or receive new rendition playlists.
-
-Admission runs the live coordinator and CMAF timing logic without serializing CMAF fragments.
-The factory only constructs the admitted publication. It does not run a hidden validation pass.
-
-Fractional GOP periods stay on an anchored rational grid. Each boundary is rounded separately.
-The planner preserves the source timestamp precision through normalization. It does not add a full frame of video slack.
-Fixed hold-back and retention settings must cover the maximum admission targets at startup.
-Relative retention uses the selected shared target for both expiry and reported retention depth.
-
-AVC segments require IDR frames. Configure the encoder for closed GOPs.
-A transport keyframe flag or recovery-point SEI does not establish independent decoding.
-Unsupported AVC random-access pictures produce a specific error with this configuration guidance.
+The test page warms all video encoders and waits for Rushls to subscribe to every track before starting the media clock. If one encoder falls behind, all renditions skip the same input frame so keyframes stay aligned (and any pending keyframe request carries over to the next accepted frame). The hardware toggle requests `prefer-hardware`, though WebCodecs does not report which backend it actually chose.
