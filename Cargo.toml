@@ -171,7 +171,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 notify = "8"
 notify-debouncer-full = "0.7"
-parking_lot = "0.12"
+parking_lot = "0.13"
 rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "std",
