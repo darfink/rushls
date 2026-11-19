@@ -7,6 +7,13 @@ contain breaking changes; they are listed first.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-19
+
+### Changed
+
+- Updated documentation, configuration reference, and `rushls-common` README to fix stale CLI/TLS/interpolation references and unify copywriting across user guides.
+- Aligned `examples/player/index.html` with the quick-start stream path (`live/event`).
+
 ## [0.3.0] - 2026-11-18
 
 ### Breaking changes
@@ -93,7 +100,8 @@ contain breaking changes; they are listed first.
 
 First release.
 
-[Unreleased]: https://github.com/darfink/rushls/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/darfink/rushls/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/darfink/rushls/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/darfink/rushls/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/darfink/rushls/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/darfink/rushls/releases/tag/v0.1.0

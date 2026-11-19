@@ -1,6 +1,6 @@
 [package]
 name = "rushls"
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -147,7 +147,7 @@ homepage = "https://github.com/darfink/rushls"
 # Common dependency versions for the application and its infrastructure crates.
 [workspace.dependencies]
 # Internal
-rushls-common = { path = "crates/rushls-common", version = "0.1.1" }
+rushls-common = { path = "crates/rushls-common", version = "0.1.2" }
 rtmpx = "3.1.1"
 
 # External
